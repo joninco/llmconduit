@@ -1,0 +1,36 @@
+[package]
+name = "resp2chat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json", "macros"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.29"
+dialoguer = "0.12"
+dirs = "6"
+eventsource-stream = "0.2"
+futures = "0.3"
+hex = "0.4"
+http = "1"
+reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "json", "rustls-tls", "stream"] }
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+pretty_assertions = "1"
+tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
