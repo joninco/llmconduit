@@ -246,8 +246,10 @@ async fn uses_configured_upstream_model_override() {
             brave_api_key: None,
             brave_max_results: 5,
             request_timeout: std::time::Duration::from_secs(30),
+            connect_timeout_secs: 10,
             max_web_search_rounds: 5,
             flatten_content: true,
+            max_replay_entries: 1000,
         },
     );
 
@@ -379,8 +381,10 @@ async fn forwards_configured_upstream_chat_kwargs() {
             brave_api_key: None,
             brave_max_results: 5,
             request_timeout: std::time::Duration::from_secs(30),
+            connect_timeout_secs: 10,
             max_web_search_rounds: 5,
             flatten_content: true,
+            max_replay_entries: 1000,
         },
     );
 
@@ -579,8 +583,10 @@ async fn proxies_models_endpoint_with_etag() {
         brave_api_key: None,
         brave_max_results: 5,
         request_timeout: std::time::Duration::from_secs(30),
+        connect_timeout_secs: 10,
         max_web_search_rounds: 5,
         flatten_content: true,
+        max_replay_entries: 1000,
     };
     let app = resp2chat::build_app(config);
     let response = app
@@ -626,8 +632,10 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         brave_api_key: None,
         brave_max_results: 5,
         request_timeout: std::time::Duration::from_secs(30),
+        connect_timeout_secs: 10,
         max_web_search_rounds: 5,
         flatten_content: true,
+        max_replay_entries: 1000,
     };
     let app = resp2chat::build_app(config);
     let response = app
@@ -1585,8 +1593,10 @@ fn test_gateway(upstream: MockUpstream, search: MockSearch) -> Arc<Gateway> {
             brave_api_key: Some("test-key".to_string()),
             brave_max_results: 5,
             request_timeout: std::time::Duration::from_secs(30),
+            connect_timeout_secs: 10,
             max_web_search_rounds: 5,
             flatten_content: true,
+            max_replay_entries: 1000,
         },
     )
 }
@@ -1598,7 +1608,7 @@ fn test_gateway_with_config(
 ) -> Arc<Gateway> {
     Arc::new(Gateway::new(
         config,
-        ReplayStore::new(),
+        ReplayStore::new(1000),
         Arc::new(upstream),
         Arc::new(search),
         MonitorHub::new(128),
