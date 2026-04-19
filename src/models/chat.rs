@@ -25,6 +25,10 @@ pub struct ChatCompletionRequest {
     pub top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_body: BTreeMap<String, Value>,
 }
@@ -128,6 +132,8 @@ pub struct ChatDelta {
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
     pub tool_calls: Option<Vec<ChatToolCall>>,
+    #[serde(default)]
+    pub refusal: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

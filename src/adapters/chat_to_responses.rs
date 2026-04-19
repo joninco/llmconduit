@@ -20,9 +20,14 @@ use uuid::Uuid;
 pub enum StreamEmission {
     OutputItemAdded(ResponseItem),
     OutputTextDelta(String),
+    ContentPartAdded,
+    ContentPartDone { text: String },
     ReasoningItemAdded(ResponseItem),
     ReasoningTextDelta(String),
+    ReasoningSummaryPartAdded,
+    ReasoningSummaryPartDone { text: String },
     FunctionCallArgumentsDelta { call_id: String, delta: String },
+    RefusalDelta(String),
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +44,10 @@ pub struct FinalizedAssistantTurn {
     pub reasoning_item: Option<ResponseItem>,
     pub tool_calls: Vec<ResolvedToolCall>,
     pub internal_assistant_message: Option<ChatMessage>,
+    pub content_part_emitted: bool,
+    pub reasoning_part_emitted: bool,
+    pub refusal_text: String,
+    pub finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -48,6 +57,10 @@ pub struct StreamState {
     output_text: String,
     reasoning_text: String,
     tool_calls: BTreeMap<usize, ToolCallAccumulator>,
+    content_part_emitted: bool,
+    reasoning_part_emitted: bool,
+    refusal_text: String,
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -70,7 +83,12 @@ impl StreamState {
                         encrypted_content: None,
                     };
                     self.reasoning_id = item_reasoning_id(&item);
+                    self.reasoning_part_emitted = false;
                     emissions.push(StreamEmission::ReasoningItemAdded(item));
+                }
+                if !self.reasoning_part_emitted {
+                    emissions.push(StreamEmission::ReasoningSummaryPartAdded);
+                    self.reasoning_part_emitted = true;
                 }
                 self.reasoning_text.push_str(reasoning_delta);
                 emissions.push(StreamEmission::ReasoningTextDelta(reasoning_delta.clone()));
@@ -86,10 +104,22 @@ impl StreamState {
                         phase: None,
                     };
                     self.message_id = item_message_id(&item);
+                    self.content_part_emitted = false;
                     emissions.push(StreamEmission::OutputItemAdded(item));
+                }
+                if !self.content_part_emitted {
+                    emissions.push(StreamEmission::ContentPartAdded);
+                    self.content_part_emitted = true;
                 }
                 self.output_text.push_str(content_delta);
                 emissions.push(StreamEmission::OutputTextDelta(content_delta.clone()));
+            }
+            if let Some(refusal) = &choice.delta.refusal {
+                self.refusal_text.push_str(refusal);
+                emissions.push(StreamEmission::RefusalDelta(refusal.clone()));
+            }
+            if let Some(reason) = &choice.finish_reason {
+                self.finish_reason = Some(reason.clone());
             }
             if let Some(tool_calls) = &choice.delta.tool_calls {
                 for tool_call in tool_calls {
@@ -266,6 +296,10 @@ impl StreamState {
             reasoning_item,
             tool_calls: resolved_tool_calls,
             internal_assistant_message,
+            content_part_emitted: self.content_part_emitted,
+            reasoning_part_emitted: self.reasoning_part_emitted,
+            refusal_text: self.refusal_text,
+            finish_reason: self.finish_reason,
         })
     }
 }
@@ -332,6 +366,7 @@ mod tests {
                     content: Some(text.to_string()),
                     reasoning_content: None,
                     tool_calls: None,
+                    refusal: None,
                 },
                 finish_reason: None,
             }],
@@ -348,6 +383,7 @@ mod tests {
                     content: None,
                     reasoning_content: Some(text.to_string()),
                     tool_calls: None,
+                    refusal: None,
                 },
                 finish_reason: None,
             }],
@@ -379,6 +415,7 @@ mod tests {
                                 .map(|s| serde_json::Value::String(s.to_string())),
                         },
                     }]),
+                    refusal: None,
                 },
                 finish_reason: None,
             }],
@@ -399,10 +436,11 @@ mod tests {
     fn apply_chunk_content_delta() {
         let mut state = StreamState::default();
         let emissions = state.apply_chunk(&content_chunk("c1", "hello"));
-        assert_eq!(emissions.len(), 2);
+        assert_eq!(emissions.len(), 3);
         assert!(matches!(&emissions[0], StreamEmission::OutputItemAdded(_)));
+        assert!(matches!(&emissions[1], StreamEmission::ContentPartAdded));
         assert!(
-            matches!(&emissions[1], StreamEmission::OutputTextDelta(d) if d == "hello")
+            matches!(&emissions[2], StreamEmission::OutputTextDelta(d) if d == "hello")
         );
     }
 
@@ -410,16 +448,18 @@ mod tests {
     fn apply_chunk_interleaved_reasoning_and_content() {
         let mut state = StreamState::default();
         let e1 = state.apply_chunk(&reasoning_chunk("c1", "thinking"));
-        assert_eq!(e1.len(), 2);
+        assert_eq!(e1.len(), 3);
         assert!(matches!(&e1[0], StreamEmission::ReasoningItemAdded(_)));
+        assert!(matches!(&e1[1], StreamEmission::ReasoningSummaryPartAdded));
         assert!(
-            matches!(&e1[1], StreamEmission::ReasoningTextDelta(d) if d == "thinking")
+            matches!(&e1[2], StreamEmission::ReasoningTextDelta(d) if d == "thinking")
         );
         let e2 = state.apply_chunk(&content_chunk("c1", "answer"));
-        assert_eq!(e2.len(), 2);
+        assert_eq!(e2.len(), 3);
         assert!(matches!(&e2[0], StreamEmission::OutputItemAdded(_)));
+        assert!(matches!(&e2[1], StreamEmission::ContentPartAdded));
         assert!(
-            matches!(&e2[1], StreamEmission::OutputTextDelta(d) if d == "answer")
+            matches!(&e2[2], StreamEmission::OutputTextDelta(d) if d == "answer")
         );
     }
 
@@ -583,5 +623,84 @@ mod tests {
         let mut buffer2 = String::new();
         append_argument_fragment(&mut buffer2, &serde_json::json!(true));
         assert_eq!(buffer2, "true");
+    }
+
+    #[test]
+    fn test_content_part_added_before_first_delta() {
+        let mut state = StreamState::default();
+        let emissions = state.apply_chunk(&content_chunk("c1", "hello"));
+        assert!(emissions.len() >= 3);
+        assert!(matches!(&emissions[0], StreamEmission::OutputItemAdded(_)));
+        assert!(matches!(&emissions[1], StreamEmission::ContentPartAdded));
+        assert!(matches!(&emissions[2], StreamEmission::OutputTextDelta(d) if d == "hello"));
+    }
+
+    #[test]
+    fn test_content_part_not_duplicated() {
+        let mut state = StreamState::default();
+        let e1 = state.apply_chunk(&content_chunk("c1", "hello"));
+        let e2 = state.apply_chunk(&content_chunk("c1", " world"));
+        let part_added_count = e1
+            .iter()
+            .chain(e2.iter())
+            .filter(|e| matches!(e, StreamEmission::ContentPartAdded))
+            .count();
+        assert_eq!(part_added_count, 1);
+    }
+
+    #[test]
+    fn test_reasoning_part_added_before_first_delta() {
+        let mut state = StreamState::default();
+        let emissions = state.apply_chunk(&reasoning_chunk("c1", "thinking"));
+        assert!(emissions.len() >= 3);
+        assert!(matches!(&emissions[0], StreamEmission::ReasoningItemAdded(_)));
+        assert!(matches!(&emissions[1], StreamEmission::ReasoningSummaryPartAdded));
+        assert!(matches!(&emissions[2], StreamEmission::ReasoningTextDelta(d) if d == "thinking"));
+    }
+
+    #[test]
+    fn test_refusal_delta_emitted() {
+        let mut state = StreamState::default();
+        let chunk = ChatCompletionChunk {
+            id: "c1".to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                    refusal: Some("I cannot help".to_string()),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let emissions = state.apply_chunk(&chunk);
+        assert_eq!(emissions.len(), 1);
+        assert!(matches!(&emissions[0], StreamEmission::RefusalDelta(t) if t == "I cannot help"));
+        assert_eq!(state.refusal_text, "I cannot help");
+    }
+
+    #[test]
+    fn test_finish_reason_captured() {
+        let mut state = StreamState::default();
+        let chunk = ChatCompletionChunk {
+            id: "c1".to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    content: Some("hi".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    refusal: None,
+                },
+                finish_reason: Some("length".to_string()),
+            }],
+            usage: None,
+        };
+        state.apply_chunk(&chunk);
+        let registry = simple_registry(vec![]);
+        let finalized = state.finalize(&registry).unwrap();
+        assert_eq!(finalized.finish_reason, Some("length".to_string()));
     }
 }

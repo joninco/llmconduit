@@ -17,7 +17,7 @@ use crate::models::responses::FailedPayload;
 use crate::models::responses::FailedResponse;
 use crate::models::responses::OutputItemPayload;
 use crate::models::responses::ReasoningDeltaPayload;
-use crate::models::responses::ResponseCompleted;
+use crate::models::responses::ResponseResource;
 use crate::models::responses::ResponseCompletedPayload;
 use crate::models::responses::ResponseInputTokensDetails;
 use crate::models::responses::ResponseOutputTokensDetails;
@@ -402,6 +402,8 @@ impl Gateway {
         let mut accumulated_usage = AccumulatedUsage::default();
         let mut upstream_request_index = 0usize;
         let mut web_search_rounds = 0usize;
+        #[allow(unused_assignments)]
+        let mut last_finish_reason: Option<String> = None;
         loop {
             upstream_request_index += 1;
             let taken_messages = std::mem::take(&mut current_messages);
@@ -418,6 +420,8 @@ impl Gateway {
                 temperature: request.temperature,
                 top_p: request.top_p,
                 max_output_tokens: request.max_output_tokens,
+                frequency_penalty: request.frequency_penalty,
+                presence_penalty: request.presence_penalty,
                 extra_body: self
                     .config
                     .upstream_chat_kwargs
@@ -571,6 +575,31 @@ impl Gateway {
                                     )
                                 })?;
                         }
+                        StreamEmission::ContentPartAdded => {
+                            tx.send(content_part_added_event())
+                                .await
+                                .map_err(|_| AppError::internal("failed to send content_part.added"))?;
+                        }
+                        StreamEmission::ContentPartDone { text } => {
+                            tx.send(content_part_done_event(text))
+                                .await
+                                .map_err(|_| AppError::internal("failed to send content_part.done"))?;
+                        }
+                        StreamEmission::ReasoningSummaryPartAdded => {
+                            tx.send(reasoning_summary_part_added_event())
+                                .await
+                                .map_err(|_| AppError::internal("failed to send reasoning_summary_part.added"))?;
+                        }
+                        StreamEmission::ReasoningSummaryPartDone { text } => {
+                            tx.send(reasoning_summary_part_done_event(text))
+                                .await
+                                .map_err(|_| AppError::internal("failed to send reasoning_summary_part.done"))?;
+                        }
+                        StreamEmission::RefusalDelta(delta) => {
+                            tx.send(refusal_delta_event(delta))
+                                .await
+                                .map_err(|_| AppError::internal("failed to send refusal.delta"))?;
+                        }
                     }
                 }
             }
@@ -578,6 +607,7 @@ impl Gateway {
                 accumulated_usage.add(usage);
             }
             let finalized = state.finalize(&tool_registry)?;
+            last_finish_reason = finalized.finish_reason.clone();
             current_messages = upstream_request.messages;
             self.emit_completed_public_items(&response_id, &tx, &finalized, &mut public_history)
                 .await?;
@@ -612,6 +642,9 @@ impl Gateway {
             break;
         }
 
+        let model_name = request.model.clone();
+        let completed_output = public_history.clone();
+        let metadata = request.metadata.clone();
         if request.store {
             self.replay_store
                 .insert(ReplayRecord {
@@ -623,9 +656,37 @@ impl Gateway {
                 .await;
         }
 
-        tx.send(completed_event(&response_id, accumulated_usage.into_response_usage()))
-            .await
-            .map_err(|_| AppError::internal("failed to send response.completed"))?;
+        let usage = accumulated_usage.into_response_usage();
+        let is_incomplete = last_finish_reason.as_deref() == Some("length");
+        let resource = ResponseResource {
+            id: response_id.clone(),
+            object: "response".to_string(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            status: if is_incomplete { "incomplete".to_string() } else { "completed".to_string() },
+            output: completed_output,
+            model: model_name,
+            usage,
+            metadata,
+            incomplete_details: if is_incomplete {
+                Some(crate::models::responses::IncompleteDetails {
+                    reason: "max_output_tokens".to_string(),
+                })
+            } else {
+                None
+            },
+        };
+        if is_incomplete {
+            tx.send(incomplete_event(resource))
+                .await
+                .map_err(|_| AppError::internal("failed to send response.incomplete"))?;
+        } else {
+            tx.send(completed_event(resource))
+                .await
+                .map_err(|_| AppError::internal("failed to send response.completed"))?;
+        }
         self.monitor.emit(response_id, MonitorEventKind::Completed);
         Ok(())
     }
@@ -639,6 +700,21 @@ impl Gateway {
     ) -> AppResult<()> {
         if let Some(reasoning) = finalized.reasoning_item.clone() {
             public_history.push(reasoning.clone());
+            if finalized.reasoning_part_emitted
+                && let ResponseItem::Reasoning { ref content, .. } = reasoning
+            {
+                    let reasoning_text = content
+                        .as_ref()
+                        .and_then(|items| items.first())
+                        .map(|item| match item {
+                            crate::models::responses::ReasoningContentItem::ReasoningText { text }
+                            | crate::models::responses::ReasoningContentItem::Text { text } => text.clone(),
+                        })
+                        .unwrap_or_default();
+                    tx.send(reasoning_summary_part_done_event(reasoning_text))
+                        .await
+                        .map_err(|_| AppError::internal("failed to send reasoning_summary_part.done"))?;
+            }
             self.monitor.emit(
                 response_id.to_string(),
                 MonitorEventKind::ResponseItem {
@@ -664,9 +740,14 @@ impl Gateway {
                     .collect::<Vec<_>>()
                     .join("");
                 if !full_text.is_empty() {
-                    tx.send(output_text_done_event(full_text))
+                    tx.send(output_text_done_event(full_text.clone()))
                         .await
                         .map_err(|_| AppError::internal("failed to send output_text.done"))?;
+                    if finalized.content_part_emitted {
+                        tx.send(content_part_done_event(full_text))
+                            .await
+                            .map_err(|_| AppError::internal("failed to send content_part.done"))?;
+                    }
                 }
             }
             public_history.push(message.clone());
@@ -681,6 +762,11 @@ impl Gateway {
             tx.send(output_item_done_event(message))
                 .await
                 .map_err(|_| AppError::internal("failed to send message done"))?;
+        }
+        if !finalized.refusal_text.is_empty() {
+            tx.send(refusal_done_event(finalized.refusal_text.clone()))
+                .await
+                .map_err(|_| AppError::internal("failed to send refusal.done"))?;
         }
         Ok(())
     }
@@ -1153,17 +1239,106 @@ fn created_event(response_id: &str) -> SseEvent {
     )
 }
 
-fn completed_event(response_id: &str, usage: Option<ResponseUsage>) -> SseEvent {
+fn completed_event(response: ResponseResource) -> SseEvent {
     json_event(
         "response.completed",
         ResponsesEnvelope {
             kind: "response.completed".to_string(),
-            payload: ResponseCompletedPayload {
-                response: ResponseCompleted {
-                    id: response_id.to_string(),
-                    usage,
+            payload: ResponseCompletedPayload { response },
+        },
+    )
+}
+
+fn incomplete_event(response: ResponseResource) -> SseEvent {
+    json_event(
+        "response.incomplete",
+        ResponsesEnvelope {
+            kind: "response.incomplete".to_string(),
+            payload: ResponseCompletedPayload { response },
+        },
+    )
+}
+
+fn content_part_added_event() -> SseEvent {
+    json_event(
+        "response.content_part.added",
+        ResponsesEnvelope {
+            kind: "response.content_part.added".to_string(),
+            payload: crate::models::responses::ContentPartPayload {
+                content_index: 0,
+                part: crate::models::responses::ContentPartRef {
+                    kind: "output_text".to_string(),
+                    text: String::new(),
                 },
             },
+        },
+    )
+}
+
+fn content_part_done_event(text: String) -> SseEvent {
+    json_event(
+        "response.content_part.done",
+        ResponsesEnvelope {
+            kind: "response.content_part.done".to_string(),
+            payload: crate::models::responses::ContentPartPayload {
+                content_index: 0,
+                part: crate::models::responses::ContentPartRef {
+                    kind: "output_text".to_string(),
+                    text,
+                },
+            },
+        },
+    )
+}
+
+fn reasoning_summary_part_added_event() -> SseEvent {
+    json_event(
+        "response.reasoning_summary_part.added",
+        ResponsesEnvelope {
+            kind: "response.reasoning_summary_part.added".to_string(),
+            payload: crate::models::responses::ReasoningSummaryPartPayload {
+                content_index: 0,
+                part: crate::models::responses::ReasoningSummaryPartRef {
+                    kind: "summary_text".to_string(),
+                    text: String::new(),
+                },
+            },
+        },
+    )
+}
+
+fn reasoning_summary_part_done_event(text: String) -> SseEvent {
+    json_event(
+        "response.reasoning_summary_part.done",
+        ResponsesEnvelope {
+            kind: "response.reasoning_summary_part.done".to_string(),
+            payload: crate::models::responses::ReasoningSummaryPartPayload {
+                content_index: 0,
+                part: crate::models::responses::ReasoningSummaryPartRef {
+                    kind: "summary_text".to_string(),
+                    text,
+                },
+            },
+        },
+    )
+}
+
+fn refusal_delta_event(delta: String) -> SseEvent {
+    json_event(
+        "response.refusal.delta",
+        ResponsesEnvelope {
+            kind: "response.refusal.delta".to_string(),
+            payload: crate::models::responses::RefusalDeltaPayload { delta },
+        },
+    )
+}
+
+fn refusal_done_event(refusal: String) -> SseEvent {
+    json_event(
+        "response.refusal.done",
+        ResponsesEnvelope {
+            kind: "response.refusal.done".to_string(),
+            payload: crate::models::responses::RefusalDonePayload { refusal },
         },
     )
 }

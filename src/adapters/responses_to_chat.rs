@@ -55,6 +55,8 @@ pub struct LoweredTurn {
     pub tool_registry: ToolRegistry,
     pub response_format: Option<Value>,
     pub reasoning_effort: Option<String>,
+    pub frequency_penalty: Option<f64>,
+    pub presence_penalty: Option<f64>,
 }
 
 pub fn lower_request(
@@ -274,6 +276,8 @@ pub fn lower_request(
         tool_registry: registry,
         response_format,
         reasoning_effort,
+        frequency_penalty: request.frequency_penalty,
+        presence_penalty: request.presence_penalty,
     })
 }
 
@@ -795,6 +799,10 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            truncation: None,
+            metadata: None,
         }
     }
 

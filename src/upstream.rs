@@ -331,6 +331,8 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             extra_body: BTreeMap::new(),
         };
 
@@ -362,6 +364,8 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             extra_body: BTreeMap::new(),
         };
 
@@ -391,6 +395,8 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             extra_body: BTreeMap::new(),
         };
 
@@ -429,6 +435,8 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             extra_body: BTreeMap::new(),
         };
 
@@ -469,6 +477,8 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             extra_body: BTreeMap::new(),
         };
 
@@ -551,6 +561,8 @@ mod tests {
             temperature: None,
             top_p: None,
             max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
             extra_body: BTreeMap::new(),
         }, true);
 

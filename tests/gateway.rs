@@ -130,6 +130,10 @@ async fn streams_function_call_turn() {
         temperature: None,
         top_p: None,
         max_output_tokens: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        truncation: None,
+        metadata: None,
     };
 
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream"));
@@ -201,6 +205,10 @@ async fn flattens_namespace_tools_for_upstream_and_preserves_namespace_in_output
         temperature: None,
         top_p: None,
         max_output_tokens: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        truncation: None,
+        metadata: None,
     };
 
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
@@ -450,8 +458,10 @@ async fn hides_web_search_loop_but_replays_internal_tool_result() {
             "response.output_item.added",
             "response.output_item.done",
             "response.output_item.added",
+            "response.content_part.added",
             "response.output_text.delta",
             "response.output_text.done",
+            "response.content_part.done",
             "response.output_item.done",
             "response.completed",
         ]
@@ -530,8 +540,10 @@ async fn degrades_gracefully_when_web_search_replay_baseline_is_missing() {
             "response.created",
             "response.in_progress",
             "response.output_item.added",
+            "response.content_part.added",
             "response.output_text.delta",
             "response.output_text.done",
+            "response.content_part.done",
             "response.output_item.done",
             "response.completed",
         ]
@@ -1453,6 +1465,10 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
         temperature: None,
         top_p: None,
         max_output_tokens: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        truncation: None,
+        metadata: None,
     };
 
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
@@ -1557,6 +1573,10 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
         temperature: None,
         top_p: None,
         max_output_tokens: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        truncation: None,
+        metadata: None,
     };
 
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
@@ -1638,6 +1658,10 @@ fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
         temperature: None,
         top_p: None,
         max_output_tokens: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        truncation: None,
+        metadata: None,
     }
 }
 
@@ -1661,6 +1685,7 @@ fn content_chunk(id: &str, content: &str) -> ChatCompletionChunk {
                 content: Some(content.to_string()),
                 reasoning_content: None,
                 tool_calls: None,
+                refusal: None,
             },
             finish_reason: None,
         }],
@@ -1677,6 +1702,7 @@ fn reasoning_chunk(id: &str, reasoning: &str) -> ChatCompletionChunk {
                 content: None,
                 reasoning_content: Some(reasoning.to_string()),
                 tool_calls: None,
+                refusal: None,
             },
             finish_reason: None,
         }],
@@ -1701,6 +1727,7 @@ fn tool_call_chunk(id: &str, call_id: &str, name: &str, arguments: &str) -> Chat
                         arguments: Some(serde_json::Value::String(arguments.to_string())),
                     },
                 }]),
+                refusal: None,
             },
             finish_reason: Some("tool_calls".to_string()),
         }],
