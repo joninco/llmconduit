@@ -234,11 +234,7 @@ pub fn lower_request(
                     tool_calls: None,
                 });
             }
-            ResponseItem::ImageGenerationCall { .. } => {
-                return Err(AppError::bad_request(
-                    "image_generation history is not supported in v1",
-                ));
-            }
+            ResponseItem::ImageGenerationCall { .. } => {}
         }
     }
     if let Some(reasoning) = pending_reasoning.take() {
@@ -333,15 +329,8 @@ fn validate_request(request: &ResponsesRequest) -> AppResult<()> {
             "previous_response_id is not supported in v1",
         ));
     }
-    if request
-        .tools
-        .iter()
-        .any(|tool| matches!(tool, ToolSpec::ImageGeneration { .. }))
-    {
-        return Err(AppError::bad_request(
-            "image_generation is not supported in v1",
-        ));
-    }
+    // ImageGeneration tools are silently stripped (not sent to upstream).
+    // Client-side MCP servers handle image generation via function tools.
     // Validate tool_choice
     match &request.tool_choice {
         Value::String(s) => match s.as_str() {
@@ -862,12 +851,12 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_image_generation_tool() {
+    fn validate_accepts_image_generation_tool() {
         let mut req = base_test_request();
         req.tools = vec![ToolSpec::ImageGeneration {
             output_format: None,
         }];
-        assert!(validate_request(&req).is_err());
+        assert!(validate_request(&req).is_ok());
     }
 
     #[test]
