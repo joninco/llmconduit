@@ -246,6 +246,8 @@ async fn uses_configured_upstream_model_override() {
             brave_api_key: None,
             brave_max_results: 5,
             request_timeout: std::time::Duration::from_secs(30),
+            max_web_search_rounds: 5,
+            flatten_content: true,
         },
     );
 
@@ -377,6 +379,8 @@ async fn forwards_configured_upstream_chat_kwargs() {
             brave_api_key: None,
             brave_max_results: 5,
             request_timeout: std::time::Duration::from_secs(30),
+            max_web_search_rounds: 5,
+            flatten_content: true,
         },
     );
 
@@ -575,6 +579,8 @@ async fn proxies_models_endpoint_with_etag() {
         brave_api_key: None,
         brave_max_results: 5,
         request_timeout: std::time::Duration::from_secs(30),
+        max_web_search_rounds: 5,
+        flatten_content: true,
     };
     let app = resp2chat::build_app(config);
     let response = app
@@ -620,6 +626,8 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         brave_api_key: None,
         brave_max_results: 5,
         request_timeout: std::time::Duration::from_secs(30),
+        max_web_search_rounds: 5,
+        flatten_content: true,
     };
     let app = resp2chat::build_app(config);
     let response = app
@@ -1577,6 +1585,8 @@ fn test_gateway(upstream: MockUpstream, search: MockSearch) -> Arc<Gateway> {
             brave_api_key: Some("test-key".to_string()),
             brave_max_results: 5,
             request_timeout: std::time::Duration::from_secs(30),
+            max_web_search_rounds: 5,
+            flatten_content: true,
         },
     )
 }

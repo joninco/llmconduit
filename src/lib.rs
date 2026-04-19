@@ -37,6 +37,7 @@ pub fn build_app_with_gateway(config: Config) -> (axum::Router, Arc<Gateway>) {
         config.upstream_base_url.clone(),
         config.upstream_api_key.clone(),
         config.upstream_request_log_path.clone(),
+        config.flatten_content,
     ));
     let search = Arc::new(BraveSearchClient::new(http_client, config.clone()));
     let gateway = Arc::new(Gateway::new(

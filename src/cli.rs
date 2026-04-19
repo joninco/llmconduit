@@ -170,6 +170,8 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         brave_api_key: (!brave_api_key.trim().is_empty()).then_some(brave_api_key),
         brave_max_results,
         request_timeout_secs,
+        max_web_search_rounds: PersistedConfig::default().max_web_search_rounds,
+        flatten_content: PersistedConfig::default().flatten_content,
     };
 
     let should_write = Confirm::with_theme(&theme)

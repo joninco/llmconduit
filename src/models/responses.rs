@@ -18,7 +18,7 @@ pub struct ResponsesRequest {
     pub parallel_tool_calls: bool,
     #[serde(default)]
     pub reasoning: Option<ReasoningRequest>,
-    #[serde(default)]
+    #[serde(default = "default_store_true")]
     pub store: bool,
     #[serde(default)]
     pub stream: bool,
@@ -44,6 +44,10 @@ pub struct ResponsesRequest {
 
 fn default_tool_choice() -> Value {
     Value::String("auto".to_string())
+}
+
+fn default_store_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -434,6 +438,20 @@ mod tests {
         let json = serde_json::to_string(&item).unwrap();
         let roundtripped: ResponseItem = serde_json::from_str(&json).unwrap();
         assert_eq!(item, roundtripped);
+    }
+
+    #[test]
+    fn test_store_defaults_to_true() {
+        let json = r#"{"model":"gpt-4","input":[]}"#;
+        let req: ResponsesRequest = serde_json::from_str(json).unwrap();
+        assert!(req.store, "store should default to true");
+    }
+
+    #[test]
+    fn test_store_explicit_false() {
+        let json = r#"{"model":"gpt-4","input":[],"store":false}"#;
+        let req: ResponsesRequest = serde_json::from_str(json).unwrap();
+        assert!(!req.store, "store should be false when explicitly set");
     }
 
     #[test]

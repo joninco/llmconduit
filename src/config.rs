@@ -22,6 +22,8 @@ pub struct Config {
     pub brave_api_key: Option<String>,
     pub brave_max_results: usize,
     pub request_timeout: Duration,
+    pub max_web_search_rounds: usize,
+    pub flatten_content: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -41,6 +43,18 @@ pub struct PersistedConfig {
     pub brave_api_key: Option<String>,
     pub brave_max_results: usize,
     pub request_timeout_secs: u64,
+    #[serde(default = "default_max_web_search_rounds")]
+    pub max_web_search_rounds: usize,
+    #[serde(default = "default_flatten_content")]
+    pub flatten_content: bool,
+}
+
+fn default_max_web_search_rounds() -> usize {
+    5
+}
+
+fn default_flatten_content() -> bool {
+    true
 }
 
 impl Default for PersistedConfig {
@@ -56,6 +70,8 @@ impl Default for PersistedConfig {
             brave_api_key: None,
             brave_max_results: 5,
             request_timeout_secs: 60,
+            max_web_search_rounds: 5,
+            flatten_content: true,
         }
     }
 }
@@ -108,6 +124,8 @@ impl Config {
                 .filter(|value| !value.is_empty()),
             brave_max_results: config.brave_max_results,
             request_timeout: Duration::from_secs(config.request_timeout_secs),
+            max_web_search_rounds: config.max_web_search_rounds,
+            flatten_content: config.flatten_content,
         })
     }
 }
@@ -200,6 +218,16 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
         && let Ok(parsed) = value.parse()
     {
         config.request_timeout_secs = parsed;
+    }
+    if let Ok(value) = env::var("RESP2CHAT_MAX_WEB_SEARCH_ROUNDS")
+        && let Ok(parsed) = value.parse()
+    {
+        config.max_web_search_rounds = parsed;
+    }
+    if let Ok(value) = env::var("RESP2CHAT_FLATTEN_CONTENT")
+        && let Ok(parsed) = value.parse()
+    {
+        config.flatten_content = parsed;
     }
 }
 
@@ -295,6 +323,8 @@ mod tests {
             brave_api_key: Some("secret".to_string()),
             brave_max_results: 7,
             request_timeout_secs: 45,
+            max_web_search_rounds: 10,
+            flatten_content: false,
         };
         write_persisted_config(&path, &config).expect("write config");
         let loaded = load_persisted_config(&path).expect("load config");

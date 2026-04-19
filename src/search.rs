@@ -172,6 +172,8 @@ mod tests {
                 brave_api_key: Some("secret".to_string()),
                 brave_max_results: 5,
                 request_timeout: std::time::Duration::from_secs(30),
+                max_web_search_rounds: 5,
+                flatten_content: true,
             },
         );
 
@@ -200,6 +202,8 @@ mod tests {
                 brave_api_key: Some("secret".to_string()),
                 brave_max_results: 5,
                 request_timeout: std::time::Duration::from_secs(30),
+                max_web_search_rounds: 5,
+                flatten_content: true,
             },
         );
 

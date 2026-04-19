@@ -27,6 +27,7 @@ use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponseStub;
 use crate::models::responses::ResponsesEnvelope;
 use crate::models::responses::ResponsesRequest;
+use crate::models::responses::WebSearchAction;
 use crate::monitor::MonitorEventKind;
 use crate::monitor::MonitorHub;
 use crate::replay::ReplayRecord;
@@ -141,6 +142,9 @@ impl Gateway {
         &self,
         request: &ResponsesRequest,
     ) -> AppResult<(Option<ReplayRecord>, usize)> {
+        if !request.store {
+            return Ok((None, 0));
+        }
         let record = self
             .replay_store
             .longest_prefix_match(&request.model, &request.instructions, &request.input)
@@ -397,6 +401,7 @@ impl Gateway {
 
         let mut accumulated_usage = AccumulatedUsage::default();
         let mut upstream_request_index = 0usize;
+        let mut web_search_rounds = 0usize;
         loop {
             upstream_request_index += 1;
             let taken_messages = std::mem::take(&mut current_messages);
@@ -596,19 +601,27 @@ impl Gateway {
                     .iter()
                     .all(|call| matches!(call.kind, ToolKind::WebSearch))
             {
+                web_search_rounds += 1;
+                if self.config.max_web_search_rounds > 0
+                    && web_search_rounds >= self.config.max_web_search_rounds
+                {
+                    return Err(AppError::upstream("web search round limit exceeded"));
+                }
                 continue;
             }
             break;
         }
 
-        self.replay_store
-            .insert(ReplayRecord {
-                model: request.model,
-                instructions: request.instructions,
-                visible_history: public_history,
-                internal_messages: current_messages,
-            })
-            .await;
+        if request.store {
+            self.replay_store
+                .insert(ReplayRecord {
+                    model: request.model,
+                    instructions: request.instructions,
+                    visible_history: public_history,
+                    internal_messages: current_messages,
+                })
+                .await;
+        }
 
         tx.send(completed_event(&response_id, accumulated_usage.into_response_usage()))
             .await
@@ -783,11 +796,7 @@ impl Gateway {
             .await
             .map_err(|_| AppError::internal("failed to send web_search start"))?;
 
-        let query = tool_call
-            .arguments
-            .get("query")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::upstream("web_search call missing query"))?;
+        let query = extract_web_search_query(action, &tool_call.arguments)?;
         self.monitor.emit(
             response_id.to_string(),
             MonitorEventKind::ToolPhase {
@@ -795,7 +804,7 @@ impl Gateway {
                 detail: format!("web_search {query}"),
             },
         );
-        let results = self.search.search(query).await?;
+        let results = self.search.search(&query).await?;
 
         let completed = ResponseItem::WebSearchCall {
             id: id.clone(),
@@ -1016,6 +1025,77 @@ mod tests {
         assert!(usage.into_response_usage().is_none());
     }
 
+    use super::extract_web_search_query;
+    use crate::models::responses::WebSearchAction;
+
+    #[test]
+    fn test_run_web_search_rejects_open_page() {
+        let action = Some(WebSearchAction::OpenPage {
+            url: Some("https://example.com".to_string()),
+        });
+        let args = json!({"query": "test"});
+        let result = extract_web_search_query(&action, &args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsupported web_search action"));
+    }
+
+    #[test]
+    fn test_run_web_search_rejects_find_in_page() {
+        let action = Some(WebSearchAction::FindInPage {
+            url: Some("https://example.com".to_string()),
+            pattern: Some("test".to_string()),
+        });
+        let args = json!({"query": "test"});
+        let result = extract_web_search_query(&action, &args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsupported web_search action"));
+    }
+
+    #[test]
+    fn test_run_web_search_rejects_other_action() {
+        let action = Some(WebSearchAction::Other);
+        let args = json!({"query": "test"});
+        let result = extract_web_search_query(&action, &args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsupported web_search action"));
+    }
+
+    #[test]
+    fn test_extract_web_search_query_from_action() {
+        let action = Some(WebSearchAction::Search {
+            query: Some("rust async".to_string()),
+            queries: None,
+        });
+        let args = json!({});
+        let result = extract_web_search_query(&action, &args).unwrap();
+        assert_eq!(result, "rust async");
+    }
+
+    #[test]
+    fn test_extract_web_search_query_fallback_to_arguments() {
+        let action = None;
+        let args = json!({"query": "fallback query"});
+        let result = extract_web_search_query(&action, &args).unwrap();
+        assert_eq!(result, "fallback query");
+    }
+
+    #[test]
+    fn test_extract_web_search_query_search_action_none_query_falls_back() {
+        let action = Some(WebSearchAction::Search {
+            query: None,
+            queries: None,
+        });
+        let args = json!({"query": "from args"});
+        let result = extract_web_search_query(&action, &args).unwrap();
+        assert_eq!(result, "from args");
+    }
+
+    #[test]
+    fn test_max_web_search_rounds_default() {
+        let config = crate::config::Config::from_persisted(&crate::config::PersistedConfig::default()).unwrap();
+        assert_eq!(config.max_web_search_rounds, 5);
+    }
+
     #[test]
     fn failure_event_shape() {
         let error = crate::error::AppError::internal("test error");
@@ -1027,6 +1107,35 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("test error"));
+    }
+}
+
+fn extract_web_search_query(
+    action: &Option<WebSearchAction>,
+    arguments: &Value,
+) -> AppResult<String> {
+    match action {
+        Some(WebSearchAction::Search { query, .. }) => {
+            if let Some(q) = query {
+                Ok(q.clone())
+            } else {
+                arguments
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| AppError::upstream("web_search call missing query"))
+            }
+        }
+        Some(WebSearchAction::OpenPage { .. })
+        | Some(WebSearchAction::FindInPage { .. })
+        | Some(WebSearchAction::Other) => {
+            Err(AppError::upstream("unsupported web_search action"))
+        }
+        None => arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| AppError::upstream("web_search call missing query")),
     }
 }
 

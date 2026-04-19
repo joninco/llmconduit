@@ -35,6 +35,7 @@ pub struct ReqwestUpstreamClient {
     base_url: Url,
     api_key: Option<String>,
     request_logger: Option<UpstreamRequestLogger>,
+    flatten_content: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -77,12 +78,14 @@ impl ReqwestUpstreamClient {
         base_url: Url,
         api_key: Option<String>,
         request_log_path: Option<PathBuf>,
+        flatten_content: bool,
     ) -> Self {
         Self {
             client,
             base_url,
             api_key,
             request_logger: request_log_path.map(UpstreamRequestLogger::new),
+            flatten_content,
         }
     }
 
@@ -111,7 +114,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         request: &ChatCompletionRequest,
     ) -> AppResult<UpstreamStream> {
         let url = self.endpoint_url("chat/completions")?;
-        let request = sanitize_chat_request(request.clone());
+        let request = sanitize_chat_request(request.clone(), self.flatten_content);
         if let Some(ref logger) = self.request_logger
             && let Err(err) = logger.log(&request).await
         {
@@ -155,7 +158,7 @@ async fn ensure_success(
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         return Err(AppError::upstream(format!(
-            "upstream chat failed with {status}: {body}"
+            "upstream chat failed with {status}: {}", truncate_for_error(&body, 500)
         )));
     }
     let stream = response
@@ -168,7 +171,7 @@ async fn ensure_success(
                     serde_json::from_str::<ChatCompletionChunk>(&event.data).map_err(|err| {
                         AppError::upstream(format!(
                             "failed to parse upstream chat chunk: {err}; payload={}",
-                            event.data
+                            truncate_for_error(&event.data, 500)
                         ))
                     }),
                 ),
@@ -196,7 +199,10 @@ pub async fn collect_models_response(
     Ok((status, body, etag))
 }
 
-fn sanitize_chat_request(mut request: ChatCompletionRequest) -> ChatCompletionRequest {
+fn sanitize_chat_request(
+    mut request: ChatCompletionRequest,
+    flatten_content: bool,
+) -> ChatCompletionRequest {
     if request.tools.as_ref().is_none_or(Vec::is_empty)
         && request.tool_choice.as_ref().is_none_or(|v| v == "auto")
     {
@@ -204,7 +210,7 @@ fn sanitize_chat_request(mut request: ChatCompletionRequest) -> ChatCompletionRe
     }
     for message in &mut request.messages {
         if let Some(content) = message.content.take() {
-            message.content = sanitize_message_content(content);
+            message.content = sanitize_message_content(content, flatten_content);
         }
         if let Some(tool_calls) = message.tool_calls.as_mut() {
             for tool_call in tool_calls {
@@ -217,11 +223,17 @@ fn sanitize_chat_request(mut request: ChatCompletionRequest) -> ChatCompletionRe
     request
 }
 
-fn sanitize_message_content(content: Value) -> Option<Value> {
+fn sanitize_message_content(content: Value, flatten_content: bool) -> Option<Value> {
     match content {
         Value::Null => None,
         Value::String(text) => Some(Value::String(text)),
-        Value::Array(parts) => Some(Value::String(flatten_content_parts(&parts))),
+        Value::Array(parts) => {
+            if flatten_content {
+                Some(Value::String(flatten_content_parts(&parts)))
+            } else {
+                Some(Value::Array(parts))
+            }
+        }
         other => Some(stringify_json_value(other)),
     }
 }
@@ -236,6 +248,16 @@ fn flatten_content_parts(parts: &[Value]) -> String {
         }
     }
     text_parts.join("\n")
+}
+
+fn truncate_for_error(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    match s.char_indices().nth(max) {
+        Some((byte_idx, _)) => format!("{}...[truncated]", &s[..byte_idx]),
+        None => s.to_string(),
+    }
 }
 
 fn stringify_json_value(value: Value) -> Value {
@@ -259,6 +281,7 @@ mod tests {
             url::Url::parse("https://api.x.ai/v1").expect("url"),
             None,
             None,
+            true,
         );
 
         assert_eq!(
@@ -277,6 +300,7 @@ mod tests {
             url::Url::parse("https://api.x.ai/v1/").expect("url"),
             None,
             None,
+            true,
         );
 
         assert_eq!(
@@ -310,7 +334,7 @@ mod tests {
             extra_body: BTreeMap::new(),
         };
 
-        let sanitized = sanitize_chat_request(request);
+        let sanitized = sanitize_chat_request(request, true);
 
         assert_eq!(sanitized.reasoning_effort, Some("high".to_string()));
         assert_eq!(sanitized.tool_choice, None);
@@ -341,7 +365,7 @@ mod tests {
             extra_body: BTreeMap::new(),
         };
 
-        let sanitized = sanitize_chat_request(request);
+        let sanitized = sanitize_chat_request(request, true);
         assert_eq!(sanitized.tool_choice, None);
     }
 
@@ -370,13 +394,13 @@ mod tests {
             extra_body: BTreeMap::new(),
         };
 
-        let sanitized_none = sanitize_chat_request(make("none"));
+        let sanitized_none = sanitize_chat_request(make("none"), true);
         assert_eq!(
             sanitized_none.tool_choice,
             Some(Value::String("none".to_string()))
         );
 
-        let sanitized_required = sanitize_chat_request(make("required"));
+        let sanitized_required = sanitize_chat_request(make("required"), true);
         assert_eq!(
             sanitized_required.tool_choice,
             Some(Value::String("required".to_string()))
@@ -408,7 +432,7 @@ mod tests {
             extra_body: BTreeMap::new(),
         };
 
-        let sanitized = sanitize_chat_request(request);
+        let sanitized = sanitize_chat_request(request, true);
         assert_eq!(sanitized.reasoning_effort, Some("high".to_string()));
     }
 
@@ -448,7 +472,7 @@ mod tests {
             extra_body: BTreeMap::new(),
         };
 
-        let sanitized = sanitize_chat_request(request);
+        let sanitized = sanitize_chat_request(request, true);
 
         assert_eq!(
             sanitized.messages[0].content,
@@ -467,12 +491,12 @@ mod tests {
 
     #[test]
     fn sanitize_null_content() {
-        assert_eq!(super::sanitize_message_content(Value::Null), None);
+        assert_eq!(super::sanitize_message_content(Value::Null, true), None);
     }
 
     #[test]
     fn sanitize_non_string_content() {
-        let result = super::sanitize_message_content(Value::Bool(true));
+        let result = super::sanitize_message_content(Value::Bool(true), true);
         assert_eq!(result, Some(Value::String("true".to_string())));
     }
 
@@ -491,6 +515,7 @@ mod tests {
             url::Url::parse("https://api.example.com").expect("url"),
             None,
             None,
+            true,
         );
         let url = client.endpoint_url("chat/completions").expect("endpoint");
         assert_eq!(url.as_str(), "https://api.example.com/chat/completions");
@@ -527,7 +552,7 @@ mod tests {
             top_p: None,
             max_output_tokens: None,
             extra_body: BTreeMap::new(),
-        });
+        }, true);
 
         logger.log(&request).await.expect("write request log");
 
@@ -541,5 +566,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_truncate_short_body_unchanged() {
+        assert_eq!(super::truncate_for_error("hello", 500), "hello");
+    }
+
+    #[test]
+    fn test_truncate_long_body() {
+        let long = "x".repeat(1000);
+        let result = super::truncate_for_error(&long, 500);
+        assert!(result.ends_with("...[truncated]"));
+        assert_eq!(result.len(), 500 + "...[truncated]".len());
+    }
+
+    #[test]
+    fn test_truncate_unicode_safe() {
+        let base = "héllo wörld ";
+        let repeated: String = base.repeat(100);
+        let result = super::truncate_for_error(&repeated, 50);
+        assert!(result.ends_with("...[truncated]"));
+        // Verify truncation happened at a char boundary by checking it's valid UTF-8
+        assert_eq!(result, result.to_string());
+        let prefix = result.trim_end_matches("...[truncated]");
+        assert_eq!(prefix.chars().count(), 50);
+    }
+
+    #[test]
+    fn test_truncate_exact_boundary() {
+        let exact = "a".repeat(500);
+        assert_eq!(super::truncate_for_error(&exact, 500), exact);
+    }
+
+    #[test]
+    fn test_sanitize_preserves_array_when_flatten_disabled() {
+        let array = serde_json::json!([
+            { "type": "text", "text": "hello" },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,abc" } }
+        ]);
+        let result = super::sanitize_message_content(array.clone(), false);
+        assert_eq!(result, Some(array));
+    }
+
+    #[test]
+    fn test_sanitize_flattens_array_when_flatten_enabled() {
+        let array = serde_json::json!([
+            { "type": "text", "text": "hello" },
+            { "type": "text", "text": "world" }
+        ]);
+        let result = super::sanitize_message_content(array, true);
+        assert_eq!(result, Some(Value::String("hello\nworld".to_string())));
+    }
+
+    #[test]
+    fn test_sanitize_non_array_unchanged_regardless() {
+        let text = Value::String("hello".to_string());
+        assert_eq!(
+            super::sanitize_message_content(text.clone(), true),
+            Some(text.clone())
+        );
+        assert_eq!(
+            super::sanitize_message_content(text.clone(), false),
+            Some(text)
+        );
     }
 }
