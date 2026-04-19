@@ -40,6 +40,18 @@ pub enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Diff consecutive upstream request log entries and highlight unstable prefixes.
+    AnalyzeLog {
+        /// Path to the config file. Defaults to ~/.config/resp2chat/config.yaml
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Path to the JSONL request log. Defaults to upstream_request_log_path from config.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Maximum number of consecutive pairs to report.
+        #[arg(long, default_value_t = 10)]
+        pairs: usize,
+    },
 }
 
 pub fn resolve_config_path(path: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -96,6 +108,17 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         .default(existing.upstream_model.clone().unwrap_or_default())
         .interact_text()
         .map_err(|err| format!("failed to read upstream model override: {err}"))?;
+    let upstream_request_log_path = Input::with_theme(&theme)
+        .with_prompt("Upstream request JSONL log path (leave blank to disable)")
+        .allow_empty(true)
+        .default(
+            existing
+                .upstream_request_log_path
+                .clone()
+                .unwrap_or_default(),
+        )
+        .interact_text()
+        .map_err(|err| format!("failed to read upstream request log path: {err}"))?;
     let upstream_chat_kwargs = Input::with_theme(&theme)
         .with_prompt("Extra upstream chat kwargs as JSON object (leave blank for none)")
         .allow_empty(true)
@@ -140,6 +163,8 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         upstream_base_url,
         upstream_api_key,
         upstream_model: (!upstream_model.trim().is_empty()).then_some(upstream_model),
+        upstream_request_log_path: (!upstream_request_log_path.trim().is_empty())
+            .then_some(upstream_request_log_path),
         upstream_chat_kwargs,
         brave_base_url,
         brave_api_key: (!brave_api_key.trim().is_empty()).then_some(brave_api_key),

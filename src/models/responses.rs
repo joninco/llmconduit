@@ -13,7 +13,7 @@ pub struct ResponsesRequest {
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
     #[serde(default = "default_tool_choice")]
-    pub tool_choice: String,
+    pub tool_choice: Value,
     #[serde(default)]
     pub parallel_tool_calls: bool,
     #[serde(default)]
@@ -34,10 +34,16 @@ pub struct ResponsesRequest {
     pub client_metadata: Option<HashMap<String, String>>,
     #[serde(default)]
     pub previous_response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i64>,
 }
 
-fn default_tool_choice() -> String {
-    "auto".to_string()
+fn default_tool_choice() -> Value {
+    Value::String("auto".to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,6 +55,11 @@ pub enum ToolSpec {
         #[serde(default)]
         strict: bool,
         parameters: Value,
+    },
+    Namespace {
+        name: String,
+        description: String,
+        tools: Vec<NamespaceToolSpec>,
     },
     ToolSearch {
         execution: String,
@@ -76,6 +87,18 @@ pub enum ToolSpec {
     ImageGeneration {
         #[serde(default)]
         output_format: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NamespaceToolSpec {
+    Function {
+        name: String,
+        description: String,
+        #[serde(default)]
+        strict: bool,
+        parameters: Value,
     },
 }
 
@@ -292,6 +315,29 @@ pub struct ResponseCompletedPayload {
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseCompleted {
     pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ResponseUsage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens_details: Option<ResponseInputTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens_details: Option<ResponseOutputTokensDetails>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseInputTokensDetails {
+    pub cached_tokens: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResponseOutputTokensDetails {
+    pub reasoning_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -326,6 +372,25 @@ pub struct FailedError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TextDonePayload {
+    pub text: String,
+    pub content_index: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionCallArgsDeltaPayload {
+    pub call_id: String,
+    pub delta: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionCallArgsDonePayload {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
 impl ResponseItem {
     pub fn message_text(role: impl Into<String>, text: impl Into<String>) -> Self {
         Self::Message {
@@ -334,5 +399,55 @@ impl ResponseItem {
             content: vec![ContentItem::OutputText { text: text.into() }],
             phase: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn response_item_message_serde_roundtrip() {
+        let item = ResponseItem::Message {
+            id: Some("msg_1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "hello".to_string(),
+            }],
+            phase: None,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let roundtripped: ResponseItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(item, roundtripped);
+    }
+
+    #[test]
+    fn response_item_function_call_serde_roundtrip() {
+        let item = ResponseItem::FunctionCall {
+            id: Some("fc_1".to_string()),
+            name: "calculator".to_string(),
+            namespace: Some("mcp__math".to_string()),
+            arguments: r#"{"expr":"1+1"}"#.to_string(),
+            call_id: "call_1".to_string(),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let roundtripped: ResponseItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(item, roundtripped);
+    }
+
+    #[test]
+    fn response_item_web_search_call_serde_roundtrip() {
+        let item = ResponseItem::WebSearchCall {
+            id: Some("ws_1".to_string()),
+            status: Some("completed".to_string()),
+            action: Some(WebSearchAction::Search {
+                query: Some("rust async".to_string()),
+                queries: None,
+            }),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let roundtripped: ResponseItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(item, roundtripped);
     }
 }

@@ -7,6 +7,7 @@ use crate::models::chat::ChatToolCall;
 use crate::models::chat::ChatToolDefinition;
 use crate::models::responses::ContentItem;
 use crate::models::responses::LocalShellAction;
+use crate::models::responses::NamespaceToolSpec;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponsesRequest;
 use crate::models::responses::ToolSpec;
@@ -17,8 +18,13 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolKind {
-    Function { public_name: String },
-    Custom { public_name: String },
+    Function {
+        public_name: String,
+        namespace: Option<String>,
+    },
+    Custom {
+        public_name: String,
+    },
     LocalShell,
     ToolSearch,
     WebSearch,
@@ -32,6 +38,13 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn get(&self, name: &str) -> Option<&ToolKind> {
         self.by_name.get(name)
+    }
+}
+
+#[cfg(test)]
+impl ToolRegistry {
+    pub fn from_map(by_name: HashMap<String, ToolKind>) -> Self {
+        Self { by_name }
     }
 }
 
@@ -67,13 +80,14 @@ pub fn lower_request(
         match item {
             ResponseItem::Message { role, content, .. } => {
                 let text = message_content_to_chat_value(content)?;
-                let reasoning_content = if role == "assistant" {
+                let normalized_role = normalize_chat_role(role);
+                let reasoning_content = if normalized_role == "assistant" {
                     pending_reasoning.take()
                 } else {
                     None
                 };
                 messages.push(ChatMessage {
-                    role: role.clone(),
+                    role: normalized_role,
                     content: Some(text),
                     tool_call_id: None,
                     name: None,
@@ -98,23 +112,25 @@ pub fn lower_request(
                 arguments,
                 call_id,
                 ..
-            } => messages.push(assistant_tool_call_message(
+            } => append_tool_call(
+                &mut messages,
                 call_id.clone(),
                 name.clone(),
                 parse_json_string(arguments)?,
                 pending_reasoning.take(),
-            )),
+            ),
             ResponseItem::CustomToolCall {
                 call_id,
                 name,
                 input,
                 ..
-            } => messages.push(assistant_tool_call_message(
+            } => append_tool_call(
+                &mut messages,
                 call_id.clone(),
                 name.clone(),
                 json!({ "input": input }),
                 pending_reasoning.take(),
-            )),
+            ),
             ResponseItem::ToolSearchCall {
                 call_id,
                 arguments,
@@ -126,14 +142,15 @@ pub fn lower_request(
                         "only tool_search calls with execution=client are supported",
                     ));
                 }
-                messages.push(assistant_tool_call_message(
+                append_tool_call(
+                    &mut messages,
                     call_id
                         .clone()
                         .unwrap_or_else(|| "tool_search_missing_call_id".to_string()),
                     "tool_search".to_string(),
                     arguments.clone(),
                     pending_reasoning.take(),
-                ));
+                );
             }
             ResponseItem::LocalShellCall {
                 call_id,
@@ -152,12 +169,13 @@ pub fn lower_request(
                         ))
                     })?,
                 };
-                messages.push(assistant_tool_call_message(
+                append_tool_call(
+                    &mut messages,
                     call_id,
                     "local_shell".to_string(),
                     arguments,
                     pending_reasoning.take(),
-                ));
+                );
             }
             ResponseItem::FunctionCallOutput { call_id, output }
             | ResponseItem::CustomToolCallOutput {
@@ -198,12 +216,13 @@ pub fn lower_request(
                 let call_id = id
                     .clone()
                     .unwrap_or_else(|| format!("web_search_missing_replay_{}", messages.len()));
-                messages.push(assistant_tool_call_message(
+                append_tool_call(
+                    &mut messages,
                     call_id.clone(),
                     "web_search".to_string(),
                     web_search_arguments(action),
                     pending_reasoning.take(),
-                ));
+                );
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: Some(Value::String(web_search_placeholder_result(action))),
@@ -230,6 +249,7 @@ pub fn lower_request(
             tool_calls: None,
         });
     }
+    hoist_system_messages(&mut messages);
     let response_format = request
         .text
         .as_ref()
@@ -257,6 +277,49 @@ pub fn lower_request(
     })
 }
 
+fn normalize_chat_role(role: &str) -> String {
+    match role {
+        "developer" => "system".to_string(),
+        _ => role.to_string(),
+    }
+}
+
+fn hoist_system_messages(messages: &mut Vec<ChatMessage>) {
+    // Find the end of the initial contiguous block of system messages.
+    let prefix_end = messages
+        .iter()
+        .position(|m| m.role != "system")
+        .unwrap_or(messages.len());
+    if prefix_end == 0 {
+        return;
+    }
+    let mut system_texts: Vec<String> = Vec::new();
+    for msg in &messages[..prefix_end] {
+        if let Some(content) = &msg.content {
+            let text = match content {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            if !text.is_empty() {
+                system_texts.push(text);
+            }
+        }
+    }
+    let rest: Vec<ChatMessage> = messages.drain(prefix_end..).collect();
+    messages.clear();
+    if !system_texts.is_empty() {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(Value::String(system_texts.join("\n\n"))),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            tool_calls: None,
+        });
+    }
+    messages.extend(rest);
+}
+
 fn validate_request(request: &ResponsesRequest) -> AppResult<()> {
     if !request.stream {
         return Err(AppError::bad_request("only stream=true is supported"));
@@ -264,11 +327,6 @@ fn validate_request(request: &ResponsesRequest) -> AppResult<()> {
     if request.previous_response_id.is_some() {
         return Err(AppError::bad_request(
             "previous_response_id is not supported in v1",
-        ));
-    }
-    if request.tool_choice != "auto" {
-        return Err(AppError::bad_request(
-            "only tool_choice=auto is supported in v1",
         ));
     }
     if request
@@ -280,20 +338,63 @@ fn validate_request(request: &ResponsesRequest) -> AppResult<()> {
             "image_generation is not supported in v1",
         ));
     }
+    // Validate tool_choice
+    match &request.tool_choice {
+        Value::String(s) => match s.as_str() {
+            "auto" | "none" => {}
+            "required" => {
+                if request.tools.is_empty() {
+                    return Err(AppError::bad_request(
+                        "tool_choice is \"required\" but no tools are provided",
+                    ));
+                }
+            }
+            other => {
+                return Err(AppError::bad_request(format!(
+                    "invalid tool_choice string: \"{other}\"; expected \"auto\", \"none\", or \"required\""
+                )));
+            }
+        },
+        Value::Object(map) => {
+            let valid = map.get("type").and_then(|v| v.as_str()) == Some("function")
+                && map
+                    .get("function")
+                    .and_then(|f| f.as_object())
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str())
+                    .map(|n| !n.is_empty())
+                    == Some(true);
+            if !valid {
+                return Err(AppError::bad_request(
+                    "invalid tool_choice object: expected {\"type\":\"function\",\"function\":{\"name\":\"<non-empty>\"}}",
+                ));
+            }
+            if request.tools.is_empty() {
+                return Err(AppError::bad_request(
+                    "tool_choice specifies a function but no tools are provided",
+                ));
+            }
+        }
+        _ => {
+            return Err(AppError::bad_request(
+                "invalid tool_choice: expected a string (\"auto\", \"none\", \"required\") or a function object",
+            ));
+        }
+    }
     Ok(())
 }
 
 fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
-    let mut tools = Vec::with_capacity(specs.len());
+    let mut tools = Vec::new();
     let mut seen_names = HashMap::new();
     for spec in specs {
-        let tool = match spec {
+        let lowered_tools = match spec {
             ToolSpec::Function {
                 name,
                 description,
                 strict,
                 parameters,
-            } => ChatTool {
+            } => vec![ChatTool {
                 kind: "function".to_string(),
                 function: ChatToolDefinition {
                     name: name.clone(),
@@ -301,12 +402,34 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
                     parameters: Some(parameters.clone()),
                     strict: *strict,
                 },
-            },
+            }],
+            ToolSpec::Namespace {
+                tools: namespace_tools,
+                ..
+            } => namespace_tools
+                .iter()
+                .map(|tool| match tool {
+                    NamespaceToolSpec::Function {
+                        name,
+                        description,
+                        strict,
+                        parameters,
+                    } => ChatTool {
+                        kind: "function".to_string(),
+                        function: ChatToolDefinition {
+                            name: name.clone(),
+                            description: description.clone(),
+                            parameters: Some(parameters.clone()),
+                            strict: *strict,
+                        },
+                    },
+                })
+                .collect(),
             ToolSpec::ToolSearch {
                 description,
                 parameters,
                 ..
-            } => ChatTool {
+            } => vec![ChatTool {
                 kind: "function".to_string(),
                 function: ChatToolDefinition {
                     name: "tool_search".to_string(),
@@ -314,8 +437,8 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
                     parameters: Some(parameters.clone()),
                     strict: false,
                 },
-            },
-            ToolSpec::LocalShell {} => ChatTool {
+            }],
+            ToolSpec::LocalShell {} => vec![ChatTool {
                 kind: "function".to_string(),
                 function: ChatToolDefinition {
                     name: "local_shell".to_string(),
@@ -339,8 +462,8 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
                     })),
                     strict: false,
                 },
-            },
-            ToolSpec::WebSearch { .. } => ChatTool {
+            }],
+            ToolSpec::WebSearch { .. } => vec![ChatTool {
                 kind: "function".to_string(),
                 function: ChatToolDefinition {
                     name: "web_search".to_string(),
@@ -354,12 +477,12 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
                     })),
                     strict: false,
                 },
-            },
+            }],
             ToolSpec::Custom {
                 name,
                 description,
                 format,
-            } => ChatTool {
+            } => vec![ChatTool {
                 kind: "function".to_string(),
                 function: ChatToolDefinition {
                     name: name.clone(),
@@ -376,16 +499,18 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
                     })),
                     strict: false,
                 },
-            },
-            ToolSpec::ImageGeneration { .. } => continue,
+            }],
+            ToolSpec::ImageGeneration { .. } => Vec::new(),
         };
-        let name = tool.function.name.clone();
-        if seen_names.insert(name.clone(), ()).is_some() {
-            return Err(AppError::bad_request(format!(
-                "duplicate tool name is not supported: {name}"
-            )));
+        for tool in lowered_tools {
+            let name = tool.function.name.clone();
+            if seen_names.insert(name.clone(), ()).is_some() {
+                return Err(AppError::bad_request(format!(
+                    "duplicate tool name is not supported: {name}"
+                )));
+            }
+            tools.push(tool);
         }
-        tools.push(tool);
     }
     Ok(tools)
 }
@@ -393,55 +518,108 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
 fn build_tool_registry(specs: &[ToolSpec]) -> AppResult<ToolRegistry> {
     let mut by_name = HashMap::new();
     for spec in specs {
-        let (name, kind) = match spec {
-            ToolSpec::Function { name, .. } => (
+        let lowered_kinds: Vec<(String, ToolKind)> = match spec {
+            ToolSpec::Function { name, .. } => vec![(
                 name.clone(),
                 ToolKind::Function {
                     public_name: name.clone(),
+                    namespace: None,
                 },
-            ),
-            ToolSpec::ToolSearch { .. } => ("tool_search".to_string(), ToolKind::ToolSearch),
-            ToolSpec::LocalShell {} => ("local_shell".to_string(), ToolKind::LocalShell),
-            ToolSpec::WebSearch { .. } => ("web_search".to_string(), ToolKind::WebSearch),
-            ToolSpec::Custom { name, .. } => (
+            )],
+            ToolSpec::Namespace {
+                name: namespace,
+                tools,
+                ..
+            } => tools
+                .iter()
+                .map(|tool| match tool {
+                    NamespaceToolSpec::Function { name, .. } => (
+                        name.clone(),
+                        ToolKind::Function {
+                            public_name: name.clone(),
+                            namespace: Some(namespace.clone()),
+                        },
+                    ),
+                })
+                .collect(),
+            ToolSpec::ToolSearch { .. } => {
+                vec![("tool_search".to_string(), ToolKind::ToolSearch)]
+            }
+            ToolSpec::LocalShell {} => vec![("local_shell".to_string(), ToolKind::LocalShell)],
+            ToolSpec::WebSearch { .. } => vec![("web_search".to_string(), ToolKind::WebSearch)],
+            ToolSpec::Custom { name, .. } => vec![(
                 name.clone(),
                 ToolKind::Custom {
                     public_name: name.clone(),
                 },
-            ),
-            ToolSpec::ImageGeneration { .. } => continue,
+            )],
+            ToolSpec::ImageGeneration { .. } => Vec::new(),
         };
-        if by_name.insert(name.clone(), kind).is_some() {
-            return Err(AppError::bad_request(format!(
-                "duplicate tool name is not supported: {name}"
-            )));
+        for (name, kind) in lowered_kinds {
+            if by_name.insert(name.clone(), kind).is_some() {
+                return Err(AppError::bad_request(format!(
+                    "duplicate tool name is not supported: {name}"
+                )));
+            }
         }
     }
     Ok(ToolRegistry { by_name })
 }
 
-fn assistant_tool_call_message(
+fn append_tool_call(
+    messages: &mut Vec<ChatMessage>,
     call_id: String,
     name: String,
     arguments: Value,
     reasoning_content: Option<String>,
-) -> ChatMessage {
-    ChatMessage {
-        role: "assistant".to_string(),
-        content: None,
-        tool_call_id: None,
-        name: None,
-        reasoning_content,
-        tool_calls: Some(vec![ChatToolCall {
+) {
+    if let Some(last) = messages.last_mut()
+        && last.role == "assistant"
+        && (last.tool_calls.is_some() || last.content.is_none())
+    {
+        let index = last
+            .tool_calls
+            .as_ref()
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let tool_call = ChatToolCall {
             id: Some(call_id),
-            index: Some(0),
+            index: Some(index),
             kind: "function".to_string(),
             function: ChatFunctionCall {
                 name: Some(name),
                 arguments: Some(arguments),
             },
-        }]),
+        };
+        if let Some(existing) = &mut last.tool_calls {
+            existing.push(tool_call);
+        } else {
+            last.tool_calls = Some(vec![tool_call]);
+        }
+        if let Some(rc) = reasoning_content
+            && last.reasoning_content.is_none()
+        {
+            last.reasoning_content = Some(rc);
+        }
+        return;
     }
+    let tool_call = ChatToolCall {
+        id: Some(call_id),
+        index: Some(0),
+        kind: "function".to_string(),
+        function: ChatFunctionCall {
+            name: Some(name),
+            arguments: Some(arguments),
+        },
+    };
+    messages.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: None,
+        tool_call_id: None,
+        name: None,
+        reasoning_content,
+        tool_calls: Some(vec![tool_call]),
+    });
 }
 
 fn parse_json_string(raw: &str) -> AppResult<Value> {
@@ -587,5 +765,463 @@ pub fn tool_call_arguments_object(arguments: &Option<Value>) -> Value {
         Some(Value::Object(map)) => Value::Object(map.clone()),
         Some(other) => other.clone(),
         None => Value::Object(Map::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::responses::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    fn base_test_request() -> ResponsesRequest {
+        ResponsesRequest {
+            model: "test".to_string(),
+            instructions: String::new(),
+            input: vec![],
+            tools: vec![],
+            tool_choice: serde_json::Value::String("auto".to_string()),
+            parallel_tool_calls: false,
+            reasoning: None,
+            store: false,
+            stream: true,
+            include: vec![],
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+            previous_response_id: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+        }
+    }
+
+    fn user_msg(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+        }
+    }
+
+    #[test]
+    fn validate_rejects_stream_false() {
+        let mut req = base_test_request();
+        req.stream = false;
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_previous_response_id() {
+        let mut req = base_test_request();
+        req.previous_response_id = Some("resp_123".to_string());
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_all_tool_choice_values() {
+        let req = base_test_request();
+        assert!(validate_request(&req).is_ok());
+
+        let mut req2 = base_test_request();
+        req2.tool_choice = serde_json::Value::String("required".to_string());
+        req2.tools = vec![ToolSpec::Function {
+            name: "f".to_string(),
+            description: "d".to_string(),
+            strict: false,
+            parameters: json!({}),
+        }];
+        assert!(validate_request(&req2).is_ok());
+
+        let mut req3 = base_test_request();
+        req3.tool_choice = serde_json::Value::String("none".to_string());
+        assert!(validate_request(&req3).is_ok());
+
+        let mut req4 = base_test_request();
+        req4.tool_choice = json!({"type": "function", "function": {"name": "echo"}});
+        req4.tools = vec![ToolSpec::Function {
+            name: "echo".to_string(),
+            description: "d".to_string(),
+            strict: false,
+            parameters: json!({}),
+        }];
+        assert!(validate_request(&req4).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_image_generation_tool() {
+        let mut req = base_test_request();
+        req.tools = vec![ToolSpec::ImageGeneration {
+            output_format: None,
+        }];
+        assert!(validate_request(&req).is_err());
+    }
+
+    #[test]
+    fn trailing_reasoning_flushed_as_message() {
+        let mut req = base_test_request();
+        req.input = vec![
+            user_msg("hello"),
+            ResponseItem::Reasoning {
+                id: "rsn_1".to_string(),
+                summary: vec![ReasoningSummaryItem::SummaryText {
+                    text: "thinking".to_string(),
+                }],
+                content: None,
+                encrypted_content: None,
+            },
+        ];
+        let result = lower_request(&req, vec![]).unwrap();
+        let last = result.messages.last().unwrap();
+        assert_eq!(last.role, "assistant");
+        assert!(last.reasoning_content.is_some());
+        assert!(last.content.is_none());
+    }
+
+    #[test]
+    fn duplicate_tool_name_rejected() {
+        let tools = vec![
+            ToolSpec::Function {
+                name: "echo".to_string(),
+                description: "a".to_string(),
+                strict: false,
+                parameters: json!({}),
+            },
+            ToolSpec::Function {
+                name: "echo".to_string(),
+                description: "b".to_string(),
+                strict: false,
+                parameters: json!({}),
+            },
+        ];
+        assert!(lower_tools(&tools).is_err());
+    }
+
+    #[test]
+    fn mixed_text_and_image_content() {
+        let content = vec![
+            ContentItem::InputText {
+                text: "hi".to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: "http://img.png".to_string(),
+            },
+        ];
+        let value = message_content_to_chat_value(&content).unwrap();
+        assert!(value.is_array());
+        let arr = value.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["type"], "text");
+        assert_eq!(arr[1]["type"], "image_url");
+    }
+
+    #[test]
+    fn single_input_image_wraps_as_array() {
+        let item = ContentItem::InputImage {
+            image_url: "http://img.png".to_string(),
+        };
+        let value = content_item_to_chat_value(&item).unwrap();
+        assert!(value.is_array());
+        assert_eq!(value[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn web_search_arguments_all_actions() {
+        let search = Some(WebSearchAction::Search {
+            query: Some("test".to_string()),
+            queries: None,
+        });
+        assert_eq!(web_search_arguments(&search), json!({"query": "test"}));
+
+        let open = Some(WebSearchAction::OpenPage {
+            url: Some("http://x.com".to_string()),
+        });
+        assert_eq!(web_search_arguments(&open), json!({"url": "http://x.com"}));
+
+        let find = Some(WebSearchAction::FindInPage {
+            url: Some("http://x.com".to_string()),
+            pattern: Some("foo".to_string()),
+        });
+        assert_eq!(
+            web_search_arguments(&find),
+            json!({"url": "http://x.com", "pattern": "foo"})
+        );
+
+        assert_eq!(web_search_arguments(&Some(WebSearchAction::Other)), json!({}));
+        assert_eq!(web_search_arguments(&None), json!({}));
+    }
+
+    #[test]
+    fn web_search_placeholder_result_all_actions() {
+        let search = Some(WebSearchAction::Search {
+            query: Some("test".to_string()),
+            queries: None,
+        });
+        assert!(web_search_placeholder_result(&search).contains("test"));
+
+        let open = Some(WebSearchAction::OpenPage {
+            url: Some("http://x.com".to_string()),
+        });
+        assert!(web_search_placeholder_result(&open).contains("http://x.com"));
+
+        let find = Some(WebSearchAction::FindInPage {
+            url: Some("http://x.com".to_string()),
+            pattern: Some("foo".to_string()),
+        });
+        let result = web_search_placeholder_result(&find);
+        assert!(result.contains("http://x.com"));
+        assert!(result.contains("foo"));
+
+        assert!(web_search_placeholder_result(&Some(WebSearchAction::Other))
+            .contains("replay state was missing"));
+        assert!(web_search_placeholder_result(&None).contains("replay state was missing"));
+    }
+
+    #[test]
+    fn tool_search_call_non_client_error() {
+        let mut req = base_test_request();
+        req.input = vec![
+            user_msg("hello"),
+            ResponseItem::ToolSearchCall {
+                call_id: Some("ts_1".to_string()),
+                status: None,
+                execution: "server".to_string(),
+                arguments: json!({}),
+            },
+        ];
+        let result = lower_request(&req, vec![]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("execution=client"));
+    }
+
+    #[test]
+    fn stringify_tool_output_non_string() {
+        assert_eq!(stringify_tool_output(&json!(42)), "42");
+        assert_eq!(stringify_tool_output(&json!(true)), "true");
+        assert_eq!(stringify_tool_output(&json!({"a": 1})), r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn tool_call_arguments_object_edge_cases() {
+        assert_eq!(tool_call_arguments_object(&None), json!({}));
+        assert_eq!(tool_call_arguments_object(&Some(json!("x"))), json!("x"));
+        assert_eq!(
+            tool_call_arguments_object(&Some(json!({"a": 1}))),
+            json!({"a": 1})
+        );
+    }
+
+    #[test]
+    fn hoist_system_messages_non_string_content() {
+        let mut messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(json!({"key": "value"})),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("hello")),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                tool_calls: None,
+            },
+        ];
+        hoist_system_messages(&mut messages);
+        assert_eq!(messages[0].role, "system");
+        let content = messages[0].content.as_ref().unwrap().as_str().unwrap();
+        assert!(content.contains("key"));
+        assert!(content.contains("value"));
+    }
+
+    #[test]
+    fn reasoning_item_text_variants() {
+        let summary = vec![ReasoningSummaryItem::SummaryText {
+            text: "summary".to_string(),
+        }];
+        let content = Some(vec![
+            ReasoningContentItem::ReasoningText {
+                text: "reasoning".to_string(),
+            },
+            ReasoningContentItem::Text {
+                text: "text".to_string(),
+            },
+        ]);
+        let result = reasoning_item_text(&summary, &content);
+        assert!(result.contains("summary"));
+        assert!(result.contains("reasoning"));
+        assert!(result.contains("text"));
+    }
+
+    // --- C1 tests ---
+
+    #[test]
+    fn test_validate_tool_choice_valid_strings() {
+        for val in &["auto", "none"] {
+            let mut req = base_test_request();
+            req.tool_choice = Value::String(val.to_string());
+            assert!(validate_request(&req).is_ok(), "expected {val} to pass");
+        }
+        let mut req = base_test_request();
+        req.tool_choice = Value::String("required".to_string());
+        req.tools = vec![ToolSpec::Function {
+            name: "f".to_string(),
+            description: "d".to_string(),
+            strict: false,
+            parameters: json!({}),
+        }];
+        assert!(validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn test_validate_tool_choice_valid_object() {
+        let mut req = base_test_request();
+        req.tool_choice = json!({"type": "function", "function": {"name": "foo"}});
+        req.tools = vec![ToolSpec::Function {
+            name: "foo".to_string(),
+            description: "d".to_string(),
+            strict: false,
+            parameters: json!({}),
+        }];
+        assert!(validate_request(&req).is_ok());
+    }
+
+    #[test]
+    fn test_validate_tool_choice_rejects_arbitrary_json() {
+        let mut req = base_test_request();
+        req.tool_choice = json!(42);
+        assert!(validate_request(&req).is_err());
+
+        let mut req2 = base_test_request();
+        req2.tool_choice = json!([1, 2, 3]);
+        assert!(validate_request(&req2).is_err());
+
+        let mut req3 = base_test_request();
+        req3.tool_choice = json!({"type": "unknown"});
+        assert!(validate_request(&req3).is_err());
+
+        let mut req4 = base_test_request();
+        req4.tool_choice = Value::String("bogus".to_string());
+        assert!(validate_request(&req4).is_err());
+    }
+
+    #[test]
+    fn test_validate_tool_choice_required_without_tools_rejected() {
+        let mut req = base_test_request();
+        req.tool_choice = Value::String("required".to_string());
+        req.tools = vec![];
+        assert!(validate_request(&req).is_err());
+    }
+
+    // --- M1+M4 tests ---
+
+    #[test]
+    fn test_append_tool_call_sequential_indices() {
+        let mut messages: Vec<ChatMessage> = vec![];
+        for i in 0..3 {
+            append_tool_call(
+                &mut messages,
+                format!("call_{i}"),
+                format!("fn_{i}"),
+                json!({}),
+                None,
+            );
+        }
+        assert_eq!(messages.len(), 1);
+        let calls = messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].index, Some(0));
+        assert_eq!(calls[1].index, Some(1));
+        assert_eq!(calls[2].index, Some(2));
+    }
+
+    #[test]
+    fn test_append_tool_call_no_merge_into_content_message() {
+        let mut messages = vec![ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(Value::String("some text".to_string())),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            tool_calls: None,
+        }];
+        append_tool_call(
+            &mut messages,
+            "call_1".to_string(),
+            "fn_1".to_string(),
+            json!({}),
+            None,
+        );
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].content,
+            Some(Value::String("some text".to_string()))
+        );
+        assert!(messages[0].tool_calls.is_none());
+        assert!(messages[1].tool_calls.is_some());
+        assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].index, Some(0));
+    }
+
+    // --- M2 test ---
+
+    #[test]
+    fn test_hoist_preserves_mid_conversation_system_messages() {
+        let mut messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(Value::String("top".to_string())),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::String("hello".to_string())),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(Value::String("mid".to_string())),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(Value::String("hi".to_string())),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                tool_calls: None,
+            },
+        ];
+        hoist_system_messages(&mut messages);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(
+            messages[0].content.as_ref().unwrap().as_str().unwrap(),
+            "top"
+        );
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[2].role, "system");
+        assert_eq!(
+            messages[2].content.as_ref().unwrap().as_str().unwrap(),
+            "mid"
+        );
+        assert_eq!(messages[3].role, "assistant");
     }
 }

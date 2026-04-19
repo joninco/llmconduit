@@ -58,3 +58,51 @@ pub fn hash_visible_history(model: &str, instructions: &str, items: &[ResponseIt
     hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::responses::{ContentItem, ResponseItem};
+
+    fn user_msg(text: &str) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText {
+                text: text.to_string(),
+            }],
+            phase: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn longest_prefix_match_partial() {
+        let store = ReplayStore::new();
+        let history = vec![user_msg("a"), user_msg("b"), user_msg("c")];
+        store
+            .insert(ReplayRecord {
+                model: "m".to_string(),
+                instructions: "i".to_string(),
+                visible_history: history.clone(),
+                internal_messages: vec![],
+            })
+            .await;
+
+        let mut query = history.clone();
+        query.push(user_msg("d"));
+        let result = store.longest_prefix_match("m", "i", &query).await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().visible_history.len(), 3);
+    }
+
+    #[test]
+    fn hash_visible_history_deterministic() {
+        let items = vec![user_msg("hello")];
+        let h1 = hash_visible_history("model", "instr", &items);
+        let h2 = hash_visible_history("model", "instr", &items);
+        assert_eq!(h1, h2);
+
+        let h3 = hash_visible_history("other_model", "instr", &items);
+        assert_ne!(h1, h3);
+    }
+}

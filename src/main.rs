@@ -5,6 +5,7 @@ use resp2chat::cli::Commands;
 use resp2chat::cli::resolve_config_path;
 use resp2chat::cli::run_configure_flow;
 use resp2chat::config::Config;
+use resp2chat::request_log::analyze_request_log;
 use resp2chat::ui::UiHandle;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -23,6 +24,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let path = resolve_config_path(config)?;
             let _ = run_configure_flow(path.clone())?;
             println!("Wrote configuration to {}", path.display());
+            Ok(())
+        }
+        Some(Commands::AnalyzeLog {
+            config,
+            path,
+            pairs,
+        }) => {
+            let config_path = resolve_config_path(config)?;
+            let config = Config::from_env_and_file(Some(&config_path))?;
+            let log_path = path.or(config.upstream_request_log_path).ok_or_else(|| {
+                format!(
+                    "no request log path configured; pass --path or set upstream_request_log_path in {}",
+                    config_path.display()
+                )
+            })?;
+            let report = analyze_request_log(&log_path, pairs)?;
+            println!("{report}");
             Ok(())
         }
         Some(Commands::Start { config, ui }) => {

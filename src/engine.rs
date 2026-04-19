@@ -9,6 +9,8 @@ use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatCompletionRequest;
 use crate::models::chat::ChatMessage;
+use crate::models::chat::ChunkUsage;
+use crate::models::chat::StreamOptions;
 use crate::models::responses::DeltaPayload;
 use crate::models::responses::FailedError;
 use crate::models::responses::FailedPayload;
@@ -17,6 +19,9 @@ use crate::models::responses::OutputItemPayload;
 use crate::models::responses::ReasoningDeltaPayload;
 use crate::models::responses::ResponseCompleted;
 use crate::models::responses::ResponseCompletedPayload;
+use crate::models::responses::ResponseInputTokensDetails;
+use crate::models::responses::ResponseOutputTokensDetails;
+use crate::models::responses::ResponseUsage;
 use crate::models::responses::ResponseCreatedPayload;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponseStub;
@@ -33,6 +38,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
@@ -89,6 +95,11 @@ impl Gateway {
         let (baseline_record, prefix_len) = self.find_replay_baseline(&request).await?;
         let mut tail_request = request.clone();
         tail_request.input = request.input[prefix_len..].to_vec();
+        if self.config.brave_api_key.is_none() {
+            tail_request
+                .tools
+                .retain(|t| !matches!(t, crate::models::responses::ToolSpec::WebSearch { .. }));
+        }
         let lowered = lower_request(
             &tail_request,
             baseline_record
@@ -373,6 +384,9 @@ impl Gateway {
         tx.send(created_event(&response_id))
             .await
             .map_err(|_| AppError::internal("failed to send response.created"))?;
+        tx.send(in_progress_event(&response_id))
+            .await
+            .map_err(|_| AppError::internal("failed to send response.in_progress"))?;
 
         let mut public_history = request.input.clone();
         let upstream_model = self
@@ -381,18 +395,24 @@ impl Gateway {
             .clone()
             .unwrap_or_else(|| request.model.clone());
 
+        let mut accumulated_usage = AccumulatedUsage::default();
         let mut upstream_request_index = 0usize;
         loop {
             upstream_request_index += 1;
+            let taken_messages = std::mem::take(&mut current_messages);
             let upstream_request = ChatCompletionRequest {
                 model: upstream_model.clone(),
-                messages: current_messages.clone(),
+                messages: taken_messages,
                 stream: true,
                 tools: (!tools.is_empty()).then_some(tools.clone()),
-                tool_choice: Some(Value::String("auto".to_string())),
+                tool_choice: Some(request.tool_choice.clone()),
                 parallel_tool_calls: false,
                 reasoning_effort: reasoning_effort.clone(),
                 response_format: response_format.clone(),
+                stream_options: Some(StreamOptions { include_usage: true }),
+                temperature: request.temperature,
+                top_p: request.top_p,
+                max_output_tokens: request.max_output_tokens,
                 extra_body: self
                     .config
                     .upstream_chat_kwargs
@@ -474,8 +494,17 @@ impl Gateway {
                 .stream_chat_completion(&upstream_request)
                 .await?;
             let mut state = StreamState::default();
-            while let Some(chunk) = stream.next().await {
+            let mut turn_usage: Option<ChunkUsage> = None;
+            loop {
+                let chunk = match timeout(self.config.request_timeout, stream.next()).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(_) => return Err(AppError::upstream("upstream stream timed out".to_string())),
+                };
                 let chunk = chunk?;
+                if chunk.usage.is_some() {
+                    turn_usage = chunk.usage.clone();
+                }
                 for emission in state.apply_chunk(&chunk) {
                     match emission {
                         StreamEmission::OutputItemAdded(item) => {
@@ -528,10 +557,23 @@ impl Gateway {
                                     AppError::internal("failed to stream reasoning delta")
                                 })?;
                         }
+                        StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                            tx.send(function_call_args_delta_event(call_id, delta))
+                                .await
+                                .map_err(|_| {
+                                    AppError::internal(
+                                        "failed to stream function call args delta",
+                                    )
+                                })?;
+                        }
                     }
                 }
             }
+            if let Some(usage) = turn_usage {
+                accumulated_usage.add(usage);
+            }
             let finalized = state.finalize(&tool_registry)?;
+            current_messages = upstream_request.messages;
             self.emit_completed_public_items(&response_id, &tx, &finalized, &mut public_history)
                 .await?;
             if let Some(message) = finalized.internal_assistant_message.clone() {
@@ -548,10 +590,11 @@ impl Gateway {
                 &mut public_history,
             )
             .await?;
-            if finalized
-                .tool_calls
-                .iter()
-                .all(|call| matches!(call.kind, ToolKind::WebSearch))
+            if self.config.brave_api_key.is_some()
+                && finalized
+                    .tool_calls
+                    .iter()
+                    .all(|call| matches!(call.kind, ToolKind::WebSearch))
             {
                 continue;
             }
@@ -567,7 +610,7 @@ impl Gateway {
             })
             .await;
 
-        tx.send(completed_event(&response_id))
+        tx.send(completed_event(&response_id, accumulated_usage.into_response_usage()))
             .await
             .map_err(|_| AppError::internal("failed to send response.completed"))?;
         self.monitor.emit(response_id, MonitorEventKind::Completed);
@@ -596,6 +639,23 @@ impl Gateway {
                 .map_err(|_| AppError::internal("failed to send reasoning done"))?;
         }
         if let Some(message) = finalized.message_item.clone() {
+            if let ResponseItem::Message { ref content, .. } = message {
+                let full_text: String = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        crate::models::responses::ContentItem::OutputText { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !full_text.is_empty() {
+                    tx.send(output_text_done_event(full_text))
+                        .await
+                        .map_err(|_| AppError::internal("failed to send output_text.done"))?;
+                }
+            }
             public_history.push(message.clone());
             self.monitor.emit(
                 response_id.to_string(),
@@ -620,14 +680,16 @@ impl Gateway {
         current_messages: &mut Vec<ChatMessage>,
         public_history: &mut Vec<ResponseItem>,
     ) -> AppResult<()> {
-        let has_web_search = finalized
-            .tool_calls
-            .iter()
-            .any(|call| matches!(call.kind, ToolKind::WebSearch));
+        let can_search = self.config.brave_api_key.is_some();
+        let has_web_search = can_search
+            && finalized
+                .tool_calls
+                .iter()
+                .any(|call| matches!(call.kind, ToolKind::WebSearch));
         let has_client_tool = finalized
             .tool_calls
             .iter()
-            .any(|call| !matches!(call.kind, ToolKind::WebSearch));
+            .any(|call| !matches!(call.kind, ToolKind::WebSearch) || !can_search);
         if has_web_search && has_client_tool {
             return Err(AppError::upstream(
                 "mixed provider-side and client-side tool calls are not supported in v1",
@@ -635,6 +697,23 @@ impl Gateway {
         }
         if has_client_tool {
             for tool_call in &finalized.tool_calls {
+                if let ResponseItem::FunctionCall {
+                    ref call_id,
+                    ref name,
+                    ref arguments,
+                    ..
+                } = tool_call.public_item
+                {
+                    tx.send(function_call_args_done_event(
+                        call_id.clone(),
+                        name.clone(),
+                        arguments.clone(),
+                    ))
+                    .await
+                    .map_err(|_| {
+                        AppError::internal("failed to send function call args done")
+                    })?;
+                }
                 self.monitor.emit(
                     response_id.to_string(),
                     MonitorEventKind::ToolPhase {
@@ -892,6 +971,63 @@ mod tests {
         assert!(preview.ends_with("...\n[truncated]"));
         assert!(preview.is_char_boundary(preview.len()));
     }
+
+    use super::AccumulatedUsage;
+    use super::failure_event;
+    use crate::models::chat::ChunkUsage;
+
+    #[test]
+    fn accumulated_usage_cached_tokens() {
+        let mut usage = AccumulatedUsage::default();
+        usage.add(ChunkUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            prompt_tokens_details: Some(crate::models::chat::PromptTokensDetails {
+                cached_tokens: 50,
+            }),
+            completion_tokens_details: None,
+        });
+        let result = usage.into_response_usage().unwrap();
+        assert_eq!(result.input_tokens, 100);
+        assert_eq!(result.input_tokens_details.unwrap().cached_tokens, 50);
+    }
+
+    #[test]
+    fn accumulated_usage_reasoning_tokens() {
+        let mut usage = AccumulatedUsage::default();
+        usage.add(ChunkUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            prompt_tokens_details: None,
+            completion_tokens_details: Some(crate::models::chat::CompletionTokensDetails {
+                reasoning_tokens: 30,
+            }),
+        });
+        let result = usage.into_response_usage().unwrap();
+        assert_eq!(result.output_tokens, 25);
+        assert_eq!(result.output_tokens_details.unwrap().reasoning_tokens, 30);
+    }
+
+    #[test]
+    fn accumulated_usage_zero_returns_none() {
+        let usage = AccumulatedUsage::default();
+        assert!(usage.into_response_usage().is_none());
+    }
+
+    #[test]
+    fn failure_event_shape() {
+        let error = crate::error::AppError::internal("test error");
+        let event = failure_event(&error);
+        assert_eq!(event.event, "response.failed");
+        assert_eq!(event.data["type"], "response.failed");
+        assert_eq!(event.data["response"]["error"]["code"], "gateway_error");
+        assert!(event.data["response"]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("test error"));
+    }
 }
 
 fn created_event(response_id: &str) -> SseEvent {
@@ -908,7 +1044,7 @@ fn created_event(response_id: &str) -> SseEvent {
     )
 }
 
-fn completed_event(response_id: &str) -> SseEvent {
+fn completed_event(response_id: &str, usage: Option<ResponseUsage>) -> SseEvent {
     json_event(
         "response.completed",
         ResponsesEnvelope {
@@ -916,10 +1052,57 @@ fn completed_event(response_id: &str) -> SseEvent {
             payload: ResponseCompletedPayload {
                 response: ResponseCompleted {
                     id: response_id.to_string(),
+                    usage,
                 },
             },
         },
     )
+}
+
+#[derive(Default)]
+struct AccumulatedUsage {
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+    cached_input_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+impl AccumulatedUsage {
+    fn add(&mut self, usage: ChunkUsage) {
+        self.input_tokens += usage.prompt_tokens;
+        self.output_tokens += usage.completion_tokens;
+        self.total_tokens += usage.total_tokens;
+        self.cached_input_tokens += usage
+            .prompt_tokens_details
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
+        self.reasoning_output_tokens += usage
+            .completion_tokens_details
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+    }
+
+    fn into_response_usage(self) -> Option<ResponseUsage> {
+        if self.total_tokens == 0 {
+            return None;
+        }
+        Some(ResponseUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            total_tokens: self.total_tokens,
+            input_tokens_details: (self.cached_input_tokens > 0).then_some(
+                ResponseInputTokensDetails {
+                    cached_tokens: self.cached_input_tokens,
+                },
+            ),
+            output_tokens_details: (self.reasoning_output_tokens > 0).then_some(
+                ResponseOutputTokensDetails {
+                    reasoning_tokens: self.reasoning_output_tokens,
+                },
+            ),
+        })
+    }
 }
 
 fn output_item_added_event(item: ResponseItem) -> SseEvent {
@@ -954,9 +1137,9 @@ fn output_text_delta_event(delta: String) -> SseEvent {
 
 fn reasoning_text_delta_event(delta: String) -> SseEvent {
     json_event(
-        "response.reasoning_text.delta",
+        "response.reasoning_summary_text.delta",
         ResponsesEnvelope {
-            kind: "response.reasoning_text.delta".to_string(),
+            kind: "response.reasoning_summary_text.delta".to_string(),
             payload: ReasoningDeltaPayload {
                 delta,
                 content_index: 0,
@@ -977,6 +1160,57 @@ fn failure_event(error: &AppError) -> SseEvent {
                         message: error.to_string(),
                     },
                 },
+            },
+        },
+    )
+}
+
+fn in_progress_event(response_id: &str) -> SseEvent {
+    json_event(
+        "response.in_progress",
+        ResponsesEnvelope {
+            kind: "response.in_progress".to_string(),
+            payload: ResponseCreatedPayload {
+                response: ResponseStub {
+                    id: response_id.to_string(),
+                },
+            },
+        },
+    )
+}
+
+fn output_text_done_event(text: String) -> SseEvent {
+    json_event(
+        "response.output_text.done",
+        ResponsesEnvelope {
+            kind: "response.output_text.done".to_string(),
+            payload: crate::models::responses::TextDonePayload {
+                text,
+                content_index: 0,
+            },
+        },
+    )
+}
+
+fn function_call_args_delta_event(call_id: String, delta: String) -> SseEvent {
+    json_event(
+        "response.function_call_arguments.delta",
+        ResponsesEnvelope {
+            kind: "response.function_call_arguments.delta".to_string(),
+            payload: crate::models::responses::FunctionCallArgsDeltaPayload { call_id, delta },
+        },
+    )
+}
+
+fn function_call_args_done_event(call_id: String, name: String, arguments: String) -> SseEvent {
+    json_event(
+        "response.function_call_arguments.done",
+        ResponsesEnvelope {
+            kind: "response.function_call_arguments.done".to_string(),
+            payload: crate::models::responses::FunctionCallArgsDonePayload {
+                call_id,
+                name,
+                arguments,
             },
         },
     )

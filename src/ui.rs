@@ -390,6 +390,7 @@ fn render_footer(turns: &VecDeque<TurnState>) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn summarize_request(
     model: &str,
     input_items: usize,

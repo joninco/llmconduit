@@ -7,6 +7,7 @@ pub mod http;
 pub mod models;
 pub mod monitor;
 pub mod replay;
+pub mod request_log;
 pub mod search;
 pub mod ui;
 pub mod upstream;
@@ -35,6 +36,7 @@ pub fn build_app_with_gateway(config: Config) -> (axum::Router, Arc<Gateway>) {
         http_client.clone(),
         config.upstream_base_url.clone(),
         config.upstream_api_key.clone(),
+        config.upstream_request_log_path.clone(),
     ));
     let search = Arc::new(BraveSearchClient::new(http_client, config.clone()));
     let gateway = Arc::new(Gateway::new(

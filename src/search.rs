@@ -127,6 +127,35 @@ mod tests {
     use super::BraveSearchClient;
     use crate::config::Config;
 
+    use super::BraveSearchResponse;
+    use super::BraveWebResult;
+    use super::BraveWebResults;
+    use super::format_search_results;
+
+    #[test]
+    fn format_search_results_empty() {
+        let response = BraveSearchResponse { web: None };
+        assert_eq!(
+            format_search_results(&response),
+            "No Brave search results found."
+        );
+    }
+
+    #[test]
+    fn format_search_results_missing_fields() {
+        let response = BraveSearchResponse {
+            web: Some(BraveWebResults {
+                results: vec![BraveWebResult {
+                    title: String::new(),
+                    url: String::new(),
+                    description: String::new(),
+                }],
+            }),
+        };
+        let result = format_search_results(&response);
+        assert!(result.contains("1."));
+    }
+
     #[test]
     fn endpoint_url_preserves_v1_without_trailing_slash() {
         let client = BraveSearchClient::new(
@@ -136,6 +165,7 @@ mod tests {
                 upstream_base_url: url::Url::parse("http://127.0.0.1:8000/v1/").expect("url"),
                 upstream_api_key: None,
                 upstream_model: None,
+                upstream_request_log_path: None,
                 upstream_chat_kwargs: serde_json::Map::new(),
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1")
                     .expect("url"),
@@ -163,6 +193,7 @@ mod tests {
                 upstream_base_url: url::Url::parse("http://127.0.0.1:8000/v1/").expect("url"),
                 upstream_api_key: None,
                 upstream_model: None,
+                upstream_request_log_path: None,
                 upstream_chat_kwargs: serde_json::Map::new(),
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1/")
                     .expect("url"),

@@ -17,8 +17,21 @@ pub struct ChatCompletionRequest {
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i64>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_body: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -76,6 +89,31 @@ pub struct ChatFunctionCall {
 pub struct ChatCompletionChunk {
     pub id: String,
     pub choices: Vec<ChatChunkChoice>,
+    #[serde(default)]
+    pub usage: Option<ChunkUsage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChunkUsage {
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(default)]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompletionTokensDetails {
+    #[serde(default)]
+    pub reasoning_tokens: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
