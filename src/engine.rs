@@ -1103,10 +1103,10 @@ mod tests {
         assert_eq!(event.event, "response.failed");
         assert_eq!(event.data["type"], "response.failed");
         assert_eq!(event.data["response"]["error"]["code"], "gateway_error");
-        assert!(event.data["response"]["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("test error"));
+        assert_eq!(
+            event.data["response"]["error"]["message"].as_str().unwrap(),
+            "internal server error"
+        );
     }
 }
 
@@ -1266,7 +1266,7 @@ fn failure_event(error: &AppError) -> SseEvent {
                 response: FailedResponse {
                     error: FailedError {
                         code: "gateway_error".to_string(),
-                        message: error.to_string(),
+                        message: error.client_message.clone(),
                     },
                 },
             },

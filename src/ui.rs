@@ -4,10 +4,7 @@ use crossterm::event;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::execute;
-use crossterm::terminal::EnterAlternateScreen;
-use crossterm::terminal::LeaveAlternateScreen;
-use crossterm::terminal::disable_raw_mode;
-use crossterm::terminal::enable_raw_mode;
+use crossterm::terminal;
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -27,6 +24,23 @@ use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 use tokio::sync::broadcast;
+
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn new() -> std::io::Result<Self> {
+        terminal::enable_raw_mode()?;
+        execute!(std::io::stdout(), terminal::EnterAlternateScreen)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(std::io::stdout(), terminal::LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
+}
 
 const PREVIEW_CHAR_LIMIT: usize = 16_000;
 const TOOL_NOTE_LIMIT: usize = 6;
@@ -62,21 +76,13 @@ impl UiHandle {
     }
 
     pub async fn run(mut self) -> Result<(), String> {
-        enable_raw_mode().map_err(|err| format!("failed to enable raw mode: {err}"))?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)
-            .map_err(|err| format!("failed to enter alternate screen: {err}"))?;
+        let _guard = TerminalGuard::new()
+            .map_err(|err| format!("failed to initialize terminal: {err}"))?;
+        let stdout = io::stdout();
         let backend = CrosstermBackend::new(stdout);
         let mut terminal =
             Terminal::new(backend).map_err(|err| format!("failed to start terminal: {err}"))?;
-        let result = self.run_loop(&mut terminal).await;
-        disable_raw_mode().map_err(|err| format!("failed to disable raw mode: {err}"))?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)
-            .map_err(|err| format!("failed to leave alternate screen: {err}"))?;
-        terminal
-            .show_cursor()
-            .map_err(|err| format!("failed to show cursor: {err}"))?;
-        result
+        self.run_loop(&mut terminal).await
     }
 
     async fn run_loop(
@@ -104,10 +110,20 @@ impl UiHandle {
                 .draw(|frame| self.render(frame))
                 .map_err(|err| format!("failed to draw UI: {err}"))?;
 
-            if event::poll(Duration::from_millis(16))
-                .map_err(|err| format!("failed to poll terminal events: {err}"))?
+            let event_result = tokio::task::spawn_blocking(|| {
+                if event::poll(Duration::from_millis(16))? {
+                    Ok(Some(event::read()?))
+                } else {
+                    Ok::<_, std::io::Error>(None)
+                }
+            })
+            .await
+            .map_err(|e| format!("spawn_blocking: {e}"))?;
+
+            if let Some(ev) =
+                event_result.map_err(|err| format!("failed to read terminal event: {err}"))?
             {
-                match event::read().map_err(|err| format!("failed to read key: {err}"))? {
+                match ev {
                     Event::Key(key) if key.code == KeyCode::Char('q') => return Ok(()),
                     Event::Resize(_, _) => {}
                     _ => {}

@@ -22,8 +22,10 @@ pub struct Config {
     pub brave_api_key: Option<String>,
     pub brave_max_results: usize,
     pub request_timeout: Duration,
+    pub connect_timeout_secs: u64,
     pub max_web_search_rounds: usize,
     pub flatten_content: bool,
+    pub max_replay_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -43,10 +45,18 @@ pub struct PersistedConfig {
     pub brave_api_key: Option<String>,
     pub brave_max_results: usize,
     pub request_timeout_secs: u64,
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
     #[serde(default = "default_max_web_search_rounds")]
     pub max_web_search_rounds: usize,
     #[serde(default = "default_flatten_content")]
     pub flatten_content: bool,
+    #[serde(default = "default_max_replay_entries")]
+    pub max_replay_entries: usize,
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    10
 }
 
 fn default_max_web_search_rounds() -> usize {
@@ -55,6 +65,10 @@ fn default_max_web_search_rounds() -> usize {
 
 fn default_flatten_content() -> bool {
     true
+}
+
+fn default_max_replay_entries() -> usize {
+    1000
 }
 
 impl Default for PersistedConfig {
@@ -70,8 +84,10 @@ impl Default for PersistedConfig {
             brave_api_key: None,
             brave_max_results: 5,
             request_timeout_secs: 60,
+            connect_timeout_secs: 10,
             max_web_search_rounds: 5,
             flatten_content: true,
+            max_replay_entries: 1000,
         }
     }
 }
@@ -85,6 +101,10 @@ impl Config {
         };
         apply_env_overrides(&mut persisted);
         Self::from_persisted(&persisted)
+    }
+
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_secs(self.connect_timeout_secs)
     }
 
     pub fn from_persisted(config: &PersistedConfig) -> Result<Self, String> {
@@ -124,8 +144,10 @@ impl Config {
                 .filter(|value| !value.is_empty()),
             brave_max_results: config.brave_max_results,
             request_timeout: Duration::from_secs(config.request_timeout_secs),
+            connect_timeout_secs: config.connect_timeout_secs,
             max_web_search_rounds: config.max_web_search_rounds,
             flatten_content: config.flatten_content,
+            max_replay_entries: config.max_replay_entries,
         })
     }
 }
@@ -159,7 +181,24 @@ pub fn write_persisted_config(path: &Path, config: &PersistedConfig) -> Result<(
         .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
     let yaml = serde_yaml::to_string(config)
         .map_err(|err| format!("failed to serialize config: {err}"))?;
-    fs::write(path, yaml).map_err(|err| format!("failed to write {}: {err}", path.display()))
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        let mut file = opts
+            .open(path)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+        file.write_all(yaml.as_bytes())
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, yaml)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn apply_env_overrides(config: &mut PersistedConfig) {
@@ -219,6 +258,11 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.request_timeout_secs = parsed;
     }
+    if let Ok(value) = env::var("RESP2CHAT_CONNECT_TIMEOUT_SECS")
+        && let Ok(parsed) = value.parse()
+    {
+        config.connect_timeout_secs = parsed;
+    }
     if let Ok(value) = env::var("RESP2CHAT_MAX_WEB_SEARCH_ROUNDS")
         && let Ok(parsed) = value.parse()
     {
@@ -228,6 +272,11 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
         && let Ok(parsed) = value.parse()
     {
         config.flatten_content = parsed;
+    }
+    if let Ok(value) = env::var("RESP2CHAT_MAX_REPLAY_ENTRIES")
+        && let Ok(parsed) = value.parse()
+    {
+        config.max_replay_entries = parsed;
     }
 }
 
@@ -323,12 +372,42 @@ mod tests {
             brave_api_key: Some("secret".to_string()),
             brave_max_results: 7,
             request_timeout_secs: 45,
+            connect_timeout_secs: 10,
             max_web_search_rounds: 10,
             flatten_content: false,
+            max_replay_entries: 1000,
         };
         write_persisted_config(&path, &config).expect("write config");
         let loaded = load_persisted_config(&path).expect("load config");
         assert_eq!(loaded, config);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_connect_timeout_default_is_10() {
+        let persisted = PersistedConfig::default();
+        assert_eq!(persisted.connect_timeout_secs, 10);
+        let config = Config::from_persisted(&persisted).unwrap();
+        assert_eq!(config.connect_timeout_secs, 10);
+        assert_eq!(
+            config.connect_timeout(),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_has_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "resp2chat-perms-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let config = PersistedConfig::default();
+        write_persisted_config(&path, &config).expect("write config");
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config file should have 0600 permissions");
         let _ = std::fs::remove_file(path);
     }
 }
