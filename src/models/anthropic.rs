@@ -88,6 +88,8 @@ pub struct AnthropicImageSource {
     pub data: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -109,6 +111,7 @@ pub struct AnthropicTool {
 pub enum AnthropicToolChoice {
     Auto,
     Any,
+    None,
     Tool { name: String },
 }
 
@@ -227,6 +230,7 @@ pub enum AnthropicDelta {
     TextDelta { text: String },
     InputJsonDelta { partial_json: String },
     ThinkingDelta { thinking: String },
+    SignatureDelta { signature: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,7 +241,10 @@ pub struct AnthropicMessageDeltaBody {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AnthropicUsage {
-    pub output_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

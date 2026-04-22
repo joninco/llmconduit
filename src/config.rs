@@ -17,12 +17,17 @@ pub struct Config {
     pub upstream_base_url: Url,
     pub upstream_api_key: Option<String>,
     pub upstream_model: Option<String>,
+    pub upstream_request_log_path: Option<PathBuf>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub model_profiles: BTreeMap<String, ModelProfile>,
     pub brave_base_url: Url,
     pub brave_api_key: Option<String>,
     pub brave_max_results: usize,
     pub request_timeout: Duration,
+    pub connect_timeout_secs: u64,
+    pub max_web_search_rounds: usize,
+    pub flatten_content: bool,
+    pub max_replay_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -47,6 +52,8 @@ pub struct PersistedConfig {
     pub upstream_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_request_log_path: Option<String>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -56,6 +63,30 @@ pub struct PersistedConfig {
     pub brave_api_key: Option<String>,
     pub brave_max_results: usize,
     pub request_timeout_secs: u64,
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_max_web_search_rounds")]
+    pub max_web_search_rounds: usize,
+    #[serde(default = "default_flatten_content")]
+    pub flatten_content: bool,
+    #[serde(default = "default_max_replay_entries")]
+    pub max_replay_entries: usize,
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_max_web_search_rounds() -> usize {
+    5
+}
+
+fn default_flatten_content() -> bool {
+    true
+}
+
+fn default_max_replay_entries() -> usize {
+    1000
 }
 
 impl Default for PersistedConfig {
@@ -65,12 +96,17 @@ impl Default for PersistedConfig {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
+            upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
             model_profiles: BTreeMap::new(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
             request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
         }
     }
 }
@@ -84,6 +120,10 @@ impl Config {
         };
         apply_env_overrides(&mut persisted);
         Self::from_persisted(&persisted)
+    }
+
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_secs(self.connect_timeout_secs)
     }
 
     pub fn from_persisted(config: &PersistedConfig) -> Result<Self, String> {
@@ -108,6 +148,12 @@ impl Config {
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            upstream_request_log_path: config
+                .upstream_request_log_path
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
             upstream_chat_kwargs: config.upstream_chat_kwargs.clone(),
             model_profiles: config
                 .model_profiles
@@ -138,6 +184,10 @@ impl Config {
                 .filter(|value| !value.is_empty()),
             brave_max_results: config.brave_max_results,
             request_timeout: Duration::from_secs(config.request_timeout_secs),
+            connect_timeout_secs: config.connect_timeout_secs,
+            max_web_search_rounds: config.max_web_search_rounds,
+            flatten_content: config.flatten_content,
+            max_replay_entries: config.max_replay_entries,
         })
     }
 
@@ -187,7 +237,24 @@ pub fn write_persisted_config(path: &Path, config: &PersistedConfig) -> Result<(
         .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
     let yaml = serde_yaml::to_string(config)
         .map_err(|err| format!("failed to serialize config: {err}"))?;
-    fs::write(path, yaml).map_err(|err| format!("failed to write {}: {err}", path.display()))
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true).mode(0o600);
+        let mut file = opts
+            .open(path)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+        file.write_all(yaml.as_bytes())
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, yaml)
+            .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn apply_env_overrides(config: &mut PersistedConfig) {
@@ -216,6 +283,11 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.upstream_model = Some(value);
     }
+    if let Ok(value) = env::var("RESP2CHAT_UPSTREAM_REQUEST_LOG_PATH")
+        && !value.trim().is_empty()
+    {
+        config.upstream_request_log_path = Some(value);
+    }
     if let Ok(value) = env::var("RESP2CHAT_UPSTREAM_CHAT_KWARGS_JSON")
         && !value.trim().is_empty()
         && let Ok(parsed) = serde_json::from_str::<JsonMap<String, JsonValue>>(&value)
@@ -242,6 +314,26 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.request_timeout_secs = parsed;
     }
+    if let Ok(value) = env::var("RESP2CHAT_CONNECT_TIMEOUT_SECS")
+        && let Ok(parsed) = value.parse()
+    {
+        config.connect_timeout_secs = parsed;
+    }
+    if let Ok(value) = env::var("RESP2CHAT_MAX_WEB_SEARCH_ROUNDS")
+        && let Ok(parsed) = value.parse()
+    {
+        config.max_web_search_rounds = parsed;
+    }
+    if let Ok(value) = env::var("RESP2CHAT_FLATTEN_CONTENT")
+        && let Ok(parsed) = value.parse()
+    {
+        config.flatten_content = parsed;
+    }
+    if let Ok(value) = env::var("RESP2CHAT_MAX_REPLAY_ENTRIES")
+        && let Ok(parsed) = value.parse()
+    {
+        config.max_replay_entries = parsed;
+    }
 }
 
 pub fn merge_json_maps(
@@ -267,12 +359,89 @@ mod tests {
     use super::JsonValue;
     use super::PersistedConfig;
     use super::PersistedModelProfile;
+    use super::apply_env_overrides;
     use super::load_persisted_config;
     use super::merge_json_maps;
     use super::write_persisted_config;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn from_persisted_invalid_base_url() {
+        let config = PersistedConfig {
+            upstream_base_url: "not a url".to_string(),
+            ..PersistedConfig::default()
+        };
+        assert!(Config::from_persisted(&config).is_err());
+    }
+
+    #[test]
+    fn whitespace_api_key_trimmed() {
+        let config = PersistedConfig {
+            upstream_api_key: Some("  secret  ".to_string()),
+            ..PersistedConfig::default()
+        };
+        let result = Config::from_persisted(&config).unwrap();
+        assert_eq!(result.upstream_api_key, Some("secret".to_string()));
+
+        let config2 = PersistedConfig {
+            upstream_api_key: Some("   ".to_string()),
+            ..PersistedConfig::default()
+        };
+        let result2 = Config::from_persisted(&config2).unwrap();
+        assert_eq!(result2.upstream_api_key, None);
+    }
+
+    #[test]
+    fn load_persisted_config_missing_file_returns_default() {
+        let result = load_persisted_config(std::path::Path::new(
+            "/tmp/nonexistent-resp2chat-config-test.yaml",
+        ));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PersistedConfig::default());
+    }
+
+    #[test]
+    fn apply_env_overrides_upstream_api_key() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("RESP2CHAT_UPSTREAM_API_KEY");
+            std::env::set_var("RESP2CHAT_UPSTREAM_API_KEY", "test-key-12345");
+        }
+        let mut config = PersistedConfig::default();
+        apply_env_overrides(&mut config);
+        assert_eq!(config.upstream_api_key, Some("test-key-12345".to_string()));
+        unsafe {
+            std::env::remove_var("RESP2CHAT_UPSTREAM_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+        };
+    }
+
+    #[test]
+    fn apply_env_overrides_openai_fallback() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::remove_var("RESP2CHAT_UPSTREAM_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::set_var("OPENAI_API_KEY", "fallback-key-67890");
+        }
+        let mut config = PersistedConfig::default();
+        config.upstream_api_key = None;
+        apply_env_overrides(&mut config);
+        assert_eq!(
+            config.upstream_api_key,
+            Some("fallback-key-67890".to_string())
+        );
+        unsafe {
+            std::env::remove_var("RESP2CHAT_UPSTREAM_API_KEY");
+            std::env::remove_var("OPENAI_API_KEY");
+        };
+    }
 
     #[test]
     fn persisted_config_roundtrips() {
@@ -285,6 +454,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: Some("upstream-secret".to_string()),
             upstream_model: Some("grok-4".to_string()),
+            upstream_request_log_path: Some("/tmp/resp2chat-upstream.jsonl".to_string()),
             upstream_chat_kwargs: JsonMap::from_iter([(
                 "clear_thinking".to_string(),
                 JsonValue::Bool(false),
@@ -306,6 +476,10 @@ mod tests {
             brave_api_key: Some("secret".to_string()),
             brave_max_results: 7,
             request_timeout_secs: 45,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 10,
+            flatten_content: false,
+            max_replay_entries: 1000,
         };
         write_persisted_config(&path, &config).expect("write config");
         let loaded = load_persisted_config(&path).expect("load config");
@@ -320,6 +494,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
+            upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
             model_profiles: BTreeMap::from_iter([(
                 "Kimi-K2.6".to_string(),
@@ -338,6 +513,10 @@ mod tests {
             brave_api_key: None,
             brave_max_results: 5,
             request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
         })
         .expect("config");
 
@@ -394,5 +573,30 @@ mod tests {
                 ("stream_reasoning".to_string(), JsonValue::Bool(true)),
             ])
         );
+    }
+
+    #[test]
+    fn test_connect_timeout_default_is_10() {
+        let persisted = PersistedConfig::default();
+        assert_eq!(persisted.connect_timeout_secs, 10);
+        let config = Config::from_persisted(&persisted).unwrap();
+        assert_eq!(config.connect_timeout_secs, 10);
+        assert_eq!(config.connect_timeout(), std::time::Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_file_has_restricted_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "resp2chat-perms-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let config = PersistedConfig::default();
+        write_persisted_config(&path, &config).expect("write config");
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config file should have 0600 permissions");
+        let _ = std::fs::remove_file(path);
     }
 }

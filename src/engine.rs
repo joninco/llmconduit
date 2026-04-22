@@ -8,24 +8,26 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatCompletionRequest;
-use crate::models::chat::ChatCompletionUsage;
 use crate::models::chat::ChatMessage;
+use crate::models::chat::ChunkUsage;
+use crate::models::chat::StreamOptions;
 use crate::models::responses::DeltaPayload;
 use crate::models::responses::FailedError;
 use crate::models::responses::FailedPayload;
 use crate::models::responses::FailedResponse;
 use crate::models::responses::OutputItemPayload;
 use crate::models::responses::ReasoningDeltaPayload;
-use crate::models::responses::ResponseCompleted;
 use crate::models::responses::ResponseCompletedPayload;
 use crate::models::responses::ResponseCreatedPayload;
 use crate::models::responses::ResponseInputTokensDetails;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponseOutputTokensDetails;
+use crate::models::responses::ResponseResource;
 use crate::models::responses::ResponseStub;
 use crate::models::responses::ResponseUsage;
 use crate::models::responses::ResponsesEnvelope;
 use crate::models::responses::ResponsesRequest;
+use crate::models::responses::WebSearchAction;
 use crate::monitor::MonitorEventKind;
 use crate::monitor::MonitorHub;
 use crate::replay::ReplayRecord;
@@ -37,6 +39,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
@@ -93,6 +96,11 @@ impl Gateway {
         let (baseline_record, prefix_len) = self.find_replay_baseline(&request).await?;
         let mut tail_request = request.clone();
         tail_request.input = request.input[prefix_len..].to_vec();
+        if self.config.brave_api_key.is_none() {
+            tail_request
+                .tools
+                .retain(|t| !matches!(t, crate::models::responses::ToolSpec::WebSearch { .. }));
+        }
         let lowered = lower_request(
             &tail_request,
             baseline_record
@@ -134,6 +142,9 @@ impl Gateway {
         &self,
         request: &ResponsesRequest,
     ) -> AppResult<(Option<ReplayRecord>, usize)> {
+        if !request.store {
+            return Ok((None, 0));
+        }
         let record = self
             .replay_store
             .longest_prefix_match(&request.model, &request.instructions, &request.input)
@@ -377,29 +388,43 @@ impl Gateway {
         tx.send(created_event(&response_id))
             .await
             .map_err(|_| AppError::internal("failed to send response.created"))?;
+        tx.send(in_progress_event(&response_id))
+            .await
+            .map_err(|_| AppError::internal("failed to send response.in_progress"))?;
 
         let mut public_history = request.input.clone();
         let upstream_model = self.config.resolve_upstream_model(&request.model);
 
+        let mut accumulated_usage = AccumulatedUsage::default();
         let mut upstream_request_index = 0usize;
-        let mut final_usage = None;
+        let mut web_search_rounds = 0usize;
+        #[allow(unused_assignments)]
+        let mut last_finish_reason: Option<String> = None;
         loop {
             upstream_request_index += 1;
+            let taken_messages = std::mem::take(&mut current_messages);
             let upstream_request = ChatCompletionRequest {
                 model: upstream_model.clone(),
-                messages: current_messages.clone(),
+                messages: taken_messages,
                 stream: true,
                 tools: (!tools.is_empty()).then_some(tools.clone()),
-                tool_choice: Some(Value::String("auto".to_string())),
+                tool_choice: Some(request.tool_choice.clone()),
                 parallel_tool_calls: false,
                 reasoning_effort: reasoning_effort.clone(),
                 response_format: response_format.clone(),
-                extra_body: force_stream_usage(
-                    self.config
-                        .resolve_upstream_chat_kwargs(&request.model)
-                        .into_iter()
-                        .collect(),
-                ),
+                stream_options: Some(StreamOptions {
+                    include_usage: true,
+                }),
+                temperature: request.temperature,
+                top_p: request.top_p,
+                max_output_tokens: request.max_output_tokens,
+                frequency_penalty: request.frequency_penalty,
+                presence_penalty: request.presence_penalty,
+                extra_body: self
+                    .config
+                    .resolve_upstream_chat_kwargs(&request.model)
+                    .into_iter()
+                    .collect(),
             };
             self.monitor.emit(
                 response_id.clone(),
@@ -475,10 +500,18 @@ impl Gateway {
                 .stream_chat_completion(&upstream_request)
                 .await?;
             let mut state = StreamState::default();
-            while let Some(chunk) = stream.next().await {
+            let mut turn_usage: Option<ChunkUsage> = None;
+            loop {
+                let chunk = match timeout(self.config.request_timeout, stream.next()).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break,
+                    Err(_) => {
+                        return Err(AppError::upstream("upstream stream timed out".to_string()));
+                    }
+                };
                 let chunk = chunk?;
-                if let Some(usage) = chunk.usage.clone() {
-                    final_usage = Some(usage);
+                if chunk.usage.is_some() {
+                    turn_usage = chunk.usage.clone();
                 }
                 for emission in state.apply_chunk(&chunk) {
                     match emission {
@@ -532,10 +565,53 @@ impl Gateway {
                                     AppError::internal("failed to stream reasoning delta")
                                 })?;
                         }
+                        StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                            tx.send(function_call_args_delta_event(call_id, delta))
+                                .await
+                                .map_err(|_| {
+                                    AppError::internal("failed to stream function call args delta")
+                                })?;
+                        }
+                        StreamEmission::ContentPartAdded => {
+                            tx.send(content_part_added_event()).await.map_err(|_| {
+                                AppError::internal("failed to send content_part.added")
+                            })?;
+                        }
+                        StreamEmission::ContentPartDone { text } => {
+                            tx.send(content_part_done_event(text)).await.map_err(|_| {
+                                AppError::internal("failed to send content_part.done")
+                            })?;
+                        }
+                        StreamEmission::ReasoningSummaryPartAdded => {
+                            tx.send(reasoning_summary_part_added_event())
+                                .await
+                                .map_err(|_| {
+                                    AppError::internal(
+                                        "failed to send reasoning_summary_part.added",
+                                    )
+                                })?;
+                        }
+                        StreamEmission::ReasoningSummaryPartDone { text } => {
+                            tx.send(reasoning_summary_part_done_event(text))
+                                .await
+                                .map_err(|_| {
+                                    AppError::internal("failed to send reasoning_summary_part.done")
+                                })?;
+                        }
+                        StreamEmission::RefusalDelta(delta) => {
+                            tx.send(refusal_delta_event(delta))
+                                .await
+                                .map_err(|_| AppError::internal("failed to send refusal.delta"))?;
+                        }
                     }
                 }
             }
+            if let Some(usage) = turn_usage {
+                accumulated_usage.add(usage);
+            }
             let finalized = state.finalize(&tool_registry)?;
+            last_finish_reason = finalized.finish_reason.clone();
+            current_messages = upstream_request.messages;
             self.emit_completed_public_items(&response_id, &tx, &finalized, &mut public_history)
                 .await?;
             if let Some(message) = finalized.internal_assistant_message.clone() {
@@ -552,28 +628,72 @@ impl Gateway {
                 &mut public_history,
             )
             .await?;
-            if finalized
-                .tool_calls
-                .iter()
-                .all(|call| matches!(call.kind, ToolKind::WebSearch))
+            if self.config.brave_api_key.is_some()
+                && finalized
+                    .tool_calls
+                    .iter()
+                    .all(|call| matches!(call.kind, ToolKind::WebSearch))
             {
+                web_search_rounds += 1;
+                if self.config.max_web_search_rounds > 0
+                    && web_search_rounds >= self.config.max_web_search_rounds
+                {
+                    return Err(AppError::upstream("web search round limit exceeded"));
+                }
                 continue;
             }
             break;
         }
 
-        self.replay_store
-            .insert(ReplayRecord {
-                model: request.model,
-                instructions: request.instructions,
-                visible_history: public_history,
-                internal_messages: current_messages,
-            })
-            .await;
+        let model_name = request.model.clone();
+        let completed_output = public_history.clone();
+        let metadata = request.metadata.clone();
+        if request.store {
+            self.replay_store
+                .insert(ReplayRecord {
+                    model: request.model,
+                    instructions: request.instructions,
+                    visible_history: public_history,
+                    internal_messages: current_messages,
+                })
+                .await;
+        }
 
-        tx.send(completed_event(&response_id, final_usage.as_ref()))
-            .await
-            .map_err(|_| AppError::internal("failed to send response.completed"))?;
+        let usage = accumulated_usage.into_response_usage();
+        let is_incomplete = last_finish_reason.as_deref() == Some("length");
+        let resource = ResponseResource {
+            id: response_id.clone(),
+            object: "response".to_string(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            status: if is_incomplete {
+                "incomplete".to_string()
+            } else {
+                "completed".to_string()
+            },
+            output: completed_output,
+            model: model_name,
+            usage,
+            metadata,
+            incomplete_details: if is_incomplete {
+                Some(crate::models::responses::IncompleteDetails {
+                    reason: "max_output_tokens".to_string(),
+                })
+            } else {
+                None
+            },
+        };
+        if is_incomplete {
+            tx.send(incomplete_event(resource))
+                .await
+                .map_err(|_| AppError::internal("failed to send response.incomplete"))?;
+        } else {
+            tx.send(completed_event(resource))
+                .await
+                .map_err(|_| AppError::internal("failed to send response.completed"))?;
+        }
         self.monitor.emit(response_id, MonitorEventKind::Completed);
         Ok(())
     }
@@ -587,6 +707,25 @@ impl Gateway {
     ) -> AppResult<()> {
         if let Some(reasoning) = finalized.reasoning_item.clone() {
             public_history.push(reasoning.clone());
+            if finalized.reasoning_part_emitted
+                && let ResponseItem::Reasoning { ref content, .. } = reasoning
+            {
+                let reasoning_text = content
+                    .as_ref()
+                    .and_then(|items| items.first())
+                    .map(|item| match item {
+                        crate::models::responses::ReasoningContentItem::ReasoningText { text }
+                        | crate::models::responses::ReasoningContentItem::Text { text } => {
+                            text.clone()
+                        }
+                    })
+                    .unwrap_or_default();
+                tx.send(reasoning_summary_part_done_event(reasoning_text))
+                    .await
+                    .map_err(|_| {
+                        AppError::internal("failed to send reasoning_summary_part.done")
+                    })?;
+            }
             self.monitor.emit(
                 response_id.to_string(),
                 MonitorEventKind::ResponseItem {
@@ -600,6 +739,28 @@ impl Gateway {
                 .map_err(|_| AppError::internal("failed to send reasoning done"))?;
         }
         if let Some(message) = finalized.message_item.clone() {
+            if let ResponseItem::Message { ref content, .. } = message {
+                let full_text: String = content
+                    .iter()
+                    .filter_map(|c| match c {
+                        crate::models::responses::ContentItem::OutputText { text } => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                if !full_text.is_empty() {
+                    tx.send(output_text_done_event(full_text.clone()))
+                        .await
+                        .map_err(|_| AppError::internal("failed to send output_text.done"))?;
+                    if finalized.content_part_emitted {
+                        tx.send(content_part_done_event(full_text))
+                            .await
+                            .map_err(|_| AppError::internal("failed to send content_part.done"))?;
+                    }
+                }
+            }
             public_history.push(message.clone());
             self.monitor.emit(
                 response_id.to_string(),
@@ -613,6 +774,11 @@ impl Gateway {
                 .await
                 .map_err(|_| AppError::internal("failed to send message done"))?;
         }
+        if !finalized.refusal_text.is_empty() {
+            tx.send(refusal_done_event(finalized.refusal_text.clone()))
+                .await
+                .map_err(|_| AppError::internal("failed to send refusal.done"))?;
+        }
         Ok(())
     }
 
@@ -624,14 +790,16 @@ impl Gateway {
         current_messages: &mut Vec<ChatMessage>,
         public_history: &mut Vec<ResponseItem>,
     ) -> AppResult<()> {
-        let has_web_search = finalized
-            .tool_calls
-            .iter()
-            .any(|call| matches!(call.kind, ToolKind::WebSearch));
+        let can_search = self.config.brave_api_key.is_some();
+        let has_web_search = can_search
+            && finalized
+                .tool_calls
+                .iter()
+                .any(|call| matches!(call.kind, ToolKind::WebSearch));
         let has_client_tool = finalized
             .tool_calls
             .iter()
-            .any(|call| !matches!(call.kind, ToolKind::WebSearch));
+            .any(|call| !matches!(call.kind, ToolKind::WebSearch) || !can_search);
         if has_web_search && has_client_tool {
             return Err(AppError::upstream(
                 "mixed provider-side and client-side tool calls are not supported in v1",
@@ -639,6 +807,21 @@ impl Gateway {
         }
         if has_client_tool {
             for tool_call in &finalized.tool_calls {
+                if let ResponseItem::FunctionCall {
+                    ref call_id,
+                    ref name,
+                    ref arguments,
+                    ..
+                } = tool_call.public_item
+                {
+                    tx.send(function_call_args_done_event(
+                        call_id.clone(),
+                        name.clone(),
+                        arguments.clone(),
+                    ))
+                    .await
+                    .map_err(|_| AppError::internal("failed to send function call args done"))?;
+                }
                 self.monitor.emit(
                     response_id.to_string(),
                     MonitorEventKind::ToolPhase {
@@ -708,11 +891,7 @@ impl Gateway {
             .await
             .map_err(|_| AppError::internal("failed to send web_search start"))?;
 
-        let query = tool_call
-            .arguments
-            .get("query")
-            .and_then(Value::as_str)
-            .ok_or_else(|| AppError::upstream("web_search call missing query"))?;
+        let query = extract_web_search_query(action, &tool_call.arguments)?;
         self.monitor.emit(
             response_id.to_string(),
             MonitorEventKind::ToolPhase {
@@ -720,7 +899,7 @@ impl Gateway {
                 detail: format!("web_search {query}"),
             },
         );
-        let results = self.search.search(query).await?;
+        let results = self.search.search(&query).await?;
 
         let completed = ResponseItem::WebSearchCall {
             id: id.clone(),
@@ -896,6 +1075,178 @@ mod tests {
         assert!(preview.ends_with("...\n[truncated]"));
         assert!(preview.is_char_boundary(preview.len()));
     }
+
+    use super::AccumulatedUsage;
+    use super::failure_event;
+    use crate::models::chat::ChunkUsage;
+
+    #[test]
+    fn accumulated_usage_cached_tokens() {
+        let mut usage = AccumulatedUsage::default();
+        usage.add(ChunkUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            prompt_tokens_details: Some(crate::models::chat::PromptTokensDetails {
+                cached_tokens: 50,
+            }),
+            completion_tokens_details: None,
+        });
+        let result = usage.into_response_usage().unwrap();
+        assert_eq!(result.input_tokens, 100);
+        assert_eq!(result.input_tokens_details.unwrap().cached_tokens, 50);
+    }
+
+    #[test]
+    fn accumulated_usage_reasoning_tokens() {
+        let mut usage = AccumulatedUsage::default();
+        usage.add(ChunkUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            prompt_tokens_details: None,
+            completion_tokens_details: Some(crate::models::chat::CompletionTokensDetails {
+                reasoning_tokens: 30,
+            }),
+        });
+        let result = usage.into_response_usage().unwrap();
+        assert_eq!(result.output_tokens, 25);
+        assert_eq!(result.output_tokens_details.unwrap().reasoning_tokens, 30);
+    }
+
+    #[test]
+    fn accumulated_usage_zero_returns_none() {
+        let usage = AccumulatedUsage::default();
+        assert!(usage.into_response_usage().is_none());
+    }
+
+    use super::extract_web_search_query;
+    use crate::models::responses::WebSearchAction;
+
+    #[test]
+    fn test_run_web_search_rejects_open_page() {
+        let action = Some(WebSearchAction::OpenPage {
+            url: Some("https://example.com".to_string()),
+        });
+        let args = json!({"query": "test"});
+        let result = extract_web_search_query(&action, &args);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported web_search action")
+        );
+    }
+
+    #[test]
+    fn test_run_web_search_rejects_find_in_page() {
+        let action = Some(WebSearchAction::FindInPage {
+            url: Some("https://example.com".to_string()),
+            pattern: Some("test".to_string()),
+        });
+        let args = json!({"query": "test"});
+        let result = extract_web_search_query(&action, &args);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported web_search action")
+        );
+    }
+
+    #[test]
+    fn test_run_web_search_rejects_other_action() {
+        let action = Some(WebSearchAction::Other);
+        let args = json!({"query": "test"});
+        let result = extract_web_search_query(&action, &args);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported web_search action")
+        );
+    }
+
+    #[test]
+    fn test_extract_web_search_query_from_action() {
+        let action = Some(WebSearchAction::Search {
+            query: Some("rust async".to_string()),
+            queries: None,
+        });
+        let args = json!({});
+        let result = extract_web_search_query(&action, &args).unwrap();
+        assert_eq!(result, "rust async");
+    }
+
+    #[test]
+    fn test_extract_web_search_query_fallback_to_arguments() {
+        let action = None;
+        let args = json!({"query": "fallback query"});
+        let result = extract_web_search_query(&action, &args).unwrap();
+        assert_eq!(result, "fallback query");
+    }
+
+    #[test]
+    fn test_extract_web_search_query_search_action_none_query_falls_back() {
+        let action = Some(WebSearchAction::Search {
+            query: None,
+            queries: None,
+        });
+        let args = json!({"query": "from args"});
+        let result = extract_web_search_query(&action, &args).unwrap();
+        assert_eq!(result, "from args");
+    }
+
+    #[test]
+    fn test_max_web_search_rounds_default() {
+        let config =
+            crate::config::Config::from_persisted(&crate::config::PersistedConfig::default())
+                .unwrap();
+        assert_eq!(config.max_web_search_rounds, 5);
+    }
+
+    #[test]
+    fn failure_event_shape() {
+        let error = crate::error::AppError::internal("test error");
+        let event = failure_event(&error);
+        assert_eq!(event.event, "response.failed");
+        assert_eq!(event.data["type"], "response.failed");
+        assert_eq!(event.data["response"]["error"]["code"], "gateway_error");
+        assert_eq!(
+            event.data["response"]["error"]["message"].as_str().unwrap(),
+            "internal server error"
+        );
+    }
+}
+
+fn extract_web_search_query(
+    action: &Option<WebSearchAction>,
+    arguments: &Value,
+) -> AppResult<String> {
+    match action {
+        Some(WebSearchAction::Search { query, .. }) => {
+            if let Some(q) = query {
+                Ok(q.clone())
+            } else {
+                arguments
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .ok_or_else(|| AppError::upstream("web_search call missing query"))
+            }
+        }
+        Some(WebSearchAction::OpenPage { .. })
+        | Some(WebSearchAction::FindInPage { .. })
+        | Some(WebSearchAction::Other) => Err(AppError::upstream("unsupported web_search action")),
+        None => arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .ok_or_else(|| AppError::upstream("web_search call missing query")),
+    }
 }
 
 fn created_event(response_id: &str) -> SseEvent {
@@ -912,59 +1263,154 @@ fn created_event(response_id: &str) -> SseEvent {
     )
 }
 
-fn completed_event(response_id: &str, usage: Option<&ChatCompletionUsage>) -> SseEvent {
+fn completed_event(response: ResponseResource) -> SseEvent {
     json_event(
         "response.completed",
         ResponsesEnvelope {
             kind: "response.completed".to_string(),
-            payload: ResponseCompletedPayload {
-                response: ResponseCompleted {
-                    id: response_id.to_string(),
-                    usage: usage.map(response_usage_from_chat_usage),
+            payload: ResponseCompletedPayload { response },
+        },
+    )
+}
+
+fn incomplete_event(response: ResponseResource) -> SseEvent {
+    json_event(
+        "response.incomplete",
+        ResponsesEnvelope {
+            kind: "response.incomplete".to_string(),
+            payload: ResponseCompletedPayload { response },
+        },
+    )
+}
+
+fn content_part_added_event() -> SseEvent {
+    json_event(
+        "response.content_part.added",
+        ResponsesEnvelope {
+            kind: "response.content_part.added".to_string(),
+            payload: crate::models::responses::ContentPartPayload {
+                content_index: 0,
+                part: crate::models::responses::ContentPartRef {
+                    kind: "output_text".to_string(),
+                    text: String::new(),
                 },
             },
         },
     )
 }
 
-fn response_usage_from_chat_usage(usage: &ChatCompletionUsage) -> ResponseUsage {
-    let reasoning_tokens = usage
-        .completion_tokens_details
-        .as_ref()
-        .map(|details| details.reasoning_tokens)
-        .or(usage.reasoning_tokens);
-    ResponseUsage {
-        input_tokens: usage.prompt_tokens,
-        input_tokens_details: usage.prompt_tokens_details.as_ref().map(|details| {
-            ResponseInputTokensDetails {
-                cached_tokens: details.cached_tokens,
-            }
-        }),
-        output_tokens: usage.completion_tokens,
-        output_tokens_details: reasoning_tokens
-            .map(|reasoning_tokens| ResponseOutputTokensDetails { reasoning_tokens }),
-        total_tokens: usage.total_tokens,
-    }
+fn content_part_done_event(text: String) -> SseEvent {
+    json_event(
+        "response.content_part.done",
+        ResponsesEnvelope {
+            kind: "response.content_part.done".to_string(),
+            payload: crate::models::responses::ContentPartPayload {
+                content_index: 0,
+                part: crate::models::responses::ContentPartRef {
+                    kind: "output_text".to_string(),
+                    text,
+                },
+            },
+        },
+    )
 }
 
-fn force_stream_usage(
-    mut extra_body: std::collections::BTreeMap<String, Value>,
-) -> std::collections::BTreeMap<String, Value> {
-    match extra_body.get_mut("stream_options") {
-        Some(Value::Object(stream_options)) => {
-            stream_options.insert("include_usage".to_string(), Value::Bool(true));
-        }
-        _ => {
-            extra_body.insert(
-                "stream_options".to_string(),
-                Value::Object(serde_json::Map::from_iter([(
-                    "include_usage".to_string(),
-                    Value::Bool(true),
-                )])),
-            );
-        }
+fn reasoning_summary_part_added_event() -> SseEvent {
+    json_event(
+        "response.reasoning_summary_part.added",
+        ResponsesEnvelope {
+            kind: "response.reasoning_summary_part.added".to_string(),
+            payload: crate::models::responses::ReasoningSummaryPartPayload {
+                content_index: 0,
+                part: crate::models::responses::ReasoningSummaryPartRef {
+                    kind: "summary_text".to_string(),
+                    text: String::new(),
+                },
+            },
+        },
+    )
+}
+
+fn reasoning_summary_part_done_event(text: String) -> SseEvent {
+    json_event(
+        "response.reasoning_summary_part.done",
+        ResponsesEnvelope {
+            kind: "response.reasoning_summary_part.done".to_string(),
+            payload: crate::models::responses::ReasoningSummaryPartPayload {
+                content_index: 0,
+                part: crate::models::responses::ReasoningSummaryPartRef {
+                    kind: "summary_text".to_string(),
+                    text,
+                },
+            },
+        },
+    )
+}
+
+fn refusal_delta_event(delta: String) -> SseEvent {
+    json_event(
+        "response.refusal.delta",
+        ResponsesEnvelope {
+            kind: "response.refusal.delta".to_string(),
+            payload: crate::models::responses::RefusalDeltaPayload { delta },
+        },
+    )
+}
+
+fn refusal_done_event(refusal: String) -> SseEvent {
+    json_event(
+        "response.refusal.done",
+        ResponsesEnvelope {
+            kind: "response.refusal.done".to_string(),
+            payload: crate::models::responses::RefusalDonePayload { refusal },
+        },
+    )
+}
+
+#[derive(Default)]
+struct AccumulatedUsage {
+    input_tokens: i64,
+    output_tokens: i64,
+    total_tokens: i64,
+    cached_input_tokens: i64,
+    reasoning_output_tokens: i64,
+}
+
+impl AccumulatedUsage {
+    fn add(&mut self, usage: ChunkUsage) {
+        self.input_tokens += usage.prompt_tokens;
+        self.output_tokens += usage.completion_tokens;
+        self.total_tokens += usage.total_tokens;
+        self.cached_input_tokens += usage
+            .prompt_tokens_details
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
+        self.reasoning_output_tokens += usage
+            .completion_tokens_details
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
     }
-    extra_body
+
+    fn into_response_usage(self) -> Option<ResponseUsage> {
+        if self.total_tokens == 0 {
+            return None;
+        }
+        Some(ResponseUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            total_tokens: self.total_tokens,
+            input_tokens_details: (self.cached_input_tokens > 0).then_some(
+                ResponseInputTokensDetails {
+                    cached_tokens: self.cached_input_tokens,
+                },
+            ),
+            output_tokens_details: (self.reasoning_output_tokens > 0).then_some(
+                ResponseOutputTokensDetails {
+                    reasoning_tokens: self.reasoning_output_tokens,
+                },
+            ),
+        })
+    }
 }
 
 fn output_item_added_event(item: ResponseItem) -> SseEvent {
@@ -999,9 +1445,9 @@ fn output_text_delta_event(delta: String) -> SseEvent {
 
 fn reasoning_text_delta_event(delta: String) -> SseEvent {
     json_event(
-        "response.reasoning_text.delta",
+        "response.reasoning_summary_text.delta",
         ResponsesEnvelope {
-            kind: "response.reasoning_text.delta".to_string(),
+            kind: "response.reasoning_summary_text.delta".to_string(),
             payload: ReasoningDeltaPayload {
                 delta,
                 content_index: 0,
@@ -1019,9 +1465,60 @@ fn failure_event(error: &AppError) -> SseEvent {
                 response: FailedResponse {
                     error: FailedError {
                         code: "gateway_error".to_string(),
-                        message: error.to_string(),
+                        message: error.client_message.clone(),
                     },
                 },
+            },
+        },
+    )
+}
+
+fn in_progress_event(response_id: &str) -> SseEvent {
+    json_event(
+        "response.in_progress",
+        ResponsesEnvelope {
+            kind: "response.in_progress".to_string(),
+            payload: ResponseCreatedPayload {
+                response: ResponseStub {
+                    id: response_id.to_string(),
+                },
+            },
+        },
+    )
+}
+
+fn output_text_done_event(text: String) -> SseEvent {
+    json_event(
+        "response.output_text.done",
+        ResponsesEnvelope {
+            kind: "response.output_text.done".to_string(),
+            payload: crate::models::responses::TextDonePayload {
+                text,
+                content_index: 0,
+            },
+        },
+    )
+}
+
+fn function_call_args_delta_event(call_id: String, delta: String) -> SseEvent {
+    json_event(
+        "response.function_call_arguments.delta",
+        ResponsesEnvelope {
+            kind: "response.function_call_arguments.delta".to_string(),
+            payload: crate::models::responses::FunctionCallArgsDeltaPayload { call_id, delta },
+        },
+    )
+}
+
+fn function_call_args_done_event(call_id: String, name: String, arguments: String) -> SseEvent {
+    json_event(
+        "response.function_call_arguments.done",
+        ResponsesEnvelope {
+            kind: "response.function_call_arguments.done".to_string(),
+            payload: crate::models::responses::FunctionCallArgsDonePayload {
+                call_id,
+                name,
+                arguments,
             },
         },
     )

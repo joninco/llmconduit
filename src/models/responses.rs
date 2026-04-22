@@ -3,22 +3,44 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
+fn deserialize_input<'de, D>(deserializer: D) -> Result<Vec<ResponseItem>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum InputHelper {
+        Bare(String),
+        Items(Vec<ResponseItem>),
+    }
+    let helper = InputHelper::deserialize(deserializer)?;
+    Ok(match helper {
+        InputHelper::Bare(text) => vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputText { text }],
+            phase: None,
+        }],
+        InputHelper::Items(items) => items,
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesRequest {
     pub model: String,
     #[serde(default)]
     pub instructions: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_input")]
     pub input: Vec<ResponseItem>,
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
     #[serde(default = "default_tool_choice")]
-    pub tool_choice: String,
+    pub tool_choice: Value,
     #[serde(default)]
     pub parallel_tool_calls: bool,
     #[serde(default)]
     pub reasoning: Option<ReasoningRequest>,
-    #[serde(default)]
+    #[serde(default = "default_store_true")]
     pub store: bool,
     #[serde(default)]
     pub stream: bool,
@@ -34,10 +56,28 @@ pub struct ResponsesRequest {
     pub client_metadata: Option<HashMap<String, String>>,
     #[serde(default)]
     pub previous_response_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+    #[serde(default)]
+    pub truncation: Option<Value>,
+    #[serde(default)]
+    pub metadata: Option<HashMap<String, Value>>,
 }
 
-fn default_tool_choice() -> String {
-    "auto".to_string()
+fn default_tool_choice() -> Value {
+    Value::String("auto".to_string())
+}
+
+fn default_store_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -49,6 +89,11 @@ pub enum ToolSpec {
         #[serde(default)]
         strict: bool,
         parameters: Value,
+    },
+    Namespace {
+        name: String,
+        description: String,
+        tools: Vec<NamespaceToolSpec>,
     },
     ToolSearch {
         execution: String,
@@ -76,6 +121,18 @@ pub enum ToolSpec {
     ImageGeneration {
         #[serde(default)]
         output_format: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NamespaceToolSpec {
+    Function {
+        name: String,
+        description: String,
+        #[serde(default)]
+        strict: bool,
+        parameters: Value,
     },
 }
 
@@ -286,32 +343,49 @@ pub struct ResponseStub {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseCompletedPayload {
-    pub response: ResponseCompleted,
+    pub response: ResponseResource,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct ResponseCompleted {
+pub struct ResponseResource {
     pub id: String,
+    pub object: String,
+    pub created_at: i64,
+    pub status: String,
+    pub output: Vec<ResponseItem>,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<ResponseUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<HashMap<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete_details: Option<IncompleteDetails>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IncompleteDetails {
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseUsage {
-    pub input_tokens: u64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub total_tokens: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_tokens_details: Option<ResponseInputTokensDetails>,
-    pub output_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens_details: Option<ResponseOutputTokensDetails>,
-    pub total_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseInputTokensDetails {
-    pub cached_tokens: u64,
+    pub cached_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseOutputTokensDetails {
-    pub reasoning_tokens: u64,
+    pub reasoning_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -346,6 +420,66 @@ pub struct FailedError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TextDonePayload {
+    pub text: String,
+    pub content_index: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionCallArgsDeltaPayload {
+    pub call_id: String,
+    pub delta: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionCallArgsDonePayload {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RefusalDeltaPayload {
+    pub delta: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RefusalDonePayload {
+    pub refusal: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentPartPayload {
+    pub content_index: usize,
+    pub part: ContentPartRef,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ContentPartRef {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReasoningSummaryPartPayload {
+    pub content_index: usize,
+    pub part: ReasoningSummaryPartRef,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReasoningSummaryPartRef {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
+}
+
+pub enum TerminalStatus {
+    Completed,
+    Incomplete { reason: String },
+}
+
 impl ResponseItem {
     pub fn message_text(role: impl Into<String>, text: impl Into<String>) -> Self {
         Self::Message {
@@ -354,5 +488,95 @@ impl ResponseItem {
             content: vec![ContentItem::OutputText { text: text.into() }],
             phase: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn response_item_message_serde_roundtrip() {
+        let item = ResponseItem::Message {
+            id: Some("msg_1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "hello".to_string(),
+            }],
+            phase: None,
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let roundtripped: ResponseItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(item, roundtripped);
+    }
+
+    #[test]
+    fn response_item_function_call_serde_roundtrip() {
+        let item = ResponseItem::FunctionCall {
+            id: Some("fc_1".to_string()),
+            name: "calculator".to_string(),
+            namespace: Some("mcp__math".to_string()),
+            arguments: r#"{"expr":"1+1"}"#.to_string(),
+            call_id: "call_1".to_string(),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let roundtripped: ResponseItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(item, roundtripped);
+    }
+
+    #[test]
+    fn test_store_defaults_to_true() {
+        let json = r#"{"model":"gpt-4","input":[]}"#;
+        let req: ResponsesRequest = serde_json::from_str(json).unwrap();
+        assert!(req.store, "store should default to true");
+    }
+
+    #[test]
+    fn test_store_explicit_false() {
+        let json = r#"{"model":"gpt-4","input":[],"store":false}"#;
+        let req: ResponsesRequest = serde_json::from_str(json).unwrap();
+        assert!(!req.store, "store should be false when explicitly set");
+    }
+
+    #[test]
+    fn test_input_bare_string_deserializes() {
+        let json = r#"{"model":"gpt-4","input":"hello","stream":true}"#;
+        let req: ResponsesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.input.len(), 1);
+        match &req.input[0] {
+            ResponseItem::Message { role, content, .. } => {
+                assert_eq!(role, "user");
+                assert_eq!(content.len(), 1);
+                match &content[0] {
+                    ContentItem::InputText { text } => assert_eq!(text, "hello"),
+                    other => panic!("expected InputText, got {:?}", other),
+                }
+            }
+            other => panic!("expected Message, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_penalties_roundtrip() {
+        let json = r#"{"model":"gpt-4","input":[],"frequency_penalty":0.5,"presence_penalty":0.3}"#;
+        let req: ResponsesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.frequency_penalty, Some(0.5));
+        assert_eq!(req.presence_penalty, Some(0.3));
+    }
+
+    #[test]
+    fn response_item_web_search_call_serde_roundtrip() {
+        let item = ResponseItem::WebSearchCall {
+            id: Some("ws_1".to_string()),
+            status: Some("completed".to_string()),
+            action: Some(WebSearchAction::Search {
+                query: Some("rust async".to_string()),
+                queries: None,
+            }),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        let roundtripped: ResponseItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(item, roundtripped);
     }
 }

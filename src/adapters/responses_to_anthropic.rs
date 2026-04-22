@@ -24,6 +24,7 @@ pub struct AnthropicStreamConverter {
     open_block: Option<ContentBlockState>,
     has_tool_calls: bool,
     started: bool,
+    pending_input_tokens: Option<u64>,
 }
 
 impl AnthropicStreamConverter {
@@ -35,6 +36,7 @@ impl AnthropicStreamConverter {
             open_block: None,
             has_tool_calls: false,
             started: false,
+            pending_input_tokens: None,
         }
     }
 
@@ -44,11 +46,13 @@ impl AnthropicStreamConverter {
             "response.created" => self.handle_created(&mut output),
             "response.output_item.added" => self.handle_item_added(&event.data, &mut output),
             "response.output_text.delta" => self.handle_text_delta(&event.data, &mut output),
-            "response.reasoning_text.delta" => {
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 self.handle_reasoning_delta(&event.data, &mut output);
             }
             "response.output_item.done" => self.handle_item_done(&event.data, &mut output),
-            "response.completed" => self.handle_completed(&mut output),
+            "response.completed" | "response.incomplete" => {
+                self.handle_completed(&event.data, &mut output)
+            }
             "response.failed" => self.handle_failed(&event.data, &mut output),
             _ => {}
         }
@@ -68,7 +72,10 @@ impl AnthropicStreamConverter {
                     model: self.model.clone(),
                     stop_reason: None,
                     stop_sequence: None,
-                    usage: AnthropicUsage { output_tokens: 0 },
+                    usage: AnthropicUsage {
+                        input_tokens: Some(self.pending_input_tokens.unwrap_or(0)),
+                        output_tokens: Some(0),
+                    },
                 },
             });
         }
@@ -175,19 +182,28 @@ impl AnthropicStreamConverter {
         }
     }
 
-    fn handle_completed(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
+    fn handle_completed(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
         self.close_open_block(output);
-        let stop_reason = if self.has_tool_calls {
-            "tool_use"
+        let usage = response_usage(data);
+        if let Some(usage) = usage.as_ref() {
+            self.pending_input_tokens = Some(usage.input_tokens);
+        }
+        let stop_reason = if let Some(reason) = response_stop_reason(data) {
+            reason
+        } else if self.has_tool_calls {
+            "tool_use".to_string()
         } else {
-            "end_turn"
+            "end_turn".to_string()
         };
         output.push(AnthropicStreamEvent::MessageDelta {
             delta: AnthropicMessageDeltaBody {
-                stop_reason: stop_reason.to_string(),
+                stop_reason,
                 stop_sequence: None,
             },
-            usage: AnthropicUsage { output_tokens: 0 },
+            usage: AnthropicUsage {
+                input_tokens: None,
+                output_tokens: Some(usage.as_ref().map_or(0, |usage| usage.output_tokens)),
+            },
         });
         output.push(AnthropicStreamEvent::MessageStop);
     }
@@ -299,6 +315,7 @@ pub struct AnthropicStreamCollector {
     stop_reason: Option<String>,
     blocks: Vec<AccumulatedBlock>,
     current_block: Option<AccumulatedBlock>,
+    input_tokens: u64,
     output_tokens: u64,
     error: Option<AnthropicErrorBody>,
 }
@@ -312,18 +329,24 @@ impl AnthropicStreamCollector {
             stop_reason: None,
             blocks: Vec::new(),
             current_block: None,
+            input_tokens: 0,
             output_tokens: 0,
             error: None,
         }
     }
 
     pub fn process(&mut self, event: &SseEvent) {
+        if let Some(usage) = response_usage(&event.data) {
+            self.input_tokens = usage.input_tokens;
+            self.output_tokens = usage.output_tokens;
+        }
         let stream_events = self.inner.convert(event);
         for se in stream_events {
             match se {
                 AnthropicStreamEvent::MessageStart { message } => {
                     self.message_id = Some(message.id);
-                    self.output_tokens = message.usage.output_tokens;
+                    self.input_tokens = message.usage.input_tokens.unwrap_or(0);
+                    self.output_tokens = message.usage.output_tokens.unwrap_or(0);
                 }
                 AnthropicStreamEvent::ContentBlockStart { content_block, .. } => {
                     self.current_block = match content_block {
@@ -374,7 +397,7 @@ impl AnthropicStreamCollector {
                 }
                 AnthropicStreamEvent::MessageDelta { delta, usage } => {
                     self.stop_reason = Some(delta.stop_reason);
-                    self.output_tokens = usage.output_tokens;
+                    self.output_tokens = usage.output_tokens.unwrap_or(0);
                 }
                 AnthropicStreamEvent::Error { error } => {
                     self.error = Some(error);
@@ -420,11 +443,34 @@ impl AnthropicStreamCollector {
             stop_reason: self.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
             stop_sequence: None,
             usage: AnthropicMessageUsage {
-                input_tokens: 0,
+                input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
             },
         })
     }
+}
+
+fn response_usage(data: &Value) -> Option<AnthropicMessageUsage> {
+    let usage = data.get("response")?.get("usage")?;
+    Some(AnthropicMessageUsage {
+        input_tokens: usage.get("input_tokens")?.as_u64()?,
+        output_tokens: usage.get("output_tokens")?.as_u64()?,
+    })
+}
+
+fn response_stop_reason(data: &Value) -> Option<String> {
+    if let Some(reason) = data
+        .get("response")
+        .and_then(|response| response.get("incomplete_details"))
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+    {
+        return Some(match reason {
+            "max_output_tokens" => "max_tokens".to_string(),
+            other => other.to_string(),
+        });
+    }
+    None
 }
 
 #[cfg(test)]
@@ -496,6 +542,41 @@ mod tests {
             data: json!({
                 "type": "response.completed",
                 "response": { "id": "resp_123" }
+            }),
+        }
+    }
+
+    fn completed_event_with_usage(input_tokens: u64, output_tokens: u64) -> SseEvent {
+        SseEvent {
+            event: "response.completed".to_string(),
+            data: json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_123",
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    }
+                }
+            }),
+        }
+    }
+
+    fn incomplete_event(reason: &str, input_tokens: u64, output_tokens: u64) -> SseEvent {
+        SseEvent {
+            event: "response.incomplete".to_string(),
+            data: json!({
+                "type": "response.incomplete",
+                "response": {
+                    "id": "resp_123",
+                    "usage": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    },
+                    "incomplete_details": {
+                        "reason": reason,
+                    }
+                }
             }),
         }
     }
@@ -663,6 +744,70 @@ mod tests {
         let events = converter.convert(&failed_event("upstream timeout"));
 
         assert_eq!(event_types(&events), vec!["error"]);
+    }
+
+    #[test]
+    fn emits_usage_from_completed_response() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [created_event(), completed_event_with_usage(12, 5)]
+            .iter()
+            .flat_map(|e| converter.convert(e))
+            .collect();
+
+        let message_start = events
+            .iter()
+            .find_map(|event| match event {
+                AnthropicStreamEvent::MessageStart { message } => Some(message),
+                _ => None,
+            })
+            .expect("message_start");
+        assert_eq!(message_start.usage.input_tokens, Some(0));
+        assert_eq!(message_start.usage.output_tokens, Some(0));
+
+        let message_delta = events
+            .iter()
+            .find_map(|event| match event {
+                AnthropicStreamEvent::MessageDelta { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .expect("message_delta");
+        assert_eq!(message_delta.output_tokens, Some(5));
+    }
+
+    #[test]
+    fn converts_incomplete_to_max_tokens_stop_reason() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [created_event(), incomplete_event("max_output_tokens", 12, 5)]
+            .iter()
+            .flat_map(|e| converter.convert(e))
+            .collect();
+
+        let message_delta = events
+            .iter()
+            .find_map(|event| match event {
+                AnthropicStreamEvent::MessageDelta { delta, .. } => Some(delta),
+                _ => None,
+            })
+            .expect("message_delta");
+        assert_eq!(message_delta.stop_reason, "max_tokens");
+    }
+
+    #[test]
+    fn collector_returns_final_usage() {
+        let mut collector = AnthropicStreamCollector::new("claude-3".to_string());
+        for event in [
+            created_event(),
+            item_added_event("message", "assistant"),
+            text_delta_event("Hello"),
+            item_done_event("message", json!({})),
+            completed_event_with_usage(12, 5),
+        ] {
+            collector.process(&event);
+        }
+
+        let response = collector.into_response().expect("response");
+        assert_eq!(response.usage.input_tokens, 12);
+        assert_eq!(response.usage.output_tokens, 5);
     }
 
     #[test]

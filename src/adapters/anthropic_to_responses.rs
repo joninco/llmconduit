@@ -13,21 +13,43 @@ use crate::models::responses::ReasoningRequest;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponsesRequest;
 use crate::models::responses::ToolSpec;
+use serde_json::json;
 use serde_json::Value;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest> {
+    if request.top_k.is_some() {
+        return Err(AppError::bad_request(
+            "Anthropic top_k is not supported by this gateway",
+        ));
+    }
+    if request
+        .stop_sequences
+        .as_ref()
+        .is_some_and(|sequences| !sequences.is_empty())
+    {
+        return Err(AppError::bad_request(
+            "Anthropic stop_sequences are not supported by this gateway",
+        ));
+    }
     let instructions = extract_system_text(&request.system);
     let input = convert_messages(&request.messages)?;
     let tools = convert_tools(&request.tools);
     let reasoning = convert_thinking(&request.thinking);
+    let tool_choice = convert_tool_choice(request.tool_choice);
+    let metadata = convert_metadata(request.metadata)?;
+    let max_output_tokens = request.max_tokens.map(|value| {
+        i64::try_from(value)
+            .map_err(|_| AppError::bad_request("Anthropic max_tokens exceeds supported range"))
+    });
 
     Ok(ResponsesRequest {
         model: request.model,
         instructions,
         input,
         tools,
-        tool_choice: "auto".to_string(),
+        tool_choice,
         parallel_tool_calls: false,
         reasoning,
         store: false,
@@ -38,16 +60,25 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         text: None,
         client_metadata: None,
         previous_response_id: None,
+        temperature: request.temperature,
+        top_p: request.top_p,
+        max_output_tokens: max_output_tokens.transpose()?,
+        frequency_penalty: None,
+        presence_penalty: None,
+        truncation: None,
+        metadata,
     })
 }
 
 fn extract_system_text(system: &Option<AnthropicSystemContent>) -> String {
     match system {
-        Some(AnthropicSystemContent::Text(text)) => text.clone(),
+        Some(AnthropicSystemContent::Text(text)) => strip_billing_nonce(text),
         Some(AnthropicSystemContent::Blocks(blocks)) => blocks
             .iter()
             .filter_map(|block| match block {
-                crate::models::anthropic::AnthropicTextBlock::Text { text } => Some(text.clone()),
+                crate::models::anthropic::AnthropicTextBlock::Text { text } => {
+                    Some(strip_billing_nonce(text))
+                }
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -86,8 +117,9 @@ fn convert_message(
 ) -> AppResult<()> {
     match content {
         AnthropicContent::Text(text) => {
+            let text = normalize_message_text(role, text);
             if !text.is_empty() {
-                items.push(text_message_item(role, text));
+                items.push(text_message_item(role, &text));
             }
         }
         AnthropicContent::Blocks(blocks) => {
@@ -97,15 +129,16 @@ fn convert_message(
             for block in blocks {
                 match block {
                     AnthropicContentBlock::Text { text } => {
+                        let text = normalize_message_text(role, text);
                         if role == "user" {
-                            content_items.push(ContentItem::InputText { text: text.clone() });
+                            content_items.push(ContentItem::InputText { text });
                         } else {
-                            content_items.push(ContentItem::OutputText { text: text.clone() });
+                            content_items.push(ContentItem::OutputText { text });
                         }
                     }
                     AnthropicContentBlock::Image { source } => {
                         content_items.push(ContentItem::InputImage {
-                            image_url: image_source_to_url(source),
+                            image_url: image_source_to_url(source)?,
                         });
                     }
                     _ => {}
@@ -163,6 +196,79 @@ fn convert_message(
     Ok(())
 }
 
+fn convert_tool_choice(tool_choice: Option<crate::models::anthropic::AnthropicToolChoice>) -> Value {
+    match tool_choice {
+        Some(crate::models::anthropic::AnthropicToolChoice::Auto) | None => {
+            Value::String("auto".to_string())
+        }
+        Some(crate::models::anthropic::AnthropicToolChoice::Any) => {
+            Value::String("required".to_string())
+        }
+        Some(crate::models::anthropic::AnthropicToolChoice::None) => {
+            Value::String("none".to_string())
+        }
+        Some(crate::models::anthropic::AnthropicToolChoice::Tool { name }) => {
+            json!({"type": "function", "function": {"name": name}})
+        }
+    }
+}
+
+fn convert_metadata(metadata: Option<Value>) -> AppResult<Option<HashMap<String, Value>>> {
+    match metadata {
+        None => Ok(None),
+        Some(Value::Object(map)) => Ok(Some(map.into_iter().collect())),
+        Some(_) => Err(AppError::bad_request(
+            "Anthropic metadata must be a JSON object",
+        )),
+    }
+}
+
+fn normalize_message_text(role: &str, text: &str) -> String {
+    if role == "user" {
+        strip_date_injection(text)
+    } else {
+        text.to_string()
+    }
+}
+
+fn strip_billing_nonce(text: &str) -> String {
+    join_filtered_lines(text, |line| !line.starts_with("x-anthropic-billing-header:"))
+}
+
+fn strip_date_injection(text: &str) -> String {
+    join_filtered_lines(text, |line| !is_date_injection_line(line))
+}
+
+fn join_filtered_lines(text: &str, keep: impl Fn(&str) -> bool) -> String {
+    let trailing_newline = text.ends_with('\n');
+    let lines: Vec<&str> = text.lines().filter(|line| keep(line)).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut normalized = lines.join("\n");
+    if trailing_newline {
+        normalized.push('\n');
+    }
+    normalized
+}
+
+fn is_date_injection_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("Today's date is ") else {
+        return false;
+    };
+    let Some(date) = rest.strip_suffix('.') else {
+        return false;
+    };
+    let bytes = date.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+}
+
 fn text_message_item(role: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -180,15 +286,31 @@ fn text_message_item(role: &str, text: &str) -> ResponseItem {
     }
 }
 
-fn image_source_to_url(source: &AnthropicImageSource) -> String {
+fn image_source_to_url(source: &AnthropicImageSource) -> AppResult<String> {
     match source.kind.as_str() {
         "base64" => {
             let media_type = source.media_type.as_deref().unwrap_or("image/png");
-            let data = source.data.as_deref().unwrap_or("");
-            format!("data:{media_type};base64,{data}")
+            let data = source
+                .data
+                .as_deref()
+                .filter(|data| !data.is_empty())
+                .ok_or_else(|| {
+                    AppError::bad_request("Anthropic base64 image source is missing data")
+                })?;
+            Ok(format!("data:{media_type};base64,{data}"))
         }
-        "url" => source.url.clone().unwrap_or_default(),
-        _ => String::new(),
+        "url" => source
+            .url
+            .clone()
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| AppError::bad_request("Anthropic image source is missing url")),
+        "file" => Err(AppError::bad_request(format!(
+            "Anthropic image source type \"file\" is not supported by this gateway (file_id={})",
+            source.file_id.as_deref().unwrap_or("unknown")
+        ))),
+        other => Err(AppError::bad_request(format!(
+            "unsupported Anthropic image source type \"{other}\""
+        ))),
     }
 }
 
@@ -217,15 +339,19 @@ fn extract_tool_result_content(content: &Option<AnthropicContent>) -> Value {
 
 fn convert_tools(tools: &Option<Vec<AnthropicTool>>) -> Vec<ToolSpec> {
     match tools {
-        Some(tools) => tools
-            .iter()
-            .map(|tool| ToolSpec::Function {
-                name: tool.name.clone(),
-                description: tool.description.clone().unwrap_or_default(),
-                strict: false,
-                parameters: tool.input_schema.clone(),
-            })
-            .collect(),
+        Some(tools) => {
+            let mut sorted_tools = tools.clone();
+            sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
+            sorted_tools
+                .into_iter()
+                .map(|tool| ToolSpec::Function {
+                    name: tool.name,
+                    description: tool.description.unwrap_or_default(),
+                    strict: false,
+                    parameters: tool.input_schema,
+                })
+                .collect()
+        }
         None => Vec::new(),
     }
 }
@@ -243,26 +369,41 @@ mod tests {
         let request = AnthropicRequest {
             model: "claude-3-5-sonnet-20241022".to_string(),
             max_tokens: Some(1024),
-            system: Some(AnthropicSystemContent::Text("Be helpful".to_string())),
+            system: Some(AnthropicSystemContent::Text(
+                "x-anthropic-billing-header: nonce\nBe helpful".to_string(),
+            )),
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
-                content: AnthropicContent::Text("Hello".to_string()),
+                content: AnthropicContent::Text("Today's date is 2026-04-21.\nHello".to_string()),
             }],
             tools: None,
             tool_choice: None,
             stream: true,
-            temperature: None,
-            top_p: None,
+            temperature: Some(0.2),
+            top_p: Some(0.7),
             top_k: None,
             stop_sequences: None,
-            metadata: None,
+            metadata: Some(json!({"source": "anthropic"})),
             thinking: None,
         };
 
         let result = convert_request(request).expect("convert");
         assert_eq!(result.model, "claude-3-5-sonnet-20241022");
         assert_eq!(result.instructions, "Be helpful");
+        assert_eq!(result.max_output_tokens, Some(1024));
+        assert_eq!(result.temperature, Some(0.2));
+        assert_eq!(result.top_p, Some(0.7));
+        assert_eq!(
+            result.metadata.as_ref().and_then(|metadata| metadata.get("source")),
+            Some(&json!("anthropic"))
+        );
         assert_eq!(result.input.len(), 1);
+        assert!(matches!(
+            &result.input[0],
+            ResponseItem::Message { role, content, .. }
+                if role == "user"
+                    && matches!(&content[0], ContentItem::InputText { text } if text == "Hello")
+        ));
         assert_eq!(result.stream, true);
     }
 
@@ -342,15 +483,22 @@ mod tests {
                 role: "user".to_string(),
                 content: AnthropicContent::Text("Hi".to_string()),
             }],
-            tools: Some(vec![AnthropicTool {
-                name: "get_weather".to_string(),
-                description: Some("Get weather".to_string()),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": { "location": { "type": "string" } },
-                    "required": ["location"]
-                }),
-            }]),
+            tools: Some(vec![
+                AnthropicTool {
+                    name: "zulu".to_string(),
+                    description: Some("Z".to_string()),
+                    input_schema: json!({"type": "object"}),
+                },
+                AnthropicTool {
+                    name: "alpha".to_string(),
+                    description: Some("A".to_string()),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": { "location": { "type": "string" } },
+                        "required": ["location"]
+                    }),
+                },
+            ]),
             tool_choice: None,
             stream: true,
             temperature: None,
@@ -362,9 +510,9 @@ mod tests {
         };
 
         let result = convert_request(request).expect("convert");
-        assert_eq!(result.tools.len(), 1);
+        assert_eq!(result.tools.len(), 2);
         assert!(
-            matches!(&result.tools[0], ToolSpec::Function { name, .. } if name == "get_weather")
+            matches!(&result.tools[0], ToolSpec::Function { name, .. } if name == "alpha")
         );
     }
 
@@ -426,15 +574,102 @@ mod tests {
     }
 
     #[test]
+    fn converts_anthropic_tool_choice_variants() {
+        let request = AnthropicRequest {
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            max_tokens: Some(1024),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("Hello".to_string()),
+            }],
+            tools: Some(vec![AnthropicTool {
+                name: "echo".to_string(),
+                description: Some("Echo".to_string()),
+                input_schema: json!({"type": "object"}),
+            }]),
+            tool_choice: Some(AnthropicToolChoice::Tool {
+                name: "echo".to_string(),
+            }),
+            stream: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            metadata: None,
+            thinking: None,
+        };
+
+        let tool_specific = convert_request(request).expect("convert");
+        assert_eq!(
+            tool_specific.tool_choice,
+            json!({"type": "function", "function": {"name": "echo"}})
+        );
+
+        assert_eq!(
+            convert_tool_choice(Some(AnthropicToolChoice::Any)),
+            Value::String("required".to_string())
+        );
+        assert_eq!(
+            convert_tool_choice(Some(AnthropicToolChoice::None)),
+            Value::String("none".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_anthropic_fields() {
+        let request = AnthropicRequest {
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            max_tokens: Some(1024),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("Hello".to_string()),
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            temperature: None,
+            top_p: None,
+            top_k: Some(5),
+            stop_sequences: None,
+            metadata: None,
+            thinking: None,
+        };
+        assert!(convert_request(request).is_err());
+
+        let request = AnthropicRequest {
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            max_tokens: Some(1024),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("Hello".to_string()),
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: Some(vec!["stop".to_string()]),
+            metadata: None,
+            thinking: None,
+        };
+        assert!(convert_request(request).is_err());
+    }
+
+    #[test]
     fn converts_base64_image_to_data_url() {
         let source = AnthropicImageSource {
             kind: "base64".to_string(),
             media_type: Some("image/png".to_string()),
             data: Some("iVBORw0KGgo=".to_string()),
             url: None,
+            file_id: None,
         };
         assert_eq!(
-            image_source_to_url(&source),
+            image_source_to_url(&source).expect("image url"),
             "data:image/png;base64,iVBORw0KGgo="
         );
     }
@@ -446,7 +681,23 @@ mod tests {
             media_type: None,
             data: None,
             url: Some("https://example.com/img.png".to_string()),
+            file_id: None,
         };
-        assert_eq!(image_source_to_url(&source), "https://example.com/img.png");
+        assert_eq!(
+            image_source_to_url(&source).expect("image url"),
+            "https://example.com/img.png"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_file_image_source() {
+        let source = AnthropicImageSource {
+            kind: "file".to_string(),
+            media_type: None,
+            data: None,
+            url: None,
+            file_id: Some("file_123".to_string()),
+        };
+        assert!(image_source_to_url(&source).is_err());
     }
 }

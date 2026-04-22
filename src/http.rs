@@ -136,17 +136,16 @@ async fn collect_anthropic_response(
     }
     match collector.into_response() {
         Ok(msg) => Ok(Json(msg).into_response()),
-        Err(err) => Ok(anthropic_error_response(AppError::Upstream(err.message))),
+        Err(err) => Ok(anthropic_error_response(AppError::upstream(err.message))),
     }
 }
 
 fn anthropic_error_response(err: AppError) -> Response {
     let status = err.status_code();
-    let error_type = match &err {
-        AppError::BadRequest(_) => "invalid_request_error",
-        AppError::Conflict(_) => "invalid_request_error",
-        AppError::Upstream(_) => "api_error",
-        AppError::Internal(_) => "api_error",
+    let error_type = match err.status_code() {
+        axum::http::StatusCode::BAD_REQUEST => "invalid_request_error",
+        axum::http::StatusCode::CONFLICT => "invalid_request_error",
+        _ => "api_error",
     };
     let body = serde_json::json!({
         "type": "error",
