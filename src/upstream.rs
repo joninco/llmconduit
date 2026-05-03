@@ -27,6 +27,7 @@ pub trait UpstreamClient: Send + Sync {
         request: &ChatCompletionRequest,
     ) -> AppResult<UpstreamStream>;
     async fn list_models(&self) -> AppResult<reqwest::Response>;
+    async fn supported_model_ids(&self) -> AppResult<Vec<String>>;
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +147,11 @@ impl UpstreamClient for ReqwestUpstreamClient {
         }
         Ok(response)
     }
+
+    async fn supported_model_ids(&self) -> AppResult<Vec<String>> {
+        let response = self.list_models().await?;
+        collect_supported_model_ids(response).await
+    }
 }
 
 async fn ensure_success(
@@ -195,6 +201,37 @@ pub async fn collect_models_response(
         .await
         .map_err(|err| AppError::upstream(format!("invalid upstream /models JSON: {err}")))?;
     Ok((status, body, etag))
+}
+
+pub async fn collect_supported_model_ids(response: reqwest::Response) -> AppResult<Vec<String>> {
+    let (_, body, _) = collect_models_response(response).await?;
+    Ok(extract_supported_model_ids(&body))
+}
+
+fn extract_supported_model_ids(body: &Value) -> Vec<String> {
+    match body {
+        Value::Object(map) => map
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|entries| extract_model_ids_from_array(entries))
+            .unwrap_or_default(),
+        Value::Array(entries) => extract_model_ids_from_array(entries),
+        _ => Vec::new(),
+    }
+}
+
+fn extract_model_ids_from_array(entries: &[Value]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            Value::String(id) => Some(id.clone()),
+            Value::Object(map) => map
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            _ => None,
+        })
+        .collect()
 }
 
 fn sanitize_chat_request(
@@ -266,6 +303,7 @@ fn stringify_json_value(value: Value) -> Value {
 mod tests {
     use super::ReqwestUpstreamClient;
     use super::UpstreamRequestLogger;
+    use super::extract_supported_model_ids;
     use super::sanitize_chat_request;
     use crate::models::chat::ChatCompletionRequest;
     use crate::models::chat::ChatMessage;
@@ -643,5 +681,28 @@ mod tests {
             super::sanitize_message_content(text.clone(), false),
             Some(text)
         );
+    }
+
+    #[test]
+    fn extract_supported_model_ids_reads_standard_models_list() {
+        let body = serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "glm-5.1"},
+                {"id": "Qwen3.5"},
+                "grok-4"
+            ]
+        });
+
+        assert_eq!(
+            extract_supported_model_ids(&body),
+            vec!["glm-5.1", "Qwen3.5", "grok-4"]
+        );
+    }
+
+    #[test]
+    fn extract_supported_model_ids_returns_empty_for_unexpected_payload() {
+        let body = serde_json::json!({"models": ["glm-5.1"]});
+        assert!(extract_supported_model_ids(&body).is_empty());
     }
 }
