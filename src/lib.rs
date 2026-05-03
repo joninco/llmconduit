@@ -29,7 +29,6 @@ pub fn build_app(config: Config) -> axum::Router {
 pub fn build_app_with_gateway(config: Config) -> (axum::Router, Arc<Gateway>) {
     let http_client = reqwest::Client::builder()
         .tcp_nodelay(true)
-        .timeout(config.request_timeout)
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
         .build()
         .expect("reqwest client");

@@ -34,10 +34,11 @@ impl AppError {
     }
 
     pub fn upstream(message: impl Into<String>) -> Self {
+        let msg = message.into();
         Self {
             status: StatusCode::BAD_GATEWAY,
-            message: message.into(),
-            client_message: "upstream error".to_string(),
+            client_message: msg.clone(),
+            message: msg,
         }
     }
 
@@ -47,6 +48,18 @@ impl AppError {
             message: message.into(),
             client_message: "internal server error".to_string(),
         }
+    }
+
+    pub fn cancelled() -> Self {
+        Self {
+            status: StatusCode::from_u16(499).expect("valid status code"),
+            message: "client disconnected".to_string(),
+            client_message: "client disconnected".to_string(),
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.status == StatusCode::from_u16(499).expect("valid status code")
     }
 
     pub fn status_code(&self) -> StatusCode {
@@ -111,9 +124,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upstream_error_hides_detail() {
-        let body = response_body_string(AppError::upstream("provider returned 500: {body}")).await;
-        assert!(body.contains("upstream error"));
-        assert!(!body.contains("provider returned 500"));
+    async fn test_upstream_error_shows_detail() {
+        let body = response_body_string(AppError::upstream("provider returned 500: oops")).await;
+        assert!(body.contains("provider returned 500: oops"));
     }
 }

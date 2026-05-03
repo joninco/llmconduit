@@ -7,6 +7,7 @@ use crate::adapters::responses_to_chat::lower_request;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::error::AppResult;
+use crate::models::chat::ChatCompletionChunk;
 use crate::models::chat::ChatCompletionRequest;
 use crate::models::chat::ChatMessage;
 use crate::models::chat::ChunkUsage;
@@ -37,11 +38,15 @@ use crate::upstream::UpstreamClient;
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
+
+const UPSTREAM_MODEL_CATALOG_TTL_SECS: u64 = 300;
 
 #[derive(Clone)]
 pub struct Gateway {
@@ -50,12 +55,67 @@ pub struct Gateway {
     upstream: Arc<dyn UpstreamClient>,
     search: Arc<dyn SearchClient>,
     monitor: MonitorHub,
+    upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
 }
 
 #[derive(Debug, Clone)]
 pub struct SseEvent {
     pub event: String,
     pub data: Value,
+}
+
+#[derive(Clone)]
+struct CachedUpstreamModelCatalog {
+    fetched_at: std::time::Instant,
+    catalog: UpstreamModelCatalog,
+}
+
+#[derive(Clone, Default)]
+struct UpstreamModelCatalog {
+    ids: Vec<String>,
+    ids_by_key: HashMap<String, Vec<String>>,
+}
+
+impl UpstreamModelCatalog {
+    fn from_ids(ids: Vec<String>) -> Self {
+        let mut ids_by_key: HashMap<String, Vec<String>> = HashMap::new();
+        for id in &ids {
+            let key = canonical_model_key(id);
+            if key.is_empty() {
+                continue;
+            }
+            ids_by_key.entry(key).or_default().push(id.clone());
+        }
+        Self { ids, ids_by_key }
+    }
+
+    fn normalize(&self, model: &str) -> Option<String> {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if self.ids.len() == 1 {
+            return self.ids.first().cloned();
+        }
+        if let Some(exact) = self.ids.iter().find(|id| id.as_str() == trimmed) {
+            return Some(exact.clone());
+        }
+        let key = canonical_model_key(trimmed);
+        let matches = self.ids_by_key.get(&key)?;
+        if matches.len() == 1 {
+            return matches.first().cloned();
+        }
+        None
+    }
+}
+
+fn canonical_model_key(model: &str) -> String {
+    model
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
 }
 
 impl Gateway {
@@ -72,6 +132,7 @@ impl Gateway {
             upstream,
             search,
             monitor,
+            upstream_model_catalog: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -125,14 +186,23 @@ impl Gateway {
                     tx.clone(),
                 )
                 .await;
-            if let Err(err) = result {
+            if let Err(err) = &result {
+                if tx.is_closed() {
+                    gateway.monitor.emit(
+                        response_id,
+                        MonitorEventKind::Failed {
+                            message: "client disconnected".to_string(),
+                        },
+                    );
+                    return;
+                }
                 gateway.monitor.emit(
                     response_id,
                     MonitorEventKind::Failed {
                         message: err.to_string(),
                     },
                 );
-                let _ = tx.send(failure_event(&err)).await;
+                let _ = tx.send(failure_event(err)).await;
             }
         });
         Ok(ReceiverStream::new(rx))
@@ -393,7 +463,14 @@ impl Gateway {
             .map_err(|_| AppError::internal("failed to send response.in_progress"))?;
 
         let mut public_history = request.input.clone();
-        let upstream_model = self.config.resolve_upstream_model(&request.model);
+        let mut response_output = Vec::new();
+        let mut event_state = ResponseEventState::default();
+        let configured_model = self.config.resolve_upstream_model(&request.model);
+        let upstream_model = tokio::select! {
+            biased;
+            _ = tx.closed() => return Err(AppError::cancelled()),
+            model = self.normalize_upstream_model(&configured_model) => model,
+        };
 
         let mut accumulated_usage = AccumulatedUsage::default();
         let mut upstream_request_index = 0usize;
@@ -401,6 +478,9 @@ impl Gateway {
         #[allow(unused_assignments)]
         let mut last_finish_reason: Option<String> = None;
         loop {
+            if tx.is_closed() {
+                return Err(AppError::cancelled());
+            }
             upstream_request_index += 1;
             let taken_messages = std::mem::take(&mut current_messages);
             let upstream_request = ChatCompletionRequest {
@@ -495,27 +575,31 @@ impl Gateway {
                             .sum::<usize>(),
                 },
             );
-            let mut stream = self
-                .upstream
-                .stream_chat_completion(&upstream_request)
-                .await?;
+            if tx.is_closed() {
+                return Err(AppError::cancelled());
+            }
+            let mut stream = tokio::select! {
+                biased;
+                _ = tx.closed() => return Err(AppError::cancelled()),
+                result = self.upstream.stream_chat_completion(&upstream_request) => result?,
+            };
             let mut state = StreamState::default();
             let mut turn_usage: Option<ChunkUsage> = None;
             loop {
-                let chunk = match timeout(self.config.request_timeout, stream.next()).await {
-                    Ok(Some(chunk)) => chunk,
-                    Ok(None) => break,
-                    Err(_) => {
-                        return Err(AppError::upstream("upstream stream timed out".to_string()));
-                    }
+                let Some(chunk) =
+                    Self::next_upstream_chunk(&mut stream, &tx, self.config.request_timeout)
+                        .await?
+                else {
+                    break;
                 };
-                let chunk = chunk?;
                 if chunk.usage.is_some() {
                     turn_usage = chunk.usage.clone();
                 }
-                for emission in state.apply_chunk(&chunk) {
+                let emissions = state.apply_chunk(&chunk);
+                for emission in emissions {
                     match emission {
                         StreamEmission::OutputItemAdded(item) => {
+                            let target = event_state.register_item(&item);
                             self.monitor.emit(
                                 response_id.clone(),
                                 MonitorEventKind::ResponseItem {
@@ -524,22 +608,30 @@ impl Gateway {
                                     payload_preview: preview_json(&item),
                                 },
                             );
-                            tx.send(output_item_added_event(item)).await.map_err(|_| {
-                                AppError::internal("failed to stream message start")
-                            })?;
+                            tx.send(output_item_added_event(item, target.output_index))
+                                .await
+                                .map_err(|_| {
+                                    AppError::internal("failed to stream message start")
+                                })?;
                         }
                         StreamEmission::OutputTextDelta(delta) => {
+                            let target = event_state.active_message_target()?;
                             self.monitor.emit(
                                 response_id.clone(),
                                 MonitorEventKind::OutputTextDelta {
                                     delta: delta.clone(),
                                 },
                             );
-                            tx.send(output_text_delta_event(delta))
-                                .await
-                                .map_err(|_| AppError::internal("failed to stream text delta"))?;
+                            tx.send(output_text_delta_event(
+                                target.item_id,
+                                target.output_index,
+                                delta,
+                            ))
+                            .await
+                            .map_err(|_| AppError::internal("failed to stream text delta"))?;
                         }
                         StreamEmission::ReasoningItemAdded(item) => {
+                            let target = event_state.register_item(&item);
                             self.monitor.emit(
                                 response_id.clone(),
                                 MonitorEventKind::ResponseItem {
@@ -548,22 +640,27 @@ impl Gateway {
                                     payload_preview: preview_json(&item),
                                 },
                             );
-                            tx.send(output_item_added_event(item)).await.map_err(|_| {
-                                AppError::internal("failed to stream reasoning start")
-                            })?;
+                            tx.send(output_item_added_event(item, target.output_index))
+                                .await
+                                .map_err(|_| {
+                                    AppError::internal("failed to stream reasoning start")
+                                })?;
                         }
                         StreamEmission::ReasoningTextDelta(delta) => {
+                            let target = event_state.active_reasoning_target()?;
                             self.monitor.emit(
                                 response_id.clone(),
                                 MonitorEventKind::ReasoningTextDelta {
                                     delta: delta.clone(),
                                 },
                             );
-                            tx.send(reasoning_text_delta_event(delta))
-                                .await
-                                .map_err(|_| {
-                                    AppError::internal("failed to stream reasoning delta")
-                                })?;
+                            tx.send(reasoning_text_delta_event(
+                                target.item_id,
+                                target.output_index,
+                                delta,
+                            ))
+                            .await
+                            .map_err(|_| AppError::internal("failed to stream reasoning delta"))?;
                         }
                         StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
                             tx.send(function_call_args_delta_event(call_id, delta))
@@ -573,30 +670,46 @@ impl Gateway {
                                 })?;
                         }
                         StreamEmission::ContentPartAdded => {
-                            tx.send(content_part_added_event()).await.map_err(|_| {
-                                AppError::internal("failed to send content_part.added")
-                            })?;
+                            let target = event_state.active_message_target()?;
+                            tx.send(content_part_added_event(
+                                target.item_id,
+                                target.output_index,
+                            ))
+                            .await
+                            .map_err(|_| AppError::internal("failed to send content_part.added"))?;
                         }
                         StreamEmission::ContentPartDone { text } => {
-                            tx.send(content_part_done_event(text)).await.map_err(|_| {
-                                AppError::internal("failed to send content_part.done")
-                            })?;
+                            let target = event_state.active_message_target()?;
+                            tx.send(content_part_done_event(
+                                target.item_id,
+                                target.output_index,
+                                text,
+                            ))
+                            .await
+                            .map_err(|_| AppError::internal("failed to send content_part.done"))?;
                         }
                         StreamEmission::ReasoningSummaryPartAdded => {
-                            tx.send(reasoning_summary_part_added_event())
-                                .await
-                                .map_err(|_| {
-                                    AppError::internal(
-                                        "failed to send reasoning_summary_part.added",
-                                    )
-                                })?;
+                            let target = event_state.active_reasoning_target()?;
+                            tx.send(reasoning_summary_part_added_event(
+                                target.item_id,
+                                target.output_index,
+                            ))
+                            .await
+                            .map_err(|_| {
+                                AppError::internal("failed to send reasoning_summary_part.added")
+                            })?;
                         }
                         StreamEmission::ReasoningSummaryPartDone { text } => {
-                            tx.send(reasoning_summary_part_done_event(text))
-                                .await
-                                .map_err(|_| {
-                                    AppError::internal("failed to send reasoning_summary_part.done")
-                                })?;
+                            let target = event_state.active_reasoning_target()?;
+                            tx.send(reasoning_summary_part_done_event(
+                                target.item_id,
+                                target.output_index,
+                                text,
+                            ))
+                            .await
+                            .map_err(|_| {
+                                AppError::internal("failed to send reasoning_summary_part.done")
+                            })?;
                         }
                         StreamEmission::RefusalDelta(delta) => {
                             tx.send(refusal_delta_event(delta))
@@ -612,8 +725,18 @@ impl Gateway {
             let finalized = state.finalize(&tool_registry)?;
             last_finish_reason = finalized.finish_reason.clone();
             current_messages = upstream_request.messages;
-            self.emit_completed_public_items(&response_id, &tx, &finalized, &mut public_history)
-                .await?;
+            self.emit_completed_public_items(
+                &response_id,
+                &tx,
+                &finalized,
+                &mut public_history,
+                &mut response_output,
+                &mut event_state,
+            )
+            .await?;
+            if tx.is_closed() {
+                return Err(AppError::cancelled());
+            }
             if let Some(message) = finalized.internal_assistant_message.clone() {
                 current_messages.push(message);
             }
@@ -626,6 +749,8 @@ impl Gateway {
                 &tx,
                 &mut current_messages,
                 &mut public_history,
+                &mut response_output,
+                &mut event_state,
             )
             .await?;
             if self.config.brave_api_key.is_some()
@@ -646,7 +771,7 @@ impl Gateway {
         }
 
         let model_name = request.model.clone();
-        let completed_output = public_history.clone();
+        let completed_output = response_output.clone();
         let metadata = request.metadata.clone();
         if request.store {
             self.replay_store
@@ -698,15 +823,72 @@ impl Gateway {
         Ok(())
     }
 
+    async fn normalize_upstream_model(&self, model: &str) -> String {
+        let catalog = match self.load_upstream_model_catalog().await {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                tracing::warn!(model, error = %err, "failed to refresh upstream model catalog");
+                return model.to_string();
+            }
+        };
+        let normalized = catalog
+            .normalize(model)
+            .unwrap_or_else(|| model.to_string());
+        if normalized != model {
+            tracing::info!(
+                requested_model = %model,
+                normalized_model = %normalized,
+                "normalized upstream model name from backend catalog"
+            );
+        }
+        normalized
+    }
+
+    async fn load_upstream_model_catalog(&self) -> AppResult<UpstreamModelCatalog> {
+        let mut cache = self.upstream_model_catalog.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.fetched_at.elapsed().as_secs() < UPSTREAM_MODEL_CATALOG_TTL_SECS
+        {
+            return Ok(cached.catalog.clone());
+        }
+        let ids = self.upstream.supported_model_ids().await?;
+        let catalog = UpstreamModelCatalog::from_ids(ids);
+        *cache = Some(CachedUpstreamModelCatalog {
+            fetched_at: std::time::Instant::now(),
+            catalog: catalog.clone(),
+        });
+        Ok(catalog)
+    }
+
+    async fn next_upstream_chunk(
+        stream: &mut crate::upstream::UpstreamStream,
+        tx: &mpsc::Sender<SseEvent>,
+        request_timeout: std::time::Duration,
+    ) -> AppResult<Option<ChatCompletionChunk>> {
+        tokio::select! {
+            biased;
+            _ = tx.closed() => Err(AppError::cancelled()),
+            result = timeout(request_timeout, stream.next()) => match result {
+                Ok(Some(chunk)) => chunk.map(Some),
+                Ok(None) => Ok(None),
+                Err(_) => Err(AppError::upstream("upstream stream timed out".to_string())),
+            },
+        }
+    }
+
     async fn emit_completed_public_items(
         &self,
         response_id: &str,
         tx: &mpsc::Sender<SseEvent>,
         finalized: &FinalizedAssistantTurn,
         public_history: &mut Vec<ResponseItem>,
+        response_output: &mut Vec<ResponseItem>,
+        event_state: &mut ResponseEventState,
     ) -> AppResult<()> {
         if let Some(reasoning) = finalized.reasoning_item.clone() {
+            let target = event_state.target_for_item(&reasoning);
             public_history.push(reasoning.clone());
+            response_output.push(reasoning.clone());
             if finalized.reasoning_part_emitted
                 && let ResponseItem::Reasoning { ref content, .. } = reasoning
             {
@@ -720,11 +902,13 @@ impl Gateway {
                         }
                     })
                     .unwrap_or_default();
-                tx.send(reasoning_summary_part_done_event(reasoning_text))
-                    .await
-                    .map_err(|_| {
-                        AppError::internal("failed to send reasoning_summary_part.done")
-                    })?;
+                tx.send(reasoning_summary_part_done_event(
+                    target.item_id.clone(),
+                    target.output_index,
+                    reasoning_text,
+                ))
+                .await
+                .map_err(|_| AppError::internal("failed to send reasoning_summary_part.done"))?;
             }
             self.monitor.emit(
                 response_id.to_string(),
@@ -734,11 +918,12 @@ impl Gateway {
                     payload_preview: preview_json(&reasoning),
                 },
             );
-            tx.send(output_item_done_event(reasoning))
+            tx.send(output_item_done_event(reasoning, target.output_index))
                 .await
                 .map_err(|_| AppError::internal("failed to send reasoning done"))?;
         }
         if let Some(message) = finalized.message_item.clone() {
+            let target = event_state.target_for_item(&message);
             if let ResponseItem::Message { ref content, .. } = message {
                 let full_text: String = content
                     .iter()
@@ -751,17 +936,26 @@ impl Gateway {
                     .collect::<Vec<_>>()
                     .join("");
                 if !full_text.is_empty() {
-                    tx.send(output_text_done_event(full_text.clone()))
-                        .await
-                        .map_err(|_| AppError::internal("failed to send output_text.done"))?;
+                    tx.send(output_text_done_event(
+                        target.item_id.clone(),
+                        target.output_index,
+                        full_text.clone(),
+                    ))
+                    .await
+                    .map_err(|_| AppError::internal("failed to send output_text.done"))?;
                     if finalized.content_part_emitted {
-                        tx.send(content_part_done_event(full_text))
-                            .await
-                            .map_err(|_| AppError::internal("failed to send content_part.done"))?;
+                        tx.send(content_part_done_event(
+                            target.item_id.clone(),
+                            target.output_index,
+                            full_text,
+                        ))
+                        .await
+                        .map_err(|_| AppError::internal("failed to send content_part.done"))?;
                     }
                 }
             }
             public_history.push(message.clone());
+            response_output.push(message.clone());
             self.monitor.emit(
                 response_id.to_string(),
                 MonitorEventKind::ResponseItem {
@@ -770,7 +964,7 @@ impl Gateway {
                     payload_preview: preview_json(&message),
                 },
             );
-            tx.send(output_item_done_event(message))
+            tx.send(output_item_done_event(message, target.output_index))
                 .await
                 .map_err(|_| AppError::internal("failed to send message done"))?;
         }
@@ -789,7 +983,12 @@ impl Gateway {
         tx: &mpsc::Sender<SseEvent>,
         current_messages: &mut Vec<ChatMessage>,
         public_history: &mut Vec<ResponseItem>,
+        response_output: &mut Vec<ResponseItem>,
+        event_state: &mut ResponseEventState,
     ) -> AppResult<()> {
+        if tx.is_closed() {
+            return Err(AppError::cancelled());
+        }
         let can_search = self.config.brave_api_key.is_some();
         let has_web_search = can_search
             && finalized
@@ -829,7 +1028,9 @@ impl Gateway {
                         detail: summarize_response_item(&tool_call.public_item),
                     },
                 );
+                let target = event_state.target_for_item(&tool_call.public_item);
                 public_history.push(tool_call.public_item.clone());
+                response_output.push(tool_call.public_item.clone());
                 self.monitor.emit(
                     response_id.to_string(),
                     MonitorEventKind::ResponseItem {
@@ -838,15 +1039,26 @@ impl Gateway {
                         payload_preview: preview_json(&tool_call.public_item),
                     },
                 );
-                tx.send(output_item_done_event(tool_call.public_item.clone()))
-                    .await
-                    .map_err(|_| AppError::internal("failed to send tool call item"))?;
+                tx.send(output_item_done_event(
+                    tool_call.public_item.clone(),
+                    target.output_index,
+                ))
+                .await
+                .map_err(|_| AppError::internal("failed to send tool call item"))?;
             }
             return Ok(());
         }
         for tool_call in &finalized.tool_calls {
-            self.run_web_search(response_id, tool_call, tx, current_messages, public_history)
-                .await?;
+            self.run_web_search(
+                response_id,
+                tool_call,
+                tx,
+                current_messages,
+                public_history,
+                response_output,
+                event_state,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -858,6 +1070,8 @@ impl Gateway {
         tx: &mpsc::Sender<SseEvent>,
         current_messages: &mut Vec<ChatMessage>,
         public_history: &mut Vec<ResponseItem>,
+        response_output: &mut Vec<ResponseItem>,
+        event_state: &mut ResponseEventState,
     ) -> AppResult<()> {
         let ResponseItem::WebSearchCall {
             id,
@@ -887,9 +1101,13 @@ impl Gateway {
                 payload_preview: preview_json(&partial),
             },
         );
-        tx.send(output_item_added_event(partial))
-            .await
-            .map_err(|_| AppError::internal("failed to send web_search start"))?;
+        let partial_target = event_state.register_item(&partial);
+        tx.send(output_item_added_event(
+            partial,
+            partial_target.output_index,
+        ))
+        .await
+        .map_err(|_| AppError::internal("failed to send web_search start"))?;
 
         let query = extract_web_search_query(action, &tool_call.arguments)?;
         self.monitor.emit(
@@ -899,14 +1117,23 @@ impl Gateway {
                 detail: format!("web_search {query}"),
             },
         );
-        let results = self.search.search(&query).await?;
+        if tx.is_closed() {
+            return Err(AppError::cancelled());
+        }
+        let results = tokio::select! {
+            biased;
+            _ = tx.closed() => return Err(AppError::cancelled()),
+            result = self.search.search(&query) => result?,
+        };
 
         let completed = ResponseItem::WebSearchCall {
             id: id.clone(),
             status: Some("completed".to_string()),
             action: action.clone(),
         };
+        let completed_target = event_state.target_for_item(&completed);
         public_history.push(completed.clone());
+        response_output.push(completed.clone());
         self.monitor.emit(
             response_id.to_string(),
             MonitorEventKind::ResponseItem {
@@ -915,9 +1142,12 @@ impl Gateway {
                 payload_preview: preview_json(&completed),
             },
         );
-        tx.send(output_item_done_event(completed))
-            .await
-            .map_err(|_| AppError::internal("failed to send web_search done"))?;
+        tx.send(output_item_done_event(
+            completed,
+            completed_target.output_index,
+        ))
+        .await
+        .map_err(|_| AppError::internal("failed to send web_search done"))?;
         self.monitor.emit(
             response_id.to_string(),
             MonitorEventKind::ToolPhase {
@@ -1283,45 +1513,53 @@ fn incomplete_event(response: ResponseResource) -> SseEvent {
     )
 }
 
-fn content_part_added_event() -> SseEvent {
+fn content_part_added_event(item_id: String, output_index: usize) -> SseEvent {
     json_event(
         "response.content_part.added",
         ResponsesEnvelope {
             kind: "response.content_part.added".to_string(),
             payload: crate::models::responses::ContentPartPayload {
+                item_id,
+                output_index,
                 content_index: 0,
                 part: crate::models::responses::ContentPartRef {
                     kind: "output_text".to_string(),
                     text: String::new(),
+                    annotations: Vec::new(),
                 },
             },
         },
     )
 }
 
-fn content_part_done_event(text: String) -> SseEvent {
+fn content_part_done_event(item_id: String, output_index: usize, text: String) -> SseEvent {
     json_event(
         "response.content_part.done",
         ResponsesEnvelope {
             kind: "response.content_part.done".to_string(),
             payload: crate::models::responses::ContentPartPayload {
+                item_id,
+                output_index,
                 content_index: 0,
                 part: crate::models::responses::ContentPartRef {
                     kind: "output_text".to_string(),
                     text,
+                    annotations: Vec::new(),
                 },
             },
         },
     )
 }
 
-fn reasoning_summary_part_added_event() -> SseEvent {
+fn reasoning_summary_part_added_event(item_id: String, output_index: usize) -> SseEvent {
     json_event(
         "response.reasoning_summary_part.added",
         ResponsesEnvelope {
             kind: "response.reasoning_summary_part.added".to_string(),
             payload: crate::models::responses::ReasoningSummaryPartPayload {
-                content_index: 0,
+                item_id,
+                output_index,
+                summary_index: 0,
                 part: crate::models::responses::ReasoningSummaryPartRef {
                     kind: "summary_text".to_string(),
                     text: String::new(),
@@ -1331,13 +1569,19 @@ fn reasoning_summary_part_added_event() -> SseEvent {
     )
 }
 
-fn reasoning_summary_part_done_event(text: String) -> SseEvent {
+fn reasoning_summary_part_done_event(
+    item_id: String,
+    output_index: usize,
+    text: String,
+) -> SseEvent {
     json_event(
         "response.reasoning_summary_part.done",
         ResponsesEnvelope {
             kind: "response.reasoning_summary_part.done".to_string(),
             payload: crate::models::responses::ReasoningSummaryPartPayload {
-                content_index: 0,
+                item_id,
+                output_index,
+                summary_index: 0,
                 part: crate::models::responses::ReasoningSummaryPartRef {
                     kind: "summary_text".to_string(),
                     text,
@@ -1365,6 +1609,80 @@ fn refusal_done_event(refusal: String) -> SseEvent {
             payload: crate::models::responses::RefusalDonePayload { refusal },
         },
     )
+}
+
+#[derive(Debug, Clone)]
+struct OutputTarget {
+    item_id: String,
+    output_index: usize,
+}
+
+#[derive(Default)]
+struct ResponseEventState {
+    next_output_index: usize,
+    output_indices: HashMap<String, usize>,
+    active_message: Option<OutputTarget>,
+    active_reasoning: Option<OutputTarget>,
+}
+
+impl ResponseEventState {
+    fn register_item(&mut self, item: &ResponseItem) -> OutputTarget {
+        let item_id = response_item_event_id(item)
+            .unwrap_or_else(|| format!("item_{}", self.next_output_index));
+        let output_index = match self.output_indices.get(&item_id) {
+            Some(index) => *index,
+            None => {
+                let index = self.next_output_index;
+                self.next_output_index += 1;
+                self.output_indices.insert(item_id.clone(), index);
+                index
+            }
+        };
+        let target = OutputTarget {
+            item_id,
+            output_index,
+        };
+        match item {
+            ResponseItem::Message { .. } => self.active_message = Some(target.clone()),
+            ResponseItem::Reasoning { .. } => self.active_reasoning = Some(target.clone()),
+            _ => {}
+        }
+        target
+    }
+
+    fn target_for_item(&mut self, item: &ResponseItem) -> OutputTarget {
+        self.register_item(item)
+    }
+
+    fn active_message_target(&self) -> AppResult<OutputTarget> {
+        self.active_message
+            .clone()
+            .ok_or_else(|| AppError::internal("missing active message output item"))
+    }
+
+    fn active_reasoning_target(&self) -> AppResult<OutputTarget> {
+        self.active_reasoning
+            .clone()
+            .ok_or_else(|| AppError::internal("missing active reasoning output item"))
+    }
+}
+
+fn response_item_event_id(item: &ResponseItem) -> Option<String> {
+    match item {
+        ResponseItem::Message { id, .. } => id.clone(),
+        ResponseItem::Reasoning { id, .. } => Some(id.clone()),
+        ResponseItem::FunctionCall { id, call_id, .. } => {
+            id.clone().or_else(|| Some(call_id.clone()))
+        }
+        ResponseItem::FunctionCallOutput { call_id, .. } => Some(call_id.clone()),
+        ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.clone()),
+        ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.clone()),
+        ResponseItem::ToolSearchCall { call_id, .. } => call_id.clone(),
+        ResponseItem::ToolSearchOutput { call_id, .. } => call_id.clone(),
+        ResponseItem::LocalShellCall { id, call_id, .. } => id.clone().or_else(|| call_id.clone()),
+        ResponseItem::WebSearchCall { id, .. } => id.clone(),
+        ResponseItem::ImageGenerationCall { id, .. } => Some(id.clone()),
+    }
 }
 
 #[derive(Default)]
@@ -1399,58 +1717,61 @@ impl AccumulatedUsage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             total_tokens: self.total_tokens,
-            input_tokens_details: (self.cached_input_tokens > 0).then_some(
-                ResponseInputTokensDetails {
-                    cached_tokens: self.cached_input_tokens,
-                },
-            ),
-            output_tokens_details: (self.reasoning_output_tokens > 0).then_some(
-                ResponseOutputTokensDetails {
-                    reasoning_tokens: self.reasoning_output_tokens,
-                },
-            ),
+            input_tokens_details: Some(ResponseInputTokensDetails {
+                cached_tokens: self.cached_input_tokens,
+            }),
+            output_tokens_details: Some(ResponseOutputTokensDetails {
+                reasoning_tokens: self.reasoning_output_tokens,
+            }),
         })
     }
 }
 
-fn output_item_added_event(item: ResponseItem) -> SseEvent {
+fn output_item_added_event(item: ResponseItem, output_index: usize) -> SseEvent {
     json_event(
         "response.output_item.added",
         ResponsesEnvelope {
             kind: "response.output_item.added".to_string(),
-            payload: OutputItemPayload { item },
+            payload: OutputItemPayload { output_index, item },
         },
     )
 }
 
-fn output_item_done_event(item: ResponseItem) -> SseEvent {
+fn output_item_done_event(item: ResponseItem, output_index: usize) -> SseEvent {
     json_event(
         "response.output_item.done",
         ResponsesEnvelope {
             kind: "response.output_item.done".to_string(),
-            payload: OutputItemPayload { item },
+            payload: OutputItemPayload { output_index, item },
         },
     )
 }
 
-fn output_text_delta_event(delta: String) -> SseEvent {
+fn output_text_delta_event(item_id: String, output_index: usize, delta: String) -> SseEvent {
     json_event(
         "response.output_text.delta",
         ResponsesEnvelope {
             kind: "response.output_text.delta".to_string(),
-            payload: DeltaPayload { delta },
+            payload: DeltaPayload {
+                item_id,
+                output_index,
+                content_index: 0,
+                delta,
+            },
         },
     )
 }
 
-fn reasoning_text_delta_event(delta: String) -> SseEvent {
+fn reasoning_text_delta_event(item_id: String, output_index: usize, delta: String) -> SseEvent {
     json_event(
         "response.reasoning_summary_text.delta",
         ResponsesEnvelope {
             kind: "response.reasoning_summary_text.delta".to_string(),
             payload: ReasoningDeltaPayload {
+                item_id,
+                output_index,
+                summary_index: 0,
                 delta,
-                content_index: 0,
             },
         },
     )
@@ -1487,14 +1808,16 @@ fn in_progress_event(response_id: &str) -> SseEvent {
     )
 }
 
-fn output_text_done_event(text: String) -> SseEvent {
+fn output_text_done_event(item_id: String, output_index: usize, text: String) -> SseEvent {
     json_event(
         "response.output_text.done",
         ResponsesEnvelope {
             kind: "response.output_text.done".to_string(),
             payload: crate::models::responses::TextDonePayload {
-                text,
+                item_id,
+                output_index,
                 content_index: 0,
+                text,
             },
         },
     )
