@@ -13,8 +13,8 @@ use crate::models::responses::ReasoningRequest;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponsesRequest;
 use crate::models::responses::ToolSpec;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -196,7 +196,9 @@ fn convert_message(
     Ok(())
 }
 
-fn convert_tool_choice(tool_choice: Option<crate::models::anthropic::AnthropicToolChoice>) -> Value {
+fn convert_tool_choice(
+    tool_choice: Option<crate::models::anthropic::AnthropicToolChoice>,
+) -> Value {
     match tool_choice {
         Some(crate::models::anthropic::AnthropicToolChoice::Auto) | None => {
             Value::String("auto".to_string())
@@ -232,7 +234,9 @@ fn normalize_message_text(role: &str, text: &str) -> String {
 }
 
 fn strip_billing_nonce(text: &str) -> String {
-    join_filtered_lines(text, |line| !line.starts_with("x-anthropic-billing-header:"))
+    join_filtered_lines(text, |line| {
+        !line.starts_with("x-anthropic-billing-header:")
+    })
 }
 
 fn strip_date_injection(text: &str) -> String {
@@ -394,7 +398,10 @@ mod tests {
         assert_eq!(result.temperature, Some(0.2));
         assert_eq!(result.top_p, Some(0.7));
         assert_eq!(
-            result.metadata.as_ref().and_then(|metadata| metadata.get("source")),
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("source")),
             Some(&json!("anthropic"))
         );
         assert_eq!(result.input.len(), 1);
@@ -511,9 +518,7 @@ mod tests {
 
         let result = convert_request(request).expect("convert");
         assert_eq!(result.tools.len(), 2);
-        assert!(
-            matches!(&result.tools[0], ToolSpec::Function { name, .. } if name == "alpha")
-        );
+        assert!(matches!(&result.tools[0], ToolSpec::Function { name, .. } if name == "alpha"));
     }
 
     #[test]

@@ -201,7 +201,7 @@ impl AnthropicStreamConverter {
                 stop_sequence: None,
             },
             usage: AnthropicUsage {
-                input_tokens: None,
+                input_tokens: usage.as_ref().map(|usage| usage.input_tokens),
                 output_tokens: Some(usage.as_ref().map_or(0, |usage| usage.output_tokens)),
             },
         });
@@ -749,10 +749,11 @@ mod tests {
     #[test]
     fn emits_usage_from_completed_response() {
         let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
-        let events: Vec<AnthropicStreamEvent> = [created_event(), completed_event_with_usage(12, 5)]
-            .iter()
-            .flat_map(|e| converter.convert(e))
-            .collect();
+        let events: Vec<AnthropicStreamEvent> =
+            [created_event(), completed_event_with_usage(12, 5)]
+                .iter()
+                .flat_map(|e| converter.convert(e))
+                .collect();
 
         let message_start = events
             .iter()
@@ -771,16 +772,20 @@ mod tests {
                 _ => None,
             })
             .expect("message_delta");
+        assert_eq!(message_delta.input_tokens, Some(12));
         assert_eq!(message_delta.output_tokens, Some(5));
     }
 
     #[test]
     fn converts_incomplete_to_max_tokens_stop_reason() {
         let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
-        let events: Vec<AnthropicStreamEvent> = [created_event(), incomplete_event("max_output_tokens", 12, 5)]
-            .iter()
-            .flat_map(|e| converter.convert(e))
-            .collect();
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            incomplete_event("max_output_tokens", 12, 5),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
 
         let message_delta = events
             .iter()
