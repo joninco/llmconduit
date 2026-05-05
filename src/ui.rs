@@ -11,11 +11,6 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Constraint;
 use ratatui::layout::Direction;
 use ratatui::layout::Layout;
-use ratatui::style::Color;
-use ratatui::style::Modifier;
-use ratatui::style::Style;
-use ratatui::text::Line;
-use ratatui::text::Span;
 use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Paragraph;
@@ -43,35 +38,26 @@ impl Drop for TerminalGuard {
 }
 
 const PREVIEW_CHAR_LIMIT: usize = 16_000;
-const TOOL_NOTE_LIMIT: usize = 6;
-const TURN_LIMIT: usize = 8;
+const MAX_REQUEST_PANES: usize = 4;
 
 #[derive(Debug, Default)]
-struct TurnState {
+struct RequestPane {
     response_id: String,
-    status: String,
-    model: Option<String>,
-    request_summary: String,
-    upstream_summary: String,
-    reasoning_preview: String,
-    output_preview: String,
-    tool_notes: VecDeque<String>,
-    failure_message: Option<String>,
+    text: String,
+    active_function_call_id: Option<String>,
 }
 
 #[derive(Debug)]
 pub struct UiHandle {
-    bind_addr: String,
     receiver: broadcast::Receiver<MonitorEvent>,
-    turns: VecDeque<TurnState>,
+    panes: VecDeque<RequestPane>,
 }
 
 impl UiHandle {
-    pub fn new(bind_addr: String, receiver: broadcast::Receiver<MonitorEvent>) -> Self {
+    pub fn new(_bind_addr: String, receiver: broadcast::Receiver<MonitorEvent>) -> Self {
         Self {
-            bind_addr,
             receiver,
-            turns: VecDeque::new(),
+            panes: VecDeque::new(),
         }
     }
 
@@ -94,15 +80,8 @@ impl UiHandle {
                 match self.receiver.try_recv() {
                     Ok(event) => self.apply_event(event),
                     Err(broadcast::error::TryRecvError::Empty) => break,
-                    Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                        self.push_monitor_notice(format!(
-                            "monitor lagged, skipped {skipped} events"
-                        ));
-                    }
-                    Err(broadcast::error::TryRecvError::Closed) => {
-                        self.push_monitor_notice("monitor channel closed".to_string());
-                        break;
-                    }
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::TryRecvError::Closed) => break,
                 }
             }
 
@@ -133,326 +112,91 @@ impl UiHandle {
     }
 
     fn apply_event(&mut self, event: MonitorEvent) {
-        let turn = self.turn_mut(&event.response_id);
         match event.kind {
-            MonitorEventKind::RequestStarted {
-                model,
-                input_items,
-                tool_count,
-                turn_count,
-                user_messages,
-                assistant_messages,
-                system_messages,
-                developer_messages,
-                reasoning_items,
-                function_calls,
-                function_outputs,
-                tool_items,
-                input_chars,
-                instructions_chars,
-            } => {
-                turn.model = Some(model.clone());
-                turn.status = "running".to_string();
-                turn.failure_message = None;
-                turn.request_summary = summarize_request(
-                    &model,
-                    input_items,
-                    tool_count,
-                    turn_count,
-                    user_messages,
-                    assistant_messages,
-                    system_messages,
-                    developer_messages,
-                    reasoning_items,
-                    function_calls,
-                    function_outputs,
-                    tool_items,
-                    input_chars,
-                    instructions_chars,
-                );
+            MonitorEventKind::RequestStarted { .. } => {
+                let pane = self.pane_mut(&event.response_id);
+                pane.text.clear();
+                pane.active_function_call_id = None;
             }
-            MonitorEventKind::UpstreamRequest {
-                request_index,
-                message_count,
-                prompt_chars,
-            } => {
-                turn.upstream_summary = format!(
-                    "upstream {request_index}  |  msgs {message_count}  |  prompt chars {prompt_chars}"
-                );
+            MonitorEventKind::OutputTextDelta { delta }
+            | MonitorEventKind::ReasoningTextDelta { delta }
+            | MonitorEventKind::RefusalDelta { delta } => {
+                append_text_delta(self.pane_mut(&event.response_id), &delta);
             }
-            MonitorEventKind::ResponseItem { .. } => {}
-            MonitorEventKind::OutputTextDelta { delta } => {
-                append_preview(&mut turn.output_preview, &delta);
-            }
-            MonitorEventKind::ReasoningTextDelta { delta } => {
-                append_preview(&mut turn.reasoning_preview, &delta);
+            MonitorEventKind::FunctionCallArgumentsDelta { call_id, delta } => {
+                append_function_call_delta(self.pane_mut(&event.response_id), &call_id, &delta);
             }
             MonitorEventKind::ToolPhase { phase, detail } => {
-                push_recent(
-                    &mut turn.tool_notes,
-                    format!("{phase}: {detail}"),
-                    TOOL_NOTE_LIMIT,
-                );
-            }
-            MonitorEventKind::Completed => {
-                turn.status = "completed".to_string();
-            }
-            MonitorEventKind::Failed { message } => {
-                turn.status = "failed".to_string();
-                turn.failure_message = Some(message);
-            }
-        }
-    }
-
-    fn turn_mut(&mut self, response_id: &str) -> &mut TurnState {
-        let index = self
-            .turns
-            .iter()
-            .position(|turn| turn.response_id == response_id);
-        match index {
-            Some(index) => self.turns.get_mut(index).expect("turn exists"),
-            None => {
-                self.turns.push_front(TurnState {
-                    response_id: response_id.to_string(),
-                    status: "running".to_string(),
-                    ..TurnState::default()
-                });
-                while self.turns.len() > TURN_LIMIT {
-                    let _ = self.turns.pop_back();
+                if let Some(line) = tool_phase_line(&phase, &detail) {
+                    append_pane_line(self.pane_mut(&event.response_id), &line);
                 }
-                self.turns.front_mut().expect("turn inserted")
+            }
+            MonitorEventKind::Completed | MonitorEventKind::Failed { .. } => {
+                self.remove_pane(&event.response_id);
+            }
+            MonitorEventKind::UpstreamRequest { .. } => {}
+            MonitorEventKind::ResponseItem { .. } => {}
+        }
+    }
+
+    fn pane_mut(&mut self, response_id: &str) -> &mut RequestPane {
+        let index = self
+            .panes
+            .iter()
+            .position(|pane| pane.response_id == response_id);
+        match index {
+            Some(index) => self.panes.get_mut(index).expect("pane exists"),
+            None => {
+                self.panes.push_front(RequestPane {
+                    response_id: response_id.to_string(),
+                    text: String::new(),
+                    active_function_call_id: None,
+                });
+                while self.panes.len() > MAX_REQUEST_PANES {
+                    let _ = self.panes.pop_back();
+                }
+                self.panes.front_mut().expect("pane inserted")
             }
         }
     }
 
-    fn push_monitor_notice(&mut self, message: String) {
-        let turn = self.turn_mut("monitor");
-        turn.status = "system".to_string();
-        turn.request_summary = "resp2chat monitor".to_string();
-        push_recent(&mut turn.tool_notes, message, TOOL_NOTE_LIMIT);
+    fn remove_pane(&mut self, response_id: &str) {
+        if let Some(index) = self
+            .panes
+            .iter()
+            .position(|pane| pane.response_id == response_id)
+        {
+            let _ = self.panes.remove(index);
+        }
     }
 
     fn render(&self, frame: &mut Frame) {
-        let latest_turn = self.turns.front();
-        let layout = Layout::default()
+        let pane_count = self.panes.len().min(MAX_REQUEST_PANES);
+        if pane_count == 0 {
+            return;
+        }
+
+        let constraints = vec![Constraint::Ratio(1, pane_count as u32); pane_count];
+        let panes = Layout::default()
             .direction(Direction::Vertical)
-            .constraints(if latest_turn.is_some() {
-                vec![
-                    Constraint::Length(1),
-                    Constraint::Length(6),
-                    Constraint::Min(10),
-                    Constraint::Length(3),
-                ]
-            } else {
-                vec![
-                    Constraint::Length(1),
-                    Constraint::Length(6),
-                    Constraint::Min(10),
-                ]
-            })
+            .constraints(constraints)
             .split(frame.area());
 
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "resp2chat",
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::raw(format!("listening on {}", self.bind_addr)),
-                Span::raw("  "),
-                Span::styled(
-                    "q",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" quit"),
-            ])),
-            layout[0],
-        );
-
-        frame.render_widget(
-            Paragraph::new(
-                latest_turn
-                    .map(|turn| {
-                        if turn.request_summary.is_empty() && turn.upstream_summary.is_empty() {
-                            "Waiting for the first request".to_string()
-                        } else if turn.upstream_summary.is_empty() {
-                            turn.request_summary.clone()
-                        } else if turn.request_summary.is_empty() {
-                            turn.upstream_summary.clone()
-                        } else {
-                            format!("{}\n{}", turn.request_summary, turn.upstream_summary)
-                        }
-                    })
-                    .unwrap_or_else(|| "Waiting for the first request".to_string()),
-            )
-            .block(Block::default().borders(Borders::ALL).title("Input"))
-            .wrap(Wrap { trim: false }),
-            layout[1],
-        );
-
-        let output_lines = render_output(latest_turn);
-        let output_height = usize::from(layout[2].height.saturating_sub(2));
-        let output_scroll = output_lines.len().saturating_sub(output_height);
-        frame.render_widget(
-            Paragraph::new(output_lines)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Streaming Output"),
-                )
-                .scroll((u16::try_from(output_scroll).unwrap_or(u16::MAX), 0))
-                .wrap(Wrap { trim: false }),
-            layout[2],
-        );
-
-        if latest_turn.is_some() {
+        for (pane, area) in self.panes.iter().zip(panes.iter()) {
+            let scroll = scroll_offset(
+                &pane.text,
+                area.height.saturating_sub(2),
+                area.width.saturating_sub(2),
+            );
             frame.render_widget(
-                Paragraph::new(render_footer(&self.turns))
-                    .block(Block::default().borders(Borders::ALL)),
-                layout[3],
+                Paragraph::new(pane.text.as_str())
+                    .block(Block::default().borders(Borders::ALL))
+                    .scroll((scroll, 0))
+                    .wrap(Wrap { trim: false }),
+                *area,
             );
         }
     }
-}
-
-fn render_output(turn: Option<&TurnState>) -> Vec<Line<'static>> {
-    let Some(turn) = turn else {
-        return vec!["No output yet".into()];
-    };
-
-    let mut lines = Vec::new();
-    if let Some(message) = turn.failure_message.as_ref() {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "failed",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(": "),
-            Span::raw(message.clone()),
-        ]));
-        lines.push(Line::from(""));
-    }
-    if !turn.tool_notes.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            "activity",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        for note in turn.tool_notes.iter().rev() {
-            lines.push(Line::from(format!("• {note}")));
-        }
-        lines.push(Line::from(""));
-    }
-    if !turn.reasoning_preview.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            "reasoning",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        lines.extend(turn.reasoning_preview.lines().map(|line| {
-            Line::from(Span::styled(
-                line.to_string(),
-                Style::default().fg(Color::DarkGray),
-            ))
-        }));
-        lines.push(Line::from(""));
-    }
-    if !turn.output_preview.is_empty() {
-        lines.push(Line::from(vec![Span::styled(
-            "output",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )]));
-        lines.extend(
-            turn.output_preview
-                .lines()
-                .map(|line| Line::from(line.to_string())),
-        );
-    }
-    if lines.is_empty() {
-        vec!["Waiting for streamed output".into()]
-    } else {
-        lines
-    }
-}
-
-fn render_footer(turns: &VecDeque<TurnState>) -> String {
-    if turns.is_empty() {
-        return String::new();
-    }
-
-    let latest = turns
-        .front()
-        .map(|turn| format!("latest {} {}", short_id(&turn.response_id), turn.status))
-        .unwrap_or_default();
-    let recent = turns
-        .iter()
-        .take(4)
-        .map(|turn| format!("{} {}", short_id(&turn.response_id), turn.status))
-        .collect::<Vec<_>>()
-        .join("  |  ");
-    if recent.is_empty() {
-        latest
-    } else {
-        format!("{latest}  |  recent {recent}")
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn summarize_request(
-    model: &str,
-    input_items: usize,
-    tool_count: usize,
-    turn_count: usize,
-    user_messages: usize,
-    assistant_messages: usize,
-    system_messages: usize,
-    developer_messages: usize,
-    reasoning_items: usize,
-    function_calls: usize,
-    function_outputs: usize,
-    tool_items: usize,
-    input_chars: usize,
-    instructions_chars: usize,
-) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "model {model}  |  turns {turn_count}  |  items {input_items}  |  tools {tool_count}"
-    ));
-    lines.push(format!(
-        "user {user_messages}  |  assistant {assistant_messages}  |  reasoning {reasoning_items}"
-    ));
-
-    let mut detail_parts = Vec::new();
-    if system_messages > 0 {
-        detail_parts.push(format!("system {system_messages}"));
-    }
-    if developer_messages > 0 {
-        detail_parts.push(format!("developer {developer_messages}"));
-    }
-    if function_calls > 0 {
-        detail_parts.push(format!("fn calls {function_calls}"));
-    }
-    if function_outputs > 0 {
-        detail_parts.push(format!("fn outputs {function_outputs}"));
-    }
-    if tool_items > 0 {
-        detail_parts.push(format!("tool items {tool_items}"));
-    }
-    detail_parts.push(format!("input chars {input_chars}"));
-    if instructions_chars > 0 {
-        detail_parts.push(format!("instructions {instructions_chars}"));
-    }
-    lines.push(detail_parts.join("  |  "));
-    lines.join("\n")
 }
 
 fn append_preview(buffer: &mut String, delta: &str) {
@@ -469,10 +213,46 @@ fn append_preview(buffer: &mut String, delta: &str) {
     }
 }
 
-fn push_recent(entries: &mut VecDeque<String>, entry: String, limit: usize) {
-    entries.push_back(entry);
-    while entries.len() > limit {
-        let _ = entries.pop_front();
+fn append_text_delta(pane: &mut RequestPane, delta: &str) {
+    if pane.active_function_call_id.take().is_some() {
+        ensure_newline(&mut pane.text);
+    }
+    append_preview(&mut pane.text, delta);
+}
+
+fn append_function_call_delta(pane: &mut RequestPane, call_id: &str, delta: &str) {
+    if pane.active_function_call_id.as_deref() != Some(call_id) {
+        ensure_newline(&mut pane.text);
+        append_preview(
+            &mut pane.text,
+            &format!("tool arguments {}:\n", short_id(call_id)),
+        );
+        pane.active_function_call_id = Some(call_id.to_string());
+    }
+    append_preview(&mut pane.text, delta);
+}
+
+fn append_pane_line(pane: &mut RequestPane, line: &str) {
+    pane.active_function_call_id = None;
+    ensure_newline(&mut pane.text);
+    append_preview(&mut pane.text, line);
+    append_preview(&mut pane.text, "\n");
+}
+
+fn ensure_newline(text: &mut String) {
+    if !text.is_empty() && !text.ends_with('\n') {
+        append_preview(text, "\n");
+    }
+}
+
+fn tool_phase_line(phase: &str, detail: &str) -> Option<String> {
+    match phase {
+        "provider_tool_detected" => None,
+        "client_tool_handoff"
+        | "client_tool_result"
+        | "provider_tool_running"
+        | "provider_tool_completed" => Some(detail.to_string()),
+        _ => Some(format!("{phase}: {detail}")),
     }
 }
 
@@ -485,10 +265,108 @@ fn short_id(response_id: &str) -> String {
     }
 }
 
+fn scroll_offset(text: &str, height: u16, width: u16) -> u16 {
+    let height = usize::from(height);
+    if height == 0 {
+        return 0;
+    }
+
+    let lines = wrapped_line_count(text, usize::from(width.max(1)));
+    u16::try_from(lines.saturating_sub(height)).unwrap_or(u16::MAX)
+}
+
+fn wrapped_line_count(text: &str, width: usize) -> usize {
+    let width = width.max(1);
+    text.split('\n')
+        .map(|line| wrapped_physical_line_count(line, width))
+        .sum()
+}
+
+fn wrapped_physical_line_count(line: &str, width: usize) -> usize {
+    if line.is_empty() {
+        return 1;
+    }
+
+    let mut lines = 1usize;
+    let mut col = 0usize;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.peek().copied() {
+        let is_whitespace = ch.is_whitespace();
+        let mut run_width = 0usize;
+        while chars
+            .peek()
+            .copied()
+            .is_some_and(|next| next.is_whitespace() == is_whitespace)
+        {
+            let _ = chars.next();
+            run_width += 1;
+        }
+
+        if is_whitespace {
+            append_wrapped_whitespace(run_width, width, &mut lines, &mut col);
+        } else {
+            append_wrapped_word(run_width, width, &mut lines, &mut col);
+        }
+    }
+
+    lines
+}
+
+fn append_wrapped_word(width_used: usize, width: usize, lines: &mut usize, col: &mut usize) {
+    if *col == width {
+        *lines += 1;
+        *col = 0;
+    }
+
+    if width_used > width {
+        if *col > 0 {
+            *lines += 1;
+            *col = 0;
+        }
+        *lines += (width_used - 1) / width;
+        *col = ((width_used - 1) % width) + 1;
+    } else if *col == 0 {
+        *col = width_used;
+    } else if *col + width_used <= width {
+        *col += width_used;
+    } else {
+        *lines += 1;
+        *col = width_used;
+    }
+}
+
+fn append_wrapped_whitespace(
+    mut width_used: usize,
+    width: usize,
+    lines: &mut usize,
+    col: &mut usize,
+) {
+    while width_used > 0 {
+        if *col == width {
+            *lines += 1;
+            *col = 0;
+        }
+        let room = width - *col;
+        if width_used <= room {
+            *col += width_used;
+            return;
+        }
+        width_used -= room;
+        *lines += 1;
+        *col = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::MAX_REQUEST_PANES;
     use super::PREVIEW_CHAR_LIMIT;
+    use super::UiHandle;
     use super::append_preview;
+    use super::scroll_offset;
+    use super::wrapped_line_count;
+    use crate::monitor::MonitorEvent;
+    use crate::monitor::MonitorEventKind;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -498,5 +376,135 @@ mod tests {
 
         assert_eq!(buffer.chars().count(), PREVIEW_CHAR_LIMIT);
         assert_eq!(buffer.chars().last(), Some('β'));
+    }
+
+    #[test]
+    fn wrapped_line_count_accounts_for_width_and_newlines() {
+        assert_eq!(wrapped_line_count("", 10), 1);
+        assert_eq!(wrapped_line_count("abcdef", 3), 2);
+        assert_eq!(wrapped_line_count("aaaaa bbbbb ccccc", 10), 3);
+        assert_eq!(wrapped_line_count("abcdefghijklmnop", 5), 4);
+        assert_eq!(wrapped_line_count("abc\ndef", 10), 2);
+        assert_eq!(wrapped_line_count("abc\n", 10), 2);
+    }
+
+    #[test]
+    fn scroll_offset_stays_at_bottom() {
+        assert_eq!(scroll_offset("a\nb\nc", 2, 10), 1);
+        assert_eq!(scroll_offset("abcdef", 2, 3), 0);
+        assert_eq!(scroll_offset("abcdefghi", 2, 3), 1);
+        assert_eq!(scroll_offset("aaaaa bbbbb ccccc", 2, 10), 1);
+    }
+
+    #[test]
+    fn active_panes_are_capped_and_removed_on_completion() {
+        let (_tx, receiver) = tokio::sync::broadcast::channel(1);
+        let mut ui = UiHandle::new(String::new(), receiver);
+
+        for index in 0..(MAX_REQUEST_PANES + 1) {
+            ui.apply_event(started(&format!("resp_{index}")));
+        }
+
+        assert_eq!(ui.panes.len(), MAX_REQUEST_PANES);
+        assert_eq!(
+            ui.panes
+                .iter()
+                .map(|pane| pane.response_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["resp_4", "resp_3", "resp_2", "resp_1"]
+        );
+
+        ui.apply_event(delta("resp_3", "hello"));
+        assert_eq!(
+            ui.panes
+                .iter()
+                .find(|pane| pane.response_id == "resp_3")
+                .map(|pane| pane.text.as_str()),
+            Some("hello")
+        );
+
+        ui.apply_event(event("resp_3", MonitorEventKind::Completed));
+        assert!(!ui.panes.iter().any(|pane| pane.response_id == "resp_3"));
+    }
+
+    #[test]
+    fn tool_related_events_append_to_text_pane() {
+        let (_tx, receiver) = tokio::sync::broadcast::channel(1);
+        let mut ui = UiHandle::new(String::new(), receiver);
+
+        ui.apply_event(started("resp_1"));
+        ui.apply_event(event(
+            "resp_1",
+            MonitorEventKind::FunctionCallArgumentsDelta {
+                call_id: "call_12345678901234567890".to_string(),
+                delta: "{\"cmd\":".to_string(),
+            },
+        ));
+        ui.apply_event(event(
+            "resp_1",
+            MonitorEventKind::FunctionCallArgumentsDelta {
+                call_id: "call_12345678901234567890".to_string(),
+                delta: "\"ls\"}".to_string(),
+            },
+        ));
+        ui.apply_event(event(
+            "resp_1",
+            MonitorEventKind::ToolPhase {
+                phase: "provider_tool_completed".to_string(),
+                detail: "web_search result ok".to_string(),
+            },
+        ));
+        ui.apply_event(event(
+            "resp_1",
+            MonitorEventKind::RefusalDelta {
+                delta: "no".to_string(),
+            },
+        ));
+
+        assert_eq!(
+            ui.panes.front().map(|pane| pane.text.as_str()),
+            Some(
+                "tool arguments call_1234567890123...:\n{\"cmd\":\"ls\"}\nweb_search result ok\nno"
+            )
+        );
+    }
+
+    fn started(response_id: &str) -> MonitorEvent {
+        event(
+            response_id,
+            MonitorEventKind::RequestStarted {
+                model: "test-model".to_string(),
+                input_items: 0,
+                tool_count: 0,
+                turn_count: 0,
+                user_messages: 0,
+                assistant_messages: 0,
+                system_messages: 0,
+                developer_messages: 0,
+                reasoning_items: 0,
+                function_calls: 0,
+                function_outputs: 0,
+                tool_items: 0,
+                input_chars: 0,
+                instructions_chars: 0,
+            },
+        )
+    }
+
+    fn delta(response_id: &str, text: &str) -> MonitorEvent {
+        event(
+            response_id,
+            MonitorEventKind::OutputTextDelta {
+                delta: text.to_string(),
+            },
+        )
+    }
+
+    fn event(response_id: &str, kind: MonitorEventKind) -> MonitorEvent {
+        MonitorEvent {
+            response_id: response_id.to_string(),
+            timestamp_ms: 0,
+            kind,
+        }
     }
 }

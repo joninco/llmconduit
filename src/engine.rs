@@ -455,6 +455,15 @@ impl Gateway {
                 instructions_chars: request.instructions.chars().count(),
             },
         );
+        for item in trailing_tool_output_items(&request.input) {
+            self.monitor.emit(
+                response_id.clone(),
+                MonitorEventKind::ToolPhase {
+                    phase: "client_tool_result".to_string(),
+                    detail: summarize_response_item(item),
+                },
+            );
+        }
         tx.send(created_event(&response_id))
             .await
             .map_err(|_| AppError::internal("failed to send response.created"))?;
@@ -663,6 +672,13 @@ impl Gateway {
                             .map_err(|_| AppError::internal("failed to stream reasoning delta"))?;
                         }
                         StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                            self.monitor.emit(
+                                response_id.clone(),
+                                MonitorEventKind::FunctionCallArgumentsDelta {
+                                    call_id: call_id.clone(),
+                                    delta: delta.clone(),
+                                },
+                            );
                             tx.send(function_call_args_delta_event(call_id, delta))
                                 .await
                                 .map_err(|_| {
@@ -712,6 +728,12 @@ impl Gateway {
                             })?;
                         }
                         StreamEmission::RefusalDelta(delta) => {
+                            self.monitor.emit(
+                                response_id.clone(),
+                                MonitorEventKind::RefusalDelta {
+                                    delta: delta.clone(),
+                                },
+                            );
                             tx.send(refusal_delta_event(delta))
                                 .await
                                 .map_err(|_| AppError::internal("failed to send refusal.delta"))?;
@@ -1268,6 +1290,25 @@ fn summarize_content(content: &[crate::models::responses::ContentItem]) -> Strin
     preview_text(&text)
 }
 
+fn trailing_tool_output_items(input: &[ResponseItem]) -> Vec<&ResponseItem> {
+    let mut items = input
+        .iter()
+        .rev()
+        .take_while(|item| is_tool_output_item(item))
+        .collect::<Vec<_>>();
+    items.reverse();
+    items
+}
+
+fn is_tool_output_item(item: &ResponseItem) -> bool {
+    matches!(
+        item,
+        ResponseItem::FunctionCallOutput { .. }
+            | ResponseItem::CustomToolCallOutput { .. }
+            | ResponseItem::ToolSearchOutput { .. }
+    )
+}
+
 fn preview_text(text: &str) -> String {
     const LIMIT: usize = 120;
     if text.chars().count() <= LIMIT {
@@ -1286,6 +1327,8 @@ fn preview_text(text: &str) -> String {
 mod tests {
     use super::preview_json;
     use super::preview_text;
+    use super::trailing_tool_output_items;
+    use crate::models::responses::ResponseItem;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -1304,6 +1347,50 @@ mod tests {
         let preview = preview_json(&value);
         assert!(preview.ends_with("...\n[truncated]"));
         assert!(preview.is_char_boundary(preview.len()));
+    }
+
+    #[test]
+    fn trailing_tool_output_items_returns_only_tail_outputs() {
+        let input = vec![
+            ResponseItem::FunctionCallOutput {
+                call_id: "old".to_string(),
+                output: json!("old"),
+            },
+            ResponseItem::message_text("assistant", "done"),
+            ResponseItem::FunctionCallOutput {
+                call_id: "fn".to_string(),
+                output: json!("fn out"),
+            },
+            ResponseItem::CustomToolCallOutput {
+                call_id: "custom".to_string(),
+                name: Some("tool".to_string()),
+                output: json!("custom out"),
+            },
+            ResponseItem::ToolSearchOutput {
+                call_id: Some("search".to_string()),
+                status: "completed".to_string(),
+                execution: "search".to_string(),
+                tools: vec![json!({ "name": "tool" })],
+            },
+        ];
+
+        let result = trailing_tool_output_items(&input);
+        assert_eq!(result.len(), 3);
+        assert!(matches!(
+            result[0],
+            ResponseItem::FunctionCallOutput { call_id, .. } if call_id == "fn"
+        ));
+        assert!(matches!(
+            result[1],
+            ResponseItem::CustomToolCallOutput { call_id, .. } if call_id == "custom"
+        ));
+        assert!(matches!(
+            result[2],
+            ResponseItem::ToolSearchOutput {
+                call_id: Some(call_id),
+                ..
+            } if call_id == "search"
+        ));
     }
 
     use super::AccumulatedUsage;

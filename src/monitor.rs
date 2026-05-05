@@ -37,6 +37,13 @@ pub enum MonitorEventKind {
     ReasoningTextDelta {
         delta: String,
     },
+    FunctionCallArgumentsDelta {
+        call_id: String,
+        delta: String,
+    },
+    RefusalDelta {
+        delta: String,
+    },
     ToolPhase {
         phase: String,
         detail: String,

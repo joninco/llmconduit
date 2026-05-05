@@ -30,7 +30,7 @@ pub enum Commands {
         /// Path to the config file. Defaults to ~/.config/resp2chat/config.yaml
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Show a live terminal dashboard while the gateway is running.
+        /// Show live request text panes while the gateway is running.
         #[arg(long, default_value_t = false)]
         ui: bool,
     },

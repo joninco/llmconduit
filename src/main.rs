@@ -12,13 +12,9 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
+    init_tracing(command_uses_tui(&cli.command));
+
     match cli.command {
         Some(Commands::Configure { config }) => {
             let path = resolve_config_path(config)?;
@@ -81,5 +77,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
             Ok(())
         }
+    }
+}
+
+fn init_tracing(tui_active: bool) {
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    if tui_active {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::sink)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
+}
+
+fn command_uses_tui(command: &Option<Commands>) -> bool {
+    matches!(command, Some(Commands::Start { ui: true, .. }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn detects_tui_start_command() {
+        assert!(command_uses_tui(&Some(Commands::Start {
+            config: None,
+            ui: true,
+        })));
+    }
+
+    #[test]
+    fn does_not_suppress_logs_for_non_tui_commands() {
+        assert!(!command_uses_tui(&None));
+        assert!(!command_uses_tui(&Some(Commands::Start {
+            config: None,
+            ui: false,
+        })));
+        assert!(!command_uses_tui(&Some(Commands::AnalyzeLog {
+            config: None,
+            path: Some(PathBuf::from("/tmp/requests.jsonl")),
+            pairs: 1,
+        })));
     }
 }
