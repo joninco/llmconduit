@@ -6,6 +6,7 @@ pub mod error;
 pub mod http;
 pub mod models;
 pub mod monitor;
+pub mod raw;
 pub mod replay;
 pub mod request_log;
 pub mod search;
@@ -16,6 +17,7 @@ use crate::config::Config;
 use crate::engine::Gateway;
 use crate::http::build_router;
 use crate::monitor::MonitorHub;
+use crate::raw::RawOutput;
 use crate::replay::ReplayStore;
 use crate::search::BraveSearchClient;
 use crate::upstream::ReqwestUpstreamClient;
@@ -27,6 +29,13 @@ pub fn build_app(config: Config) -> axum::Router {
 }
 
 pub fn build_app_with_gateway(config: Config) -> (axum::Router, Arc<Gateway>) {
+    build_app_with_gateway_and_raw_output(config, None)
+}
+
+pub fn build_app_with_gateway_and_raw_output(
+    config: Config,
+    raw_output: Option<RawOutput>,
+) -> (axum::Router, Arc<Gateway>) {
     let http_client = reqwest::Client::builder()
         .tcp_nodelay(true)
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
@@ -48,6 +57,7 @@ pub fn build_app_with_gateway(config: Config) -> (axum::Router, Arc<Gateway>) {
         upstream,
         search,
         monitor,
+        raw_output,
     ));
     let app = build_router(Arc::clone(&gateway));
     (app, gateway)

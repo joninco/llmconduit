@@ -32,6 +32,8 @@ pub struct AnthropicRequest {
     pub metadata: Option<Value>,
     #[serde(default)]
     pub thinking: Option<AnthropicThinking>,
+    #[serde(default)]
+    pub output_config: Option<Value>,
 }
 
 #[derive(Debug, Clone)]

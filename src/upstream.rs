@@ -3,9 +3,12 @@ use crate::error::AppResult;
 use crate::models::chat::ChatCompletionChunk;
 use crate::models::chat::ChatCompletionRequest;
 use async_trait::async_trait;
+use axum::body::Bytes;
 use eventsource_stream::Eventsource;
 use futures::Stream;
 use futures::StreamExt;
+use http::HeaderMap;
+use http::HeaderName;
 use reqwest::RequestBuilder;
 use reqwest::StatusCode;
 use serde_json::Value;
@@ -27,6 +30,15 @@ pub trait UpstreamClient: Send + Sync {
         request: &ChatCompletionRequest,
     ) -> AppResult<UpstreamStream>;
     async fn list_models(&self) -> AppResult<reqwest::Response>;
+    async fn proxy_completions(
+        &self,
+        _headers: HeaderMap,
+        _body: Bytes,
+    ) -> AppResult<reqwest::Response> {
+        Err(AppError::internal(
+            "upstream completions proxy is not implemented",
+        ))
+    }
     async fn supported_model_ids(&self) -> AppResult<Vec<String>>;
 }
 
@@ -148,10 +160,57 @@ impl UpstreamClient for ReqwestUpstreamClient {
         Ok(response)
     }
 
+    async fn proxy_completions(
+        &self,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> AppResult<reqwest::Response> {
+        let url = self.endpoint_url("completions")?;
+        let request = copy_proxy_request_headers(self.client.post(url), &headers).body(body);
+        self.with_auth(request).send().await.map_err(|err| {
+            AppError::upstream(format!("upstream completions request failed: {err}"))
+        })
+    }
+
     async fn supported_model_ids(&self) -> AppResult<Vec<String>> {
         let response = self.list_models().await?;
         collect_supported_model_ids(response).await
     }
+}
+
+fn copy_proxy_request_headers(mut request: RequestBuilder, headers: &HeaderMap) -> RequestBuilder {
+    for (name, value) in headers {
+        if should_proxy_request_header(name) {
+            request = request.header(name.clone(), value.clone());
+        }
+    }
+    request
+}
+
+fn should_proxy_request_header(name: &HeaderName) -> bool {
+    !is_hop_by_hop_header(name)
+        && !header_name_eq(name, "authorization")
+        && !header_name_eq(name, "host")
+        && !header_name_eq(name, "content-length")
+}
+
+fn is_hop_by_hop_header(name: &HeaderName) -> bool {
+    [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ]
+    .iter()
+    .any(|header| header_name_eq(name, header))
+}
+
+fn header_name_eq(name: &HeaderName, other: &str) -> bool {
+    name.as_str().eq_ignore_ascii_case(other)
 }
 
 async fn ensure_success(

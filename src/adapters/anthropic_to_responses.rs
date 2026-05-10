@@ -12,6 +12,8 @@ use crate::models::responses::ReasoningContentItem;
 use crate::models::responses::ReasoningRequest;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponsesRequest;
+use crate::models::responses::TextControls;
+use crate::models::responses::TextFormat;
 use crate::models::responses::ToolSpec;
 use serde_json::Value;
 use serde_json::json;
@@ -39,6 +41,7 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
     let reasoning = convert_thinking(&request.thinking);
     let tool_choice = convert_tool_choice(request.tool_choice);
     let metadata = convert_metadata(request.metadata)?;
+    let text = convert_output_config(request.output_config)?;
     let max_output_tokens = request.max_tokens.map(|value| {
         i64::try_from(value)
             .map_err(|_| AppError::bad_request("Anthropic max_tokens exceeds supported range"))
@@ -57,7 +60,7 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
-        text: None,
+        text,
         client_metadata: None,
         previous_response_id: None,
         temperature: request.temperature,
@@ -67,7 +70,62 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         presence_penalty: None,
         truncation: None,
         metadata,
+        extra_body: Default::default(),
     })
+}
+
+fn convert_output_config(output_config: Option<Value>) -> AppResult<Option<TextControls>> {
+    let Some(output_config) = output_config else {
+        return Ok(None);
+    };
+    let Value::Object(config) = output_config else {
+        return Err(AppError::bad_request(
+            "Anthropic output_config must be a JSON object",
+        ));
+    };
+    let Some(format) = config.get("format") else {
+        return Ok(None);
+    };
+    if format.is_null() {
+        return Ok(None);
+    }
+    let Some(format) = format.as_object() else {
+        return Err(AppError::bad_request(
+            "Anthropic output_config.format must be a JSON object",
+        ));
+    };
+    let kind = format
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| AppError::bad_request("Anthropic output_config.format is missing type"))?;
+    if kind != "json_schema" {
+        return Err(AppError::bad_request(format!(
+            "Anthropic output_config.format type \"{kind}\" is not supported by this gateway"
+        )));
+    }
+    let schema = format.get("schema").cloned().ok_or_else(|| {
+        AppError::bad_request("Anthropic output_config.format json_schema is missing schema")
+    })?;
+    let name = format
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("response")
+        .to_string();
+    let strict = format
+        .get("strict")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    Ok(Some(TextControls {
+        verbosity: None,
+        format: Some(TextFormat {
+            kind: "json_schema".to_string(),
+            strict,
+            schema,
+            name,
+        }),
+    }))
 }
 
 fn extract_system_text(system: &Option<AnthropicSystemContent>) -> String {
@@ -389,6 +447,7 @@ mod tests {
             stop_sequences: None,
             metadata: Some(json!({"source": "anthropic"})),
             thinking: None,
+            output_config: None,
         };
 
         let result = convert_request(request).expect("convert");
@@ -412,6 +471,57 @@ mod tests {
                     && matches!(&content[0], ContentItem::InputText { text } if text == "Hello")
         ));
         assert_eq!(result.stream, true);
+    }
+
+    #[test]
+    fn converts_output_config_json_schema_to_text_format() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "title": { "type": "string" }
+            },
+            "required": ["title"]
+        });
+        let request = AnthropicRequest {
+            model: "claude-haiku-4-5-20251001".to_string(),
+            max_tokens: Some(32000),
+            system: Some(AnthropicSystemContent::Blocks(vec![
+                AnthropicTextBlock::Text {
+                    text: "Return JSON with a single \"title\" field.".to_string(),
+                },
+            ])),
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("Build a web app.".to_string()),
+            }],
+            tools: Some(Vec::new()),
+            tool_choice: None,
+            stream: true,
+            temperature: Some(1.0),
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            metadata: None,
+            thinking: None,
+            output_config: Some(json!({
+                "format": {
+                    "type": "json_schema",
+                    "schema": schema
+                }
+            })),
+        };
+
+        let result = convert_request(request).expect("convert");
+        let format = result
+            .text
+            .as_ref()
+            .and_then(|text| text.format.as_ref())
+            .expect("text format");
+        assert_eq!(format.kind, "json_schema");
+        assert_eq!(format.name, "response");
+        assert!(format.strict);
+        assert_eq!(format.schema, schema);
     }
 
     #[test]
@@ -456,6 +566,7 @@ mod tests {
             stop_sequences: None,
             metadata: None,
             thinking: None,
+            output_config: None,
         };
 
         let result = convert_request(request).expect("convert");
@@ -514,6 +625,7 @@ mod tests {
             stop_sequences: None,
             metadata: None,
             thinking: None,
+            output_config: None,
         };
 
         let result = convert_request(request).expect("convert");
@@ -542,6 +654,7 @@ mod tests {
             thinking: Some(AnthropicThinking::Enabled {
                 budget_tokens: Some(10000),
             }),
+            output_config: None,
         };
 
         let result = convert_request(request).expect("convert");
@@ -571,6 +684,7 @@ mod tests {
             stop_sequences: None,
             metadata: None,
             thinking: None,
+            output_config: None,
         };
 
         let result = convert_request(request);
@@ -603,6 +717,7 @@ mod tests {
             stop_sequences: None,
             metadata: None,
             thinking: None,
+            output_config: None,
         };
 
         let tool_specific = convert_request(request).expect("convert");
@@ -640,6 +755,7 @@ mod tests {
             stop_sequences: None,
             metadata: None,
             thinking: None,
+            output_config: None,
         };
         assert!(convert_request(request).is_err());
 
@@ -660,6 +776,7 @@ mod tests {
             stop_sequences: Some(vec!["stop".to_string()]),
             metadata: None,
             thinking: None,
+            output_config: None,
         };
         assert!(convert_request(request).is_err());
     }

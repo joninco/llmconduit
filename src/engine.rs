@@ -31,6 +31,7 @@ use crate::models::responses::ResponsesRequest;
 use crate::models::responses::WebSearchAction;
 use crate::monitor::MonitorEventKind;
 use crate::monitor::MonitorHub;
+use crate::raw::RawOutput;
 use crate::replay::ReplayRecord;
 use crate::replay::ReplayStore;
 use crate::search::SearchClient;
@@ -38,6 +39,7 @@ use crate::upstream::UpstreamClient;
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -55,6 +57,7 @@ pub struct Gateway {
     upstream: Arc<dyn UpstreamClient>,
     search: Arc<dyn SearchClient>,
     monitor: MonitorHub,
+    raw_output: Option<RawOutput>,
     upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
 }
 
@@ -118,6 +121,104 @@ fn canonical_model_key(model: &str) -> String {
         .collect()
 }
 
+fn build_upstream_extra_body(
+    defaults: serde_json::Map<String, Value>,
+    request: &ResponsesRequest,
+    response_format: &Option<Value>,
+    reasoning_effort: &Option<String>,
+) -> BTreeMap<String, Value> {
+    let mut extra_body = defaults.into_iter().collect();
+    remove_defaults_for_explicit_request_fields(
+        &mut extra_body,
+        request,
+        response_format,
+        reasoning_effort,
+    );
+    remove_defaults_shadowed_by_request_extra(&mut extra_body, &request.extra_body);
+    for (key, value) in &request.extra_body {
+        merge_request_extra_value(&mut extra_body, key, value);
+    }
+    extra_body
+}
+
+fn remove_defaults_for_explicit_request_fields(
+    extra_body: &mut BTreeMap<String, Value>,
+    request: &ResponsesRequest,
+    response_format: &Option<Value>,
+    reasoning_effort: &Option<String>,
+) {
+    if request.temperature.is_some() {
+        remove_keys(extra_body, &["temperature"]);
+    }
+    if request.top_p.is_some() {
+        remove_keys(extra_body, &["top_p"]);
+    }
+    if request.max_output_tokens.is_some() {
+        remove_keys(
+            extra_body,
+            &["max_tokens", "max_output_tokens", "max_completion_tokens"],
+        );
+    }
+    if request.frequency_penalty.is_some() {
+        remove_keys(extra_body, &["frequency_penalty"]);
+    }
+    if request.presence_penalty.is_some() {
+        remove_keys(extra_body, &["presence_penalty"]);
+    }
+    if response_format.is_some() {
+        remove_keys(extra_body, &["response_format"]);
+    }
+    if reasoning_effort.is_some() {
+        remove_keys(extra_body, &["reasoning_effort"]);
+    }
+}
+
+fn remove_defaults_shadowed_by_request_extra(
+    extra_body: &mut BTreeMap<String, Value>,
+    request_extra: &BTreeMap<String, Value>,
+) {
+    for aliases in [&["max_tokens", "max_output_tokens", "max_completion_tokens"][..]] {
+        if aliases.iter().any(|key| request_extra.contains_key(*key)) {
+            remove_keys(extra_body, aliases);
+        }
+    }
+}
+
+fn remove_keys(extra_body: &mut BTreeMap<String, Value>, keys: &[&str]) {
+    for key in keys {
+        extra_body.remove(*key);
+    }
+}
+
+fn merge_request_extra_value(extra_body: &mut BTreeMap<String, Value>, key: &str, value: &Value) {
+    if key == "chat_template_kwargs"
+        && let Some(existing) = extra_body.get_mut(key)
+    {
+        merge_json_value_prefer_source(existing, value);
+        return;
+    }
+    extra_body.insert(key.to_string(), value.clone());
+}
+
+fn merge_json_value_prefer_source(destination: &mut Value, source: &Value) {
+    if let Value::Object(destination_object) = destination
+        && let Value::Object(source_object) = source
+    {
+        for (key, source_value) in source_object {
+            match destination_object.get_mut(key) {
+                Some(destination_value) => {
+                    merge_json_value_prefer_source(destination_value, source_value);
+                }
+                None => {
+                    destination_object.insert(key.clone(), source_value.clone());
+                }
+            }
+        }
+        return;
+    }
+    *destination = source.clone();
+}
+
 impl Gateway {
     pub fn new(
         config: Config,
@@ -125,6 +226,7 @@ impl Gateway {
         upstream: Arc<dyn UpstreamClient>,
         search: Arc<dyn SearchClient>,
         monitor: MonitorHub,
+        raw_output: Option<RawOutput>,
     ) -> Self {
         Self {
             config,
@@ -132,6 +234,7 @@ impl Gateway {
             upstream,
             search,
             monitor,
+            raw_output,
             upstream_model_catalog: Arc::new(Mutex::new(None)),
         }
     }
@@ -148,6 +251,24 @@ impl Gateway {
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::monitor::MonitorEvent> {
         self.monitor.subscribe()
+    }
+
+    async fn send_event(
+        &self,
+        tx: &mpsc::Sender<SseEvent>,
+        event: SseEvent,
+        failure_message: &'static str,
+    ) -> AppResult<()> {
+        let raw_event = event.clone();
+        tx.send(event)
+            .await
+            .map_err(|_| AppError::internal(failure_message))?;
+        if let Some(raw_output) = &self.raw_output {
+            raw_output
+                .write_sse_event(&raw_event)
+                .map_err(|err| AppError::internal(format!("failed to write raw output: {err}")))?;
+        }
+        Ok(())
     }
 
     pub async fn stream_responses(
@@ -202,7 +323,9 @@ impl Gateway {
                         message: err.to_string(),
                     },
                 );
-                let _ = tx.send(failure_event(err)).await;
+                let _ = gateway
+                    .send_event(&tx, failure_event(err), "failed to send response.failed")
+                    .await;
             }
         });
         Ok(ReceiverStream::new(rx))
@@ -464,12 +587,18 @@ impl Gateway {
                 },
             );
         }
-        tx.send(created_event(&response_id))
-            .await
-            .map_err(|_| AppError::internal("failed to send response.created"))?;
-        tx.send(in_progress_event(&response_id))
-            .await
-            .map_err(|_| AppError::internal("failed to send response.in_progress"))?;
+        self.send_event(
+            &tx,
+            created_event(&response_id),
+            "failed to send response.created",
+        )
+        .await?;
+        self.send_event(
+            &tx,
+            in_progress_event(&response_id),
+            "failed to send response.in_progress",
+        )
+        .await?;
 
         let mut public_history = request.input.clone();
         let mut response_output = Vec::new();
@@ -486,6 +615,12 @@ impl Gateway {
         let mut web_search_rounds = 0usize;
         #[allow(unused_assignments)]
         let mut last_finish_reason: Option<String> = None;
+        let upstream_extra_body = build_upstream_extra_body(
+            self.config.resolve_upstream_chat_kwargs(&request.model),
+            &request,
+            &response_format,
+            &reasoning_effort,
+        );
         loop {
             if tx.is_closed() {
                 return Err(AppError::cancelled());
@@ -509,11 +644,7 @@ impl Gateway {
                 max_output_tokens: request.max_output_tokens,
                 frequency_penalty: request.frequency_penalty,
                 presence_penalty: request.presence_penalty,
-                extra_body: self
-                    .config
-                    .resolve_upstream_chat_kwargs(&request.model)
-                    .into_iter()
-                    .collect(),
+                extra_body: upstream_extra_body.clone(),
             };
             self.monitor.emit(
                 response_id.clone(),
@@ -617,11 +748,12 @@ impl Gateway {
                                     payload_preview: preview_json(&item),
                                 },
                             );
-                            tx.send(output_item_added_event(item, target.output_index))
-                                .await
-                                .map_err(|_| {
-                                    AppError::internal("failed to stream message start")
-                                })?;
+                            self.send_event(
+                                &tx,
+                                output_item_added_event(item, target.output_index),
+                                "failed to stream message start",
+                            )
+                            .await?;
                         }
                         StreamEmission::OutputTextDelta(delta) => {
                             let target = event_state.active_message_target()?;
@@ -631,13 +763,12 @@ impl Gateway {
                                     delta: delta.clone(),
                                 },
                             );
-                            tx.send(output_text_delta_event(
-                                target.item_id,
-                                target.output_index,
-                                delta,
-                            ))
-                            .await
-                            .map_err(|_| AppError::internal("failed to stream text delta"))?;
+                            self.send_event(
+                                &tx,
+                                output_text_delta_event(target.item_id, target.output_index, delta),
+                                "failed to stream text delta",
+                            )
+                            .await?;
                         }
                         StreamEmission::ReasoningItemAdded(item) => {
                             let target = event_state.register_item(&item);
@@ -649,11 +780,12 @@ impl Gateway {
                                     payload_preview: preview_json(&item),
                                 },
                             );
-                            tx.send(output_item_added_event(item, target.output_index))
-                                .await
-                                .map_err(|_| {
-                                    AppError::internal("failed to stream reasoning start")
-                                })?;
+                            self.send_event(
+                                &tx,
+                                output_item_added_event(item, target.output_index),
+                                "failed to stream reasoning start",
+                            )
+                            .await?;
                         }
                         StreamEmission::ReasoningTextDelta(delta) => {
                             let target = event_state.active_reasoning_target()?;
@@ -663,13 +795,16 @@ impl Gateway {
                                     delta: delta.clone(),
                                 },
                             );
-                            tx.send(reasoning_text_delta_event(
-                                target.item_id,
-                                target.output_index,
-                                delta,
-                            ))
-                            .await
-                            .map_err(|_| AppError::internal("failed to stream reasoning delta"))?;
+                            self.send_event(
+                                &tx,
+                                reasoning_text_delta_event(
+                                    target.item_id,
+                                    target.output_index,
+                                    delta,
+                                ),
+                                "failed to stream reasoning delta",
+                            )
+                            .await?;
                         }
                         StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
                             self.monitor.emit(
@@ -679,53 +814,55 @@ impl Gateway {
                                     delta: delta.clone(),
                                 },
                             );
-                            tx.send(function_call_args_delta_event(call_id, delta))
-                                .await
-                                .map_err(|_| {
-                                    AppError::internal("failed to stream function call args delta")
-                                })?;
+                            self.send_event(
+                                &tx,
+                                function_call_args_delta_event(call_id, delta),
+                                "failed to stream function call args delta",
+                            )
+                            .await?;
                         }
                         StreamEmission::ContentPartAdded => {
                             let target = event_state.active_message_target()?;
-                            tx.send(content_part_added_event(
-                                target.item_id,
-                                target.output_index,
-                            ))
-                            .await
-                            .map_err(|_| AppError::internal("failed to send content_part.added"))?;
+                            self.send_event(
+                                &tx,
+                                content_part_added_event(target.item_id, target.output_index),
+                                "failed to send content_part.added",
+                            )
+                            .await?;
                         }
                         StreamEmission::ContentPartDone { text } => {
                             let target = event_state.active_message_target()?;
-                            tx.send(content_part_done_event(
-                                target.item_id,
-                                target.output_index,
-                                text,
-                            ))
-                            .await
-                            .map_err(|_| AppError::internal("failed to send content_part.done"))?;
+                            self.send_event(
+                                &tx,
+                                content_part_done_event(target.item_id, target.output_index, text),
+                                "failed to send content_part.done",
+                            )
+                            .await?;
                         }
                         StreamEmission::ReasoningSummaryPartAdded => {
                             let target = event_state.active_reasoning_target()?;
-                            tx.send(reasoning_summary_part_added_event(
-                                target.item_id,
-                                target.output_index,
-                            ))
-                            .await
-                            .map_err(|_| {
-                                AppError::internal("failed to send reasoning_summary_part.added")
-                            })?;
+                            self.send_event(
+                                &tx,
+                                reasoning_summary_part_added_event(
+                                    target.item_id,
+                                    target.output_index,
+                                ),
+                                "failed to send reasoning_summary_part.added",
+                            )
+                            .await?;
                         }
                         StreamEmission::ReasoningSummaryPartDone { text } => {
                             let target = event_state.active_reasoning_target()?;
-                            tx.send(reasoning_summary_part_done_event(
-                                target.item_id,
-                                target.output_index,
-                                text,
-                            ))
-                            .await
-                            .map_err(|_| {
-                                AppError::internal("failed to send reasoning_summary_part.done")
-                            })?;
+                            self.send_event(
+                                &tx,
+                                reasoning_summary_part_done_event(
+                                    target.item_id,
+                                    target.output_index,
+                                    text,
+                                ),
+                                "failed to send reasoning_summary_part.done",
+                            )
+                            .await?;
                         }
                         StreamEmission::RefusalDelta(delta) => {
                             self.monitor.emit(
@@ -734,9 +871,12 @@ impl Gateway {
                                     delta: delta.clone(),
                                 },
                             );
-                            tx.send(refusal_delta_event(delta))
-                                .await
-                                .map_err(|_| AppError::internal("failed to send refusal.delta"))?;
+                            self.send_event(
+                                &tx,
+                                refusal_delta_event(delta),
+                                "failed to send refusal.delta",
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -833,13 +973,19 @@ impl Gateway {
             },
         };
         if is_incomplete {
-            tx.send(incomplete_event(resource))
-                .await
-                .map_err(|_| AppError::internal("failed to send response.incomplete"))?;
+            self.send_event(
+                &tx,
+                incomplete_event(resource),
+                "failed to send response.incomplete",
+            )
+            .await?;
         } else {
-            tx.send(completed_event(resource))
-                .await
-                .map_err(|_| AppError::internal("failed to send response.completed"))?;
+            self.send_event(
+                &tx,
+                completed_event(resource),
+                "failed to send response.completed",
+            )
+            .await?;
         }
         self.monitor.emit(response_id, MonitorEventKind::Completed);
         Ok(())
@@ -924,13 +1070,16 @@ impl Gateway {
                         }
                     })
                     .unwrap_or_default();
-                tx.send(reasoning_summary_part_done_event(
-                    target.item_id.clone(),
-                    target.output_index,
-                    reasoning_text,
-                ))
-                .await
-                .map_err(|_| AppError::internal("failed to send reasoning_summary_part.done"))?;
+                self.send_event(
+                    tx,
+                    reasoning_summary_part_done_event(
+                        target.item_id.clone(),
+                        target.output_index,
+                        reasoning_text,
+                    ),
+                    "failed to send reasoning_summary_part.done",
+                )
+                .await?;
             }
             self.monitor.emit(
                 response_id.to_string(),
@@ -940,9 +1089,12 @@ impl Gateway {
                     payload_preview: preview_json(&reasoning),
                 },
             );
-            tx.send(output_item_done_event(reasoning, target.output_index))
-                .await
-                .map_err(|_| AppError::internal("failed to send reasoning done"))?;
+            self.send_event(
+                tx,
+                output_item_done_event(reasoning, target.output_index),
+                "failed to send reasoning done",
+            )
+            .await?;
         }
         if let Some(message) = finalized.message_item.clone() {
             let target = event_state.target_for_item(&message);
@@ -958,21 +1110,27 @@ impl Gateway {
                     .collect::<Vec<_>>()
                     .join("");
                 if !full_text.is_empty() {
-                    tx.send(output_text_done_event(
-                        target.item_id.clone(),
-                        target.output_index,
-                        full_text.clone(),
-                    ))
-                    .await
-                    .map_err(|_| AppError::internal("failed to send output_text.done"))?;
-                    if finalized.content_part_emitted {
-                        tx.send(content_part_done_event(
+                    self.send_event(
+                        tx,
+                        output_text_done_event(
                             target.item_id.clone(),
                             target.output_index,
-                            full_text,
-                        ))
-                        .await
-                        .map_err(|_| AppError::internal("failed to send content_part.done"))?;
+                            full_text.clone(),
+                        ),
+                        "failed to send output_text.done",
+                    )
+                    .await?;
+                    if finalized.content_part_emitted {
+                        self.send_event(
+                            tx,
+                            content_part_done_event(
+                                target.item_id.clone(),
+                                target.output_index,
+                                full_text,
+                            ),
+                            "failed to send content_part.done",
+                        )
+                        .await?;
                     }
                 }
             }
@@ -986,14 +1144,20 @@ impl Gateway {
                     payload_preview: preview_json(&message),
                 },
             );
-            tx.send(output_item_done_event(message, target.output_index))
-                .await
-                .map_err(|_| AppError::internal("failed to send message done"))?;
+            self.send_event(
+                tx,
+                output_item_done_event(message, target.output_index),
+                "failed to send message done",
+            )
+            .await?;
         }
         if !finalized.refusal_text.is_empty() {
-            tx.send(refusal_done_event(finalized.refusal_text.clone()))
-                .await
-                .map_err(|_| AppError::internal("failed to send refusal.done"))?;
+            self.send_event(
+                tx,
+                refusal_done_event(finalized.refusal_text.clone()),
+                "failed to send refusal.done",
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1035,13 +1199,16 @@ impl Gateway {
                     ..
                 } = tool_call.public_item
                 {
-                    tx.send(function_call_args_done_event(
-                        call_id.clone(),
-                        name.clone(),
-                        arguments.clone(),
-                    ))
-                    .await
-                    .map_err(|_| AppError::internal("failed to send function call args done"))?;
+                    self.send_event(
+                        tx,
+                        function_call_args_done_event(
+                            call_id.clone(),
+                            name.clone(),
+                            arguments.clone(),
+                        ),
+                        "failed to send function call args done",
+                    )
+                    .await?;
                 }
                 self.monitor.emit(
                     response_id.to_string(),
@@ -1061,12 +1228,12 @@ impl Gateway {
                         payload_preview: preview_json(&tool_call.public_item),
                     },
                 );
-                tx.send(output_item_done_event(
-                    tool_call.public_item.clone(),
-                    target.output_index,
-                ))
-                .await
-                .map_err(|_| AppError::internal("failed to send tool call item"))?;
+                self.send_event(
+                    tx,
+                    output_item_done_event(tool_call.public_item.clone(), target.output_index),
+                    "failed to send tool call item",
+                )
+                .await?;
             }
             return Ok(());
         }
@@ -1124,12 +1291,12 @@ impl Gateway {
             },
         );
         let partial_target = event_state.register_item(&partial);
-        tx.send(output_item_added_event(
-            partial,
-            partial_target.output_index,
-        ))
-        .await
-        .map_err(|_| AppError::internal("failed to send web_search start"))?;
+        self.send_event(
+            tx,
+            output_item_added_event(partial, partial_target.output_index),
+            "failed to send web_search start",
+        )
+        .await?;
 
         let query = extract_web_search_query(action, &tool_call.arguments)?;
         self.monitor.emit(
@@ -1164,12 +1331,12 @@ impl Gateway {
                 payload_preview: preview_json(&completed),
             },
         );
-        tx.send(output_item_done_event(
-            completed,
-            completed_target.output_index,
-        ))
-        .await
-        .map_err(|_| AppError::internal("failed to send web_search done"))?;
+        self.send_event(
+            tx,
+            output_item_done_event(completed, completed_target.output_index),
+            "failed to send web_search done",
+        )
+        .await?;
         self.monitor.emit(
             response_id.to_string(),
             MonitorEventKind::ToolPhase {
@@ -1404,6 +1571,7 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 25,
             total_tokens: 125,
+            reasoning_tokens: None,
             prompt_tokens_details: Some(crate::models::chat::PromptTokensDetails {
                 cached_tokens: 50,
             }),
@@ -1421,6 +1589,7 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 25,
             total_tokens: 125,
+            reasoning_tokens: None,
             prompt_tokens_details: None,
             completion_tokens_details: Some(crate::models::chat::CompletionTokensDetails {
                 reasoning_tokens: 30,
@@ -1428,6 +1597,39 @@ mod tests {
         });
         let result = usage.into_response_usage().unwrap();
         assert_eq!(result.output_tokens, 25);
+        assert_eq!(result.output_tokens_details.unwrap().reasoning_tokens, 30);
+    }
+
+    #[test]
+    fn accumulated_usage_top_level_reasoning_tokens() {
+        let mut usage = AccumulatedUsage::default();
+        usage.add(ChunkUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            reasoning_tokens: Some(30),
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        });
+        let result = usage.into_response_usage().unwrap();
+        assert_eq!(result.output_tokens, 25);
+        assert_eq!(result.output_tokens_details.unwrap().reasoning_tokens, 30);
+    }
+
+    #[test]
+    fn accumulated_usage_prefers_nested_reasoning_tokens() {
+        let mut usage = AccumulatedUsage::default();
+        usage.add(ChunkUsage {
+            prompt_tokens: 100,
+            completion_tokens: 25,
+            total_tokens: 125,
+            reasoning_tokens: Some(10),
+            prompt_tokens_details: None,
+            completion_tokens_details: Some(crate::models::chat::CompletionTokensDetails {
+                reasoning_tokens: 30,
+            }),
+        });
+        let result = usage.into_response_usage().unwrap();
         assert_eq!(result.output_tokens_details.unwrap().reasoning_tokens, 30);
     }
 
@@ -1790,10 +1992,11 @@ impl AccumulatedUsage {
             .prompt_tokens_details
             .map(|d| d.cached_tokens)
             .unwrap_or(0);
-        self.reasoning_output_tokens += usage
+        let reasoning_tokens = usage
             .completion_tokens_details
             .map(|d| d.reasoning_tokens)
-            .unwrap_or(0);
+            .or(usage.reasoning_tokens);
+        self.reasoning_output_tokens += reasoning_tokens.unwrap_or(0);
     }
 
     fn into_response_usage(self) -> Option<ResponseUsage> {

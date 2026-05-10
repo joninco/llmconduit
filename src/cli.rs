@@ -31,8 +31,11 @@ pub enum Commands {
         #[arg(long)]
         config: Option<PathBuf>,
         /// Show live request text panes while the gateway is running.
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, conflicts_with = "raw")]
         ui: bool,
+        /// Dump raw model delta text to the terminal while the gateway is running.
+        #[arg(long, default_value_t = false, conflicts_with = "ui")]
+        raw: bool,
     },
     /// Run the interactive configuration flow and write a config file.
     Configure {

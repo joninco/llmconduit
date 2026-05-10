@@ -1,10 +1,12 @@
 use clap::Parser;
 use resp2chat::build_app_with_gateway;
+use resp2chat::build_app_with_gateway_and_raw_output;
 use resp2chat::cli::Cli;
 use resp2chat::cli::Commands;
 use resp2chat::cli::resolve_config_path;
 use resp2chat::cli::run_configure_flow;
 use resp2chat::config::Config;
+use resp2chat::raw::RawOutput;
 use resp2chat::request_log::analyze_request_log;
 use resp2chat::ui::UiHandle;
 use tokio::net::TcpListener;
@@ -13,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-    init_tracing(command_uses_tui(&cli.command));
+    init_tracing(command_uses_dedicated_terminal(&cli.command));
 
     match cli.command {
         Some(Commands::Configure { config }) => {
@@ -39,11 +41,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{report}");
             Ok(())
         }
-        Some(Commands::Start { config, ui }) => {
+        Some(Commands::Start { config, ui, raw }) => {
+            if ui && raw {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "--ui and --raw cannot be used together",
+                )
+                .into());
+            }
             let path = resolve_config_path(config)?;
             let config = Config::from_env_and_file(Some(&path))?;
             let bind_addr = config.bind_addr;
-            let (app, gateway) = build_app_with_gateway(config);
+            let (app, gateway) =
+                build_app_with_gateway_and_raw_output(config, raw.then(RawOutput::stdout));
             let listener = TcpListener::bind(bind_addr).await?;
             tracing::info!("resp2chat listening on {bind_addr}");
             tracing::info!("using config file {}", path.display());
@@ -93,8 +103,11 @@ fn init_tracing(tui_active: bool) {
     }
 }
 
-fn command_uses_tui(command: &Option<Commands>) -> bool {
-    matches!(command, Some(Commands::Start { ui: true, .. }))
+fn command_uses_dedicated_terminal(command: &Option<Commands>) -> bool {
+    matches!(
+        command,
+        Some(Commands::Start { ui: true, .. }) | Some(Commands::Start { raw: true, .. })
+    )
 }
 
 #[cfg(test)]
@@ -104,23 +117,36 @@ mod tests {
 
     #[test]
     fn detects_tui_start_command() {
-        assert!(command_uses_tui(&Some(Commands::Start {
+        assert!(command_uses_dedicated_terminal(&Some(Commands::Start {
             config: None,
             ui: true,
+            raw: false,
+        })));
+    }
+
+    #[test]
+    fn detects_raw_start_command() {
+        assert!(command_uses_dedicated_terminal(&Some(Commands::Start {
+            config: None,
+            ui: false,
+            raw: true,
         })));
     }
 
     #[test]
     fn does_not_suppress_logs_for_non_tui_commands() {
-        assert!(!command_uses_tui(&None));
-        assert!(!command_uses_tui(&Some(Commands::Start {
+        assert!(!command_uses_dedicated_terminal(&None));
+        assert!(!command_uses_dedicated_terminal(&Some(Commands::Start {
             config: None,
             ui: false,
+            raw: false,
         })));
-        assert!(!command_uses_tui(&Some(Commands::AnalyzeLog {
-            config: None,
-            path: Some(PathBuf::from("/tmp/requests.jsonl")),
-            pairs: 1,
-        })));
+        assert!(!command_uses_dedicated_terminal(&Some(
+            Commands::AnalyzeLog {
+                config: None,
+                path: Some(PathBuf::from("/tmp/requests.jsonl")),
+                pairs: 1,
+            }
+        )));
     }
 }

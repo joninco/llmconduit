@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 fn deserialize_input<'de, D>(deserializer: D) -> Result<Vec<ResponseItem>, D::Error>
@@ -70,6 +71,8 @@ pub struct ResponsesRequest {
     pub truncation: Option<Value>,
     #[serde(default)]
     pub metadata: Option<HashMap<String, Value>>,
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra_body: BTreeMap<String, Value>,
 }
 
 fn default_tool_choice() -> Value {

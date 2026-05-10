@@ -22,6 +22,7 @@ use resp2chat::models::responses::ResponseItem;
 use resp2chat::models::responses::ResponsesRequest;
 use resp2chat::models::responses::ToolSpec;
 use resp2chat::monitor::MonitorHub;
+use resp2chat::raw::RawOutput;
 use resp2chat::replay::ReplayStore;
 use resp2chat::search::SearchClient;
 use resp2chat::upstream::UpstreamClient;
@@ -29,13 +30,17 @@ use resp2chat::upstream::UpstreamStream;
 use serde_json::Map as JsonMap;
 use serde_json::json;
 use std::collections::VecDeque;
+use std::io;
+use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tower::ServiceExt;
 use wiremock::Mock;
 use wiremock::MockServer;
 use wiremock::ResponseTemplate;
+use wiremock::matchers::body_json;
 use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
@@ -218,6 +223,7 @@ async fn streams_function_call_turn() {
         presence_penalty: None,
         truncation: None,
         metadata: None,
+        extra_body: Default::default(),
     };
 
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream"));
@@ -245,6 +251,29 @@ async fn streams_function_call_turn() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].parallel_tool_calls, false);
     assert_eq!(requests[0].tools.as_ref().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn raw_output_observes_gateway_sse_deltas() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(reasoning_chunk("chat-1", "thinking")),
+            Ok(content_chunk("chat-1", "answer")),
+        ])
+        .await;
+    let buffer = Arc::new(StdMutex::new(Vec::new()));
+    let gateway = test_gateway_with_raw_output(
+        upstream,
+        MockSearch::default(),
+        RawOutput::new(SharedBuffer(Arc::clone(&buffer))),
+    );
+
+    let request = base_request(vec![user_message("hello")]);
+    let _events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let output = buffer.lock().expect("buffer lock").clone();
+    assert_eq!(String::from_utf8(output).expect("utf8"), "thinkinganswer");
 }
 
 #[tokio::test]
@@ -350,6 +379,7 @@ async fn flattens_namespace_tools_for_upstream_and_preserves_namespace_in_output
         presence_penalty: None,
         truncation: None,
         metadata: None,
+        extra_body: Default::default(),
     };
 
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
@@ -890,6 +920,71 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
 }
 
 #[tokio::test]
+async fn request_values_override_configured_upstream_defaults_and_merge_chat_template_kwargs() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let mut config = test_config();
+    config.upstream_chat_kwargs = JsonMap::from_iter([
+        ("temperature".to_string(), json!(0.2)),
+        ("max_tokens".to_string(), json!(1024)),
+        ("top_k".to_string(), json!(20)),
+        (
+            "chat_template_kwargs".to_string(),
+            json!({
+                "enable_thinking": true,
+                "preserve_thinking": true,
+                "nested": {
+                    "from_default": true,
+                    "shared": "default"
+                }
+            }),
+        ),
+    ]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let mut request = base_request(vec![user_message("hello")]);
+    request.temperature = Some(0.7);
+    request.max_output_tokens = Some(256);
+    request.extra_body = std::collections::BTreeMap::from([
+        ("top_k".to_string(), json!(5)),
+        (
+            "chat_template_kwargs".to_string(),
+            json!({
+                "preserve_thinking": false,
+                "thinking": true,
+                "nested": {
+                    "shared": "request"
+                }
+            }),
+        ),
+    ]);
+
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].temperature, Some(0.7));
+    assert_eq!(requests[0].max_output_tokens, Some(256));
+    assert_eq!(requests[0].extra_body.get("temperature"), None);
+    assert_eq!(requests[0].extra_body.get("max_tokens"), None);
+    assert_eq!(requests[0].extra_body.get("top_k"), Some(&json!(5)));
+    assert_eq!(
+        requests[0].extra_body.get("chat_template_kwargs"),
+        Some(&json!({
+            "enable_thinking": true,
+            "preserve_thinking": false,
+            "thinking": true,
+            "nested": {
+                "from_default": true,
+                "shared": "request"
+            }
+        }))
+    );
+}
+
+#[tokio::test]
 async fn hides_web_search_loop_but_replays_internal_tool_result() {
     let upstream = MockUpstream::default();
     upstream
@@ -1097,6 +1192,16 @@ async fn proxies_models_endpoint_with_etag() {
             .and_then(|value| value.to_str().ok()),
         Some("\"etag-1\"")
     );
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    assert_eq!(
+        body,
+        json!({
+            "data": [{"id": "glm-5.1"}]
+        })
+    );
 }
 
 #[tokio::test]
@@ -1140,6 +1245,228 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         .expect("response");
 
     assert_eq!(response.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn transforms_models_endpoint_for_anthropic_clients() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"upstream-etag\"")
+                .set_body_json(json!({
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": "glm-5.1",
+                            "object": "model",
+                            "created": 1760000000,
+                            "owned_by": "zai",
+                            "context_length": 131072,
+                            "max_output_tokens": 8192
+                        },
+                        {
+                            "id": "qwen3",
+                            "created_at": "2025-02-19T00:00:00Z",
+                            "display_name": "Qwen 3",
+                            "capabilities": {
+                                "thinking": {
+                                    "supported": true
+                                }
+                            }
+                        }
+                    ]
+                })),
+        )
+        .mount(&server)
+        .await;
+
+    let config = Config {
+        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
+        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
+        upstream_api_key: None,
+        upstream_model: None,
+        upstream_request_log_path: None,
+        upstream_chat_kwargs: JsonMap::new(),
+        model_profiles: std::collections::BTreeMap::new(),
+        brave_base_url: "https://example.com/".parse().expect("url"),
+        brave_api_key: None,
+        brave_max_results: 5,
+        request_timeout: std::time::Duration::from_secs(30),
+        connect_timeout_secs: 10,
+        max_web_search_rounds: 5,
+        flatten_content: true,
+        max_replay_entries: 1000,
+    };
+    let app = resp2chat::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models?limit=1")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(response.headers().get("etag").is_none());
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    assert_eq!(body["has_more"], true);
+    assert_eq!(body["first_id"], "glm-5.1");
+    assert_eq!(body["last_id"], "glm-5.1");
+    let models = body["data"].as_array().expect("data array");
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["id"], "glm-5.1");
+    assert_eq!(models[0]["type"], "model");
+    assert_eq!(models[0]["display_name"], "glm-5.1");
+    assert_eq!(models[0]["created_at"], "1970-01-01T00:00:00Z");
+    assert_eq!(models[0]["max_input_tokens"], 131072);
+    assert_eq!(models[0]["max_tokens"], 8192);
+    assert_eq!(models[0]["capabilities"]["thinking"]["supported"], false);
+}
+
+#[tokio::test]
+async fn paginates_anthropic_models_transform_with_cursors() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                {"id": "model-a"},
+                {"id": "model-b"},
+                {"id": "model-c"}
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let config = Config {
+        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
+        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
+        upstream_api_key: None,
+        upstream_model: None,
+        upstream_request_log_path: None,
+        upstream_chat_kwargs: JsonMap::new(),
+        model_profiles: std::collections::BTreeMap::new(),
+        brave_base_url: "https://example.com/".parse().expect("url"),
+        brave_api_key: None,
+        brave_max_results: 5,
+        request_timeout: std::time::Duration::from_secs(30),
+        connect_timeout_secs: 10,
+        max_web_search_rounds: 5,
+        flatten_content: true,
+        max_replay_entries: 1000,
+    };
+    let app = resp2chat::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models?after_id=model-a&limit=2")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    assert_eq!(body["has_more"], false);
+    assert_eq!(body["first_id"], "model-b");
+    assert_eq!(body["last_id"], "model-c");
+    let ids = body["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id"))
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["model-b", "model-c"]);
+}
+
+#[tokio::test]
+async fn proxies_completions_endpoint_passthrough() {
+    let server = MockServer::start().await;
+    let request_body = json!({
+        "model": "GLM-5",
+        "prompt": "hello",
+        "stream": false,
+        "max_tokens": 8
+    });
+    let upstream_body = json!({
+        "id": "cmpl-1",
+        "object": "text_completion",
+        "choices": [{ "text": "ok", "index": 0, "finish_reason": "stop" }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/completions"))
+        .and(header("authorization", "Bearer upstream-secret"))
+        .and(header("content-type", "application/json"))
+        .and(header("x-trace-id", "trace-1"))
+        .and(body_json(request_body.clone()))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("x-upstream", "yes")
+                .set_body_json(upstream_body.clone()),
+        )
+        .mount(&server)
+        .await;
+
+    let config = Config {
+        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
+        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
+        upstream_api_key: Some("upstream-secret".to_string()),
+        upstream_model: None,
+        upstream_request_log_path: None,
+        upstream_chat_kwargs: JsonMap::new(),
+        model_profiles: std::collections::BTreeMap::new(),
+        brave_base_url: "https://example.com/".parse().expect("url"),
+        brave_api_key: None,
+        brave_max_results: 5,
+        request_timeout: std::time::Duration::from_secs(30),
+        connect_timeout_secs: 10,
+        max_web_search_rounds: 5,
+        flatten_content: true,
+        max_replay_entries: 1000,
+    };
+    let app = resp2chat::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer client-secret")
+                .header("x-trace-id", "trace-1")
+                .body(Body::from(
+                    serde_json::to_vec(&request_body).expect("serialize request"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 202);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream")
+            .and_then(|value| value.to_str().ok()),
+        Some("yes")
+    );
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    assert_eq!(body, upstream_body);
 }
 
 #[tokio::test]
@@ -1807,6 +2134,7 @@ async fn response_completed_includes_usage_from_upstream() {
                     prompt_tokens: 100,
                     completion_tokens: 25,
                     total_tokens: 125,
+                    reasoning_tokens: None,
                     prompt_tokens_details: None,
                     completion_tokens_details: None,
                 }),
@@ -1848,6 +2176,7 @@ async fn response_completed_accumulates_usage_across_web_search_rounds() {
                     prompt_tokens: 200,
                     completion_tokens: 30,
                     total_tokens: 230,
+                    reasoning_tokens: None,
                     prompt_tokens_details: None,
                     completion_tokens_details: None,
                 }),
@@ -1865,6 +2194,7 @@ async fn response_completed_accumulates_usage_across_web_search_rounds() {
                     prompt_tokens: 350,
                     completion_tokens: 20,
                     total_tokens: 370,
+                    reasoning_tokens: None,
                     prompt_tokens_details: None,
                     completion_tokens_details: None,
                 }),
@@ -1969,6 +2299,7 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
         presence_penalty: None,
         truncation: None,
         metadata: None,
+        extra_body: Default::default(),
     };
 
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
@@ -2079,6 +2410,7 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
         presence_penalty: None,
         truncation: None,
         metadata: None,
+        extra_body: Default::default(),
     };
 
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
@@ -2105,27 +2437,15 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
 }
 
 fn test_gateway(upstream: MockUpstream, search: MockSearch) -> Arc<Gateway> {
-    test_gateway_with_config(
-        upstream,
-        search,
-        Config {
-            bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
-            upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
-            upstream_api_key: None,
-            upstream_model: None,
-            upstream_request_log_path: None,
-            upstream_chat_kwargs: JsonMap::new(),
-            model_profiles: std::collections::BTreeMap::new(),
-            brave_base_url: "https://example.com/".parse().expect("url"),
-            brave_api_key: Some("test-key".to_string()),
-            brave_max_results: 5,
-            request_timeout: std::time::Duration::from_secs(30),
-            connect_timeout_secs: 10,
-            max_web_search_rounds: 5,
-            flatten_content: true,
-            max_replay_entries: 1000,
-        },
-    )
+    test_gateway_with_config(upstream, search, test_config())
+}
+
+fn test_gateway_with_raw_output(
+    upstream: MockUpstream,
+    search: MockSearch,
+    raw_output: RawOutput,
+) -> Arc<Gateway> {
+    test_gateway_with_config_and_raw_output(upstream, search, test_config(), Some(raw_output))
 }
 
 fn test_gateway_with_config(
@@ -2133,13 +2453,43 @@ fn test_gateway_with_config(
     search: MockSearch,
     config: Config,
 ) -> Arc<Gateway> {
+    test_gateway_with_config_and_raw_output(upstream, search, config, None)
+}
+
+fn test_gateway_with_config_and_raw_output(
+    upstream: MockUpstream,
+    search: MockSearch,
+    config: Config,
+    raw_output: Option<RawOutput>,
+) -> Arc<Gateway> {
     Arc::new(Gateway::new(
         config,
         ReplayStore::new(1000),
         Arc::new(upstream),
         Arc::new(search),
         MonitorHub::new(128),
+        raw_output,
     ))
+}
+
+fn test_config() -> Config {
+    Config {
+        bind_addr: "127.0.0.1:0".parse().expect("socket addr"),
+        upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
+        upstream_api_key: None,
+        upstream_model: None,
+        upstream_request_log_path: None,
+        upstream_chat_kwargs: JsonMap::new(),
+        model_profiles: std::collections::BTreeMap::new(),
+        brave_base_url: "https://example.com/".parse().expect("url"),
+        brave_api_key: Some("test-key".to_string()),
+        brave_max_results: 5,
+        request_timeout: std::time::Duration::from_secs(30),
+        connect_timeout_secs: 10,
+        max_web_search_rounds: 5,
+        flatten_content: true,
+        max_replay_entries: 1000,
+    }
 }
 
 fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
@@ -2169,6 +2519,7 @@ fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
         presence_penalty: None,
         truncation: None,
         metadata: None,
+        extra_body: Default::default(),
     }
 }
 
@@ -2286,6 +2637,7 @@ fn usage_chunk(
                 .try_into()
                 .expect("completion_tokens fits in i64"),
             total_tokens: total_tokens.try_into().expect("total_tokens fits in i64"),
+            reasoning_tokens: None,
             prompt_tokens_details: cached_tokens.map(|cached_tokens| PromptTokensDetails {
                 cached_tokens: cached_tokens as i64,
             }),
@@ -2312,6 +2664,22 @@ async fn collect_stream(
         })
         .collect()
         .await
+}
+
+struct SharedBuffer(Arc<StdMutex<Vec<u8>>>);
+
+impl Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("buffer lock poisoned"))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn event_names(events: &[serde_json::Value]) -> Vec<&str> {
@@ -2342,6 +2710,368 @@ fn parse_anthropic_sse_events(body: &str) -> Vec<serde_json::Value> {
             })
         })
         .collect()
+}
+
+fn parse_chat_sse_events(body: &str) -> Vec<serde_json::Value> {
+    body.split("\n\n")
+        .filter_map(|block| {
+            block.lines().find_map(|line| {
+                line.strip_prefix("data: ").and_then(|data| {
+                    (data != "[DONE]")
+                        .then(|| serde_json::from_str(data).expect("valid Chat SSE JSON"))
+                })
+            })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI /v1/chat/completions integration tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn chat_completions_returns_non_streaming_json() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "Hello")),
+            Ok(usage_chunk("chat-1", 12, 5, 17, Some(3), Some(2))),
+        ])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = resp2chat::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "messages": [
+            { "role": "user", "content": "Hi" }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("valid json");
+    assert_eq!(json["object"], "chat.completion");
+    assert_eq!(json["model"], "glm-5.1");
+    assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(json["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(json["choices"][0]["finish_reason"], "stop");
+    assert_eq!(json["usage"]["prompt_tokens"], 12);
+    assert_eq!(json["usage"]["completion_tokens"], 5);
+    assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
+    assert_eq!(
+        json["usage"]["completion_tokens_details"]["reasoning_tokens"],
+        2
+    );
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].stream, true);
+    assert_eq!(requests[0].messages[0].role, "user");
+    assert_eq!(
+        requests[0].messages[0]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("Hi")
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_streams_openai_sse() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "Hello")),
+            Ok(content_chunk("chat-1", " there")),
+            Ok(usage_chunk("chat-1", 12, 5, 17, None, None)),
+        ])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = resp2chat::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": true,
+        "stream_options": { "include_usage": true },
+        "messages": [
+            { "role": "user", "content": "Hi" }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body_text = String::from_utf8(body_bytes.to_vec()).expect("utf8");
+    assert!(body_text.contains("data: [DONE]"), "missing [DONE]");
+    let events = parse_chat_sse_events(&body_text);
+
+    assert_eq!(events[0]["object"], "chat.completion.chunk");
+    assert_eq!(events[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(events[1]["choices"][0]["delta"]["content"], "Hello");
+    assert_eq!(events[2]["choices"][0]["delta"]["content"], " there");
+    assert_eq!(
+        events
+            .iter()
+            .find_map(|event| event["usage"]["prompt_tokens"].as_u64()),
+        Some(12)
+    );
+    assert!(events.iter().any(|event| {
+        event["choices"].as_array().is_some_and(|choices| {
+            choices
+                .iter()
+                .any(|choice| choice["finish_reason"] == "stop")
+        })
+    }));
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].stream, true);
+}
+
+#[tokio::test]
+async fn chat_completions_web_search_is_server_side_and_hidden() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_ws_1",
+            "web_search",
+            "{\"query\":\"weather seattle\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "It is rainy."))])
+        .await;
+    let search = MockSearch::default();
+    let gateway = test_gateway(upstream.clone(), search.clone());
+    let app = resp2chat::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "messages": [
+            { "role": "user", "content": "Weather in Seattle?" }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "query": { "type": "string" } },
+                        "required": ["query"]
+                    }
+                }
+            }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+    let body_text = String::from_utf8(body_bytes.to_vec()).expect("utf8");
+    let json: serde_json::Value = serde_json::from_str(&body_text).expect("valid json");
+    assert_eq!(json["choices"][0]["message"]["content"], "It is rainy.");
+    assert!(json["choices"][0]["message"]["tool_calls"].is_null());
+    assert!(
+        !body_text.contains("web_search"),
+        "internal web_search call leaked into Chat response: {body_text}"
+    );
+
+    assert_eq!(
+        search.queries.lock().await.as_slice(),
+        &["weather seattle".to_string()]
+    );
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0]
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.first())
+            .map(|tool| tool.function.name.as_str()),
+        Some("web_search")
+    );
+    assert_eq!(
+        requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .and_then(|message| message.content.as_ref())
+            .and_then(|content| content.as_str()),
+        Some("Search result for weather seattle")
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_client_tool_call_surfaces_tool_calls() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_echo",
+            "echo",
+            "{\"value\":\"hi\"}",
+        ))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = resp2chat::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "messages": [
+            { "role": "user", "content": "Echo hi" }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "description": "Echo a value.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "value": { "type": "string" } },
+                        "required": ["value"]
+                    }
+                }
+            }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("valid json");
+    assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+    assert!(json["choices"][0]["message"]["content"].is_null());
+    assert_eq!(
+        json["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "echo"
+    );
+    assert_eq!(
+        json["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{\"value\":\"hi\"}"
+    );
+}
+
+#[tokio::test]
+async fn chat_completions_developer_messages_become_system_messages() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = resp2chat::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "messages": [
+            { "role": "developer", "content": "Be terse." },
+            { "role": "user", "content": "Hi" },
+            { "role": "assistant", "content": "Hello" },
+            { "role": "developer", "content": "Use metric units." },
+            { "role": "user", "content": "Weather?" }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let roles: Vec<&str> = requests[0]
+        .messages
+        .iter()
+        .map(|message| message.role.as_str())
+        .collect();
+    assert_eq!(roles, vec!["system", "user", "assistant", "system", "user"]);
+    assert_eq!(
+        requests[0].messages[0]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("Be terse.")
+    );
+    assert_eq!(
+        requests[0].messages[3]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("Use metric units.")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2430,6 +3160,89 @@ async fn anthropic_messages_streams_text_response() {
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].stream, true);
+}
+
+#[tokio::test]
+async fn anthropic_messages_forwards_output_config_as_response_format() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk(
+            "chat-1",
+            "{\"title\":\"Build SMB levels\"}",
+        ))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = resp2chat::build_app_from_gateway(gateway);
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "title": { "type": "string" }
+        },
+        "required": ["title"]
+    });
+
+    let body = serde_json::json!({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 32000,
+        "stream": true,
+        "temperature": 1,
+        "system": [
+            { "type": "text", "text": "You are Claude Code, Anthropic's official CLI for Claude." },
+            { "type": "text", "text": "Return JSON with a single \"title\" field." }
+        ],
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Build me an incredible web app."
+                    }
+                ]
+            }
+        ],
+        "tools": [],
+        "output_config": {
+            "format": {
+                "type": "json_schema",
+                "schema": schema.clone()
+            }
+        }
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].response_format,
+        Some(json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "response",
+                "schema": schema,
+                "strict": true
+            }
+        }))
+    );
+    assert_eq!(requests[0].reasoning_effort, None);
+    assert_eq!(requests[0].tools, None);
 }
 
 #[tokio::test]
@@ -2759,6 +3572,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
         Arc::new(upstream.clone()),
         Arc::new(MockSearch::default()),
         MonitorHub::new(128),
+        None,
     ));
 
     let request = base_request(vec![user_message("count")]);

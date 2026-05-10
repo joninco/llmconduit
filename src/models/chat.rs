@@ -7,11 +7,13 @@ use std::collections::BTreeMap;
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ChatTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
+    #[serde(default)]
     pub parallel_tool_calls: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
@@ -26,6 +28,7 @@ pub struct ChatCompletionRequest {
     #[serde(
         rename = "max_tokens",
         alias = "max_output_tokens",
+        alias = "max_completion_tokens",
         skip_serializing_if = "Option::is_none"
     )]
     pub max_output_tokens: Option<i64>,
@@ -39,6 +42,7 @@ pub struct ChatCompletionRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StreamOptions {
+    #[serde(default)]
     pub include_usage: bool,
 }
 
@@ -67,6 +71,7 @@ pub struct ChatTool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatToolDefinition {
     pub name: String,
+    #[serde(default)]
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parameters: Option<Value>,
@@ -110,6 +115,8 @@ pub struct ChunkUsage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    #[serde(default)]
+    pub reasoning_tokens: Option<i64>,
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
     #[serde(default)]
@@ -321,5 +328,35 @@ mod tests {
             value.get("max_output_tokens").is_none(),
             "chat backend requests should use max_tokens"
         );
+    }
+
+    #[test]
+    fn deserializes_max_completion_tokens_alias() {
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "glm-5.1",
+            "messages": [],
+            "max_completion_tokens": 512
+        }))
+        .expect("request should deserialize");
+
+        assert_eq!(request.max_output_tokens, Some(512));
+    }
+
+    #[test]
+    fn deserializes_chat_tool_without_description() {
+        let tool: ChatTool = serde_json::from_value(serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "echo",
+                "parameters": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }
+        }))
+        .expect("tool should deserialize");
+
+        assert_eq!(tool.function.name, "echo");
+        assert_eq!(tool.function.description, "");
     }
 }

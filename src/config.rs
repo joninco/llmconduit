@@ -192,8 +192,7 @@ impl Config {
     }
 
     pub fn resolve_upstream_model(&self, request_model: &str) -> String {
-        self.model_profiles
-            .get(request_model)
+        self.model_profile(request_model)
             .and_then(|profile| profile.upstream_model.clone())
             .or_else(|| self.upstream_model.clone())
             .unwrap_or_else(|| request_model.to_string())
@@ -201,10 +200,19 @@ impl Config {
 
     pub fn resolve_upstream_chat_kwargs(&self, request_model: &str) -> JsonMap<String, JsonValue> {
         let mut kwargs = self.upstream_chat_kwargs.clone();
-        if let Some(profile) = self.model_profiles.get(request_model) {
+        if let Some(profile) = self.model_profile(request_model) {
             merge_json_maps(&mut kwargs, &profile.upstream_chat_kwargs);
         }
         kwargs
+    }
+
+    fn model_profile(&self, request_model: &str) -> Option<&ModelProfile> {
+        self.model_profiles.get(request_model).or_else(|| {
+            self.model_profiles
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(request_model))
+                .map(|(_, profile)| profile)
+        })
     }
 }
 
@@ -533,6 +541,107 @@ mod tests {
                     "preserve_thinking": true
                 }),
             )])
+        );
+    }
+
+    #[test]
+    fn resolves_model_profiles_case_insensitively() {
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: None,
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            model_profiles: BTreeMap::from_iter([(
+                "MiMo-V2.5".to_string(),
+                PersistedModelProfile {
+                    upstream_model: Some("mimo-v2.5".to_string()),
+                    upstream_chat_kwargs: JsonMap::from_iter([
+                        ("separate_reasoning".to_string(), JsonValue::Bool(true)),
+                        (
+                            "chat_template_kwargs".to_string(),
+                            json!({
+                                "enable_thinking": true,
+                                "keep_all_reasoning": true
+                            }),
+                        ),
+                    ]),
+                },
+            )]),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        })
+        .expect("config");
+
+        assert_eq!(config.resolve_upstream_model("mimo-v2.5"), "mimo-v2.5");
+        assert_eq!(
+            config.resolve_upstream_chat_kwargs("mimo-v2.5"),
+            JsonMap::from_iter([
+                ("separate_reasoning".to_string(), JsonValue::Bool(true)),
+                (
+                    "chat_template_kwargs".to_string(),
+                    json!({
+                        "enable_thinking": true,
+                        "keep_all_reasoning": true
+                    }),
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn resolves_exact_model_profile_before_case_insensitive_fallback() {
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: None,
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            model_profiles: BTreeMap::from_iter([
+                (
+                    "MiMo-V2.5".to_string(),
+                    PersistedModelProfile {
+                        upstream_model: Some("upper-profile".to_string()),
+                        upstream_chat_kwargs: JsonMap::from_iter([(
+                            "stream_reasoning".to_string(),
+                            JsonValue::Bool(true),
+                        )]),
+                    },
+                ),
+                (
+                    "mimo-v2.5".to_string(),
+                    PersistedModelProfile {
+                        upstream_model: Some("lower-profile".to_string()),
+                        upstream_chat_kwargs: JsonMap::from_iter([(
+                            "stream_reasoning".to_string(),
+                            JsonValue::Bool(false),
+                        )]),
+                    },
+                ),
+            ]),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        })
+        .expect("config");
+
+        assert_eq!(config.resolve_upstream_model("mimo-v2.5"), "lower-profile");
+        assert_eq!(
+            config.resolve_upstream_chat_kwargs("mimo-v2.5"),
+            JsonMap::from_iter([("stream_reasoning".to_string(), JsonValue::Bool(false))])
         );
     }
 

@@ -805,6 +805,7 @@ mod tests {
             presence_penalty: None,
             truncation: None,
             metadata: None,
+            extra_body: Default::default(),
         }
     }
 

@@ -22,6 +22,9 @@ cargo build --release
 
 # Start the gateway
 ./target/release/resp2chat start
+
+# Start and print streamed model deltas directly to stdout
+./target/release/resp2chat start --raw
 ```
 
 The gateway listens on `http://127.0.0.1:4000` by default. Point your Responses API client at it:
@@ -161,6 +164,7 @@ Codex / Client
 | `src/models/` | Request/response types for both API formats |
 | `src/error.rs` | Error handling with client/server message separation |
 | `src/ui.rs` | Optional TUI monitor (`--ui` flag) |
+| `src/raw.rs` | Optional raw model delta stream (`--raw` flag) |
 
 ## Endpoints
 
