@@ -1,6 +1,15 @@
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::json;
 use serde_json::Value;
+
+// ---------------------------------------------------------------------------
+// Default helpers
+// ---------------------------------------------------------------------------
+
+fn default_input_schema() -> Value {
+    json!({"type": "object"})
+}
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -105,6 +114,7 @@ pub struct AnthropicTool {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default = "default_input_schema")]
     pub input_schema: Value,
 }
 
@@ -312,4 +322,29 @@ pub enum AnthropicResponseContentBlock {
 pub struct AnthropicMessageUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_without_input_schema_gets_default() {
+        let value = serde_json::json!({"name": "web_search"});
+        let tool: AnthropicTool = serde_json::from_value(value).unwrap();
+        assert_eq!(tool.name, "web_search");
+        assert_eq!(tool.input_schema, serde_json::json!({"type": "object"}));
+    }
+
+    #[test]
+    fn tool_with_input_schema_preserves_value() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } }
+        });
+        let value = serde_json::json!({"name": "search", "input_schema": schema});
+        let tool: AnthropicTool = serde_json::from_value(value).unwrap();
+        assert_eq!(tool.name, "search");
+        assert_eq!(tool.input_schema, schema);
+    }
 }
