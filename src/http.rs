@@ -32,7 +32,9 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::response::Sse;
 use axum::routing::get;
+use axum::routing::on;
 use axum::routing::post;
+use axum::routing::MethodFilter;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
@@ -60,9 +62,13 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
     let router = Router::new()
         .route("/v1/responses", post(post_responses))
         .route("/v1/messages", post(post_messages))
+        .route("/v1/messages", on(MethodFilter::HEAD, probe_messages))
+        .route("/v1/messages", on(MethodFilter::OPTIONS, probe_messages))
         .route("/v1/chat/completions", post(post_chat_completions))
         .route("/v1/completions", post(post_completions))
-        .route("/v1/models", get(get_models));
+        .route("/v1/models", get(get_models))
+        .route("/health", get(get_health))
+        .route("/", get(get_root));
 
     let router = if options.with_debug_ui {
         router
@@ -149,6 +155,27 @@ async fn log_api_call(request: Request, next: Next) -> Response {
 
 async fn api_not_found() -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
+}
+
+fn probe_response(allow: &str) -> Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    response.headers_mut().insert(
+        header::ALLOW,
+        HeaderValue::try_from(allow).expect("valid header value"),
+    );
+    response
+}
+
+async fn probe_messages() -> Response {
+    probe_response("POST, HEAD, OPTIONS")
+}
+
+async fn get_health() -> Response {
+    (StatusCode::OK, Json(serde_json::json!({"status": "healthy"}))).into_response()
+}
+
+async fn get_root() -> Response {
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response()
 }
 
 fn header_for_log(headers: &HeaderMap, name: &str) -> String {
@@ -763,6 +790,10 @@ fn stream_chat_completions_response(
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
     );
+    response.headers_mut().insert(
+        header::CONNECTION,
+        HeaderValue::from_static("keep-alive"),
+    );
     response
 }
 
@@ -802,6 +833,10 @@ fn stream_anthropic_response(
     response.headers_mut().insert(
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
+    );
+    response.headers_mut().insert(
+        header::CONNECTION,
+        HeaderValue::from_static("keep-alive"),
     );
     Ok(response)
 }
@@ -867,6 +902,10 @@ fn stream_responses_response(stream: ReceiverStream<crate::engine::SseEvent>) ->
     response.headers_mut().insert(
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
+    );
+    response.headers_mut().insert(
+        header::CONNECTION,
+        HeaderValue::from_static("keep-alive"),
     );
     response
 }
@@ -1048,44 +1087,75 @@ fn extract_model_entries(body: &Value) -> Vec<Value> {
 
 fn anthropic_model_entry(entry: &Value) -> Option<Value> {
     match entry {
-        Value::String(id) => Some(build_anthropic_model_entry(
-            id,
-            id,
-            UNKNOWN_MODEL_CREATED_AT,
-            None,
-            None,
-            None,
-        )),
+        Value::String(id) => {
+            let caps = infer_capabilities_from_model_id(id);
+            Some(build_anthropic_model_entry(
+                id,
+                id,
+                UNKNOWN_MODEL_CREATED_AT,
+                None,
+                None,
+                Some(&caps),
+            ))
+        }
         Value::Object(map) => {
             let id = map.get("id").and_then(Value::as_str)?;
             let display_name = map
-                .get("display_name")
+                .get("id")
                 .and_then(Value::as_str)
+                .or_else(|| map.get("display_name").and_then(Value::as_str))
                 .unwrap_or(id);
-            let created_at = map
-                .get("created_at")
-                .and_then(Value::as_str)
-                .unwrap_or(UNKNOWN_MODEL_CREATED_AT);
+            let created_at = parse_created_at(map)
+                .unwrap_or_else(|| UNKNOWN_MODEL_CREATED_AT.to_string());
+
             let max_input_tokens = map
                 .get("max_input_tokens")
                 .or_else(|| map.get("context_length"))
                 .or_else(|| map.get("context_window"))
-                .or_else(|| map.get("max_context_length"));
+                .or_else(|| map.get("max_context_length"))
+                .or_else(|| map.get("max_model_len"));
             let max_tokens = map
                 .get("max_tokens")
                 .or_else(|| map.get("max_output_tokens"));
-            let capabilities = map.get("capabilities");
+            let capabilities = map
+                .get("capabilities")
+                .filter(|value| value.is_object())
+                .map(Value::clone)
+                .unwrap_or_else(|| infer_capabilities_from_model_id(id));
+
             Some(build_anthropic_model_entry(
                 id,
                 display_name,
-                created_at,
+                &created_at,
                 max_input_tokens,
                 max_tokens,
-                capabilities,
+                Some(&capabilities),
             ))
         }
         _ => None,
     }
+}
+
+/// Parse a creation timestamp from common upstream formats.
+///
+/// - `created_at` → ISO 8601 string (passed through)
+/// - `created`    → Unix epoch integer / float (⇒ ISO 8601 string)
+fn parse_created_at(map: &serde_json::Map<String, Value>) -> Option<String> {
+    match map.get("created_at").and_then(Value::as_str) {
+        Some(iso) => Some(iso.to_string()),
+        None => {
+            let epoch = map.get("created").and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_f64().and_then(|f| (f as u64).checked_add(0)))
+            })?;
+            chrono::DateTime::from_timestamp(epoch as i64, 0)
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        }
+    }
+}
+
+fn infer_capabilities_from_model_id(_id: &str) -> Value {
+    default_anthropic_model_capabilities()
 }
 
 fn build_anthropic_model_entry(

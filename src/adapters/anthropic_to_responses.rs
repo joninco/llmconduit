@@ -17,23 +17,15 @@ use crate::models::responses::TextFormat;
 use crate::models::responses::ToolSpec;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use uuid::Uuid;
 
 pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest> {
-    if request.top_k.is_some() {
-        return Err(AppError::bad_request(
-            "Anthropic top_k is not supported by this gateway",
-        ));
-    }
-    if request
-        .stop_sequences
-        .as_ref()
-        .is_some_and(|sequences| !sequences.is_empty())
-    {
-        return Err(AppError::bad_request(
-            "Anthropic stop_sequences are not supported by this gateway",
-        ));
+    let stop = request.stop_sequences;
+    let mut extra_body = BTreeMap::new();
+    if let Some(top_k) = request.top_k {
+        extra_body.insert("top_k".to_string(), Value::from(top_k));
     }
     let instructions = extract_system_text(&request.system);
     let input = convert_messages(&request.messages)?;
@@ -70,7 +62,8 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         presence_penalty: None,
         truncation: None,
         metadata,
-        extra_body: Default::default(),
+        stop,
+        extra_body,
     })
 }
 
@@ -493,6 +486,33 @@ mod tests {
     }
 
     #[test]
+    fn translates_stop_sequences_and_top_k() {
+        let request = AnthropicRequest {
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            max_tokens: Some(64),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("Decide.".to_string()),
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: Some(40),
+            stop_sequences: Some(vec!["</decision>".to_string()]),
+            metadata: None,
+            thinking: None,
+            output_config: None,
+        };
+
+        let result = convert_request(request).expect("convert");
+        assert_eq!(result.stop, Some(vec!["</decision>".to_string()]));
+        assert_eq!(result.extra_body.get("top_k"), Some(&json!(40)));
+    }
+
+    #[test]
     fn converts_output_config_json_schema_to_text_format() {
         let schema = json!({
             "type": "object",
@@ -756,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_anthropic_fields() {
+    fn carries_top_k_without_stop_sequences() {
         let request = AnthropicRequest {
             model: "claude-3-5-sonnet-20241022".to_string(),
             max_tokens: Some(1024),
@@ -776,28 +796,9 @@ mod tests {
             thinking: None,
             output_config: None,
         };
-        assert!(convert_request(request).is_err());
-
-        let request = AnthropicRequest {
-            model: "claude-3-5-sonnet-20241022".to_string(),
-            max_tokens: Some(1024),
-            system: None,
-            messages: vec![AnthropicMessage {
-                role: "user".to_string(),
-                content: AnthropicContent::Text("Hello".to_string()),
-            }],
-            tools: None,
-            tool_choice: None,
-            stream: true,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-            stop_sequences: Some(vec!["stop".to_string()]),
-            metadata: None,
-            thinking: None,
-            output_config: None,
-        };
-        assert!(convert_request(request).is_err());
+        let result = convert_request(request).expect("convert");
+        assert_eq!(result.extra_body.get("top_k"), Some(&json!(5)));
+        assert_eq!(result.stop, None);
     }
 
     #[test]

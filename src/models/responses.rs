@@ -72,6 +72,12 @@ pub struct ResponsesRequest {
     pub truncation: Option<Value>,
     #[serde(default)]
     pub metadata: Option<HashMap<String, Value>>,
+    #[serde(
+        default,
+        deserialize_with = "crate::models::chat::deserialize_opt_stop",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stop: Option<Vec<String>>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_body: BTreeMap<String, Value>,
 }

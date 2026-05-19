@@ -223,6 +223,7 @@ async fn streams_function_call_turn() {
         presence_penalty: None,
         truncation: None,
         metadata: None,
+        stop: None,
         extra_body: Default::default(),
     };
 
@@ -379,6 +380,7 @@ async fn flattens_namespace_tools_for_upstream_and_preserves_namespace_in_output
         presence_penalty: None,
         truncation: None,
         metadata: None,
+        stop: None,
         extra_body: Default::default(),
     };
 
@@ -1408,10 +1410,12 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
     assert_eq!(models[0]["id"], "glm-5.1");
     assert_eq!(models[0]["type"], "model");
     assert_eq!(models[0]["display_name"], "glm-5.1");
-    assert_eq!(models[0]["created_at"], "1970-01-01T00:00:00Z");
+    assert_eq!(models[0]["created_at"], "2025-10-09T08:53:20Z");
     assert_eq!(models[0]["max_input_tokens"], 131072);
     assert_eq!(models[0]["max_tokens"], 8192);
     assert_eq!(models[0]["capabilities"]["thinking"]["supported"], false);
+    assert_eq!(models[0]["capabilities"]["image_input"]["supported"], false);
+    assert_eq!(models[0]["capabilities"]["structured_outputs"]["supported"], false);
 }
 
 #[tokio::test]
@@ -2382,6 +2386,7 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
         presence_penalty: None,
         truncation: None,
         metadata: None,
+        stop: None,
         extra_body: Default::default(),
     };
 
@@ -2493,6 +2498,7 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
         presence_penalty: None,
         truncation: None,
         metadata: None,
+        stop: None,
         extra_body: Default::default(),
     };
 
@@ -2602,6 +2608,7 @@ fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
         presence_penalty: None,
         truncation: None,
         metadata: None,
+        stop: None,
         extra_body: Default::default(),
     }
 }
@@ -4050,4 +4057,142 @@ async fn cancels_mid_stream_when_client_disconnects() {
 
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
+}
+
+#[tokio::test]
+async fn head_and_options_probes_return_204_with_allow_header() {
+    let config = test_config();
+    let app = llmconduit::build_app(config);
+
+    for (method, path, expected_allow) in [
+        ("HEAD", "/v1/messages", "POST, HEAD, OPTIONS"),
+        ("OPTIONS", "/v1/messages", "POST, HEAD, OPTIONS"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response.status().as_u16(),
+            204,
+            "{method} {path} should return 204"
+        );
+        let allow_header = response.headers().get("allow").and_then(|v| v.to_str().ok());
+        assert_eq!(
+            allow_header,
+            Some(expected_allow),
+            "{method} {path} should have correct Allow header"
+        );
+    }
+}
+
+#[tokio::test]
+async fn health_endpoint_returns_healthy() {
+    let config = test_config();
+    let app = llmconduit::build_app(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    assert_eq!(body["status"], "healthy");
+}
+
+#[tokio::test]
+async fn root_endpoint_returns_ok() {
+    let config = test_config();
+    let app = llmconduit::build_app(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+    assert_eq!(body["status"], "ok");
+}
+
+
+
+#[tokio::test]
+async fn sse_responses_include_connection_keep_alive() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let request = ResponsesRequest {
+        model: "glm-5.1".to_string(),
+        instructions: String::new(),
+        input: vec![user_message("hi")],
+        tools: Vec::new(),
+        tool_choice: json!("auto"),
+        parallel_tool_calls: true,
+        reasoning: None,
+        store: false,
+        stream: true,
+        include: Vec::new(),
+        service_tier: None,
+        prompt_cache_key: None,
+        text: None,
+        client_metadata: None,
+        previous_response_id: None,
+        temperature: None,
+        top_p: None,
+        max_output_tokens: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        truncation: None,
+        metadata: None,
+        stop: None,
+        extra_body: Default::default(),
+    };
+
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&request).expect("serialize"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let connection = response.headers().get("connection").and_then(|v| v.to_str().ok());
+    assert_eq!(connection, Some("keep-alive"));
 }

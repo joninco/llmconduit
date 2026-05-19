@@ -52,6 +52,7 @@ pub fn convert_request(request: ChatCompletionRequest) -> AppResult<ResponsesReq
         presence_penalty: request.presence_penalty,
         truncation: None,
         metadata: None,
+        stop: request.stop,
         extra_body,
     })
 }
@@ -977,6 +978,7 @@ mod tests {
             max_output_tokens: None,
             frequency_penalty: None,
             presence_penalty: None,
+            stop: None,
             extra_body: extra_body.clone(),
         };
 

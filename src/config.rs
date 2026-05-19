@@ -899,4 +899,69 @@ mod tests {
         assert_eq!(mode, 0o600, "config file should have 0600 permissions");
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn passes_prefixed_model_name_unmodified_when_no_profile() {
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: None,
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            model_profiles: BTreeMap::new(),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        })
+        .expect("config");
+
+        assert_eq!(
+            config.resolve_upstream_model("anthropic/Kimi-K2.6"),
+            "anthropic/Kimi-K2.6"
+        );
+        assert_eq!(
+            config.resolve_upstream_chat_kwargs("anthropic/Kimi-K2.6"),
+            JsonMap::new()
+        );
+    }
+
+    #[test]
+    fn resolves_exact_prefix_model_profile_when_present() {
+        let config = Config::from_persisted(&PersistedConfig {
+            bind_addr: "127.0.0.1:4010".to_string(),
+            upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+            upstream_api_key: None,
+            upstream_model: None,
+            upstream_request_log_path: None,
+            upstream_chat_kwargs: JsonMap::new(),
+            model_profiles: BTreeMap::from_iter([(
+                "anthropic/Kimi-K2.6".to_string(),
+                PersistedModelProfile {
+                    upstream_model: Some("anthropic-custom".to_string()),
+                    upstream_chat_kwargs: JsonMap::new(),
+                    system_prompt_prefix: None,
+                },
+            )]),
+            brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
+            brave_api_key: None,
+            brave_max_results: 5,
+            request_timeout_secs: 60,
+            connect_timeout_secs: 10,
+            max_web_search_rounds: 5,
+            flatten_content: true,
+            max_replay_entries: 1000,
+        })
+        .expect("config");
+
+        assert_eq!(
+            config.resolve_upstream_model("anthropic/Kimi-K2.6"),
+            "anthropic-custom"
+        );
+    }
 }

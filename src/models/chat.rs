@@ -1,3 +1,5 @@
+use crate::error::AppError;
+use crate::error::AppResult;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -36,8 +38,59 @@ pub struct ChatCompletionRequest {
     pub frequency_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub presence_penalty: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_stop",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stop: Option<Vec<String>>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_body: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StringOrVec {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// OpenAI's `stop` is `string | array | null`; accept all three into `Vec<String>`.
+pub(crate) fn deserialize_opt_stop<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(
+        Option::<StringOrVec>::deserialize(deserializer)?.map(|value| match value {
+            StringOrVec::One(single) => vec![single],
+            StringOrVec::Many(many) => many,
+        }),
+    )
+}
+
+pub(crate) const OPENAI_MAX_STOP_SEQUENCES: usize = 4;
+
+/// Drop empty sequences and reject more than OpenAI's documented maximum (it 400s, not truncates).
+pub(crate) fn normalize_stop(stop: Option<Vec<String>>) -> AppResult<Option<Vec<String>>> {
+    let sequences: Vec<String> = match stop {
+        None => return Ok(None),
+        Some(values) => values
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect(),
+    };
+    if sequences.is_empty() {
+        return Ok(None);
+    }
+    if sequences.len() > OPENAI_MAX_STOP_SEQUENCES {
+        return Err(AppError::bad_request(format!(
+            "stop supports at most {OPENAI_MAX_STOP_SEQUENCES} sequences, got {}",
+            sequences.len()
+        )));
+    }
+    Ok(Some(sequences))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -385,6 +438,7 @@ mod tests {
             max_output_tokens: Some(256),
             frequency_penalty: None,
             presence_penalty: None,
+            stop: None,
             extra_body: Default::default(),
         };
 
@@ -394,6 +448,111 @@ mod tests {
         assert!(
             value.get("max_output_tokens").is_none(),
             "chat backend requests should use max_tokens"
+        );
+    }
+
+    #[test]
+    fn serializes_stop_to_upstream_key() {
+        let request = ChatCompletionRequest {
+            model: "glm-5.1".to_string(),
+            messages: Vec::new(),
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: false,
+            reasoning_effort: None,
+            response_format: None,
+            stream_options: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: Some(vec!["</decision>".to_string()]),
+            extra_body: Default::default(),
+        };
+
+        let value = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(value["stop"], serde_json::json!(["</decision>"]));
+
+        let omitted = ChatCompletionRequest {
+            stop: None,
+            ..request
+        };
+        let value = serde_json::to_value(omitted).expect("serialize");
+        assert!(value.get("stop").is_none(), "stop must be omitted when None");
+    }
+
+    #[test]
+    fn deserializes_stop_as_string_or_array() {
+        let from_string: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "glm-5.1",
+            "messages": [],
+            "stop": "</s>"
+        }))
+        .expect("string stop should deserialize");
+        assert_eq!(from_string.stop, Some(vec!["</s>".to_string()]));
+
+        let from_array: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "glm-5.1",
+            "messages": [],
+            "stop": ["a", "b"]
+        }))
+        .expect("array stop should deserialize");
+        assert_eq!(from_array.stop, Some(vec!["a".to_string(), "b".to_string()]));
+
+        let absent: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "glm-5.1",
+            "messages": []
+        }))
+        .expect("absent stop should deserialize");
+        assert_eq!(absent.stop, None);
+
+        let null_stop: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "glm-5.1",
+            "messages": [],
+            "stop": null
+        }))
+        .expect("null stop should deserialize");
+        assert_eq!(null_stop.stop, None);
+    }
+
+    #[test]
+    fn normalize_stop_drops_empties_and_rejects_excess() {
+        assert_eq!(normalize_stop(None).expect("none"), None);
+        assert_eq!(
+            normalize_stop(Some(vec![String::new(), String::new()])).expect("all empty"),
+            None
+        );
+        assert_eq!(
+            normalize_stop(Some(vec![
+                "x".to_string(),
+                String::new(),
+                "y".to_string()
+            ]))
+            .expect("filtered"),
+            Some(vec!["x".to_string(), "y".to_string()])
+        );
+        let four = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
+        assert_eq!(
+            normalize_stop(Some(four.clone())).expect("exactly four"),
+            Some(four)
+        );
+        let mut five = vec![
+            "a".to_string(),
+            "b".to_string(),
+            "c".to_string(),
+            "d".to_string(),
+        ];
+        five.push("e".to_string());
+        assert!(
+            normalize_stop(Some(five)).is_err(),
+            "more than four must error"
         );
     }
 
