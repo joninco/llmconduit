@@ -566,9 +566,10 @@ fn build_tool_registry(specs: &[ToolSpec]) -> AppResult<ToolRegistry> {
             ToolSpec::ImageGeneration { .. } => Vec::new(),
         };
         for (name, kind) in lowered_kinds {
-            if by_name.insert(name.clone(), kind).is_some() {
+            let name_lc = name.to_ascii_lowercase();
+            if by_name.insert(name_lc.clone(), kind).is_some() {
                 return Err(AppError::bad_request(format!(
-                    "duplicate tool name is not supported: {name}"
+                    "duplicate tool name is not supported: {name_lc}"
                 )));
             }
         }

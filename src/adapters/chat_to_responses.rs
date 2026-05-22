@@ -232,7 +232,8 @@ impl StreamState {
             let name = accumulator.name.ok_or_else(|| {
                 AppError::upstream("upstream tool call chunk missing function name")
             })?;
-            let tool_kind = registry.get(&name).cloned().ok_or_else(|| {
+            let name_lc = name.to_ascii_lowercase();
+            let tool_kind = registry.get(&name_lc).cloned().ok_or_else(|| {
                 AppError::upstream(format!("unknown tool returned by upstream: {name}"))
             })?;
             let arguments = if accumulator.arguments_text.trim().is_empty() {
