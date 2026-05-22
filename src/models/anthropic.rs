@@ -224,6 +224,18 @@ pub enum AnthropicContentBlockStart {
     Thinking {
         thinking: String,
     },
+    /// Anthropic server-side tool invocation (e.g. server-executed web search).
+    /// Streamed without `input`; the query arrives via `input_json_delta`.
+    ServerToolUse {
+        id: String,
+        name: String,
+    },
+    /// Results of a server-side web search, surfaced so clients count the
+    /// search and render source citations.
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -247,6 +259,16 @@ pub struct AnthropicUsage {
     pub input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    /// Server-executed tool usage. Claude Code's "Did N searches" indicator
+    /// reads `server_tool_use.web_search_requests`; omitted when no server-side
+    /// search ran so token-only turns stay byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_tool_use: Option<AnthropicServerToolUse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AnthropicServerToolUse {
+    pub web_search_requests: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -305,6 +327,15 @@ pub enum AnthropicResponseContentBlock {
         id: String,
         name: String,
         input: Value,
+    },
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: Value,
     },
 }
 

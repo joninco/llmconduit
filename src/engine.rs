@@ -36,6 +36,7 @@ use crate::raw::RawOutput;
 use crate::replay::ReplayRecord;
 use crate::replay::ReplayStore;
 use crate::search::SearchClient;
+use crate::search::SearchOutcome;
 use crate::upstream::UpstreamClient;
 use crate::upstream::sanitize_chat_request;
 use futures::StreamExt;
@@ -664,6 +665,13 @@ impl Gateway {
         let mut accumulated_usage = AccumulatedUsage::default();
         let mut upstream_request_index = 0usize;
         let mut web_search_rounds = 0usize;
+        // A forced `tool_choice` (e.g. an Anthropic `web_search` server tool,
+        // which Claude Code always forces) must apply only to the first
+        // upstream request. After a provider-side web search runs and its
+        // results are injected, the model has to be free to answer in prose.
+        // Re-sending the forced tool_choice makes vLLM/Kimi emit the final
+        // answer text into `function.arguments`, which then fails to parse.
+        let mut current_tool_choice = request.tool_choice.clone();
         #[allow(unused_assignments)]
         let mut last_finish_reason: Option<String> = None;
         let upstream_extra_body = build_upstream_extra_body(
@@ -683,7 +691,7 @@ impl Gateway {
                 messages: taken_messages,
                 stream: true,
                 tools: (!tools.is_empty()).then_some(tools.clone()),
-                tool_choice: Some(request.tool_choice.clone()),
+                tool_choice: Some(current_tool_choice.clone()),
                 parallel_tool_calls: false,
                 reasoning_effort: reasoning_effort.clone(),
                 response_format: response_format.clone(),
@@ -981,11 +989,24 @@ impl Gateway {
                     .all(|call| matches!(call.kind, ToolKind::WebSearch))
             {
                 web_search_rounds += 1;
-                if self.config.max_web_search_rounds > 0
-                    && web_search_rounds >= self.config.max_web_search_rounds
-                {
+                // `max_web_search_rounds == 0` is treated as "unlimited" by
+                // configuration, but an unbounded loop lets a model that keeps
+                // choosing web_search every round hang the turn forever. Always
+                // enforce an absolute ceiling so the turn is guaranteed to end.
+                const WEB_SEARCH_ROUNDS_HARD_CEILING: usize = 25;
+                let configured_limit = if self.config.max_web_search_rounds > 0 {
+                    self.config.max_web_search_rounds
+                } else {
+                    WEB_SEARCH_ROUNDS_HARD_CEILING
+                };
+                let effective_limit = configured_limit.min(WEB_SEARCH_ROUNDS_HARD_CEILING);
+                if web_search_rounds >= effective_limit {
                     return Err(AppError::upstream("web search round limit exceeded"));
                 }
+                // Results are now in the message history; let the model answer
+                // (or decide to search again) instead of forcing another
+                // web_search tool call.
+                current_tool_choice = Value::String("auto".to_string());
                 continue;
             }
             break;
@@ -1379,10 +1400,24 @@ impl Gateway {
         if tx.is_closed() {
             return Err(AppError::cancelled());
         }
-        let results = tokio::select! {
+        // The search backend (Brave) has no internal timeout; without this
+        // bound a slow or stalled search request would block the turn forever
+        // and the client would hang behind the SSE keep-alive. Degrade
+        // gracefully so the model can still produce a final answer.
+        let outcome: SearchOutcome = tokio::select! {
             biased;
             _ = tx.closed() => return Err(AppError::cancelled()),
-            result = self.search.search(&query) => result?,
+            result = timeout(self.config.request_timeout, self.search.search(&query)) => match result {
+                Ok(Ok(outcome)) => outcome,
+                Ok(Err(err)) => SearchOutcome {
+                    formatted: format!("web_search failed: {err}"),
+                    sources: Vec::new(),
+                },
+                Err(_) => SearchOutcome {
+                    formatted: "web_search timed out before returning results.".to_string(),
+                    sources: Vec::new(),
+                },
+            },
         };
 
         let completed = ResponseItem::WebSearchCall {
@@ -1407,17 +1442,53 @@ impl Gateway {
             "failed to send web_search done",
         )
         .await?;
+
+        // Surface the search to Anthropic clients. The OpenAI `web_search_call`
+        // item above carries no results (matching OpenAI's schema), so this
+        // additive event hands the structured sources to the Anthropic
+        // converter, which renders them as `server_tool_use` +
+        // `web_search_tool_result` blocks. Non-Anthropic clients ignore the
+        // unknown SSE event, keeping the Responses stream OpenAI-compatible.
+        let tool_use_id = id
+            .clone()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| format!("srvtoolu_{}", Uuid::new_v4().simple()));
+        let result_items: Vec<Value> = outcome
+            .sources
+            .iter()
+            .map(|source| {
+                serde_json::json!({
+                    "type": "web_search_result",
+                    "url": source.url,
+                    "title": source.title,
+                })
+            })
+            .collect();
+        self.send_event(
+            tx,
+            SseEvent {
+                event: "response.web_search_results".to_string(),
+                data: serde_json::json!({
+                    "type": "response.web_search_results",
+                    "tool_use_id": tool_use_id,
+                    "query": query,
+                    "results": result_items,
+                }),
+            },
+            "failed to send web_search results",
+        )
+        .await?;
         self.monitor.emit(
             response_id.to_string(),
             MonitorEventKind::ToolPhase {
                 phase: "provider_tool_completed".to_string(),
-                detail: format!("web_search result {}", preview_text(&results)),
+                detail: format!("web_search result {}", preview_text(&outcome.formatted)),
             },
         );
 
         current_messages.push(ChatMessage {
             role: "tool".to_string(),
-            content: Some(Value::String(results)),
+            content: Some(Value::String(outcome.formatted.clone())),
             tool_call_id: tool_call.internal_call.id.clone(),
             name: None,
             reasoning_content: None,

@@ -172,9 +172,18 @@ struct MockSearch {
 
 #[async_trait]
 impl SearchClient for MockSearch {
-    async fn search(&self, query: &str) -> Result<String, llmconduit::error::AppError> {
+    async fn search(
+        &self,
+        query: &str,
+    ) -> Result<llmconduit::search::SearchOutcome, llmconduit::error::AppError> {
         self.queries.lock().await.push(query.to_string());
-        Ok(format!("Search result for {query}"))
+        Ok(llmconduit::search::SearchOutcome {
+            formatted: format!("Search result for {query}"),
+            sources: vec![llmconduit::search::SearchSource {
+                title: format!("Result for {query}"),
+                url: "https://example.com/result".to_string(),
+            }],
+        })
     }
 }
 
@@ -1068,6 +1077,7 @@ async fn hides_web_search_loop_but_replays_internal_tool_result() {
             "response.function_call_arguments.delta",
             "response.output_item.added",
             "response.output_item.done",
+            "response.web_search_results",
             "response.output_item.added",
             "response.content_part.added",
             "response.output_text.delta",
@@ -1113,6 +1123,119 @@ async fn hides_web_search_loop_but_replays_internal_tool_result() {
     assert_eq!(requests[2].messages.len(), 5);
     assert_eq!(requests[2].messages[2].role, "tool");
     assert_eq!(requests[2].messages[3].role, "assistant");
+}
+
+#[tokio::test]
+async fn web_search_emits_structured_results_event_for_anthropic_clients() {
+    // Regression: resp2chat ran Brave server-side but never told the client a
+    // search happened, so Claude Code reported "Did 0 searches" with no source
+    // chips. The engine must emit a `response.web_search_results` event the
+    // Anthropic converter turns into server_tool_use + web_search_tool_result.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_ws_1",
+            "web_search",
+            "{\"query\":\"weather seattle\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "It is rainy."))])
+        .await;
+    let search = MockSearch::default();
+    let gateway = test_gateway(upstream.clone(), search.clone());
+
+    let mut request = base_request(vec![user_message("weather?")]);
+    request.tools = vec![ToolSpec::WebSearch {
+        external_web_access: Some(true),
+        filters: None,
+        user_location: None,
+        search_context_size: None,
+        search_content_types: None,
+    }];
+    let events = collect_stream(
+        gateway
+            .stream_responses(request)
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let ws = events
+        .iter()
+        .find(|e| e["_event"] == "response.web_search_results")
+        .expect("expected a response.web_search_results event");
+    assert_eq!(ws["query"], "weather seattle");
+    assert!(
+        ws["tool_use_id"].as_str().is_some_and(|s| !s.is_empty()),
+        "web_search_results must carry a non-empty tool_use_id"
+    );
+    assert_eq!(
+        ws["results"],
+        serde_json::json!([
+            {
+                "type": "web_search_result",
+                "url": "https://example.com/result",
+                "title": "Result for weather seattle"
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn web_search_continuation_round_relaxes_forced_tool_choice() {
+    // Regression: Claude Code forces `tool_choice` to the web_search server
+    // tool. The first upstream round must keep that forced choice, but the
+    // continuation round (after Brave results are injected) must relax to
+    // `auto` — otherwise vLLM/Kimi emits the final answer text into
+    // `function.arguments` and the turn fails with a JSON parse error.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_ws_1",
+            "web_search",
+            "{\"query\":\"weather seattle\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "It is sunny."))])
+        .await;
+    let search = MockSearch::default();
+    let gateway = test_gateway(upstream.clone(), search.clone());
+
+    let mut request = base_request(vec![user_message("weather?")]);
+    request.tools = vec![ToolSpec::WebSearch {
+        external_web_access: Some(true),
+        filters: None,
+        user_location: None,
+        search_context_size: None,
+        search_content_types: None,
+    }];
+    let forced = json!({"type": "function", "function": {"name": "web_search"}});
+    request.tool_choice = forced.clone();
+
+    let _ = collect_stream(
+        gateway
+            .stream_responses(request)
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 2, "expected one search round + one answer round");
+    assert_eq!(
+        requests[0].tool_choice,
+        Some(forced),
+        "round 1 must keep the forced tool_choice"
+    );
+    assert_eq!(
+        requests[1].tool_choice,
+        Some(json!("auto")),
+        "web-search continuation round must relax tool_choice to auto"
+    );
 }
 
 #[tokio::test]

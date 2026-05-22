@@ -425,11 +425,26 @@ fn convert_tools(tools: &Option<Vec<AnthropicTool>>) -> Vec<ToolSpec> {
             sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
             sorted_tools
                 .into_iter()
-                .map(|tool| ToolSpec::Function {
-                    name: tool.name,
-                    description: tool.description.unwrap_or_default(),
-                    strict: false,
-                    parameters: tool.input_schema,
+                // The Anthropic `web_search` server tool (type
+                // `web_search_20250305`, which Claude Code always sends and
+                // forces via `tool_choice`) must run server-side via Brave, so
+                // it maps to `ToolSpec::WebSearch` rather than a client
+                // `Function`. The `type` field is dropped at deserialization,
+                // so the tool name is the only signal available here.
+                .map(|tool| match tool.name.as_str() {
+                    "web_search" => ToolSpec::WebSearch {
+                        external_web_access: None,
+                        filters: None,
+                        user_location: None,
+                        search_context_size: None,
+                        search_content_types: None,
+                    },
+                    _ => ToolSpec::Function {
+                        name: tool.name,
+                        description: tool.description.unwrap_or_default(),
+                        strict: false,
+                        parameters: tool.input_schema,
+                    },
                 })
                 .collect()
         }

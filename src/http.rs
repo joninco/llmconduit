@@ -774,12 +774,22 @@ fn stream_anthropic_response(
     tokio::spawn(async move {
         let mut converter = AnthropicStreamConverter::new(model);
         let mut stream = std::pin::pin!(stream);
-        'streaming: while let Some(event) = stream.next().await {
+        while let Some(event) = stream.next().await {
             let anthropic_events = converter.convert(&event);
             for anthropic_event in anthropic_events {
                 if tx.send(anthropic_event).await.is_err() {
-                    break 'streaming;
+                    return;
                 }
+            }
+        }
+        // The upstream event stream ended. If it never produced a
+        // `response.completed` (engine error, dropped/stalled turn, aborted
+        // web-search round-trip), emit a terminal `message_delta` +
+        // `message_stop` so the client is not left hanging behind the SSE
+        // keep-alive forever.
+        for anthropic_event in converter.finalize() {
+            if tx.send(anthropic_event).await.is_err() {
+                return;
             }
         }
     });

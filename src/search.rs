@@ -5,9 +5,26 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use url::Url;
 
+/// A single web result, structured for the Anthropic `web_search_tool_result`
+/// block (so clients render source citations). The model-facing prose still
+/// comes from [`SearchOutcome::formatted`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchSource {
+    pub title: String,
+    pub url: String,
+}
+
+/// Result of a web search: the flattened text injected into the model's
+/// context, plus the structured sources surfaced to the client.
+#[derive(Debug, Clone, Default)]
+pub struct SearchOutcome {
+    pub formatted: String,
+    pub sources: Vec<SearchSource>,
+}
+
 #[async_trait]
 pub trait SearchClient: Send + Sync {
-    async fn search(&self, query: &str) -> AppResult<String>;
+    async fn search(&self, query: &str) -> AppResult<SearchOutcome>;
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +58,7 @@ impl BraveSearchClient {
 
 #[async_trait]
 impl SearchClient for BraveSearchClient {
-    async fn search(&self, query: &str) -> AppResult<String> {
+    async fn search(&self, query: &str) -> AppResult<SearchOutcome> {
         let api_key = self.api_key.as_deref().ok_or_else(|| {
             AppError::internal("web_search is configured but BRAVE_SEARCH_API_KEY is missing")
         })?;
@@ -70,8 +87,26 @@ impl SearchClient for BraveSearchClient {
             .json()
             .await
             .map_err(|err| AppError::upstream(format!("invalid Brave search JSON: {err}")))?;
-        Ok(format_search_results(&payload))
+        Ok(SearchOutcome {
+            formatted: format_search_results(&payload),
+            sources: collect_sources(&payload),
+        })
     }
+}
+
+fn collect_sources(payload: &BraveSearchResponse) -> Vec<SearchSource> {
+    payload
+        .web
+        .as_ref()
+        .map(|web| web.results.as_slice())
+        .unwrap_or(&[])
+        .iter()
+        .filter(|result| !result.url.is_empty())
+        .map(|result| SearchSource {
+            title: result.title.clone(),
+            url: result.url.clone(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +165,8 @@ mod tests {
     use super::BraveSearchResponse;
     use super::BraveWebResult;
     use super::BraveWebResults;
+    use super::SearchSource;
+    use super::collect_sources;
     use super::format_search_results;
 
     #[test]
@@ -154,6 +191,49 @@ mod tests {
         };
         let result = format_search_results(&response);
         assert!(result.contains("1."));
+    }
+
+    #[test]
+    fn collect_sources_extracts_structured_url_title_skipping_empty_urls() {
+        // The structured sources feed the Anthropic `web_search_tool_result`
+        // block; results without a URL can't be a citation and are dropped.
+        // The model-facing formatted text must stay byte-identical.
+        let response = BraveSearchResponse {
+            web: Some(BraveWebResults {
+                results: vec![
+                    BraveWebResult {
+                        title: "Alpha".to_string(),
+                        url: "https://a.test".to_string(),
+                        description: "da".to_string(),
+                    },
+                    BraveWebResult {
+                        title: "No URL".to_string(),
+                        url: String::new(),
+                        description: "d".to_string(),
+                    },
+                    BraveWebResult {
+                        title: "Beta".to_string(),
+                        url: "https://b.test".to_string(),
+                        description: "db".to_string(),
+                    },
+                ],
+            }),
+        };
+        let sources = collect_sources(&response);
+        assert_eq!(
+            sources,
+            vec![
+                SearchSource {
+                    title: "Alpha".to_string(),
+                    url: "https://a.test".to_string(),
+                },
+                SearchSource {
+                    title: "Beta".to_string(),
+                    url: "https://b.test".to_string(),
+                },
+            ]
+        );
+        assert!(format_search_results(&response).contains("URL: https://a.test"));
     }
 
     #[test]

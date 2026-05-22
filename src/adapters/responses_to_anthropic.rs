@@ -7,6 +7,7 @@ use crate::models::anthropic::AnthropicMessageResponse;
 use crate::models::anthropic::AnthropicMessageStart;
 use crate::models::anthropic::AnthropicMessageUsage;
 use crate::models::anthropic::AnthropicResponseContentBlock;
+use crate::models::anthropic::AnthropicServerToolUse;
 use crate::models::anthropic::AnthropicStreamEvent;
 use crate::models::anthropic::AnthropicUsage;
 use serde_json::Value;
@@ -24,7 +25,9 @@ pub struct AnthropicStreamConverter {
     open_block: Option<ContentBlockState>,
     has_tool_calls: bool,
     started: bool,
+    completed: bool,
     pending_input_tokens: Option<u64>,
+    web_search_count: u64,
 }
 
 impl AnthropicStreamConverter {
@@ -36,8 +39,19 @@ impl AnthropicStreamConverter {
             open_block: None,
             has_tool_calls: false,
             started: false,
+            completed: false,
             pending_input_tokens: None,
+            web_search_count: 0,
         }
+    }
+
+    /// `usage.server_tool_use` for terminal events: `Some` once a server-side
+    /// web search has run this turn, otherwise `None` so token-only turns stay
+    /// byte-identical.
+    fn server_tool_use_usage(&self) -> Option<AnthropicServerToolUse> {
+        (self.web_search_count > 0).then_some(AnthropicServerToolUse {
+            web_search_requests: self.web_search_count,
+        })
     }
 
     pub fn convert(&mut self, event: &SseEvent) -> Vec<AnthropicStreamEvent> {
@@ -54,6 +68,9 @@ impl AnthropicStreamConverter {
                 self.handle_completed(&event.data, &mut output)
             }
             "response.failed" => self.handle_failed(&event.data, &mut output),
+            "response.web_search_results" => {
+                self.handle_web_search_results(&event.data, &mut output)
+            }
             _ => {}
         }
         output
@@ -75,6 +92,7 @@ impl AnthropicStreamConverter {
                     usage: AnthropicUsage {
                         input_tokens: Some(self.pending_input_tokens.unwrap_or(0)),
                         output_tokens: Some(0),
+                        server_tool_use: None,
                     },
                 },
             });
@@ -178,11 +196,54 @@ impl AnthropicStreamConverter {
                 self.close_open_block(output);
                 self.emit_tool_use_block(item, output);
             }
+            "web_search_call" => {
+                // Server-side tool: deliberately not surfaced. Brave Search runs
+                // server-side, so the Anthropic client must not see a tool_use
+                // block for it; the final answer (generated after results are
+                // injected) is emitted as regular text. Same effect as the `_`
+                // arm — kept explicit to document the intentional omission.
+            }
             _ => {}
         }
     }
 
+    /// Guarantees the Anthropic stream is terminated.
+    ///
+    /// The converter only emits `message_delta` + `message_stop` when it sees a
+    /// `response.completed` event. If the upstream turn ends any other way (an
+    /// error, a dropped/stalled engine task, an aborted web-search round-trip),
+    /// the client would otherwise be left waiting forever behind the SSE
+    /// keep-alive. Callers MUST invoke this once the upstream event stream is
+    /// exhausted so every connection ends with a terminal event.
+    pub fn finalize(&mut self) -> Vec<AnthropicStreamEvent> {
+        let mut output = Vec::new();
+        if self.completed {
+            return output;
+        }
+        self.ensure_started(&mut output);
+        self.close_open_block(&mut output);
+        output.push(AnthropicStreamEvent::MessageDelta {
+            delta: AnthropicMessageDeltaBody {
+                stop_reason: if self.has_tool_calls {
+                    "tool_use".to_string()
+                } else {
+                    "end_turn".to_string()
+                },
+                stop_sequence: None,
+            },
+            usage: AnthropicUsage {
+                input_tokens: self.pending_input_tokens,
+                output_tokens: Some(0),
+                server_tool_use: self.server_tool_use_usage(),
+            },
+        });
+        output.push(AnthropicStreamEvent::MessageStop);
+        self.completed = true;
+        output
+    }
+
     fn handle_completed(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
+        self.completed = true;
         self.close_open_block(output);
         let usage = response_usage(data);
         if let Some(usage) = usage.as_ref() {
@@ -203,6 +264,7 @@ impl AnthropicStreamConverter {
             usage: AnthropicUsage {
                 input_tokens: usage.as_ref().map(|usage| usage.input_tokens),
                 output_tokens: Some(usage.as_ref().map_or(0, |usage| usage.output_tokens)),
+                server_tool_use: self.server_tool_use_usage(),
             },
         });
         output.push(AnthropicStreamEvent::MessageStop);
@@ -221,6 +283,63 @@ impl AnthropicStreamConverter {
                 kind: "api_error".to_string(),
                 message,
             },
+        });
+    }
+
+    /// Surface a server-side web search to the Anthropic client.
+    ///
+    /// resp2chat runs Brave server-side, so the client never sees the model's
+    /// own tool call. Without explicit `server_tool_use` + `web_search_tool_result`
+    /// blocks, Claude Code reports "Did 0 searches" and renders no source
+    /// citations. This mirrors Anthropic's native web-search streaming shape:
+    /// a `server_tool_use` block (query streamed via `input_json_delta`) followed
+    /// by a `web_search_tool_result` block carrying the structured sources. The
+    /// turn still ends with `end_turn` (the search is resolved server-side), so
+    /// `has_tool_calls` is intentionally left untouched.
+    fn handle_web_search_results(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
+        self.ensure_started(output);
+        self.close_open_block(output);
+        self.web_search_count += 1;
+
+        let tool_use_id = data
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let query = data.get("query").and_then(Value::as_str).unwrap_or("");
+        let results = data
+            .get("results")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
+
+        let stu_index = self.next_block_index;
+        self.next_block_index += 1;
+        output.push(AnthropicStreamEvent::ContentBlockStart {
+            index: stu_index,
+            content_block: AnthropicContentBlockStart::ServerToolUse {
+                id: tool_use_id.clone(),
+                name: "web_search".to_string(),
+            },
+        });
+        output.push(AnthropicStreamEvent::ContentBlockDelta {
+            index: stu_index,
+            delta: AnthropicDelta::InputJsonDelta {
+                partial_json: serde_json::json!({ "query": query }).to_string(),
+            },
+        });
+        output.push(AnthropicStreamEvent::ContentBlockStop { index: stu_index });
+
+        let result_index = self.next_block_index;
+        self.next_block_index += 1;
+        output.push(AnthropicStreamEvent::ContentBlockStart {
+            index: result_index,
+            content_block: AnthropicContentBlockStart::WebSearchToolResult {
+                tool_use_id,
+                content: results,
+            },
+        });
+        output.push(AnthropicStreamEvent::ContentBlockStop {
+            index: result_index,
         });
     }
 
@@ -306,6 +425,15 @@ enum AccumulatedBlock {
         name: String,
         input: String,
     },
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: Value,
+    },
 }
 
 pub struct AnthropicStreamCollector {
@@ -365,6 +493,20 @@ impl AnthropicStreamCollector {
                                 input: String::new(),
                             })
                         }
+                        AnthropicContentBlockStart::ServerToolUse { id, name } => {
+                            Some(AccumulatedBlock::ServerToolUse {
+                                id,
+                                name,
+                                input: String::new(),
+                            })
+                        }
+                        AnthropicContentBlockStart::WebSearchToolResult {
+                            tool_use_id,
+                            content,
+                        } => Some(AccumulatedBlock::WebSearchToolResult {
+                            tool_use_id,
+                            content,
+                        }),
                     };
                 }
                 AnthropicStreamEvent::ContentBlockDelta { delta, .. } => {
@@ -382,7 +524,8 @@ impl AnthropicStreamCollector {
                             text.push_str(&t);
                         }
                         (
-                            Some(AccumulatedBlock::ToolUse { input, .. }),
+                            Some(AccumulatedBlock::ToolUse { input, .. })
+                            | Some(AccumulatedBlock::ServerToolUse { input, .. }),
                             AnthropicDelta::InputJsonDelta { partial_json },
                         ) => {
                             input.push_str(&partial_json);
@@ -429,6 +572,19 @@ impl AnthropicStreamCollector {
                         input: parsed_input,
                     }
                 }
+                AccumulatedBlock::ServerToolUse { id, name, input } => {
+                    let parsed_input: Value =
+                        serde_json::from_str(&input).unwrap_or(Value::Object(Default::default()));
+                    AnthropicResponseContentBlock::ServerToolUse {
+                        id,
+                        name,
+                        input: parsed_input,
+                    }
+                }
+                AccumulatedBlock::WebSearchToolResult {
+                    tool_use_id,
+                    content,
+                } => AnthropicResponseContentBlock::WebSearchToolResult { tool_use_id, content },
             })
             .collect();
 
@@ -860,5 +1016,216 @@ mod tests {
             )
         });
         assert!(!has_web_search_tool_use);
+    }
+
+    #[test]
+    fn finalize_terminates_stream_when_upstream_ends_without_completed() {
+        // Regression: a web-search round-trip that stalls/aborts ends the
+        // upstream event stream without `response.completed`. Without an
+        // explicit finalize the client only ever sees `message_start` and
+        // hangs forever behind the SSE keep-alive.
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let mut events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("message", "assistant"),
+            text_delta_event("Searching the web"),
+            // ...stream ends here: no response.output_item.done, no completed.
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+        events.extend(converter.finalize());
+
+        let names = event_types(&events);
+        assert_eq!(
+            names.last(),
+            Some(&"message_stop"),
+            "stream must end with message_stop, got {names:?}"
+        );
+        // The dangling text content block must be closed before message_stop.
+        let stop_idx = names.iter().position(|n| *n == "content_block_stop");
+        let msg_stop_idx = names.iter().position(|n| *n == "message_stop");
+        assert!(stop_idx < msg_stop_idx, "open block not closed: {names:?}");
+    }
+
+    #[test]
+    fn finalize_terminates_stream_with_no_events_at_all() {
+        // The engine can stall before producing any output. finalize() must
+        // still synthesize a complete, valid message envelope.
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events = converter.finalize();
+        assert_eq!(
+            event_types(&events),
+            vec!["ping", "message_start", "message_delta", "message_stop"]
+        );
+    }
+
+    #[test]
+    fn finalize_is_noop_after_normal_completion() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let _: Vec<_> = [
+            created_event(),
+            item_added_event("message", "assistant"),
+            text_delta_event("Hello"),
+            item_done_event("message", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+        // No duplicate message_delta/message_stop after a clean completion.
+        assert!(converter.finalize().is_empty());
+    }
+
+    fn web_search_results_event(tool_use_id: &str, query: &str, results: Value) -> SseEvent {
+        SseEvent {
+            event: "response.web_search_results".to_string(),
+            data: json!({
+                "type": "response.web_search_results",
+                "tool_use_id": tool_use_id,
+                "query": query,
+                "results": results,
+            }),
+        }
+    }
+
+    #[test]
+    fn web_search_results_emit_server_tool_use_then_result_block() {
+        // Regression: resp2chat ran Brave server-side but swallowed the call,
+        // so Claude Code reported "Did 0 searches" and listed no sources. The
+        // converter must surface the Anthropic server-side web-search blocks
+        // (`server_tool_use` + `web_search_tool_result`) so the client counts
+        // the search and renders source chips.
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let results = json!([
+            {"type": "web_search_result", "url": "https://example.com/a", "title": "Site A"},
+            {"type": "web_search_result", "url": "https://example.com/b", "title": "Site B"}
+        ]);
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("message", "assistant"),
+            text_delta_event("Let me search."),
+            web_search_results_event("srvtoolu_1", "current weather Boppard", results.clone()),
+            text_delta_event("It is 11C."),
+            item_done_event("message", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        let jsons: Vec<Value> = events
+            .iter()
+            .map(|e| serde_json::from_str(&e.to_json()).unwrap())
+            .collect();
+
+        // server_tool_use block, query streamed via input_json_delta, then stop.
+        let stu_pos = jsons
+            .iter()
+            .position(|j| j["content_block"]["type"] == "server_tool_use")
+            .expect("server_tool_use content_block_start");
+        assert_eq!(jsons[stu_pos]["type"], "content_block_start");
+        assert_eq!(jsons[stu_pos]["content_block"]["name"], "web_search");
+        let stu_id = jsons[stu_pos]["content_block"]["id"].as_str().unwrap();
+        assert!(!stu_id.is_empty(), "server_tool_use must carry an id");
+        let stu_idx = jsons[stu_pos]["index"].clone();
+
+        assert_eq!(jsons[stu_pos + 1]["type"], "content_block_delta");
+        assert_eq!(jsons[stu_pos + 1]["delta"]["type"], "input_json_delta");
+        let partial = jsons[stu_pos + 1]["delta"]["partial_json"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(partial).expect("partial_json is JSON");
+        assert_eq!(parsed["query"], "current weather Boppard");
+        assert_eq!(jsons[stu_pos + 2]["type"], "content_block_stop");
+        assert_eq!(jsons[stu_pos + 2]["index"], stu_idx);
+
+        // web_search_tool_result block carrying the structured sources.
+        let res_pos = stu_pos + 3;
+        assert_eq!(jsons[res_pos]["type"], "content_block_start");
+        assert_eq!(
+            jsons[res_pos]["content_block"]["type"],
+            "web_search_tool_result"
+        );
+        assert_eq!(jsons[res_pos]["content_block"]["tool_use_id"], stu_id);
+        assert_eq!(jsons[res_pos]["content_block"]["content"], results);
+        assert_eq!(jsons[res_pos + 1]["type"], "content_block_stop");
+
+        // Server-side tool: turn still ends with end_turn, not tool_use.
+        let msg_delta = jsons
+            .iter()
+            .find(|j| j["type"] == "message_delta")
+            .expect("message_delta");
+        assert_eq!(msg_delta["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn web_search_count_is_reported_in_terminal_usage() {
+        // Claude Code's "Did N searches" reads usage.server_tool_use
+        // .web_search_requests. resp2chat must report it so a server-side
+        // search isn't shown as "Did 0 searches".
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let r = json!([{"type": "web_search_result", "url": "https://x", "title": "X"}]);
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("message", "assistant"),
+            web_search_results_event("srvtoolu_1", "q1", r.clone()),
+            web_search_results_event("srvtoolu_2", "q2", r.clone()),
+            text_delta_event("answer"),
+            item_done_event("message", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        let md = events
+            .iter()
+            .find(|e| matches!(e, AnthropicStreamEvent::MessageDelta { .. }))
+            .map(|e| serde_json::from_str::<Value>(&e.to_json()).unwrap())
+            .expect("message_delta");
+        assert_eq!(md["usage"]["server_tool_use"]["web_search_requests"], 2);
+    }
+
+    #[test]
+    fn no_server_tool_use_usage_when_no_web_search() {
+        // Pristine: a turn without web search must not emit server_tool_use usage.
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("message", "assistant"),
+            text_delta_event("hi"),
+            item_done_event("message", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+        let md = events
+            .iter()
+            .find(|e| matches!(e, AnthropicStreamEvent::MessageDelta { .. }))
+            .map(|e| serde_json::from_str::<Value>(&e.to_json()).unwrap())
+            .expect("message_delta");
+        assert!(
+            md["usage"].get("server_tool_use").is_none(),
+            "no web search => no server_tool_use usage, got {}",
+            md["usage"]
+        );
+    }
+
+    #[test]
+    fn finalize_terminates_stream_after_failure_event() {
+        // handle_failed only emits `error`; the client still needs a terminal
+        // message_stop to stop waiting.
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let mut events = converter.convert(&created_event());
+        events.extend(converter.convert(&failed_event("web search round limit exceeded")));
+        events.extend(converter.finalize());
+
+        let names = event_types(&events);
+        assert!(names.contains(&"error"), "expected error event: {names:?}");
+        assert_eq!(
+            names.last(),
+            Some(&"message_stop"),
+            "stream must still end with message_stop, got {names:?}"
+        );
     }
 }

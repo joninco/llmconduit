@@ -238,7 +238,8 @@ impl StreamState {
             let arguments = if accumulator.arguments_text.trim().is_empty() {
                 Value::Object(Default::default())
             } else {
-                serde_json::from_str(&accumulator.arguments_text).map_err(|err| {
+                let cleaned = extract_json_arguments(&accumulator.arguments_text);
+                serde_json::from_str(cleaned).map_err(|err| {
                     AppError::upstream(format!(
                         "failed to parse upstream tool arguments for {name}: {err}"
                     ))
@@ -364,6 +365,53 @@ fn append_argument_fragment(buffer: &mut String, value: &Value) {
             buffer.push_str(&serde_json::to_string(other).unwrap_or_else(|_| "null".to_string()))
         }
     }
+}
+
+/// Extract the JSON payload from an upstream tool-call `arguments` string.
+///
+/// vLLM's Kimi/Moonshot tool-call parser can leak the model's internal
+/// tool-call sentinel tokens (e.g. `<|tool_calls_section_begin|>`) into
+/// `function.arguments`, particularly when `tool_choice` forces a specific
+/// function — which is exactly what an Anthropic `web_search` server tool
+/// produces. The leaked prefix/suffix makes an otherwise-valid object fail
+/// strict JSON parsing ("expected value at line 1 column 2"). Locate the first
+/// balanced JSON object/array and ignore anything around it. String-aware so
+/// braces inside string literals don't confuse the scan. Falls back to the
+/// trimmed input (which will then surface a real parse error) when no JSON
+/// value is present.
+fn extract_json_arguments(raw: &str) -> &str {
+    let Some(start) = raw.find(['{', '[']) else {
+        return raw.trim();
+    };
+    let open = raw.as_bytes()[start] as char;
+    let close = if open == '{' { '}' } else { ']' };
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (idx, ch) in raw[start..].char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            c if c == open => depth += 1,
+            c if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return &raw[start..start + idx + ch.len_utf8()];
+                }
+            }
+            _ => {}
+        }
+    }
+    raw.trim()
 }
 
 fn new_item_id(prefix: &str) -> String {
@@ -999,5 +1047,78 @@ mod tests {
         let registry = simple_registry(vec![]);
         let finalized = state.finalize(&registry).unwrap();
         assert_eq!(finalized.finish_reason, Some("length".to_string()));
+    }
+
+    #[test]
+    fn extract_json_arguments_strips_kimi_tool_call_sentinel() {
+        // Exact bytes observed from vLLM Kimi-K2.6 under forced tool_choice.
+        let raw = " <|tool_calls_section_begin|> {\"query\":\"current weather Boppard Germany\"}";
+        let cleaned = extract_json_arguments(raw);
+        let v: Value = serde_json::from_str(cleaned).expect("must parse after cleaning");
+        assert_eq!(v["query"], "current weather Boppard Germany");
+    }
+
+    #[test]
+    fn extract_json_arguments_handles_clean_and_padded_input() {
+        assert_eq!(extract_json_arguments("{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(
+            extract_json_arguments("  {\"a\":1}  ").trim(),
+            "{\"a\":1}"
+        );
+        // Trailing sentinel after the object is ignored too.
+        assert_eq!(
+            extract_json_arguments("{\"a\":1} <|tool_calls_section_end|>"),
+            "{\"a\":1}"
+        );
+    }
+
+    #[test]
+    fn extract_json_arguments_is_string_aware() {
+        // Braces inside string literals must not end the scan early.
+        let raw = "<|x|> {\"q\":\"a{b}c \\\" }\"}";
+        let cleaned = extract_json_arguments(raw);
+        let v: Value = serde_json::from_str(cleaned).expect("string-aware parse");
+        assert_eq!(v["q"], "a{b}c \" }");
+    }
+
+    #[test]
+    fn extract_json_arguments_supports_array_payloads() {
+        let raw = "<|tool_call_begin|> [{\"a\":1},{\"b\":2}] trailing";
+        let cleaned = extract_json_arguments(raw);
+        let v: Value = serde_json::from_str(cleaned).expect("array parse");
+        assert!(v.is_array() && v.as_array().unwrap().len() == 2);
+    }
+
+    #[test]
+    fn extract_json_arguments_without_json_returns_trimmed() {
+        // No JSON value -> trimmed input, which still surfaces a real error
+        // at the call site (we do not silently swallow genuinely-broken args).
+        assert_eq!(extract_json_arguments("  not json  "), "not json");
+    }
+
+    #[test]
+    fn finalize_tolerates_kimi_sentinel_in_web_search_arguments() {
+        // End-to-end through finalize(): the leaked sentinel must no longer
+        // produce `failed to parse upstream tool arguments`.
+        let mut state = StreamState::default();
+        state.apply_chunk(&tool_call_chunk(
+            "c1",
+            Some("call_ws"),
+            0,
+            Some("web_search"),
+            Some(" <|tool_calls_section_begin|> {\"query\":\"boppard weather\"}"),
+        ));
+        let registry = simple_registry(vec![("web_search", ToolKind::WebSearch)]);
+        let finalized = state
+            .finalize(&registry)
+            .expect("kimi sentinel must be tolerated");
+        let call = &finalized.tool_calls[0];
+        match &call.public_item {
+            ResponseItem::WebSearchCall {
+                action: Some(WebSearchAction::Search { query, .. }),
+                ..
+            } => assert_eq!(query.as_deref(), Some("boppard weather")),
+            other => panic!("expected web_search_call, got {other:?}"),
+        }
     }
 }
