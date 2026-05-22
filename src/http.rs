@@ -1101,9 +1101,9 @@ fn anthropic_model_entry(entry: &Value) -> Option<Value> {
         Value::Object(map) => {
             let id = map.get("id").and_then(Value::as_str)?;
             let display_name = map
-                .get("id")
+                .get("display_name")
                 .and_then(Value::as_str)
-                .or_else(|| map.get("display_name").and_then(Value::as_str))
+                .or_else(|| map.get("id").and_then(Value::as_str))
                 .unwrap_or(id);
             let created_at = parse_created_at(map)
                 .unwrap_or_else(|| UNKNOWN_MODEL_CREATED_AT.to_string());
