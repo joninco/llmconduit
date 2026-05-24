@@ -349,18 +349,27 @@
     .title-row {
       display: flex;
       align-items: center;
-      justify-content: space-between;
       gap: 12px;
       min-width: 0;
     }
 
     .title {
+      flex: 1;
       min-width: 0;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-size: 14px;
+    }
+
+    .title-model {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: 40%;
     }
 
     .summary-line {
@@ -481,6 +490,72 @@
       font-size: 13px;
       word-break: break-word;
       overflow-wrap: anywhere;
+    }
+
+    .accordion {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--panel-2);
+      margin-bottom: 10px;
+      overflow: hidden;
+    }
+    .accordion > .accordion-summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 8px 12px;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      user-select: none;
+    }
+    .accordion > .accordion-summary::-webkit-details-marker { display: none; }
+    .accordion > .accordion-summary::before {
+      content: "▸";
+      display: inline-block;
+      width: 10px;
+      color: var(--muted);
+      transition: transform 0.1s ease;
+    }
+    .accordion[open] > .accordion-summary::before { transform: rotate(90deg); }
+    .accordion-role { color: var(--muted); }
+    .accordion.role-system .accordion-role { color: var(--blue); }
+    .accordion.role-user .accordion-role { color: var(--text); }
+    .accordion.role-assistant .accordion-role { color: var(--text); }
+    .accordion.role-reasoning .accordion-role { color: var(--reasoning); }
+    .accordion.role-tool .accordion-role { color: var(--tool); }
+    .accordion > .segment {
+      margin: 0;
+      padding: 10px 12px;
+      border-top: 1px solid var(--line);
+      background: #0d0f12;
+    }
+    .accordion.stale > .accordion-summary { opacity: 0.6; }
+    .accordion.stale > .accordion-summary .accordion-role { color: var(--muted); }
+
+    .raw-section-label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin: 16px 0 6px;
+    }
+    .raw-section-label:first-child { margin-top: 0; }
+    .raw-subhead {
+      color: var(--muted);
+      font-size: 11px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      margin: 8px 0 4px;
+    }
+    .raw-empty {
+      color: var(--muted);
+      font-size: 13px;
+      padding: 8px 0;
     }
 
     /* Dashboard grid -- tile count drives the layout shape so visible tiles
@@ -2093,8 +2168,8 @@
   customElements.define("live-dashboard", LiveDashboard);
 
   // ------------------------------------------------------------------------
-  // <request-detail>: tabbed view for a single request (Output / Prompt /
-  // Upstream / Events).
+  // <request-detail>: tabbed view for a single request (Messages / Raw /
+  // Events).
   // ------------------------------------------------------------------------
 
   class RequestDetail extends HTMLElement {
@@ -2108,7 +2183,7 @@
           `;
         this._head = this.querySelector('[data-role="head"]');
         this._pane = this.querySelector('[data-role="pane"]');
-        this._tab = "output";
+        this._tab = "messages";
         this._built = true;
       }
       this._onRequestChanged = (e) => {
@@ -2133,10 +2208,10 @@
       this._renderHead(request);
       this._pane.className = "pane";
       switch (this._tab) {
-        case "output": this._renderOutput(request); break;
-        case "prompt": this._renderPrompt(request); break;
-        case "upstream": this._renderUpstream(request); break;
+        case "messages": this._renderMessages(request); break;
+        case "raw": this._renderUpstream(request); break;
         case "events": this._renderEvents(request); break;
+        default: this._renderMessages(request); break;
       }
     }
 
@@ -2144,14 +2219,13 @@
       const status = request.status || "running";
       this._head.innerHTML = `
           <div class="title-row">
-            <div class="title">${escapeHtml(request.response_id)}</div>
+            <div class="title">${escapeHtml(formatTime(request.started_at_ms))} ${escapeHtml(request.response_id)} ${escapeHtml(formatDuration(request))}</div>
+            <span class="title-model">${escapeHtml(request.model || "unknown model")}</span>
             <span class="badge status-icon ${escapeHtml(status)}" title="${escapeHtml(status)}">${statusIcon(status)}</span>
           </div>
-          <div class="summary-line">${escapeHtml(request.model || "unknown model")} | ${formatTime(request.started_at_ms)} | ${formatDuration(request)}</div>
           <div class="tabs">
-            ${this._tabButton("output", "Output")}
-            ${this._tabButton("prompt", "Prompt")}
-            ${this._tabButton("upstream", "Upstream")}
+            ${this._tabButton("messages", "Messages")}
+            ${this._tabButton("raw", "Raw")}
             ${this._tabButton("events", "Events")}
           </div>
         `;
@@ -2167,49 +2241,228 @@
       return `<button type="button" class="tab ${this._tab === id ? "active" : ""}" data-tab="${id}">${label}</button>`;
     }
 
-    _renderOutput(request) {
+    _renderMessages(request) {
       this._pane.replaceChildren();
-      if (!request.segments?.length) {
-        this._pane.className = "pane empty";
-        this._pane.textContent = "No output yet";
-        return;
+
+      const sections = [];
+
+      // System prompt + input messages parsed from the upstream payload.
+      // When there's been a previous upstream call on this request, mark
+      // everything carried over from it as "stale" so it can default closed.
+      const parsedPrompt = this._parsePromptPayload(request);
+      const prevCount = this._countPreviousMessages(request);
+      if (parsedPrompt) {
+        if (parsedPrompt.system) {
+          sections.push({ label: "System", role: "system", body: parsedPrompt.system, stale: true });
+        }
+        parsedPrompt.messages.forEach((msg, idx) => {
+          sections.push({
+            label: msg.role.charAt(0).toUpperCase() + msg.role.slice(1),
+            role: msg.role,
+            body: msg.content,
+            stale: idx < prevCount,
+          });
+        });
       }
-      for (const segment of request.segments) {
+
+      // Assistant output: reasoning collapsed separately, then plain output.
+      const segs = request.segments || [];
+      let reasoning = "";
+      let output = "";
+      let tool = "";
+      for (const seg of segs) {
+        if (seg.kind === "reasoning") reasoning += seg.text;
+        else if (seg.kind === "tool") tool += seg.text;
+        else output += seg.text;
+      }
+      if (reasoning.trim()) sections.push({ label: "Reasoning", role: "reasoning", body: reasoning, stale: false });
+      if (tool.trim()) sections.push({ label: "Tool", role: "tool", body: tool, stale: false });
+      if (output.trim()) sections.push({ label: "Assistant", role: "assistant", body: output, stale: false });
+
+      if (!sections.length) { this._empty("No messages yet"); return; }
+
+      // Default: system is always collapsed; carry-over messages from a
+      // prior upstream are collapsed; everything new on this request is open.
+      for (const section of sections) {
+        const details = document.createElement("details");
+        details.className = `accordion role-${section.role}${section.stale ? " stale" : ""}`;
+        details.open = !section.stale && section.role !== "system";
+        const summary = document.createElement("summary");
+        summary.className = "accordion-summary";
+        summary.innerHTML = `<span class="accordion-role">${escapeHtml(section.label)}</span>`;
+        details.appendChild(summary);
         const pre = document.createElement("pre");
-        pre.className = `segment ${segment.kind || "output"}`;
-        pre.textContent = segment.text;
-        this._pane.appendChild(pre);
+        pre.className = `segment ${section.role === "reasoning" ? "reasoning" : section.role === "tool" ? "tool" : "output"}`;
+        pre.textContent = section.body;
+        details.appendChild(pre);
+        this._pane.appendChild(details);
       }
-      this._pane.scrollTop = this._pane.scrollHeight;
     }
 
-    _renderPrompt(request) {
+    // Returns the message count from the most recent *prior* upstream call
+    // on this request — anything at index < this count in the current
+    // payload is carry-over and should default to collapsed.
+    _countPreviousMessages(request) {
+      const events = (request.events || []).filter(it =>
+              (it.kind === "upstream_request" || it.kind === "request_payload") && it.payload_preview
+      );
+      if (events.length < 2) return 0;
+      const prev = events[events.length - 2];
+      let parsed = null;
+      try { parsed = JSON.parse(prev.payload_preview); } catch (_) { return 0; }
+      if (!parsed) return 0;
+      if (Array.isArray(parsed.messages)) {
+        return parsed.messages.filter(m => m && m.role !== "system" && this._flatten(m.content)).length;
+      }
+      if (Array.isArray(parsed.input)) {
+        return parsed.input.filter(it => {
+          if (!it) return false;
+          if (typeof it === "object" && it.role === "system") return false;
+          return Boolean(this._flatten(typeof it === "object" ? it.content : it));
+        }).length;
+      }
+      if (parsed.input !== undefined) return 1;
+      return 0;
+    }
+
+    _parsePromptPayload(request) {
       const events = [...(request.events || [])].reverse();
-      const event = events.find(it => it.kind === "upstream_request" && this._hasDetail(it))
-              || events.find(it => it.kind === "request_payload" && this._hasDetail(it));
-      this._pane.replaceChildren();
-      if (!event) { this._empty("No prompt"); return; }
-      this._appendImages(this._pane, event);
-      this._appendPayload(this._pane, event);
+      const event = events.find(it => it.kind === "upstream_request" && it.payload_preview)
+              || events.find(it => it.kind === "request_payload" && it.payload_preview);
+      if (!event) return null;
+      let parsed = null;
+      try { parsed = JSON.parse(event.payload_preview); } catch (_) { return null; }
+      if (!parsed) return null;
+
+      let system = "";
+      const messages = [];
+
+      // Anthropic style: top-level `system` + `messages[]`.
+      if (typeof parsed.system === "string") {
+        system = parsed.system;
+      } else if (Array.isArray(parsed.system)) {
+        system = this._flatten(parsed.system);
+      }
+
+      if (Array.isArray(parsed.messages)) {
+        for (const msg of parsed.messages) {
+          const role = typeof msg.role === "string" ? msg.role : "?";
+          const content = this._flatten(msg.content);
+          if (!content) continue;
+          if (role === "system" && !system) { system = content; continue; }
+          messages.push({ role, content });
+        }
+      } else if (parsed.input !== undefined) {
+        // OpenAI Responses style: `input` may be a string or array of items.
+        if (Array.isArray(parsed.input)) {
+          for (const item of parsed.input) {
+            if (item && typeof item === "object" && typeof item.role === "string") {
+              const content = this._flatten(item.content);
+              if (!content) continue;
+              if (item.role === "system" && !system) { system = content; continue; }
+              messages.push({ role: item.role, content });
+            } else {
+              const content = this._flatten(item);
+              if (content) messages.push({ role: "user", content });
+            }
+          }
+        } else {
+          const content = this._flatten(parsed.input);
+          if (content) messages.push({ role: "user", content });
+        }
+        if (typeof parsed.instructions === "string" && !system) system = parsed.instructions;
+      }
+
+      return { system, messages };
+    }
+
+    _flatten(value) {
+      if (value === null || value === undefined) return "";
+      if (typeof value === "string") return value;
+      if (!Array.isArray(value)) {
+        if (typeof value === "object" && typeof value.text === "string") return value.text;
+        return "";
+      }
+      let out = "";
+      const push = (s) => {
+        if (!s) return;
+        if (out && !out.endsWith("\n")) out += "\n";
+        out += s;
+      };
+      for (const item of value) {
+        if (typeof item === "string") push(item);
+        else if (item && typeof item === "object") {
+          if (typeof item.text === "string") push(item.text);
+          else if (item.content !== undefined) push(this._flatten(item.content));
+          else if (typeof item.type === "string") push(`[${item.type}]`);
+        }
+      }
+      return out;
     }
 
     _renderUpstream(request) {
-      const events = (request.events || []).filter(it => it.kind === "upstream_request");
       this._pane.replaceChildren();
-      if (!events.length) { this._empty("No upstream requests"); return; }
-      for (const event of events) {
-        const details = document.createElement("details");
-        details.className = "event";
-        details.open = events.length === 1;
-        details.innerHTML = `
-            <summary>
-              <div class="event-meta"><span>${formatTime(event.timestamp_ms)}</span><span class="event-kind">${escapeHtml(event.kind)}</span></div>
-              <div class="event-summary">${escapeHtml(event.summary)}</div>
-            </summary>
-          `;
-        this._appendImages(details, event);
-        this._appendPayload(details, event);
-        this._pane.appendChild(details);
+
+      const events = request.events || [];
+      const clientEvents = events.filter(it => it.kind === "request_payload" && it.payload_preview);
+      const upstreamEvents = events.filter(it => it.kind === "upstream_request" && it.payload_preview);
+
+      const addHeader = (text) => {
+        const el = document.createElement("div");
+        el.className = "raw-section-label";
+        el.textContent = text;
+        this._pane.appendChild(el);
+      };
+      const addSubhead = (text) => {
+        const el = document.createElement("div");
+        el.className = "raw-subhead";
+        el.textContent = text;
+        this._pane.appendChild(el);
+      };
+      const addEmpty = (text) => {
+        const el = document.createElement("div");
+        el.className = "raw-empty";
+        el.textContent = text;
+        this._pane.appendChild(el);
+      };
+      const addPayload = (text) => {
+        const pre = document.createElement("pre");
+        pre.className = "payload";
+        pre.textContent = text;
+        this._pane.appendChild(pre);
+      };
+
+      // Client request: the original payload received by LLMConduit.
+      addHeader("Client request");
+      if (!clientEvents.length) {
+        addEmpty("No client payload captured");
+      } else {
+        for (const event of clientEvents) {
+          addPayload(event.payload_preview);
+        }
+      }
+
+      // Upstream request(s): what LLMConduit forwarded to the provider,
+      // after transformation. Multiple when tool calls trigger follow-ups.
+      addHeader("Upstream request");
+      if (!upstreamEvents.length) {
+        addEmpty("No upstream request yet");
+      } else {
+        upstreamEvents.forEach((event, idx) => {
+          if (upstreamEvents.length > 1) {
+            addSubhead(`#${idx + 1} · ${formatTime(event.timestamp_ms)}`);
+          }
+          addPayload(event.payload_preview);
+        });
+      }
+
+      // Received: reconstructed from streamed segments.
+      addHeader("Received");
+      const segs = request.segments || [];
+      if (!segs.length) {
+        addEmpty("No response yet");
+      } else {
+        addPayload(segs.map(s => s.text).join(""));
       }
     }
 
