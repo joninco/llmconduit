@@ -230,12 +230,12 @@ async fn ensure_success(
         .filter_map(|result| async move {
             match result {
                 Ok(event) if event.data == "[DONE]" => {
-                    eprintln!("[reasoning-debug] <<DONE>>");
+                    println!("[reasoning-debug] <<DONE>>");
                     None
                 }
                 Ok(event) => {
                     if event.data.contains("reasoning") || event.data.contains("thinking") {
-                        eprintln!("[reasoning-debug] raw chunk: {}", event.data);
+                        println!("[reasoning-debug] raw chunk: {}", event.data);
                     }
                     Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
                         AppError::upstream(format!(
