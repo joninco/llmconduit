@@ -111,7 +111,16 @@ pub struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ChatThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatToolCall>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatThinking {
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -222,17 +231,33 @@ pub struct ChatDelta {
 
 impl ChatDelta {
     pub fn reasoning_delta(&self) -> Option<&str> {
-        self.reasoning_content.as_deref().or_else(|| {
-            [
-                "reasoning",
-                "reasoning_text",
-                "reasoning_delta",
-                "thinking",
-                "thinking_content",
-            ]
-            .into_iter()
-            .find_map(|key| self.extra.get(key).and_then(Value::as_str))
-        })
+        self.reasoning_content
+            .as_deref()
+            .or_else(|| {
+                [
+                    "reasoning",
+                    "reasoning_text",
+                    "reasoning_delta",
+                    "thinking",
+                    "thinking_content",
+                ]
+                .into_iter()
+                .find_map(|key| self.extra.get(key).and_then(Value::as_str))
+            })
+            .or_else(|| self.thinking_object_field("content"))
+            .or_else(|| self.thinking_object_field("thinking"))
+    }
+
+    pub fn reasoning_signature_delta(&self) -> Option<&str> {
+        self.thinking_object_field("signature")
+            .or_else(|| self.extra.get("signature").and_then(Value::as_str))
+    }
+
+    fn thinking_object_field(&self, field: &str) -> Option<&str> {
+        self.extra
+            .get("thinking")
+            .and_then(|value| value.get(field))
+            .and_then(Value::as_str)
     }
 
     pub fn non_null_delta_keys(&self) -> Vec<String> {
@@ -447,6 +472,29 @@ mod tests {
             chunk.choices[0].delta.non_null_delta_keys(),
             vec!["reasoning".to_string()]
         );
+    }
+
+    #[test]
+    fn deserializes_nested_thinking_content_and_signature() {
+        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "thinking": {
+                        "content": "hidden step",
+                        "signature": "sig_123"
+                    }
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("chunk should deserialize");
+
+        let delta = &chunk.choices[0].delta;
+        assert_eq!(delta.reasoning_delta(), Some("hidden step"));
+        assert_eq!(delta.reasoning_signature_delta(), Some("sig_123"));
+        assert_eq!(delta.non_null_delta_keys(), vec!["thinking".to_string()]);
     }
 
     #[test]

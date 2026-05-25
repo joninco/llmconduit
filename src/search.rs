@@ -247,6 +247,8 @@ mod tests {
                 upstream_model: None,
                 upstream_request_log_path: None,
                 upstream_chat_kwargs: serde_json::Map::new(),
+                fallback_upstreams: Vec::new(),
+                upstream_failure_cooldown_secs: 30,
                 model_profiles: std::collections::BTreeMap::new(),
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1")
                     .expect("url"),
@@ -280,6 +282,8 @@ mod tests {
                 upstream_model: None,
                 upstream_request_log_path: None,
                 upstream_chat_kwargs: serde_json::Map::new(),
+                fallback_upstreams: Vec::new(),
+                upstream_failure_cooldown_secs: 30,
                 model_profiles: std::collections::BTreeMap::new(),
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1/")
                     .expect("url"),

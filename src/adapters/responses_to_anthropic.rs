@@ -11,11 +11,13 @@ use crate::models::anthropic::AnthropicServerToolUse;
 use crate::models::anthropic::AnthropicStreamEvent;
 use crate::models::anthropic::AnthropicUsage;
 use serde_json::Value;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 enum ContentBlockState {
     Thinking { index: usize },
     Text { index: usize },
+    ToolUse { index: usize, call_id: String },
 }
 
 pub struct AnthropicStreamConverter {
@@ -28,6 +30,8 @@ pub struct AnthropicStreamConverter {
     completed: bool,
     pending_input_tokens: Option<u64>,
     web_search_count: u64,
+    emitted_tool_call_ids: HashSet<String>,
+    closed_tool_call_ids: HashSet<String>,
 }
 
 impl AnthropicStreamConverter {
@@ -42,6 +46,8 @@ impl AnthropicStreamConverter {
             completed: false,
             pending_input_tokens: None,
             web_search_count: 0,
+            emitted_tool_call_ids: HashSet::new(),
+            closed_tool_call_ids: HashSet::new(),
         }
     }
 
@@ -62,6 +68,15 @@ impl AnthropicStreamConverter {
             "response.output_text.delta" => self.handle_text_delta(&event.data, &mut output),
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
                 self.handle_reasoning_delta(&event.data, &mut output);
+            }
+            "response.reasoning_summary_text.signature_delta" => {
+                self.handle_reasoning_signature_delta(&event.data, &mut output);
+            }
+            "response.function_call_arguments.delta" => {
+                self.handle_function_call_arguments_delta(&event.data, &mut output);
+            }
+            "response.function_call_arguments.done" => {
+                self.handle_function_call_arguments_done(&event.data, &mut output);
             }
             "response.output_item.done" => self.handle_item_done(&event.data, &mut output),
             "response.completed" | "response.incomplete" => {
@@ -176,6 +191,107 @@ impl AnthropicStreamConverter {
                 }
             }
         }
+    }
+
+    fn handle_reasoning_signature_delta(
+        &mut self,
+        data: &Value,
+        output: &mut Vec<AnthropicStreamEvent>,
+    ) {
+        self.ensure_started(output);
+        let Some(signature) = data.get("signature").and_then(Value::as_str) else {
+            return;
+        };
+        if let Some(ContentBlockState::Thinking { index }) = self.open_block {
+            output.push(AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicDelta::SignatureDelta {
+                    signature: signature.to_string(),
+                },
+            });
+        }
+    }
+
+    fn handle_function_call_arguments_delta(
+        &mut self,
+        data: &Value,
+        output: &mut Vec<AnthropicStreamEvent>,
+    ) {
+        self.ensure_started(output);
+        let Some(call_id) = data.get("call_id").and_then(Value::as_str) else {
+            return;
+        };
+        if self.emitted_tool_call_ids.contains(call_id)
+            || self.closed_tool_call_ids.contains(call_id)
+        {
+            return;
+        }
+        let Some(delta) = data.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        if delta.is_empty() {
+            return;
+        }
+        self.has_tool_calls = true;
+        let name = data.get("name").and_then(Value::as_str).unwrap_or_default();
+        self.ensure_tool_block(call_id, name, output);
+        if let Some(ContentBlockState::ToolUse { index, .. }) = self.open_block {
+            output.push(AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicDelta::InputJsonDelta {
+                    partial_json: delta.to_string(),
+                },
+            });
+        }
+    }
+
+    fn handle_function_call_arguments_done(
+        &mut self,
+        data: &Value,
+        output: &mut Vec<AnthropicStreamEvent>,
+    ) {
+        self.ensure_started(output);
+        let Some(call_id) = data.get("call_id").and_then(Value::as_str) else {
+            return;
+        };
+        self.has_tool_calls = true;
+        if self.emitted_tool_call_ids.contains(call_id) {
+            return;
+        }
+        if self.closed_tool_call_ids.contains(call_id) {
+            self.emitted_tool_call_ids.insert(call_id.to_string());
+            return;
+        }
+        if matches!(
+            &self.open_block,
+            Some(ContentBlockState::ToolUse {
+                call_id: open_call_id,
+                ..
+            }) if open_call_id == call_id
+        ) {
+            self.close_open_block(output);
+            self.emitted_tool_call_ids.insert(call_id.to_string());
+            return;
+        }
+
+        let name = data.get("name").and_then(Value::as_str).unwrap_or_default();
+        let arguments = data
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+        self.ensure_tool_block(call_id, name, output);
+        if !arguments.is_empty()
+            && let Some(ContentBlockState::ToolUse { index, .. }) = self.open_block
+        {
+            output.push(AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicDelta::InputJsonDelta {
+                    partial_json: arguments.to_string(),
+                },
+            });
+        }
+        self.close_open_block(output);
+        self.emitted_tool_call_ids.insert(call_id.to_string());
     }
 
     fn handle_item_done(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
@@ -347,6 +463,10 @@ impl AnthropicStreamConverter {
         if let Some(block) = self.open_block.take() {
             let index = match block {
                 ContentBlockState::Thinking { index } | ContentBlockState::Text { index } => index,
+                ContentBlockState::ToolUse { index, call_id } => {
+                    self.closed_tool_call_ids.insert(call_id);
+                    index
+                }
             };
             output.push(AnthropicStreamEvent::ContentBlockStop { index });
         }
@@ -376,21 +496,28 @@ impl AnthropicStreamConverter {
         });
     }
 
-    fn emit_tool_use_block(&mut self, item: &Value, output: &mut Vec<AnthropicStreamEvent>) {
-        self.has_tool_calls = true;
+    fn ensure_tool_block(
+        &mut self,
+        call_id: &str,
+        name: &str,
+        output: &mut Vec<AnthropicStreamEvent>,
+    ) {
+        if matches!(
+            &self.open_block,
+            Some(ContentBlockState::ToolUse {
+                call_id: open_call_id,
+                ..
+            }) if open_call_id == call_id
+        ) {
+            return;
+        }
+        self.close_open_block(output);
         let index = self.next_block_index;
         self.next_block_index += 1;
-
-        let call_id = item
-            .get("call_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-        let arguments = item
-            .get("arguments")
-            .and_then(Value::as_str)
-            .unwrap_or("{}");
-
+        self.open_block = Some(ContentBlockState::ToolUse {
+            index,
+            call_id: call_id.to_string(),
+        });
         output.push(AnthropicStreamEvent::ContentBlockStart {
             index,
             content_block: AnthropicContentBlockStart::ToolUse {
@@ -399,13 +526,38 @@ impl AnthropicStreamConverter {
                 input: Value::Object(Default::default()),
             },
         });
-        output.push(AnthropicStreamEvent::ContentBlockDelta {
-            index,
-            delta: AnthropicDelta::InputJsonDelta {
-                partial_json: arguments.to_string(),
-            },
-        });
-        output.push(AnthropicStreamEvent::ContentBlockStop { index });
+    }
+
+    fn emit_tool_use_block(&mut self, item: &Value, output: &mut Vec<AnthropicStreamEvent>) {
+        self.has_tool_calls = true;
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if self.emitted_tool_call_ids.contains(call_id) {
+            return;
+        }
+        if self.closed_tool_call_ids.contains(call_id) {
+            self.emitted_tool_call_ids.insert(call_id.to_string());
+            return;
+        }
+        let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+        let arguments = item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or("{}");
+
+        self.ensure_tool_block(call_id, name, output);
+        if let Some(ContentBlockState::ToolUse { index, .. }) = self.open_block {
+            output.push(AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicDelta::InputJsonDelta {
+                    partial_json: arguments.to_string(),
+                },
+            });
+        }
+        self.close_open_block(output);
+        self.emitted_tool_call_ids.insert(call_id.to_string());
     }
 }
 
@@ -416,6 +568,7 @@ impl AnthropicStreamConverter {
 enum AccumulatedBlock {
     Thinking {
         text: String,
+        signature: Option<String>,
     },
     Text {
         text: String,
@@ -484,6 +637,7 @@ impl AnthropicStreamCollector {
                         AnthropicContentBlockStart::Thinking { .. } => {
                             Some(AccumulatedBlock::Thinking {
                                 text: String::new(),
+                                signature: None,
                             })
                         }
                         AnthropicContentBlockStart::ToolUse { id, name, .. } => {
@@ -518,10 +672,16 @@ impl AnthropicStreamCollector {
                             text.push_str(&t);
                         }
                         (
-                            Some(AccumulatedBlock::Thinking { text }),
+                            Some(AccumulatedBlock::Thinking { text, .. }),
                             AnthropicDelta::ThinkingDelta { thinking: t },
                         ) => {
                             text.push_str(&t);
+                        }
+                        (
+                            Some(AccumulatedBlock::Thinking { signature, .. }),
+                            AnthropicDelta::SignatureDelta { signature: sig },
+                        ) => {
+                            *signature = Some(sig);
                         }
                         (
                             Some(AccumulatedBlock::ToolUse { input, .. })
@@ -560,8 +720,11 @@ impl AnthropicStreamCollector {
             .into_iter()
             .map(|block| match block {
                 AccumulatedBlock::Text { text } => AnthropicResponseContentBlock::Text { text },
-                AccumulatedBlock::Thinking { text } => {
-                    AnthropicResponseContentBlock::Thinking { thinking: text }
+                AccumulatedBlock::Thinking { text, signature } => {
+                    AnthropicResponseContentBlock::Thinking {
+                        thinking: text,
+                        signature,
+                    }
                 }
                 AccumulatedBlock::ToolUse { id, name, input } => {
                     let parsed_input: Value =
@@ -584,7 +747,10 @@ impl AnthropicStreamCollector {
                 AccumulatedBlock::WebSearchToolResult {
                     tool_use_id,
                     content,
-                } => AnthropicResponseContentBlock::WebSearchToolResult { tool_use_id, content },
+                } => AnthropicResponseContentBlock::WebSearchToolResult {
+                    tool_use_id,
+                    content,
+                },
             })
             .collect();
 
@@ -672,6 +838,41 @@ mod tests {
                 "type": "response.reasoning_text.delta",
                 "delta": text,
                 "content_index": 0
+            }),
+        }
+    }
+
+    fn reasoning_signature_delta_event(signature: &str) -> SseEvent {
+        SseEvent {
+            event: "response.reasoning_summary_text.signature_delta".to_string(),
+            data: json!({
+                "type": "response.reasoning_summary_text.signature_delta",
+                "signature": signature,
+                "summary_index": 0
+            }),
+        }
+    }
+
+    fn function_call_arguments_delta_event(call_id: &str, name: &str, delta: &str) -> SseEvent {
+        SseEvent {
+            event: "response.function_call_arguments.delta".to_string(),
+            data: json!({
+                "type": "response.function_call_arguments.delta",
+                "call_id": call_id,
+                "name": name,
+                "delta": delta,
+            }),
+        }
+    }
+
+    fn function_call_arguments_done_event(call_id: &str, name: &str, arguments: &str) -> SseEvent {
+        SseEvent {
+            event: "response.function_call_arguments.done".to_string(),
+            data: json!({
+                "type": "response.function_call_arguments.done",
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
             }),
         }
     }
@@ -818,6 +1019,32 @@ mod tests {
     }
 
     #[test]
+    fn converts_reasoning_signature_delta() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("reasoning", ""),
+            reasoning_delta_event("Thinking..."),
+            reasoning_signature_delta_event("sig_123"),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        let signatures: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AnthropicStreamEvent::ContentBlockDelta {
+                    delta: AnthropicDelta::SignatureDelta { signature },
+                    ..
+                } => Some(signature.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signatures, vec!["sig_123"]);
+    }
+
+    #[test]
     fn converts_function_call_response() {
         let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
         let events: Vec<AnthropicStreamEvent> = [
@@ -860,6 +1087,71 @@ mod tests {
             .iter()
             .find(|e| matches!(e, AnthropicStreamEvent::MessageDelta { .. }));
         assert!(message_delta.is_some());
+    }
+
+    #[test]
+    fn streams_function_call_argument_deltas_progressively() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            function_call_arguments_delta_event("call_1", "get_weather", r#"{"loc"#),
+            function_call_arguments_delta_event("call_1", "get_weather", r#"ation":"Seattle"}"#),
+            function_call_arguments_done_event(
+                "call_1",
+                "get_weather",
+                r#"{"location":"Seattle"}"#,
+            ),
+            item_done_event(
+                "function_call",
+                json!({
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"location\":\"Seattle\"}"
+                }),
+            ),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        assert_eq!(
+            event_types(&events),
+            vec![
+                "ping",
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        let tool_starts = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    AnthropicStreamEvent::ContentBlockStart {
+                        content_block: AnthropicContentBlockStart::ToolUse { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(tool_starts, 1);
+        let partials: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AnthropicStreamEvent::ContentBlockDelta {
+                    delta: AnthropicDelta::InputJsonDelta { partial_json },
+                    ..
+                } => Some(partial_json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(partials, vec![r#"{"loc"#, r#"ation":"Seattle"}"#]);
     }
 
     #[test]
@@ -969,6 +1261,30 @@ mod tests {
         let response = collector.into_response().expect("response");
         assert_eq!(response.usage.input_tokens, 12);
         assert_eq!(response.usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn collector_preserves_thinking_signature() {
+        let mut collector = AnthropicStreamCollector::new("claude-3".to_string());
+        for event in [
+            created_event(),
+            item_added_event("reasoning", ""),
+            reasoning_delta_event("private chain"),
+            reasoning_signature_delta_event("sig_123"),
+            item_done_event("reasoning", json!({})),
+            completed_event(),
+        ] {
+            collector.process(&event);
+        }
+
+        let response = collector.into_response().expect("response");
+        assert!(matches!(
+            &response.content[0],
+            AnthropicResponseContentBlock::Thinking {
+                thinking,
+                signature: Some(signature),
+            } if thinking == "private chain" && signature == "sig_123"
+        ));
     }
 
     #[test]
@@ -1132,7 +1448,9 @@ mod tests {
 
         assert_eq!(jsons[stu_pos + 1]["type"], "content_block_delta");
         assert_eq!(jsons[stu_pos + 1]["delta"]["type"], "input_json_delta");
-        let partial = jsons[stu_pos + 1]["delta"]["partial_json"].as_str().unwrap();
+        let partial = jsons[stu_pos + 1]["delta"]["partial_json"]
+            .as_str()
+            .unwrap();
         let parsed: Value = serde_json::from_str(partial).expect("partial_json is JSON");
         assert_eq!(parsed["query"], "current weather Boppard");
         assert_eq!(jsons[stu_pos + 2]["type"], "content_block_stop");

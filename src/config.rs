@@ -19,6 +19,8 @@ pub struct Config {
     pub upstream_model: Option<String>,
     pub upstream_request_log_path: Option<PathBuf>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
+    pub upstream_failure_cooldown_secs: u64,
     pub model_profiles: BTreeMap<String, ModelProfile>,
     pub brave_base_url: Url,
     pub brave_api_key: Option<String>,
@@ -47,6 +49,31 @@ pub struct ModelProfile {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
 }
 
+#[derive(Debug, Clone)]
+pub struct FallbackUpstreamConfig {
+    pub name: String,
+    pub upstream_base_url: Url,
+    pub upstream_api_key: Option<String>,
+    pub upstream_model: Option<String>,
+    pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    pub upstream_request_log_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct PersistedFallbackUpstream {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub upstream_base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
+    pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_request_log_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedConfig {
     pub bind_addr: String,
@@ -59,6 +86,10 @@ pub struct PersistedConfig {
     pub upstream_request_log_path: Option<String>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_upstreams: Vec<PersistedFallbackUpstream>,
+    #[serde(default = "default_upstream_failure_cooldown_secs")]
+    pub upstream_failure_cooldown_secs: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_profiles: BTreeMap<String, PersistedModelProfile>,
     pub brave_base_url: String,
@@ -92,6 +123,10 @@ fn default_max_replay_entries() -> usize {
     1000
 }
 
+fn default_upstream_failure_cooldown_secs() -> u64 {
+    30
+}
+
 impl Default for PersistedConfig {
     fn default() -> Self {
         Self {
@@ -101,6 +136,8 @@ impl Default for PersistedConfig {
             upstream_model: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: default_upstream_failure_cooldown_secs(),
             model_profiles: BTreeMap::new(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
@@ -138,6 +175,44 @@ impl Config {
             .map_err(|err| format!("invalid upstream_base_url: {err}"))?;
         let brave_base_url = Url::parse(&config.brave_base_url)
             .map_err(|err| format!("invalid brave_base_url: {err}"))?;
+        let fallback_upstreams = config
+            .fallback_upstreams
+            .iter()
+            .enumerate()
+            .map(|(index, provider)| {
+                let upstream_base_url =
+                    Url::parse(provider.upstream_base_url.trim()).map_err(|err| {
+                        format!("invalid fallback_upstreams[{index}].upstream_base_url: {err}")
+                    })?;
+                let name = provider
+                    .name
+                    .as_ref()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| format!("fallback-{}", index + 1));
+                Ok(FallbackUpstreamConfig {
+                    name,
+                    upstream_base_url,
+                    upstream_api_key: provider
+                        .upstream_api_key
+                        .as_ref()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty()),
+                    upstream_model: provider
+                        .upstream_model
+                        .as_ref()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty()),
+                    upstream_chat_kwargs: provider.upstream_chat_kwargs.clone(),
+                    upstream_request_log_path: provider
+                        .upstream_request_log_path
+                        .as_ref()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                        .map(PathBuf::from),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         Ok(Self {
             bind_addr,
             upstream_base_url,
@@ -158,6 +233,8 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
             upstream_chat_kwargs: config.upstream_chat_kwargs.clone(),
+            fallback_upstreams,
+            upstream_failure_cooldown_secs: config.upstream_failure_cooldown_secs,
             model_profiles: config
                 .model_profiles
                 .iter()
@@ -339,6 +416,11 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.upstream_chat_kwargs = parsed;
     }
+    if let Ok(value) = env::var("LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS")
+        && let Ok(parsed) = value.parse()
+    {
+        config.upstream_failure_cooldown_secs = parsed;
+    }
     if let Ok(value) = env::var("LLMCONDUIT_BRAVE_BASE_URL")
         && !value.trim().is_empty()
     {
@@ -403,6 +485,7 @@ mod tests {
     use super::JsonMap;
     use super::JsonValue;
     use super::PersistedConfig;
+    use super::PersistedFallbackUpstream;
     use super::PersistedModelProfile;
     use super::apply_env_overrides;
     use super::default_config_path;
@@ -466,6 +549,88 @@ mod tests {
     }
 
     #[test]
+    fn from_persisted_parses_fallback_upstreams() {
+        let config = PersistedConfig {
+            fallback_upstreams: vec![
+                PersistedFallbackUpstream {
+                    name: Some(" backup ".to_string()),
+                    upstream_base_url: "  http://127.0.0.1:8001/v1  ".to_string(),
+                    upstream_api_key: Some(" backup-secret ".to_string()),
+                    upstream_model: Some(" fallback-model ".to_string()),
+                    upstream_chat_kwargs: JsonMap::from_iter([(
+                        "provider".to_string(),
+                        json!({
+                            "order": ["z-ai"],
+                            "allow_fallbacks": true
+                        }),
+                    )]),
+                    upstream_request_log_path: Some(" /tmp/llmconduit-fallback.jsonl ".to_string()),
+                },
+                PersistedFallbackUpstream {
+                    name: Some("   ".to_string()),
+                    upstream_base_url: "http://127.0.0.1:8002/v1".to_string(),
+                    upstream_api_key: Some("   ".to_string()),
+                    upstream_model: None,
+                    upstream_chat_kwargs: JsonMap::new(),
+                    upstream_request_log_path: None,
+                },
+            ],
+            upstream_failure_cooldown_secs: 12,
+            ..PersistedConfig::default()
+        };
+
+        let result = Config::from_persisted(&config).expect("config");
+
+        assert_eq!(result.upstream_failure_cooldown_secs, 12);
+        assert_eq!(result.fallback_upstreams.len(), 2);
+        assert_eq!(result.fallback_upstreams[0].name, "backup");
+        assert_eq!(
+            result.fallback_upstreams[0].upstream_base_url.as_str(),
+            "http://127.0.0.1:8001/v1"
+        );
+        assert_eq!(
+            result.fallback_upstreams[0].upstream_api_key.as_deref(),
+            Some("backup-secret")
+        );
+        assert_eq!(
+            result.fallback_upstreams[0].upstream_model.as_deref(),
+            Some("fallback-model")
+        );
+        assert_eq!(
+            result.fallback_upstreams[0]
+                .upstream_chat_kwargs
+                .get("provider"),
+            Some(&json!({
+                "order": ["z-ai"],
+                "allow_fallbacks": true
+            }))
+        );
+        assert_eq!(
+            result.fallback_upstreams[0]
+                .upstream_request_log_path
+                .as_deref(),
+            Some(std::path::Path::new("/tmp/llmconduit-fallback.jsonl"))
+        );
+        assert_eq!(result.fallback_upstreams[1].name, "fallback-2");
+        assert_eq!(result.fallback_upstreams[1].upstream_api_key, None);
+    }
+
+    #[test]
+    fn from_persisted_rejects_invalid_fallback_upstream_url() {
+        let config = PersistedConfig {
+            fallback_upstreams: vec![PersistedFallbackUpstream {
+                upstream_base_url: "not a url".to_string(),
+                ..PersistedFallbackUpstream::default()
+            }],
+            ..PersistedConfig::default()
+        };
+
+        let error = Config::from_persisted(&config).expect_err("invalid fallback URL");
+
+        assert!(error.contains("invalid fallback_upstreams[0].upstream_base_url"));
+    }
+
+    #[test]
     fn load_persisted_config_missing_file_returns_default() {
         let result = load_persisted_config(std::path::Path::new(
             "/tmp/nonexistent-llmconduit-config-test.yaml",
@@ -513,6 +678,20 @@ mod tests {
     }
 
     #[test]
+    fn apply_env_overrides_upstream_failure_cooldown() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS", "7");
+        }
+        let mut config = PersistedConfig::default();
+        apply_env_overrides(&mut config);
+        assert_eq!(config.upstream_failure_cooldown_secs, 7);
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS");
+        };
+    }
+
+    #[test]
     fn persisted_config_roundtrips() {
         let path = std::env::temp_dir().join(format!(
             "llmconduit-config-{}.yaml",
@@ -528,6 +707,8 @@ mod tests {
                 "clear_thinking".to_string(),
                 JsonValue::Bool(false),
             )]),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
             model_profiles: BTreeMap::from_iter([(
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
@@ -566,6 +747,8 @@ mod tests {
             upstream_model: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
             model_profiles: BTreeMap::from_iter([(
                 "Kimi-K2.6".to_string(),
                 PersistedModelProfile {
@@ -616,6 +799,8 @@ mod tests {
             upstream_model: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
             model_profiles: BTreeMap::from_iter([(
                 "MiMo-V2.5".to_string(),
                 PersistedModelProfile {
@@ -669,6 +854,8 @@ mod tests {
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
             model_profiles: BTreeMap::from_iter([(
                 "xiaomi/mimo-v2.5-pro".to_string(),
                 PersistedModelProfile {
@@ -723,6 +910,8 @@ mod tests {
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
             model_profiles: BTreeMap::from_iter([
                 (
                     "xiaomi/mimo-v2.5-pro".to_string(),
@@ -790,6 +979,8 @@ mod tests {
             upstream_model: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
             model_profiles: BTreeMap::from_iter([
                 (
                     "MiMo-V2.5".to_string(),
@@ -909,6 +1100,8 @@ mod tests {
             upstream_model: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
             model_profiles: BTreeMap::new(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
@@ -940,6 +1133,8 @@ mod tests {
             upstream_model: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
+            fallback_upstreams: Vec::new(),
+            upstream_failure_cooldown_secs: 30,
             model_profiles: BTreeMap::from_iter([(
                 "anthropic/Kimi-K2.6".to_string(),
                 PersistedModelProfile {

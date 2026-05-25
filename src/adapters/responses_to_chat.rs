@@ -2,6 +2,7 @@ use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatFunctionCall;
 use crate::models::chat::ChatMessage;
+use crate::models::chat::ChatThinking;
 use crate::models::chat::ChatTool;
 use crate::models::chat::ChatToolCall;
 use crate::models::chat::ChatToolDefinition;
@@ -59,6 +60,38 @@ pub struct LoweredTurn {
     pub presence_penalty: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingReasoning {
+    text: String,
+    signature: Option<String>,
+}
+
+impl PendingReasoning {
+    fn from_parts(text: String, signature: Option<String>) -> Self {
+        Self { text, signature }
+    }
+
+    fn append(&mut self, text: String, signature: Option<String>) {
+        if !self.text.is_empty() && !text.is_empty() {
+            self.text.push_str("\n\n");
+            self.text.push_str(&text);
+        } else if self.text.is_empty() {
+            self.text = text;
+        }
+        if self.signature.is_none() {
+            self.signature = signature;
+        }
+    }
+
+    fn into_chat_parts(self) -> (Option<String>, Option<ChatThinking>) {
+        let thinking = self.signature.clone().map(|signature| ChatThinking {
+            content: self.text.clone(),
+            signature: Some(signature),
+        });
+        (Some(self.text), thinking)
+    }
+}
+
 pub fn lower_request(
     request: &ResponsesRequest,
     baseline_messages: Vec<ChatMessage>,
@@ -72,21 +105,25 @@ pub fn lower_request(
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            thinking: None,
             tool_calls: None,
         });
     }
     let tools = lower_tools(&request.tools)?;
     let registry = build_tool_registry(&request.tools)?;
-    let mut pending_reasoning: Option<String> = None;
+    let mut pending_reasoning: Option<PendingReasoning> = None;
     for item in &request.input {
         match item {
             ResponseItem::Message { role, content, .. } => {
                 let text = message_content_to_chat_value(content)?;
                 let normalized_role = normalize_chat_role(role);
-                let reasoning_content = if normalized_role == "assistant" {
-                    pending_reasoning.take()
+                let (reasoning_content, thinking) = if normalized_role == "assistant" {
+                    pending_reasoning
+                        .take()
+                        .map(PendingReasoning::into_chat_parts)
+                        .unwrap_or((None, None))
                 } else {
-                    None
+                    (None, None)
                 };
                 messages.push(ChatMessage {
                     role: normalized_role,
@@ -94,20 +131,26 @@ pub fn lower_request(
                     tool_call_id: None,
                     name: None,
                     reasoning_content,
+                    thinking,
                     tool_calls: None,
                 });
             }
             ResponseItem::Reasoning {
-                summary, content, ..
+                summary,
+                content,
+                encrypted_content,
+                ..
             } => {
                 let text = reasoning_item_text(summary, content);
-                pending_reasoning = match pending_reasoning.take() {
-                    Some(existing) if !existing.is_empty() && !text.is_empty() => {
-                        Some(format!("{existing}\n\n{text}"))
-                    }
-                    Some(existing) => Some(existing),
-                    None => Some(text),
-                };
+                let signature = encrypted_content
+                    .as_ref()
+                    .filter(|signature| !signature.is_empty())
+                    .cloned();
+                if let Some(existing) = pending_reasoning.as_mut() {
+                    existing.append(text, signature);
+                } else {
+                    pending_reasoning = Some(PendingReasoning::from_parts(text, signature));
+                }
             }
             ResponseItem::FunctionCall {
                 name,
@@ -188,6 +231,7 @@ pub fn lower_request(
                 tool_call_id: Some(call_id.clone()),
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             }),
             ResponseItem::ToolSearchOutput {
@@ -212,6 +256,7 @@ pub fn lower_request(
                 tool_call_id: call_id.clone(),
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             }),
             ResponseItem::WebSearchCall { id, action, .. } => {
@@ -231,6 +276,7 @@ pub fn lower_request(
                     tool_call_id: Some(call_id),
                     name: None,
                     reasoning_content: None,
+                    thinking: None,
                     tool_calls: None,
                 });
             }
@@ -238,12 +284,14 @@ pub fn lower_request(
         }
     }
     if let Some(reasoning) = pending_reasoning.take() {
+        let (reasoning_content, thinking) = reasoning.into_chat_parts();
         messages.push(ChatMessage {
             role: "assistant".to_string(),
             content: None,
             tool_call_id: None,
             name: None,
-            reasoning_content: Some(reasoning),
+            reasoning_content,
+            thinking,
             tool_calls: None,
         });
     }
@@ -333,6 +381,7 @@ fn hoist_system_messages(messages: &mut Vec<ChatMessage>) {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            thinking: None,
             tool_calls: None,
         });
     }
@@ -582,7 +631,7 @@ fn append_tool_call(
     call_id: String,
     name: String,
     arguments: Value,
-    reasoning_content: Option<String>,
+    pending_reasoning: Option<PendingReasoning>,
 ) {
     if let Some(last) = messages.last_mut()
         && last.role == "assistant"
@@ -603,10 +652,12 @@ fn append_tool_call(
         } else {
             last.tool_calls = Some(vec![tool_call]);
         }
-        if let Some(rc) = reasoning_content
+        if let Some(reasoning) = pending_reasoning
             && last.reasoning_content.is_none()
         {
-            last.reasoning_content = Some(rc);
+            let (reasoning_content, thinking) = reasoning.into_chat_parts();
+            last.reasoning_content = reasoning_content;
+            last.thinking = thinking;
         }
         return;
     }
@@ -624,7 +675,15 @@ fn append_tool_call(
         content: None,
         tool_call_id: None,
         name: None,
-        reasoning_content,
+        reasoning_content: pending_reasoning
+            .as_ref()
+            .map(|reasoning| reasoning.text.clone()),
+        thinking: pending_reasoning.and_then(|reasoning| {
+            reasoning.signature.map(|signature| ChatThinking {
+                content: reasoning.text,
+                signature: Some(signature),
+            })
+        }),
         tool_calls: Some(vec![tool_call]),
     });
 }
@@ -946,6 +1005,44 @@ mod tests {
     }
 
     #[test]
+    fn signed_reasoning_history_preserves_chat_thinking_signature() {
+        let mut req = base_test_request();
+        req.input = vec![
+            user_msg("hello"),
+            ResponseItem::Reasoning {
+                id: "rsn_1".to_string(),
+                summary: Vec::new(),
+                content: Some(vec![ReasoningContentItem::ReasoningText {
+                    text: "private chain".to_string(),
+                }]),
+                encrypted_content: Some("sig_history".to_string()),
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "assistant".to_string(),
+                content: vec![ContentItem::OutputText {
+                    text: "answer".to_string(),
+                }],
+                phase: None,
+            },
+        ];
+
+        let result = lower_request(&req, vec![]).unwrap();
+        let assistant = result
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("assistant message");
+        assert_eq!(
+            assistant.reasoning_content.as_deref(),
+            Some("private chain")
+        );
+        let thinking = assistant.thinking.as_ref().expect("signed thinking");
+        assert_eq!(thinking.content, "private chain");
+        assert_eq!(thinking.signature.as_deref(), Some("sig_history"));
+    }
+
+    #[test]
     fn normalizes_medium_reasoning_effort_for_upstream() {
         let mut req = base_test_request();
         req.reasoning = Some(ReasoningRequest {
@@ -1162,6 +1259,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             },
             ChatMessage {
@@ -1170,6 +1268,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             },
         ];
@@ -1289,6 +1388,7 @@ mod tests {
             tool_call_id: None,
             name: None,
             reasoning_content: None,
+            thinking: None,
             tool_calls: None,
         }];
         append_tool_call(
@@ -1319,6 +1419,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             },
             ChatMessage {
@@ -1327,6 +1428,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             },
             ChatMessage {
@@ -1335,6 +1437,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             },
             ChatMessage {
@@ -1343,6 +1446,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             },
         ];
