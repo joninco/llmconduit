@@ -221,18 +221,41 @@ pub struct ChatDelta {
 }
 
 impl ChatDelta {
-    pub fn reasoning_delta(&self) -> Option<&str> {
-        self.reasoning_content.as_deref().or_else(|| {
-            [
-                "reasoning",
-                "reasoning_text",
-                "reasoning_delta",
-                "thinking",
-                "thinking_content",
-            ]
-            .into_iter()
-            .find_map(|key| self.extra.get(key).and_then(Value::as_str))
-        })
+    pub fn reasoning_delta(&self) -> Option<String> {
+        if let Some(text) = self
+            .reasoning_content
+            .as_deref()
+            .filter(|text| !text.is_empty())
+        {
+            return Some(text.to_string());
+        }
+        for key in [
+            "reasoning",
+            "reasoning_text",
+            "reasoning_delta",
+            "reasoning_summary",
+            "thinking",
+            "thinking_content",
+        ] {
+            let Some(value) = self.extra.get(key) else {
+                continue;
+            };
+            if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
+                return Some(text.to_string());
+            }
+            if let Some(object) = value.as_object() {
+                for nested in ["text", "delta", "content", "summary"] {
+                    if let Some(text) = object
+                        .get(nested)
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                    {
+                        return Some(text.to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 
     pub fn non_null_delta_keys(&self) -> Vec<String> {
@@ -440,7 +463,7 @@ mod tests {
         .expect("chunk should deserialize");
 
         assert_eq!(
-            chunk.choices[0].delta.reasoning_delta(),
+            chunk.choices[0].delta.reasoning_delta().as_deref(),
             Some("hidden step")
         );
         assert_eq!(

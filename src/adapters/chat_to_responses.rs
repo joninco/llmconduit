@@ -107,10 +107,8 @@ impl StreamState {
                     emissions.push(StreamEmission::ReasoningSummaryPartAdded);
                     self.reasoning_part_emitted = true;
                 }
-                self.reasoning_text.push_str(reasoning_delta);
-                emissions.push(StreamEmission::ReasoningTextDelta(
-                    reasoning_delta.to_string(),
-                ));
+                self.reasoning_text.push_str(&reasoning_delta);
+                emissions.push(StreamEmission::ReasoningTextDelta(reasoning_delta));
             }
             if let Some(content_delta) = choice
                 .delta
