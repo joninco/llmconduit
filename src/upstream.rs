@@ -230,12 +230,12 @@ async fn ensure_success(
         .filter_map(|result| async move {
             match result {
                 Ok(event) if event.data == "[DONE]" => {
-                    println!("[reasoning-debug] <<DONE>>");
+                    tracing::info!(target: "reasoning_debug", "<<DONE>>");
                     None
                 }
                 Ok(event) => {
                     if event.data.contains("reasoning") || event.data.contains("thinking") {
-                        println!("[reasoning-debug] raw chunk: {}", event.data);
+                        tracing::info!(target: "reasoning_debug", chunk = %event.data, "raw chunk");
                     }
                     Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
                         AppError::upstream(format!(
