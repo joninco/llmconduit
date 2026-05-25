@@ -22,15 +22,22 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest> {
-    let stop = request.stop_sequences;
-    let mut extra_body = BTreeMap::new();
-    if let Some(top_k) = request.top_k {
-        extra_body.insert("top_k".to_string(), Value::from(top_k));
+    if request.top_k.is_some() {
+        return Err(AppError::bad_request(
+            "Anthropic top_k is not supported by this gateway",
+        ));
     }
     let instructions = extract_system_text(&request.system);
     let input = convert_messages(&request.messages)?;
     let tools = convert_tools(&request.tools);
-    let reasoning = convert_thinking(&request.thinking);
+    let (reasoning, mut extra_body) = convert_thinking(&request.thinking);
+    if let Some(stop_sequences) = request
+        .stop_sequences
+        .as_ref()
+        .filter(|sequences| !sequences.is_empty())
+    {
+        extra_body.insert("stop".to_string(), json!(stop_sequences));
+    }
     let tool_choice = convert_tool_choice(request.tool_choice);
     let metadata = convert_metadata(request.metadata)?;
     let text = convert_output_config(request.output_config)?;
@@ -62,7 +69,7 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         presence_penalty: None,
         truncation: None,
         metadata,
-        stop,
+        stop: None,
         extra_body,
     })
 }
@@ -137,18 +144,54 @@ fn extract_system_text(system: &Option<AnthropicSystemContent>) -> String {
     }
 }
 
-fn convert_thinking(thinking: &Option<AnthropicThinking>) -> Option<ReasoningRequest> {
-    thinking.as_ref().and_then(|t| match t {
-        AnthropicThinking::Enabled { .. } => Some(ReasoningRequest {
-            effort: Some("medium".to_string()),
-            summary: None,
-        }),
-        AnthropicThinking::Disabled => None,
-        AnthropicThinking::Adaptive { .. } => Some(ReasoningRequest {
-            effort: None,
-            summary: None,
-        }),
-    })
+fn convert_thinking(
+    thinking: &Option<AnthropicThinking>,
+) -> (Option<ReasoningRequest>, BTreeMap<String, Value>) {
+    let Some(thinking) = thinking else {
+        return (None, BTreeMap::new());
+    };
+    match thinking {
+        AnthropicThinking::Disabled => (None, BTreeMap::new()),
+        AnthropicThinking::Enabled { budget_tokens }
+        | AnthropicThinking::Adaptive { budget_tokens } => {
+            let budget = budget_tokens.unwrap_or(10_000);
+            let effort = thinking_effort_for_budget(budget);
+            let mut extra_body = BTreeMap::new();
+            extra_body.insert(
+                "reasoning".to_string(),
+                json!({
+                    "effort": effort,
+                    "enabled": true,
+                    "max_tokens": budget,
+                }),
+            );
+            extra_body.insert("enable_thinking".to_string(), Value::Bool(true));
+            extra_body.insert(
+                "chat_template_kwargs".to_string(),
+                json!({
+                    "enable_thinking": true,
+                    "clear_thinking": false,
+                }),
+            );
+            (
+                Some(ReasoningRequest {
+                    effort: Some(effort.to_string()),
+                    summary: None,
+                }),
+                extra_body,
+            )
+        }
+    }
+}
+
+fn thinking_effort_for_budget(budget: u64) -> &'static str {
+    if budget <= 5_000 {
+        "low"
+    } else if budget <= 20_000 {
+        "medium"
+    } else {
+        "high"
+    }
 }
 
 fn convert_messages(
@@ -174,9 +217,19 @@ fn convert_message(
             }
         }
         AnthropicContent::Blocks(blocks) => {
-            // Collect text/image content into a single message item,
-            // then emit tool_use / tool_result items separately.
             let mut content_items = Vec::new();
+            let flush_message =
+                |items: &mut Vec<ResponseItem>, content_items: &mut Vec<ContentItem>| {
+                    if !content_items.is_empty() {
+                        items.push(ResponseItem::Message {
+                            id: None,
+                            role: role.to_string(),
+                            content: std::mem::take(content_items),
+                            phase: None,
+                        });
+                    }
+                };
+
             for block in blocks {
                 match block {
                     AnthropicContentBlock::Text { text } => {
@@ -190,20 +243,8 @@ fn convert_message(
                     AnthropicContentBlock::Image { source } => {
                         content_items.push(image_source_to_content_item(source)?);
                     }
-                    _ => {}
-                }
-            }
-            if !content_items.is_empty() {
-                items.push(ResponseItem::Message {
-                    id: None,
-                    role: role.to_string(),
-                    content: content_items,
-                    phase: None,
-                });
-            }
-            for block in blocks {
-                match block {
                     AnthropicContentBlock::ToolUse { id, name, input } => {
+                        flush_message(items, &mut content_items);
                         let arguments = serde_json::to_string(input).map_err(|err| {
                             AppError::bad_request(format!(
                                 "failed to serialize tool_use input: {err}"
@@ -222,24 +263,41 @@ fn convert_message(
                         content: result_content,
                         ..
                     } => {
+                        flush_message(items, &mut content_items);
+                        let (output, images) = extract_tool_result_parts(result_content)?;
                         items.push(ResponseItem::FunctionCallOutput {
                             call_id: tool_use_id.clone(),
-                            output: extract_tool_result_content(result_content),
+                            output,
                         });
+                        if !images.is_empty() {
+                            items.push(ResponseItem::Message {
+                                id: None,
+                                role: "user".to_string(),
+                                content: images,
+                                phase: None,
+                            });
+                        }
                     }
-                    AnthropicContentBlock::Thinking { thinking } => {
+                    AnthropicContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => {
+                        flush_message(items, &mut content_items);
                         items.push(ResponseItem::Reasoning {
                             id: format!("rsn_{}", Uuid::new_v4().simple()),
                             summary: Vec::new(),
                             content: Some(vec![ReasoningContentItem::ReasoningText {
                                 text: thinking.clone(),
                             }]),
-                            encrypted_content: None,
+                            encrypted_content: signature
+                                .as_ref()
+                                .filter(|signature| !signature.is_empty())
+                                .cloned(),
                         });
                     }
-                    _ => {}
                 }
             }
+            flush_message(items, &mut content_items);
         }
     }
     Ok(())
@@ -388,26 +446,37 @@ fn image_source_to_content_item(source: &AnthropicImageSource) -> AppResult<Cont
     }
 }
 
-fn extract_tool_result_content(content: &Option<AnthropicContent>) -> Value {
+fn extract_tool_result_parts(
+    content: &Option<AnthropicContent>,
+) -> AppResult<(Value, Vec<ContentItem>)> {
     match content {
-        Some(AnthropicContent::Text(text)) => Value::String(text.clone()),
+        Some(AnthropicContent::Text(text)) => Ok((Value::String(text.clone()), Vec::new())),
         Some(AnthropicContent::Blocks(blocks)) => {
-            let text_parts: Vec<String> = blocks
-                .iter()
-                .filter_map(|block| match block {
-                    AnthropicContentBlock::Text { text } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect();
-            if text_parts.len() == 1 {
+            let mut text_parts = Vec::new();
+            let mut images = Vec::new();
+            for block in blocks {
+                match block {
+                    AnthropicContentBlock::Text { text } => text_parts.push(text.clone()),
+                    AnthropicContentBlock::Image { source } => {
+                        images.push(image_source_to_content_item(source)?);
+                    }
+                    _ => {}
+                }
+            }
+            let output = if text_parts.len() == 1 {
                 Value::String(text_parts.into_iter().next().unwrap())
             } else if text_parts.is_empty() {
-                Value::Null
+                if images.is_empty() {
+                    Value::Null
+                } else {
+                    Value::String("[image returned]".to_string())
+                }
             } else {
                 Value::String(text_parts.join("\n"))
-            }
+            };
+            Ok((output, images))
         }
-        None => Value::Null,
+        None => Ok((Value::Null, Vec::new())),
     }
 }
 
@@ -501,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn translates_stop_sequences_and_top_k() {
+    fn converts_stop_sequences_to_extra_body_stop() {
         let request = AnthropicRequest {
             model: "claude-3-5-sonnet-20241022".to_string(),
             max_tokens: Some(64),
@@ -515,7 +584,7 @@ mod tests {
             stream: false,
             temperature: None,
             top_p: None,
-            top_k: Some(40),
+            top_k: None,
             stop_sequences: Some(vec!["</decision>".to_string()]),
             metadata: None,
             thinking: None,
@@ -523,8 +592,8 @@ mod tests {
         };
 
         let result = convert_request(request).expect("convert");
-        assert_eq!(result.stop, Some(vec!["</decision>".to_string()]));
-        assert_eq!(result.extra_body.get("top_k"), Some(&json!(40)));
+        assert_eq!(result.stop, None);
+        assert_eq!(result.extra_body.get("stop"), Some(&json!(["</decision>"])));
     }
 
     #[test]
@@ -646,6 +715,64 @@ mod tests {
     }
 
     #[test]
+    fn converts_tool_result_images_to_user_image_messages() {
+        let request = AnthropicRequest {
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            max_tokens: Some(1024),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Blocks(vec![AnthropicContentBlock::ToolResult {
+                    tool_use_id: "toolu_1".to_string(),
+                    content: Some(AnthropicContent::Blocks(vec![
+                        AnthropicContentBlock::Text {
+                            text: "screenshot attached".to_string(),
+                        },
+                        AnthropicContentBlock::Image {
+                            source: AnthropicImageSource {
+                                kind: "url".to_string(),
+                                media_type: None,
+                                data: None,
+                                url: Some("https://example.com/result.png".to_string()),
+                                file_id: None,
+                            },
+                        },
+                    ])),
+                    is_error: None,
+                }]),
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            metadata: None,
+            thinking: None,
+            output_config: None,
+        };
+
+        let result = convert_request(request).expect("convert");
+        assert_eq!(result.input.len(), 2);
+        assert!(matches!(
+            &result.input[0],
+            ResponseItem::FunctionCallOutput { call_id, output }
+                if call_id == "toolu_1" && output == &json!("screenshot attached")
+        ));
+        assert!(matches!(
+            &result.input[1],
+            ResponseItem::Message { role, content, .. }
+                if role == "user"
+                    && matches!(
+                        &content[0],
+                        ContentItem::InputImage { image_url: Some(url), .. }
+                            if url == "https://example.com/result.png"
+                    )
+        ));
+    }
+
+    #[test]
     fn converts_tools_to_function_specs() {
         let request = AnthropicRequest {
             model: "claude-3-5-sonnet-20241022".to_string(),
@@ -717,6 +844,118 @@ mod tests {
             result.reasoning.as_ref().unwrap().effort.as_deref(),
             Some("medium")
         );
+        assert_eq!(
+            result.extra_body.get("reasoning"),
+            Some(&json!({
+                "effort": "medium",
+                "enabled": true,
+                "max_tokens": 10000,
+            }))
+        );
+        assert_eq!(result.extra_body.get("enable_thinking"), Some(&json!(true)));
+        assert_eq!(
+            result.extra_body.get("chat_template_kwargs"),
+            Some(&json!({
+                "enable_thinking": true,
+                "clear_thinking": false,
+            }))
+        );
+    }
+
+    #[test]
+    fn converts_thinking_history_signature_to_encrypted_content() {
+        let request = AnthropicRequest {
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            max_tokens: Some(1024),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "assistant".to_string(),
+                content: AnthropicContent::Blocks(vec![AnthropicContentBlock::Thinking {
+                    thinking: "private chain".to_string(),
+                    signature: Some("sig_history".to_string()),
+                }]),
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            metadata: None,
+            thinking: None,
+            output_config: None,
+        };
+
+        let result = convert_request(request).expect("convert");
+        assert_eq!(result.input.len(), 1);
+        assert!(matches!(
+            &result.input[0],
+            ResponseItem::Reasoning {
+                content: Some(content),
+                encrypted_content: Some(signature),
+                ..
+            } if signature == "sig_history"
+                && matches!(
+                    &content[0],
+                    ReasoningContentItem::ReasoningText { text } if text == "private chain"
+            )
+        ));
+    }
+
+    #[test]
+    fn preserves_assistant_thinking_before_text_history_order() {
+        let request = AnthropicRequest {
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            max_tokens: Some(1024),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "assistant".to_string(),
+                content: AnthropicContent::Blocks(vec![
+                    AnthropicContentBlock::Thinking {
+                        thinking: "private".to_string(),
+                        signature: Some("sig".to_string()),
+                    },
+                    AnthropicContentBlock::Text {
+                        text: "Answer".to_string(),
+                    },
+                ]),
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            metadata: None,
+            thinking: None,
+            output_config: None,
+        };
+
+        let result = convert_request(request).expect("convert");
+        assert_eq!(result.input.len(), 2);
+        assert!(matches!(
+            &result.input[0],
+            ResponseItem::Reasoning {
+                content: Some(content),
+                encrypted_content: Some(signature),
+                ..
+            } if signature == "sig"
+                && matches!(
+                    &content[0],
+                    ReasoningContentItem::ReasoningText { text } if text == "private"
+                )
+        ));
+        assert!(matches!(
+            &result.input[1],
+            ResponseItem::Message { role, content, .. }
+                if role == "assistant"
+                    && matches!(
+                        &content[0],
+                        ContentItem::OutputText { text } if text == "Answer"
+                    )
+        ));
     }
 
     #[test]
@@ -791,7 +1030,7 @@ mod tests {
     }
 
     #[test]
-    fn carries_top_k_without_stop_sequences() {
+    fn rejects_unsupported_anthropic_fields() {
         let request = AnthropicRequest {
             model: "claude-3-5-sonnet-20241022".to_string(),
             max_tokens: Some(1024),
@@ -811,9 +1050,7 @@ mod tests {
             thinking: None,
             output_config: None,
         };
-        let result = convert_request(request).expect("convert");
-        assert_eq!(result.extra_body.get("top_k"), Some(&json!(5)));
-        assert_eq!(result.stop, None);
+        assert!(convert_request(request).is_err());
     }
 
     #[test]

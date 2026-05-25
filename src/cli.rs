@@ -169,6 +169,8 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         upstream_request_log_path: (!upstream_request_log_path.trim().is_empty())
             .then_some(upstream_request_log_path),
         upstream_chat_kwargs,
+        fallback_upstreams: existing.fallback_upstreams.clone(),
+        upstream_failure_cooldown_secs: existing.upstream_failure_cooldown_secs,
         model_profiles: existing.model_profiles.clone(),
         brave_base_url,
         brave_api_key: (!brave_api_key.trim().is_empty()).then_some(brave_api_key),

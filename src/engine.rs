@@ -18,6 +18,7 @@ use crate::models::responses::FailedPayload;
 use crate::models::responses::FailedResponse;
 use crate::models::responses::OutputItemPayload;
 use crate::models::responses::ReasoningDeltaPayload;
+use crate::models::responses::ReasoningSignatureDeltaPayload;
 use crate::models::responses::ResponseCompletedPayload;
 use crate::models::responses::ResponseCreatedPayload;
 use crate::models::responses::ResponseInputTokensDetails;
@@ -790,15 +791,15 @@ impl Gateway {
             let mut stream = tokio::select! {
                 biased;
                 _ = tx.closed() => return Err(AppError::cancelled()),
-                result = self.upstream.stream_chat_completion(&upstream_request) => result?,
+                result = self.upstream.stream_chat_completion_with_timeout(
+                    &upstream_request,
+                    self.config.request_timeout,
+                ) => result?,
             };
             let mut state = StreamState::default();
             let mut turn_usage: Option<ChunkUsage> = None;
             loop {
-                let Some(chunk) =
-                    Self::next_upstream_chunk(&mut stream, &tx, self.config.request_timeout)
-                        .await?
-                else {
+                let Some(chunk) = Self::next_upstream_chunk(&mut stream, &tx).await? else {
                     break;
                 };
                 if chunk.usage.is_some() {
@@ -875,7 +876,24 @@ impl Gateway {
                             )
                             .await?;
                         }
-                        StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                        StreamEmission::ReasoningSignatureDelta(signature) => {
+                            let target = event_state.active_reasoning_target()?;
+                            self.send_event(
+                                &tx,
+                                reasoning_signature_delta_event(
+                                    target.item_id,
+                                    target.output_index,
+                                    signature,
+                                ),
+                                "failed to stream reasoning signature delta",
+                            )
+                            .await?;
+                        }
+                        StreamEmission::FunctionCallArgumentsDelta {
+                            call_id,
+                            name,
+                            delta,
+                        } => {
                             self.monitor.emit(
                                 response_id.clone(),
                                 MonitorEventKind::FunctionCallArgumentsDelta {
@@ -885,7 +903,7 @@ impl Gateway {
                             );
                             self.send_event(
                                 &tx,
-                                function_call_args_delta_event(call_id, delta),
+                                function_call_args_delta_event(call_id, name, delta),
                                 "failed to stream function call args delta",
                             )
                             .await?;
@@ -1124,15 +1142,13 @@ impl Gateway {
     async fn next_upstream_chunk(
         stream: &mut crate::upstream::UpstreamStream,
         tx: &mpsc::Sender<SseEvent>,
-        request_timeout: std::time::Duration,
     ) -> AppResult<Option<ChatCompletionChunk>> {
         tokio::select! {
             biased;
             _ = tx.closed() => Err(AppError::cancelled()),
-            result = timeout(request_timeout, stream.next()) => match result {
-                Ok(Some(chunk)) => chunk.map(Some),
-                Ok(None) => Ok(None),
-                Err(_) => Err(AppError::upstream("upstream stream timed out".to_string())),
+            result = stream.next() => match result {
+                Some(chunk) => chunk.map(Some),
+                None => Ok(None),
             },
         }
     }
@@ -1494,6 +1510,7 @@ impl Gateway {
             tool_call_id: tool_call.internal_call.id.clone(),
             name: None,
             reasoning_content: None,
+            thinking: None,
             tool_calls: None,
         });
         Ok(())
@@ -2376,6 +2393,25 @@ fn reasoning_text_delta_event(item_id: String, output_index: usize, delta: Strin
     )
 }
 
+fn reasoning_signature_delta_event(
+    item_id: String,
+    output_index: usize,
+    signature: String,
+) -> SseEvent {
+    json_event(
+        "response.reasoning_summary_text.signature_delta",
+        ResponsesEnvelope {
+            kind: "response.reasoning_summary_text.signature_delta".to_string(),
+            payload: ReasoningSignatureDeltaPayload {
+                item_id,
+                output_index,
+                summary_index: 0,
+                signature,
+            },
+        },
+    )
+}
+
 fn failure_event(error: &AppError) -> SseEvent {
     json_event(
         "response.failed",
@@ -2422,12 +2458,20 @@ fn output_text_done_event(item_id: String, output_index: usize, text: String) ->
     )
 }
 
-fn function_call_args_delta_event(call_id: String, delta: String) -> SseEvent {
+fn function_call_args_delta_event(
+    call_id: String,
+    name: Option<String>,
+    delta: String,
+) -> SseEvent {
     json_event(
         "response.function_call_arguments.delta",
         ResponsesEnvelope {
             kind: "response.function_call_arguments.delta".to_string(),
-            payload: crate::models::responses::FunctionCallArgsDeltaPayload { call_id, delta },
+            payload: crate::models::responses::FunctionCallArgsDeltaPayload {
+                call_id,
+                name,
+                delta,
+            },
         },
     )
 }

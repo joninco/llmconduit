@@ -79,6 +79,8 @@ pub enum AnthropicContentBlock {
     },
     Thinking {
         thinking: String,
+        #[serde(default)]
+        signature: Option<String>,
     },
     ToolResult {
         tool_use_id: String,
@@ -332,6 +334,8 @@ pub enum AnthropicResponseContentBlock {
     },
     Thinking {
         thinking: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     ToolUse {
         id: String,

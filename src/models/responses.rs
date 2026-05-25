@@ -557,6 +557,14 @@ pub struct ReasoningDeltaPayload {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ReasoningSignatureDeltaPayload {
+    pub item_id: String,
+    pub output_index: usize,
+    pub summary_index: usize,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct FailedPayload {
     pub response: FailedResponse,
 }
@@ -583,6 +591,8 @@ pub struct TextDonePayload {
 #[derive(Debug, Clone, Serialize)]
 pub struct FunctionCallArgsDeltaPayload {
     pub call_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub delta: String,
 }
 

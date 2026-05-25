@@ -964,6 +964,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             }],
             stream: true,

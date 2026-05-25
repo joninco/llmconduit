@@ -11,6 +11,7 @@ use http::HeaderMap;
 use http::HeaderName;
 use reqwest::RequestBuilder;
 use reqwest::StatusCode;
+use serde_json::Map as JsonMap;
 use serde_json::Value;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -18,6 +19,8 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 use url::Url;
 
 pub type UpstreamStream =
@@ -29,6 +32,14 @@ pub trait UpstreamClient: Send + Sync {
         &self,
         request: &ChatCompletionRequest,
     ) -> AppResult<UpstreamStream>;
+    async fn stream_chat_completion_with_timeout(
+        &self,
+        request: &ChatCompletionRequest,
+        request_timeout: Duration,
+    ) -> AppResult<UpstreamStream> {
+        let stream = self.stream_chat_completion(request).await?;
+        Ok(timeout_upstream_stream(stream, request_timeout))
+    }
     async fn list_models(&self) -> AppResult<reqwest::Response>;
     async fn proxy_completions(
         &self,
@@ -49,6 +60,43 @@ pub struct ReqwestUpstreamClient {
     api_key: Option<String>,
     request_logger: Option<UpstreamRequestLogger>,
     flatten_content: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailoverUpstreamProvider {
+    name: String,
+    client: ReqwestUpstreamClient,
+    upstream_model: Option<String>,
+    upstream_chat_kwargs: JsonMap<String, Value>,
+}
+
+impl FailoverUpstreamProvider {
+    pub fn new(
+        name: impl Into<String>,
+        client: ReqwestUpstreamClient,
+        upstream_model: Option<String>,
+        upstream_chat_kwargs: JsonMap<String, Value>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            client,
+            upstream_model,
+            upstream_chat_kwargs,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct FailoverUpstreamClient {
+    providers: Vec<FailoverUpstreamProvider>,
+    cooldown: Duration,
+    states: Arc<Mutex<Vec<ProviderCooldownState>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderCooldownState {
+    cooling_until: Option<Instant>,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +226,387 @@ impl UpstreamClient for ReqwestUpstreamClient {
     }
 }
 
+impl FailoverUpstreamClient {
+    pub fn new(providers: Vec<FailoverUpstreamProvider>, cooldown: Duration) -> Self {
+        let states = vec![ProviderCooldownState::default(); providers.len()];
+        Self {
+            providers,
+            cooldown,
+            states: Arc::new(Mutex::new(states)),
+        }
+    }
+
+    fn available_provider_indices(&self) -> Vec<usize> {
+        let now = Instant::now();
+        let states = self
+            .states
+            .lock()
+            .expect("upstream provider cooldown state lock poisoned");
+        self.providers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                let cooling = states
+                    .get(index)
+                    .and_then(|state| state.cooling_until)
+                    .is_some_and(|until| until > now);
+                (!cooling).then_some(index)
+            })
+            .collect()
+    }
+
+    fn cooldown_error(&self) -> AppError {
+        let now = Instant::now();
+        let states = self
+            .states
+            .lock()
+            .expect("upstream provider cooldown state lock poisoned");
+        let next_retry_secs = states
+            .iter()
+            .filter_map(|state| state.cooling_until)
+            .filter(|until| *until > now)
+            .map(|until| until.duration_since(now).as_secs().max(1))
+            .min()
+            .unwrap_or(0);
+        let last_error = states
+            .iter()
+            .rev()
+            .find_map(|state| state.last_error.as_deref())
+            .unwrap_or("no provider is currently available");
+        AppError::upstream(format!(
+            "all upstream providers are in cooldown; next retry in {next_retry_secs}s; last error: {last_error}"
+        ))
+    }
+
+    fn request_for_provider(
+        provider: &FailoverUpstreamProvider,
+        request: &ChatCompletionRequest,
+    ) -> ChatCompletionRequest {
+        let mut request = request.clone();
+        if let Some(model) = &provider.upstream_model {
+            request.model = model.clone();
+        }
+        merge_fallback_chat_kwargs(&mut request, &provider.upstream_chat_kwargs);
+        request
+    }
+
+    async fn prefetch_first_chunk(
+        mut stream: UpstreamStream,
+        request_timeout: Duration,
+    ) -> AppResult<(ChatCompletionChunk, UpstreamStream)> {
+        match tokio::time::timeout(request_timeout, stream.next()).await {
+            Ok(Some(Ok(chunk))) => Ok((chunk, stream)),
+            Ok(Some(Err(err))) => Err(err),
+            Ok(None) => Err(AppError::upstream(
+                "upstream stream ended before the first chunk",
+            )),
+            Err(_) => Err(AppError::upstream("upstream stream timed out".to_string())),
+        }
+    }
+
+    fn stream_after_prefetch(
+        &self,
+        provider_index: usize,
+        first_chunk: ChatCompletionChunk,
+        mut stream: UpstreamStream,
+        request_timeout: Duration,
+    ) -> UpstreamStream {
+        let states = Arc::clone(&self.states);
+        let cooldown = self.cooldown;
+        let provider_name = self.providers[provider_index].name.clone();
+        Box::pin(async_stream::stream! {
+            yield Ok(first_chunk);
+            loop {
+                match tokio::time::timeout(request_timeout, stream.next()).await {
+                    Ok(Some(Ok(chunk))) => yield Ok(chunk),
+                    Ok(Some(Err(err))) => {
+                        Self::mark_provider_failure(
+                            &states,
+                            provider_index,
+                            &provider_name,
+                            cooldown,
+                            err.to_string(),
+                        );
+                        yield Err(err);
+                        break;
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        let err = AppError::upstream("upstream stream timed out".to_string());
+                        Self::mark_provider_failure(
+                            &states,
+                            provider_index,
+                            &provider_name,
+                            cooldown,
+                            err.to_string(),
+                        );
+                        yield Err(err);
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    fn mark_provider_success(&self, provider_index: usize) {
+        let mut states = self
+            .states
+            .lock()
+            .expect("upstream provider cooldown state lock poisoned");
+        if let Some(state) = states.get_mut(provider_index) {
+            state.cooling_until = None;
+            state.last_error = None;
+        }
+    }
+
+    fn mark_provider_failure(
+        states: &Arc<Mutex<Vec<ProviderCooldownState>>>,
+        provider_index: usize,
+        provider_name: &str,
+        cooldown: Duration,
+        error: String,
+    ) {
+        let cooling_until = (cooldown > Duration::ZERO).then(|| Instant::now() + cooldown);
+        let mut states = states
+            .lock()
+            .expect("upstream provider cooldown state lock poisoned");
+        if let Some(state) = states.get_mut(provider_index) {
+            state.cooling_until = cooling_until;
+            state.last_error = Some(error.clone());
+        }
+        if cooldown > Duration::ZERO {
+            tracing::warn!(
+                provider = provider_name,
+                cooldown_secs = cooldown.as_secs(),
+                error = %error,
+                "upstream provider failed; entering cooldown"
+            );
+        } else {
+            tracing::warn!(
+                provider = provider_name,
+                error = %error,
+                "upstream provider failed"
+            );
+        }
+    }
+
+    fn mark_failure(&self, provider_index: usize, error: &AppError) {
+        Self::mark_provider_failure(
+            &self.states,
+            provider_index,
+            &self.providers[provider_index].name,
+            self.cooldown,
+            error.to_string(),
+        );
+    }
+}
+
+#[async_trait]
+impl UpstreamClient for FailoverUpstreamClient {
+    async fn stream_chat_completion(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> AppResult<UpstreamStream> {
+        self.stream_chat_completion_with_timeout(request, Duration::from_secs(60))
+            .await
+    }
+
+    async fn stream_chat_completion_with_timeout(
+        &self,
+        request: &ChatCompletionRequest,
+        request_timeout: Duration,
+    ) -> AppResult<UpstreamStream> {
+        let mut last_error = None;
+        let provider_indices = self.available_provider_indices();
+        if provider_indices.is_empty() {
+            return Err(self.cooldown_error());
+        }
+        for provider_index in provider_indices {
+            let provider = &self.providers[provider_index];
+            let provider_request = Self::request_for_provider(provider, request);
+            let stream = match provider
+                .client
+                .stream_chat_completion(&provider_request)
+                .await
+            {
+                Ok(stream) => stream,
+                Err(err) => {
+                    self.mark_failure(provider_index, &err);
+                    last_error = Some(err);
+                    continue;
+                }
+            };
+            match Self::prefetch_first_chunk(stream, request_timeout).await {
+                Ok((first_chunk, stream)) => {
+                    self.mark_provider_success(provider_index);
+                    if provider_index > 0 {
+                        tracing::info!(
+                            provider = %provider.name,
+                            "using fallback upstream provider"
+                        );
+                    }
+                    return Ok(self.stream_after_prefetch(
+                        provider_index,
+                        first_chunk,
+                        stream,
+                        request_timeout,
+                    ));
+                }
+                Err(err) => {
+                    self.mark_failure(provider_index, &err);
+                    last_error = Some(err);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            AppError::upstream("all upstream providers failed before producing a response")
+        }))
+    }
+
+    async fn list_models(&self) -> AppResult<reqwest::Response> {
+        let mut last_error = None;
+        let provider_indices = self.available_provider_indices();
+        if provider_indices.is_empty() {
+            return Err(self.cooldown_error());
+        }
+        for provider_index in provider_indices {
+            let provider = &self.providers[provider_index];
+            match provider.client.list_models().await {
+                Ok(response) => {
+                    if let Some(model) = &provider.upstream_model {
+                        return filter_models_response(response, model).await;
+                    }
+                    return Ok(response);
+                }
+                Err(err) => last_error = Some(err),
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| AppError::upstream("all upstream providers failed to list models")))
+    }
+
+    async fn proxy_completions(
+        &self,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> AppResult<reqwest::Response> {
+        let mut last_error = None;
+        let provider_indices = self.available_provider_indices();
+        if provider_indices.is_empty() {
+            return Err(self.cooldown_error());
+        }
+        for provider_index in provider_indices {
+            match self.providers[provider_index]
+                .client
+                .proxy_completions(headers.clone(), body.clone())
+                .await
+            {
+                Ok(response) => {
+                    let status = response.status();
+                    if !should_failover_proxy_status(status) {
+                        return Ok(response);
+                    }
+                    let body = response.text().await.unwrap_or_default();
+                    let err = AppError::upstream(format!(
+                        "upstream completions failed with {status}: {body}"
+                    ));
+                    self.mark_failure(provider_index, &err);
+                    last_error = Some(err);
+                }
+                Err(err) => {
+                    self.mark_failure(provider_index, &err);
+                    last_error = Some(err);
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            AppError::upstream("all upstream providers failed to proxy completions")
+        }))
+    }
+
+    async fn supported_model_ids(&self) -> AppResult<Vec<String>> {
+        let response = self.list_models().await?;
+        collect_supported_model_ids(response).await
+    }
+}
+
+fn timeout_upstream_stream(
+    mut stream: UpstreamStream,
+    request_timeout: Duration,
+) -> UpstreamStream {
+    Box::pin(async_stream::stream! {
+        loop {
+            match tokio::time::timeout(request_timeout, stream.next()).await {
+                Ok(Some(chunk)) => yield chunk,
+                Ok(None) => break,
+                Err(_) => {
+                    yield Err(AppError::upstream("upstream stream timed out".to_string()));
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn should_failover_proxy_status(status: StatusCode) -> bool {
+    status.is_server_error()
+        || status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+}
+
+fn merge_fallback_chat_kwargs(
+    request: &mut ChatCompletionRequest,
+    defaults: &JsonMap<String, Value>,
+) {
+    for (key, value) in defaults {
+        if chat_request_field_is_set(request, key) {
+            continue;
+        }
+        match request.extra_body.get_mut(key) {
+            Some(existing) => merge_json_value_preserve_destination(existing, value),
+            None => {
+                request.extra_body.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn chat_request_field_is_set(request: &ChatCompletionRequest, key: &str) -> bool {
+    match key {
+        "model" | "messages" | "stream" | "parallel_tool_calls" => true,
+        "tools" => request.tools.is_some(),
+        "tool_choice" => request.tool_choice.is_some(),
+        "reasoning_effort" => request.reasoning_effort.is_some(),
+        "response_format" => request.response_format.is_some(),
+        "stream_options" => request.stream_options.is_some(),
+        "temperature" => request.temperature.is_some(),
+        "top_p" => request.top_p.is_some(),
+        "max_tokens" | "max_output_tokens" | "max_completion_tokens" => {
+            request.max_output_tokens.is_some()
+        }
+        "frequency_penalty" => request.frequency_penalty.is_some(),
+        "presence_penalty" => request.presence_penalty.is_some(),
+        _ => false,
+    }
+}
+
+fn merge_json_value_preserve_destination(destination: &mut Value, source: &Value) {
+    if let Value::Object(destination_object) = destination
+        && let Value::Object(source_object) = source
+    {
+        for (key, source_value) in source_object {
+            match destination_object.get_mut(key) {
+                Some(destination_value) => {
+                    merge_json_value_preserve_destination(destination_value, source_value);
+                }
+                None => {
+                    destination_object.insert(key.clone(), source_value.clone());
+                }
+            }
+        }
+    }
+}
+
 fn copy_proxy_request_headers(mut request: RequestBuilder, headers: &HeaderMap) -> RequestBuilder {
     for (name, value) in headers {
         if should_proxy_request_header(name) {
@@ -303,6 +732,83 @@ pub async fn collect_models_response(
 pub async fn collect_supported_model_ids(response: reqwest::Response) -> AppResult<Vec<String>> {
     let (_, body, _) = collect_models_response(response).await?;
     Ok(extract_supported_model_ids(&body))
+}
+
+async fn filter_models_response(
+    response: reqwest::Response,
+    model: &str,
+) -> AppResult<reqwest::Response> {
+    let status = response.status();
+    let body = response
+        .json::<Value>()
+        .await
+        .map_err(|err| AppError::upstream(format!("invalid upstream /models JSON: {err}")))?;
+    let body = filter_models_body(body, model);
+    let body = serde_json::to_string(&body).map_err(|err| {
+        AppError::internal(format!("failed to serialize /models response: {err}"))
+    })?;
+    let response = http::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .map_err(|err| AppError::internal(format!("failed to build /models response: {err}")))?;
+    Ok(reqwest::Response::from(response))
+}
+
+fn filter_models_body(body: Value, model: &str) -> Value {
+    match body {
+        Value::Object(mut map) => {
+            if let Some(entries) = map.get("data").and_then(Value::as_array) {
+                map.insert(
+                    "data".to_string(),
+                    Value::Array(filter_model_entries(entries, model)),
+                );
+                Value::Object(map)
+            } else if let Some(entries) = map.get("models").and_then(Value::as_array) {
+                map.insert(
+                    "models".to_string(),
+                    Value::Array(filter_model_entries(entries, model)),
+                );
+                Value::Object(map)
+            } else {
+                single_model_list_body(model)
+            }
+        }
+        Value::Array(entries) => Value::Array(filter_model_entries(&entries, model)),
+        _ => single_model_list_body(model),
+    }
+}
+
+fn filter_model_entries(entries: &[Value], model: &str) -> Vec<Value> {
+    match entries
+        .iter()
+        .find(|entry| model_entry_id(entry).is_some_and(|id| id == model))
+    {
+        Some(entry) => vec![entry.clone()],
+        None => vec![single_model_entry(model)],
+    }
+}
+
+fn model_entry_id(entry: &Value) -> Option<&str> {
+    match entry {
+        Value::String(id) => Some(id.as_str()),
+        Value::Object(map) => map.get("id").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn single_model_list_body(model: &str) -> Value {
+    serde_json::json!({
+        "object": "list",
+        "data": [single_model_entry(model)]
+    })
+}
+
+fn single_model_entry(model: &str) -> Value {
+    serde_json::json!({
+        "id": model,
+        "object": "model",
+    })
 }
 
 fn extract_supported_model_ids(body: &Value) -> Vec<String> {
@@ -537,6 +1043,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             }],
             stream: true,
@@ -571,6 +1078,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             }],
             stream: true,
@@ -603,6 +1111,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             }],
             stream: true,
@@ -644,6 +1153,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: None,
             }],
             stream: true,
@@ -679,6 +1189,7 @@ mod tests {
                 tool_call_id: None,
                 name: None,
                 reasoning_content: None,
+                thinking: None,
                 tool_calls: Some(vec![crate::models::chat::ChatToolCall {
                     id: Some("call_1".to_string()),
                     index: Some(0),
@@ -773,6 +1284,7 @@ mod tests {
                     tool_call_id: None,
                     name: None,
                     reasoning_content: None,
+                    thinking: None,
                     tool_calls: None,
                 }],
                 stream: true,

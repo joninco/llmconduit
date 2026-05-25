@@ -21,6 +21,8 @@ use crate::monitor::MonitorHub;
 use crate::raw::RawOutput;
 use crate::replay::ReplayStore;
 use crate::search::BraveSearchClient;
+use crate::upstream::FailoverUpstreamClient;
+use crate::upstream::FailoverUpstreamProvider;
 use crate::upstream::ReqwestUpstreamClient;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,13 +62,42 @@ pub fn build_app_with_gateway_and_options(
     } else {
         MonitorHub::disabled()
     };
-    let upstream = Arc::new(ReqwestUpstreamClient::new(
+    let primary_upstream = ReqwestUpstreamClient::new(
         http_client.clone(),
         config.upstream_base_url.clone(),
         config.upstream_api_key.clone(),
         config.upstream_request_log_path.clone(),
         config.flatten_content,
-    ));
+    );
+    let upstream: Arc<dyn crate::upstream::UpstreamClient> = if config.fallback_upstreams.is_empty()
+    {
+        Arc::new(primary_upstream)
+    } else {
+        let mut providers = vec![FailoverUpstreamProvider::new(
+            "primary",
+            primary_upstream,
+            None,
+            serde_json::Map::new(),
+        )];
+        providers.extend(config.fallback_upstreams.iter().map(|provider| {
+            FailoverUpstreamProvider::new(
+                provider.name.clone(),
+                ReqwestUpstreamClient::new(
+                    http_client.clone(),
+                    provider.upstream_base_url.clone(),
+                    provider.upstream_api_key.clone(),
+                    provider.upstream_request_log_path.clone(),
+                    config.flatten_content,
+                ),
+                provider.upstream_model.clone(),
+                provider.upstream_chat_kwargs.clone(),
+            )
+        }));
+        Arc::new(FailoverUpstreamClient::new(
+            providers,
+            Duration::from_secs(config.upstream_failure_cooldown_secs),
+        ))
+    };
     let search = Arc::new(BraveSearchClient::new(http_client, config.clone()));
     let gateway = Arc::new(Gateway::new(
         config,

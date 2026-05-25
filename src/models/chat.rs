@@ -111,7 +111,16 @@ pub struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ChatThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ChatToolCall>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatThinking {
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -221,13 +230,15 @@ pub struct ChatDelta {
 }
 
 impl ChatDelta {
-    pub fn reasoning_delta(&self) -> Option<String> {
+    pub fn reasoning_delta(&self) -> Option<&str> {
+        // Treat empty reasoning_content as absent so we fall through to alternate
+        // fields when an upstream emits an empty placeholder alongside the real text.
         if let Some(text) = self
             .reasoning_content
             .as_deref()
             .filter(|text| !text.is_empty())
         {
-            return Some(text.to_string());
+            return Some(text);
         }
         for key in [
             "reasoning",
@@ -241,21 +252,33 @@ impl ChatDelta {
                 continue;
             };
             if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
-                return Some(text.to_string());
+                return Some(text);
             }
             if let Some(object) = value.as_object() {
-                for nested in ["text", "delta", "content", "summary"] {
+                for nested in ["text", "delta", "content", "summary", "thinking"] {
                     if let Some(text) = object
                         .get(nested)
                         .and_then(Value::as_str)
                         .filter(|text| !text.is_empty())
                     {
-                        return Some(text.to_string());
+                        return Some(text);
                     }
                 }
             }
         }
         None
+    }
+
+    pub fn reasoning_signature_delta(&self) -> Option<&str> {
+        self.thinking_object_field("signature")
+            .or_else(|| self.extra.get("signature").and_then(Value::as_str))
+    }
+
+    fn thinking_object_field(&self, field: &str) -> Option<&str> {
+        self.extra
+            .get("thinking")
+            .and_then(|value| value.get(field))
+            .and_then(Value::as_str)
     }
 
     pub fn non_null_delta_keys(&self) -> Vec<String> {
@@ -463,13 +486,36 @@ mod tests {
         .expect("chunk should deserialize");
 
         assert_eq!(
-            chunk.choices[0].delta.reasoning_delta().as_deref(),
+            chunk.choices[0].delta.reasoning_delta(),
             Some("hidden step")
         );
         assert_eq!(
             chunk.choices[0].delta.non_null_delta_keys(),
             vec!["reasoning".to_string()]
         );
+    }
+
+    #[test]
+    fn deserializes_nested_thinking_content_and_signature() {
+        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "thinking": {
+                        "content": "hidden step",
+                        "signature": "sig_123"
+                    }
+                },
+                "finish_reason": null
+            }]
+        }))
+        .expect("chunk should deserialize");
+
+        let delta = &chunk.choices[0].delta;
+        assert_eq!(delta.reasoning_delta(), Some("hidden step"));
+        assert_eq!(delta.reasoning_signature_delta(), Some("sig_123"));
+        assert_eq!(delta.non_null_delta_keys(), vec!["thinking".to_string()]);
     }
 
     #[test]

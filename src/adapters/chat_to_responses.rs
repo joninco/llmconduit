@@ -5,6 +5,7 @@ use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatCompletionChunk;
 use crate::models::chat::ChatMessage;
+use crate::models::chat::ChatThinking;
 use crate::models::chat::ChatToolCall;
 use crate::models::responses::ContentItem;
 use crate::models::responses::LocalShellAction;
@@ -21,12 +22,21 @@ pub enum StreamEmission {
     OutputItemAdded(ResponseItem),
     OutputTextDelta(String),
     ContentPartAdded,
-    ContentPartDone { text: String },
+    ContentPartDone {
+        text: String,
+    },
     ReasoningItemAdded(ResponseItem),
     ReasoningTextDelta(String),
+    ReasoningSignatureDelta(String),
     ReasoningSummaryPartAdded,
-    ReasoningSummaryPartDone { text: String },
-    FunctionCallArgumentsDelta { call_id: String, delta: String },
+    ReasoningSummaryPartDone {
+        text: String,
+    },
+    FunctionCallArgumentsDelta {
+        call_id: String,
+        name: Option<String>,
+        delta: String,
+    },
     RefusalDelta(String),
 }
 
@@ -56,6 +66,7 @@ pub struct StreamState {
     reasoning_id: Option<String>,
     output_text: String,
     reasoning_text: String,
+    reasoning_signature: Option<String>,
     tool_calls: BTreeMap<usize, ToolCallAccumulator>,
     content_part_emitted: bool,
     reasoning_part_emitted: bool,
@@ -107,8 +118,21 @@ impl StreamState {
                     emissions.push(StreamEmission::ReasoningSummaryPartAdded);
                     self.reasoning_part_emitted = true;
                 }
-                self.reasoning_text.push_str(&reasoning_delta);
-                emissions.push(StreamEmission::ReasoningTextDelta(reasoning_delta));
+                self.reasoning_text.push_str(reasoning_delta);
+                emissions.push(StreamEmission::ReasoningTextDelta(
+                    reasoning_delta.to_string(),
+                ));
+            }
+            if let Some(signature) = choice
+                .delta
+                .reasoning_signature_delta()
+                .filter(|signature| !signature.is_empty())
+                && self.reasoning_id.is_some()
+            {
+                self.reasoning_signature = Some(signature.to_string());
+                emissions.push(StreamEmission::ReasoningSignatureDelta(
+                    signature.to_string(),
+                ));
             }
             if let Some(content_delta) = choice
                 .delta
@@ -194,7 +218,11 @@ impl StreamState {
             append_argument_fragment(&mut entry.arguments_text, arguments);
             let delta = entry.arguments_text[before_len..].to_string();
             if !delta.is_empty() {
-                emissions.push(StreamEmission::FunctionCallArgumentsDelta { call_id, delta });
+                emissions.push(StreamEmission::FunctionCallArgumentsDelta {
+                    call_id,
+                    name: entry.name.clone(),
+                    delta,
+                });
             }
         }
     }
@@ -219,7 +247,7 @@ impl StreamState {
                 content: Some(vec![ReasoningContentItem::ReasoningText {
                     text: self.reasoning_text.clone(),
                 }]),
-                encrypted_content: None,
+                encrypted_content: self.reasoning_signature.clone(),
             })
         } else {
             None
@@ -338,6 +366,21 @@ impl StreamState {
                         .map(reasoning_content_text)
                         .unwrap_or_default(),
                     _ => String::new(),
+                }),
+                thinking: reasoning_item.as_ref().and_then(|item| match item {
+                    ResponseItem::Reasoning {
+                        content,
+                        encrypted_content,
+                        ..
+                    } => encrypted_content.as_ref().map(|signature| ChatThinking {
+                        content: content
+                            .as_ref()
+                            .and_then(|items| items.first())
+                            .map(reasoning_content_text)
+                            .unwrap_or_default(),
+                        signature: Some(signature.clone()),
+                    }),
+                    _ => None,
                 }),
                 tool_calls: (!internal_tool_calls.is_empty()).then_some(internal_tool_calls),
             })
@@ -795,7 +838,7 @@ mod tests {
         let deltas: Vec<_> = emissions
             .iter()
             .filter_map(|e| match e {
-                StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                StreamEmission::FunctionCallArgumentsDelta { call_id, delta, .. } => {
                     Some((call_id.clone(), delta.clone()))
                 }
                 _ => None,
@@ -810,7 +853,7 @@ mod tests {
         let deltas2: Vec<_> = emissions2
             .iter()
             .filter_map(|e| match e {
-                StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                StreamEmission::FunctionCallArgumentsDelta { call_id, delta, .. } => {
                     Some((call_id.clone(), delta.clone()))
                 }
                 _ => None,
@@ -833,7 +876,7 @@ mod tests {
         let deltas: Vec<_> = emissions
             .iter()
             .filter_map(|e| match e {
-                StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                StreamEmission::FunctionCallArgumentsDelta { call_id, delta, .. } => {
                     Some((call_id.clone(), delta.clone()))
                 }
                 _ => None,
@@ -870,7 +913,7 @@ mod tests {
         let deltas: Vec<_> = emissions
             .iter()
             .filter_map(|e| match e {
-                StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                StreamEmission::FunctionCallArgumentsDelta { call_id, delta, .. } => {
                     Some((call_id.clone(), delta.clone()))
                 }
                 _ => None,
@@ -888,7 +931,7 @@ mod tests {
         let deltas2: Vec<_> = emissions2
             .iter()
             .filter_map(|e| match e {
-                StreamEmission::FunctionCallArgumentsDelta { call_id, delta } => {
+                StreamEmission::FunctionCallArgumentsDelta { call_id, delta, .. } => {
                     Some((call_id.clone(), delta.clone()))
                 }
                 _ => None,
@@ -996,6 +1039,61 @@ mod tests {
                 .iter()
                 .any(|emission| matches!(emission, StreamEmission::ReasoningTextDelta(delta) if delta == "hidden step"))
         );
+    }
+
+    #[test]
+    fn nested_thinking_object_emits_reasoning_and_signature_delta() {
+        let mut state = StreamState::default();
+        let chunk = ChatCompletionChunk {
+            id: "c1".to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
+                    function_call: None,
+                    refusal: None,
+                    extra: std::collections::BTreeMap::from([(
+                        "thinking".to_string(),
+                        serde_json::json!({
+                            "content": "hidden step",
+                            "signature": "sig_123"
+                        }),
+                    )]),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+
+        let emissions = state.apply_chunk(&chunk);
+
+        assert!(
+            emissions
+                .iter()
+                .any(|emission| matches!(emission, StreamEmission::ReasoningTextDelta(delta) if delta == "hidden step"))
+        );
+        assert!(
+            emissions
+                .iter()
+                .any(|emission| matches!(emission, StreamEmission::ReasoningSignatureDelta(signature) if signature == "sig_123"))
+        );
+        let finalized = state.finalize(&simple_registry(vec![])).unwrap();
+        assert!(matches!(
+            finalized.reasoning_item,
+            Some(ResponseItem::Reasoning {
+                encrypted_content: Some(ref signature),
+                ..
+            }) if signature == "sig_123"
+        ));
+        let internal = finalized
+            .internal_assistant_message
+            .expect("internal assistant message");
+        assert_eq!(internal.reasoning_content.as_deref(), Some("hidden step"));
+        let thinking = internal.thinking.as_ref().expect("signed thinking");
+        assert_eq!(thinking.content, "hidden step");
+        assert_eq!(thinking.signature.as_deref(), Some("sig_123"));
     }
 
     #[test]
