@@ -3925,25 +3925,7 @@ async fn anthropic_messages_streams_nested_thinking_response() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].stream, true);
     assert_eq!(requests[0].reasoning_effort.as_deref(), Some("low"));
-    assert_eq!(
-        requests[0].extra_body.get("reasoning"),
-        Some(&json!({
-            "effort": "low",
-            "enabled": true,
-            "max_tokens": 1024,
-        }))
-    );
-    assert_eq!(
-        requests[0].extra_body.get("enable_thinking"),
-        Some(&json!(true))
-    );
-    assert_eq!(
-        requests[0].extra_body.get("chat_template_kwargs"),
-        Some(&json!({
-            "enable_thinking": true,
-            "clear_thinking": false,
-        }))
-    );
+    assert!(requests[0].extra_body.is_empty());
 }
 
 #[tokio::test]

@@ -156,29 +156,12 @@ fn convert_thinking(
         | AnthropicThinking::Adaptive { budget_tokens } => {
             let budget = budget_tokens.unwrap_or(10_000);
             let effort = thinking_effort_for_budget(budget);
-            let mut extra_body = BTreeMap::new();
-            extra_body.insert(
-                "reasoning".to_string(),
-                json!({
-                    "effort": effort,
-                    "enabled": true,
-                    "max_tokens": budget,
-                }),
-            );
-            extra_body.insert("enable_thinking".to_string(), Value::Bool(true));
-            extra_body.insert(
-                "chat_template_kwargs".to_string(),
-                json!({
-                    "enable_thinking": true,
-                    "clear_thinking": false,
-                }),
-            );
             (
                 Some(ReasoningRequest {
                     effort: Some(effort.to_string()),
                     summary: None,
                 }),
-                extra_body,
+                BTreeMap::new(),
             )
         }
     }
@@ -844,22 +827,7 @@ mod tests {
             result.reasoning.as_ref().unwrap().effort.as_deref(),
             Some("medium")
         );
-        assert_eq!(
-            result.extra_body.get("reasoning"),
-            Some(&json!({
-                "effort": "medium",
-                "enabled": true,
-                "max_tokens": 10000,
-            }))
-        );
-        assert_eq!(result.extra_body.get("enable_thinking"), Some(&json!(true)));
-        assert_eq!(
-            result.extra_body.get("chat_template_kwargs"),
-            Some(&json!({
-                "enable_thinking": true,
-                "clear_thinking": false,
-            }))
-        );
+        assert!(result.extra_body.is_empty());
     }
 
     #[test]
