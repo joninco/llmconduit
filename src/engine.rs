@@ -283,14 +283,27 @@ impl Gateway {
         self: Arc<Self>,
         request: ResponsesRequest,
     ) -> AppResult<ReceiverStream<SseEvent>> {
-        let request = self.apply_system_prompt_prefix(request);
+        let mut request = self.apply_system_prompt_prefix(request);
         let (baseline_record, prefix_len) = self.find_replay_baseline(&request).await?;
         let mut tail_request = request.clone();
         tail_request.input = request.input[prefix_len..].to_vec();
         if self.config.brave_api_key.is_none() {
+            let original_tool_count = tail_request.tools.len();
             tail_request
                 .tools
                 .retain(|t| !matches!(t, crate::models::responses::ToolSpec::WebSearch { .. }));
+            if tail_request.tools.len() != original_tool_count {
+                relax_tool_choice_after_stripping_tool(
+                    &mut tail_request.tool_choice,
+                    "web_search",
+                    tail_request.tools.is_empty(),
+                );
+                relax_tool_choice_after_stripping_tool(
+                    &mut request.tool_choice,
+                    "web_search",
+                    tail_request.tools.is_empty(),
+                );
+            }
         }
         let lowered = lower_request(
             &tail_request,
@@ -1514,6 +1527,30 @@ impl Gateway {
             tool_calls: None,
         });
         Ok(())
+    }
+}
+
+fn relax_tool_choice_after_stripping_tool(
+    tool_choice: &mut Value,
+    stripped_name: &str,
+    no_tools_remaining: bool,
+) {
+    match tool_choice {
+        Value::String(choice) if choice == "required" && no_tools_remaining => {
+            *tool_choice = Value::String("auto".to_string());
+        }
+        Value::Object(map)
+            if map.get("type").and_then(Value::as_str) == Some("function")
+                && map
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+                    == Some(stripped_name) =>
+        {
+            *tool_choice = Value::String("auto".to_string());
+        }
+        _ => {}
     }
 }
 

@@ -1,7 +1,8 @@
 use serde::Deserialize;
 use serde::Serialize;
-use serde_json::json;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
+use serde_json::json;
 
 // ---------------------------------------------------------------------------
 // Default helpers
@@ -9,6 +10,10 @@ use serde_json::Value;
 
 fn default_input_schema() -> Value {
     json!({"type": "object"})
+}
+
+fn default_object() -> Value {
+    json!({})
 }
 
 // ---------------------------------------------------------------------------
@@ -63,8 +68,7 @@ pub enum AnthropicContent {
     Blocks(Vec<AnthropicContentBlock>),
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum AnthropicContentBlock {
     Text {
         text: String,
@@ -79,16 +83,26 @@ pub enum AnthropicContentBlock {
     },
     Thinking {
         thinking: String,
-        #[serde(default)]
         signature: Option<String>,
+    },
+    RedactedThinking {
+        data: String,
     },
     ToolResult {
         tool_use_id: String,
-        #[serde(default)]
         content: Option<AnthropicContent>,
-        #[serde(default)]
         is_error: Option<bool>,
     },
+    ServerToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    WebSearchToolResult {
+        tool_use_id: String,
+        content: Value,
+    },
+    Other(Value),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,6 +189,130 @@ impl<'de> Deserialize<'de> for AnthropicContent {
             )),
         }
     }
+}
+
+impl<'de> Deserialize<'de> for AnthropicContentBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let Some(kind) = value.get("type").and_then(Value::as_str) else {
+            return Ok(Self::Other(value));
+        };
+
+        match kind {
+            "text" => {
+                #[derive(Deserialize)]
+                struct TextBlock {
+                    text: String,
+                }
+
+                parse_block(value).map(|block: TextBlock| Self::Text { text: block.text })
+            }
+            "image" => {
+                #[derive(Deserialize)]
+                struct ImageBlock {
+                    source: AnthropicImageSource,
+                }
+
+                parse_block(value).map(|block: ImageBlock| Self::Image {
+                    source: block.source,
+                })
+            }
+            "tool_use" => {
+                #[derive(Deserialize)]
+                struct ToolUseBlock {
+                    id: String,
+                    name: String,
+                    input: Value,
+                }
+
+                parse_block(value).map(|block: ToolUseBlock| Self::ToolUse {
+                    id: block.id,
+                    name: block.name,
+                    input: block.input,
+                })
+            }
+            "thinking" => {
+                #[derive(Deserialize)]
+                struct ThinkingBlock {
+                    thinking: String,
+                    #[serde(default)]
+                    signature: Option<String>,
+                }
+
+                parse_block(value).map(|block: ThinkingBlock| Self::Thinking {
+                    thinking: block.thinking,
+                    signature: block.signature,
+                })
+            }
+            "redacted_thinking" => {
+                #[derive(Deserialize)]
+                struct RedactedThinkingBlock {
+                    data: String,
+                }
+
+                parse_block(value)
+                    .map(|block: RedactedThinkingBlock| Self::RedactedThinking { data: block.data })
+            }
+            "tool_result" => {
+                #[derive(Deserialize)]
+                struct ToolResultBlock {
+                    tool_use_id: String,
+                    #[serde(default)]
+                    content: Option<AnthropicContent>,
+                    #[serde(default)]
+                    is_error: Option<bool>,
+                }
+
+                parse_block(value).map(|block: ToolResultBlock| Self::ToolResult {
+                    tool_use_id: block.tool_use_id,
+                    content: block.content,
+                    is_error: block.is_error,
+                })
+            }
+            "server_tool_use" => {
+                #[derive(Deserialize)]
+                struct ServerToolUseBlock {
+                    id: String,
+                    name: String,
+                    #[serde(default = "default_object")]
+                    input: Value,
+                }
+
+                parse_block(value).map(|block: ServerToolUseBlock| Self::ServerToolUse {
+                    id: block.id,
+                    name: block.name,
+                    input: block.input,
+                })
+            }
+            "web_search_tool_result" => {
+                #[derive(Deserialize)]
+                struct WebSearchToolResultBlock {
+                    tool_use_id: String,
+                    #[serde(default)]
+                    content: Value,
+                }
+
+                parse_block(value).map(|block: WebSearchToolResultBlock| {
+                    Self::WebSearchToolResult {
+                        tool_use_id: block.tool_use_id,
+                        content: block.content,
+                    }
+                })
+            }
+            _ => Ok(Self::Other(value)),
+        }
+    }
+}
+
+fn parse_block<T, E>(value: Value) -> Result<T, E>
+where
+    T: DeserializeOwned,
+    E: serde::de::Error,
+{
+    serde_json::from_value(value).map_err(E::custom)
 }
 
 // ---------------------------------------------------------------------------

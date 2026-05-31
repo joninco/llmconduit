@@ -31,10 +31,10 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::response::Sse;
+use axum::routing::MethodFilter;
 use axum::routing::get;
 use axum::routing::on;
 use axum::routing::post;
-use axum::routing::MethodFilter;
 use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
@@ -171,7 +171,11 @@ async fn probe_messages() -> Response {
 }
 
 async fn get_health() -> Response {
-    (StatusCode::OK, Json(serde_json::json!({"status": "healthy"}))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "healthy"})),
+    )
+        .into_response()
 }
 
 async fn get_root() -> Response {
@@ -790,10 +794,9 @@ fn stream_chat_completions_response(
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
     );
-    response.headers_mut().insert(
-        header::CONNECTION,
-        HeaderValue::from_static("keep-alive"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
     response
 }
 
@@ -844,10 +847,9 @@ fn stream_anthropic_response(
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
     );
-    response.headers_mut().insert(
-        header::CONNECTION,
-        HeaderValue::from_static("keep-alive"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
     Ok(response)
 }
 
@@ -913,10 +915,9 @@ fn stream_responses_response(stream: ReceiverStream<crate::engine::SseEvent>) ->
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
     );
-    response.headers_mut().insert(
-        header::CONNECTION,
-        HeaderValue::from_static("keep-alive"),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
     response
 }
 
@@ -1115,8 +1116,8 @@ fn anthropic_model_entry(entry: &Value) -> Option<Value> {
                 .and_then(Value::as_str)
                 .or_else(|| map.get("id").and_then(Value::as_str))
                 .unwrap_or(id);
-            let created_at = parse_created_at(map)
-                .unwrap_or_else(|| UNKNOWN_MODEL_CREATED_AT.to_string());
+            let created_at =
+                parse_created_at(map).unwrap_or_else(|| UNKNOWN_MODEL_CREATED_AT.to_string());
 
             let max_input_tokens = map
                 .get("max_input_tokens")
