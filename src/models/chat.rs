@@ -56,9 +56,7 @@ enum StringOrVec {
 }
 
 /// OpenAI's `stop` is `string | array | null`; accept all three into `Vec<String>`.
-pub(crate) fn deserialize_opt_stop<'de, D>(
-    deserializer: D,
-) -> Result<Option<Vec<String>>, D::Error>
+pub(crate) fn deserialize_opt_stop<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -165,8 +163,7 @@ fn deserialize_chat_tool_call_kind<'de, D>(deserializer: D) -> Result<String, D:
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Option::<String>::deserialize(deserializer)?
-        .unwrap_or_else(default_chat_tool_call_kind))
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_else(default_chat_tool_call_kind))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -414,7 +411,11 @@ mod tests {
         assert!(tool_call.id.is_none());
         assert!(tool_call.function.name.is_none());
         assert_eq!(
-            tool_call.function.arguments.as_ref().and_then(Value::as_str),
+            tool_call
+                .function
+                .arguments
+                .as_ref()
+                .and_then(Value::as_str),
             Some("\"} ")
         );
     }
@@ -577,7 +578,10 @@ mod tests {
             ..request
         };
         let value = serde_json::to_value(omitted).expect("serialize");
-        assert!(value.get("stop").is_none(), "stop must be omitted when None");
+        assert!(
+            value.get("stop").is_none(),
+            "stop must be omitted when None"
+        );
     }
 
     #[test]
@@ -596,7 +600,10 @@ mod tests {
             "stop": ["a", "b"]
         }))
         .expect("array stop should deserialize");
-        assert_eq!(from_array.stop, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(
+            from_array.stop,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
 
         let absent: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
             "model": "glm-5.1",
@@ -622,12 +629,8 @@ mod tests {
             None
         );
         assert_eq!(
-            normalize_stop(Some(vec![
-                "x".to_string(),
-                String::new(),
-                "y".to_string()
-            ]))
-            .expect("filtered"),
+            normalize_stop(Some(vec!["x".to_string(), String::new(), "y".to_string()]))
+                .expect("filtered"),
             Some(vec!["x".to_string(), "y".to_string()])
         );
         let four = vec![

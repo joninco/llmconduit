@@ -1166,13 +1166,7 @@ async fn web_search_emits_structured_results_event_for_anthropic_clients() {
         search_context_size: None,
         search_content_types: None,
     }];
-    let events = collect_stream(
-        gateway
-            .stream_responses(request)
-            .await
-            .expect("stream"),
-    )
-    .await;
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
     let ws = events
         .iter()
@@ -1228,16 +1222,14 @@ async fn web_search_continuation_round_relaxes_forced_tool_choice() {
     let forced = json!({"type": "function", "function": {"name": "web_search"}});
     request.tool_choice = forced.clone();
 
-    let _ = collect_stream(
-        gateway
-            .stream_responses(request)
-            .await
-            .expect("stream"),
-    )
-    .await;
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
     let requests = upstream.requests().await;
-    assert_eq!(requests.len(), 2, "expected one search round + one answer round");
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected one search round + one answer round"
+    );
     assert_eq!(
         requests[0].tool_choice,
         Some(forced),
@@ -1683,7 +1675,10 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
     assert_eq!(models[0]["max_tokens"], 8192);
     assert_eq!(models[0]["capabilities"]["thinking"]["supported"], false);
     assert_eq!(models[0]["capabilities"]["image_input"]["supported"], false);
-    assert_eq!(models[0]["capabilities"]["structured_outputs"]["supported"], false);
+    assert_eq!(
+        models[0]["capabilities"]["structured_outputs"]["supported"],
+        false
+    );
 }
 
 #[tokio::test]
@@ -4616,6 +4611,285 @@ async fn anthropic_messages_converts_tool_result_history() {
 }
 
 #[tokio::test]
+async fn anthropic_messages_replays_server_tool_history_blocks() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk(
+            "chat-2",
+            "Because a front moved in.",
+        ))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": false,
+        "messages": [
+            { "role": "user", "content": "What's the weather in Seattle?" },
+            { "role": "assistant", "content": [
+                {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_1",
+                    "name": "web_search",
+                    "input": { "query": "weather seattle" }
+                },
+                {
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_1",
+                    "content": [
+                        {
+                            "type": "web_search_result",
+                            "url": "https://example.com/weather",
+                            "title": "Weather"
+                        }
+                    ]
+                },
+                { "type": "text", "text": "It is raining." }
+            ]},
+            { "role": "user", "content": "Why?" }
+        ],
+        "tools": [
+            { "type": "web_search_20250305", "name": "web_search" }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let messages = &requests[0].messages;
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|message| message.role.as_str())
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["user", "assistant", "tool", "assistant", "user"]
+    );
+    let tool_call = &messages[1].tool_calls.as_ref().expect("tool call")[0];
+    assert_eq!(tool_call.id.as_deref(), Some("srvtoolu_1"));
+    assert_eq!(tool_call.function.name.as_deref(), Some("web_search"));
+    assert_eq!(
+        tool_call.function.arguments.as_ref(),
+        Some(&json!({ "query": "weather seattle" }))
+    );
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("srvtoolu_1"));
+    assert!(
+        messages[2]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str())
+            .is_some_and(|content| content.contains("https://example.com/weather"))
+    );
+    assert_eq!(
+        messages[3]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("It is raining.")
+    );
+}
+
+#[tokio::test]
+async fn anthropic_messages_relaxes_forced_web_search_when_brave_is_disabled() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "No search available."))])
+        .await;
+    let mut config = test_config();
+    config.brave_api_key = None;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": false,
+        "messages": [
+            { "role": "user", "content": "Search for the weather." }
+        ],
+        "tools": [
+            { "type": "web_search_20250305", "name": "web_search" }
+        ],
+        "tool_choice": { "type": "tool", "name": "web_search" }
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].tools, None);
+    assert_eq!(requests[0].tool_choice, Some(json!("auto")));
+}
+
+#[tokio::test]
+async fn anthropic_messages_lifts_claude_code_skill_listing_before_user_prompt() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello."))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let skill_listing = concat!(
+        "- deep-research: Deep research harness. Use when the user wants research.\n",
+        "- update-config: Configure settings. Use when the user asks to update config.\n",
+        "- security-review: Complete a security review. Invoke with the request."
+    );
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": false,
+        "messages": [
+            { "role": "user", "content": "hello" },
+            { "role": "user", "content": skill_listing }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let messages = &requests[0].messages;
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|message| message.role.as_str())
+        .collect();
+    assert_eq!(roles, vec!["system", "user"]);
+    let system = messages[0]
+        .content
+        .as_ref()
+        .and_then(|value| value.as_str())
+        .expect("system content");
+    assert!(system.contains("skill listing"));
+    assert!(system.contains("security-review"));
+    assert!(system.contains("Do not quote"));
+    assert_eq!(
+        messages[1]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("hello")
+    );
+}
+
+#[tokio::test]
+async fn anthropic_messages_lifts_late_system_skill_listing_before_user_prompt() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello."))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let skill_listing = concat!(
+        "The following skills are available for use with the Skill tool:\n\n",
+        "- deep-research: Deep research harness. Use when the user wants research.\n",
+        "- update-config: Configure settings. Use when the user asks to update config.\n",
+        "- security-review: Complete a security review. Invoke with the request."
+    );
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "system": "You are Claude Code.",
+        "stream": false,
+        "messages": [
+            { "role": "user", "content": "hello" },
+            { "role": "system", "content": skill_listing }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let messages = &requests[0].messages;
+    let roles: Vec<&str> = messages
+        .iter()
+        .map(|message| message.role.as_str())
+        .collect();
+    assert_eq!(roles, vec!["system", "user"]);
+    let system = messages[0]
+        .content
+        .as_ref()
+        .and_then(|value| value.as_str())
+        .expect("system content");
+    assert!(system.contains("You are Claude Code."));
+    assert!(system.contains("skill listing"));
+    assert!(system.contains("security-review"));
+    assert!(system.contains("Do not quote"));
+    assert_eq!(
+        messages[1]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str()),
+        Some("hello")
+    );
+}
+
+#[tokio::test]
 async fn cancels_mid_stream_when_client_disconnects() {
     let upstream = PendingChunkUpstream::new();
     let stream_polled = upstream.stream_polled.notified();
@@ -4693,7 +4967,10 @@ async fn head_and_options_probes_return_204_with_allow_header() {
             204,
             "{method} {path} should return 204"
         );
-        let allow_header = response.headers().get("allow").and_then(|v| v.to_str().ok());
+        let allow_header = response
+            .headers()
+            .get("allow")
+            .and_then(|v| v.to_str().ok());
         assert_eq!(
             allow_header,
             Some(expected_allow),
@@ -4748,8 +5025,6 @@ async fn root_endpoint_returns_ok() {
     assert_eq!(body["status"], "ok");
 }
 
-
-
 #[tokio::test]
 async fn sse_responses_include_connection_keep_alive() {
     let upstream = MockUpstream::default();
@@ -4792,15 +5067,16 @@ async fn sse_responses_include_connection_keep_alive() {
                 .method("POST")
                 .uri("/v1/responses")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&request).expect("serialize"),
-                ))
+                .body(Body::from(serde_json::to_vec(&request).expect("serialize")))
                 .expect("request"),
         )
         .await
         .expect("response");
 
     assert_eq!(response.status().as_u16(), 200);
-    let connection = response.headers().get("connection").and_then(|v| v.to_str().ok());
+    let connection = response
+        .headers()
+        .get("connection")
+        .and_then(|v| v.to_str().ok());
     assert_eq!(connection, Some("keep-alive"));
 }

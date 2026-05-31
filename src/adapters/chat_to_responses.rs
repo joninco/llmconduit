@@ -1158,10 +1158,7 @@ mod tests {
     #[test]
     fn extract_json_arguments_handles_clean_and_padded_input() {
         assert_eq!(extract_json_arguments("{\"a\":1}"), "{\"a\":1}");
-        assert_eq!(
-            extract_json_arguments("  {\"a\":1}  ").trim(),
-            "{\"a\":1}"
-        );
+        assert_eq!(extract_json_arguments("  {\"a\":1}  ").trim(), "{\"a\":1}");
         // Trailing sentinel after the object is ignored too.
         assert_eq!(
             extract_json_arguments("{\"a\":1} <|tool_calls_section_end|>"),
