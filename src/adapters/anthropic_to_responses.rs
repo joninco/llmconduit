@@ -446,7 +446,7 @@ fn split_private_context_tag(text: &str, tag: &str, label: &str) -> Vec<UserText
         push_prompt_segment(&mut segments, before);
         let after_open = &rest[open_start + open.len()..];
         let Some(close_start) = after_open.find(&close) else {
-            push_prompt_segment(&mut segments, rest);
+            push_prompt_segment(&mut segments, &rest[open_start..]);
             return segments;
         };
         let inner = after_open[..close_start].trim();
