@@ -33,33 +33,96 @@ upstream_base_url: "http://127.0.0.1:8000/v1"
 upstream_model: "Qwen3.5"
 ```
 
-Optional fallback upstreams:
+Multi-upstream model routing:
 
 ```yaml
-upstream_failure_cooldown_secs: 30
-fallback_upstreams:
-  - name: "backup"
+upstreams:
+  - name: "local"
+    upstream_base_url: "http://127.0.0.1:8000/v1"
+  - name: "openrouter"
     upstream_base_url: "https://openrouter.ai/api/v1"
     upstream_api_key: "..."
-    upstream_model: "openai/gpt-4.1-mini"
-    upstream_chat_kwargs:
-      provider:
-        order:
-          - z-ai
-        allow_fallbacks: true
 ```
 
-When configured, llmconduit tries the primary upstream first. If a provider
-fails before producing the first chat chunk, it is skipped for
-`upstream_failure_cooldown_secs` and the next configured provider is tried.
-Failures after streaming has started still fail the active request, but mark
-that provider unhealthy for subsequent requests. A fallback `upstream_model` is
-optional. When set, llmconduit sends chat requests to that provider with the
-configured model and filters that provider's `/v1/models` response down to only
-that model. When unset, request models and model lists pass through unchanged.
-Fallback `upstream_chat_kwargs` are provider-specific freeform chat completion
-defaults. They are merged into requests only when that fallback is selected,
+When `upstreams` is configured, llmconduit exposes the ordered union of the
+primary upstream model catalogs. If a request omits `model`, passes a blank
+model, or requests a model that is not currently available, llmconduit uses the
+first model from the first upstream with a catalog entry. Requested model names
+are normalized against the catalogs, so aliases such as different case or
+punctuation route to the exact model id exposed by the backend. If multiple
+upstreams expose the same model id, the first upstream wins.
+
+Optional nested fallback providers:
+
+```yaml
+upstreams:
+  - name: "local"
+    upstream_base_url: "http://127.0.0.1:8000/v1"
+    fallback_upstreams:
+      - name: "backup"
+        upstream_base_url: "https://openrouter.ai/api/v1"
+        upstream_api_key: "..."
+        upstream_model: "openai/gpt-4.1-mini"
+        exposed_model: "GPT-4.1-mini"
+        upstream_chat_kwargs:
+          provider:
+            order:
+              - z-ai
+            allow_fallbacks: true
+```
+
+If a selected upstream fails before producing the first chat chunk, only that
+upstream's nested `fallback_upstreams` are tried. llmconduit does not treat the
+next model-routing upstream as a failure fallback. Fallback models are not shown
+in `/v1/models` unless `exposed_model` is set. A fallback `upstream_model` is
+optional; when set, fallback requests use that model, otherwise they keep the
+routed primary model id. `exposed_model` advertises a fallback model under a
+client-facing alias and routes requests for that alias to the declaring fallback
+provider.
+Fallback `upstream_chat_kwargs` are merged only when that fallback is selected,
 with per-model kwargs and explicit request values taking precedence.
+
+The legacy top-level `upstream_*` and `fallback_upstreams` settings still work
+when `upstreams` is not configured.
+
+Global and per-model request defaults:
+
+```yaml
+system_prompt_prefix: |
+  Shared instructions prepended to every request.
+
+upstream_chat_kwargs:
+  stream_reasoning: true
+
+model_profile_templates:
+  thinking:
+    separate_reasoning: true
+    chat_template_kwargs:
+      enable_thinking: true
+
+model_profiles:
+  GLM-5.1:
+    extends:
+      - thinking
+    chat_template_kwargs:
+      clear_thinking: false
+
+  Kimi-K2.6:
+    extends:
+      - thinking
+    system_prompt_prefix: |
+      Extra Kimi-specific instructions.
+    chat_template_kwargs:
+      preserve_thinking: true
+```
+
+`system_prompt_prefix` is prepended to all Responses, Chat Completions, and
+Anthropic Messages requests. A profile-specific prefix is appended after the
+global prefix. `upstream_chat_kwargs` merge in this order: top-level defaults,
+matched model profile templates, matched model profile, then explicit request
+values. In model profiles and templates, extra profile-level keys are shorthand
+for upstream chat kwargs; the explicit `upstream_chat_kwargs` wrapper still
+works and overrides the shorthand when both set the same key.
 
 Optional Brave Search:
 
@@ -130,6 +193,7 @@ LLMCONDUIT_BIND_ADDR
 LLMCONDUIT_UPSTREAM_BASE_URL
 LLMCONDUIT_UPSTREAM_API_KEY
 LLMCONDUIT_UPSTREAM_MODEL
+LLMCONDUIT_SYSTEM_PROMPT_PREFIX
 LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON
 LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS
 LLMCONDUIT_BRAVE_MAX_RESULTS

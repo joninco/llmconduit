@@ -29,6 +29,7 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponsesRequest {
+    #[serde(default, deserialize_with = "crate::models::chat::deserialize_model")]
     pub model: String,
     #[serde(default)]
     pub instructions: String,

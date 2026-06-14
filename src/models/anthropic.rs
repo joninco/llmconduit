@@ -22,6 +22,7 @@ fn default_object() -> Value {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AnthropicRequest {
+    #[serde(default, deserialize_with = "crate::models::chat::deserialize_model")]
     pub model: String,
     #[serde(default)]
     pub max_tokens: Option<u64>,

@@ -39,6 +39,7 @@ use crate::replay::ReplayStore;
 use crate::search::SearchClient;
 use crate::search::SearchOutcome;
 use crate::upstream::UpstreamClient;
+use crate::upstream::canonical_model_key;
 use crate::upstream::sanitize_chat_request;
 use futures::StreamExt;
 use serde::Serialize;
@@ -98,31 +99,23 @@ impl UpstreamModelCatalog {
 
     fn normalize(&self, model: &str) -> Option<String> {
         let trimmed = model.trim();
-        if trimmed.is_empty() {
-            return None;
+        if !trimmed.is_empty() {
+            if let Some(exact) = self.ids.iter().find(|id| id.as_str() == trimmed) {
+                return Some(exact.clone());
+            }
+            let key = canonical_model_key(trimmed);
+            if let Some(matches) = self.ids_by_key.get(&key) {
+                let unique_ids = matches
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<std::collections::HashSet<_>>();
+                if unique_ids.len() == 1 {
+                    return matches.first().cloned();
+                }
+            }
         }
-        if self.ids.len() == 1 {
-            return self.ids.first().cloned();
-        }
-        if let Some(exact) = self.ids.iter().find(|id| id.as_str() == trimmed) {
-            return Some(exact.clone());
-        }
-        let key = canonical_model_key(trimmed);
-        let matches = self.ids_by_key.get(&key)?;
-        if matches.len() == 1 {
-            return matches.first().cloned();
-        }
-        None
+        self.ids.first().cloned()
     }
-}
-
-fn canonical_model_key(model: &str) -> String {
-    model
-        .trim()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect()
 }
 
 fn build_upstream_extra_body(
@@ -251,6 +244,11 @@ impl Gateway {
         Arc::clone(&self.upstream)
     }
 
+    pub async fn resolve_request_model(&self, request_model: &str) -> String {
+        let configured_model = self.config.resolve_upstream_model(request_model);
+        self.normalize_upstream_model(&configured_model).await
+    }
+
     pub fn subscribe_monitor(
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::monitor::DebugUpdate> {
@@ -283,7 +281,8 @@ impl Gateway {
         self: Arc<Self>,
         request: ResponsesRequest,
     ) -> AppResult<ReceiverStream<SseEvent>> {
-        let mut request = self.apply_system_prompt_prefix(request);
+        let resolved_model = self.resolve_request_model(&request.model).await;
+        let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
         let (baseline_record, prefix_len) = self.find_replay_baseline(&request).await?;
         let mut tail_request = request.clone();
         tail_request.input = request.input[prefix_len..].to_vec();
@@ -326,6 +325,7 @@ impl Gateway {
                     lowered.tool_registry,
                     lowered.response_format,
                     lowered.reasoning_effort,
+                    resolved_model,
                     tx.clone(),
                 )
                 .await;
@@ -353,8 +353,15 @@ impl Gateway {
         Ok(ReceiverStream::new(rx))
     }
 
-    fn apply_system_prompt_prefix(&self, mut request: ResponsesRequest) -> ResponsesRequest {
-        let Some(prefix) = self.config.resolve_system_prompt_prefix(&request.model) else {
+    fn apply_system_prompt_prefix(
+        &self,
+        mut request: ResponsesRequest,
+        resolved_model: &str,
+    ) -> ResponsesRequest {
+        let Some(prefix) = self
+            .config
+            .resolve_system_prompt_prefix_for_resolved_model(&request.model, resolved_model)
+        else {
             return request;
         };
         request.instructions = if request.instructions.is_empty() {
@@ -393,6 +400,7 @@ impl Gateway {
         tool_registry: crate::adapters::responses_to_chat::ToolRegistry,
         response_format: Option<Value>,
         reasoning_effort: Option<String>,
+        upstream_model: String,
         tx: mpsc::Sender<SseEvent>,
     ) -> AppResult<()> {
         self.monitor.emit(
@@ -669,12 +677,6 @@ impl Gateway {
         let mut public_history = request.input.clone();
         let mut response_output = Vec::new();
         let mut event_state = ResponseEventState::default();
-        let configured_model = self.config.resolve_upstream_model(&request.model);
-        let upstream_model = tokio::select! {
-            biased;
-            _ = tx.closed() => return Err(AppError::cancelled()),
-            model = self.normalize_upstream_model(&configured_model) => model,
-        };
 
         let mut accumulated_usage = AccumulatedUsage::default();
         let mut upstream_request_index = 0usize;
@@ -689,7 +691,8 @@ impl Gateway {
         #[allow(unused_assignments)]
         let mut last_finish_reason: Option<String> = None;
         let upstream_extra_body = build_upstream_extra_body(
-            self.config.resolve_upstream_chat_kwargs(&request.model),
+            self.config
+                .resolve_upstream_chat_kwargs_for_resolved_model(&request.model, &upstream_model),
             &request,
             &response_format,
             &reasoning_effort,
@@ -1045,13 +1048,13 @@ impl Gateway {
             break;
         }
 
-        let model_name = request.model.clone();
+        let model_name = upstream_model.clone();
         let completed_output = response_output.clone();
         let metadata = request.metadata.clone();
         if request.store {
             self.replay_store
                 .insert(ReplayRecord {
-                    model: request.model,
+                    model: model_name.clone(),
                     instructions: request.instructions,
                     visible_history: public_history,
                     internal_messages: current_messages,

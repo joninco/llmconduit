@@ -24,6 +24,8 @@ use crate::search::BraveSearchClient;
 use crate::upstream::FailoverUpstreamClient;
 use crate::upstream::FailoverUpstreamProvider;
 use crate::upstream::ReqwestUpstreamClient;
+use crate::upstream::RoutingUpstreamClient;
+use crate::upstream::RoutingUpstreamProvider;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,41 +64,86 @@ pub fn build_app_with_gateway_and_options(
     } else {
         MonitorHub::disabled()
     };
-    let primary_upstream = ReqwestUpstreamClient::new(
-        http_client.clone(),
-        config.upstream_base_url.clone(),
-        config.upstream_api_key.clone(),
-        config.upstream_request_log_path.clone(),
-        config.flatten_content,
-    );
-    let upstream: Arc<dyn crate::upstream::UpstreamClient> = if config.fallback_upstreams.is_empty()
-    {
-        Arc::new(primary_upstream)
-    } else {
-        let mut providers = vec![FailoverUpstreamProvider::new(
-            "primary",
-            primary_upstream,
-            None,
-            serde_json::Map::new(),
-        )];
-        providers.extend(config.fallback_upstreams.iter().map(|provider| {
-            FailoverUpstreamProvider::new(
-                provider.name.clone(),
-                ReqwestUpstreamClient::new(
+    let upstream: Arc<dyn crate::upstream::UpstreamClient> = if !config.upstreams.is_empty() {
+        let providers = config
+            .upstreams
+            .iter()
+            .map(|provider| {
+                let primary_client = ReqwestUpstreamClient::new(
                     http_client.clone(),
                     provider.upstream_base_url.clone(),
                     provider.upstream_api_key.clone(),
                     provider.upstream_request_log_path.clone(),
                     config.flatten_content,
-                ),
-                provider.upstream_model.clone(),
-                provider.upstream_chat_kwargs.clone(),
-            )
-        }));
-        Arc::new(FailoverUpstreamClient::new(
-            providers,
-            Duration::from_secs(config.upstream_failure_cooldown_secs),
-        ))
+                );
+                let fallback_providers = provider
+                    .fallback_upstreams
+                    .iter()
+                    .map(|fallback| {
+                        FailoverUpstreamProvider::new(
+                            fallback.name.clone(),
+                            ReqwestUpstreamClient::new(
+                                http_client.clone(),
+                                fallback.upstream_base_url.clone(),
+                                fallback.upstream_api_key.clone(),
+                                fallback.upstream_request_log_path.clone(),
+                                config.flatten_content,
+                            ),
+                            fallback.upstream_model.clone(),
+                            fallback.exposed_model.clone(),
+                            fallback.upstream_chat_kwargs.clone(),
+                        )
+                    })
+                    .collect();
+                RoutingUpstreamProvider::new(
+                    provider.name.clone(),
+                    primary_client,
+                    provider.upstream_model.clone(),
+                    provider.upstream_chat_kwargs.clone(),
+                    fallback_providers,
+                    Duration::from_secs(config.upstream_failure_cooldown_secs),
+                )
+            })
+            .collect();
+        Arc::new(RoutingUpstreamClient::new(providers))
+    } else {
+        let primary_upstream = ReqwestUpstreamClient::new(
+            http_client.clone(),
+            config.upstream_base_url.clone(),
+            config.upstream_api_key.clone(),
+            config.upstream_request_log_path.clone(),
+            config.flatten_content,
+        );
+        if config.fallback_upstreams.is_empty() {
+            Arc::new(primary_upstream)
+        } else {
+            let mut providers = vec![FailoverUpstreamProvider::new(
+                "primary",
+                primary_upstream,
+                None,
+                None,
+                serde_json::Map::new(),
+            )];
+            providers.extend(config.fallback_upstreams.iter().map(|provider| {
+                FailoverUpstreamProvider::new(
+                    provider.name.clone(),
+                    ReqwestUpstreamClient::new(
+                        http_client.clone(),
+                        provider.upstream_base_url.clone(),
+                        provider.upstream_api_key.clone(),
+                        provider.upstream_request_log_path.clone(),
+                        config.flatten_content,
+                    ),
+                    provider.upstream_model.clone(),
+                    provider.exposed_model.clone(),
+                    provider.upstream_chat_kwargs.clone(),
+                )
+            }));
+            Arc::new(FailoverUpstreamClient::new(
+                providers,
+                Duration::from_secs(config.upstream_failure_cooldown_secs),
+            ))
+        }
     };
     let search = Arc::new(BraveSearchClient::new(http_client, config.clone()));
     let gateway = Arc::new(Gateway::new(

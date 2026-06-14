@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatCompletionRequest {
+    #[serde(default, deserialize_with = "deserialize_model")]
     pub model: String,
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
@@ -46,6 +47,15 @@ pub struct ChatCompletionRequest {
     pub stop: Option<Vec<String>>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_body: BTreeMap<String, Value>,
+}
+
+pub(crate) fn deserialize_model<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?
+        .map(|model| model.trim().to_string())
+        .unwrap_or_default())
 }
 
 #[derive(Deserialize)]
