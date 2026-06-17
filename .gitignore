@@ -1,2 +1,7 @@
 /target
 .omx/
+
+# Ralph orchestration state (ephemeral). Specs + plan + protocol are kept (docs value).
+.ralph/orchestrate.*.state.md
+.ralph/COMPLETED_TASKS.md
+.ralph/reviewed-commits.log
