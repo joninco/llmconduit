@@ -16,8 +16,18 @@ use uuid::Uuid;
 
 const ESTIMATED_OUTPUT_TOKEN_BYTES: usize = 4;
 
+/// Name of the server-side web-search tool. Brave runs server-side, so the
+/// model's own `web_search` call is NOT surfaced to the Anthropic client as a
+/// regular `tool_use` block -- the search is rendered via the additive
+/// `response.web_search_results` event (`server_tool_use` +
+/// `web_search_tool_result`). The streamed `function_call_arguments` for this
+/// tool are therefore swallowed: they must not open a client tool_use block,
+/// must not flip `has_tool_calls` (the turn ends `end_turn`, not `tool_use`),
+/// and must not trip the late-reasoning drop gate (`content_started`) -- a
+/// web-search turn legitimately continues with reasoning after the results.
+const WEB_SEARCH_TOOL_NAME: &str = "web_search";
+
 enum ContentBlockState {
-    Thinking { index: usize },
     Text { index: usize },
     ToolUse { index: usize, call_id: String },
 }
@@ -36,6 +46,26 @@ pub struct AnthropicStreamConverter {
     web_search_count: u64,
     emitted_tool_call_ids: HashSet<String>,
     closed_tool_call_ids: HashSet<String>,
+    // Deferred reasoning (G8): reasoning is buffered rather than emitted live so
+    // the converter can decide its final shape only once the stream's shape is
+    // known. When text/tool output follows, the buffer is flushed as a genuine
+    // `thinking` block. When the turn produces *only* reasoning, a CLEAN
+    // terminal (`response.completed`) promotes it to a `text` block (the backend
+    // put the answer in the reasoning channel) -- unless it carries a signature,
+    // which marks it as genuine chain-of-thought that must stay a `thinking`
+    // block. ANY `response.incomplete` terminal (`max_output_tokens`,
+    // `content_filter`, or any future reason) is not a clean stop and is never
+    // promoted -- it stays a `thinking` block. Reasoning arriving after text has
+    // already started is "late" and dropped.
+    reasoning_buffer: Vec<String>,
+    reasoning_signature: Option<String>,
+    // The late-reasoning drop gate. Set ONLY by real text/tool output (the cases
+    // where any subsequent reasoning is genuinely abnormal/late). It is NOT set
+    // by the additive `response.web_search_results` block: a normal web-search
+    // turn streams CONTINUATION reasoning after the results, which must be
+    // buffered and handled normally rather than dropped. The fact that a search
+    // ran is tracked separately via `web_search_count`.
+    content_started: bool,
 }
 
 impl AnthropicStreamConverter {
@@ -54,6 +84,9 @@ impl AnthropicStreamConverter {
             web_search_count: 0,
             emitted_tool_call_ids: HashSet::new(),
             closed_tool_call_ids: HashSet::new(),
+            reasoning_buffer: Vec::new(),
+            reasoning_signature: None,
+            content_started: false,
         }
     }
 
@@ -86,7 +119,7 @@ impl AnthropicStreamConverter {
             }
             "response.output_item.done" => self.handle_item_done(&event.data, &mut output),
             "response.completed" | "response.incomplete" => {
-                self.handle_completed(&event.data, &mut output)
+                self.handle_completed(event.event.as_str(), &event.data, &mut output)
             }
             "response.failed" => self.handle_failed(&event.data, &mut output),
             "response.web_search_results" => {
@@ -130,12 +163,14 @@ impl AnthropicStreamConverter {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
         match item_type {
             "message" => {
+                self.flush_reasoning_as_thinking(output);
                 self.close_open_block(output);
+                self.content_started = true;
                 self.start_text_block(output);
             }
             "reasoning" => {
-                self.close_open_block(output);
-                self.start_thinking_block(output);
+                // Deferred: do not open a thinking block here. Reasoning is
+                // buffered until the stream shape is known (see struct docs).
             }
             _ => {}
         }
@@ -157,7 +192,9 @@ impl AnthropicStreamConverter {
                 self.record_output_delta(delta, output);
             }
             _ => {
+                self.flush_reasoning_as_thinking(output);
                 self.close_open_block(output);
+                self.content_started = true;
                 self.start_text_block(output);
                 if let Some(ContentBlockState::Text { index }) = self.open_block {
                     output.push(AnthropicStreamEvent::ContentBlockDelta {
@@ -177,30 +214,19 @@ impl AnthropicStreamConverter {
         let Some(delta) = data.get("delta").and_then(Value::as_str) else {
             return;
         };
-        match self.open_block {
-            Some(ContentBlockState::Thinking { index }) => {
-                output.push(AnthropicStreamEvent::ContentBlockDelta {
-                    index,
-                    delta: AnthropicDelta::ThinkingDelta {
-                        thinking: delta.to_string(),
-                    },
-                });
-                self.record_output_delta(delta, output);
-            }
-            _ => {
-                self.close_open_block(output);
-                self.start_thinking_block(output);
-                if let Some(ContentBlockState::Thinking { index }) = self.open_block {
-                    output.push(AnthropicStreamEvent::ContentBlockDelta {
-                        index,
-                        delta: AnthropicDelta::ThinkingDelta {
-                            thinking: delta.to_string(),
-                        },
-                    });
-                    self.record_output_delta(delta, output);
-                }
-            }
+        if delta.is_empty() {
+            return;
         }
+        // Late reasoning: anything that arrives after text/tool output has
+        // already begun is abnormal and dropped (it cannot legally precede the
+        // content that was already streamed).
+        if self.content_started {
+            return;
+        }
+        // Defer: buffer the reasoning, but keep progressive output-usage live so
+        // clients still see the token counter advance while the model thinks.
+        self.record_output_delta(delta, output);
+        self.reasoning_buffer.push(delta.to_string());
     }
 
     fn handle_reasoning_signature_delta(
@@ -212,14 +238,18 @@ impl AnthropicStreamConverter {
         let Some(signature) = data.get("signature").and_then(Value::as_str) else {
             return;
         };
-        if let Some(ContentBlockState::Thinking { index }) = self.open_block {
-            output.push(AnthropicStreamEvent::ContentBlockDelta {
-                index,
-                delta: AnthropicDelta::SignatureDelta {
-                    signature: signature.to_string(),
-                },
-            });
+        if signature.is_empty() || self.content_started {
+            return;
         }
+        // Buffered alongside the reasoning text; flushed with it. A signature is
+        // a marker of genuine chain-of-thought, so its presence later pins the
+        // buffer to a `thinking` block (never promoted to text). A signature can
+        // arrive in multiple `signature_delta` chunks, so accumulate them in
+        // order (concatenate) rather than overwriting -- otherwise only the last
+        // fragment would survive.
+        self.reasoning_signature
+            .get_or_insert_with(String::new)
+            .push_str(signature);
     }
 
     fn handle_function_call_arguments_delta(
@@ -236,6 +266,14 @@ impl AnthropicStreamConverter {
         {
             return;
         }
+        let name = data.get("name").and_then(Value::as_str).unwrap_or_default();
+        // Server-side web search: swallow its streamed arguments. The search is
+        // surfaced via `response.web_search_results`, so opening a client
+        // tool_use block here would duplicate it, flip the turn to `tool_use`,
+        // and trip the late-reasoning gate against the post-search reasoning.
+        if name == WEB_SEARCH_TOOL_NAME {
+            return;
+        }
         let Some(delta) = data.get("delta").and_then(Value::as_str) else {
             return;
         };
@@ -243,7 +281,6 @@ impl AnthropicStreamConverter {
             return;
         }
         self.has_tool_calls = true;
-        let name = data.get("name").and_then(Value::as_str).unwrap_or_default();
         self.ensure_tool_block(call_id, name, output);
         if let Some(ContentBlockState::ToolUse { index, .. }) = self.open_block {
             output.push(AnthropicStreamEvent::ContentBlockDelta {
@@ -265,6 +302,12 @@ impl AnthropicStreamConverter {
         let Some(call_id) = data.get("call_id").and_then(Value::as_str) else {
             return;
         };
+        // Server-side web search: swallow it (surfaced via web_search_results).
+        // Must precede the `has_tool_calls` flip so the turn ends `end_turn` and
+        // the post-search reasoning is not gated as "late".
+        if data.get("name").and_then(Value::as_str) == Some(WEB_SEARCH_TOOL_NAME) {
+            return;
+        }
         self.has_tool_calls = true;
         if self.emitted_tool_call_ids.contains(call_id) {
             return;
@@ -316,9 +359,9 @@ impl AnthropicStreamConverter {
                 }
             }
             "reasoning" => {
-                if matches!(self.open_block, Some(ContentBlockState::Thinking { .. })) {
-                    self.close_open_block(output);
-                }
+                // Deferred: the reasoning item completing does not flush the
+                // buffer. The buffer is held until content arrives (-> thinking)
+                // or the turn ends (-> promote to text / keep as thinking).
             }
             "function_call" | "custom_tool_call" => {
                 self.close_open_block(output);
@@ -349,6 +392,11 @@ impl AnthropicStreamConverter {
             return output;
         }
         self.ensure_started(&mut output);
+        // No clean terminal event arrived (engine error / stalled turn). The
+        // reference treats a missing finish_reason as "do not promote": flush any
+        // buffered reasoning as a thinking block rather than guessing it was the
+        // answer. Promotion is reserved for a clean `response.completed`.
+        self.flush_reasoning_as_thinking(&mut output);
         self.close_open_block(&mut output);
         output.push(AnthropicStreamEvent::MessageDelta {
             delta: AnthropicMessageDeltaBody {
@@ -370,8 +418,23 @@ impl AnthropicStreamConverter {
         output
     }
 
-    fn handle_completed(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
+    fn handle_completed(
+        &mut self,
+        event_type: &str,
+        data: &Value,
+        output: &mut Vec<AnthropicStreamEvent>,
+    ) {
         self.completed = true;
+        let mapped_stop_reason = response_stop_reason(data);
+        // Resolve any buffered reasoning before closing out: promote a
+        // reasoning-only turn to text only on a CLEAN completion, otherwise
+        // flush genuine CoT as thinking. Promotion is gated on
+        // `response.completed` (a true `finish_reason:stop`); EVERY
+        // `response.incomplete` terminal -- regardless of its reason
+        // (`max_output_tokens`, `content_filter`, or any future reason) -- is
+        // NOT a clean stop and must stay a `thinking` block, never promoted.
+        let clean_completed = event_type == "response.completed";
+        self.flush_reasoning_terminal(clean_completed, output);
         self.close_open_block(output);
         let usage = response_usage(data);
         if let Some(usage) = usage.as_ref() {
@@ -383,7 +446,7 @@ impl AnthropicStreamConverter {
             .unwrap_or(self.last_output_tokens)
             .max(self.last_output_tokens);
         self.last_output_tokens = output_tokens;
-        let stop_reason = if let Some(reason) = response_stop_reason(data) {
+        let stop_reason = if let Some(reason) = mapped_stop_reason {
             reason
         } else if self.has_tool_calls {
             "tool_use".to_string()
@@ -430,8 +493,20 @@ impl AnthropicStreamConverter {
     /// by a `web_search_tool_result` block carrying the structured sources. The
     /// turn still ends with `end_turn` (the search is resolved server-side), so
     /// `has_tool_calls` is intentionally left untouched.
+    ///
+    /// A web-search round is additive, NOT real text/tool output: a normal turn
+    /// is reasoning -> web_search_call -> `web_search_results` -> CONTINUATION
+    /// reasoning -> text answer. So this block must NOT trip the late-reasoning
+    /// gate (`content_started`) -- doing so would drop the legitimate
+    /// post-search continuation reasoning. It still flushes any buffered
+    /// PRE-search reasoning as a `thinking` block (genuine CoT that preceded the
+    /// search) and records the search via `web_search_count` (tracked separately
+    /// from `content_started`, which keys only on real text/tool content). The
+    /// continuation reasoning that follows is buffered and handled normally
+    /// (flushed as thinking when the answer starts, or resolved at the terminal).
     fn handle_web_search_results(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
         self.ensure_started(output);
+        self.flush_reasoning_as_thinking(output);
         self.close_open_block(output);
         self.web_search_count += 1;
 
@@ -477,10 +552,91 @@ impl AnthropicStreamConverter {
         });
     }
 
+    /// Flush buffered reasoning as a genuine `thinking` block.
+    ///
+    /// Used when text/tool content follows the reasoning (the reasoning was a
+    /// real chain-of-thought preface) and at the terminal event for truncated or
+    /// signed reasoning. No-op when the buffer is empty. The buffer (text and
+    /// signature) is consumed.
+    fn flush_reasoning_as_thinking(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
+        if self.reasoning_buffer.is_empty() && self.reasoning_signature.is_none() {
+            return;
+        }
+        self.close_open_block(output);
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+        output.push(AnthropicStreamEvent::ContentBlockStart {
+            index,
+            content_block: AnthropicContentBlockStart::Thinking {
+                thinking: String::new(),
+            },
+        });
+        for chunk in std::mem::take(&mut self.reasoning_buffer) {
+            output.push(AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicDelta::ThinkingDelta { thinking: chunk },
+            });
+        }
+        if let Some(signature) = self.reasoning_signature.take() {
+            output.push(AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicDelta::SignatureDelta { signature },
+            });
+        }
+        output.push(AnthropicStreamEvent::ContentBlockStop { index });
+    }
+
+    /// Resolve the reasoning buffer at the terminal event.
+    ///
+    /// If reasoning was the *only* output this turn (no text or tool blocks),
+    /// the backend put the answer in the reasoning channel: promote it to a
+    /// `text` block so the client renders it -- but ONLY on a clean completion
+    /// (`response.completed`, a true `finish_reason:stop`) and only when it is
+    /// not genuine chain-of-thought (no signature). EVERY `response.incomplete`
+    /// terminal -- whatever its reason (`max_output_tokens`, `content_filter`,
+    /// or any future reason) -- is not a clean stop, so `clean_completed` is
+    /// false and the buffer stays a `thinking` block. Once any content has
+    /// started, leftover reasoning is just a normal preface and is flushed as a
+    /// `thinking` block.
+    fn flush_reasoning_terminal(
+        &mut self,
+        clean_completed: bool,
+        output: &mut Vec<AnthropicStreamEvent>,
+    ) {
+        if self.reasoning_buffer.is_empty() && self.reasoning_signature.is_none() {
+            return;
+        }
+        let promote = clean_completed
+            && !self.content_started
+            && !self.has_tool_calls
+            && self.reasoning_signature.is_none();
+        if !promote {
+            self.flush_reasoning_as_thinking(output);
+            return;
+        }
+        let promoted: String = std::mem::take(&mut self.reasoning_buffer).concat();
+        self.reasoning_signature = None;
+        self.content_started = true;
+        self.close_open_block(output);
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+        output.push(AnthropicStreamEvent::ContentBlockStart {
+            index,
+            content_block: AnthropicContentBlockStart::Text {
+                text: String::new(),
+            },
+        });
+        output.push(AnthropicStreamEvent::ContentBlockDelta {
+            index,
+            delta: AnthropicDelta::TextDelta { text: promoted },
+        });
+        output.push(AnthropicStreamEvent::ContentBlockStop { index });
+    }
+
     fn close_open_block(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
         if let Some(block) = self.open_block.take() {
             let index = match block {
-                ContentBlockState::Thinking { index } | ContentBlockState::Text { index } => index,
+                ContentBlockState::Text { index } => index,
                 ContentBlockState::ToolUse { index, call_id } => {
                     self.closed_tool_call_ids.insert(call_id);
                     index
@@ -527,18 +683,6 @@ impl AnthropicStreamConverter {
         });
     }
 
-    fn start_thinking_block(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
-        let index = self.next_block_index;
-        self.next_block_index += 1;
-        self.open_block = Some(ContentBlockState::Thinking { index });
-        output.push(AnthropicStreamEvent::ContentBlockStart {
-            index,
-            content_block: AnthropicContentBlockStart::Thinking {
-                thinking: String::new(),
-            },
-        });
-    }
-
     fn ensure_tool_block(
         &mut self,
         call_id: &str,
@@ -554,6 +698,8 @@ impl AnthropicStreamConverter {
         ) {
             return;
         }
+        self.flush_reasoning_as_thinking(output);
+        self.content_started = true;
         self.close_open_block(output);
         let index = self.next_block_index;
         self.next_block_index += 1;
@@ -1051,14 +1197,18 @@ mod tests {
         .flat_map(|e| converter.convert(e))
         .collect();
 
+        // Reasoning is deferred (G8): its progressive output-usage is emitted
+        // live as bytes arrive, but the `thinking` block itself is not opened
+        // until the following text forces a flush. So the progress `message_delta`
+        // for the reasoning bytes precedes the (contiguous) thinking block.
         assert_eq!(
             event_types(&events),
             vec![
                 "ping",
                 "message_start",
-                "content_block_start", // thinking
+                "message_delta",       // progressive usage for buffered reasoning
+                "content_block_start", // thinking (flushed on text arrival)
                 "content_block_delta", // thinking delta
-                "message_delta",       // progressive usage
                 "content_block_stop",  // close thinking before text
                 "content_block_start", // text
                 "content_block_delta", // text delta
@@ -1072,12 +1222,17 @@ mod tests {
 
     #[test]
     fn converts_reasoning_signature_delta() {
+        // A signed reasoning-only turn: the buffer carries a signature, so at the
+        // terminal event it is flushed as a `thinking` block (never promoted) and
+        // the buffered `signature_delta` is surfaced.
         let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
         let events: Vec<AnthropicStreamEvent> = [
             created_event(),
             item_added_event("reasoning", ""),
             reasoning_delta_event("Thinking..."),
             reasoning_signature_delta_event("sig_123"),
+            item_done_event("reasoning", json!({})),
+            completed_event(),
         ]
         .iter()
         .flat_map(|e| converter.convert(e))
@@ -1094,6 +1249,103 @@ mod tests {
             })
             .collect();
         assert_eq!(signatures, vec!["sig_123"]);
+        // Signed reasoning must stay a thinking block, not be promoted to text.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AnthropicStreamEvent::ContentBlockStart {
+                    content_block: AnthropicContentBlockStart::Thinking { .. },
+                    ..
+                }
+            )),
+            "signed reasoning should produce a thinking block"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AnthropicStreamEvent::ContentBlockStart {
+                    content_block: AnthropicContentBlockStart::Text { .. },
+                    ..
+                }
+            )),
+            "signed reasoning must never be promoted to a text block"
+        );
+    }
+
+    #[test]
+    fn reasoning_only_incomplete_non_length_stays_thinking() {
+        // A reasoning-only turn ending in `response.incomplete` with a reason
+        // OTHER than length/max-tokens (e.g. content_filter) is NOT a clean
+        // stop, so it must flush as a thinking block, never be promoted to text.
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("reasoning", ""),
+            reasoning_delta_event("partial think"),
+            item_done_event("reasoning", json!({})),
+            incomplete_event("content_filter", 12, 5),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AnthropicStreamEvent::ContentBlockStart {
+                    content_block: AnthropicContentBlockStart::Thinking { .. },
+                    ..
+                }
+            )),
+            "non-length incomplete reasoning must stay a thinking block"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AnthropicStreamEvent::ContentBlockStart {
+                    content_block: AnthropicContentBlockStart::Text { .. },
+                    ..
+                }
+            )),
+            "non-length incomplete reasoning must never be promoted to text"
+        );
+    }
+
+    #[test]
+    fn accumulates_multi_part_signature_deltas() {
+        // A thinking signature can be streamed in multiple `signature_delta`
+        // chunks; the emitted thinking block's signature must be the full
+        // concatenation, not just the last fragment.
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("reasoning", ""),
+            reasoning_delta_event("Thinking..."),
+            reasoning_signature_delta_event("sig_"),
+            reasoning_signature_delta_event("part2_"),
+            reasoning_signature_delta_event("end"),
+            item_done_event("reasoning", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        let signatures: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AnthropicStreamEvent::ContentBlockDelta {
+                    delta: AnthropicDelta::SignatureDelta { signature },
+                    ..
+                } => Some(signature.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            signatures,
+            vec!["sig_part2_end"],
+            "multi-part signature must be concatenated in order"
+        );
     }
 
     #[test]
@@ -1590,6 +1842,71 @@ mod tests {
             .find(|j| j["type"] == "message_delta" && j["delta"]["stop_reason"].is_string())
             .expect("message_delta");
         assert_eq!(msg_delta["delta"]["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn post_web_search_reasoning_and_answer_are_preserved() {
+        // Regression: a web-search turn is reasoning -> web_search_results ->
+        // CONTINUATION reasoning -> text answer. The web_search_results block is
+        // additive and must NOT trip the late-reasoning drop gate, otherwise the
+        // legitimate post-search reasoning is silently dropped. Both the
+        // post-search reasoning (as a thinking block) and the text answer must
+        // survive.
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let results = json!([
+            {"type": "web_search_result", "url": "https://example.com/a", "title": "Site A"}
+        ]);
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("reasoning", ""),
+            reasoning_delta_event("Pre-search thought."),
+            web_search_results_event("srvtoolu_1", "weather", results.clone()),
+            // Continuation reasoning AFTER the search results.
+            item_added_event("reasoning", ""),
+            reasoning_delta_event("Post-search thought."),
+            // The actual answer.
+            item_added_event("message", "assistant"),
+            text_delta_event("It is sunny."),
+            item_done_event("message", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        // Both reasoning segments must surface as thinking deltas (pre-search
+        // flushed at the search boundary, post-search flushed when text begins).
+        let thinking: String = events
+            .iter()
+            .filter_map(|event| match event {
+                AnthropicStreamEvent::ContentBlockDelta {
+                    delta: AnthropicDelta::ThinkingDelta { thinking },
+                    ..
+                } => Some(thinking.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            thinking.contains("Pre-search thought."),
+            "pre-search reasoning must be preserved as thinking, got {thinking:?}"
+        );
+        assert!(
+            thinking.contains("Post-search thought."),
+            "post-search continuation reasoning must NOT be dropped, got {thinking:?}"
+        );
+
+        // The text answer must survive intact.
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                AnthropicStreamEvent::ContentBlockDelta {
+                    delta: AnthropicDelta::TextDelta { text },
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "It is sunny.", "the text answer must be preserved");
     }
 
     #[test]
