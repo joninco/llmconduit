@@ -33,6 +33,11 @@ pub struct Config {
     pub flatten_content: bool,
     pub max_replay_entries: usize,
     pub debug_log_max_age_hours: Option<u64>,
+    /// Floor for the reduced completion budget when retrying a context-window
+    /// overflow (G1). A shrink-and-retry never pushes `max_completion_tokens`
+    /// below this value, so a near-full prompt still gets a usable (if small)
+    /// completion budget instead of being clamped to zero/negative.
+    pub min_completion_tokens: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +192,8 @@ pub struct PersistedConfig {
     /// default) disables rotation entirely so behavior is opt-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug_log_max_age_hours: Option<u64>,
+    #[serde(default = "default_min_completion_tokens")]
+    pub min_completion_tokens: i64,
 }
 
 fn default_bind_addr() -> String {
@@ -229,6 +236,10 @@ fn default_upstream_failure_cooldown_secs() -> u64 {
     30
 }
 
+fn default_min_completion_tokens() -> i64 {
+    4096
+}
+
 impl Default for PersistedConfig {
     fn default() -> Self {
         Self {
@@ -253,6 +264,7 @@ impl Default for PersistedConfig {
             flatten_content: true,
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
+            min_completion_tokens: default_min_completion_tokens(),
         }
     }
 }
@@ -384,6 +396,7 @@ impl Config {
             flatten_content: config.flatten_content,
             max_replay_entries: config.max_replay_entries,
             debug_log_max_age_hours: config.debug_log_max_age_hours,
+            min_completion_tokens: config.min_completion_tokens.max(1),
         })
     }
 
@@ -783,6 +796,12 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.debug_log_max_age_hours = Some(parsed);
     }
+    if let Ok(value) = env::var("LLMCONDUIT_MIN_COMPLETION_TOKENS")
+        && let Ok(parsed) = value.trim().parse::<i64>()
+        && parsed >= 1
+    {
+        config.min_completion_tokens = parsed;
+    }
 }
 
 pub fn merge_json_maps(
@@ -1154,6 +1173,7 @@ mod tests {
             flatten_content: false,
             max_replay_entries: 1000,
             debug_log_max_age_hours: Some(48),
+            min_completion_tokens: 4096,
         };
         write_persisted_config(&path, &config).expect("write config");
         let loaded = load_persisted_config(&path).expect("load config");
@@ -1199,6 +1219,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
+            min_completion_tokens: 4096,
         })
         .expect("config");
 
@@ -1259,6 +1280,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
+            min_completion_tokens: 4096,
         })
         .expect("config");
 
@@ -1315,6 +1337,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
+            min_completion_tokens: 4096,
         })
         .expect("config");
 
@@ -1393,6 +1416,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
+            min_completion_tokens: 4096,
         })
         .expect("config");
 
@@ -1463,6 +1487,7 @@ mod tests {
             flatten_content: true,
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
+            min_completion_tokens: 4096,
         })
         .expect("config");
 
@@ -1812,6 +1837,7 @@ model_profiles:
             flatten_content: true,
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
+            min_completion_tokens: 4096,
         })
         .expect("config");
 
@@ -1857,6 +1883,7 @@ model_profiles:
             flatten_content: true,
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
+            min_completion_tokens: 4096,
         })
         .expect("config");
 

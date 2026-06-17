@@ -9,6 +9,7 @@ use futures::Stream;
 use futures::StreamExt;
 use http::HeaderMap;
 use http::HeaderName;
+use regex::Regex;
 use reqwest::RequestBuilder;
 use reqwest::StatusCode;
 use serde_json::Map as JsonMap;
@@ -20,6 +21,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
@@ -65,6 +67,9 @@ pub struct ReqwestUpstreamClient {
     api_key: Option<String>,
     request_logger: Option<UpstreamRequestLogger>,
     flatten_content: bool,
+    /// Floor for the shrink-and-retry completion budget on a context-window
+    /// overflow (G1). A retry never reduces `max_completion_tokens` below this.
+    min_completion_tokens: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -239,6 +244,7 @@ impl ReqwestUpstreamClient {
         api_key: Option<String>,
         request_log_path: Option<PathBuf>,
         flatten_content: bool,
+        min_completion_tokens: i64,
     ) -> Self {
         Self {
             client,
@@ -246,6 +252,7 @@ impl ReqwestUpstreamClient {
             api_key,
             request_logger: request_log_path.map(UpstreamRequestLogger::new),
             flatten_content,
+            min_completion_tokens: min_completion_tokens.max(1),
         }
     }
 
@@ -264,6 +271,18 @@ impl ReqwestUpstreamClient {
         }
         url.join(path)
             .map_err(|err| AppError::internal(format!("invalid upstream URL: {err}")))
+    }
+
+    async fn send_chat_request(
+        &self,
+        url: &Url,
+        request: &ChatCompletionRequest,
+    ) -> AppResult<reqwest::Response> {
+        self.with_auth(self.client.post(url.clone()))
+            .json(request)
+            .send()
+            .await
+            .map_err(|err| AppError::upstream(format!("upstream chat request failed: {err}")))
     }
 }
 
@@ -284,13 +303,68 @@ impl UpstreamClient for ReqwestUpstreamClient {
                 "failed to append upstream request log"
             );
         }
-        let response = self
-            .with_auth(self.client.post(url))
-            .json(&request)
-            .send()
-            .await
-            .map_err(|err| AppError::upstream(format!("upstream chat request failed: {err}")))?;
-        ensure_success(response.status(), response).await
+
+        // First attempt. On a non-2xx whose body indicates a context/completion
+        // token-limit overflow, shrink `max_completion_tokens` and retry ONCE.
+        // This happens before any SSE chunk is parsed/yielded downstream, so it
+        // can never duplicate already-streamed tokens, and it stays inside the
+        // leaf client so the failover/routing layers never see a context-limit
+        // error as a provider failure (it is a same-provider shrink-and-retry).
+        let response = self.send_chat_request(&url, &request).await?;
+        let status = response.status();
+        if status.is_success() {
+            return stream_success_response(response).await;
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        if let Some(retry) = classify_context_overflow(&body, self.min_completion_tokens, None) {
+            let mut retried = request.clone();
+            retried.max_output_tokens = Some(retry.max_completion_tokens);
+            // The reduced budget lives on the typed `max_output_tokens` field
+            // (serialized as `max_tokens`). Any max-token ALIAS that flowed into
+            // `extra_body` (`max_tokens`, `max_completion_tokens`,
+            // `max_output_tokens`) would serialize alongside and let the upstream
+            // honor the stale oversized value, defeating the retry. Mirror the
+            // engine's "explicit field removes conflicting default keys" rule and
+            // strip them so only the reduced typed field applies.
+            remove_max_token_aliases(&mut retried.extra_body);
+            tracing::warn!(
+                reason = retry.reason,
+                ctx_limit = retry.ctx_limit,
+                input_tokens = retry.input_tokens.unwrap_or(0),
+                input_is_lower_bound = retry.input_tokens_is_lower_bound,
+                new_max_completion_tokens = retry.max_completion_tokens,
+                "upstream context-window overflow; retrying once with reduced completion budget"
+            );
+            let retry_response = self.send_chat_request(&url, &retried).await?;
+            let retry_status = retry_response.status();
+            if retry_status.is_success() {
+                return stream_success_response(retry_response).await;
+            }
+            // The retry ALSO failed. If it is again a context overflow, this is a
+            // same-provider sizing problem, not a provider failure: surface a
+            // TERMINAL error so `FailoverUpstreamClient`/routing does NOT retry
+            // the same oversized prompt on another provider (only one shrink-and-
+            // retry is allowed; we do not loop). Any other non-2xx is a normal
+            // (failover-eligible) upstream error.
+            let retry_body = retry_response.text().await.unwrap_or_default();
+            if classify_context_overflow(&retry_body, self.min_completion_tokens, None).is_some() {
+                return Err(AppError::upstream_terminal(format!(
+                    "upstream context-window overflow persisted after shrink-and-retry; \
+                     failed with {retry_status}: {}",
+                    truncate_for_error(&retry_body, 500)
+                )));
+            }
+            return Err(AppError::upstream(format!(
+                "upstream chat failed with {retry_status}: {}",
+                truncate_for_error(&retry_body, 500)
+            )));
+        }
+
+        Err(AppError::upstream(format!(
+            "upstream chat failed with {status}: {}",
+            truncate_for_error(&body, 500)
+        )))
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
@@ -552,6 +626,13 @@ impl FailoverUpstreamClient {
                 .await
             {
                 Ok(stream) => stream,
+                Err(err) if !err.is_failover_eligible() => {
+                    // Terminal same-provider error (e.g. a context overflow that
+                    // survived the leaf shrink-and-retry). Trying the next
+                    // provider would just overflow again, so surface it as-is and
+                    // do NOT mark this provider failed (it is not at fault).
+                    return Err(err);
+                }
                 Err(err) => {
                     self.mark_failure(provider_index, &err);
                     last_error = Some(err);
@@ -1097,6 +1178,22 @@ fn chat_request_field_is_set(request: &ChatCompletionRequest, key: &str) -> bool
     }
 }
 
+/// Max-token alias keys that can coexist with the typed `max_output_tokens`
+/// field inside the flattened `extra_body`. The engine treats these as one
+/// logical knob (`engine.rs` `remove_*` helpers); the leaf shrink-and-retry
+/// must strip all of them so a stale oversized alias cannot override the
+/// reduced typed `max_tokens` on the retried request.
+const MAX_TOKEN_ALIAS_KEYS: [&str; 3] =
+    ["max_tokens", "max_output_tokens", "max_completion_tokens"];
+
+/// Remove every max-token alias from `extra_body` so only the typed,
+/// reduced `max_output_tokens` (serialized as `max_tokens`) applies on retry.
+fn remove_max_token_aliases(extra_body: &mut std::collections::BTreeMap<String, Value>) {
+    for key in MAX_TOKEN_ALIAS_KEYS {
+        extra_body.remove(key);
+    }
+}
+
 fn merge_json_value_preserve_destination(destination: &mut Value, source: &Value) {
     if let Value::Object(destination_object) = destination
         && let Value::Object(source_object) = source
@@ -1189,17 +1286,237 @@ fn header_name_eq(name: &HeaderName, other: &str) -> bool {
     name.as_str().eq_ignore_ascii_case(other)
 }
 
-async fn ensure_success(
-    status: StatusCode,
-    response: reqwest::Response,
-) -> AppResult<UpstreamStream> {
-    if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        return Err(AppError::upstream(format!(
-            "upstream chat failed with {status}: {}",
-            truncate_for_error(&body, 500)
-        )));
+/// Small fixed reserve subtracted from the context window when recomputing the
+/// completion budget for an exact-token overflow error.
+const CONTEXT_RETRY_MARGIN: i64 = 100;
+/// Larger reserve used when the reported input-token count is only a lower
+/// bound (vLLM's "prompt contains at least N input tokens"). The real prompt is
+/// at least that large, so a wider margin avoids chasing a one-token-over
+/// boundary across retries.
+const CONTEXT_LOWER_BOUND_RETRY_MARGIN: i64 = 1024;
+
+/// A structured decision to retry an upstream request after a context/
+/// completion token-limit overflow, carrying the recomputed completion budget.
+///
+/// `max_completion_tokens` is already clamped to the configured minimum floor;
+/// callers reduce the request's `max_completion_tokens` to this value and retry
+/// exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextOverflowRetry {
+    /// Recomputed `max_completion_tokens` for the retry (>= the min floor).
+    pub max_completion_tokens: i64,
+    /// The model's context window as reported by the error body.
+    pub ctx_limit: i64,
+    /// Input/prompt tokens parsed from the error body, when available.
+    pub input_tokens: Option<i64>,
+    /// Which overflow shape matched: `"completion_limit"` or `"context_limit"`.
+    pub reason: &'static str,
+    /// True when `input_tokens` is a lower bound ("prompt contains at least N").
+    pub input_tokens_is_lower_bound: bool,
+}
+
+fn context_retry_completion_budget(
+    ctx_limit: i64,
+    input_tokens: Option<i64>,
+    min_completion_tokens: i64,
+    input_tokens_is_lower_bound: bool,
+) -> i64 {
+    let margin = if input_tokens_is_lower_bound {
+        CONTEXT_LOWER_BOUND_RETRY_MARGIN
+    } else {
+        CONTEXT_RETRY_MARGIN
+    };
+    let available = ctx_limit - margin - input_tokens.unwrap_or(0);
+    available.max(min_completion_tokens)
+}
+
+/// vLLM/SGLang output-only limit:
+/// `max_completion_tokens=X cannot be greater than max_model_len=Y`.
+///
+/// Mirrors the reference regex
+/// `max_completion_tokens\s*=\s*([\d,]+).*?max_model_len\D*([\d,]+)`
+/// (claude-relay `server._context_overflow_retry_from_error`), with the literal
+/// `cannot be greater than` comparison pinned BETWEEN the two anchored fields.
+/// The reference's bare `.*?` would also match an unrelated validation body
+/// that merely names both fields with numbers (e.g. "max_completion_tokens=N is
+/// not allowed together with max_model_len=N"); requiring the actual overflow
+/// comparison — the exact wording this shape always carries — rejects that
+/// false positive while still matching every genuine overflow. Group 1 =
+/// requested completion tokens (presence enforces the shape), group 2 =
+/// `max_model_len` (the ctx limit).
+static COMPLETION_LIMIT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)max_completion_tokens\s*=\s*([\d,]+).*?cannot be greater than.*?max_model_len\D*([\d,]+)",
+    )
+    .expect("completion-limit overflow regex is valid")
+});
+
+/// vLLM combined input+output limit:
+/// `maximum context length is X. However, you requested Y output tokens and
+/// your prompt contains [at least] Z input tokens`.
+///
+/// Mirrors the reference regex
+/// `maximum context length is\s*([\d,]+).*?requested\s*([\d,]+)\s*output tokens
+/// .*?prompt contains(?P<lower_bound>\s+at least)?\s*([\d,]+)\s*input tokens`.
+/// The tight `requested\s*([\d,]+)\s*output tokens` adjacency (only whitespace
+/// between `requested`, the number and `output tokens`) is what rejects bodies
+/// that merely contain the bare words out of shape. Group 1 = ctx limit,
+/// `lower_bound` = the optional ` at least` qualifier, group 3 = input tokens.
+static VLLM_COMBINED_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)maximum context length is\s*([\d,]+).*?requested\s*([\d,]+)\s*output tokens.*?prompt contains(?P<lower_bound>\s+at least)?\s*([\d,]+)\s*input tokens",
+    )
+    .expect("vLLM combined overflow regex is valid")
+});
+
+/// OpenAI-compatible/SGLang shape:
+/// `maximum context length is X tokens. However, you requested Y tokens
+/// (Z in the messages, W in the completion)`.
+/// The canonical OpenAI wording uses `in the prompt` rather than `in the
+/// messages`.
+///
+/// Mirrors the reference regex
+/// `maximum context length is\s*([\d,]+).*?requested\s*([\d,]+)\s*tokens.*?
+/// \(([\d,]+)\s*in (?:the )?(?:messages|prompt).*?([\d,]+)\s*in (?:the )?
+/// (?:completion|output)`. The literal `\(` before the input count and the
+/// tight `requested\s*([\d,]+)\s*tokens` adjacency, plus the required
+/// `... in the completion` half, reject bodies that only echo the input-side
+/// phrase or carry the clauses out of order. Group 1 = ctx limit, group 3 =
+/// input tokens.
+static OPENAI_COMPATIBLE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)maximum context length is\s*([\d,]+).*?requested\s*([\d,]+)\s*tokens.*?\(([\d,]+)\s*in (?:the )?(?:messages|prompt).*?([\d,]+)\s*in (?:the )?(?:completion|output)",
+    )
+    .expect("OpenAI-compatible overflow regex is valid")
+});
+
+/// vLLM/SGLang newer shape:
+/// `Requested token count exceeds the model's maximum context length of X
+/// tokens. You requested a total of Y tokens: Z tokens from the input messages
+/// and W tokens for the completion`.
+///
+/// Mirrors the reference regex
+/// `maximum context length of\s*([\d,]+)\s*tokens.*?requested a total of
+/// \s*([\d,]+)\s*tokens.*?([\d,]+)\s*tokens from (?:the )?
+/// (?:input messages|messages|prompt).*?([\d,]+)\s*tokens for (?:the )?
+/// (?:completion|output)`, hardened (like the other shapes) with this shape's
+/// DISTINCTIVE LEADING LITERAL `requested token count exceeds`. That phrase is
+/// the unique opening sentence this overflow always carries; an unrelated 4xx
+/// that merely echoes the generic `maximum context length of …` +
+/// `requested a total of N tokens` anchors (e.g. a validation/diagnostics body
+/// rejecting some other field) does NOT contain it. Requiring it before the
+/// anchors rejects that false positive (Codex round 6: the regex rewrite had
+/// dropped this literal an earlier round added) while still matching every
+/// genuine overflow. Group 1 = ctx limit, group 3 = input tokens.
+static REQUESTED_TOTAL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?is)requested token count exceeds.*?maximum context length of\s*([\d,]+)\s*tokens.*?requested a total of\s*([\d,]+)\s*tokens.*?([\d,]+)\s*tokens from (?:the )?(?:input messages|messages|prompt).*?([\d,]+)\s*tokens for (?:the )?(?:completion|output)",
+    )
+    .expect("requested-total overflow regex is valid")
+});
+
+/// Parse a non-streaming upstream error body for a context/completion
+/// token-limit overflow and compute the reduced completion budget for a retry.
+///
+/// Returns `None` for any error text that is not a recognizable token-limit
+/// overflow, so the original error is surfaced unchanged (no retry).
+///
+/// `estimated_input_tokens` supplies the prompt size for the completion-only
+/// (`max_model_len`) shape, which does not itself report the input size; the
+/// leaf upstream path passes `None` (no local estimate), matching the reference
+/// implementation's behavior when no estimate is available.
+///
+/// Classification uses the SAME anchored regexes the reference implementation
+/// uses (`server._context_overflow_retry_from_error`, tests
+/// `test_non_200_retry_*`): each shape is matched by a precompiled
+/// [`Regex`] that mirrors the reference pattern exactly, and token counts are
+/// extracted from the capture groups (commas stripped before parsing).
+pub fn classify_context_overflow(
+    error_body: &str,
+    min_completion_tokens: i64,
+    estimated_input_tokens: Option<i64>,
+) -> Option<ContextOverflowRetry> {
+    // vLLM/SGLang output-only limit (group 2 = max_model_len = ctx limit).
+    if let Some(captures) = COMPLETION_LIMIT_RE.captures(error_body) {
+        let ctx_limit = parse_token_count(&captures[2]);
+        return Some(ContextOverflowRetry {
+            max_completion_tokens: context_retry_completion_budget(
+                ctx_limit,
+                estimated_input_tokens,
+                min_completion_tokens,
+                false,
+            ),
+            ctx_limit,
+            input_tokens: estimated_input_tokens,
+            reason: "completion_limit",
+            input_tokens_is_lower_bound: false,
+        });
     }
+
+    // vLLM combined input+output limit. Groups: 1 = ctx limit, 2 = requested
+    // output tokens, 3 (named `lower_bound`) = the optional " at least"
+    // qualifier, 4 = input tokens. The `lower_bound` group is a numbered slot in
+    // its own right (Rust `regex` counts named captures positionally), so the
+    // input count is group 4, not 3.
+    if let Some(captures) = VLLM_COMBINED_RE.captures(error_body) {
+        let ctx_limit = parse_token_count(&captures[1]);
+        let input_tokens = parse_token_count(&captures[4]);
+        let is_lower_bound = captures.name("lower_bound").is_some();
+        return Some(ContextOverflowRetry {
+            max_completion_tokens: context_retry_completion_budget(
+                ctx_limit,
+                Some(input_tokens),
+                min_completion_tokens,
+                is_lower_bound,
+            ),
+            ctx_limit,
+            input_tokens: Some(input_tokens),
+            reason: "context_limit",
+            input_tokens_is_lower_bound: is_lower_bound,
+        });
+    }
+
+    // OpenAI-compatible/SGLang and the newer "requested a total of" shape both
+    // report ctx limit in group 1 and input tokens in group 3.
+    if let Some(captures) = OPENAI_COMPATIBLE_RE
+        .captures(error_body)
+        .or_else(|| REQUESTED_TOTAL_RE.captures(error_body))
+    {
+        let ctx_limit = parse_token_count(&captures[1]);
+        let input_tokens = parse_token_count(&captures[3]);
+        return Some(ContextOverflowRetry {
+            max_completion_tokens: context_retry_completion_budget(
+                ctx_limit,
+                Some(input_tokens),
+                min_completion_tokens,
+                false,
+            ),
+            ctx_limit,
+            input_tokens: Some(input_tokens),
+            reason: "context_limit",
+            input_tokens_is_lower_bound: false,
+        });
+    }
+
+    None
+}
+
+/// Parse a comma-grouped integer token count from a regex capture (e.g.
+/// "202,752" -> 202752). Mirrors the reference `_parse_token_count`.
+fn parse_token_count(group: &str) -> i64 {
+    group
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// Convert an already-confirmed-success upstream response into the parsed SSE
+/// chunk stream. The first chunk is only produced lazily by the returned
+/// stream, so the context-overflow retry (which happens before this is called)
+/// remains strictly pre-first-chunk.
+async fn stream_success_response(response: reqwest::Response) -> AppResult<UpstreamStream> {
     let stream = response
         .bytes_stream()
         .eventsource()
@@ -1495,6 +1812,7 @@ mod tests {
             None,
             None,
             true,
+            4096,
         );
 
         assert_eq!(
@@ -1514,6 +1832,7 @@ mod tests {
             None,
             None,
             true,
+            4096,
         );
 
         assert_eq!(
@@ -1823,6 +2142,7 @@ mod tests {
             None,
             None,
             true,
+            4096,
         );
         let url = client.endpoint_url("chat/completions").expect("endpoint");
         assert_eq!(url.as_str(), "https://api.example.com/chat/completions");

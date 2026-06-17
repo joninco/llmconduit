@@ -15,6 +15,7 @@ eventsource-stream = "0.2"
 futures = "0.3"
 hex = "0.4"
 http = "1"
+regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

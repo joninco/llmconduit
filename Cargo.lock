@@ -1045,6 +1045,7 @@ dependencies = [
  "http",
  "http-body-util",
  "pretty_assertions",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

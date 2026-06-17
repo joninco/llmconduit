@@ -184,6 +184,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         flatten_content: existing.flatten_content,
         max_replay_entries: existing.max_replay_entries,
         debug_log_max_age_hours: existing.debug_log_max_age_hours,
+        min_completion_tokens: existing.min_completion_tokens,
     };
 
     let should_write = Confirm::with_theme(&theme)

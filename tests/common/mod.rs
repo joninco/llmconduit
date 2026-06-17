@@ -183,6 +183,7 @@ pub fn test_config() -> Config {
         flatten_content: true,
         max_replay_entries: 1000,
         debug_log_max_age_hours: None,
+        min_completion_tokens: 4096,
     }
 }
 

@@ -12,6 +12,16 @@ pub struct AppError {
     pub status: StatusCode,
     pub message: String,
     pub client_message: String,
+    /// Whether the multi-provider `FailoverUpstreamClient` may treat this error
+    /// as a provider failure and retry the request on the next provider.
+    ///
+    /// Defaults to `true`. A context-window overflow that persists *after* the
+    /// leaf client's single shrink-and-retry is a same-provider concern, not a
+    /// provider failure, so it is surfaced with this set to `false` so failover/
+    /// routing returns it terminally instead of hammering another provider with
+    /// the same oversized prompt (see `AGENTS.md`: context-overflow is a
+    /// same-provider shrink-and-retry, not a failover trigger).
+    pub failover_eligible: bool,
 }
 
 impl AppError {
@@ -21,6 +31,7 @@ impl AppError {
             status: StatusCode::BAD_REQUEST,
             client_message: msg.clone(),
             message: msg,
+            failover_eligible: true,
         }
     }
 
@@ -30,6 +41,7 @@ impl AppError {
             status: StatusCode::CONFLICT,
             client_message: msg.clone(),
             message: msg,
+            failover_eligible: true,
         }
     }
 
@@ -39,6 +51,17 @@ impl AppError {
             status: StatusCode::BAD_GATEWAY,
             client_message: msg.clone(),
             message: msg,
+            failover_eligible: true,
+        }
+    }
+
+    /// An upstream error that must NOT trigger cross-provider failover. Used for
+    /// a context-window overflow that persists after the leaf shrink-and-retry:
+    /// trying another provider with the same prompt would just overflow again.
+    pub fn upstream_terminal(message: impl Into<String>) -> Self {
+        Self {
+            failover_eligible: false,
+            ..Self::upstream(message)
         }
     }
 
@@ -47,6 +70,7 @@ impl AppError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
             client_message: "internal server error".to_string(),
+            failover_eligible: true,
         }
     }
 
@@ -55,6 +79,7 @@ impl AppError {
             status: StatusCode::from_u16(499).expect("valid status code"),
             message: "client disconnected".to_string(),
             client_message: "client disconnected".to_string(),
+            failover_eligible: true,
         }
     }
 
@@ -64,6 +89,13 @@ impl AppError {
 
     pub fn status_code(&self) -> StatusCode {
         self.status
+    }
+
+    /// True when the multi-provider failover client may retry this error on the
+    /// next provider. False for terminal same-provider errors (e.g. a context
+    /// overflow that survived the leaf shrink-and-retry).
+    pub fn is_failover_eligible(&self) -> bool {
+        self.failover_eligible
     }
 }
 

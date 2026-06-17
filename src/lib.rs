@@ -76,6 +76,7 @@ pub fn build_app_with_gateway_and_options(
                     provider.upstream_api_key.clone(),
                     provider.upstream_request_log_path.clone(),
                     config.flatten_content,
+                    config.min_completion_tokens,
                 );
                 let fallback_providers = provider
                     .fallback_upstreams
@@ -89,6 +90,7 @@ pub fn build_app_with_gateway_and_options(
                                 fallback.upstream_api_key.clone(),
                                 fallback.upstream_request_log_path.clone(),
                                 config.flatten_content,
+                                config.min_completion_tokens,
                             ),
                             fallback.upstream_model.clone(),
                             fallback.exposed_model.clone(),
@@ -114,6 +116,7 @@ pub fn build_app_with_gateway_and_options(
             config.upstream_api_key.clone(),
             config.upstream_request_log_path.clone(),
             config.flatten_content,
+            config.min_completion_tokens,
         );
         if config.fallback_upstreams.is_empty() {
             Arc::new(primary_upstream)
@@ -134,6 +137,7 @@ pub fn build_app_with_gateway_and_options(
                         provider.upstream_api_key.clone(),
                         provider.upstream_request_log_path.clone(),
                         config.flatten_content,
+                        config.min_completion_tokens,
                     ),
                     provider.upstream_model.clone(),
                     provider.exposed_model.clone(),
