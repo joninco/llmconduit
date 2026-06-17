@@ -5,6 +5,7 @@ pub mod debug_ui;
 pub mod engine;
 pub mod error;
 pub mod http;
+pub mod log_rotation;
 pub mod models;
 pub mod monitor;
 pub mod raw;

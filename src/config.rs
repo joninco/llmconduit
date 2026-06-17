@@ -32,6 +32,7 @@ pub struct Config {
     pub max_web_search_rounds: usize,
     pub flatten_content: bool,
     pub max_replay_entries: usize,
+    pub debug_log_max_age_hours: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +183,10 @@ pub struct PersistedConfig {
     pub flatten_content: bool,
     #[serde(default = "default_max_replay_entries")]
     pub max_replay_entries: usize,
+    /// Opt-in age-based cleanup of debug/request-log dump files. `None` (the
+    /// default) disables rotation entirely so behavior is opt-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_log_max_age_hours: Option<u64>,
 }
 
 fn default_bind_addr() -> String {
@@ -247,6 +252,7 @@ impl Default for PersistedConfig {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         }
     }
 }
@@ -264,6 +270,53 @@ impl Config {
 
     pub fn connect_timeout(&self) -> Duration {
         Duration::from_secs(self.connect_timeout_secs)
+    }
+
+    /// Deduplicated parent directories of the request-log paths the running
+    /// gateway *actually writes to* for the configured mode. Used by debug-log
+    /// rotation so it only cleans directories that receive dump files, without
+    /// inventing a second log-path concept.
+    ///
+    /// This mirrors how `build_app_with_gateway_and_options` wires upstreams:
+    /// - Routing mode (`upstreams` non-empty): only the per-routing-upstream
+    ///   paths and their nested fallbacks are active. The top-level
+    ///   `upstream_request_log_path` and the global `fallback_upstreams` are
+    ///   ignored by the gateway, so they are excluded here too.
+    /// - Single/failover mode (`upstreams` empty): the top-level path plus the
+    ///   global `fallback_upstreams` paths are active.
+    pub fn debug_log_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut push_dir = |path: Option<&PathBuf>| {
+            if let Some(dir) = path.and_then(|path| path.parent()) {
+                // Treat a bare filename (no parent component) as the current dir.
+                let dir = if dir.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    dir.to_path_buf()
+                };
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        };
+
+        if self.upstreams.is_empty() {
+            // Single/failover mode: top-level primary + global fallbacks.
+            push_dir(self.upstream_request_log_path.as_ref());
+            for fallback in &self.fallback_upstreams {
+                push_dir(fallback.upstream_request_log_path.as_ref());
+            }
+        } else {
+            // Routing mode: per-routing-upstream primaries and their nested
+            // fallbacks only.
+            for upstream in &self.upstreams {
+                push_dir(upstream.upstream_request_log_path.as_ref());
+                for fallback in &upstream.fallback_upstreams {
+                    push_dir(fallback.upstream_request_log_path.as_ref());
+                }
+            }
+        }
+        dirs
     }
 
     pub fn from_persisted(config: &PersistedConfig) -> Result<Self, String> {
@@ -330,6 +383,7 @@ impl Config {
             max_web_search_rounds: config.max_web_search_rounds,
             flatten_content: config.flatten_content,
             max_replay_entries: config.max_replay_entries,
+            debug_log_max_age_hours: config.debug_log_max_age_hours,
         })
     }
 
@@ -724,6 +778,11 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.max_replay_entries = parsed;
     }
+    if let Ok(value) = env::var("LLMCONDUIT_DEBUG_LOG_MAX_AGE_HOURS")
+        && let Ok(parsed) = value.trim().parse()
+    {
+        config.debug_log_max_age_hours = Some(parsed);
+    }
 }
 
 pub fn merge_json_maps(
@@ -759,6 +818,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1093,6 +1153,7 @@ mod tests {
             max_web_search_rounds: 10,
             flatten_content: false,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: Some(48),
         };
         write_persisted_config(&path, &config).expect("write config");
         let loaded = load_persisted_config(&path).expect("load config");
@@ -1137,6 +1198,7 @@ mod tests {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         })
         .expect("config");
 
@@ -1196,6 +1258,7 @@ mod tests {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         })
         .expect("config");
 
@@ -1251,6 +1314,7 @@ mod tests {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         })
         .expect("config");
 
@@ -1328,6 +1392,7 @@ mod tests {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         })
         .expect("config");
 
@@ -1397,6 +1462,7 @@ mod tests {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         })
         .expect("config");
 
@@ -1745,6 +1811,7 @@ model_profiles:
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         })
         .expect("config");
 
@@ -1789,12 +1856,94 @@ model_profiles:
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         })
         .expect("config");
 
         assert_eq!(
             config.resolve_upstream_model("anthropic/Kimi-K2.6"),
             "anthropic-custom"
+        );
+    }
+
+    #[test]
+    fn debug_log_dirs_single_failover_mode_includes_top_level_and_global_fallbacks() {
+        // No `upstreams` => single/failover mode, matching the `upstreams`
+        // empty branch in `build_app_with_gateway_and_options`. The top-level
+        // primary path and the global fallback paths are the active log paths.
+        let config = Config::from_persisted(&PersistedConfig {
+            upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
+            fallback_upstreams: vec![PersistedFallbackUpstream {
+                upstream_base_url: "http://127.0.0.1:8001/v1".to_string(),
+                upstream_request_log_path: Some("/tmp/llmconduit-global/backup.jsonl".to_string()),
+                ..PersistedFallbackUpstream::default()
+            }],
+            ..PersistedConfig::default()
+        })
+        .expect("config");
+
+        let dirs = config.debug_log_dirs();
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/tmp/llmconduit-top"),
+                PathBuf::from("/tmp/llmconduit-global"),
+            ],
+            "single/failover mode must include the top-level and global fallback log dirs"
+        );
+    }
+
+    #[test]
+    fn debug_log_dirs_routing_mode_excludes_inactive_top_level_and_global_fallbacks() {
+        // Non-empty `upstreams` => routing mode. The gateway uses only the
+        // per-routing-upstream clients and their nested fallbacks; the
+        // top-level `upstream_request_log_path` and global `fallback_upstreams`
+        // are never written to, so they must NOT be collected for cleanup.
+        let config = Config::from_persisted(&PersistedConfig {
+            upstream_request_log_path: Some(
+                "/tmp/llmconduit-inactive-top/primary.jsonl".to_string(),
+            ),
+            fallback_upstreams: vec![PersistedFallbackUpstream {
+                upstream_base_url: "http://127.0.0.1:9001/v1".to_string(),
+                upstream_request_log_path: Some(
+                    "/tmp/llmconduit-inactive-global/backup.jsonl".to_string(),
+                ),
+                ..PersistedFallbackUpstream::default()
+            }],
+            upstreams: vec![PersistedUpstream {
+                upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+                upstream_request_log_path: Some(
+                    "/tmp/llmconduit-routing/primary.jsonl".to_string(),
+                ),
+                fallback_upstreams: vec![PersistedFallbackUpstream {
+                    upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
+                    upstream_request_log_path: Some(
+                        "/tmp/llmconduit-routing-fallback/backup.jsonl".to_string(),
+                    ),
+                    ..PersistedFallbackUpstream::default()
+                }],
+                ..PersistedUpstream::default()
+            }],
+            ..PersistedConfig::default()
+        })
+        .expect("config");
+
+        let dirs = config.debug_log_dirs();
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/tmp/llmconduit-routing"),
+                PathBuf::from("/tmp/llmconduit-routing-fallback"),
+            ],
+            "routing mode must collect only routing-upstream + nested-fallback log dirs"
+        );
+        assert!(
+            !dirs.contains(&PathBuf::from("/tmp/llmconduit-inactive-top")),
+            "routing mode must exclude the inactive top-level log dir"
+        );
+        assert!(
+            !dirs.contains(&PathBuf::from("/tmp/llmconduit-inactive-global")),
+            "routing mode must exclude the inactive global fallback log dir"
         );
     }
 }

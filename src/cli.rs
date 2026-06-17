@@ -183,6 +183,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         max_web_search_rounds: existing.max_web_search_rounds,
         flatten_content: existing.flatten_content,
         max_replay_entries: existing.max_replay_entries,
+        debug_log_max_age_hours: existing.debug_log_max_age_hours,
     };
 
     let should_write = Confirm::with_theme(&theme)

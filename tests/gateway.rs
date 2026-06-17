@@ -454,6 +454,7 @@ async fn uses_configured_upstream_model_override() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         },
     );
 
@@ -529,6 +530,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         },
     );
 
@@ -869,6 +871,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         },
     );
 
@@ -930,6 +933,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         },
     );
 
@@ -1526,6 +1530,7 @@ async fn proxies_models_endpoint_with_etag() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        debug_log_max_age_hours: None,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1590,6 +1595,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        debug_log_max_age_hours: None,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1660,6 +1666,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        debug_log_max_age_hours: None,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1733,6 +1740,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        debug_log_max_age_hours: None,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1811,6 +1819,7 @@ async fn proxies_completions_endpoint_passthrough() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        debug_log_max_age_hours: None,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -2870,6 +2879,7 @@ fn test_config() -> Config {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        debug_log_max_age_hours: None,
     }
 }
 
@@ -5539,6 +5549,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            debug_log_max_age_hours: None,
         },
         ReplayStore::new(1000),
         Arc::new(upstream.clone()),

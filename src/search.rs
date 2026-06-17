@@ -261,6 +261,7 @@ mod tests {
                 max_web_search_rounds: 5,
                 flatten_content: true,
                 max_replay_entries: 1000,
+                debug_log_max_age_hours: None,
             },
         );
 
@@ -298,6 +299,7 @@ mod tests {
                 max_web_search_rounds: 5,
                 flatten_content: true,
                 max_replay_entries: 1000,
+                debug_log_max_age_hours: None,
             },
         );
 

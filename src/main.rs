@@ -6,6 +6,7 @@ use llmconduit::cli::Commands;
 use llmconduit::cli::resolve_config_path;
 use llmconduit::cli::run_configure_flow;
 use llmconduit::config::Config;
+use llmconduit::log_rotation::spawn_cleanup;
 use llmconduit::raw::RawOutput;
 use llmconduit::request_log::analyze_request_log;
 use tokio::net::TcpListener;
@@ -47,6 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let path = resolve_config_path(config)?;
             let config = Config::from_env_and_file(Some(&path))?;
             let bind_addr = config.bind_addr;
+            run_debug_log_cleanup(&config);
             let (app, _gateway) = build_app_with_gateway_and_options(
                 config,
                 raw.then(RawOutput::stdout),
@@ -65,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let path = resolve_config_path(None)?;
             let config = Config::from_env_and_file(Some(&path))?;
             let bind_addr = config.bind_addr;
+            run_debug_log_cleanup(&config);
             let (app, _gateway) = build_app_with_gateway_and_options(config, None, app_options);
             let listener = TcpListener::bind(bind_addr).await?;
             tracing::info!("llmconduit listening on {bind_addr}");
@@ -75,6 +78,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
             Ok(())
         }
+    }
+}
+
+/// Spawn opt-in age-based cleanup of debug/request-log dump files for each
+/// configured log directory. No-op unless `debug_log_max_age_hours` is set.
+/// Cleanup runs on the blocking pool, never blocking serve startup.
+fn run_debug_log_cleanup(config: &Config) {
+    let max_age_hours = config.debug_log_max_age_hours;
+    if max_age_hours.is_none() {
+        return;
+    }
+    for dir in config.debug_log_dirs() {
+        spawn_cleanup(Some(dir), max_age_hours);
     }
 }
 
