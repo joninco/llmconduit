@@ -45,6 +45,8 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
     }
     let tool_choice = convert_tool_choice(request.tool_choice);
     let metadata = convert_metadata(request.metadata)?;
+    let reasoning =
+        apply_output_config_effort(reasoning, &request.thinking, &request.output_config);
     let text = convert_output_config(request.output_config)?;
     let max_output_tokens = request.max_tokens.map(|value| {
         i64::try_from(value)
@@ -131,6 +133,51 @@ fn convert_output_config(output_config: Option<Value>) -> AppResult<Option<TextC
             name,
         }),
     }))
+}
+
+/// Adaptive-thinking effort override.
+///
+/// Claude Code's `/effort` command rides on `output_config.effort`. When the
+/// caller leaves thinking *adaptive* (no fixed `budget_tokens`), this is the
+/// only signal for how hard to reason, so it sets the canonical
+/// `reasoning.effort`. When thinking is `enabled` the budget already pins the
+/// effort (see `convert_thinking`), so the field is ignored to avoid fighting
+/// the explicit budget; it is likewise ignored when reasoning is off. The raw
+/// effort string is passed through unvalidated — the canonical→Chat lowering
+/// (`responses_to_chat::normalize_reasoning_effort`) clamps unsupported values
+/// like `max`/`xhigh`, keeping this conversion pure and single-sourced.
+fn apply_output_config_effort(
+    reasoning: Option<ReasoningRequest>,
+    thinking: &Option<AnthropicThinking>,
+    output_config: &Option<Value>,
+) -> Option<ReasoningRequest> {
+    if !matches!(thinking, Some(AnthropicThinking::Adaptive { .. })) {
+        return reasoning;
+    }
+    let Some(effort) = output_config_effort(output_config) else {
+        return reasoning;
+    };
+    Some(ReasoningRequest {
+        effort: Some(effort),
+        summary: reasoning.and_then(|reasoning| reasoning.summary),
+    })
+}
+
+/// Pull the raw `output_config.effort` string out of the request. Any non-empty
+/// value (trimmed) passes through verbatim as canonical `reasoning.effort`;
+/// effort validation is single-sourced in
+/// `responses_to_chat::normalize_reasoning_effort`, which lowercases, clamps
+/// unsupported levels, and maps unknown values to a supported effort at lowering
+/// time. Only missing/empty/non-string values are dropped here so they cannot
+/// clobber a budget-derived effort.
+fn output_config_effort(output_config: &Option<Value>) -> Option<String> {
+    let effort = output_config
+        .as_ref()?
+        .as_object()?
+        .get("effort")?
+        .as_str()?
+        .trim();
+    (!effort.is_empty()).then(|| effort.to_string())
 }
 
 fn extract_system_text(system: &Option<AnthropicSystemContent>) -> String {

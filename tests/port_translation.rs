@@ -164,23 +164,139 @@ fn anthropic_output_config_without_format_is_noop() {
     assert!(result.text.is_none());
 }
 
-/// GAP (partial): claude-relay mapped output_config.effort + adaptive thinking
-/// onto chat_template_kwargs.reasoning_effort. llmconduit derives effort from
-/// `thinking`, and treats output_config purely as structured-output `format`.
-/// There is no effort path through output_config.
+/// claude-relay mapped output_config.effort + adaptive thinking onto
+/// chat_template_kwargs.reasoning_effort. llmconduit derives baseline effort
+/// from `thinking`, then lets `output_config.effort` override it onto canonical
+/// `reasoning.effort` while thinking is adaptive (Claude Code's `/effort`).
 #[test]
-#[ignore = "GAP: request-translation/output_config_effort_to_reasoning_effort"]
 fn anthropic_output_config_effort_maps_to_reasoning_effort() {
+    for level in ["low", "medium", "high", "max"] {
+        let result = anthropic_to_responses::convert_request(anthropic(json!({
+            "model": "claude-3",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": level}
+        })))
+        .expect("convert");
+        let effort = result.reasoning.and_then(|r| r.effort);
+        assert_eq!(
+            effort.as_deref(),
+            Some(level),
+            "adaptive thinking should adopt output_config.effort {level:?}"
+        );
+    }
+}
+
+/// Effort normalization is single-sourced in
+/// `responses_to_chat::normalize_reasoning_effort`. The adapter must NOT
+/// allow-list or clamp: case variants, surrounding whitespace, and otherwise
+/// unrecognized-but-non-empty values pass through to canonical
+/// `reasoning.effort` verbatim (trimmed) so the lowering step can normalize
+/// them. Dropping them here would silently divert to budget-derived effort.
+#[test]
+fn anthropic_output_config_effort_passes_through_raw_for_lowering() {
+    for raw in ["HIGH", " high ", "xhigh", "ultra"] {
+        let result = anthropic_to_responses::convert_request(anthropic(json!({
+            "model": "claude-3",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": raw}
+        })))
+        .expect("convert");
+        let effort = result.reasoning.and_then(|r| r.effort);
+        assert_eq!(
+            effort.as_deref(),
+            Some(raw.trim()),
+            "adapter must pass effort {raw:?} through raw (trimmed), not drop or clamp it"
+        );
+    }
+}
+
+/// An empty / whitespace-only effort string carries no signal and must be
+/// dropped so it cannot clobber a budget-derived effort.
+#[test]
+fn anthropic_output_config_effort_empty_is_dropped() {
+    let result = anthropic_to_responses::convert_request(anthropic(json!({
+        "model": "claude-3",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "adaptive", "budget_tokens": 30000},
+        "output_config": {"effort": "   "}
+    })))
+    .expect("convert");
+    let effort = result.reasoning.and_then(|r| r.effort);
+    assert_eq!(
+        effort.as_deref(),
+        Some("high"),
+        "blank effort must be ignored, leaving the budget-derived effort intact"
+    );
+}
+
+/// output_config.effort is an adaptive-thinking signal only. When thinking is
+/// disabled, effort must not synthesize reasoning out of nothing.
+#[test]
+fn anthropic_output_config_effort_ignored_without_active_thinking() {
+    let result = anthropic_to_responses::convert_request(anthropic(json!({
+        "model": "claude-3",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+        "output_config": {"effort": "high"}
+    })))
+    .expect("convert");
+    assert!(
+        result.reasoning.is_none(),
+        "no thinking block => no reasoning effort, got {:?}",
+        result.reasoning
+    );
+}
+
+/// When thinking is `enabled`, the explicit budget pins the effort; a coexisting
+/// output_config.effort must not override the budget-derived effort.
+#[test]
+fn anthropic_output_config_effort_ignored_when_thinking_enabled() {
+    let result = anthropic_to_responses::convert_request(anthropic(json!({
+        "model": "claude-3",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": {"type": "enabled", "budget_tokens": 30000},
+        "output_config": {"effort": "low"}
+    })))
+    .expect("convert");
+    let effort = result.reasoning.and_then(|r| r.effort);
+    assert_eq!(
+        effort.as_deref(),
+        Some("high"),
+        "enabled thinking keeps its budget-derived effort, ignoring output_config.effort"
+    );
+}
+
+/// effort and a json_schema format can ride in one output_config: the format
+/// still lands in `text` controls while effort drives `reasoning.effort`.
+#[test]
+fn anthropic_output_config_effort_and_format_coexist() {
     let result = anthropic_to_responses::convert_request(anthropic(json!({
         "model": "claude-3",
         "max_tokens": 64,
         "messages": [{"role": "user", "content": "hi"}],
         "thinking": {"type": "adaptive"},
-        "output_config": {"effort": "high"}
+        "output_config": {
+            "effort": "high",
+            "format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": {"type": "object", "properties": {}}
+            }
+        }
     })))
     .expect("convert");
     let effort = result.reasoning.and_then(|r| r.effort);
     assert_eq!(effort.as_deref(), Some("high"));
+    let text =
+        serde_json::to_value(result.text.expect("text controls present")).expect("serialize");
+    assert_eq!(text["format"]["type"], "json_schema");
+    assert_eq!(text["format"]["name"], "answer");
 }
 
 // ===========================================================================
