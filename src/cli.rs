@@ -175,6 +175,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         upstream_failure_cooldown_secs: existing.upstream_failure_cooldown_secs,
         model_profile_templates: existing.model_profile_templates.clone(),
         model_profiles: existing.model_profiles.clone(),
+        template_family: existing.template_family.clone(),
         brave_base_url,
         brave_api_key: (!brave_api_key.trim().is_empty()).then_some(brave_api_key),
         brave_max_results,

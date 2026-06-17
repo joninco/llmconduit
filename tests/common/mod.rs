@@ -89,6 +89,13 @@ impl UpstreamClient for MockUpstream {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<UpstreamStream, AppError> {
+        // Mirror the production leaf (`ReqwestUpstreamClient`): family-specific
+        // `chat_template_kwargs` (G2) are injected in the upstream client from
+        // the FINAL provider model, so the recorded request reflects what the
+        // backend would actually receive.
+        let mut request = request.clone();
+        llmconduit::upstream::apply_family_chat_template_kwargs(&mut request);
+        let request = &request;
         self.requests.lock().await.push(request.clone());
         let chunks = self
             .responses
@@ -184,6 +191,7 @@ pub fn test_config() -> Config {
         max_replay_entries: 1000,
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
+        template_family: None,
     }
 }
 

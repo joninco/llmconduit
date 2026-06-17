@@ -293,7 +293,15 @@ impl UpstreamClient for ReqwestUpstreamClient {
         request: &ChatCompletionRequest,
     ) -> AppResult<UpstreamStream> {
         let url = self.endpoint_url("chat/completions")?;
-        let request = sanitize_chat_request(request.clone(), self.flatten_content);
+        // Inject family-specific `chat_template_kwargs` (G2) HERE: this leaf is
+        // the single point that sees the FINAL provider model after any
+        // routing/failover/exposed-alias remap, with provider kwargs already
+        // merged by `request_for_provider`. The engine threads the
+        // `template_family` override and the client's explicit kwargs on the
+        // request; sniffing happens against `request.model`.
+        let mut request = request.clone();
+        apply_family_chat_template_kwargs(&mut request);
+        let request = sanitize_chat_request(request, self.flatten_content);
         if let Some(ref logger) = self.request_logger
             && let Err(err) = logger.log(&request).await
         {
@@ -1142,6 +1150,164 @@ fn should_failover_proxy_status(status: StatusCode) -> bool {
         || status == StatusCode::TOO_MANY_REQUESTS
 }
 
+/// Backend chat-template contract a model speaks. vLLM/SGLang expose
+/// reasoning through different `chat_template_kwargs` per model family, so we
+/// inject the right knobs (G2). Mirrors claude-relay `backend.py`.
+///
+/// Detection + injection live HERE, in the upstream client, rather than in the
+/// engine: routing/failover/exposed-alias paths rewrite the actual provider
+/// model AFTER the engine resolves its model (`request_for_provider` /
+/// `RoutingUpstreamClient::stream_chat_completion`). Sniffing the family from
+/// the engine's model would send e.g. Kimi kwargs to a DeepSeek fallback (or
+/// none to a Kimi fallback). The leaf is the single point that always sees the
+/// FINAL `request.model` with provider `upstream_chat_kwargs` already merged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModelFamily {
+    Kimi,
+    DeepSeek,
+}
+
+/// Resolve the backend family for the FINAL provider model. An explicit
+/// `template_family` override (already normalized to `kimi`/`deepseek`) wins;
+/// otherwise sniff the model id case-insensitively. The concrete provider model
+/// is authoritative — a stale configured `upstream_model`, an exposed alias, or
+/// a failover remap must not push real DeepSeek traffic through Kimi mutation
+/// (claude-relay lesson, now enforced at the layer that knows the real model).
+///
+/// Unlike claude-relay (which defaults unrecognized names to DeepSeek),
+/// llmconduit returns `None` for anything unrecognized: the gateway serves
+/// arbitrary OpenAI-compatible upstreams (glm, qwen, gpt, ...), and injecting
+/// DeepSeek `enable_thinking` into those would be a regression.
+pub(crate) fn detect_model_family(
+    resolved_model: &str,
+    family_override: Option<&str>,
+) -> Option<ModelFamily> {
+    match family_override {
+        Some("kimi") => return Some(ModelFamily::Kimi),
+        Some("deepseek") => return Some(ModelFamily::DeepSeek),
+        _ => {}
+    }
+    let name = resolved_model.to_ascii_lowercase();
+    if name.contains("kimi") {
+        Some(ModelFamily::Kimi)
+    } else if name.contains("deepseek") {
+        Some(ModelFamily::DeepSeek)
+    } else {
+        None
+    }
+}
+
+/// Inject family-specific `chat_template_kwargs` into the request `extra_body`
+/// from the FINAL provider model. Composes with (does not clobber) the
+/// already-merged configured/provider `upstream_chat_kwargs`, and re-overlays
+/// the client's explicit `chat_template_kwargs` last so an explicit request
+/// value still WINS over a forced family default. A no-op when the family is
+/// unrecognized.
+///
+/// Public so the integration test harness's mock upstream can mirror the
+/// production leaf and record the request the backend would actually receive.
+pub fn apply_family_chat_template_kwargs(request: &mut ChatCompletionRequest) {
+    let Some(family) = detect_model_family(&request.model, request.template_family.as_deref())
+    else {
+        return;
+    };
+    let reasoning_effort = request.reasoning_effort.clone();
+    let entry = request
+        .extra_body
+        .entry("chat_template_kwargs".to_string())
+        .or_insert_with(|| Value::Object(JsonMap::new()));
+    let kwargs = match entry {
+        Value::Object(kwargs) => kwargs,
+        // A non-object configured `chat_template_kwargs` is malformed; replace
+        // it with a fresh object rather than silently no-op'ing.
+        other => {
+            *other = Value::Object(JsonMap::new());
+            other.as_object_mut().expect("just set to object")
+        }
+    };
+    write_family_kwargs(kwargs, family, &reasoning_effort);
+    // Request-supplied keys win over the forced family default (AGENTS.md:
+    // request `extra_body` beats configured/injected defaults). Deep-merge so a
+    // nested client object overlays the already-merged family/provider object
+    // leaf-by-leaf (client wins on conflicts) instead of clobbering sibling keys
+    // that came from the deep-merge of configured/provider defaults.
+    if let Some(client_kwargs) = &request.client_chat_template_kwargs {
+        for (key, value) in client_kwargs {
+            match kwargs.get_mut(key) {
+                Some(existing) => merge_json_value_prefer_source(existing, value),
+                None => {
+                    kwargs.insert(key.clone(), value.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Recursively overlay `source` onto `destination`, with `source` (the
+/// client/request value) winning on conflicting leaves while sibling keys
+/// present only in `destination` are preserved. Mirror of
+/// `merge_json_value_preserve_destination` with the precedence flipped.
+fn merge_json_value_prefer_source(destination: &mut Value, source: &Value) {
+    if let Value::Object(destination_object) = destination
+        && let Value::Object(source_object) = source
+    {
+        for (key, source_value) in source_object {
+            match destination_object.get_mut(key) {
+                Some(destination_value) => {
+                    merge_json_value_prefer_source(destination_value, source_value);
+                }
+                None => {
+                    destination_object.insert(key.clone(), source_value.clone());
+                }
+            }
+        }
+        return;
+    }
+    *destination = source.clone();
+}
+
+fn write_family_kwargs(
+    kwargs: &mut JsonMap<String, Value>,
+    family: ModelFamily,
+    reasoning_effort: &Option<String>,
+) {
+    match family {
+        ModelFamily::Kimi => {
+            // Kimi K2 templates read `thinking`/`preserve_thinking` (bools),
+            // NOT the DeepSeek vars. Strip the DeepSeek-only keys so a stale
+            // configured default for the wrong family can't leak through.
+            for key in ["enable_thinking", "clear_thinking", "reasoning_effort"] {
+                kwargs.remove(key);
+            }
+            // Force thinking ON unconditionally — even when the client did not
+            // request reasoning. With `thinking=false` the vLLM kimi parser
+            // falls through to the identity parser and leaks the raw chain of
+            // thought (plus a stray `</think>`) into `content`. `thinking=true`
+            // routes it to `delta.reasoning`, where the response-side handling
+            // decides whether the client actually sees it. This intentionally
+            // OVERRIDES a configured default; an explicit request
+            // `chat_template_kwargs.thinking` still wins (re-overlaid after).
+            kwargs.insert("thinking".to_string(), Value::Bool(true));
+            kwargs.insert("preserve_thinking".to_string(), Value::Bool(true));
+        }
+        ModelFamily::DeepSeek => {
+            // DeepSeek reads `enable_thinking` (+ `reasoning_effort`). Use
+            // setdefault semantics: respect any configured default, and don't
+            // fight the separately-handled top-level `reasoning_effort`.
+            kwargs.entry("enable_thinking").or_insert(Value::Bool(true));
+            if let Some(effort) = reasoning_effort
+                .as_deref()
+                .map(str::trim)
+                .filter(|effort| !effort.is_empty())
+            {
+                kwargs
+                    .entry("reasoning_effort")
+                    .or_insert_with(|| Value::String(effort.to_string()));
+            }
+        }
+    }
+}
+
 fn merge_fallback_chat_kwargs(
     request: &mut ChatCompletionRequest,
     defaults: &JsonMap<String, Value>,
@@ -1841,6 +2007,267 @@ mod tests {
         );
     }
 
+    // --- G2: family detection + chat_template_kwargs injection at the leaf ---
+
+    use super::FailoverUpstreamClient;
+    use super::FailoverUpstreamProvider;
+    use super::ModelFamily;
+    use super::apply_family_chat_template_kwargs;
+    use super::detect_model_family;
+    use super::write_family_kwargs;
+    use serde_json::Map as JsonMap;
+    use serde_json::json;
+
+    /// Minimal request for family-injection tests. `model` is the FINAL provider
+    /// model the leaf sees (after any routing/failover/alias rewrite).
+    fn family_request(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.to_string(),
+            messages: Vec::new(),
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: false,
+            reasoning_effort: None,
+            response_format: None,
+            stream_options: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            extra_body: BTreeMap::new(),
+            template_family: None,
+            client_chat_template_kwargs: None,
+        }
+    }
+
+    fn kwargs_of(request: &ChatCompletionRequest) -> &serde_json::Map<String, Value> {
+        request.extra_body["chat_template_kwargs"]
+            .as_object()
+            .expect("chat_template_kwargs object")
+    }
+
+    #[test]
+    fn detect_family_sniffs_resolved_model_case_insensitively() {
+        assert_eq!(
+            detect_model_family("kimi-k2-instruct", None),
+            Some(ModelFamily::Kimi)
+        );
+        assert_eq!(
+            detect_model_family("Moonshot-KIMI-K2", None),
+            Some(ModelFamily::Kimi)
+        );
+        assert_eq!(
+            detect_model_family("DeepSeek-V3", None),
+            Some(ModelFamily::DeepSeek)
+        );
+        assert_eq!(detect_model_family("glm-5.1", None), None);
+        assert_eq!(detect_model_family("gpt-4o", None), None);
+    }
+
+    #[test]
+    fn detect_family_override_beats_model_name() {
+        assert_eq!(
+            detect_model_family("glm-5.1", Some("kimi")),
+            Some(ModelFamily::Kimi)
+        );
+        assert_eq!(
+            detect_model_family("kimi-k2", Some("deepseek")),
+            Some(ModelFamily::DeepSeek)
+        );
+        // An unrecognized override falls through to name sniffing.
+        assert_eq!(
+            detect_model_family("kimi-k2", Some("bogus")),
+            Some(ModelFamily::Kimi)
+        );
+    }
+
+    #[test]
+    fn write_kimi_kwargs_forces_thinking_and_strips_deepseek_keys() {
+        let mut kwargs = JsonMap::new();
+        kwargs.insert("enable_thinking".to_string(), json!(true));
+        kwargs.insert("clear_thinking".to_string(), json!(true));
+        kwargs.insert("reasoning_effort".to_string(), json!("low"));
+        kwargs.insert("keep_me".to_string(), json!(1));
+        write_family_kwargs(&mut kwargs, ModelFamily::Kimi, &Some("high".to_string()));
+        assert_eq!(kwargs["thinking"], json!(true));
+        assert_eq!(kwargs["preserve_thinking"], json!(true));
+        assert!(!kwargs.contains_key("enable_thinking"));
+        assert!(!kwargs.contains_key("clear_thinking"));
+        assert!(!kwargs.contains_key("reasoning_effort"));
+        assert_eq!(kwargs["keep_me"], json!(1));
+    }
+
+    #[test]
+    fn write_deepseek_kwargs_setdefaults_enable_thinking_and_effort() {
+        let mut kwargs = JsonMap::new();
+        write_family_kwargs(
+            &mut kwargs,
+            ModelFamily::DeepSeek,
+            &Some("high".to_string()),
+        );
+        assert_eq!(kwargs["enable_thinking"], json!(true));
+        assert_eq!(kwargs["reasoning_effort"], json!("high"));
+
+        let mut kwargs = JsonMap::new();
+        kwargs.insert("enable_thinking".to_string(), json!(false));
+        kwargs.insert("reasoning_effort".to_string(), json!("low"));
+        write_family_kwargs(
+            &mut kwargs,
+            ModelFamily::DeepSeek,
+            &Some("high".to_string()),
+        );
+        assert_eq!(kwargs["enable_thinking"], json!(false));
+        assert_eq!(kwargs["reasoning_effort"], json!("low"));
+
+        let mut kwargs = JsonMap::new();
+        write_family_kwargs(&mut kwargs, ModelFamily::DeepSeek, &None);
+        assert_eq!(kwargs["enable_thinking"], json!(true));
+        assert!(!kwargs.contains_key("reasoning_effort"));
+    }
+
+    /// Finding 1: the FINAL provider model drives the family. A request that a
+    /// failover/exposed-alias path rewrote to a Kimi model gets Kimi kwargs for
+    /// THAT provider, even though the engine never saw "kimi".
+    #[test]
+    fn kimi_final_provider_model_gets_kimi_kwargs() {
+        let mut request = family_request("kimi-k2-instruct");
+        apply_family_chat_template_kwargs(&mut request);
+        let kwargs = kwargs_of(&request);
+        assert_eq!(kwargs["thinking"], json!(true));
+        assert_eq!(kwargs["preserve_thinking"], json!(true));
+    }
+
+    /// Finding 1 (negative): a DeepSeek FINAL provider model does NOT get the
+    /// Kimi `thinking` knob — the wrong-family kwargs cannot leak across.
+    #[test]
+    fn deepseek_final_provider_model_does_not_get_kimi_kwargs() {
+        let mut request = family_request("deepseek-v3");
+        request.reasoning_effort = Some("high".to_string());
+        apply_family_chat_template_kwargs(&mut request);
+        let kwargs = kwargs_of(&request);
+        assert_eq!(kwargs["enable_thinking"], json!(true));
+        assert_eq!(kwargs["reasoning_effort"], json!("high"));
+        assert!(
+            kwargs.get("thinking").is_none(),
+            "DeepSeek must not carry the Kimi `thinking` key"
+        );
+    }
+
+    /// Finding 1 end-to-end through `request_for_provider`: a failover provider
+    /// that remaps the model to Kimi AND carries its own `upstream_chat_kwargs`
+    /// produces a request that, once the leaf injects, has BOTH the merged
+    /// provider kwarg and the Kimi family knobs (deep-merge, not clobber).
+    #[test]
+    fn request_for_provider_kimi_remap_then_inject_deep_merges() {
+        let mut provider_kwargs = JsonMap::new();
+        provider_kwargs.insert(
+            "chat_template_kwargs".to_string(),
+            json!({ "configured_only": true }),
+        );
+        let provider = FailoverUpstreamProvider::new(
+            "kimi-fallback",
+            ReqwestUpstreamClient::new(
+                reqwest::Client::new(),
+                url::Url::parse("https://example.invalid/v1").expect("url"),
+                None,
+                None,
+                true,
+                4096,
+            ),
+            Some("kimi-k2-instruct".to_string()),
+            None,
+            provider_kwargs,
+        );
+        // Engine-level request still names a non-Kimi model; the provider remaps.
+        let base = family_request("glm-5.1");
+        let mut provider_request = FailoverUpstreamClient::request_for_provider(&provider, &base);
+        assert_eq!(provider_request.model, "kimi-k2-instruct");
+        // Leaf injects family from the FINAL (remapped) model.
+        apply_family_chat_template_kwargs(&mut provider_request);
+        let kwargs = kwargs_of(&provider_request);
+        assert_eq!(kwargs["thinking"], json!(true));
+        assert_eq!(kwargs["preserve_thinking"], json!(true));
+        assert_eq!(kwargs["configured_only"], json!(true));
+    }
+
+    /// Finding 1: an explicit client `chat_template_kwargs` value still WINS
+    /// over the forced family default, while non-conflicting forced keys remain.
+    #[test]
+    fn client_chat_template_kwargs_win_over_forced_family_default() {
+        let mut request = family_request("kimi-k2");
+        request.client_chat_template_kwargs = Some(
+            json!({ "thinking": false, "custom": 1 })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        // The engine bakes the client value into extra_body; mirror that.
+        request.extra_body.insert(
+            "chat_template_kwargs".to_string(),
+            json!({ "thinking": false, "custom": 1 }),
+        );
+        apply_family_chat_template_kwargs(&mut request);
+        let kwargs = kwargs_of(&request);
+        assert_eq!(kwargs["thinking"], json!(false), "client value wins");
+        assert_eq!(kwargs["custom"], json!(1));
+        assert_eq!(kwargs["preserve_thinking"], json!(true));
+    }
+
+    /// Finding 2: the client `chat_template_kwargs` re-overlay must DEEP-merge
+    /// over the already-deep-merged family/provider object. A nested client
+    /// object wins ONLY on its conflicting leaf; sibling keys placed there by the
+    /// configured/provider deep-merge survive (a shallow `insert` would clobber
+    /// the whole nested object and drop those siblings).
+    #[test]
+    fn client_kwargs_deep_merge_preserves_sibling_keys() {
+        let mut request = family_request("kimi-k2-instruct");
+        // Configured/provider deep-merge already produced a nested object with
+        // two siblings under `mm_processor_kwargs`.
+        request.extra_body.insert(
+            "chat_template_kwargs".to_string(),
+            json!({ "mm_processor_kwargs": { "from_config": true, "shared": "config" } }),
+        );
+        // The client only overrides ONE nested leaf and adds a new nested key.
+        request.client_chat_template_kwargs = Some(
+            json!({ "mm_processor_kwargs": { "shared": "client", "from_client": 1 } })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        apply_family_chat_template_kwargs(&mut request);
+        let nested = kwargs_of(&request)["mm_processor_kwargs"]
+            .as_object()
+            .expect("nested object survives deep-merge");
+        assert_eq!(
+            nested["shared"],
+            json!("client"),
+            "client wins the conflict"
+        );
+        assert_eq!(
+            nested["from_config"],
+            json!(true),
+            "sibling key from the config deep-merge must survive"
+        );
+        assert_eq!(
+            nested["from_client"],
+            json!(1),
+            "client adds new nested key"
+        );
+        // Forced family knobs still applied alongside the nested object.
+        assert_eq!(kwargs_of(&request)["thinking"], json!(true));
+    }
+
+    /// Unrecognized family => no injection at all.
+    #[test]
+    fn unrecognized_final_model_injects_nothing() {
+        let mut request = family_request("glm-5.1");
+        apply_family_chat_template_kwargs(&mut request);
+        assert!(!request.extra_body.contains_key("chat_template_kwargs"));
+    }
+
     #[test]
     fn normalize_sparse_tool_call_types_fills_chat_function_type() {
         let mut value = serde_json::json!({
@@ -1942,6 +2369,8 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: BTreeMap::new(),
+            template_family: None,
+            client_chat_template_kwargs: None,
         };
 
         let sanitized = sanitize_chat_request(request, true);
@@ -1977,6 +2406,8 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: BTreeMap::new(),
+            template_family: None,
+            client_chat_template_kwargs: None,
         };
 
         let sanitized = sanitize_chat_request(request, true);
@@ -2010,6 +2441,8 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: BTreeMap::new(),
+            template_family: None,
+            client_chat_template_kwargs: None,
         };
 
         let sanitized_none = sanitize_chat_request(make("none"), true);
@@ -2052,6 +2485,8 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: BTreeMap::new(),
+            template_family: None,
+            client_chat_template_kwargs: None,
         };
 
         let sanitized = sanitize_chat_request(request, true);
@@ -2096,6 +2531,8 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: BTreeMap::new(),
+            template_family: None,
+            client_chat_template_kwargs: None,
         };
 
         let sanitized = sanitize_chat_request(request, true);
@@ -2184,6 +2621,8 @@ mod tests {
                 presence_penalty: None,
                 stop: None,
                 extra_body: BTreeMap::new(),
+                template_family: None,
+                client_chat_template_kwargs: None,
             },
             true,
         );

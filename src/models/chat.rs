@@ -47,6 +47,17 @@ pub struct ChatCompletionRequest {
     pub stop: Option<Vec<String>>,
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
     pub extra_body: BTreeMap<String, Value>,
+    /// Backend chat-template family override (G2), normalized to
+    /// `kimi`/`deepseek`. Threaded from the engine to the upstream client where
+    /// the FINAL per-provider model is known; never serialized to the wire.
+    #[serde(skip)]
+    pub template_family: Option<String>,
+    /// The client's explicitly-requested `chat_template_kwargs` (from the
+    /// inbound request `extra_body`). Family injection at the upstream layer
+    /// re-overlays these so an explicit client value still WINS over a forced
+    /// family default. Never serialized to the wire.
+    #[serde(skip)]
+    pub client_chat_template_kwargs: Option<serde_json::Map<String, Value>>,
 }
 
 pub(crate) fn deserialize_model<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -548,6 +559,8 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: Default::default(),
+            template_family: None,
+            client_chat_template_kwargs: None,
         };
 
         let value = serde_json::to_value(request).expect("serialize");
@@ -578,6 +591,8 @@ mod tests {
             presence_penalty: None,
             stop: Some(vec!["</decision>".to_string()]),
             extra_body: Default::default(),
+            template_family: None,
+            client_chat_template_kwargs: None,
         };
 
         let value = serde_json::to_value(&request).expect("serialize");

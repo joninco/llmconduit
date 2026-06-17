@@ -118,6 +118,24 @@ impl UpstreamModelCatalog {
     }
 }
 
+/// Whether a Chat-Completions inbound request asked for reasoning, either via
+/// the top-level `reasoning_effort` field or an explicit thinking knob in
+/// `chat_template_kwargs` (`thinking` / `enable_thinking`). When true, forced
+/// family reasoning is NOT considered "unrequested" and Chat output is left
+/// untouched.
+fn chat_request_requested_reasoning(request: &ChatCompletionRequest) -> bool {
+    if request.reasoning_effort.is_some() {
+        return true;
+    }
+    request
+        .extra_body
+        .get("chat_template_kwargs")
+        .and_then(Value::as_object)
+        .is_some_and(|kwargs| {
+            kwargs.contains_key("thinking") || kwargs.contains_key("enable_thinking")
+        })
+}
+
 fn build_upstream_extra_body(
     defaults: serde_json::Map<String, Value>,
     request: &ResponsesRequest,
@@ -247,6 +265,24 @@ impl Gateway {
     pub async fn resolve_request_model(&self, request_model: &str) -> String {
         let configured_model = self.config.resolve_upstream_model(request_model);
         self.normalize_upstream_model(&configured_model).await
+    }
+
+    /// Decide whether the Chat output converter must suppress
+    /// `reasoning_content` for this inbound request. We suppress whenever the
+    /// inbound Chat client did NOT request reasoning, for ALL models and
+    /// independent of the backend family (G2, Finding 1). Cross-family
+    /// routing/failover means the engine-resolved family is not a reliable proxy
+    /// for what the backend will actually emit, so the decision is computed
+    /// purely from the inbound request at the HTTP boundary: a Chat client that
+    /// never asked for reasoning must never receive server-side chain-of-thought
+    /// (AGENTS.md: do not leak server-side internals to Chat).
+    ///
+    /// The client is considered to have requested reasoning if it sent
+    /// `reasoning_effort` OR explicitly set a thinking knob (`thinking` /
+    /// `enable_thinking`) in its `chat_template_kwargs` — in those cases
+    /// `reasoning_content` is surfaced unchanged.
+    pub fn chat_reasoning_suppressed(&self, request: &ChatCompletionRequest) -> bool {
+        !chat_request_requested_reasoning(request)
     }
 
     pub fn subscribe_monitor(
@@ -690,6 +726,21 @@ impl Gateway {
         let mut current_tool_choice = request.tool_choice.clone();
         #[allow(unused_assignments)]
         let mut last_finish_reason: Option<String> = None;
+        // Family-specific `chat_template_kwargs` are injected LATER, in the
+        // upstream client, against the FINAL per-provider model (G2 cross-layer
+        // fix): routing/failover/exposed-alias paths rewrite the actual provider
+        // model after this point, so the engine cannot know the real family
+        // here. We thread the configured `template_family` override and the
+        // client's explicit `chat_template_kwargs` (so a client value still wins
+        // over a forced family default) down for the upstream layer to apply.
+        let template_family_override = self
+            .config
+            .resolve_template_family(&request.model, &upstream_model);
+        let client_chat_template_kwargs = request
+            .extra_body
+            .get("chat_template_kwargs")
+            .and_then(Value::as_object)
+            .cloned();
         let upstream_extra_body = build_upstream_extra_body(
             self.config
                 .resolve_upstream_chat_kwargs_for_resolved_model(&request.model, &upstream_model),
@@ -723,6 +774,8 @@ impl Gateway {
                 presence_penalty: request.presence_penalty,
                 stop: normalized_stop.clone(),
                 extra_body: upstream_extra_body.clone(),
+                template_family: template_family_override.clone(),
+                client_chat_template_kwargs: client_chat_template_kwargs.clone(),
             };
             if self.monitor.is_enabled() {
                 let upstream_debug_request =
@@ -2105,6 +2158,10 @@ mod tests {
             "internal server error"
         );
     }
+
+    // G2 model-family detection + `chat_template_kwargs` injection now lives in
+    // the upstream client (it must run against the FINAL per-provider model,
+    // which routing/failover only know there). See `src/upstream.rs` tests.
 }
 
 fn extract_web_search_query(

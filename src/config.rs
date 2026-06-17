@@ -24,6 +24,10 @@ pub struct Config {
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
     pub upstream_failure_cooldown_secs: u64,
     pub model_profiles: BTreeMap<String, ModelProfile>,
+    /// Forces the backend chat-template contract (`kimi`/`deepseek`) regardless
+    /// of the model name, when family auto-detection from the model id is wrong
+    /// (G2). Profile-level `template_family` overrides this global value.
+    pub template_family: Option<String>,
     pub brave_base_url: Url,
     pub brave_api_key: Option<String>,
     pub brave_max_results: usize,
@@ -59,6 +63,8 @@ pub struct PersistedModelProfile {
     pub upstream_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_family: Option<String>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
 }
@@ -77,6 +83,8 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             #[serde(default)]
             system_prompt_prefix: Option<String>,
             #[serde(default)]
+            template_family: Option<String>,
+            #[serde(default)]
             upstream_chat_kwargs: JsonMap<String, JsonValue>,
             #[serde(default, flatten)]
             shorthand_upstream_chat_kwargs: JsonMap<String, JsonValue>,
@@ -84,11 +92,16 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
 
         let raw = RawPersistedModelProfile::deserialize(deserializer)?;
         let mut upstream_chat_kwargs = raw.shorthand_upstream_chat_kwargs;
+        // `template_family` is a recognized profile knob, not a chat-template
+        // shorthand kwarg, so drop any copy the `flatten` swept into the
+        // shorthand bucket (it lives in its own typed field).
+        upstream_chat_kwargs.remove("template_family");
         merge_json_maps(&mut upstream_chat_kwargs, &raw.upstream_chat_kwargs);
         Ok(Self {
             extends: raw.extends,
             upstream_model: raw.upstream_model,
             system_prompt_prefix: raw.system_prompt_prefix,
+            template_family: raw.template_family,
             upstream_chat_kwargs,
         })
     }
@@ -98,6 +111,7 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
 pub struct ModelProfile {
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
+    pub template_family: Option<String>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
 }
 
@@ -172,6 +186,10 @@ pub struct PersistedConfig {
     pub model_profile_templates: BTreeMap<String, PersistedModelProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_profiles: BTreeMap<String, PersistedModelProfile>,
+    /// Global override for the backend chat-template family (`kimi`/`deepseek`).
+    /// A matched model profile's `template_family` takes precedence (G2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_family: Option<String>,
     #[serde(default = "default_brave_base_url")]
     pub brave_base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,6 +273,7 @@ impl Default for PersistedConfig {
             upstream_failure_cooldown_secs: default_upstream_failure_cooldown_secs(),
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::new(),
+            template_family: None,
             brave_base_url: default_brave_base_url(),
             brave_api_key: None,
             brave_max_results: default_brave_max_results(),
@@ -383,6 +402,7 @@ impl Config {
             fallback_upstreams,
             upstream_failure_cooldown_secs: config.upstream_failure_cooldown_secs,
             model_profiles,
+            template_family: normalize_template_family(config.template_family.as_deref()),
             brave_base_url,
             brave_api_key: config
                 .brave_api_key
@@ -422,6 +442,23 @@ impl Config {
             merge_json_maps(&mut kwargs, &profile.upstream_chat_kwargs);
         }
         kwargs
+    }
+
+    /// Resolve an explicit backend chat-template family override for this
+    /// turn (G2). The most-specific matched model profile wins, then the
+    /// global `template_family`. Returns `None` when no override applies, in
+    /// which case the engine sniffs the resolved model id instead. Values are
+    /// already normalized to `kimi`/`deepseek` at construction time.
+    pub fn resolve_template_family(
+        &self,
+        request_model: &str,
+        resolved_model: &str,
+    ) -> Option<String> {
+        self.model_profiles_for_resolved_model(request_model, resolved_model)
+            .into_iter()
+            .rev()
+            .find_map(|profile| profile.template_family.clone())
+            .or_else(|| self.template_family.clone())
     }
 
     pub fn resolve_system_prompt_prefix(&self, request_model: &str) -> Option<String> {
@@ -479,6 +516,7 @@ impl Config {
 struct ResolvedModelProfile {
     upstream_model: Option<String>,
     system_prompt_prefixes: Vec<String>,
+    template_family: Option<String>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
 }
 
@@ -487,6 +525,7 @@ impl ResolvedModelProfile {
         ModelProfile {
             upstream_model: self.upstream_model,
             system_prompt_prefix: join_prompt_prefixes(self.system_prompt_prefixes),
+            template_family: normalize_template_family(self.template_family.as_deref()),
             upstream_chat_kwargs: self.upstream_chat_kwargs,
         }
     }
@@ -550,6 +589,9 @@ fn merge_resolved_model_profile(
     if source.upstream_model.is_some() {
         destination.upstream_model = source.upstream_model;
     }
+    if source.template_family.is_some() {
+        destination.template_family = source.template_family;
+    }
     destination
         .system_prompt_prefixes
         .extend(source.system_prompt_prefixes);
@@ -565,6 +607,9 @@ fn merge_persisted_model_profile(
 ) {
     if let Some(upstream_model) = trim_nonempty(source.upstream_model.as_deref()) {
         destination.upstream_model = Some(upstream_model);
+    }
+    if let Some(template_family) = trim_nonempty(source.template_family.as_deref()) {
+        destination.template_family = Some(template_family);
     }
     if let Some(system_prompt_prefix) = trim_nonempty(source.system_prompt_prefix.as_deref()) {
         destination
@@ -655,6 +700,18 @@ fn trim_nonempty(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+/// Canonicalize a configured `template_family` override to the lowercase forms
+/// the family detector understands. Unrecognized / blank values resolve to
+/// `None` so a typo silently falls back to name-based auto-detection rather
+/// than forcing the wrong contract.
+fn normalize_template_family(value: Option<&str>) -> Option<String> {
+    match trim_nonempty(value)?.to_ascii_lowercase().as_str() {
+        "kimi" => Some("kimi".to_string()),
+        "deepseek" => Some("deepseek".to_string()),
+        _ => None,
+    }
+}
+
 pub fn default_config_path() -> Result<PathBuf, String> {
     let config_dir = dirs::config_dir()
         .ok_or_else(|| "unable to determine configuration directory".to_string())?;
@@ -729,6 +786,11 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
         && !value.trim().is_empty()
     {
         config.upstream_model = Some(value);
+    }
+    if let Ok(value) = env::var("LLMCONDUIT_TEMPLATE_FAMILY")
+        && !value.trim().is_empty()
+    {
+        config.template_family = Some(value);
     }
     if let Ok(value) = env::var("LLMCONDUIT_SYSTEM_PROMPT_PREFIX")
         && !value.trim().is_empty()
@@ -1104,6 +1166,24 @@ mod tests {
     }
 
     #[test]
+    fn apply_env_overrides_template_family() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLMCONDUIT_TEMPLATE_FAMILY", "deepseek");
+        }
+        let mut config = PersistedConfig::default();
+        apply_env_overrides(&mut config);
+        // Env sets the raw persisted value; normalization happens in
+        // `from_persisted`.
+        assert_eq!(config.template_family, Some("deepseek".to_string()));
+        let resolved = Config::from_persisted(&config).expect("config");
+        assert_eq!(resolved.template_family, Some("deepseek".to_string()));
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_TEMPLATE_FAMILY");
+        };
+    }
+
+    #[test]
     fn apply_env_overrides_upstream_failure_cooldown() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
@@ -1147,6 +1227,7 @@ mod tests {
                         "stream_reasoning".to_string(),
                         JsonValue::Bool(true),
                     )]),
+                    template_family: None,
                 },
             )]),
             model_profiles: BTreeMap::from_iter([(
@@ -1162,6 +1243,7 @@ mod tests {
                             "preserve_thinking": true
                         }),
                     )]),
+                    template_family: None,
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1174,6 +1256,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: Some(48),
             min_completion_tokens: 4096,
+            template_family: None,
         };
         write_persisted_config(&path, &config).expect("write config");
         let loaded = load_persisted_config(&path).expect("load config");
@@ -1208,6 +1291,7 @@ mod tests {
                             "preserve_thinking": true
                         }),
                     )]),
+                    template_family: None,
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1220,6 +1304,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            template_family: None,
         })
         .expect("config");
 
@@ -1237,6 +1322,71 @@ mod tests {
                 }),
             )])
         );
+    }
+
+    /// Build a `PersistedModelProfile` with only a `template_family` set.
+    fn profile_with_family(family: &str) -> PersistedModelProfile {
+        PersistedModelProfile {
+            template_family: Some(family.to_string()),
+            ..PersistedModelProfile::default()
+        }
+    }
+
+    #[test]
+    fn resolves_template_family_override_from_profile_and_global() {
+        let config = Config::from_persisted(&PersistedConfig {
+            template_family: Some("deepseek".to_string()),
+            model_profiles: BTreeMap::from_iter([(
+                "Kimi-Route".to_string(),
+                profile_with_family("KIMI"),
+            )]),
+            ..PersistedConfig::default()
+        })
+        .expect("config");
+
+        // Profile match (case-insensitive on the profile key) -> normalized
+        // profile family wins over the global override.
+        assert_eq!(
+            config.resolve_template_family("kimi-route", "kimi-route"),
+            Some("kimi".to_string())
+        );
+        // No profile match -> the global override applies.
+        assert_eq!(
+            config.resolve_template_family("other", "other"),
+            Some("deepseek".to_string())
+        );
+    }
+
+    #[test]
+    fn template_family_normalizes_and_rejects_unknown_values() {
+        // Unknown/blank override values normalize to None (fall back to name
+        // sniffing) rather than forcing a wrong contract.
+        let config = Config::from_persisted(&PersistedConfig {
+            template_family: Some("  Bogus ".to_string()),
+            ..PersistedConfig::default()
+        })
+        .expect("config");
+        assert_eq!(config.template_family, None);
+        assert_eq!(config.resolve_template_family("m", "m"), None);
+
+        // A recognized value is canonicalized to lowercase.
+        let config = Config::from_persisted(&PersistedConfig {
+            template_family: Some("KIMI".to_string()),
+            ..PersistedConfig::default()
+        })
+        .expect("config");
+        assert_eq!(config.template_family, Some("kimi".to_string()));
+    }
+
+    #[test]
+    fn profile_template_family_shorthand_does_not_leak_into_chat_kwargs() {
+        // `template_family` provided as a YAML shorthand key must land in the
+        // typed field, not the flattened chat-template kwargs bucket.
+        let profile: PersistedModelProfile =
+            serde_yaml::from_str("template_family: kimi\nthinking: true\n").expect("profile");
+        assert_eq!(profile.template_family, Some("kimi".to_string()));
+        assert!(!profile.upstream_chat_kwargs.contains_key("template_family"));
+        assert_eq!(profile.upstream_chat_kwargs["thinking"], json!(true));
     }
 
     #[test]
@@ -1269,6 +1419,7 @@ mod tests {
                             }),
                         ),
                     ]),
+                    template_family: None,
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1281,6 +1432,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            template_family: None,
         })
         .expect("config");
 
@@ -1326,6 +1478,7 @@ mod tests {
                             "enabled": true
                         }),
                     )]),
+                    template_family: None,
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1338,6 +1491,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            template_family: None,
         })
         .expect("config");
 
@@ -1390,6 +1544,7 @@ mod tests {
                                 "effort": "medium"
                             }),
                         )]),
+                        template_family: None,
                     },
                 ),
                 (
@@ -1404,6 +1559,7 @@ mod tests {
                                 "effort": "high"
                             }),
                         )]),
+                        template_family: None,
                     },
                 ),
             ]),
@@ -1417,6 +1573,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            template_family: None,
         })
         .expect("config");
 
@@ -1463,6 +1620,7 @@ mod tests {
                             "stream_reasoning".to_string(),
                             JsonValue::Bool(true),
                         )]),
+                        template_family: None,
                     },
                 ),
                 (
@@ -1475,6 +1633,7 @@ mod tests {
                             "stream_reasoning".to_string(),
                             JsonValue::Bool(false),
                         )]),
+                        template_family: None,
                     },
                 ),
             ]),
@@ -1488,6 +1647,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            template_family: None,
         })
         .expect("config");
 
@@ -1513,6 +1673,7 @@ mod tests {
                     upstream_model: None,
                     system_prompt_prefix: Some("Profile prefix.".to_string()),
                     upstream_chat_kwargs: JsonMap::new(),
+                    template_family: None,
                 },
             )]),
             ..PersistedConfig::default()
@@ -1559,6 +1720,7 @@ mod tests {
                                 }),
                             ),
                         ]),
+                        template_family: None,
                     },
                 ),
                 (
@@ -1584,6 +1746,7 @@ mod tests {
                                 }),
                             ),
                         ]),
+                        template_family: None,
                     },
                 ),
             ]),
@@ -1610,6 +1773,7 @@ mod tests {
                             }),
                         ),
                     ]),
+                    template_family: None,
                 },
             )]),
             ..PersistedConfig::default()
@@ -1701,6 +1865,7 @@ model_profiles:
                     upstream_model: None,
                     system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::new(),
+                    template_family: None,
                 },
             )]),
             ..PersistedConfig::default()
@@ -1721,6 +1886,7 @@ model_profiles:
                         upstream_model: None,
                         system_prompt_prefix: None,
                         upstream_chat_kwargs: JsonMap::new(),
+                        template_family: None,
                     },
                 ),
                 (
@@ -1730,6 +1896,7 @@ model_profiles:
                         upstream_model: None,
                         system_prompt_prefix: None,
                         upstream_chat_kwargs: JsonMap::new(),
+                        template_family: None,
                     },
                 ),
             ]),
@@ -1740,6 +1907,7 @@ model_profiles:
                     upstream_model: None,
                     system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::new(),
+                    template_family: None,
                 },
             )]),
             ..PersistedConfig::default()
@@ -1838,6 +2006,7 @@ model_profiles:
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            template_family: None,
         })
         .expect("config");
 
@@ -1872,6 +2041,7 @@ model_profiles:
                     upstream_model: Some("anthropic-custom".to_string()),
                     upstream_chat_kwargs: JsonMap::new(),
                     system_prompt_prefix: None,
+                    template_family: None,
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1884,6 +2054,7 @@ model_profiles:
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            template_family: None,
         })
         .expect("config");
 
