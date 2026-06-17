@@ -792,8 +792,11 @@ async fn handle_count_tokens(
     // Mirror the generation path: the configured system-prompt prefix is part
     // of the real upstream prompt, so it must be counted here too.
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
-    let lowered =
-        crate::adapters::responses_to_chat::lower_request(&responses_request, Vec::new())?;
+    let lowered = crate::adapters::responses_to_chat::lower_request_with_default_reasoning_effort(
+        &responses_request,
+        Vec::new(),
+        &gateway.config().default_reasoning_effort,
+    )?;
     let body = serde_json::json!({
         "model": resolved_model,
         "messages": lowered.messages,

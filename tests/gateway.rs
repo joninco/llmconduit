@@ -439,6 +439,7 @@ async fn uses_configured_upstream_model_override() {
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
             upstream_model: Some("grok-4".to_string()),
+            default_reasoning_effort: "max".to_string(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -514,6 +515,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
             upstream_model: Some("alias-from-config".to_string()),
+            default_reasoning_effort: "max".to_string(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -851,6 +853,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
             upstream_model: Some("GLM-5.1".to_string()),
+            default_reasoning_effort: "max".to_string(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::from_iter([(
@@ -902,6 +905,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
+            default_reasoning_effort: "max".to_string(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1511,6 +1515,7 @@ async fn proxies_models_endpoint_with_etag() {
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
         upstream_model: None,
+        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -1575,6 +1580,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: Some("upstream-secret".to_string()),
         upstream_model: None,
+        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -1645,6 +1651,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
         upstream_model: None,
+        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -1718,6 +1725,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
         upstream_model: None,
+        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -1796,6 +1804,7 @@ async fn proxies_completions_endpoint_passthrough() {
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: Some("upstream-secret".to_string()),
         upstream_model: None,
+        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -2870,6 +2879,7 @@ fn test_config() -> Config {
         upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
         upstream_api_key: None,
         upstream_model: None,
+        default_reasoning_effort: "max".to_string(),
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         upstream_chat_kwargs: JsonMap::new(),
@@ -4559,7 +4569,7 @@ async fn anthropic_messages_streams_nested_thinking_response() {
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].stream, true);
-    assert_eq!(requests[0].reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(requests[0].reasoning_effort.as_deref(), Some("high"));
     assert!(requests[0].extra_body.is_empty());
 }
 
@@ -4693,6 +4703,7 @@ async fn anthropic_messages_forwards_output_config_as_response_format() {
         ],
         "tools": [],
         "output_config": {
+            "effort": "xhigh",
             "format": {
                 "type": "json_schema",
                 "schema": schema.clone()
@@ -4730,7 +4741,7 @@ async fn anthropic_messages_forwards_output_config_as_response_format() {
             }
         }))
     );
-    assert_eq!(requests[0].reasoning_effort, None);
+    assert_eq!(requests[0].reasoning_effort.as_deref(), Some("max"));
     assert_eq!(requests[0].tools, None);
 }
 
@@ -5539,6 +5550,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
             upstream_base_url: "http://127.0.0.1:8000/v1".parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
+            default_reasoning_effort: "max".to_string(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),

@@ -17,6 +17,7 @@ pub struct Config {
     pub upstream_base_url: Url,
     pub upstream_api_key: Option<String>,
     pub upstream_model: Option<String>,
+    pub default_reasoning_effort: String,
     pub system_prompt_prefix: Option<String>,
     pub upstream_request_log_path: Option<PathBuf>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
@@ -150,6 +151,8 @@ pub struct PersistedConfig {
     pub upstream_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
+    #[serde(default = "default_reasoning_effort")]
+    pub default_reasoning_effort: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +195,10 @@ fn default_upstream_base_url() -> String {
     "http://127.0.0.1:8000/v1".to_string()
 }
 
+pub fn default_reasoning_effort() -> String {
+    "max".to_string()
+}
+
 fn default_brave_base_url() -> String {
     "https://api.search.brave.com/res/v1".to_string()
 }
@@ -231,6 +238,7 @@ impl Default for PersistedConfig {
             upstream_base_url: default_upstream_base_url(),
             upstream_api_key: None,
             upstream_model: None,
+            default_reasoning_effort: default_reasoning_effort(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -275,6 +283,8 @@ impl Config {
             .map_err(|err| format!("invalid upstream_base_url: {err}"))?;
         let brave_base_url = Url::parse(&config.brave_base_url)
             .map_err(|err| format!("invalid brave_base_url: {err}"))?;
+        let default_reasoning_effort =
+            normalize_default_reasoning_effort(&config.default_reasoning_effort);
         let fallback_upstreams = config
             .fallback_upstreams
             .iter()
@@ -302,6 +312,7 @@ impl Config {
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
+            default_reasoning_effort,
             system_prompt_prefix: config
                 .system_prompt_prefix
                 .as_ref()
@@ -405,6 +416,13 @@ impl Config {
                 .find(|(name, _)| name.eq_ignore_ascii_case(request_model))
                 .map(|(_, profile)| profile)
         })
+    }
+}
+
+fn normalize_default_reasoning_effort(effort: &str) -> String {
+    match effort.trim().to_ascii_lowercase().as_str() {
+        "max" | "xhigh" => "max".to_string(),
+        _ => "high".to_string(),
     }
 }
 
@@ -663,6 +681,11 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.upstream_model = Some(value);
     }
+    if let Ok(value) = env::var("LLMCONDUIT_DEFAULT_REASONING_EFFORT")
+        && !value.trim().is_empty()
+    {
+        config.default_reasoning_effort = value;
+    }
     if let Ok(value) = env::var("LLMCONDUIT_SYSTEM_PROMPT_PREFIX")
         && !value.trim().is_empty()
     {
@@ -753,6 +776,7 @@ mod tests {
     use super::PersistedUpstream;
     use super::apply_env_overrides;
     use super::default_config_path;
+    use super::default_reasoning_effort;
     use super::load_persisted_config;
     use super::merge_json_maps;
     use super::write_persisted_config;
@@ -810,6 +834,26 @@ mod tests {
         };
         let result2 = Config::from_persisted(&config2).unwrap();
         assert_eq!(result2.upstream_api_key, None);
+    }
+
+    #[test]
+    fn default_reasoning_effort_defaults_to_max_and_normalizes_to_two_levels() {
+        let result = Config::from_persisted(&PersistedConfig::default()).unwrap();
+        assert_eq!(result.default_reasoning_effort, "max");
+
+        let high_config = PersistedConfig {
+            default_reasoning_effort: " low ".to_string(),
+            ..PersistedConfig::default()
+        };
+        let result = Config::from_persisted(&high_config).unwrap();
+        assert_eq!(result.default_reasoning_effort, "high");
+
+        let max_config = PersistedConfig {
+            default_reasoning_effort: " xhigh ".to_string(),
+            ..PersistedConfig::default()
+        };
+        let result = Config::from_persisted(&max_config).unwrap();
+        assert_eq!(result.default_reasoning_effort, "max");
     }
 
     #[test]
@@ -1049,6 +1093,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: Some("upstream-secret".to_string()),
             upstream_model: Some("grok-4".to_string()),
+            default_reasoning_effort: default_reasoning_effort(),
             system_prompt_prefix: Some("Global prefix.".to_string()),
             upstream_request_log_path: Some("/tmp/llmconduit-upstream.jsonl".to_string()),
             upstream_chat_kwargs: JsonMap::from_iter([(
@@ -1107,6 +1152,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
+            default_reasoning_effort: default_reasoning_effort(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1163,6 +1209,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
+            default_reasoning_effort: default_reasoning_effort(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1222,6 +1269,7 @@ mod tests {
             upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
             upstream_api_key: None,
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
+            default_reasoning_effort: default_reasoning_effort(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1282,6 +1330,7 @@ mod tests {
             upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
             upstream_api_key: None,
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
+            default_reasoning_effort: default_reasoning_effort(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1356,6 +1405,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
+            default_reasoning_effort: default_reasoning_effort(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1729,6 +1779,7 @@ model_profiles:
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
+            default_reasoning_effort: default_reasoning_effort(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1765,6 +1816,7 @@ model_profiles:
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
+            default_reasoning_effort: default_reasoning_effort(),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),

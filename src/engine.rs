@@ -3,7 +3,7 @@ use crate::adapters::chat_to_responses::ResolvedToolCall;
 use crate::adapters::chat_to_responses::StreamEmission;
 use crate::adapters::chat_to_responses::StreamState;
 use crate::adapters::responses_to_chat::ToolKind;
-use crate::adapters::responses_to_chat::lower_request;
+use crate::adapters::responses_to_chat::lower_request_with_default_reasoning_effort;
 use crate::config::Config;
 use crate::error::AppError;
 use crate::error::AppResult;
@@ -326,12 +326,13 @@ impl Gateway {
                 );
             }
         }
-        let lowered = lower_request(
+        let lowered = lower_request_with_default_reasoning_effort(
             &tail_request,
             baseline_record
                 .as_ref()
                 .map(|record| record.internal_messages.clone())
                 .unwrap_or_default(),
+            &self.config.default_reasoning_effort,
         )?;
 
         let (tx, rx) = mpsc::channel(128);

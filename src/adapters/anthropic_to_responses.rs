@@ -45,7 +45,8 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
     }
     let tool_choice = convert_tool_choice(request.tool_choice);
     let metadata = convert_metadata(request.metadata)?;
-    let text = convert_output_config(request.output_config)?;
+    let output_config = convert_output_config(request.output_config)?;
+    let reasoning = apply_output_config_effort(reasoning, output_config.reasoning_effort);
     let max_output_tokens = request.max_tokens.map(|value| {
         i64::try_from(value)
             .map_err(|_| AppError::bad_request("Anthropic max_tokens exceeds supported range"))
@@ -64,7 +65,7 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
-        text,
+        text: output_config.text,
         client_metadata: None,
         previous_response_id: None,
         temperature: request.temperature,
@@ -79,20 +80,33 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
     })
 }
 
-fn convert_output_config(output_config: Option<Value>) -> AppResult<Option<TextControls>> {
+#[derive(Default)]
+struct ConvertedOutputConfig {
+    text: Option<TextControls>,
+    reasoning_effort: Option<String>,
+}
+
+fn convert_output_config(output_config: Option<Value>) -> AppResult<ConvertedOutputConfig> {
     let Some(output_config) = output_config else {
-        return Ok(None);
+        return Ok(ConvertedOutputConfig::default());
     };
     let Value::Object(config) = output_config else {
         return Err(AppError::bad_request(
             "Anthropic output_config must be a JSON object",
         ));
     };
+    let reasoning_effort = convert_output_config_effort(config.get("effort"))?;
     let Some(format) = config.get("format") else {
-        return Ok(None);
+        return Ok(ConvertedOutputConfig {
+            text: None,
+            reasoning_effort,
+        });
     };
     if format.is_null() {
-        return Ok(None);
+        return Ok(ConvertedOutputConfig {
+            text: None,
+            reasoning_effort,
+        });
     }
     let Some(format) = format.as_object() else {
         return Err(AppError::bad_request(
@@ -122,15 +136,50 @@ fn convert_output_config(output_config: Option<Value>) -> AppResult<Option<TextC
         .and_then(Value::as_bool)
         .unwrap_or(true);
 
-    Ok(Some(TextControls {
-        verbosity: None,
-        format: Some(TextFormat {
-            kind: "json_schema".to_string(),
-            strict,
-            schema,
-            name,
+    Ok(ConvertedOutputConfig {
+        text: Some(TextControls {
+            verbosity: None,
+            format: Some(TextFormat {
+                kind: "json_schema".to_string(),
+                strict,
+                schema,
+                name,
+            }),
         }),
-    }))
+        reasoning_effort,
+    })
+}
+
+fn convert_output_config_effort(effort: Option<&Value>) -> AppResult<Option<String>> {
+    let Some(effort) = effort else {
+        return Ok(None);
+    };
+    if effort.is_null() {
+        return Ok(None);
+    }
+    let Some(effort) = effort.as_str() else {
+        return Err(AppError::bad_request(
+            "Anthropic output_config.effort must be a string",
+        ));
+    };
+    normalize_reasoning_effort(effort)
+}
+
+fn apply_output_config_effort(
+    reasoning: Option<ReasoningRequest>,
+    effort: Option<String>,
+) -> Option<ReasoningRequest> {
+    match (reasoning, effort) {
+        (Some(mut reasoning), Some(effort)) => {
+            reasoning.effort = Some(effort);
+            Some(reasoning)
+        }
+        (None, Some(effort)) => Some(ReasoningRequest {
+            effort: Some(effort),
+            summary: None,
+        }),
+        (reasoning, None) => reasoning,
+    }
 }
 
 fn extract_system_text(system: &Option<AnthropicSystemContent>) -> String {
@@ -157,8 +206,14 @@ fn convert_thinking(
     };
     match thinking {
         AnthropicThinking::Disabled => (None, BTreeMap::new()),
-        AnthropicThinking::Enabled { budget_tokens }
-        | AnthropicThinking::Adaptive { budget_tokens } => {
+        AnthropicThinking::Adaptive { .. } => (
+            Some(ReasoningRequest {
+                effort: None,
+                summary: None,
+            }),
+            BTreeMap::new(),
+        ),
+        AnthropicThinking::Enabled { budget_tokens } => {
             let budget = budget_tokens.unwrap_or(10_000);
             let effort = thinking_effort_for_budget(budget);
             (
@@ -180,6 +235,18 @@ fn thinking_effort_for_budget(budget: u64) -> &'static str {
     } else {
         "high"
     }
+}
+
+fn normalize_reasoning_effort(effort: &str) -> AppResult<Option<String>> {
+    let effort = effort.trim();
+    if effort.is_empty() {
+        return Ok(None);
+    }
+    let normalized = match effort.to_ascii_lowercase().as_str() {
+        "max" | "xhigh" => "max",
+        _ => "high",
+    };
+    Ok(Some(normalized.to_string()))
 }
 
 struct ConvertedMessages {
@@ -1028,6 +1095,68 @@ mod tests {
         assert_eq!(format.name, "response");
         assert!(format.strict);
         assert_eq!(format.schema, schema);
+    }
+
+    #[test]
+    fn converts_output_config_effort_to_reasoning() {
+        let request = AnthropicRequest {
+            model: "claude-opus-4-5-20251101".to_string(),
+            max_tokens: Some(32000),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("Think deeply.".to_string()),
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            metadata: None,
+            thinking: Some(AnthropicThinking::Adaptive {
+                budget_tokens: None,
+            }),
+            output_config: Some(json!({
+                "effort": "xhigh"
+            })),
+        };
+
+        let result = convert_request(request).expect("convert");
+        assert_eq!(
+            result.reasoning.as_ref().unwrap().effort.as_deref(),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn adaptive_thinking_enables_reasoning_without_inventing_effort() {
+        let request = AnthropicRequest {
+            model: "claude-opus-4-5-20251101".to_string(),
+            max_tokens: Some(32000),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("Think deeply.".to_string()),
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            metadata: None,
+            thinking: Some(AnthropicThinking::Adaptive {
+                budget_tokens: None,
+            }),
+            output_config: None,
+        };
+
+        let result = convert_request(request).expect("convert");
+        assert!(result.reasoning.is_some());
+        assert_eq!(result.reasoning.as_ref().unwrap().effort, None);
     }
 
     #[test]

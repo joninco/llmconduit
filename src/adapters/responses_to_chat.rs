@@ -96,6 +96,18 @@ pub fn lower_request(
     request: &ResponsesRequest,
     baseline_messages: Vec<ChatMessage>,
 ) -> AppResult<LoweredTurn> {
+    lower_request_with_default_reasoning_effort(
+        request,
+        baseline_messages,
+        &crate::config::default_reasoning_effort(),
+    )
+}
+
+pub fn lower_request_with_default_reasoning_effort(
+    request: &ResponsesRequest,
+    baseline_messages: Vec<ChatMessage>,
+    default_reasoning_effort: &str,
+) -> AppResult<LoweredTurn> {
     validate_request(request)?;
     let mut messages = baseline_messages;
     if messages.is_empty() && !request.instructions.is_empty() {
@@ -310,12 +322,12 @@ pub fn lower_request(
                 }
             })
         });
-    let reasoning_effort = normalize_reasoning_effort(
-        request
-            .reasoning
-            .as_ref()
-            .and_then(|reasoning| reasoning.effort.as_deref()),
-    )?;
+    let request_reasoning_effort = request
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.effort.as_deref());
+    let reasoning_effort =
+        normalize_reasoning_effort(request_reasoning_effort.or(Some(default_reasoning_effort)))?;
     Ok(LoweredTurn {
         messages,
         tools,
@@ -339,11 +351,9 @@ fn normalize_reasoning_effort(effort: Option<&str>) -> AppResult<Option<String>>
         None => Ok(None),
         Some(value) => {
             let normalized = match value.to_ascii_lowercase().as_str() {
-                "none" => "none",
-                "low" => "low",
-                "medium" | "high" => "high",
-                // Some upstreams validate this field but do not use it.
-                // Clamp unknown values to a supported non-zero effort.
+                "max" | "xhigh" => "max",
+                // OSS reasoning models are converging on a smaller upstream
+                // vocabulary. Anything below max is sent as high.
                 _ => "high",
             };
             Ok(Some(normalized.to_string()))
@@ -1055,7 +1065,15 @@ mod tests {
     }
 
     #[test]
-    fn clamps_invalid_reasoning_effort_for_upstream() {
+    fn defaults_missing_reasoning_effort_to_max_for_upstream() {
+        let req = base_test_request();
+
+        let result = lower_request(&req, vec![]).expect("lower_request");
+        assert_eq!(result.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn preserves_max_reasoning_effort_for_upstream() {
         let mut req = base_test_request();
         req.reasoning = Some(ReasoningRequest {
             effort: Some("max".to_string()),
@@ -1063,11 +1081,11 @@ mod tests {
         });
 
         let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(result.reasoning_effort.as_deref(), Some("max"));
     }
 
     #[test]
-    fn clamps_xhigh_reasoning_effort_for_upstream() {
+    fn normalizes_xhigh_reasoning_effort_to_max_for_upstream() {
         let mut req = base_test_request();
         req.reasoning = Some(ReasoningRequest {
             effort: Some("xhigh".to_string()),
@@ -1075,11 +1093,11 @@ mod tests {
         });
 
         let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(result.reasoning_effort.as_deref(), Some("max"));
     }
 
     #[test]
-    fn normalizes_reasoning_effort_case_and_whitespace() {
+    fn normalizes_low_reasoning_effort_to_high_for_upstream() {
         let mut req = base_test_request();
         req.reasoning = Some(ReasoningRequest {
             effort: Some("  LoW  ".to_string()),
@@ -1087,7 +1105,7 @@ mod tests {
         });
 
         let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(result.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]
