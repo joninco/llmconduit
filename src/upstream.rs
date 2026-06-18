@@ -70,6 +70,11 @@ pub struct ReqwestUpstreamClient {
     /// Floor for the shrink-and-retry completion budget on a context-window
     /// overflow (G1). A retry never reduces `max_completion_tokens` below this.
     min_completion_tokens: i64,
+    /// Per-frame byte ceiling for the upstream SSE read path (G6 DoS guard).
+    /// Bounds bytes accumulated between event boundaries so a hostile/buggy
+    /// upstream cannot grow the parser buffer without bound; an oversized or
+    /// unterminated frame is rejected as an `AppError`.
+    max_sse_frame_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +251,30 @@ impl ReqwestUpstreamClient {
         flatten_content: bool,
         min_completion_tokens: i64,
     ) -> Self {
+        Self::with_options(
+            client,
+            base_url,
+            api_key,
+            request_log_path,
+            flatten_content,
+            min_completion_tokens,
+            default_max_sse_frame_bytes(),
+        )
+    }
+
+    /// Construct with an explicit upstream SSE per-frame cap (G6). The simpler
+    /// `new` delegates here with the default ceiling; callers that need to
+    /// thread a configured/lowered cap (e.g. the DI root or a test) use this.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_options(
+        client: reqwest::Client,
+        base_url: Url,
+        api_key: Option<String>,
+        request_log_path: Option<PathBuf>,
+        flatten_content: bool,
+        min_completion_tokens: i64,
+        max_sse_frame_bytes: usize,
+    ) -> Self {
         Self {
             client,
             base_url,
@@ -253,6 +282,7 @@ impl ReqwestUpstreamClient {
             request_logger: request_log_path.map(UpstreamRequestLogger::new),
             flatten_content,
             min_completion_tokens: min_completion_tokens.max(1),
+            max_sse_frame_bytes: max_sse_frame_bytes.max(1024),
         }
     }
 
@@ -321,7 +351,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         let response = self.send_chat_request(&url, &request).await?;
         let status = response.status();
         if status.is_success() {
-            return stream_success_response(response).await;
+            return stream_success_response(response, self.max_sse_frame_bytes).await;
         }
 
         let body = response.text().await.unwrap_or_default();
@@ -347,7 +377,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
             let retry_response = self.send_chat_request(&url, &retried).await?;
             let retry_status = retry_response.status();
             if retry_status.is_success() {
-                return stream_success_response(retry_response).await;
+                return stream_success_response(retry_response, self.max_sse_frame_bytes).await;
             }
             // The retry ALSO failed. If it is again a context overflow, this is a
             // same-provider sizing problem, not a provider failure: surface a
@@ -1682,25 +1712,572 @@ fn parse_token_count(group: &str) -> i64 {
 /// chunk stream. The first chunk is only produced lazily by the returned
 /// stream, so the context-overflow retry (which happens before this is called)
 /// remains strictly pre-first-chunk.
-async fn stream_success_response(response: reqwest::Response) -> AppResult<UpstreamStream> {
-    let stream = response
-        .bytes_stream()
-        .eventsource()
-        .filter_map(|result| async move {
-            match result {
-                Ok(event) if event.data == "[DONE]" => None,
-                Ok(event) => Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
-                    AppError::upstream(format!(
-                        "failed to parse upstream chat chunk: {err}; payload={}",
-                        truncate_for_error(&event.data, 500)
-                    ))
-                })),
-                Err(err) => Some(Err(AppError::upstream(format!(
-                    "failed to read upstream SSE: {err}"
-                )))),
-            }
-        });
+async fn stream_success_response(
+    response: reqwest::Response,
+    max_sse_frame_bytes: usize,
+) -> AppResult<UpstreamStream> {
+    // Bound the upstream SSE read BEFORE `eventsource()` parses it (G6). The
+    // `eventsource-stream` 0.2 parser accumulates bytes into an internal
+    // `String`/`Vec` buffer and only flushes on an event boundary (a blank
+    // line); a hostile/buggy upstream streaming an oversized or never-terminated
+    // frame would grow that buffer without bound (OOM). `bounded_sse_byte_stream`
+    // caps the bytes accumulated since the last boundary and surfaces a clean
+    // `AppError` before the parser can over-accumulate. The 256 MiB request-body
+    // cap in `http.rs` is inbound-only and does NOT cover this response path.
+    let bounded = bounded_sse_byte_stream(response.bytes_stream(), max_sse_frame_bytes);
+    let stream = bounded.eventsource().filter_map(|result| async move {
+        match result {
+            Ok(event) if event.data == "[DONE]" => None,
+            Ok(event) => Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
+                AppError::upstream(format!(
+                    "failed to parse upstream chat chunk: {err}; payload={}",
+                    truncate_for_error(&event.data, 500)
+                ))
+            })),
+            // The bounded adapter surfaces the frame-cap rejection through the
+            // transport-error channel as an already-formed `AppError` (its
+            // `Display` carries the cap message); other transport errors are
+            // wrapped here. Either way the model output is never silently
+            // truncated — the stream ends in an error item.
+            Err(err) => Some(Err(AppError::upstream(format!(
+                "failed to read upstream SSE: {err}"
+            )))),
+        }
+    });
     Ok(Box::pin(stream))
+}
+
+/// 8 MiB default upstream SSE per-frame ceiling. Mirrors
+/// `config::default_max_sse_frame_bytes`; kept here so `ReqwestUpstreamClient::new`
+/// (which does not take a cap) has a sane default without depending on config.
+pub(crate) fn default_max_sse_frame_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+/// Pure, synchronous per-frame byte-accounting guard for the upstream SSE read
+/// (G6). Feed it each incoming byte chunk in order; it tracks the number of
+/// bytes accumulated **since the last SSE event boundary** and returns an
+/// `AppError` the moment that running count exceeds the cap — i.e. as soon as an
+/// oversized or never-terminated (no blank-line) frame would force the
+/// downstream `eventsource-stream` parser to over-buffer.
+///
+/// Kept pure (no async, no `reqwest`) so it is unit/integration-testable with
+/// raw byte slices; `bounded_sse_byte_stream` is the thin async wrapper that
+/// drives it over a real `bytes_stream()`.
+#[derive(Debug)]
+pub struct SseFrameGuard {
+    max_frame_bytes: usize,
+    /// INVARIANT: `since_boundary` = bytes of the current in-progress frame that
+    /// are CONFIRMED not part of a pending boundary (every such byte counted
+    /// exactly once). `carry` = the trailing <=3 bytes of the stream so far that
+    /// form a (possibly empty) PREFIX of an SSE boundary and are therefore NOT
+    /// yet charged: on the next chunk they either complete a boundary (→ reset,
+    /// never charged) or are disambiguated as ordinary frame bytes (→ charged
+    /// then). Holding the ambiguous tail uncharged is what makes the verdict
+    /// chunking-INDEPENDENT.
+    since_boundary: usize,
+    /// Deferred boundary-prefix tail (`\n`, `\r`, `\r\n`, or `\r\n\r`). Fixed tiny
+    /// window — never grows beyond 3 bytes; uncharged until disambiguated.
+    carry: Vec<u8>,
+    /// Set when the stream is currently INSIDE a maximal run of consecutive EOLs
+    /// that began at a completed frame boundary (Codex round-4 LOW). After a blank
+    /// line (boundary = two EOLs) any ADDITIONAL consecutive EOLs are extra empty
+    /// lines that `eventsource-stream` dispatches as empty events / skips, so they
+    /// belong to NO data frame and must be charged to neither. When this is true,
+    /// a leading EOL on the next chunk continues that empty-line run (consumed,
+    /// uncharged) rather than being charged into the next frame; the `carry` then
+    /// holds the run's trailing partial EOL (a lone `\r` whose CR/CRLF nature is
+    /// still ambiguous) instead of a boundary-prefix. Cleared the moment a
+    /// non-EOL byte (real frame content) ends the run.
+    in_eol_run: bool,
+}
+
+impl SseFrameGuard {
+    /// Build a guard with the given per-frame ceiling (floored at 1 KiB so a
+    /// misconfigured tiny cap cannot reject every normal frame).
+    ///
+    /// `in_eol_run` starts TRUE: the stream begins AS IF immediately after a frame
+    /// boundary, so any LEADING EOLs (an empty/blank-line SSE event, or stray
+    /// separators before the first `data:`) are an empty-line run charged to NO
+    /// frame — exactly like extra blank lines BETWEEN frames (Codex round-4 LOW).
+    /// Starting false instead charged a leading EOL into the first real frame, a
+    /// false reject for a frame otherwise exactly at cap (Codex round-5 LOW). A
+    /// stream that opens directly on real content ends the (zero-length) leading run
+    /// at byte 0, so this is a no-op for the common case.
+    pub fn new(max_frame_bytes: usize) -> Self {
+        Self {
+            max_frame_bytes: max_frame_bytes.max(1024),
+            since_boundary: 0,
+            carry: Vec::new(),
+            in_eol_run: true,
+        }
+    }
+
+    /// The effective (floored) per-frame cap this guard enforces.
+    pub fn max_frame_bytes(&self) -> usize {
+        self.max_frame_bytes
+    }
+
+    /// Account for one incoming chunk. Returns `Err` the moment ANY single SSE
+    /// frame — the bytes between two boundaries, terminated or not — would exceed
+    /// the cap (the caller must stop and surface the error — never silently
+    /// truncate). Each boundary resets the running count, so a well-formed (even
+    /// large-but-bounded-per-event) stream always passes.
+    ///
+    /// The scan searches `carry + chunk` (so a boundary straddling the chunk edge
+    /// is detected). `carry` is the previously-DEFERRED boundary-prefix tail
+    /// (uncharged), so the scan both charges it (when it turns out to be ordinary
+    /// frame bytes) and re-derives a fresh deferred tail — all in one pass. This
+    /// keeps the verdict independent of how the stream is split into chunks.
+    /// See [`scan_frames_since_boundary`].
+    pub fn accept(&mut self, chunk: &[u8]) -> Result<(), AppError> {
+        self.scan(chunk, false)
+    }
+
+    /// Finalize accounting when the upstream byte stream ENDS. Any bytes still held
+    /// in the deferred boundary-prefix carry could not be completed into a frame
+    /// boundary (no more bytes will arrive), so a dangling single EOL is charged as
+    /// part of the still-open, unterminated frame and a final cap check is emitted
+    /// (Codex round-3 Finding 2: an unterminated frame must not slip past the cap by
+    /// a trailing `\n`/`\r`/`\r\n`/`\r\n\r` just because EOF arrived before the carry
+    /// was disambiguated). A trailing carry that is itself a complete boundary
+    /// (`\n\r`, `\r\r`, `\r\n\r`, resolving the final CR at EOF) resets instead of
+    /// being charged. Idempotent: after a successful call the carry is empty, so a
+    /// second call is a no-op.
+    pub fn finish(&mut self) -> Result<(), AppError> {
+        self.scan(&[], true)
+    }
+
+    fn scan(&mut self, chunk: &[u8], at_eof: bool) -> Result<(), AppError> {
+        let ScanState {
+            since_boundary,
+            carry,
+            in_eol_run,
+        } = scan_frames_since_boundary(
+            ScanState {
+                since_boundary: self.since_boundary,
+                carry: std::mem::take(&mut self.carry),
+                in_eol_run: self.in_eol_run,
+            },
+            chunk,
+            self.max_frame_bytes,
+            at_eof,
+        )
+        .map_err(|observed| {
+            AppError::upstream(format!(
+                "upstream SSE frame exceeded {} bytes before an event boundary \
+                         (saw {observed}); rejecting to bound memory (G6)",
+                self.max_frame_bytes
+            ))
+        })?;
+        self.since_boundary = since_boundary;
+        self.carry = carry;
+        self.in_eol_run = in_eol_run;
+        Ok(())
+    }
+}
+
+/// Wrap an upstream byte stream so the bytes accumulated **between SSE event
+/// boundaries** never exceed `max_frame_bytes` before being handed to the
+/// `eventsource-stream` parser (G6 DoS guard).
+///
+/// SSE events are separated by a blank line (`\n\n`, `\r\n\r\n`, or `\r\r`). The
+/// `eventsource-stream` parser buffers everything it receives until it sees such
+/// a separator, so the only thing that can grow its buffer without bound is a
+/// frame that never terminates (or a single oversized frame). The
+/// [`SseFrameGuard`] tracks the byte count since the last separator and we reject
+/// as soon as it exceeds the cap — *before* forwarding the offending chunk — so
+/// the downstream parser buffer is itself bounded by `max_frame_bytes` (plus one
+/// in-flight chunk).
+///
+/// The rejection is yielded as a `std::io::Error` so it travels the transport
+/// (`EventStreamError::Transport`) channel of `eventsource()`; its message is the
+/// `AppError`'s, and `stream_success_response` re-wraps it into an `AppError`.
+/// Normal-sized streaming is untouched: each well-formed event resets the
+/// counter at its boundary.
+///
+/// On stream END the adapter FINALIZES the guard ([`SseFrameGuard::finish`]):
+/// any pending boundary-prefix carry is charged and a final cap check is emitted,
+/// so an unterminated over-cap frame is rejected even if EOF arrives before a
+/// trailing separator byte could be disambiguated (Codex round-3 Finding 2). This
+/// is why a plain `.map` is insufficient — the adapter must be able to act on
+/// end-of-stream — so it is a stateful `async_stream` that drives the guard and
+/// emits one trailing error item when finalization trips the cap.
+///
+/// Cancellation is preserved: this is a lazy stream adapter that only advances
+/// when polled. The caller's `tx.closed()`/timeout selects still cancel the
+/// whole chain by dropping it; nothing here blocks or spawns. The raw `*.delta`
+/// path and AppError-not-truncation contract are unchanged: every rejection still
+/// travels the transport-error channel as an `std::io::Error` whose message is the
+/// `AppError`'s, which `stream_success_response` re-wraps — output is never
+/// silently truncated.
+pub(crate) fn bounded_sse_byte_stream<S, B>(
+    stream: S,
+    max_frame_bytes: usize,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>>
+where
+    S: Stream<Item = Result<B, reqwest::Error>>,
+    B: AsRef<[u8]>,
+{
+    async_stream::stream! {
+        let mut guard = SseFrameGuard::new(max_frame_bytes);
+        let mut stream = std::pin::pin!(stream);
+        while let Some(result) = stream.next().await {
+            let bytes = match result {
+                Ok(bytes) => Bytes::copy_from_slice(bytes.as_ref()),
+                Err(err) => {
+                    yield Err(std::io::Error::other(format!(
+                        "failed to read upstream SSE bytes: {err}"
+                    )));
+                    return;
+                }
+            };
+            // Reject BEFORE forwarding so the parser never sees the over-cap bytes.
+            if let Err(err) = guard.accept(bytes.as_ref()) {
+                yield Err(std::io::Error::other(err.to_string()));
+                return;
+            }
+            yield Ok(bytes);
+        }
+        // Upstream ended: charge any deferred carry and cap-check the (possibly
+        // unterminated) final frame. A clean end stays clean; an over-cap dangling
+        // frame surfaces as a trailing transport error rather than a silent EOF.
+        if let Err(err) = guard.finish() {
+            yield Err(std::io::Error::other(err.to_string()));
+        }
+    }
+}
+
+/// Length of the EOL token starting at `buf[i]`, tokenized **exactly like**
+/// `eventsource-stream`'s `end-of-line = ( cr lf / cr / lf )` (CRLF matched
+/// greedily, longest-first). Returns:
+///   * `EolToken::Complete(len)` — a fully-determined EOL of `len` bytes;
+///   * `EolToken::IncompleteCr` — `buf[i]` is a CR that is the LAST byte of `buf`
+///     and `at_eof` is false, so we cannot yet tell `\r` (CR) from `\r\n` (CRLF);
+///   * `EolToken::None` — `buf[i]` is not an EOL byte.
+///
+/// At end-of-stream (`at_eof`) a trailing lone CR is resolved as a 1-byte CR EOL,
+/// because the parser will never receive the following byte that could make it a
+/// CRLF (mirrors the parser leaving a trailing `\r` `Incomplete` forever).
+enum EolToken {
+    Complete(usize),
+    IncompleteCr,
+    None,
+}
+
+fn eol_token_at(buf: &[u8], i: usize, at_eof: bool) -> EolToken {
+    match buf.get(i) {
+        Some(b'\r') => match buf.get(i + 1) {
+            Some(b'\n') => EolToken::Complete(2),    // CRLF, greedy.
+            Some(_) => EolToken::Complete(1),        // lone CR proven by a following byte.
+            None if at_eof => EolToken::Complete(1), // no more bytes: CR resolves to CR.
+            None => EolToken::IncompleteCr,          // could still become CRLF.
+        },
+        Some(b'\n') => EolToken::Complete(1), // LF never coalesces forward.
+        _ => EolToken::None,
+    }
+}
+
+/// Carried byte-accounting state of the SSE frame guard between chunks. Bundled
+/// into one value so the maximal-EOL-run flag (`in_eol_run`) travels alongside
+/// the running count and the deferred-prefix carry without an ever-widening
+/// tuple. See [`SseFrameGuard`] for the field invariants.
+#[derive(Debug, Clone)]
+struct ScanState {
+    since_boundary: usize,
+    carry: Vec<u8>,
+    in_eol_run: bool,
+}
+
+/// Advance past a MAXIMAL run of complete EOL tokens in `buf` starting at `from`,
+/// returning `(end, stop)` where `end` is the index just past the last complete
+/// EOL consumed and `stop` says WHY the run ended:
+///   * [`EolRunStop::Content`] — `buf[end]` is a non-EOL byte (real frame content);
+///   * [`EolRunStop::BufferEnd`] — the run reached the end of `buf` cleanly (the
+///     last token was a complete EOL); a leading EOL on the NEXT chunk continues it;
+///   * [`EolRunStop::IncompleteCr`] — the run stopped on a trailing lone `\r` whose
+///     CR-vs-CRLF nature is unresolved mid-stream (`!at_eof`); that `\r` is itself
+///     another empty-line EOL and is deferred uncharged into the carry.
+///
+/// Every byte consumed here is an empty-line EOL that belongs to NO data frame, so
+/// the caller charges none of them (Codex round-4 LOW).
+fn eol_run_end(buf: &[u8], from: usize, at_eof: bool) -> (usize, EolRunStop) {
+    let mut i = from;
+    loop {
+        match eol_token_at(buf, i, at_eof) {
+            EolToken::Complete(len) => i += len,
+            EolToken::IncompleteCr => return (i, EolRunStop::IncompleteCr),
+            EolToken::None => {
+                return if i >= buf.len() {
+                    (i, EolRunStop::BufferEnd)
+                } else {
+                    (i, EolRunStop::Content)
+                };
+            }
+        }
+    }
+}
+
+enum EolRunStop {
+    Content,
+    BufferEnd,
+    IncompleteCr,
+}
+
+/// Single robust pass that bounds EVERY SSE frame in `carry + chunk` and returns
+/// the updated [`ScanState`] (running count, freshly-deferred tail, and whether we
+/// ended inside an empty-line EOL run).
+///
+/// A frame boundary is a BLANK LINE = two consecutive `end-of-line`s, tokenized
+/// exactly like the `eventsource-stream` parser (`end-of-line = cr lf / cr / lf`,
+/// CRLF greedy). So the boundary byte-sequences are, by length: `\n\n`, `\n\r`,
+/// `\r\r` (2); `\n\r\n`, `\r\n\n`, `\r\n\r`, `\r\r\n` (3); `\r\n\r\n` (4). The old
+/// guard recognized only `\n\n`/`\r\r`/`\r\n\r\n` and so mis-detected the mixed
+/// combos (Codex round-3 Finding 1).
+///
+/// `carry` is the tail DEFERRED by the previous call (uncharged). We rebuild
+/// `buf = carry + chunk` so a boundary straddling the chunk edge is detected, then
+/// walk it boundary by boundary:
+///   * For each completed boundary, the bytes of `buf` since the current frame
+///     started are now CONFIRMED frame bytes (a boundary follows them): charge
+///     them to `since_boundary` and check the cap, then reset `since_boundary` to
+///     0 for the next frame. (This naturally subsumes the old `carry` bytes — they
+///     are charged here exactly once, the first time they are confirmed.)
+///   * Immediately AFTER each boundary, consume the MAXIMAL run of additional
+///     consecutive EOLs (Codex round-4 LOW): those are extra empty lines that the
+///     parser dispatches as empty events / skips, so they belong to no frame and
+///     resume scanning from the end of the run with `since_boundary` still 0. A run
+///     that straddles the chunk edge is finished on the next chunk via `in_eol_run`
+///     (a leading EOL there continues it, uncharged) so it is never charged.
+///   * After the last boundary/run, the trailing segment is split: when `!at_eof`,
+///     its longest suffix that is a PROPER PREFIX of a boundary is deferred
+///     uncharged into the new carry and the remainder is charged; when `at_eof`
+///     there is no future byte to disambiguate, so the entire trailing segment is
+///     charged (a dangling single EOL is part of the still-open, unterminated
+///     frame) — UNLESS we are still inside an EOL run, in which case a trailing EOL
+///     is one more empty line and stays uncharged (Finding 2 vs. round-4 LOW: an
+///     unterminated *frame* must be charged at EOF, but an inter-frame empty line
+///     must not).
+///
+/// Correctness properties:
+///   * Finding 1 — a trailing byte that merely STARTS a boundary is never charged
+///     until the next chunk disambiguates it, so an ambiguous tail cannot trip the
+///     cap (and the verdict does not depend on the chunk split).
+///   * Finding 2 — a deferred boundary-prefix carry that never completes is charged
+///     to the unterminated frame at EOF.
+///   * Round-4 LOW — extra/empty blank-line EOLs are charged to no frame, with the
+///     run consumed even when split across a chunk edge (carry = run tail,
+///     `in_eol_run = true`).
+///
+/// Returns the new `ScanState`, or `Err(observed)` — the count that first exceeded
+/// the cap — so the caller can format the error.
+fn scan_frames_since_boundary(
+    state: ScanState,
+    chunk: &[u8],
+    cap: usize,
+    at_eof: bool,
+) -> Result<ScanState, usize> {
+    let ScanState {
+        mut since_boundary,
+        carry,
+        in_eol_run,
+    } = state;
+    debug_assert!(
+        carry.len() <= 3 && boundary_prefix_suffix_len(&carry) == carry.len(),
+        "carry must be a pure boundary prefix of <=3 bytes"
+    );
+    let mut buf = Vec::with_capacity(carry.len() + chunk.len());
+    buf.extend_from_slice(&carry);
+    buf.extend_from_slice(chunk);
+
+    // `seg_start` is the `buf` index where the current in-progress frame begins;
+    // `scan` is how far we have searched for the next boundary.
+    let mut seg_start = 0usize;
+    let mut scan = 0usize;
+
+    // If the previous chunk ended inside an empty-line EOL run, finish consuming it
+    // FIRST: a leading EOL here is one more empty line (charged to nothing), not the
+    // first byte of the next frame. Only when the run ends do we begin the frame.
+    if in_eol_run {
+        match eol_run_end(&buf, 0, at_eof) {
+            (end, EolRunStop::IncompleteCr) => {
+                // Still mid-run: defer the trailing lone `\r` (another empty-line
+                // EOL whose CR/CRLF nature is unresolved) and stay in the run.
+                let new_carry = buf[end..].to_vec();
+                debug_assert!(new_carry.len() <= 1, "in-run carry is a lone CR");
+                return Ok(ScanState {
+                    since_boundary: 0,
+                    carry: new_carry,
+                    in_eol_run: true,
+                });
+            }
+            (_end, EolRunStop::BufferEnd) => {
+                // Run consumed the whole buffer cleanly; the next chunk's leading
+                // EOLs (if any) continue it. Nothing is charged.
+                return Ok(ScanState {
+                    since_boundary: 0,
+                    carry: Vec::new(),
+                    in_eol_run: true,
+                });
+            }
+            (end, EolRunStop::Content) => {
+                // The run ended at real frame content: the next frame starts here,
+                // and we fall through to the normal boundary scan below.
+                seg_start = end;
+                scan = end;
+            }
+        }
+    }
+
+    while let Some((bs, be)) = next_boundary(&buf, scan, at_eof) {
+        // No boundary is ever double-counted: `scan`/`seg_start` only advance, so
+        // each reported boundary starts at/after the current frame's start, and a
+        // mid-stream `carry` is never itself a complete boundary (it was deferred
+        // precisely because its trailing CR was an unresolved last byte, i.e.
+        // `next_boundary(carry, 0, false) == None`). A boundary may now legitimately
+        // END at `carry.len()` when the FIRST chunk byte merely RESOLVES that
+        // trailing CR (e.g. carry `\r\r` + chunk `d` → boundary `[0,2)`), which is a
+        // first detection, not a re-reset.
+        debug_assert!(
+            bs >= seg_start,
+            "boundary start {bs} precedes frame start {seg_start} — double reset"
+        );
+        // Bytes [seg_start, bs) are now confirmed frame bytes (a boundary follows).
+        let confirmed = bs.saturating_sub(seg_start);
+        since_boundary = since_boundary.saturating_add(confirmed);
+        if since_boundary > cap {
+            return Err(since_boundary);
+        }
+        // Boundary terminates the frame: the count resets for the next frame. Then
+        // consume any ADDITIONAL consecutive EOLs (extra empty lines) so their bytes
+        // are charged to no frame (Codex round-4 LOW).
+        since_boundary = 0;
+        match eol_run_end(&buf, be, at_eof) {
+            (end, EolRunStop::IncompleteCr) => {
+                let new_carry = buf[end..].to_vec();
+                debug_assert!(new_carry.len() <= 1, "in-run carry is a lone CR");
+                return Ok(ScanState {
+                    since_boundary: 0,
+                    carry: new_carry,
+                    in_eol_run: true,
+                });
+            }
+            (_end, EolRunStop::BufferEnd) => {
+                return Ok(ScanState {
+                    since_boundary: 0,
+                    carry: Vec::new(),
+                    in_eol_run: true,
+                });
+            }
+            (end, EolRunStop::Content) => {
+                seg_start = end;
+                scan = end;
+            }
+        }
+    }
+
+    // Trailing unterminated segment after the final boundary/run (or the whole
+    // buffer if there was none). Mid-stream we defer its boundary-prefix suffix
+    // uncharged and charge the rest; at EOF nothing more can arrive to complete a
+    // boundary, so the whole segment is charged as part of the unterminated frame.
+    let tail = &buf[seg_start..];
+    let defer = if at_eof {
+        0
+    } else {
+        boundary_prefix_suffix_len(tail)
+    };
+    let charged = tail.len() - defer;
+    since_boundary = since_boundary.saturating_add(charged);
+    if since_boundary > cap {
+        return Err(since_boundary);
+    }
+    let new_carry = tail[charged..].to_vec();
+    debug_assert!(new_carry.len() <= 3, "deferred carry must stay <=3 bytes");
+    Ok(ScanState {
+        since_boundary,
+        carry: new_carry,
+        in_eol_run: false,
+    })
+}
+
+/// Length of the longest suffix of `buf` that is a PROPER prefix of an SSE
+/// blank-line boundary (two `end-of-line`s) — i.e. bytes that might still grow
+/// into / complete a boundary on the next chunk and so must be deferred
+/// uncharged. With CRLF-greedy EOL tokenization the proper boundary prefixes,
+/// longest-first, are:
+///   * `\r\n\r` (3) — one CRLF EOL plus a pending CR (→ `\r\n\r\n` or `\r\n`+`\r`);
+///   * `\r\n` (2) — one CRLF EOL, second EOL not yet seen;
+///   * `\n\r` (2) — LF EOL plus a pending CR (→ `\n\r\n` or `\n`+`\r`);
+///   * `\r\r` (2) — CR EOL plus a pending CR (→ `\r\r\n` or `\r`+`\r`);
+///   * a lone trailing `\r` or `\n` (1).
+///
+/// A two-EOL boundary that is already COMPLETE and unambiguous (`\n\n`, `\r\n\n`,
+/// `\n\r\n`, `\r\r\n`, `\r\n\r\n`) is consumed by [`next_boundary`] before the
+/// tail is examined, so it never reaches here. The ambiguous-length boundaries
+/// (`\n\r`, `\r\r`, `\r\n\r`) are deferred here precisely because a trailing CR
+/// could still extend the separator — deferring them keeps the byte verdict
+/// chunking-independent; they are resolved (as complete boundaries that reset, or
+/// as charged frame bytes) on the next chunk or at EOF.
+fn boundary_prefix_suffix_len(buf: &[u8]) -> usize {
+    let n = buf.len();
+    // 3-byte prefix `\r\n\r` of `\r\n\r\n`.
+    if n >= 3 && &buf[n - 3..] == b"\r\n\r" {
+        return 3;
+    }
+    // 2-byte ambiguous/partial prefixes: one EOL plus a pending CR, or a partial
+    // CRLF, that could still complete or extend a boundary on the next chunk.
+    if n >= 2 {
+        let last2 = &buf[n - 2..];
+        if last2 == b"\r\n" || last2 == b"\n\r" || last2 == b"\r\r" {
+            return 2;
+        }
+    }
+    // 1-byte prefix: a lone trailing `\r` (start of `\r\r`/`\r\n...`) or `\n`
+    // (start of `\n\n`/`\n\r`).
+    if n >= 1 && (buf[n - 1] == b'\r' || buf[n - 1] == b'\n') {
+        return 1;
+    }
+    0
+}
+
+/// Find the next SSE blank-line boundary in `buf` at or after `from`, returning
+/// its `(start, end)` byte range, or `None` if none completes. A boundary is two
+/// consecutive `end-of-line`s, each tokenized greedily as `cr lf / cr / lf` (see
+/// [`eol_token_at`]); the `(start, end)` range covers BOTH EOLs (so the bytes of
+/// the separator itself are never charged to either adjacent frame). A trailing
+/// lone CR that cannot yet be disambiguated (`!at_eof`) does not complete a
+/// boundary — it is deferred into the carry instead.
+fn next_boundary(buf: &[u8], from: usize, at_eof: bool) -> Option<(usize, usize)> {
+    let n = buf.len();
+    let mut i = from;
+    while i < n {
+        // First EOL of the candidate blank line.
+        let first_len = match eol_token_at(buf, i, at_eof) {
+            EolToken::Complete(len) => len,
+            // A lone trailing CR mid-stream cannot start a confirmed boundary yet.
+            EolToken::IncompleteCr => return None,
+            EolToken::None => {
+                i += 1;
+                continue;
+            }
+        };
+        // Second consecutive EOL → the line between them is empty → boundary.
+        match eol_token_at(buf, i + first_len, at_eof) {
+            EolToken::Complete(second_len) => {
+                return Some((i, i + first_len + second_len));
+            }
+            // The second EOL is an unresolved trailing CR (mid-stream): the
+            // boundary is not yet complete; defer (it lives in the carry).
+            EolToken::IncompleteCr => return None,
+            // First byte was an EOL but the next is ordinary content: not a blank
+            // line. Resume scanning AFTER this EOL (the content may yet end in a
+            // real boundary).
+            EolToken::None => {
+                i += first_len;
+            }
+        }
+    }
+    None
 }
 
 fn parse_chat_completion_chunk(data: &str) -> Result<ChatCompletionChunk, serde_json::Error> {
@@ -1961,6 +2538,7 @@ fn stringify_json_value(value: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::Bytes;
     use super::ReqwestUpstreamClient;
     use super::UpstreamRequestLogger;
     use super::extract_supported_model_ids;
@@ -2736,5 +3314,268 @@ mod tests {
     fn extract_supported_model_ids_reads_models_array() {
         let body = serde_json::json!({"models": ["glm-5.1"]});
         assert_eq!(extract_supported_model_ids(&body), vec!["glm-5.1"]);
+    }
+
+    // --- G6 upstream SSE per-frame cap: boundary-detection internals ---
+
+    #[test]
+    fn next_boundary_tokenizes_every_eol_combo_like_the_parser() {
+        // No boundary.
+        assert_eq!(super::next_boundary(b"data: hi", 0, false), None);
+        // Two consecutive EOLs = blank line = boundary; (start, end) spans BOTH
+        // EOLs so separator bytes are charged to neither frame. All combos of
+        // `cr lf / cr / lf` x `cr lf / cr / lf` (CRLF greedy) are recognized.
+        // Followed by `b` so any trailing CR is disambiguated (not incomplete).
+        assert_eq!(super::next_boundary(b"a\n\nb", 0, false), Some((1, 3))); // LF LF
+        assert_eq!(super::next_boundary(b"a\r\rb", 0, false), Some((1, 3))); // CR CR
+        assert_eq!(super::next_boundary(b"a\r\n\r\nb", 0, false), Some((1, 5))); // CRLF CRLF
+        assert_eq!(super::next_boundary(b"a\r\n\nb", 0, false), Some((1, 4))); // CRLF LF
+        assert_eq!(super::next_boundary(b"a\n\rb", 0, false), Some((1, 3))); // LF CR
+        assert_eq!(super::next_boundary(b"a\r\n\rb", 0, false), Some((1, 4))); // CRLF CR
+        assert_eq!(super::next_boundary(b"a\n\r\nb", 0, false), Some((1, 4))); // LF CRLF
+        assert_eq!(super::next_boundary(b"a\r\r\nb", 0, false), Some((1, 4))); // CR CRLF
+        // A trailing lone CR mid-stream is INCOMPLETE: it might still become CRLF,
+        // so no boundary is reported until disambiguated (or EOF).
+        assert_eq!(super::next_boundary(b"a\n\r", 0, false), None);
+        assert_eq!(super::next_boundary(b"a\r\r", 0, false), None);
+        // ...but at EOF the trailing CR resolves to a CR EOL and the boundary completes.
+        assert_eq!(super::next_boundary(b"a\n\r", 0, true), Some((1, 3)));
+        assert_eq!(super::next_boundary(b"a\r\r", 0, true), Some((1, 3)));
+        // A single EOL followed by ordinary content is NOT a blank line; scanning
+        // resumes and finds the real boundary later.
+        assert_eq!(super::next_boundary(b"a\nb\n\nc", 0, false), Some((3, 5)));
+        // The FIRST boundary at/after `from` is returned; `from` skips earlier ones.
+        assert_eq!(super::next_boundary(b"a\n\nb\n\nc", 0, false), Some((1, 3)));
+        assert_eq!(super::next_boundary(b"a\n\nb\n\nc", 3, false), Some((4, 6)));
+    }
+
+    /// Thin test shim: drive `scan_frames_since_boundary` with the legacy
+    /// positional args and collapse the returned `ScanState` to the
+    /// `(since_boundary, carry)` tuple the older assertions read. `in_eol_run`
+    /// defaults to false on input (the round-4 LOW cases assert it explicitly via
+    /// `scan_state`). Returns `Err(observed)` unchanged.
+    fn scan(
+        since: usize,
+        carry: &[u8],
+        chunk: &[u8],
+        cap: usize,
+        eof: bool,
+    ) -> Result<(usize, Vec<u8>), usize> {
+        scan_state(since, carry, false, chunk, cap, eof).map(|s| (s.since_boundary, s.carry))
+    }
+
+    /// Like [`scan`] but also threads/returns the `in_eol_run` flag so the
+    /// round-4 LOW (maximal-EOL-run) cases can assert run state.
+    fn scan_state(
+        since: usize,
+        carry: &[u8],
+        in_eol_run: bool,
+        chunk: &[u8],
+        cap: usize,
+        eof: bool,
+    ) -> Result<super::ScanState, usize> {
+        super::scan_frames_since_boundary(
+            super::ScanState {
+                since_boundary: since,
+                carry: carry.to_vec(),
+                in_eol_run,
+            },
+            chunk,
+            cap,
+            eof,
+        )
+    }
+
+    #[test]
+    fn scan_frames_charges_confirmed_frame_bytes_and_defers_prefix_tail() {
+        let cap = 1024;
+        // No carry, boundary mid-chunk: "ab" confirmed+reset, tail "cd" charged,
+        // nothing deferred.
+        assert_eq!(scan(0, b"", b"ab\n\ncd", cap, false), Ok((2, vec![])));
+        // No boundary, no prefix tail: whole new chunk extends the frame and the
+        // carried-in count; the (uncharged) carry "\r" is now confirmed & charged.
+        assert_eq!(scan(5, b"\r", b"abc", cap, false), Ok((9, vec![])));
+        // Boundary straddling carry/chunk edge: carry "\r\n" + chunk "\r\nz" =>
+        // boundary completes & resets, tail "z" charged.
+        assert_eq!(scan(7, b"\r\n", b"\r\nz", cap, false), Ok((1, vec![])));
+        // A MIXED-separator boundary mid-chunk is recognized (Finding 1): carry-in
+        // count 6, chunk "..\r\n\ncd" => the `\r\n\n` blank line resets (the `\r` is
+        // NOT charged as a frame byte), tail "cd" charged.
+        assert_eq!(scan(6, b"", b"\r\n\ncd", cap, false), Ok((2, vec![])));
+        // A trailing boundary-PREFIX is DEFERRED, not charged (Finding 1): "ab"
+        // charged, trailing "\r\n\r" held uncharged in the returned carry.
+        assert_eq!(
+            scan(0, b"", b"ab\r\n\r", cap, false),
+            Ok((2, b"\r\n\r".to_vec()))
+        );
+        // A lone trailing "\n" is deferred (could start "\n\n"); count unchanged.
+        assert_eq!(scan(3, b"", b"\n", cap, false), Ok((3, b"\n".to_vec())));
+        // An ambiguous-length 2-byte prefix ("\n\r": LF + pending CR) is deferred
+        // whole, mid-stream, so the verdict stays chunk-independent.
+        assert_eq!(scan(3, b"", b"\n\r", cap, false), Ok((3, b"\n\r".to_vec())));
+    }
+
+    #[test]
+    fn scan_frames_consumes_maximal_eol_run_after_boundary() {
+        // Codex round-4 LOW: extra blank-line EOLs after a boundary belong to no
+        // frame and must be charged to neither side.
+        let cap = 4;
+        // Three consecutive LFs: the first two are the boundary, the THIRD is an
+        // extra empty line. "ab" charged+reset, the extra "\n" consumed (charged to
+        // nothing), tail "cd" charged => since=2. The OLD code charged the extra
+        // "\n" into "cd" (since=3).
+        let s = scan_state(0, b"", false, b"ab\n\n\ncd", cap, false).expect("ok");
+        assert_eq!(
+            (s.since_boundary, s.carry, s.in_eol_run),
+            (2, vec![], false)
+        );
+        // FOUR LFs (two boundaries' worth) collapse the same way: only "cd" counts.
+        let s = scan_state(0, b"", false, b"ab\n\n\n\ncd", cap, false).expect("ok");
+        assert_eq!(s.since_boundary, 2);
+        // The exact Codex sequence: a frame at cap, then `\n\n\n`, then a second
+        // frame of EXACTLY cap content. The extra `\n` must NOT be charged into the
+        // second frame, so it stays at cap (accepted), not cap+1.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"x".repeat(cap).as_slice());
+        data.extend_from_slice(b"\n\n\n");
+        data.extend_from_slice(b"y".repeat(cap).as_slice());
+        let s = scan_state(0, b"", false, &data, cap, false).expect("at-cap second frame accepted");
+        assert_eq!(s.since_boundary, cap);
+        // Mixed run `\r\n\n` (boundary) + `\r\r` (two more empty-line EOLs): all
+        // consumed, nothing charged from the run; tail "z" charged.
+        let s = scan_state(0, b"", false, b"ab\r\n\n\r\rz", cap, false).expect("ok");
+        assert_eq!((s.since_boundary, s.carry), (1, vec![]));
+    }
+
+    #[test]
+    fn scan_frames_eol_run_straddling_chunk_edge_is_fully_consumed() {
+        // The maximal-EOL run can straddle a chunk edge; it must still be consumed
+        // (never charged), matching the in-chunk verdict (Codex round-4 LOW).
+        let cap = 8;
+        // Chunk 1 ends mid-run with a trailing lone `\r` (after boundary `\n\n` +
+        // `\r`): the `\r` is deferred and we stay `in_eol_run`.
+        let s = scan_state(0, b"", false, b"ab\n\n\r", cap, false).expect("ok");
+        assert_eq!(
+            (s.since_boundary, s.carry, s.in_eol_run),
+            (0, b"\r".to_vec(), true)
+        );
+        // Chunk 2 resolves it as a CR EOL (`\r` + content): the run's `\r` is one
+        // more empty line (NOT charged) and "cd" begins the next frame.
+        let s = scan_state(0, b"\r", true, b"cd", cap, false).expect("ok");
+        assert_eq!(
+            (s.since_boundary, s.carry, s.in_eol_run),
+            (2, vec![], false)
+        );
+        // If chunk 2 instead resolves it as CRLF (`\r\n`) followed by content, the
+        // `\r\n` is still ONE empty-line EOL (uncharged) and "cd" begins the frame.
+        let s = scan_state(0, b"\r", true, b"\ncd", cap, false).expect("ok");
+        assert_eq!((s.since_boundary, s.in_eol_run), (2, false));
+        // `in_eol_run` with a leading EOL that itself ends the chunk stays in-run.
+        let s = scan_state(0, b"", true, b"\n", cap, false).expect("ok");
+        assert_eq!((s.since_boundary, s.carry, s.in_eol_run), (0, vec![], true));
+        // `in_eol_run` ending at EOF on a dangling `\r`: that final CR is one last
+        // empty line, charged to nothing (NOT to a frame).
+        let s = scan_state(0, b"\r", true, b"", cap, true).expect("ok");
+        assert_eq!(s.since_boundary, 0);
+    }
+
+    #[test]
+    fn scan_frames_finalizes_carry_on_eof() {
+        let cap = 4;
+        // EOF with a dangling single EOL carry charges it as the unterminated
+        // frame's bytes (Finding 2): since=4 + carry "\n" => 5 > 4 => reject.
+        assert_eq!(scan(cap, b"\n", b"", cap, true), Err(5));
+        // EOF where the carry is itself a complete boundary ("\r\r", resolving the
+        // final CR) resets instead of charging: the frame WAS terminated.
+        assert_eq!(scan(3, b"\r\r", b"", cap, true), Ok((0, vec![])));
+        // EOF with `\r\n\r` carry: that is `\r\n` EOL + a final CR EOL = boundary,
+        // so it resets (no charge).
+        assert_eq!(scan(3, b"\r\n\r", b"", cap, true), Ok((0, vec![])));
+        // EOF with `\r\n` carry: one EOL, no second => unterminated frame; charge
+        // both bytes. since=3 + 2 => 5 > 4 => reject.
+        assert_eq!(scan(3, b"\r\n", b"", cap, true), Err(5));
+    }
+
+    #[test]
+    fn scan_frames_caps_pre_boundary_segment() {
+        let cap = 4;
+        // A TERMINATED but oversized segment ("xxxxx" = 5 > 4) is rejected even
+        // though the post-boundary tail is empty (Finding 1 sibling: confirmed
+        // pre-boundary bytes are still capped).
+        assert_eq!(scan(0, b"", b"xxxxx\n\n", cap, false), Err(5));
+        // A pre-boundary segment that, added to the carried-in count, crosses the
+        // cap is rejected before the reset (since=4, +"x" before "\n\n" => 5).
+        assert_eq!(scan(cap, b"", b"x\n\n", cap, false), Err(5));
+    }
+
+    #[test]
+    fn carry_completes_boundary_split_across_tiny_chunks() {
+        // A `\r\n\r\n` separator arriving as "\r","\n","\r\n" must be detected.
+        let mut guard = super::SseFrameGuard::new(1024);
+        guard.accept(b"\r").expect("carry \\r");
+        guard.accept(b"\n").expect("carry \\r\\n");
+        // This completes \r\n\r\n across the chunk edge; the frame resets to 0.
+        guard.accept(b"\r\n").expect("boundary completes");
+        // Prove the reset: a near-cap frame now fits where it would not have if
+        // the prior bytes had still been counted.
+        let near_cap = vec![b'q'; 1024];
+        guard
+            .accept(&near_cap)
+            .expect("fresh frame fits after multi-chunk boundary reset");
+    }
+
+    #[test]
+    fn boundary_prefix_suffix_len_classifies_tails() {
+        // Proper, incomplete/ambiguous boundary prefixes, longest-first. (In real
+        // use the caller only ever passes a post-final-boundary tail, so an
+        // unambiguous COMPLETE boundary like `\n\n` never reaches here.)
+        assert_eq!(super::boundary_prefix_suffix_len(b"a\r\n\r"), 3); // CRLF + pending CR
+        assert_eq!(super::boundary_prefix_suffix_len(b"a\r\n"), 2); // CRLF, 2nd EOL pending
+        // Ambiguous-LENGTH 2-byte separators (one EOL + a pending CR) are deferred
+        // whole: a following `\n` extends/redefines the boundary, so charging them
+        // early would make the verdict depend on the chunk split.
+        assert_eq!(super::boundary_prefix_suffix_len(b"a\n\r"), 2); // LF + pending CR
+        assert_eq!(super::boundary_prefix_suffix_len(b"a\r\r"), 2); // CR + pending CR
+        assert_eq!(super::boundary_prefix_suffix_len(b"a\r"), 1);
+        assert_eq!(super::boundary_prefix_suffix_len(b"a\n"), 1);
+        // A trailing `\r` is always a deferrable prefix (it may begin a `\r\r` or
+        // `\r\n...` on the next chunk).
+        assert_eq!(super::boundary_prefix_suffix_len(b"x\r"), 1);
+        // Ordinary bytes defer nothing.
+        assert_eq!(super::boundary_prefix_suffix_len(b"abc"), 0);
+        assert_eq!(super::boundary_prefix_suffix_len(b""), 0);
+    }
+
+    #[test]
+    fn guard_floors_tiny_cap_to_1kib() {
+        let guard = super::SseFrameGuard::new(10);
+        assert_eq!(guard.max_frame_bytes(), 1024);
+    }
+
+    #[tokio::test]
+    async fn bounded_stream_passes_normal_then_errors_on_oversized() {
+        use futures::StreamExt;
+        // A normal small frame, then a chunk that blows the (floored) cap.
+        // `Bytes` here is the re-exported `bytes::Bytes` already in scope; using
+        // `Result<Bytes, reqwest::Error>` matches what `bytes_stream()` yields so
+        // the adapter's generic bound is exercised exactly as in production.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![
+            Ok(Bytes::from_static(b"data: ok\n\n")),
+            Ok(Bytes::from(vec![b'x'; 2048])),
+        ];
+        let mut stream = Box::pin(super::bounded_sse_byte_stream(
+            futures::stream::iter(chunks),
+            1024,
+        ));
+        // First item passes through unchanged.
+        let first = stream.next().await.expect("first item").expect("ok bytes");
+        assert_eq!(first.as_ref(), b"data: ok\n\n");
+        // Second item exceeds the cap and surfaces as a transport error.
+        let err = stream
+            .next()
+            .await
+            .expect("second item")
+            .expect_err("oversized chunk errors");
+        assert!(err.to_string().contains("exceeded"));
     }
 }

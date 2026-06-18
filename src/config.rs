@@ -42,6 +42,14 @@ pub struct Config {
     /// below this value, so a near-full prompt still gets a usable (if small)
     /// completion budget instead of being clamped to zero/negative.
     pub min_completion_tokens: i64,
+    /// Per-frame byte ceiling for the UPSTREAM SSE read path (G6, DoS guard).
+    /// A hostile/buggy upstream that streams an oversized or never-terminated
+    /// SSE frame (no `\n\n` event boundary) would otherwise grow the parser
+    /// buffer without bound. When the bytes accumulated since the last event
+    /// boundary exceed this value, the stream is rejected as an `AppError`
+    /// before unbounded accumulation. The inbound-request-body cap in `http.rs`
+    /// does NOT cover this response-read path.
+    pub max_sse_frame_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +220,11 @@ pub struct PersistedConfig {
     pub debug_log_max_age_hours: Option<u64>,
     #[serde(default = "default_min_completion_tokens")]
     pub min_completion_tokens: i64,
+    /// Per-frame byte ceiling for the upstream SSE read path (G6 DoS guard).
+    /// Bounds the bytes accumulated between event boundaries; an oversized or
+    /// unterminated frame is rejected before unbounded buffer growth.
+    #[serde(default = "default_max_sse_frame_bytes")]
+    pub max_sse_frame_bytes: usize,
 }
 
 fn default_bind_addr() -> String {
@@ -258,6 +271,14 @@ fn default_min_completion_tokens() -> i64 {
     4096
 }
 
+/// Default upstream SSE per-frame cap: 8 MiB. Comfortably above any sane single
+/// model-output SSE event (typical chunks are well under 1 MiB) so normal
+/// streaming is never affected, while still bounding a hostile/unterminated
+/// frame far below the memory a single oversized accumulation could exhaust.
+fn default_max_sse_frame_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
 impl Default for PersistedConfig {
     fn default() -> Self {
         Self {
@@ -284,6 +305,7 @@ impl Default for PersistedConfig {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: default_min_completion_tokens(),
+            max_sse_frame_bytes: default_max_sse_frame_bytes(),
         }
     }
 }
@@ -417,6 +439,9 @@ impl Config {
             max_replay_entries: config.max_replay_entries,
             debug_log_max_age_hours: config.debug_log_max_age_hours,
             min_completion_tokens: config.min_completion_tokens.max(1),
+            // Floor at 1 KiB so a misconfigured tiny/zero cap cannot reject every
+            // normal frame; the default is far larger.
+            max_sse_frame_bytes: config.max_sse_frame_bytes.max(1024),
         })
     }
 
@@ -864,6 +889,12 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.min_completion_tokens = parsed;
     }
+    if let Ok(value) = env::var("LLMCONDUIT_MAX_SSE_FRAME_BYTES")
+        && let Ok(parsed) = value.trim().parse::<usize>()
+        && parsed >= 1
+    {
+        config.max_sse_frame_bytes = parsed;
+    }
 }
 
 pub fn merge_json_maps(
@@ -1256,6 +1287,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: Some(48),
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         };
         write_persisted_config(&path, &config).expect("write config");
@@ -1304,6 +1336,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         })
         .expect("config");
@@ -1432,6 +1465,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         })
         .expect("config");
@@ -1491,6 +1525,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         })
         .expect("config");
@@ -1573,6 +1608,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         })
         .expect("config");
@@ -1647,6 +1683,7 @@ mod tests {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         })
         .expect("config");
@@ -2006,6 +2043,7 @@ model_profiles:
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         })
         .expect("config");
@@ -2054,6 +2092,7 @@ model_profiles:
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         })
         .expect("config");

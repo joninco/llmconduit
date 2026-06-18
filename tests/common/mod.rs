@@ -191,6 +191,7 @@ pub fn test_config() -> Config {
         max_replay_entries: 1000,
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
+        max_sse_frame_bytes: 8 * 1024 * 1024,
         template_family: None,
     }
 }

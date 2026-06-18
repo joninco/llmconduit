@@ -456,6 +456,7 @@ async fn uses_configured_upstream_model_override() {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         },
     );
@@ -534,6 +535,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         },
     );
@@ -877,6 +879,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         },
     );
@@ -942,6 +945,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         },
     );
@@ -1542,6 +1546,7 @@ async fn proxies_models_endpoint_with_etag() {
         max_replay_entries: 1000,
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
+        max_sse_frame_bytes: 8 * 1024 * 1024,
         template_family: None,
     };
     let app = llmconduit::build_app(config);
@@ -1609,6 +1614,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         max_replay_entries: 1000,
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
+        max_sse_frame_bytes: 8 * 1024 * 1024,
         template_family: None,
     };
     let app = llmconduit::build_app(config);
@@ -1682,6 +1688,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         max_replay_entries: 1000,
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
+        max_sse_frame_bytes: 8 * 1024 * 1024,
         template_family: None,
     };
     let app = llmconduit::build_app(config);
@@ -1758,6 +1765,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         max_replay_entries: 1000,
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
+        max_sse_frame_bytes: 8 * 1024 * 1024,
         template_family: None,
     };
     let app = llmconduit::build_app(config);
@@ -1839,6 +1847,7 @@ async fn proxies_completions_endpoint_passthrough() {
         max_replay_entries: 1000,
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
+        max_sse_frame_bytes: 8 * 1024 * 1024,
         template_family: None,
     };
     let app = llmconduit::build_app(config);
@@ -2901,6 +2910,7 @@ fn test_config() -> Config {
         max_replay_entries: 1000,
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
+        max_sse_frame_bytes: 8 * 1024 * 1024,
         template_family: None,
     }
 }
@@ -5576,6 +5586,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
             max_replay_entries: 1000,
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
+            max_sse_frame_bytes: 8 * 1024 * 1024,
             template_family: None,
         },
         ReplayStore::new(1000),
