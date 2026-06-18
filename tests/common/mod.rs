@@ -35,6 +35,7 @@ use llmconduit::search::SearchClient;
 use llmconduit::search::SearchOutcome;
 use llmconduit::search::SearchSource;
 use llmconduit::upstream::UpstreamClient;
+use llmconduit::upstream::UpstreamModelEntry;
 use llmconduit::upstream::UpstreamStream;
 use serde_json::Map as JsonMap;
 use serde_json::Value;
@@ -59,6 +60,7 @@ pub struct MockUpstream {
     responses: Arc<Mutex<VecDeque<ChunkBatch>>>,
     supported_models: Arc<Mutex<Vec<String>>>,
     supported_model_queries: Arc<Mutex<usize>>,
+    context_limits: Arc<Mutex<Vec<(String, i64)>>>,
 }
 
 impl MockUpstream {
@@ -80,6 +82,16 @@ impl MockUpstream {
 
     pub async fn supported_model_queries(&self) -> usize {
         *self.supported_model_queries.lock().await
+    }
+
+    /// Supply per-model context-window lengths for G3 pre-flight budgeting.
+    pub async fn set_context_limits<I, S>(&self, limits: I)
+    where
+        I: IntoIterator<Item = (S, i64)>,
+        S: Into<String>,
+    {
+        *self.context_limits.lock().await =
+            limits.into_iter().map(|(id, n)| (id.into(), n)).collect();
     }
 }
 
@@ -110,9 +122,22 @@ impl UpstreamClient for MockUpstream {
         Err(AppError::internal("unused in this test"))
     }
 
-    async fn supported_model_ids(&self) -> Result<Vec<String>, AppError> {
+    async fn supported_model_catalog(&self) -> Result<Vec<UpstreamModelEntry>, AppError> {
         *self.supported_model_queries.lock().await += 1;
-        Ok(self.supported_models.lock().await.clone())
+        let limits = self.context_limits.lock().await.clone();
+        Ok(self
+            .supported_models
+            .lock()
+            .await
+            .iter()
+            .map(|id| UpstreamModelEntry {
+                id: id.clone(),
+                context_limit: limits
+                    .iter()
+                    .find(|(limit_id, _)| limit_id == id)
+                    .map(|(_, limit)| *limit),
+            })
+            .collect())
     }
 }
 

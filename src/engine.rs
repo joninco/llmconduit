@@ -2,6 +2,7 @@ use crate::adapters::chat_to_responses::FinalizedAssistantTurn;
 use crate::adapters::chat_to_responses::ResolvedToolCall;
 use crate::adapters::chat_to_responses::StreamEmission;
 use crate::adapters::chat_to_responses::StreamState;
+use crate::adapters::responses_to_chat::LoweredTurn;
 use crate::adapters::responses_to_chat::ToolKind;
 use crate::adapters::responses_to_chat::lower_request;
 use crate::config::Config;
@@ -39,6 +40,7 @@ use crate::replay::ReplayStore;
 use crate::search::SearchClient;
 use crate::search::SearchOutcome;
 use crate::upstream::UpstreamClient;
+use crate::upstream::UpstreamModelEntry;
 use crate::upstream::canonical_model_key;
 use crate::upstream::sanitize_chat_request;
 use futures::StreamExt;
@@ -82,19 +84,37 @@ struct CachedUpstreamModelCatalog {
 struct UpstreamModelCatalog {
     ids: Vec<String>,
     ids_by_key: HashMap<String, Vec<String>>,
+    /// Per-model context-window length (keyed by upstream catalog id) parsed
+    /// from `/v1/models`, used for G3 pre-flight budgeting. Absent when the
+    /// upstream does not report a context length for a model; budgeting no-ops
+    /// for missing entries.
+    context_limit_by_id: HashMap<String, i64>,
 }
 
 impl UpstreamModelCatalog {
-    fn from_ids(ids: Vec<String>) -> Self {
+    /// Build the catalog from a single `/v1/models` snapshot: the id list,
+    /// `canonical_model_key` index, and per-model context limit all derive from
+    /// the same entries, so normalization and G3 budgeting describe one
+    /// consistent provider state.
+    fn from_entries(entries: Vec<UpstreamModelEntry>) -> Self {
+        let mut ids = Vec::with_capacity(entries.len());
         let mut ids_by_key: HashMap<String, Vec<String>> = HashMap::new();
-        for id in &ids {
-            let key = canonical_model_key(id);
-            if key.is_empty() {
-                continue;
+        let mut context_limit_by_id: HashMap<String, i64> = HashMap::new();
+        for entry in entries {
+            let key = canonical_model_key(&entry.id);
+            if !key.is_empty() {
+                ids_by_key.entry(key).or_default().push(entry.id.clone());
             }
-            ids_by_key.entry(key).or_default().push(id.clone());
+            if let Some(limit) = entry.context_limit {
+                context_limit_by_id.insert(entry.id.clone(), limit);
+            }
+            ids.push(entry.id);
         }
-        Self { ids, ids_by_key }
+        Self {
+            ids,
+            ids_by_key,
+            context_limit_by_id,
+        }
     }
 
     fn normalize(&self, model: &str) -> Option<String> {
@@ -116,6 +136,125 @@ impl UpstreamModelCatalog {
         }
         self.ids.first().cloned()
     }
+}
+
+/// Fixed token reserve subtracted from a model's context window when capping an
+/// explicitly-requested output budget (G3 pre-flight budgeting). Mirrors
+/// claude-relay's `_completion_token_margin = 128`: a deliberately
+/// model-independent constant reserve, NOT a per-tokenizer computation.
+const CONTEXT_BUDGET_MARGIN_TOKENS: i64 = 128;
+
+/// Pre-flight context budgeting could not fit the input within the model's
+/// context window. The call site maps this to an `AppError::bad_request`.
+#[derive(Debug)]
+struct ContextBudgetError;
+
+/// Build the chat request whose serialized bytes the G3 estimate counts: the
+/// LOWERED payload (`messages`/`tools`/`reasoning_effort`/`response_format`)
+/// passed through the SAME `sanitize_chat_request` the upstream leaf applies
+/// before POSTing (`flatten_content` from config). This is the terminal layer —
+/// nothing transforms the body below `sanitize_chat_request` — so counting it
+/// makes an over-count structurally impossible (e.g. multi-part text content is
+/// flattened to a bare string here exactly as on the wire).
+///
+/// The ADDITIVE fields the leaf merges later (`extra_body`/`upstream_chat_kwargs`,
+/// G2 family `chat_template_kwargs`, `temperature`/`stop`/penalties) are
+/// deliberately OMITTED — they only ever GROW the real payload, so leaving them
+/// out keeps the estimate a safe lower bound and keeps G3 out of the
+/// kwargs-merge seam (whose entanglement caused the original G3 thrash). `pub`
+/// so the test oracle reuses this exact construction (one source of truth).
+pub fn estimate_request_from_lowered(
+    messages: &[ChatMessage],
+    tools: &[crate::models::chat::ChatTool],
+    reasoning_effort: &Option<String>,
+    response_format: &Option<Value>,
+    flatten_content: bool,
+) -> ChatCompletionRequest {
+    let request = ChatCompletionRequest {
+        model: String::new(),
+        messages: messages.to_vec(),
+        stream: true,
+        tools: (!tools.is_empty()).then(|| tools.to_vec()),
+        // Mirror the run_turn seam's default; `sanitize_chat_request` clears it
+        // when there are no tools, matching the wire body.
+        tool_choice: Some(Value::String("auto".to_string())),
+        parallel_tool_calls: false,
+        reasoning_effort: reasoning_effort.clone(),
+        response_format: response_format.clone(),
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }),
+        temperature: None,
+        top_p: None,
+        max_output_tokens: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stop: None,
+        extra_body: BTreeMap::new(),
+        template_family: None,
+        client_chat_template_kwargs: None,
+    };
+    sanitize_chat_request(request, flatten_content)
+}
+
+/// Coarse, deterministic, CONSERVATIVE lower-bound estimate of the input tokens
+/// the FIRST upstream turn will consume, for G3 pre-flight budgeting only.
+///
+/// Option B, terminal layer: the estimate counts the EXACT serialized bytes the
+/// leaf POSTs — the lowered payload after `sanitize_chat_request`
+/// (`estimate_request_from_lowered`) — NOT the canonical `ResponsesRequest` and
+/// NOT the pre-sanitize lowered messages. Because no transform exists below
+/// `sanitize_chat_request`, no field (dropped `Message` subfields,
+/// `text.verbosity`, `reasoning.summary`, raw `ToolSpec`, `ImageGenerationCall`,
+/// or leaf content-flattening of multi-part text) can inflate the estimate.
+/// `ceil(serialized_bytes / 4)` is an intentional coarse heuristic, not a
+/// tokenizer — do NOT replace it with one.
+///
+/// It remains a safe LOWER BOUND of the real request: it omits only the additive
+/// per-provider config/family kwargs merged at the leaf (G2), which only grow
+/// the payload. So it can never OVER-count and thus never cause a false
+/// pre-flight 400; any residual under-count is absorbed by G1's reactive
+/// shrink-and-retry, the precise net. The estimate covers the first upstream
+/// turn only; later tool-loop turns rely on G1.
+fn estimate_input_tokens(lowered: &LoweredTurn, flatten_content: bool) -> i64 {
+    let request = estimate_request_from_lowered(
+        &lowered.messages,
+        &lowered.tools,
+        &lowered.reasoning_effort,
+        &lowered.response_format,
+        flatten_content,
+    );
+    // `serde_json` serialization is deterministic for this type, so the byte
+    // count (and thus the estimate) is stable. The test oracle reuses
+    // `estimate_request_from_lowered`, so it tracks these exact bytes.
+    let bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
+    // ceil(bytes / 4): ~4 bytes per token is the standard coarse approximation.
+    bytes.div_ceil(4) as i64
+}
+
+/// Cap an explicitly-requested output-token budget down to what the model's
+/// context window can still fit after the estimated input and the fixed margin.
+///
+/// Pure and unit-testable; the call site maps `Err` to a 400. Rules (mirroring
+/// claude-relay `_cap_max_completion_tokens`):
+/// - `available = context_limit - estimated_input_tokens - margin`.
+/// - `available <= 0` ⇒ `Err` (input + margin already exhausts the context).
+/// - an explicit positive request is capped to `min(requested, available)`;
+///   it is NEVER raised, and an absent/non-positive request is left untouched
+///   (G3 never synthesizes a cap — G1 stays the reactive net).
+fn budget_explicit_max_output_tokens(
+    requested: Option<i64>,
+    context_limit: i64,
+    estimated_input_tokens: i64,
+) -> Result<Option<i64>, ContextBudgetError> {
+    let available = context_limit - estimated_input_tokens - CONTEXT_BUDGET_MARGIN_TOKENS;
+    if available <= 0 {
+        return Err(ContextBudgetError);
+    }
+    Ok(match requested {
+        Some(n) if n > 0 => Some(n.min(available)),
+        other => other,
+    })
 }
 
 /// Whether a Chat-Completions inbound request asked for reasoning, either via
@@ -340,6 +479,13 @@ impl Gateway {
                 );
             }
         }
+        // Lower the canonical request to the upstream chat payload BEFORE
+        // budgeting. The `?` surfaces any lowering/validation error (invalid
+        // tool_choice, unsupported `previous_response_id`, duplicate tools, …)
+        // exactly as before, so the client sees the same canonical error;
+        // budgeting only runs on a successful lowering (never a new error path).
+        // `lower_request` is a pure transform and `find_replay_baseline` above is
+        // a side-effect-free read, so computing them here is safe.
         let lowered = lower_request(
             &tail_request,
             baseline_record
@@ -347,6 +493,31 @@ impl Gateway {
                 .map(|record| record.internal_messages.clone())
                 .unwrap_or_default(),
         )?;
+
+        // G3 pre-flight context budgeting (single seam, Option B). Estimate over
+        // the LOWERED upstream payload (`lowered.messages`/`tools`/scalars) so no
+        // canonical field can inflate the estimate. When the upstream reports a
+        // context window for the resolved model, cap an explicitly requested
+        // `max_output_tokens` down to what still fits after the estimated input +
+        // fixed margin, or reject clear input overflow with a 400. Returning Err
+        // here short-circuits before `tokio::spawn`, so no upstream chat POST is
+        // made; unknown context ⇒ no-op. We mutate ONLY the typed field, which
+        // flows through to the chat request build and wins over conflicting
+        // default max-token aliases.
+        if let Some(limit) = self.upstream_model_context_limit(&resolved_model).await {
+            let estimated_input_tokens =
+                estimate_input_tokens(&lowered, self.config.flatten_content);
+            match budget_explicit_max_output_tokens(
+                request.max_output_tokens,
+                limit,
+                estimated_input_tokens,
+            ) {
+                Ok(capped) => request.max_output_tokens = capped,
+                Err(ContextBudgetError) => {
+                    return Err(AppError::bad_request("input exceeds model context window"));
+                }
+            }
+        }
 
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
@@ -1199,13 +1370,29 @@ impl Gateway {
         {
             return Ok(cached.catalog.clone());
         }
-        let ids = self.upstream.supported_model_ids().await?;
-        let catalog = UpstreamModelCatalog::from_ids(ids);
+        // Single `/v1/models` snapshot feeds BOTH model normalization and G3
+        // context budgeting, so ids and context limits can never describe
+        // different provider states.
+        let entries = self.upstream.supported_model_catalog().await?;
+        let catalog = UpstreamModelCatalog::from_entries(entries);
         *cache = Some(CachedUpstreamModelCatalog {
             fetched_at: std::time::Instant::now(),
             catalog: catalog.clone(),
         });
         Ok(catalog)
+    }
+
+    /// Context-window length the upstream reports for the resolved catalog
+    /// model id, if any, for G3 pre-flight budgeting. A catalog-load failure is
+    /// non-fatal (logged) and yields `None` so budgeting no-ops.
+    async fn upstream_model_context_limit(&self, resolved_model: &str) -> Option<i64> {
+        match self.load_upstream_model_catalog().await {
+            Ok(catalog) => catalog.context_limit_by_id.get(resolved_model).copied(),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to load catalog for context budgeting");
+                None
+            }
+        }
     }
 
     async fn next_upstream_chunk(

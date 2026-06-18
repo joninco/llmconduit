@@ -31,6 +31,18 @@ use url::Url;
 pub type UpstreamStream =
     Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, AppError>> + Send + 'static>>;
 
+/// One entry of the upstream `/v1/models` catalog: the model id plus its
+/// context-window length (`None` when the upstream reports no positive context
+/// length for it). Ids and context limits are derived from a SINGLE
+/// `/v1/models` snapshot so they always describe the same provider/state (G3:
+/// a separate context-limit fetch could otherwise pair one provider's ids with
+/// another's limits under failover).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamModelEntry {
+    pub id: String,
+    pub context_limit: Option<i64>,
+}
+
 const ROUTING_MODEL_CATALOG_TTL_SECS: u64 = 300;
 
 #[async_trait]
@@ -57,7 +69,17 @@ pub trait UpstreamClient: Send + Sync {
             "upstream completions proxy is not implemented",
         ))
     }
-    async fn supported_model_ids(&self) -> AppResult<Vec<String>>;
+    /// The upstream model catalog (ids + per-model context length) from a single
+    /// `/v1/models` snapshot. The default impl fetches `list_models()` once and
+    /// parses both the id list and the context-window length per entry, so model
+    /// routing/normalization and G3 pre-flight context budgeting always read a
+    /// consistent provider state. Clients whose `list_models()` is unavailable
+    /// surface the error; entries without a positive context length carry
+    /// `context_limit: None` (budgeting no-ops for them).
+    async fn supported_model_catalog(&self) -> AppResult<Vec<UpstreamModelEntry>> {
+        let response = self.list_models().await?;
+        collect_supported_model_catalog(response).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -432,11 +454,6 @@ impl UpstreamClient for ReqwestUpstreamClient {
         self.with_auth(request).send().await.map_err(|err| {
             AppError::upstream(format!("upstream completions request failed: {err}"))
         })
-    }
-
-    async fn supported_model_ids(&self) -> AppResult<Vec<String>> {
-        let response = self.list_models().await?;
-        collect_supported_model_ids(response).await
     }
 }
 
@@ -1051,11 +1068,6 @@ impl UpstreamClient for FailoverUpstreamClient {
         self.proxy_completions_with_provider_indices(provider_indices, headers, body)
             .await
     }
-
-    async fn supported_model_ids(&self) -> AppResult<Vec<String>> {
-        let response = self.list_models().await?;
-        collect_supported_model_ids(response).await
-    }
 }
 
 #[async_trait]
@@ -1150,9 +1162,24 @@ impl UpstreamClient for RoutingUpstreamClient {
         }
     }
 
-    async fn supported_model_ids(&self) -> AppResult<Vec<String>> {
+    async fn supported_model_catalog(&self) -> AppResult<Vec<UpstreamModelEntry>> {
+        // Build from the cached union catalog directly (single snapshot) rather
+        // than re-serializing `union_body()` through the default `list_models()`
+        // path: the union ids are authoritative, and any context length is read
+        // from the same merged entries.
         let catalog = self.load_catalog().await?;
-        Ok(catalog.union_ids)
+        let limit_by_id: HashMap<String, i64> =
+            extract_model_context_limits(&Value::Array(catalog.union_entries.clone()))
+                .into_iter()
+                .collect();
+        Ok(catalog
+            .union_ids
+            .into_iter()
+            .map(|id| {
+                let context_limit = limit_by_id.get(&id).copied();
+                UpstreamModelEntry { id, context_limit }
+            })
+            .collect())
     }
 }
 
@@ -2336,9 +2363,11 @@ pub async fn collect_models_response(
     Ok((status, body, etag))
 }
 
-pub async fn collect_supported_model_ids(response: reqwest::Response) -> AppResult<Vec<String>> {
+pub async fn collect_supported_model_catalog(
+    response: reqwest::Response,
+) -> AppResult<Vec<UpstreamModelEntry>> {
     let (_, body, _) = collect_models_response(response).await?;
-    Ok(extract_supported_model_ids(&body))
+    Ok(extract_supported_model_catalog(&body))
 }
 
 async fn filter_models_response(
@@ -2429,8 +2458,45 @@ fn single_model_entry(model: &str) -> Value {
     })
 }
 
-fn extract_supported_model_ids(body: &Value) -> Vec<String> {
-    extract_model_ids_from_array(&model_entries_from_body(body))
+/// Parse the upstream model catalog (id + optional context length) from a
+/// `/v1/models` body in a SINGLE pass. Preserves the existing id behavior: bare
+/// string entries are ids with no context length; object entries take their
+/// `id` and, if present, the first positive context-length field. Entries
+/// without an `id` are skipped.
+fn extract_supported_model_catalog(body: &Value) -> Vec<UpstreamModelEntry> {
+    model_entries_from_body(body)
+        .iter()
+        .filter_map(|entry| match entry {
+            Value::String(id) => Some(UpstreamModelEntry {
+                id: id.clone(),
+                context_limit: None,
+            }),
+            Value::Object(map) => {
+                let id = map.get("id").and_then(Value::as_str)?;
+                Some(UpstreamModelEntry {
+                    id: id.to_string(),
+                    context_limit: entry_context_limit(map),
+                })
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// First positive integer among the context-length keys the Anthropic
+/// `/v1/models` reshape uses (`http.rs`): `max_input_tokens`, `context_length`,
+/// `context_window`, `max_context_length`, `max_model_len`. Single source for
+/// G3 context budgeting and the routing union parse.
+fn entry_context_limit(map: &serde_json::Map<String, Value>) -> Option<i64> {
+    [
+        "max_input_tokens",
+        "context_length",
+        "context_window",
+        "max_context_length",
+        "max_model_len",
+    ]
+    .iter()
+    .find_map(|key| map.get(*key).and_then(Value::as_i64).filter(|n| *n > 0))
 }
 
 fn model_entries_from_body(body: &Value) -> Vec<Value> {
@@ -2446,16 +2512,16 @@ fn model_entries_from_body(body: &Value) -> Vec<Value> {
     }
 }
 
-fn extract_model_ids_from_array(entries: &[Value]) -> Vec<String> {
-    entries
+/// Parse `(id, context_limit)` pairs from a `/v1/models` body for G3 budgeting,
+/// omitting entries with no positive context length. Used by the routing client
+/// to read context limits from its already-merged union entries.
+fn extract_model_context_limits(body: &Value) -> Vec<(String, i64)> {
+    model_entries_from_body(body)
         .iter()
-        .filter_map(|entry| match entry {
-            Value::String(id) => Some(id.clone()),
-            Value::Object(map) => map
-                .get("id")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-            _ => None,
+        .filter_map(|entry| {
+            let map = entry.as_object()?;
+            let id = map.get("id").and_then(Value::as_str)?;
+            Some((id.to_string(), entry_context_limit(map)?))
         })
         .collect()
 }
@@ -2540,8 +2606,10 @@ fn stringify_json_value(value: Value) -> Value {
 mod tests {
     use super::Bytes;
     use super::ReqwestUpstreamClient;
+    use super::UpstreamModelEntry;
     use super::UpstreamRequestLogger;
-    use super::extract_supported_model_ids;
+    use super::extract_model_context_limits;
+    use super::extract_supported_model_catalog;
     use super::sanitize_chat_request;
     use crate::models::chat::ChatCompletionRequest;
     use crate::models::chat::ChatMessage;
@@ -3293,8 +3361,12 @@ mod tests {
         );
     }
 
+    fn catalog_ids(entries: &[UpstreamModelEntry]) -> Vec<&str> {
+        entries.iter().map(|entry| entry.id.as_str()).collect()
+    }
+
     #[test]
-    fn extract_supported_model_ids_reads_standard_models_list() {
+    fn extract_supported_model_catalog_reads_standard_models_list() {
         let body = serde_json::json!({
             "object": "list",
             "data": [
@@ -3304,16 +3376,102 @@ mod tests {
             ]
         });
 
+        // Ids preserved, including the bare-string entry (context_limit None).
         assert_eq!(
-            extract_supported_model_ids(&body),
+            catalog_ids(&extract_supported_model_catalog(&body)),
             vec!["glm-5.1", "Qwen3.5", "grok-4"]
+        );
+        assert!(
+            extract_supported_model_catalog(&body)
+                .iter()
+                .all(|entry| entry.context_limit.is_none())
         );
     }
 
     #[test]
-    fn extract_supported_model_ids_reads_models_array() {
+    fn extract_supported_model_catalog_reads_models_array() {
         let body = serde_json::json!({"models": ["glm-5.1"]});
-        assert_eq!(extract_supported_model_ids(&body), vec!["glm-5.1"]);
+        assert_eq!(
+            extract_supported_model_catalog(&body),
+            vec![UpstreamModelEntry {
+                id: "glm-5.1".to_string(),
+                context_limit: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn extract_supported_model_catalog_reads_ids_and_context_limits_in_one_pass() {
+        // Same snapshot yields ids AND limits: first positive context key wins,
+        // and an entry with no positive context length keeps its id with a
+        // `None` limit (budgeting no-ops for it, but it still resolves).
+        let body = serde_json::json!({
+            "data": [
+                {"id": "a", "max_input_tokens": 1000, "context_length": 9999},
+                {"id": "b", "context_window": 2048},
+                {"id": "c", "context_length": 0},
+                "bare",
+            ]
+        });
+
+        assert_eq!(
+            extract_supported_model_catalog(&body),
+            vec![
+                UpstreamModelEntry {
+                    id: "a".to_string(),
+                    context_limit: Some(1000)
+                },
+                UpstreamModelEntry {
+                    id: "b".to_string(),
+                    context_limit: Some(2048)
+                },
+                UpstreamModelEntry {
+                    id: "c".to_string(),
+                    context_limit: None
+                },
+                UpstreamModelEntry {
+                    id: "bare".to_string(),
+                    context_limit: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_model_context_limits_reads_first_positive_key() {
+        // Prefers `max_input_tokens`, then falls back through the alias keys;
+        // skips entries with no positive context length (string ids, zero,
+        // missing) so budgeting no-ops for them.
+        let body = serde_json::json!({
+            "data": [
+                {"id": "a", "max_input_tokens": 1000, "context_length": 9999},
+                {"id": "b", "context_window": 2048},
+                {"id": "c", "max_model_len": 4096},
+                {"id": "d", "context_length": 0},
+                {"id": "e"},
+                "bare-string-id",
+            ]
+        });
+
+        let limits = extract_model_context_limits(&body);
+        assert_eq!(
+            limits,
+            vec![
+                ("a".to_string(), 1000),
+                ("b".to_string(), 2048),
+                ("c".to_string(), 4096),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_model_context_limits_handles_models_array_and_empty() {
+        let body = serde_json::json!({"models": [{"id": "x", "max_context_length": 32768}]});
+        assert_eq!(
+            extract_model_context_limits(&body),
+            vec![("x".to_string(), 32768)]
+        );
+        assert!(extract_model_context_limits(&serde_json::json!({})).is_empty());
     }
 
     // --- G6 upstream SSE per-frame cap: boundary-detection internals ---

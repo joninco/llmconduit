@@ -27,6 +27,7 @@ use llmconduit::raw::RawOutput;
 use llmconduit::replay::ReplayStore;
 use llmconduit::search::SearchClient;
 use llmconduit::upstream::UpstreamClient;
+use llmconduit::upstream::UpstreamModelEntry;
 use llmconduit::upstream::UpstreamStream;
 use pretty_assertions::assert_eq;
 use serde_json::Map as JsonMap;
@@ -101,10 +102,21 @@ impl UpstreamClient for MockUpstream {
         Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
-    async fn supported_model_ids(&self) -> Result<Vec<String>, llmconduit::error::AppError> {
+    async fn supported_model_catalog(
+        &self,
+    ) -> Result<Vec<UpstreamModelEntry>, llmconduit::error::AppError> {
         let mut query_count = self.supported_model_queries.lock().await;
         *query_count += 1;
-        Ok(self.supported_models.lock().await.clone())
+        Ok(self
+            .supported_models
+            .lock()
+            .await
+            .iter()
+            .map(|id| UpstreamModelEntry {
+                id: id.clone(),
+                context_limit: None,
+            })
+            .collect())
     }
 }
 
@@ -163,8 +175,13 @@ impl UpstreamClient for PendingChunkUpstream {
         Err(llmconduit::error::AppError::internal("unused in this test"))
     }
 
-    async fn supported_model_ids(&self) -> Result<Vec<String>, llmconduit::error::AppError> {
-        Ok(vec!["glm-5.1".to_string()])
+    async fn supported_model_catalog(
+        &self,
+    ) -> Result<Vec<UpstreamModelEntry>, llmconduit::error::AppError> {
+        Ok(vec![UpstreamModelEntry {
+            id: "glm-5.1".to_string(),
+            context_limit: None,
+        }])
     }
 }
 
