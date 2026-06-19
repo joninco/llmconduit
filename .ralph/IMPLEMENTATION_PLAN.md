@@ -171,10 +171,28 @@ routing layer, which collapses the ladder as part of its scope. T1 extracted onl
 co-owned with T2 by this deferral.
 
 ### Task 11.2 — Typed routing-candidate plan (delete G4 side-channel vision gating)
-**Priority:** HIGH · **Spec:** `.ralph/specs/T2-routing-candidate-plan.md`
-Delete `request_model_genuinely_resolves` + side-channel native-vision gating (`engine.rs:759`);
-return a typed backend-candidate plan from the real routing/failover layer; reuse for G4 gating.
-**Files:** `src/engine.rs`, `src/upstream.rs` (routing), tests.
+**Priority:** HIGH · **Spec:** `.ralph/specs/T2-routing-candidate-plan.md` · **Commit:** `f56fbe9`
+**Status:** Codex-xhigh APPROVED (R3). Deleted `request_model_genuinely_resolves` +
+side-channel gating resolution. `upstream::BackendCandidatePlan { candidates }` is the
+single source of truth for the candidate set; `UpstreamClient::backend_candidate_plan`
+builds it (routing: from `catalog.resolve`; failover: per-provider effective models;
+default: passthrough), and `candidate_backend_models` default-projects from it (one
+method per client, no duplicated enumeration). The `genuine` signal is a byproduct of
+the ONE `normalize_upstream_model` walk (now returns `(String, bool)`), threaded
+`stream_responses` → `activate_image_agent` → `backend_is_native_vision` — NOT a
+re-derived side-channel. `genuine` is false ONLY on a real default-fallback (blank OR
+non-blank collapsing to a differing catalog default); true for exact/route/canonical/
+no-default-passthrough/catalog-unavailable. G4 decision-table semantics + PROFILE-ONLY
+lookup preserved. Round-8 #1 covered by `gating_table_unmatched_request_override_does_
+not_apply_to_default` (stale alias) + `gating_table_blank_request_override_does_not_
+apply_to_default` (blank model, R1 regression guard). `resolve_request_model` →
+`(String, bool)`; 3 http.rs label callers take `.0`. Mock upstream overrides
+`backend_candidate_plan`. **Deferred to T9:** the `normalize_upstream_model` ladder
+DEDUP vs `RoutingModelCatalog::resolve` — `UpstreamModelCatalog` carries G3
+`context_limit_by_id`; T9 moves G3 budgeting behind route/provider resolution, at which
+point this fn delegates to the routing catalog and the ladder collapses. T2 collapsed
+the gating side-channel only.
+**Files:** `src/engine.rs`, `src/upstream.rs`, `src/http.rs`, `tests/gateway.rs`.
 **Depends on:** 11.1.
 
 ### Task 11.3 — Extract ToolDeltaGate from run_turn
