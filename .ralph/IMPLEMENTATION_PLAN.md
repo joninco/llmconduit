@@ -29,7 +29,7 @@ per-gap Codex review replaces it).
 
 ### Task 3 — G1 ✅ COMPLETED — commit `ebe6b41`, Codex-xhigh APPROVED (round 7). See Completed tasks.
 
-### Task 4 — G3 ✅ COMPLETED (resolved via OPTION B — estimate the lowered upstream payload)
+### Task 4 — G3 ✅ COMPLETED — commit `41d7428`, Codex-xhigh APPROVED (R6) (resolved via OPTION B — estimate the lowered upstream payload)
 - First implementation went through **9 Codex-xhigh review rounds / 12 findings** (rounds 4-9 were the
   same floor-vs-synthetic class) and was reverted. Re-done as the minimal claude-relay port; the re-attempt
   then took **several more Codex-xhigh rounds, ALL the same estimator-vs-payload class** — the pre-flight
@@ -89,6 +89,7 @@ per-gap Codex review replaces it).
 | 1 | P1 output_config.effort → reasoning.effort | `1faba60` | Codex-xhigh APPROVED (R2) |
 | 2 | G5 debug-dump log rotation (mode-aware dirs) | `b610a53` | Codex-xhigh APPROVED (R2) |
 | 3 | G1 context-window-limit retry (regex classifier) | `ebe6b41` | Codex-xhigh APPROVED (R7) |
+| 4 | G3 pre-flight context budgeting cap (post-sanitize estimate) | `41d7428` | Codex-xhigh APPROVED (R6) |
 | 5 | G2 Kimi/DeepSeek family kwargs (provider-leaf) | `d1e626e` | Codex-xhigh APPROVED (R3) |
 | 6 | G8 reasoning promotion/suppression (Anthropic) | `8297ca6` | Codex-xhigh APPROVED (R3) |
 | 7 | G6 SSE per-frame buffer cap (DoS guard) | `881cfe1` | Codex-xhigh APPROVED |
