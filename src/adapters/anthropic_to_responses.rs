@@ -143,9 +143,11 @@ fn convert_output_config(output_config: Option<Value>) -> AppResult<Option<TextC
 /// `reasoning.effort`. When thinking is `enabled` the budget already pins the
 /// effort (see `convert_thinking`), so the field is ignored to avoid fighting
 /// the explicit budget; it is likewise ignored when reasoning is off. The raw
-/// effort string is passed through unvalidated — the canonical→Chat lowering
-/// (`responses_to_chat::normalize_reasoning_effort`) clamps unsupported values
-/// like `max`/`xhigh`, keeping this conversion pure and single-sourced.
+/// effort string is passed through unvalidated — lowering
+/// (`responses_to_chat::normalize_reasoning_effort`) only normalizes
+/// case/whitespace, and the upstream LEAF (`upstream::finalize_request_for_backend`)
+/// then maps it per-model (`reasoning_effort_map`) or clamps unsupported values
+/// like `max`/`xhigh`, keeping this conversion pure.
 fn apply_output_config_effort(
     reasoning: Option<ReasoningRequest>,
     thinking: &Option<AnthropicThinking>,

@@ -109,6 +109,11 @@ impl UpstreamClient for MockUpstream {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<UpstreamStream, llmconduit::error::AppError> {
+        // Records the ENGINE's request (pre-leaf): reasoning_effort here is the
+        // RAW canonical level, not the clamped/mapped wire value, and no family
+        // chat_template_kwargs are injected. Tests that need the on-wire body
+        // (clamped effort, family/effort-map kwargs) use the leaf-mirroring mock
+        // in tests/common/mod.rs (which calls finalize_request_for_backend).
         self.requests.lock().await.push(request.clone());
         let chunks = self
             .responses
