@@ -5051,10 +5051,10 @@ async fn anthropic_messages_streams_tool_use_response() {
     assert_eq!(tool_starts.len(), 1);
     let json_deltas: Vec<_> = anthropic_events
         .iter()
-        .filter_map(|event| {
-            (event["type"] == "content_block_delta" && event["delta"]["type"] == "input_json_delta")
-                .then(|| event["delta"]["partial_json"].as_str().unwrap())
+        .filter(|&event| {
+            event["type"] == "content_block_delta" && event["delta"]["type"] == "input_json_delta"
         })
+        .map(|event| event["delta"]["partial_json"].as_str().unwrap())
         .collect();
     assert_eq!(json_deltas, vec![r#"{"loc"#, r#"ation":"Seattle"}"#]);
 }
