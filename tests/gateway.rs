@@ -65,6 +65,11 @@ struct MockUpstream {
     /// simulate a failover chain (primary + fallbacks). `None` falls back to the
     /// trait default (just the request model).
     candidate_models: Arc<StdMutex<Option<Vec<String>>>>,
+    /// Per-model finalization policies (effort/family/kwargs), built from the
+    /// test config by the gateway harness so the mock's leaf-mirror applies the
+    /// SAME profile kwargs the production leaf would (T1). Empty by default
+    /// (most tests don't assert kwargs).
+    finalization_policies: Arc<StdMutex<llmconduit::upstream::BackendFinalizationPolicies>>,
 }
 
 impl MockUpstream {
@@ -73,6 +78,16 @@ impl MockUpstream {
         chunks: Vec<Result<ChatCompletionChunk, llmconduit::error::AppError>>,
     ) {
         self.responses.lock().await.push_back(chunks);
+    }
+
+    /// Set the finalization policies built from the test config, so the mock's
+    /// leaf-mirror applies the same profile/family/effort kwargs the production
+    /// leaf would (T1).
+    fn set_finalization_policies(
+        &self,
+        policies: llmconduit::upstream::BackendFinalizationPolicies,
+    ) {
+        *self.finalization_policies.lock().expect("policies lock") = policies;
     }
 
     /// Set the candidate backend model set reported to G4 native-vision gating
@@ -107,14 +122,24 @@ impl MockUpstream {
 impl UpstreamClient for MockUpstream {
     async fn stream_chat_completion(
         &self,
-        request: &ChatCompletionRequest,
+        backend: &llmconduit::upstream::BackendChatRequest,
     ) -> Result<UpstreamStream, llmconduit::error::AppError> {
-        // Records the ENGINE's request (pre-leaf): reasoning_effort here is the
-        // RAW canonical level, not the clamped/mapped wire value, and no family
-        // chat_template_kwargs are injected. Tests that need the on-wire body
-        // (clamped effort, family/effort-map kwargs) use the leaf-mirroring mock
-        // in tests/common/mod.rs (which calls finalize_request_for_backend).
-        self.requests.lock().await.push(request.clone());
+        // Mirror the production leaf so the recorded request reflects what the
+        // backend would actually receive: per-model `upstream_chat_kwargs` +
+        // `template_family` + effort (clamp/map) + family `chat_template_kwargs`
+        // are applied HERE (T1 moved profile resolution from the engine to the
+        // leaf). Empty policies → the unmapped/clamp path; the per-model
+        // reasoning_effort_map is exercised against the real leaf in
+        // port_config.rs. Tests asserting a RAW pre-leaf `reasoning_effort` rely
+        // on non-family models where the leaf is a no-op on that field.
+        let mut backend = backend.clone();
+        let policies = self
+            .finalization_policies
+            .lock()
+            .expect("policies lock")
+            .clone();
+        llmconduit::upstream::finalize_request_for_backend(&mut backend, &policies);
+        self.requests.lock().await.push(backend.request.clone());
         let chunks = self
             .responses
             .lock()
@@ -193,9 +218,9 @@ impl Drop for NotifyOnDrop {
 impl UpstreamClient for PendingChunkUpstream {
     async fn stream_chat_completion(
         &self,
-        request: &ChatCompletionRequest,
+        backend: &llmconduit::upstream::BackendChatRequest,
     ) -> Result<UpstreamStream, llmconduit::error::AppError> {
-        self.requests.lock().await.push(request.clone());
+        self.requests.lock().await.push(backend.request.clone());
         let stream_polled = Arc::clone(&self.stream_polled);
         let stream_dropped = Arc::clone(&self.stream_dropped);
         let stream = async_stream::stream! {
@@ -553,6 +578,7 @@ async fn uses_configured_upstream_model_override() {
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             model_routes: Vec::new(),
+            template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: None,
             brave_max_results: 5,
@@ -569,7 +595,6 @@ async fn uses_configured_upstream_model_override() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            template_family: None,
         },
     );
 
@@ -638,6 +663,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             model_routes: Vec::new(),
+            template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: Some("test-key".to_string()),
             brave_max_results: 5,
@@ -654,7 +680,6 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            template_family: None,
         },
     );
 
@@ -988,6 +1013,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             model_routes: Vec::new(),
+            template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: None,
             brave_max_results: 5,
@@ -1004,7 +1030,6 @@ async fn forwards_configured_upstream_chat_kwargs() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            template_family: None,
         },
     );
 
@@ -1056,12 +1081,12 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
                             "preserve_thinking": true
                         }),
                     )]),
-                    template_family: None,
                     native_vision: None,
                     ..Default::default()
                 },
             )]),
             model_routes: Vec::new(),
+            template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: None,
             brave_max_results: 5,
@@ -1078,7 +1103,6 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            template_family: None,
         },
     );
 
@@ -1112,7 +1136,6 @@ async fn prepends_profile_system_prompt_prefix_for_responses_requests() {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
-            template_family: None,
             native_vision: None,
             ..Default::default()
         },
@@ -1671,6 +1694,7 @@ async fn proxies_models_endpoint_with_etag() {
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
+        template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: None,
         brave_max_results: 5,
@@ -1687,7 +1711,6 @@ async fn proxies_models_endpoint_with_etag() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
-        template_family: None,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1745,6 +1768,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
+        template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: None,
         brave_max_results: 5,
@@ -1761,7 +1785,6 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
-        template_family: None,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1825,6 +1848,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
+        template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: None,
         brave_max_results: 5,
@@ -1841,7 +1865,6 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
-        template_family: None,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1908,6 +1931,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
+        template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: None,
         brave_max_results: 5,
@@ -1924,7 +1948,6 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
-        template_family: None,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -1996,6 +2019,7 @@ async fn proxies_completions_endpoint_passthrough() {
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
+        template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: None,
         brave_max_results: 5,
@@ -2012,7 +2036,6 @@ async fn proxies_completions_endpoint_passthrough() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
-        template_family: None,
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3041,6 +3064,12 @@ fn test_gateway_with_config_and_raw_output(
     config: Config,
     raw_output: Option<RawOutput>,
 ) -> Arc<Gateway> {
+    // Build the leaf finalization policies from the test config so the mock's
+    // leaf-mirror applies the SAME profile/family/effort kwargs the production
+    // leaf would (T1 moved profile resolution from the engine to the leaf).
+    upstream.set_finalization_policies(
+        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
+    );
     // Non-image-agent tests get a no-op vision client; the cache is built from
     // config and never activated unless `image_agent_enabled` + `vision_url`.
     let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(MockVisionClient::default());
@@ -3093,6 +3122,7 @@ fn test_config() -> Config {
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         model_routes: Vec::new(),
+        template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: Some("test-key".to_string()),
         brave_max_results: 5,
@@ -3109,7 +3139,6 @@ fn test_config() -> Config {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
-        template_family: None,
     }
 }
 
@@ -4032,7 +4061,6 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
                     "shared": "model"
                 }),
             )]),
-            template_family: None,
             native_vision: None,
             ..Default::default()
         },
@@ -4105,13 +4133,22 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
                 "allow_fallbacks": true
             })
         );
+        // T1: profile `upstream_chat_kwargs` resolve at the LEAF against the FINAL
+        // provider model ("fallback-model"), not the request alias ("client-model").
+        // The failover target has no profile of its own, so the request-alias
+        // profile's `chat_template_kwargs` ({model_default, shared:"model"}) do
+        // NOT bleed onto the fallback — only the fallback PROVIDER's own kwargs
+        // ({fallback_default, shared:"fallback"}) reach the backend.
         assert_eq!(
             body["chat_template_kwargs"],
             json!({
                 "fallback_default": true,
-                "model_default": true,
-                "shared": "model"
+                "shared": "fallback"
             })
+        );
+        assert!(
+            body["chat_template_kwargs"]["model_default"].is_null(),
+            "request-alias profile kwargs must not apply to a failover target (T1)"
         );
     }
 }
@@ -4563,7 +4600,6 @@ async fn chat_completions_prepends_profile_system_prompt_prefix() {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
-            template_family: None,
             native_vision: None,
             ..Default::default()
         },
@@ -5135,7 +5171,6 @@ async fn anthropic_messages_prepends_profile_system_prompt_prefix() {
             upstream_model: None,
             system_prompt_prefix: Some("Profile prefix.".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
-            template_family: None,
             native_vision: None,
             ..Default::default()
         },
@@ -5781,6 +5816,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             model_routes: Vec::new(),
+            template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: None,
             brave_max_results: 5,
@@ -5797,7 +5833,6 @@ async fn cancels_mid_stream_when_client_disconnects() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            template_family: None,
         },
         ReplayStore::new(1000),
         Arc::new(upstream.clone()),
@@ -6602,7 +6637,6 @@ async fn image_agent_profile_native_vision_override_skips() {
         llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: None,
-            template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
@@ -7394,7 +7428,6 @@ async fn image_agent_request_native_vision_override_does_not_leak_onto_fallback(
         llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: None,
-            template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
@@ -7485,7 +7518,6 @@ async fn image_agent_strips_when_kimi_alias_remaps_to_text_backend() {
         llmconduit::config::ModelProfile {
             upstream_model: Some("deepseek-v3".to_string()),
             system_prompt_prefix: None,
-            template_family: None,
             native_vision: None,
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
@@ -7617,7 +7649,6 @@ async fn image_agent_request_native_vision_false_on_kimi_primary_strips() {
         llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: None,
-            template_family: None,
             native_vision: Some(false),
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
@@ -7656,7 +7687,6 @@ async fn image_agent_request_native_vision_true_on_text_named_primary_passes_thr
         llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: None,
-            template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
@@ -7699,7 +7729,6 @@ async fn image_agent_request_native_vision_true_does_not_flip_nonnative_fallback
         llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: None,
-            template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
@@ -7856,7 +7885,6 @@ async fn gating_table_unmatched_request_override_does_not_apply_to_default() {
         llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: None,
-            template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
@@ -7902,7 +7930,6 @@ async fn gating_table_genuine_resolution_native_true_passes_through() {
         llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: None,
-            template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
@@ -7935,7 +7962,6 @@ async fn gating_table_native_false_on_resolved_primary_strips() {
         llmconduit::config::ModelProfile {
             upstream_model: None,
             system_prompt_prefix: None,
-            template_family: None,
             native_vision: Some(false),
             upstream_chat_kwargs: JsonMap::new(),
             ..Default::default()
@@ -8046,7 +8072,6 @@ async fn gating_table_candidate_lookup_uses_own_profile_not_remap_target() {
                 // this candidate's native-vision decision.
                 upstream_model: Some("kimi-native".to_string()),
                 system_prompt_prefix: None,
-                template_family: None,
                 native_vision: Some(false), // the candidate's OWN truth
                 upstream_chat_kwargs: JsonMap::new(),
                 ..Default::default()
@@ -8057,7 +8082,6 @@ async fn gating_table_candidate_lookup_uses_own_profile_not_remap_target() {
             llmconduit::config::ModelProfile {
                 upstream_model: None,
                 system_prompt_prefix: None,
-                template_family: None,
                 native_vision: Some(true), // remap target — must NOT leak in
                 upstream_chat_kwargs: JsonMap::new(),
                 ..Default::default()
@@ -8103,7 +8127,6 @@ async fn gating_table_request_override_not_displaced_by_remap_target_profile() {
             llmconduit::config::ModelProfile {
                 upstream_model: Some("kimi-native".to_string()),
                 system_prompt_prefix: None,
-                template_family: None,
                 native_vision: Some(false), // request's OWN truth
                 upstream_chat_kwargs: JsonMap::new(),
                 ..Default::default()
@@ -8114,7 +8137,6 @@ async fn gating_table_request_override_not_displaced_by_remap_target_profile() {
             llmconduit::config::ModelProfile {
                 upstream_model: None,
                 system_prompt_prefix: None,
-                template_family: None,
                 native_vision: Some(true), // remap target — must NOT displace
                 upstream_chat_kwargs: JsonMap::new(),
                 ..Default::default()

@@ -223,8 +223,6 @@ pub fn estimate_request_from_lowered(
         presence_penalty: None,
         stop: None,
         extra_body: BTreeMap::new(),
-        template_family: None,
-        client_chat_template_kwargs: None,
     };
     sanitize_chat_request(request, flatten_content)
 }
@@ -1128,24 +1126,27 @@ impl Gateway {
         let mut current_tool_choice = request.tool_choice.clone();
         #[allow(unused_assignments)]
         let mut last_finish_reason: Option<String> = None;
-        // Family-specific `chat_template_kwargs` are injected LATER, in the
-        // upstream client, against the FINAL per-provider model (G2 cross-layer
-        // fix): routing/failover/exposed-alias paths rewrite the actual provider
-        // model after this point, so the engine cannot know the real family
-        // here. We thread the configured `template_family` override and the
-        // client's explicit `chat_template_kwargs` (so a client value still wins
-        // over a forced family default) down for the upstream layer to apply.
-        let template_family_override = self
-            .config
-            .resolve_template_family(&request.model, &upstream_model);
+        // T1: `template_family` + `upstream_chat_kwargs` profile resolution moved
+        // to the upstream LEAF (`finalize_request_for_backend`), where the FINAL
+        // per-provider model is known after routing/failover/exposed-alias remap.
+        // The engine no longer pre-resolves these against the pre-routing
+        // `upstream_model`, so a routed/failover cross-family target gets its OWN
+        // family/kwargs rather than the alias's. The engine still captures the
+        // client's EXPLICIT `chat_template_kwargs` here (PRE-MERGE) and threads it
+        // on the `BackendChatRequest` wrapper: the leaf cannot re-derive it from
+        // the merged `extra_body`, and re-asserting it (not the provider/global
+        // blend) over the forced family default preserves client-wins precedence.
         let client_chat_template_kwargs = request
             .extra_body
             .get("chat_template_kwargs")
             .and_then(Value::as_object)
             .cloned();
+        // `build_upstream_extra_body` now runs with EMPTY defaults: the
+        // profile/global `upstream_chat_kwargs` merge at the leaf. It still
+        // performs the request-extra normalization (remove typed-field defaults
+        // shadowed by explicit request fields, deep-merge `request.extra_body`).
         let upstream_extra_body = build_upstream_extra_body(
-            self.config
-                .resolve_upstream_chat_kwargs_for_resolved_model(&request.model, &upstream_model),
+            serde_json::Map::new(),
             &request,
             &response_format,
             &reasoning_effort,
@@ -1181,8 +1182,6 @@ impl Gateway {
                 presence_penalty: request.presence_penalty,
                 stop: normalized_stop.clone(),
                 extra_body: upstream_extra_body.clone(),
-                template_family: template_family_override.clone(),
-                client_chat_template_kwargs: client_chat_template_kwargs.clone(),
             };
             if self.monitor.is_enabled() {
                 let upstream_debug_request =
@@ -1264,11 +1263,15 @@ impl Gateway {
             if tx.is_closed() {
                 return Err(AppError::cancelled());
             }
+            let backend_request = crate::upstream::BackendChatRequest::new(
+                upstream_request.clone(),
+                client_chat_template_kwargs.clone(),
+            );
             let mut stream = tokio::select! {
                 biased;
                 _ = tx.closed() => return Err(AppError::cancelled()),
                 result = self.upstream.stream_chat_completion_with_timeout(
-                    &upstream_request,
+                    &backend_request,
                     self.config.request_timeout,
                 ) => result?,
             };
@@ -1785,16 +1788,22 @@ impl Gateway {
                 return model.to_string();
             }
         };
-        // Precedence (must mirror `RoutingModelCatalog::resolve`, G7):
+        // Precedence (mirrors `RoutingModelCatalog::resolve`, G7; route-match
+        // uses the shared `config::route_matches` primitive):
         //   1. exact catalog id (an exact id always wins),
         //   2. ad-hoc route match (exact name or glob) -> pass the model through
         //      UNCHANGED so the routing client dispatches the route instead of
         //      collapsing an unknown route name to the catalog default,
         //   3. unique canonical-key catalog match,
         //   4. default catalog id.
-        // Without step 2, a mixed `upstreams` + `model_routes` config would
-        // pre-normalize a route-only model to the catalog default here and the
-        // route would never fire.
+        // The ladder is duplicated here vs `RoutingModelCatalog::resolve` because
+        // the engine normalizes against its own `UpstreamModelCatalog` (which also
+        // carries G3 context limits) rather than the routing client's catalog.
+        // T2 collapses this: it deletes `request_model_genuinely_resolves` and
+        // returns a typed backend-candidate plan from the real routing layer, so
+        // the engine stops re-deriving the ladder. Without step 2, a mixed
+        // `upstreams` + `model_routes` config would pre-normalize a route-only
+        // model to the catalog default here and the route would never fire.
         if let Some(exact) = catalog.exact_id(model) {
             if exact != model {
                 tracing::info!(

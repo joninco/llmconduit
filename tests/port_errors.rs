@@ -339,6 +339,7 @@ mod integration {
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             model_routes: Vec::new(),
+            template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: None,
             brave_max_results: 5,
@@ -355,7 +356,6 @@ mod integration {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
-            template_family: None,
         }
     }
 

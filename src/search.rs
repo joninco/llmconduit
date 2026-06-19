@@ -253,6 +253,7 @@ mod tests {
                 upstream_failure_cooldown_secs: 30,
                 model_profiles: std::collections::BTreeMap::new(),
                 model_routes: Vec::new(),
+                template_family: None,
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1")
                     .expect("url"),
                 brave_api_key: Some("secret".to_string()),
@@ -270,7 +271,6 @@ mod tests {
                 vision_model: None,
                 image_cache_max_size: 100,
                 image_cache_ttl_secs: 300,
-                template_family: None,
             },
         );
 
@@ -300,6 +300,7 @@ mod tests {
                 upstream_failure_cooldown_secs: 30,
                 model_profiles: std::collections::BTreeMap::new(),
                 model_routes: Vec::new(),
+                template_family: None,
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1/")
                     .expect("url"),
                 brave_api_key: Some("secret".to_string()),
@@ -317,7 +318,6 @@ mod tests {
                 vision_model: None,
                 image_cache_max_size: 100,
                 image_cache_ttl_secs: 300,
-                template_family: None,
             },
         );
 

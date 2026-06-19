@@ -74,11 +74,13 @@ pub fn build_app_with_gateway_and_options(
     // (G7); routes alone are enough to switch the gateway into the routing
     // client so route-name/glob matching applies.
     let routing_mode = !config.upstreams.is_empty() || !config.model_routes.is_empty();
-    // Per-backend-model reasoning-effort policies, shared (cheap clone) across all
-    // leaf clients so each gets the FINAL model's effort vocabulary. Copy the
-    // scalar config knobs out so the builder closure doesn't borrow `config`
-    // (which is moved into the Gateway below).
-    let effort_policies = Arc::new(config.reasoning_effort_policies());
+    // Per-backend-model finalization policies (effort map, `template_family`
+    // override, `upstream_chat_kwargs`), shared (cheap clone) across all leaf
+    // clients so each resolves against the FINAL provider model (T1). Built once
+    // from config; the leaf (`finalize_request_for_backend`) looks up the policy
+    // for the model it actually POSTs to. Copy the scalar config knobs out so
+    // the builder closure doesn't borrow `config` (moved into the Gateway below).
+    let finalization_policies = crate::upstream::BackendFinalizationPolicies::from_config(&config);
     let flatten_content = config.flatten_content;
     let min_completion_tokens = config.min_completion_tokens;
     let max_sse_frame_bytes = config.max_sse_frame_bytes;
@@ -93,7 +95,7 @@ pub fn build_app_with_gateway_and_options(
                 min_completion_tokens,
                 max_sse_frame_bytes,
             )
-            .with_effort_policies(effort_policies.clone())
+            .with_finalization_policies(finalization_policies.clone())
         };
     let upstream: Arc<dyn crate::upstream::UpstreamClient> = if routing_mode {
         let providers = config

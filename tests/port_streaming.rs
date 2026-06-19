@@ -66,8 +66,6 @@ fn chat_request() -> ChatCompletionRequest {
         presence_penalty: None,
         stop: None,
         extra_body: std::collections::BTreeMap::new(),
-        template_family: None,
-        client_chat_template_kwargs: None,
     }
 }
 
@@ -1360,7 +1358,10 @@ async fn real_upstream_normal_stream_is_unaffected() {
     );
 
     let mut stream = client
-        .stream_chat_completion(&chat_request())
+        .stream_chat_completion(&llmconduit::upstream::BackendChatRequest::new(
+            chat_request(),
+            None,
+        ))
         .await
         .expect("stream opens");
 
@@ -1409,7 +1410,10 @@ async fn real_upstream_oversized_frame_is_rejected_as_error() {
     );
 
     let mut stream = client
-        .stream_chat_completion(&chat_request())
+        .stream_chat_completion(&llmconduit::upstream::BackendChatRequest::new(
+            chat_request(),
+            None,
+        ))
         .await
         .expect("stream opens");
 

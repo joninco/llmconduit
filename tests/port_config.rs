@@ -423,6 +423,84 @@ model_routes:
     );
 }
 
+/// T1: a routed model gets ITS OWN `template_family` override, not the request
+/// alias's. A route maps alias "glm-alias" to an opaque target "opaque-target".
+/// The alias's profile sets `template_family: kimi`; the TARGET's profile sets
+/// `template_family: deepseek`. Pre-T1 the engine resolved the family from the
+/// alias PRE-routing, so the alias's `kimi` bled onto the target (wrong family
+/// kwargs). Post-T1 the leaf resolves family from the FINAL provider model, so
+/// the target's `deepseek` wins — DeepSeek `enable_thinking` is injected and the
+/// Kimi `thinking` knob is absent.
+#[tokio::test]
+async fn route_target_family_wins_over_alias_family_override() {
+    let target = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({ "model": "opaque-target" })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_sse_body("chat-tgt", "from-target")),
+        )
+        .mount(&target)
+        .await;
+
+    let config = config_from_yaml(&format!(
+        r#"
+upstream_base_url: "http://unused.invalid/v1"
+model_routes:
+  "glm-alias":
+    upstream_base_url: "{}/v1/"
+    upstream_model: "opaque-target"
+model_profiles:
+  "glm-alias":
+    template_family: kimi
+  "opaque-target":
+    template_family: deepseek
+"#,
+        target.uri()
+    ));
+
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "glm-alias",
+                        "stream": false,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let posted: Vec<_> = target
+        .received_requests()
+        .await
+        .expect("recorded requests")
+        .into_iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path() == "/v1/chat/completions")
+        .collect();
+    assert_eq!(posted.len(), 1, "exactly one upstream POST");
+    let body: serde_json::Value = posted[0].body_json().expect("chat request json");
+    assert_eq!(body["model"].as_str(), Some("opaque-target"));
+    // The TARGET's `deepseek` family applies (leaf resolved from the FINAL model).
+    assert_eq!(body["chat_template_kwargs"]["enable_thinking"], json!(true));
+    assert!(
+        body["chat_template_kwargs"].get("thinking").is_none(),
+        "Kimi `thinking` from the alias's family override must NOT bleed onto the deepseek target (T1): {:?}",
+        body["chat_template_kwargs"]
+    );
+}
+
 /// An exact catalog model id beats an overlapping glob route: the request goes
 /// to the catalog upstream, NOT the glob route target. (AGENTS.md "Exact model
 /// id wins"; claude-relay exact-before-glob.)

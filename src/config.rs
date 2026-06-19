@@ -114,6 +114,22 @@ impl PartialEq for ModelRoute {
     }
 }
 
+/// Whether `model` matches ANY of `routes` by exact name (case-insensitive) or
+/// glob. The single route-matching primitive shared by config-side route checks
+/// and the routing catalog's dispatch (`RoutingModelCatalog::match_route` returns
+/// the SPECIFIC matching route for dispatch; this is the boolean projection).
+/// Trims + rejects empty input.
+pub fn route_matches(routes: &[ModelRoute], model: &str) -> bool {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    routes.iter().any(|route| match &route.glob {
+        Some(glob) => glob.is_match(trimmed),
+        None => route.name.eq_ignore_ascii_case(trimmed),
+    })
+}
+
 /// Persisted form of a model route. Accepts either a bare URL string
 /// (`name = "http://host:8000"`) or a table with `upstream_base_url`/`url` and
 /// `upstream_model`/`model`, mirroring claude-relay's str-or-table coercion.
@@ -788,21 +804,15 @@ impl Config {
     }
 
     /// Whether `model` matches an ad-hoc `model_routes` entry by exact name
-    /// (case-insensitive) or glob, using the SAME first-match-wins semantics as
-    /// `RoutingModelCatalog::match_route` (G7). The engine consults this so a
-    /// route-bound request model is NOT pre-collapsed to a catalog/default model
-    /// before the routing client can dispatch it. Slots between an exact catalog
-    /// id and the canonical-key/default fallbacks: callers must check an exact
-    /// catalog id FIRST so a catalog id still beats a route.
+    /// (case-insensitive) or glob, via the shared [`route_matches`] primitive
+    /// (the SAME boolean projection `RoutingModelCatalog::match_route` uses for
+    /// dispatch, G7). The engine consults this so a route-bound request model is
+    /// NOT pre-collapsed to a catalog/default model before the routing client can
+    /// dispatch it. Slots between an exact catalog id and the canonical-key/
+    /// default fallbacks: callers must check an exact catalog id FIRST so a
+    /// catalog id still beats a route.
     pub fn matches_model_route(&self, model: &str) -> bool {
-        let trimmed = model.trim();
-        if trimmed.is_empty() {
-            return false;
-        }
-        self.model_routes.iter().any(|route| match &route.glob {
-            Some(glob) => glob.is_match(trimmed),
-            None => route.name.eq_ignore_ascii_case(trimmed),
-        })
+        route_matches(&self.model_routes, model)
     }
 
     pub fn resolve_upstream_chat_kwargs(&self, request_model: &str) -> JsonMap<String, JsonValue> {
@@ -843,6 +853,68 @@ impl Config {
                 (name.clone(), ReasoningEffortPolicy { map, default })
             })
             .collect()
+    }
+
+    /// Per-BACKEND-MODEL `template_family` override policies, keyed by the
+    /// resolved model id (profile name). Applied at the upstream LEAF — the
+    /// single point that knows the FINAL provider model after routing/failover/
+    /// exposed-alias remap — so a route/failover target gets its OWN model's
+    /// family override rather than the request alias's (T1). Each profile's
+    /// `template_family` is already normalized to `kimi`/`deepseek` at
+    /// construction. Only profiles that set a family are included; the GLOBAL
+    /// `template_family` is exposed separately by [`global_template_family`]
+    /// and the leaf folds it in as the fallback when no per-model policy matches.
+    ///
+    /// [`global_template_family`]: Config::global_template_family
+    pub fn template_family_policies(&self) -> BTreeMap<String, String> {
+        self.model_profiles
+            .iter()
+            .filter_map(|(name, profile)| {
+                profile
+                    .template_family
+                    .clone()
+                    .map(|family| (name.clone(), family))
+            })
+            .collect()
+    }
+
+    /// The GLOBAL `template_family` override (already normalized), applied by
+    /// the leaf as the fallback when no per-model policy matches the FINAL
+    /// model. Exposed so the upstream leaf can resolve family against the
+    /// post-routing model without consulting the engine (T1).
+    pub fn global_template_family(&self) -> Option<String> {
+        self.template_family.clone()
+    }
+
+    /// Per-BACKEND-MODEL `upstream_chat_kwargs` policies, keyed by the resolved
+    /// model id (profile name). Applied at the upstream LEAF — the single point
+    /// that knows the FINAL provider model after routing/failover/exposed-alias
+    /// remap — so a route/failover target gets its OWN model's kwargs rather
+    /// than the request alias's (T1). Each profile's `upstream_chat_kwargs` is
+    /// already extends-merged at construction. Only non-empty profiles are
+    /// included; the GLOBAL `upstream_chat_kwargs` is exposed separately by
+    /// [`global_upstream_chat_kwargs`] and the leaf merges it as the base layer
+    /// under the per-profile policy.
+    ///
+    /// [`global_upstream_chat_kwargs`]: Config::global_upstream_chat_kwargs
+    pub fn upstream_chat_kwargs_policies(&self) -> BTreeMap<String, JsonMap<String, JsonValue>> {
+        self.model_profiles
+            .iter()
+            .filter_map(|(name, profile)| {
+                if profile.upstream_chat_kwargs.is_empty() {
+                    None
+                } else {
+                    Some((name.clone(), profile.upstream_chat_kwargs.clone()))
+                }
+            })
+            .collect()
+    }
+
+    /// The GLOBAL `upstream_chat_kwargs` (base layer), merged by the leaf under
+    /// the per-profile policy for the FINAL model. Exposed for the upstream leaf
+    /// (T1); the engine no longer pre-merges profile kwargs.
+    pub fn global_upstream_chat_kwargs(&self) -> &JsonMap<String, JsonValue> {
+        &self.upstream_chat_kwargs
     }
 
     /// Resolve an explicit backend chat-template family override for this

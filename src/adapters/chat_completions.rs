@@ -1023,8 +1023,6 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: extra_body.clone(),
-            template_family: None,
-            client_chat_template_kwargs: None,
         };
 
         let converted = convert_request(request).expect("convert request");

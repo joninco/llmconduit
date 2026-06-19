@@ -142,14 +142,33 @@ dispatcher, per-session LRU+TTL `ImageCache`, gating. Tests: `tests/gateway.rs` 
 > builds the typed resolver T2/T9 consume).
 
 ### Task 11.1 — Leaf-side profile resolution (template_family + upstream_chat_kwargs)
-**Priority:** HIGH · **Spec:** `.ralph/specs/T1-leaf-profile-resolution.md`
-Move `template_family` + `upstream_chat_kwargs` resolution from the engine (pre-routing) to
-`upstream::finalize_request_for_backend`, mirroring `reasoning_effort_policies`. Introduce a
-`BackendChatRequest` wrapper (remove `#[serde(skip)]` side-channel fields). Collapses the triply-
-duplicated model-precedence truth. **Touches the effort leaf → live-verify `claude --effort
+**Priority:** HIGH · **Spec:** `.ralph/specs/T1-leaf-profile-resolution.md` · **Commit:** `cdb293d`
+**Status:** implemented; Codex-xhigh R1 found 4 findings — F1 (HIGH, case-sensitive policy
+lookup) + F2 (MEDIUM, max-token alias shadowing) + F4 (LOW, wrapper visibility doc) fixed in a
+follow-up commit; F3 (MEDIUM, single-resolver dedup) split to T2 (see below).
+**Final design:** `template_family` + `upstream_chat_kwargs` profile resolution moved from the
+engine (pre-routing) to `upstream::finalize_request_for_backend`, mirroring
+`reasoning_effort_policies`. New `BackendChatRequest` wrapper (carries `client_chat_template_kwargs`
+— the one value not re-derivable at the leaf) + `BackendFinalizationPolicies` (effort + family +
+kwargs, global + per-model, built once via `from_config`). `ChatCompletionRequest` no longer
+carries `#[serde(skip)]` side-channel fields. The `UpstreamClient::stream_chat_completion` trait
+method takes `&BackendChatRequest`; dispatch (`request_for_provider`, `routed_request`, failover/
+routing) threads the wrapper. Per-model policy lookup uses `policy_for_model` (exact then
+canonical-key-unique, matching `Config::model_profile`). `merge_upstream_chat_kwargs` preserves
+max-token alias shadowing. `config::route_matches` is the shared route-match primitive
+(`matches_model_route` is a thin caller). Provider-vs-profile kwargs precedence preserved (provider
+kwargs merge in `request_for_provider` request-wins; the leaf gap-fills profile+global with the
+same semantics). G3 estimate unchanged. **Touches the effort leaf → live-verify `claude --effort
 high/max/off` on :5022.**
 **Files:** `src/config.rs`, `src/engine.rs`, `src/upstream.rs`, `src/models/chat.rs`, tests.
 **Blocks:** 11.2, 11.9.
+**Deferred to T2:** the full model-precedence ladder dedup. `normalize_upstream_model` (engine)
+still re-derives the 5-step ladder against its own `UpstreamModelCatalog` (which also carries G3
+context limits) rather than delegating to `RoutingModelCatalog::resolve`. T2 deletes
+`request_model_genuinely_resolves` and returns a typed backend-candidate plan from the real
+routing layer, which collapses the ladder as part of its scope. T1 extracted only the shared
+`route_matches` boolean primitive. The spec acceptance criterion "single typed resolver" is
+co-owned with T2 by this deferral.
 
 ### Task 11.2 — Typed routing-candidate plan (delete G4 side-channel vision gating)
 **Priority:** HIGH · **Spec:** `.ralph/specs/T2-routing-candidate-plan.md`

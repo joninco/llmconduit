@@ -61,11 +61,25 @@ pub struct MockUpstream {
     supported_models: Arc<Mutex<Vec<String>>>,
     supported_model_queries: Arc<Mutex<usize>>,
     context_limits: Arc<Mutex<Vec<(String, i64)>>>,
+    /// Per-model finalization policies (effort/family/kwargs), built from the
+    /// test config by the gateway harness so the mock's leaf-mirror applies the
+    /// SAME profile kwargs the production leaf would (T1). Empty by default.
+    finalization_policies: Arc<std::sync::Mutex<llmconduit::upstream::BackendFinalizationPolicies>>,
 }
 
 impl MockUpstream {
     pub async fn push_response(&self, chunks: ChunkBatch) {
         self.responses.lock().await.push_back(chunks);
+    }
+
+    /// Set the finalization policies built from the test config, so the mock's
+    /// leaf-mirror applies the same profile/family/effort kwargs the production
+    /// leaf would (T1).
+    pub fn set_finalization_policies(
+        &self,
+        policies: llmconduit::upstream::BackendFinalizationPolicies,
+    ) {
+        *self.finalization_policies.lock().expect("policies lock") = policies;
     }
 
     pub async fn requests(&self) -> Vec<ChatCompletionRequest> {
@@ -99,20 +113,24 @@ impl MockUpstream {
 impl UpstreamClient for MockUpstream {
     async fn stream_chat_completion(
         &self,
-        request: &ChatCompletionRequest,
+        backend: &llmconduit::upstream::BackendChatRequest,
     ) -> Result<UpstreamStream, AppError> {
         // Mirror the production leaf (`ReqwestUpstreamClient`): family-specific
         // `chat_template_kwargs` (G2) are injected in the upstream client from
         // the FINAL provider model, so the recorded request reflects what the
         // backend would actually receive.
-        let mut request = request.clone();
+        let mut backend = backend.clone();
         // Mirror the production leaf finalize (clamp/map reasoning effort + inject
-        // family kwargs from the FINAL model) so the recorded request reflects what
-        // the backend would receive. No effort policies here -> the unmapped
-        // (clamp) path; the per-model reasoning_effort_map is exercised against the
-        // real leaf in port_config.rs.
-        llmconduit::upstream::finalize_request_for_backend(&mut request, &Default::default());
-        let request = &request;
+        // family kwargs from the FINAL model, apply per-model upstream_chat_kwargs)
+        // so the recorded request reflects what the backend would receive. The
+        // policies are built from the test config by the gateway harness (T1).
+        let policies = self
+            .finalization_policies
+            .lock()
+            .expect("policies lock")
+            .clone();
+        llmconduit::upstream::finalize_request_for_backend(&mut backend, &policies);
+        let request = &backend.request;
         self.requests.lock().await.push(request.clone());
         let chunks = self
             .responses
@@ -188,6 +206,12 @@ pub fn test_gateway_with_config(
     search: MockSearch,
     config: Config,
 ) -> Arc<Gateway> {
+    // Build the leaf finalization policies from the test config so the mock's
+    // leaf-mirror applies the SAME profile/family/effort kwargs the production
+    // leaf would (T1 moved profile resolution from the engine to the leaf).
+    upstream.set_finalization_policies(
+        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
+    );
     // These shared port_* tests never exercise the image agent (off in
     // `test_config`), so a real `ReqwestVisionClient` that is never called and a
     // cache derived from config satisfy the constructor.
@@ -221,6 +245,7 @@ pub fn test_config() -> Config {
         upstream_failure_cooldown_secs: 30,
         model_profiles: BTreeMap::new(),
         model_routes: Vec::new(),
+        template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: Some("test-key".to_string()),
         brave_max_results: 5,
@@ -237,7 +262,6 @@ pub fn test_config() -> Config {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
-        template_family: None,
     }
 }
 

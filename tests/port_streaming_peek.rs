@@ -63,7 +63,6 @@ use llmconduit::error::AppError;
 use llmconduit::models::anthropic::AnthropicContentBlockStart;
 use llmconduit::models::anthropic::AnthropicDelta;
 use llmconduit::models::anthropic::AnthropicStreamEvent;
-use llmconduit::models::chat::ChatCompletionRequest;
 use llmconduit::monitor::MonitorHub;
 use llmconduit::replay::ReplayStore;
 use llmconduit::upstream::UpstreamClient;
@@ -111,7 +110,7 @@ struct PendingUpstream;
 impl UpstreamClient for PendingUpstream {
     async fn stream_chat_completion(
         &self,
-        _request: &ChatCompletionRequest,
+        _backend: &llmconduit::upstream::BackendChatRequest,
     ) -> Result<UpstreamStream, AppError> {
         // A stream that is immediately and permanently pending.
         let stream = async_stream::stream! {

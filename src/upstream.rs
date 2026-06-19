@@ -1,3 +1,4 @@
+use crate::config::merge_json_maps;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatCompletionChunk;
@@ -49,11 +50,11 @@ const ROUTING_MODEL_CATALOG_TTL_SECS: u64 = 300;
 pub trait UpstreamClient: Send + Sync {
     async fn stream_chat_completion(
         &self,
-        request: &ChatCompletionRequest,
+        request: &BackendChatRequest,
     ) -> AppResult<UpstreamStream>;
     async fn stream_chat_completion_with_timeout(
         &self,
-        request: &ChatCompletionRequest,
+        request: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
         let stream = self.stream_chat_completion(request).await?;
@@ -112,11 +113,12 @@ pub struct ReqwestUpstreamClient {
     /// upstream cannot grow the parser buffer without bound; an oversized or
     /// unterminated frame is rejected as an `AppError`.
     max_sse_frame_bytes: usize,
-    /// Per-backend-model reasoning-effort policies (keyed by resolved model id).
-    /// Applied at this leaf because it is the single point that sees the FINAL
-    /// provider model after routing/failover/exposed-alias remap. Shared (cheap
-    /// clone) across all providers; empty when no profile defines a map.
-    effort_policies: Arc<std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>>,
+    /// Per-backend-model finalization policies (effort map, `template_family`
+    /// override, `upstream_chat_kwargs`), keyed by resolved model id. Applied at
+    /// this leaf because it is the single point that sees the FINAL provider
+    /// model after routing/failover/exposed-alias remap (T1). Shared (cheap
+    /// clone) across all providers; empty when no profile defines any.
+    finalization_policies: BackendFinalizationPolicies,
 }
 
 #[derive(Debug, Clone)]
@@ -460,18 +462,19 @@ impl ReqwestUpstreamClient {
             flatten_content,
             min_completion_tokens: min_completion_tokens.max(1),
             max_sse_frame_bytes: max_sse_frame_bytes.max(1024),
-            effort_policies: Arc::new(std::collections::BTreeMap::new()),
+            finalization_policies: BackendFinalizationPolicies::default(),
         }
     }
 
-    /// Attach the per-backend-model reasoning-effort policies (built once from
-    /// config). Threaded post-construction so the existing `with_options`
-    /// signature is unchanged.
-    pub fn with_effort_policies(
+    /// Attach the per-backend-model finalization policies (effort map,
+    /// `template_family` override, `upstream_chat_kwargs`; built once from
+    /// config). Threaded post-construction so the `with_options` signature is
+    /// unchanged.
+    pub(crate) fn with_finalization_policies(
         mut self,
-        policies: Arc<std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>>,
+        policies: BackendFinalizationPolicies,
     ) -> Self {
-        self.effort_policies = policies;
+        self.finalization_policies = policies;
         self
     }
 
@@ -509,18 +512,20 @@ impl ReqwestUpstreamClient {
 impl UpstreamClient for ReqwestUpstreamClient {
     async fn stream_chat_completion(
         &self,
-        request: &ChatCompletionRequest,
+        backend: &BackendChatRequest,
     ) -> AppResult<UpstreamStream> {
         let url = self.endpoint_url("chat/completions")?;
-        // Inject family-specific `chat_template_kwargs` (G2) HERE: this leaf is
-        // the single point that sees the FINAL provider model after any
-        // routing/failover/exposed-alias remap, with provider kwargs already
-        // merged by `request_for_provider`. The engine threads the
-        // `template_family` override and the client's explicit kwargs on the
-        // request; sniffing happens against `request.model`.
-        let mut request = request.clone();
-        finalize_request_for_backend(&mut request, &self.effort_policies);
-        let request = sanitize_chat_request(request, self.flatten_content);
+        // Finalize at THIS leaf: the single point that sees the FINAL provider
+        // model after routing/failover/exposed-alias remap, with provider kwargs
+        // already merged by `request_for_provider`. Resolves the per-model
+        // `upstream_chat_kwargs` (global base + per-model) + `template_family`
+        // override from policies keyed by `request.model`, maps/clamps reasoning
+        // effort, and injects family `chat_template_kwargs` (precedence: config <
+        // family < effort-map < client; the wrapper's `client_chat_template_kwargs`
+        // is re-asserted last so an explicit client value still wins).
+        let mut backend = backend.clone();
+        finalize_request_for_backend(&mut backend, &self.finalization_policies);
+        let request = sanitize_chat_request(backend.request, self.flatten_content);
         if let Some(ref logger) = self.request_logger
             && let Err(err) = logger.log(&request).await
         {
@@ -710,14 +715,17 @@ impl FailoverUpstreamClient {
 
     fn request_for_provider(
         provider: &FailoverUpstreamProvider,
-        request: &ChatCompletionRequest,
-    ) -> ChatCompletionRequest {
-        let mut request = request.clone();
+        backend: &BackendChatRequest,
+    ) -> BackendChatRequest {
+        let mut request = backend.request.clone();
         if let Some(model) = &provider.upstream_model {
             request.model = model.clone();
         }
         merge_fallback_chat_kwargs(&mut request, &provider.upstream_chat_kwargs);
-        request
+        BackendChatRequest {
+            request,
+            client_chat_template_kwargs: backend.client_chat_template_kwargs.clone(),
+        }
     }
 
     async fn prefetch_first_chunk(
@@ -833,7 +841,7 @@ impl FailoverUpstreamClient {
     async fn stream_chat_completion_with_timeout_from_provider(
         &self,
         provider_index: usize,
-        request: &ChatCompletionRequest,
+        backend: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
         if provider_index >= self.providers.len() {
@@ -846,7 +854,7 @@ impl FailoverUpstreamClient {
         }
         self.stream_chat_completion_with_provider_indices(
             vec![provider_index],
-            request,
+            backend,
             request_timeout,
         )
         .await
@@ -855,13 +863,13 @@ impl FailoverUpstreamClient {
     async fn stream_chat_completion_with_provider_indices(
         &self,
         provider_indices: Vec<usize>,
-        request: &ChatCompletionRequest,
+        backend: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
         let mut last_error = None;
         for provider_index in provider_indices {
             let provider = &self.providers[provider_index];
-            let provider_request = Self::request_for_provider(provider, request);
+            let provider_request = Self::request_for_provider(provider, backend);
             let stream = match provider
                 .client
                 .stream_chat_completion(&provider_request)
@@ -997,20 +1005,24 @@ impl RoutingUpstreamClient {
 
     /// Clone the request and apply the resolved upstream-model rewrite, logging
     /// once when the model actually changes. Shared by catalog and route
-    /// dispatch so both honor the same rewrite + log behavior.
+    /// dispatch so both honor the same rewrite + log behavior. The wrapper's
+    /// `client_chat_template_kwargs` is preserved across the rewrite.
     fn routed_request(
         &self,
-        request: &ChatCompletionRequest,
+        backend: &BackendChatRequest,
         model_id: &str,
         provider_name: &str,
         kind: MatchKind,
-    ) -> ChatCompletionRequest {
-        let mut routed_request = request.clone();
+    ) -> BackendChatRequest {
+        let mut routed_request = backend.request.clone();
         if routed_request.model != model_id {
             log_model_resolution(&routed_request.model, model_id, provider_name, kind);
             routed_request.model = model_id.to_string();
         }
-        routed_request
+        BackendChatRequest {
+            request: routed_request,
+            client_chat_template_kwargs: backend.client_chat_template_kwargs.clone(),
+        }
     }
 
     async fn load_catalog(&self) -> AppResult<RoutingModelCatalog> {
@@ -1322,15 +1334,15 @@ fn register_routing_model(
 impl UpstreamClient for FailoverUpstreamClient {
     async fn stream_chat_completion(
         &self,
-        request: &ChatCompletionRequest,
+        backend: &BackendChatRequest,
     ) -> AppResult<UpstreamStream> {
-        self.stream_chat_completion_with_timeout(request, Duration::from_secs(60))
+        self.stream_chat_completion_with_timeout(backend, Duration::from_secs(60))
             .await
     }
 
     async fn stream_chat_completion_with_timeout(
         &self,
-        request: &ChatCompletionRequest,
+        backend: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
         let provider_indices = self.available_provider_indices();
@@ -1339,7 +1351,7 @@ impl UpstreamClient for FailoverUpstreamClient {
         }
         self.stream_chat_completion_with_provider_indices(
             provider_indices,
-            request,
+            backend,
             request_timeout,
         )
         .await
@@ -1403,9 +1415,9 @@ impl UpstreamClient for FailoverUpstreamClient {
 impl UpstreamClient for RoutingUpstreamClient {
     async fn stream_chat_completion(
         &self,
-        request: &ChatCompletionRequest,
+        backend: &BackendChatRequest,
     ) -> AppResult<UpstreamStream> {
-        self.stream_chat_completion_with_timeout(request, Duration::from_secs(60))
+        self.stream_chat_completion_with_timeout(backend, Duration::from_secs(60))
             .await
     }
 
@@ -1452,20 +1464,20 @@ impl UpstreamClient for RoutingUpstreamClient {
 
     async fn stream_chat_completion_with_timeout(
         &self,
-        request: &ChatCompletionRequest,
+        backend: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
         let catalog = self.load_catalog().await.map_err(|err| {
             tracing::warn!(
-                requested_model = %request.model,
+                requested_model = %backend.request.model,
                 error = %err,
                 "failed to load upstream model catalog (is the backend reachable?)"
             );
             err
         })?;
-        let (resolution, match_kind) = catalog.resolve(&request.model).ok_or_else(|| {
+        let (resolution, match_kind) = catalog.resolve(&backend.request.model).ok_or_else(|| {
             tracing::warn!(
-                requested_model = %request.model,
+                requested_model = %backend.request.model,
                 "upstream model catalog is empty; no model to serve (is the backend serving any model?)"
             );
             AppError::upstream("no models are currently available from configured upstreams")
@@ -1476,7 +1488,7 @@ impl UpstreamClient for RoutingUpstreamClient {
         } = &resolution
         {
             let provider = self.route_provider(*route_provider_index)?;
-            let routed_request = self.routed_request(request, model_id, &provider.name, match_kind);
+            let routed_request = self.routed_request(backend, model_id, &provider.name, match_kind);
             return provider
                 .client
                 .stream_chat_completion_with_timeout(&routed_request, request_timeout)
@@ -1492,7 +1504,7 @@ impl UpstreamClient for RoutingUpstreamClient {
                 AppError::internal("resolved upstream provider index was out of range")
             })?;
         let routed_request =
-            self.routed_request(request, &resolution.model_id, &provider.name, match_kind);
+            self.routed_request(backend, &resolution.model_id, &provider.name, match_kind);
         match resolution.target {
             RoutingModelTarget::Primary => {
                 provider
@@ -1618,6 +1630,136 @@ fn should_failover_proxy_status(status: StatusCode) -> bool {
         || status == StatusCode::TOO_MANY_REQUESTS
 }
 
+/// Resolved per-model finalization policies, built ONCE from config and shared
+/// (cheap `Arc` clone) across all leaf clients. Each map is keyed by the FINAL
+/// resolved model id (profile name); the leaf looks up the policy for the model
+/// it actually POSTs to (post routing/failover/exposed-alias remap), so a
+/// routed/failover target gets its OWN model's family/kwargs/effort vocabulary
+/// rather than the request alias's (T1).
+///
+/// This is the typed successor to the engine's pre-routing resolution: the
+/// engine no longer threads `template_family` / `upstream_chat_kwargs` down the
+/// wire DTO, and `ChatCompletionRequest` carries no `#[serde(skip)]` side-channel
+/// fields. The leaf is the single point that knows the FINAL `request.model`.
+#[derive(Clone, Default, Debug)]
+pub struct BackendFinalizationPolicies {
+    /// Per-model reasoning-effort policy (`reasoning_effort_map` + default).
+    pub effort: Arc<std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>>,
+    /// Per-model `template_family` override (normalized `kimi`/`deepseek`).
+    pub template_family: Arc<std::collections::BTreeMap<String, String>>,
+    /// GLOBAL `template_family` fallback (normalized), applied when no per-model
+    /// policy matches the FINAL model.
+    pub global_template_family: Option<String>,
+    /// Per-model extends-merged `upstream_chat_kwargs`.
+    pub upstream_chat_kwargs: Arc<std::collections::BTreeMap<String, JsonMap<String, Value>>>,
+    /// GLOBAL `upstream_chat_kwargs` (base layer), merged under the per-model
+    /// policy at the leaf.
+    pub global_upstream_chat_kwargs: Arc<JsonMap<String, Value>>,
+}
+
+impl BackendFinalizationPolicies {
+    /// Build the leaf finalization policies from config: effort map,
+    /// `template_family` override, and `upstream_chat_kwargs` (global base +
+    /// per-model). Built once at startup and shared (cheap `Arc` clone) across
+    /// all leaf clients. `pub` so the test harness builds the same policies the
+    /// production leaf receives (T1).
+    pub fn from_config(config: &crate::config::Config) -> Self {
+        Self {
+            effort: Arc::new(config.reasoning_effort_policies()),
+            template_family: Arc::new(config.template_family_policies()),
+            global_template_family: config.global_template_family(),
+            upstream_chat_kwargs: Arc::new(config.upstream_chat_kwargs_policies()),
+            global_upstream_chat_kwargs: Arc::new(config.global_upstream_chat_kwargs().clone()),
+        }
+    }
+
+    /// Resolve the `template_family` override for the FINAL provider `model`:
+    /// the per-model policy wins (exact then canonical-key match, mirroring
+    /// `Config::model_profile` / `reasoning_effort_fragment`), else the global
+    /// fallback. `None` means sniff the model id instead.
+    fn resolve_family_override(&self, model: &str) -> Option<String> {
+        policy_for_model(&self.template_family, model)
+            .cloned()
+            .or_else(|| self.global_template_family.clone())
+    }
+
+    /// The extends-merged `upstream_chat_kwargs` for the FINAL provider `model`:
+    /// the per-model policy (exact then canonical-key match) layered over the
+    /// global base (per-model wins on conflict). Empty when neither applies.
+    fn resolve_chat_kwargs(&self, model: &str) -> JsonMap<String, Value> {
+        let mut merged = (*self.global_upstream_chat_kwargs).clone();
+        if let Some(per_model) = policy_for_model(&self.upstream_chat_kwargs, model) {
+            merge_json_maps(&mut merged, per_model);
+        }
+        merged
+    }
+}
+/// Look up a per-model policy in `map` for the FINAL provider `model` with the
+/// SAME semantics as `Config::model_profile` and `RoutingModelCatalog` model
+/// matching: exact (case-sensitive) id first, then a canonical-key match
+/// (case/punctuation-insensitive) ONLY when unambiguous (exactly one profile
+/// shares that canonical key — two would make the pick order-dependent). `None`
+/// when no policy applies. Keeps the leaf's per-model policy lookup consistent
+/// with how profiles are matched everywhere else (T1).
+fn policy_for_model<'a, V>(
+    map: &'a std::collections::BTreeMap<String, V>,
+    model: &str,
+) -> Option<&'a V> {
+    if let Some(policy) = map.get(model) {
+        return Some(policy);
+    }
+    let key = canonical_model_key(model);
+    let mut matches = map
+        .iter()
+        .filter(|(name, _)| canonical_model_key(name) == key)
+        .map(|(_, policy)| policy);
+    match (matches.next(), matches.next()) {
+        (Some(policy), None) => Some(policy),
+        _ => None,
+    }
+}
+
+/// Leaf-boundary wrapper carrying finalization metadata that does NOT belong on
+/// the wire DTO `ChatCompletionRequest`. Built at the leaf boundary (in the
+/// engine, before dispatch) from per-model policies keyed by the FINAL
+/// `request.model` after routing/failover rewrite. Never crosses a serde
+/// boundary (no serde derives; it is not serialized to the wire).
+///
+/// `pub` only because the `pub UpstreamClient` trait's `stream_chat_completion`
+/// takes it (and `Gateway::upstream_client()` returns `Arc<dyn UpstreamClient>`
+/// publicly, so the trait is `pub`). The crate is a binary gateway with no
+/// external consumer; the wrapper is an internal seam, not a public API surface.
+///
+/// `client_chat_template_kwargs` is the client's EXPLICIT `chat_template_kwargs`
+/// (from the inbound request `extra_body`), captured PRE-MERGE. It is NOT
+/// re-derivable at the leaf: by the time the leaf runs, `request.extra_body[
+/// "chat_template_kwargs"]` already contains global+profile+provider merges, and
+/// re-asserting that blend over the forced family default would regress leak
+/// prevention (a provider/global `thinking:false` would clobber Kimi's forced
+/// `thinking:true`). Threading the pure client value lets the leaf re-overlay
+/// ONLY the client's keys so an explicit client value still wins over the family
+/// default (precedence: config < family < effort-map < client).
+#[derive(Debug, Clone)]
+pub struct BackendChatRequest {
+    pub request: ChatCompletionRequest,
+    pub client_chat_template_kwargs: Option<JsonMap<String, Value>>,
+}
+
+impl BackendChatRequest {
+    /// Wrap a wire request with the client's explicit `chat_template_kwargs`
+    /// (captured pre-merge by the engine). The leaf resolves family/kwargs from
+    /// policies keyed by `request.model` inside `finalize_request_for_backend`.
+    pub fn new(
+        request: ChatCompletionRequest,
+        client_chat_template_kwargs: Option<JsonMap<String, Value>>,
+    ) -> Self {
+        Self {
+            request,
+            client_chat_template_kwargs,
+        }
+    }
+}
+
 /// Backend chat-template contract a model speaks. vLLM/SGLang expose
 /// reasoning through different `chat_template_kwargs` per model family, so we
 /// inject the right knobs (G2). Mirrors claude-relay `backend.py`.
@@ -1667,9 +1809,11 @@ pub(crate) fn detect_model_family(
 
 /// Finalize the chat request the backend will receive, at the leaf — the single
 /// point that knows the FINAL provider `model` after routing/failover/exposed-
-/// alias remap. Resolves and applies that model's reasoning-effort policy, then
-/// injects family `chat_template_kwargs`. `request.reasoning_effort` arrives RAW
-/// (lowering does not clamp); here it is either MAPPED or clamped.
+/// alias remap. Resolves and applies that model's `upstream_chat_kwargs` (global
+/// base + per-model policy, request-wins), its `template_family` override (per-
+/// model policy else global), its reasoning-effort policy, then injects family
+/// `chat_template_kwargs`. `request.reasoning_effort` arrives RAW (lowering does
+/// not clamp); here it is either MAPPED or clamped.
 ///
 /// MAPPED: the per-model `reasoning_effort_map` produces a fragment, so the
 /// top-level field is CLEARED (the fragment relays effort via
@@ -1684,11 +1828,21 @@ pub(crate) fn detect_model_family(
 ///
 /// `pub` so the integration-test mock upstreams mirror the production leaf.
 pub fn finalize_request_for_backend(
-    request: &mut ChatCompletionRequest,
-    effort_policies: &std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>,
+    backend: &mut BackendChatRequest,
+    policies: &BackendFinalizationPolicies,
 ) {
+    let request = &mut backend.request;
+    // 1. Per-model `upstream_chat_kwargs` (global base + per-model policy),
+    //    gap-filling into `extra_body` (request-wins: keys already set by the
+    //    engine's request-extra merge or by `request_for_provider`'s provider
+    //    kwargs are preserved). This replaces the engine's pre-routing
+    //    `build_upstream_extra_body` defaults (T1): the leaf now resolves kwargs
+    //    against the FINAL model, so a routed/failover cross-family target gets
+    //    its OWN kwargs, not the alias's.
+    merge_upstream_chat_kwargs(request, &policies.resolve_chat_kwargs(&request.model));
+    // 2. Reasoning effort: map (→ fragment, top-level cleared) or clamp.
     let fragment = reasoning_effort_fragment(
-        effort_policies,
+        &policies.effort,
         &request.model,
         request.reasoning_effort.as_deref(),
     );
@@ -1697,9 +1851,47 @@ pub fn finalize_request_for_backend(
     } else {
         clamp_reasoning_effort(request.reasoning_effort.as_deref())
     };
-    apply_family_chat_template_kwargs(request);
+    // 3. Family kwargs from the FINAL model + resolved override.
+    apply_family_chat_template_kwargs(backend, policies);
+    // 4. Effort fragment after family (effort-map > family default).
     if let Some(fragment) = fragment {
-        apply_reasoning_effort_fragment(request, &fragment);
+        apply_reasoning_effort_fragment(backend, &fragment);
+    }
+}
+
+/// Merge per-model `upstream_chat_kwargs` `defaults` into the request
+/// `extra_body` with REQUEST-WINS semantics, mirroring `merge_fallback_chat_kwargs`
+/// (provider kwargs): a key already explicitly set on the request (typed field
+/// or `extra_body`) is preserved; a configured default fills the gap. Deep-merge
+/// nested objects so a configured object composes with a request object rather
+/// than clobbering sibling keys.
+fn merge_upstream_chat_kwargs(
+    request: &mut ChatCompletionRequest,
+    defaults: &JsonMap<String, Value>,
+) {
+    // Max-token aliases (`max_tokens`/`max_output_tokens`/`max_completion_tokens`)
+    // are ONE logical knob. If the client expressed ANY of them (typed
+    // `max_output_tokens` OR an alias in `request.extra_body`), skip ALL of them
+    // from the configured defaults so a stale config alias cannot land alongside
+    // the explicit request value and shadow it (mirrors the engine's pre-T1
+    // `remove_defaults_shadowed_by_request_extra`).
+    let max_token_requested = request.max_output_tokens.is_some()
+        || MAX_TOKEN_ALIAS_KEYS
+            .iter()
+            .any(|alias| request.extra_body.contains_key(*alias));
+    for (key, value) in defaults {
+        if max_token_requested && MAX_TOKEN_ALIAS_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        if chat_request_field_is_set(request, key) {
+            continue;
+        }
+        match request.extra_body.get_mut(key) {
+            Some(existing) => merge_json_value_preserve_destination(existing, value),
+            None => {
+                request.extra_body.insert(key.clone(), value.clone());
+            }
+        }
     }
 }
 
@@ -1726,21 +1918,7 @@ fn reasoning_effort_fragment(
     model: &str,
     raw_effort: Option<&str>,
 ) -> Option<Value> {
-    let policy = policies.get(model).or_else(|| {
-        // No exact id match: fall back to a canonical-key match, but ONLY when it
-        // is unambiguous. Two profile names sharing a canonical key would make the
-        // pick order-dependent, so require exactly one and otherwise apply no
-        // policy (deterministic; the engine keeps its clamped top-level effort).
-        let key = canonical_model_key(model);
-        let mut matches = policies
-            .iter()
-            .filter(|(name, _)| canonical_model_key(name) == key)
-            .map(|(_, policy)| policy);
-        match (matches.next(), matches.next()) {
-            (Some(policy), None) => Some(policy),
-            _ => None,
-        }
-    })?;
+    let policy = policy_for_model(policies, model)?;
     let level = raw_effort
         .map(str::trim)
         .filter(|level| !level.is_empty())
@@ -1756,10 +1934,11 @@ fn reasoning_effort_fragment(
 /// configured default would otherwise block a per-request mapping), then the
 /// client's own explicit `chat_template_kwargs` are re-asserted so an inbound
 /// client value still wins. Call AFTER `apply_family_chat_template_kwargs`.
-pub fn apply_reasoning_effort_fragment(request: &mut ChatCompletionRequest, fragment: &Value) {
+pub fn apply_reasoning_effort_fragment(backend: &mut BackendChatRequest, fragment: &Value) {
     let Value::Object(fragment) = fragment else {
         return;
     };
+    let request = &mut backend.request;
     for (key, value) in fragment {
         match request.extra_body.get_mut(key) {
             Some(existing) => merge_json_value_prefer_source(existing, value),
@@ -1770,7 +1949,7 @@ pub fn apply_reasoning_effort_fragment(request: &mut ChatCompletionRequest, frag
     }
     // Re-assert the client's explicit chat_template_kwargs over the effort-map
     // fragment (precedence: client > effort-map).
-    if let Some(client_kwargs) = &request.client_chat_template_kwargs
+    if let Some(client_kwargs) = &backend.client_chat_template_kwargs
         && let Some(Value::Object(kwargs)) = request.extra_body.get_mut("chat_template_kwargs")
     {
         for (key, value) in client_kwargs {
@@ -1785,19 +1964,24 @@ pub fn apply_reasoning_effort_fragment(request: &mut ChatCompletionRequest, frag
 }
 
 /// Inject family-specific `chat_template_kwargs` into the request `extra_body`
-/// from the FINAL provider model. Composes with (does not clobber) the
-/// already-merged configured/provider `upstream_chat_kwargs`, and re-overlays
-/// the client's explicit `chat_template_kwargs` last so an explicit request
-/// value still WINS over a forced family default. A no-op when the family is
-/// unrecognized.
+/// from the FINAL provider model + resolved `template_family` override. Composes
+/// with (does not clobber) the already-merged configured/provider
+/// `upstream_chat_kwargs`, and re-overlays the client's explicit
+/// `chat_template_kwargs` last so an explicit request value still WINS over a
+/// forced family default. A no-op when the family is unrecognized.
 ///
 /// Public so the integration test harness's mock upstream can mirror the
 /// production leaf and record the request the backend would actually receive.
-pub fn apply_family_chat_template_kwargs(request: &mut ChatCompletionRequest) {
-    let Some(family) = detect_model_family(&request.model, request.template_family.as_deref())
+pub fn apply_family_chat_template_kwargs(
+    backend: &mut BackendChatRequest,
+    policies: &BackendFinalizationPolicies,
+) {
+    let family_override = policies.resolve_family_override(&backend.request.model);
+    let Some(family) = detect_model_family(&backend.request.model, family_override.as_deref())
     else {
         return;
     };
+    let request = &mut backend.request;
     let reasoning_effort = request.reasoning_effort.clone();
     let entry = request
         .extra_body
@@ -1818,7 +2002,7 @@ pub fn apply_family_chat_template_kwargs(request: &mut ChatCompletionRequest) {
     // nested client object overlays the already-merged family/provider object
     // leaf-by-leaf (client wins on conflicts) instead of clobbering sibling keys
     // that came from the deep-merge of configured/provider defaults.
-    if let Some(client_kwargs) = &request.client_chat_template_kwargs {
+    if let Some(client_kwargs) = &backend.client_chat_template_kwargs {
         for (key, value) in client_kwargs {
             match kwargs.get_mut(key) {
                 Some(existing) => merge_json_value_prefer_source(existing, value),
@@ -3220,6 +3404,8 @@ mod tests {
 
     // --- G2: family detection + chat_template_kwargs injection at the leaf ---
 
+    use super::BackendChatRequest;
+    use super::BackendFinalizationPolicies;
     use super::FailoverUpstreamClient;
     use super::FailoverUpstreamProvider;
     use super::ModelFamily;
@@ -3228,6 +3414,7 @@ mod tests {
     use super::write_family_kwargs;
     use serde_json::Map as JsonMap;
     use serde_json::json;
+    use std::sync::Arc;
 
     /// Minimal request for family-injection tests. `model` is the FINAL provider
     /// model the leaf sees (after any routing/failover/alias rewrite).
@@ -3249,8 +3436,6 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: BTreeMap::new(),
-            template_family: None,
-            client_chat_template_kwargs: None,
         }
     }
 
@@ -3282,6 +3467,49 @@ mod tests {
                 ]),
             },
         )])
+    }
+
+    /// Wrap a family-request with optional client kwargs into the leaf wrapper.
+    fn family_backend(
+        model: &str,
+        client_kwargs: Option<JsonMap<String, Value>>,
+    ) -> BackendChatRequest {
+        BackendChatRequest::new(family_request(model), client_kwargs)
+    }
+
+    /// Empty finalization policies (no effort map, no family override, no
+    /// per-model kwargs). The leaf's unmapped/clamp path.
+    fn empty_policies() -> BackendFinalizationPolicies {
+        BackendFinalizationPolicies::default()
+    }
+
+    /// GLM effort-map finalization policies (no family override, no kwargs).
+    fn glm_backend_policies() -> BackendFinalizationPolicies {
+        BackendFinalizationPolicies {
+            effort: Arc::new(glm_effort_policies()),
+            ..Default::default()
+        }
+    }
+
+    /// Finalization policies carrying a per-model `template_family` override.
+    fn family_policies(per_model: &[(&str, &str)]) -> BackendFinalizationPolicies {
+        BackendFinalizationPolicies {
+            template_family: Arc::new(
+                per_model
+                    .iter()
+                    .map(|(m, f)| (m.to_string(), f.to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    /// Finalization policies carrying a global `upstream_chat_kwargs` base.
+    fn global_kwargs_policies(kwargs: JsonMap<String, Value>) -> BackendFinalizationPolicies {
+        BackendFinalizationPolicies {
+            global_upstream_chat_kwargs: Arc::new(kwargs),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -3330,23 +3558,31 @@ mod tests {
 
         // A configured chat_template_kwargs default is OVERRIDDEN by the map
         // (prefer-source), fixing the "config blocks the map" case.
-        let mut request = family_request("GLM-5.2-NVFP4-MTP");
-        request.extra_body.insert(
+        let mut backend = family_backend("GLM-5.2-NVFP4-MTP", None);
+        backend.request.extra_body.insert(
             "chat_template_kwargs".to_string(),
             json!({"reasoning_effort": "max", "sibling": 1}),
         );
-        apply_reasoning_effort_fragment(&mut request, &fragment);
-        assert_eq!(kwargs_of(&request)["reasoning_effort"], json!("high"));
-        assert_eq!(kwargs_of(&request)["sibling"], json!(1));
+        apply_reasoning_effort_fragment(&mut backend, &fragment);
+        assert_eq!(
+            kwargs_of(&backend.request)["reasoning_effort"],
+            json!("high")
+        );
+        assert_eq!(kwargs_of(&backend.request)["sibling"], json!(1));
 
         // An explicit CLIENT value wins over the map (client > effort-map).
-        let mut request = family_request("GLM-5.2-NVFP4-MTP");
-        request.client_chat_template_kwargs = Some(JsonMap::from_iter([(
-            "reasoning_effort".to_string(),
-            json!("max"),
-        )]));
-        apply_reasoning_effort_fragment(&mut request, &fragment);
-        assert_eq!(kwargs_of(&request)["reasoning_effort"], json!("max"));
+        let mut backend = family_backend(
+            "GLM-5.2-NVFP4-MTP",
+            Some(JsonMap::from_iter([(
+                "reasoning_effort".to_string(),
+                json!("max"),
+            )])),
+        );
+        apply_reasoning_effort_fragment(&mut backend, &fragment);
+        assert_eq!(
+            kwargs_of(&backend.request)["reasoning_effort"],
+            json!("max")
+        );
     }
 
     #[test]
@@ -3355,14 +3591,14 @@ mod tests {
         // Kimi injection wipes enable_thinking/reasoning_effort and forces
         // thinking=true; applying the fragment AFTER family re-asserts the map's
         // enable_thinking:false (fixes the Kimi-map-ignored finding).
-        let mut request = family_request("kimi-k2-instruct");
-        apply_family_chat_template_kwargs(&mut request);
-        assert_eq!(kwargs_of(&request)["thinking"], json!(true));
+        let mut backend = family_backend("kimi-k2-instruct", None);
+        apply_family_chat_template_kwargs(&mut backend, &empty_policies());
+        assert_eq!(kwargs_of(&backend.request)["thinking"], json!(true));
         apply_reasoning_effort_fragment(
-            &mut request,
+            &mut backend,
             &json!({"chat_template_kwargs": {"enable_thinking": false}}),
         );
-        assert_eq!(kwargs_of(&request)["enable_thinking"], json!(false));
+        assert_eq!(kwargs_of(&backend.request)["enable_thinking"], json!(false));
     }
 
     #[test]
@@ -3391,22 +3627,30 @@ mod tests {
     #[test]
     fn finalize_unmapped_model_clamps_top_level_effort() {
         use super::finalize_request_for_backend;
-        let mut request = family_request("some-plain-model");
-        request.reasoning_effort = Some("xhigh".to_string());
-        finalize_request_for_backend(&mut request, &std::collections::BTreeMap::new());
+        let mut backend = family_backend("some-plain-model", None);
+        backend.request.reasoning_effort = Some("xhigh".to_string());
+        finalize_request_for_backend(&mut backend, &empty_policies());
         // No policy -> clamp; no family -> no chat_template_kwargs injected.
-        assert_eq!(request.reasoning_effort.as_deref(), Some("high"));
-        assert!(!request.extra_body.contains_key("chat_template_kwargs"));
+        assert_eq!(backend.request.reasoning_effort.as_deref(), Some("high"));
+        assert!(
+            !backend
+                .request
+                .extra_body
+                .contains_key("chat_template_kwargs")
+        );
     }
 
     #[test]
     fn finalize_mapped_model_clears_top_level_and_maps_to_chat_template_kwargs() {
         use super::finalize_request_for_backend;
-        let mut request = family_request("GLM-5.2-NVFP4-MTP");
-        request.reasoning_effort = Some("max".to_string());
-        finalize_request_for_backend(&mut request, &glm_effort_policies());
-        assert_eq!(request.reasoning_effort, None);
-        assert_eq!(kwargs_of(&request)["reasoning_effort"], json!("max"));
+        let mut backend = family_backend("GLM-5.2-NVFP4-MTP", None);
+        backend.request.reasoning_effort = Some("max".to_string());
+        finalize_request_for_backend(&mut backend, &glm_backend_policies());
+        assert_eq!(backend.request.reasoning_effort, None);
+        assert_eq!(
+            kwargs_of(&backend.request)["reasoning_effort"],
+            json!("max")
+        );
     }
 
     #[test]
@@ -3493,9 +3737,9 @@ mod tests {
     /// THAT provider, even though the engine never saw "kimi".
     #[test]
     fn kimi_final_provider_model_gets_kimi_kwargs() {
-        let mut request = family_request("kimi-k2-instruct");
-        apply_family_chat_template_kwargs(&mut request);
-        let kwargs = kwargs_of(&request);
+        let mut backend = family_backend("kimi-k2-instruct", None);
+        apply_family_chat_template_kwargs(&mut backend, &empty_policies());
+        let kwargs = kwargs_of(&backend.request);
         assert_eq!(kwargs["thinking"], json!(true));
         assert_eq!(kwargs["preserve_thinking"], json!(true));
     }
@@ -3504,10 +3748,10 @@ mod tests {
     /// Kimi `thinking` knob — the wrong-family kwargs cannot leak across.
     #[test]
     fn deepseek_final_provider_model_does_not_get_kimi_kwargs() {
-        let mut request = family_request("deepseek-v3");
-        request.reasoning_effort = Some("high".to_string());
-        apply_family_chat_template_kwargs(&mut request);
-        let kwargs = kwargs_of(&request);
+        let mut backend = family_backend("deepseek-v3", None);
+        backend.request.reasoning_effort = Some("high".to_string());
+        apply_family_chat_template_kwargs(&mut backend, &empty_policies());
+        let kwargs = kwargs_of(&backend.request);
         assert_eq!(kwargs["enable_thinking"], json!(true));
         assert_eq!(kwargs["reasoning_effort"], json!("high"));
         assert!(
@@ -3542,12 +3786,12 @@ mod tests {
             provider_kwargs,
         );
         // Engine-level request still names a non-Kimi model; the provider remaps.
-        let base = family_request("glm-5.1");
+        let base = family_backend("glm-5.1", None);
         let mut provider_request = FailoverUpstreamClient::request_for_provider(&provider, &base);
-        assert_eq!(provider_request.model, "kimi-k2-instruct");
+        assert_eq!(provider_request.request.model, "kimi-k2-instruct");
         // Leaf injects family from the FINAL (remapped) model.
-        apply_family_chat_template_kwargs(&mut provider_request);
-        let kwargs = kwargs_of(&provider_request);
+        apply_family_chat_template_kwargs(&mut provider_request, &empty_policies());
+        let kwargs = kwargs_of(&provider_request.request);
         assert_eq!(kwargs["thinking"], json!(true));
         assert_eq!(kwargs["preserve_thinking"], json!(true));
         assert_eq!(kwargs["configured_only"], json!(true));
@@ -3557,20 +3801,22 @@ mod tests {
     /// over the forced family default, while non-conflicting forced keys remain.
     #[test]
     fn client_chat_template_kwargs_win_over_forced_family_default() {
-        let mut request = family_request("kimi-k2");
-        request.client_chat_template_kwargs = Some(
-            json!({ "thinking": false, "custom": 1 })
-                .as_object()
-                .unwrap()
-                .clone(),
+        let mut backend = family_backend(
+            "kimi-k2",
+            Some(
+                json!({ "thinking": false, "custom": 1 })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
         );
         // The engine bakes the client value into extra_body; mirror that.
-        request.extra_body.insert(
+        backend.request.extra_body.insert(
             "chat_template_kwargs".to_string(),
             json!({ "thinking": false, "custom": 1 }),
         );
-        apply_family_chat_template_kwargs(&mut request);
-        let kwargs = kwargs_of(&request);
+        apply_family_chat_template_kwargs(&mut backend, &empty_policies());
+        let kwargs = kwargs_of(&backend.request);
         assert_eq!(kwargs["thinking"], json!(false), "client value wins");
         assert_eq!(kwargs["custom"], json!(1));
         assert_eq!(kwargs["preserve_thinking"], json!(true));
@@ -3583,22 +3829,23 @@ mod tests {
     /// the whole nested object and drop those siblings).
     #[test]
     fn client_kwargs_deep_merge_preserves_sibling_keys() {
-        let mut request = family_request("kimi-k2-instruct");
+        let mut backend = family_backend(
+            "kimi-k2-instruct",
+            Some(
+                json!({ "mm_processor_kwargs": { "shared": "client", "from_client": 1 } })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        );
         // Configured/provider deep-merge already produced a nested object with
         // two siblings under `mm_processor_kwargs`.
-        request.extra_body.insert(
+        backend.request.extra_body.insert(
             "chat_template_kwargs".to_string(),
             json!({ "mm_processor_kwargs": { "from_config": true, "shared": "config" } }),
         );
-        // The client only overrides ONE nested leaf and adds a new nested key.
-        request.client_chat_template_kwargs = Some(
-            json!({ "mm_processor_kwargs": { "shared": "client", "from_client": 1 } })
-                .as_object()
-                .unwrap()
-                .clone(),
-        );
-        apply_family_chat_template_kwargs(&mut request);
-        let nested = kwargs_of(&request)["mm_processor_kwargs"]
+        apply_family_chat_template_kwargs(&mut backend, &empty_policies());
+        let nested = kwargs_of(&backend.request)["mm_processor_kwargs"]
             .as_object()
             .expect("nested object survives deep-merge");
         assert_eq!(
@@ -3617,15 +3864,114 @@ mod tests {
             "client adds new nested key"
         );
         // Forced family knobs still applied alongside the nested object.
-        assert_eq!(kwargs_of(&request)["thinking"], json!(true));
+        assert_eq!(kwargs_of(&backend.request)["thinking"], json!(true));
     }
 
     /// Unrecognized family => no injection at all.
     #[test]
     fn unrecognized_final_model_injects_nothing() {
-        let mut request = family_request("glm-5.1");
-        apply_family_chat_template_kwargs(&mut request);
-        assert!(!request.extra_body.contains_key("chat_template_kwargs"));
+        let mut backend = family_backend("glm-5.1", None);
+        apply_family_chat_template_kwargs(&mut backend, &empty_policies());
+        assert!(
+            !backend
+                .request
+                .extra_body
+                .contains_key("chat_template_kwargs")
+        );
+    }
+
+    /// T1: the leaf resolves the `template_family` override from the FINAL
+    /// provider model's policy (per-model, else global). A per-model policy
+    /// forces a family the model NAME does not sniff, so the right family kwargs
+    /// apply to the model the provider actually receives — not the alias's.
+    #[test]
+    fn leaf_resolves_family_from_per_model_policy_on_final_model() {
+        // An opaque-named model with a per-model `deepseek` policy gets DeepSeek
+        // kwargs even though the name sniffs nothing.
+        let policies = family_policies(&[("opaque-target", "deepseek")]);
+        let mut backend = family_backend("opaque-target", None);
+        apply_family_chat_template_kwargs(&mut backend, &policies);
+        let kwargs = kwargs_of(&backend.request);
+        assert_eq!(kwargs["enable_thinking"], json!(true));
+        assert!(
+            kwargs.get("thinking").is_none(),
+            "no Kimi knob for deepseek"
+        );
+
+        // An alias's policy does NOT bleed onto a different final model: the
+        // final model has its own policy, which wins.
+        let policies = family_policies(&[("glm-alias", "kimi"), ("opaque-target", "deepseek")]);
+        let mut backend = family_backend("opaque-target", None);
+        apply_family_chat_template_kwargs(&mut backend, &policies);
+        let kwargs = kwargs_of(&backend.request);
+        assert_eq!(kwargs["enable_thinking"], json!(true));
+        assert!(
+            kwargs.get("thinking").is_none(),
+            "alias's kimi override must not bleed onto the deepseek target"
+        );
+    }
+
+    /// T1 (R1 F1): per-model family policy lookup is case-insensitive (exact
+    /// then canonical-key), mirroring `Config::model_profile`. A profile keyed
+    /// `Opaque-Target` matches a FINAL model `opaque-target`.
+    #[test]
+    fn leaf_family_policy_lookup_is_case_insensitive() {
+        let policies = family_policies(&[("Opaque-Target", "deepseek")]);
+        let mut backend = family_backend("opaque-target", None);
+        apply_family_chat_template_kwargs(&mut backend, &policies);
+        let kwargs = kwargs_of(&backend.request);
+        assert_eq!(
+            kwargs["enable_thinking"],
+            json!(true),
+            "mixed-case profile key must match lowercase final model"
+        );
+    }
+
+    /// T1: the GLOBAL `template_family` fallback applies when no per-model
+    /// policy matches the FINAL model.
+    #[test]
+    fn leaf_global_family_fallback_when_no_per_model_policy() {
+        let policies = BackendFinalizationPolicies {
+            global_template_family: Some("kimi".to_string()),
+            ..Default::default()
+        };
+        let mut backend = family_backend("opaque-no-profile", None);
+        apply_family_chat_template_kwargs(&mut backend, &policies);
+        let kwargs = kwargs_of(&backend.request);
+        assert_eq!(kwargs["thinking"], json!(true));
+        assert_eq!(kwargs["preserve_thinking"], json!(true));
+    }
+
+    /// T1 (R1 F2): max-token aliases are one logical knob. If the client sent
+    /// `max_completion_tokens` via `extra_body`, the leaf must NOT insert a
+    /// configured `max_tokens` default alongside it (would shadow the explicit
+    /// request value). Mirrors the engine's pre-T1
+    /// `remove_defaults_shadowed_by_request_extra`.
+    #[test]
+    fn leaf_kwargs_skip_max_token_aliases_when_request_has_one() {
+        use super::finalize_request_for_backend;
+        let mut defaults = JsonMap::new();
+        defaults.insert("max_tokens".to_string(), json!(8192));
+        let policies = global_kwargs_policies(defaults);
+
+        // Client expressed `max_completion_tokens` via extra_body (typed field
+        // absent). The configured `max_tokens` default must NOT be inserted.
+        let mut backend = family_backend("plain-model", None);
+        backend
+            .request
+            .extra_body
+            .insert("max_completion_tokens".to_string(), json!(2048));
+        finalize_request_for_backend(&mut backend, &policies);
+        assert!(
+            !backend.request.extra_body.contains_key("max_tokens"),
+            "configured max_tokens must be shadowed by the request's max_completion_tokens alias: {:?}",
+            backend.request.extra_body
+        );
+        assert_eq!(
+            backend.request.extra_body["max_completion_tokens"],
+            json!(2048),
+            "request alias preserved"
+        );
     }
 
     #[test]
@@ -3729,8 +4075,6 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: BTreeMap::new(),
-            template_family: None,
-            client_chat_template_kwargs: None,
         };
 
         let sanitized = sanitize_chat_request(request, true);
@@ -3766,8 +4110,6 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: BTreeMap::new(),
-            template_family: None,
-            client_chat_template_kwargs: None,
         };
 
         let sanitized = sanitize_chat_request(request, true);
@@ -3801,8 +4143,6 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: BTreeMap::new(),
-            template_family: None,
-            client_chat_template_kwargs: None,
         };
 
         let sanitized_none = sanitize_chat_request(make("none"), true);
@@ -3845,8 +4185,6 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: BTreeMap::new(),
-            template_family: None,
-            client_chat_template_kwargs: None,
         };
 
         let sanitized = sanitize_chat_request(request, true);
@@ -3891,8 +4229,6 @@ mod tests {
             presence_penalty: None,
             stop: None,
             extra_body: BTreeMap::new(),
-            template_family: None,
-            client_chat_template_kwargs: None,
         };
 
         let sanitized = sanitize_chat_request(request, true);
@@ -3981,8 +4317,6 @@ mod tests {
                 presence_penalty: None,
                 stop: None,
                 extra_body: BTreeMap::new(),
-                template_family: None,
-                client_chat_template_kwargs: None,
             },
             true,
         );

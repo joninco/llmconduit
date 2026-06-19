@@ -355,8 +355,6 @@ fn chat_request(model: &str, reasoning_effort: Option<&str>) -> ChatCompletionRe
         presence_penalty: None,
         stop: None,
         extra_body: std::collections::BTreeMap::new(),
-        template_family: None,
-        client_chat_template_kwargs: None,
     }
 }
 
