@@ -815,6 +815,21 @@ impl Config {
         route_matches(&self.model_routes, model)
     }
 
+    /// Plain single-provider mode: no `upstreams` (routing), no `model_routes`
+    /// (ad-hoc routes), no top-level `fallback_upstreams` (non-routing failover).
+    /// In this mode the engine's own `/v1/models` catalog IS the single served
+    /// provider, so G3 budgeting may fall back to it when the candidate plan has
+    /// no known window. In any other mode the candidate plan is the authoritative
+    /// resolver (routing/failover rewrites the model pre-first-chunk), so the
+    /// engine union catalog must NOT be used as a budgeting fallback — it could
+    /// mask a failover target's smaller window or budget a routed model against
+    /// the wrong window (T9).
+    pub fn is_plain_single_provider(&self) -> bool {
+        self.upstreams.is_empty()
+            && self.model_routes.is_empty()
+            && self.fallback_upstreams.is_empty()
+    }
+
     pub fn resolve_upstream_chat_kwargs(&self, request_model: &str) -> JsonMap<String, JsonValue> {
         let upstream_model = self.resolve_upstream_model(request_model);
         self.resolve_upstream_chat_kwargs_for_resolved_model(request_model, &upstream_model)

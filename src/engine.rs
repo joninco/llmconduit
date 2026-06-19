@@ -98,17 +98,20 @@ struct UpstreamModelCatalog {
     ids: Vec<String>,
     ids_by_key: HashMap<String, Vec<String>>,
     /// Per-model context-window length (keyed by upstream catalog id) parsed
-    /// from `/v1/models`, used for G3 pre-flight budgeting. Absent when the
-    /// upstream does not report a context length for a model; budgeting no-ops
-    /// for missing entries.
+    /// from `/v1/models`. T9 moved ROUTING-mode budgeting to the routing
+    /// layer's `BackendCandidatePlan` (conservative MIN over per-provider
+    /// limits); this engine catalog is the NON-ROUTING resolver (the single
+    /// provider's catalog, which IS the served model's limit) and the fallback
+    /// when the candidate plan has no known limits (all-unknown / catalog-load
+    /// failure). `normalize_upstream_model`'s ladder uses only the id fields.
     context_limit_by_id: HashMap<String, i64>,
 }
 
 impl UpstreamModelCatalog {
     /// Build the catalog from a single `/v1/models` snapshot: the id list,
     /// `canonical_model_key` index, and per-model context limit all derive from
-    /// the same entries, so normalization and G3 budgeting describe one
-    /// consistent provider state.
+    /// the same entries, so normalization and (non-routing) budgeting describe
+    /// one consistent provider state.
     fn from_entries(entries: Vec<UpstreamModelEntry>) -> Self {
         let mut ids = Vec::with_capacity(entries.len());
         let mut ids_by_key: HashMap<String, Vec<String>> = HashMap::new();
@@ -196,34 +199,126 @@ struct ContextBudgetError;
 /// Omitting it can only SHRINK the estimate, preserving the lower-bound proof in
 /// both the mapped (cleared) and unmapped (kept) cases. `pub` so the test oracle
 /// reuses this exact construction (one source of truth).
-pub fn estimate_request_from_lowered(
+/// Additive upstream-request fields that the G3 estimate and the dispatch loop
+/// parameterize differently (T9). The COMMON base (`messages`/`tools`/
+/// `response_format`/`tool_choice`/`stream`/`stream_options`/`parallel_tool_calls`)
+/// is shared via [`build_upstream_chat_request`]; these additives are the seam
+/// where the estimate deliberately uses lower-bound-safe empties while dispatch
+/// uses the real values.
+///
+/// Why the estimate omits what it omits (the lower-bound proof, preserved
+/// exactly from the pre-T9 shadow builder):
+/// - `reasoning_effort`: a per-model `reasoning_effort_map` CLEARS the top-level
+///   field at the leaf for mapped models, so it is not guaranteed on the wire.
+///   Including it could OVER-count for mapped models ⇒ false pre-flight 400.
+///   Omitting can only SHRINK the estimate.
+/// - `max_output_tokens`: budgeting CAPS this down, so the real payload carries
+///   the (smaller) capped value. Including the uncapped request value could
+///   over-count. Omitting is safe.
+/// - `stop` / `temperature` / `top_p` / `frequency_penalty` / `presence_penalty`
+///   / `extra_body`: the additive leaf merges (`upstream_chat_kwargs`,
+///   `chat_template_kwargs`) happen at `finalize_request_for_backend`, AFTER the
+///   `run_turn` build, so `extra_body` here is pre-leaf-merge and does NOT
+///   include the kwargs that grow the payload. The estimate omits these scalars
+///   to stay a conservative lower bound; they only ever grow the real payload.
+/// - `model`: the real model id is always on the wire, so the estimate uses the
+///   real id (safe — it can only make the estimate LARGER, never over-count vs.
+///   the wire since the wire carries the same id).
+#[derive(Clone)]
+struct UpstreamRequestAdditives {
+    model: String,
+    reasoning_effort: Option<String>,
+    max_output_tokens: Option<i64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    stop: Option<Vec<String>>,
+    extra_body: BTreeMap<String, Value>,
+}
+
+impl UpstreamRequestAdditives {
+    /// Lower-bound-safe additives for the G3 estimate: real `model` (on the
+    /// wire), everything else empty/None (see [`UpstreamRequestAdditives`]).
+    fn for_estimate(model: String) -> Self {
+        Self {
+            model,
+            reasoning_effort: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            extra_body: BTreeMap::new(),
+        }
+    }
+}
+
+/// The ONE first-upstream-request builder (T9): shared by the G3 estimate and
+/// the `run_turn` dispatch loop so the request shape has a single source of
+/// truth. The COMMON base (`messages`/`tools`/`response_format`/`tool_choice`)
+/// is identical for both callers; the [`UpstreamRequestAdditives`] parameter is
+/// the seam where the estimate uses lower-bound-safe empties and dispatch uses
+/// the real values. `tool_choice` is passed in because the dispatch loop mutates
+/// it across turns (forced `tool_choice` on turn 1 only), while the estimate
+/// always uses the run_turn seam's default (`"auto"`, cleared by
+/// `sanitize_chat_request` when there are no tools).
+fn build_upstream_chat_request(
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<crate::models::chat::ChatTool>>,
+    response_format: Option<Value>,
+    tool_choice: Value,
+    additives: UpstreamRequestAdditives,
+) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: additives.model,
+        messages,
+        stream: true,
+        tools,
+        tool_choice: Some(tool_choice),
+        parallel_tool_calls: false,
+        reasoning_effort: additives.reasoning_effort,
+        response_format,
+        stream_options: Some(StreamOptions {
+            include_usage: true,
+        }),
+        temperature: additives.temperature,
+        top_p: additives.top_p,
+        max_output_tokens: additives.max_output_tokens,
+        frequency_penalty: additives.frequency_penalty,
+        presence_penalty: additives.presence_penalty,
+        stop: additives.stop,
+        extra_body: additives.extra_body,
+    }
+}
+
+/// Build the G3 estimate request from the LOWERED payload: the COMMON base via
+/// [`build_upstream_chat_request`] with lower-bound-safe additives
+/// ([`UpstreamRequestAdditives::for_estimate`]), then `sanitize_chat_request`
+/// (the terminal leaf transform — nothing transforms the body below it, so
+/// counting it makes an over-count structurally impossible). Private: only
+/// `estimate_input_tokens` calls it. The G3 test oracle (T9) builds its OWN
+/// independent normalization of the recorded request — it does NOT call this
+/// fn, so estimator-vs-oracle drift is detectable. `resolved_model` is the
+/// backend model id the leaf POSTs (on the wire, so counting it is safe — it
+/// only grows the estimate, preserving the lower bound).
+fn estimate_request_from_lowered(
     messages: &[ChatMessage],
     tools: &[crate::models::chat::ChatTool],
     response_format: &Option<Value>,
     flatten_content: bool,
+    resolved_model: &str,
 ) -> ChatCompletionRequest {
-    let request = ChatCompletionRequest {
-        model: String::new(),
-        messages: messages.to_vec(),
-        stream: true,
-        tools: (!tools.is_empty()).then(|| tools.to_vec()),
+    let request = build_upstream_chat_request(
+        messages.to_vec(),
+        (!tools.is_empty()).then(|| tools.to_vec()),
+        response_format.clone(),
         // Mirror the run_turn seam's default; `sanitize_chat_request` clears it
         // when there are no tools, matching the wire body.
-        tool_choice: Some(Value::String("auto".to_string())),
-        parallel_tool_calls: false,
-        reasoning_effort: None,
-        response_format: response_format.clone(),
-        stream_options: Some(StreamOptions {
-            include_usage: true,
-        }),
-        temperature: None,
-        top_p: None,
-        max_output_tokens: None,
-        frequency_penalty: None,
-        presence_penalty: None,
-        stop: None,
-        extra_body: BTreeMap::new(),
-    };
+        Value::String("auto".to_string()),
+        UpstreamRequestAdditives::for_estimate(resolved_model.to_string()),
+    );
     sanitize_chat_request(request, flatten_content)
 }
 
@@ -246,16 +341,22 @@ pub fn estimate_request_from_lowered(
 /// pre-flight 400; any residual under-count is absorbed by G1's reactive
 /// shrink-and-retry, the precise net. The estimate covers the first upstream
 /// turn only; later tool-loop turns rely on G1.
-fn estimate_input_tokens(lowered: &LoweredTurn, flatten_content: bool) -> i64 {
+fn estimate_input_tokens(
+    lowered: &LoweredTurn,
+    flatten_content: bool,
+    resolved_model: &str,
+) -> i64 {
     let request = estimate_request_from_lowered(
         &lowered.messages,
         &lowered.tools,
         &lowered.response_format,
         flatten_content,
+        resolved_model,
     );
     // `serde_json` serialization is deterministic for this type, so the byte
-    // count (and thus the estimate) is stable. The test oracle reuses
-    // `estimate_request_from_lowered`, so it tracks these exact bytes.
+    // count (and thus the estimate) is stable. The G3 test oracle (T9) builds
+    // an INDEPENDENT normalization of the recorded request — it does not call
+    // this fn — so estimator-vs-oracle drift surfaces as a test failure.
     let bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
     // ceil(bytes / 4): ~4 bytes per token is the standard coarse approximation.
     bytes.div_ceil(4) as i64
@@ -284,6 +385,20 @@ fn budget_explicit_max_output_tokens(
         Some(n) if n > 0 => Some(n.min(available)),
         other => other,
     })
+}
+
+/// Conservative floor for G3 pre-flight budgeting (T9): the STRICTEST context
+/// window across the candidate set's KNOWN per-model limits (the min). A
+/// failover to a smaller-window model then constrains the budget, so the cap /
+/// reject decision is never wider than the tightest backend that could serve.
+/// Candidates with no reported window (`None`) are skipped (unknown ⇒ no-op,
+/// matching pre-T9). Returns `None` when the set is empty OR no candidate
+/// reports a window ⇒ budgeting no-ops entirely.
+fn candidate_context_floor(plan: &crate::upstream::BackendCandidatePlan) -> Option<i64> {
+    plan.candidates
+        .iter()
+        .filter_map(|candidate| candidate.context_limit)
+        .min()
 }
 
 /// Whether a Chat-Completions inbound request asked for reasoning, either via
@@ -560,19 +675,40 @@ impl Gateway {
             vision_session.is_some(),
         )?;
 
-        // G3 pre-flight context budgeting (single seam, Option B). Estimate over
-        // the LOWERED upstream payload (`lowered.messages`/`tools`/scalars) so no
-        // canonical field can inflate the estimate. When the upstream reports a
-        // context window for the resolved model, cap an explicitly requested
-        // `max_output_tokens` down to what still fits after the estimated input +
-        // fixed margin, or reject clear input overflow with a 400. Returning Err
-        // here short-circuits before `tokio::spawn`, so no upstream chat POST is
-        // made; unknown context ⇒ no-op. We mutate ONLY the typed field, which
-        // flows through to the chat request build and wins over conflicting
-        // default max-token aliases.
-        if let Some(limit) = self.upstream_model_context_limit(&resolved_model).await {
+        // G3 pre-flight context budgeting (T9: candidate-set seam). Estimate
+        // over the LOWERED upstream payload (`lowered.messages`/`tools`/scalars)
+        // so no canonical field can inflate the estimate, then budget against
+        // the CONSERVATIVE MIN of the per-candidate context windows the
+        // routing/failover layer reports for the resolved model's pre-first-chunk
+        // candidate set (the primary + its failover chain + the routing target).
+        // The MIN is the strictest window across the chain, so a failover to a
+        // smaller-window model cannot overflow; candidates with no reported
+        // window (`None`) are skipped (unknown ⇒ no-op, matching pre-T9). If NO
+        // candidate reports a window (non-routing single upstream / all-unknown
+        // / empty set), fall back to the engine's non-routing catalog limit for
+        // `resolved_model` (the single provider's window — the served model's
+        // limit, correct in non-routing mode). If that is also unknown,
+        // budgeting no-ops. Cap an explicitly requested `max_output_tokens` down
+        // to what still fits after the estimated input + fixed margin, or reject
+        // clear input overflow with a 400. Returning Err here short-circuits
+        // before `tokio::spawn`, so no upstream chat POST is made. We mutate
+        // ONLY the typed field, which flows through to the chat request build
+        // and wins over conflicting default max-token aliases.
+        let candidate_plan = self.upstream.backend_candidate_plan(&resolved_model).await;
+        // T9: the candidate plan is the authoritative resolver in routing/
+        // failover mode. The engine's own `/v1/models` catalog is a budgeting
+        // fallback ONLY in plain single-provider mode (where it IS the single
+        // served provider); in any other mode an all-unknown candidate plan
+        // must NO-OP rather than budget against the engine union, which could
+        // mask a failover target's smaller window or budget a routed model
+        // against the wrong window.
+        let mut limit = candidate_context_floor(&candidate_plan);
+        if limit.is_none() && self.config.is_plain_single_provider() {
+            limit = self.upstream_model_context_limit(&resolved_model).await;
+        }
+        if let Some(limit) = limit {
             let estimated_input_tokens =
-                estimate_input_tokens(&lowered, self.config.flatten_content);
+                estimate_input_tokens(&lowered, self.config.flatten_content, &resolved_model);
             match budget_explicit_max_output_tokens(
                 request.max_output_tokens,
                 limit,
@@ -777,7 +913,7 @@ impl Gateway {
             {
                 return native;
             }
-            self.candidate_is_native_vision(candidate)
+            self.candidate_is_native_vision(&candidate.model)
         })
     }
 
@@ -1160,26 +1296,28 @@ impl Gateway {
             }
             upstream_request_index += 1;
             let taken_messages = std::mem::take(&mut current_messages);
-            let upstream_request = ChatCompletionRequest {
-                model: upstream_model.clone(),
-                messages: taken_messages,
-                stream: true,
-                tools: (!tools.is_empty()).then_some(tools.clone()),
-                tool_choice: Some(current_tool_choice.clone()),
-                parallel_tool_calls: false,
-                reasoning_effort: reasoning_effort.clone(),
-                response_format: response_format.clone(),
-                stream_options: Some(StreamOptions {
-                    include_usage: true,
-                }),
-                temperature: request.temperature,
-                top_p: request.top_p,
-                max_output_tokens: request.max_output_tokens,
-                frequency_penalty: request.frequency_penalty,
-                presence_penalty: request.presence_penalty,
-                stop: normalized_stop.clone(),
-                extra_body: upstream_extra_body.clone(),
-            };
+            // T9: the ONE first-upstream-request builder, shared with the G3
+            // estimate. The common base is identical; the additives carry the
+            // real dispatch values (vs. the estimate's lower-bound-safe
+            // empties). `current_tool_choice` mutates across turns (forced
+            // `tool_choice` on turn 1 only).
+            let upstream_request = build_upstream_chat_request(
+                taken_messages,
+                (!tools.is_empty()).then_some(tools.clone()),
+                response_format.clone(),
+                current_tool_choice.clone(),
+                UpstreamRequestAdditives {
+                    model: upstream_model.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
+                    max_output_tokens: request.max_output_tokens,
+                    temperature: request.temperature,
+                    top_p: request.top_p,
+                    frequency_penalty: request.frequency_penalty,
+                    presence_penalty: request.presence_penalty,
+                    stop: normalized_stop.clone(),
+                    extra_body: upstream_extra_body.clone(),
+                },
+            );
             if self.monitor.is_enabled() {
                 let upstream_debug_request =
                     sanitize_chat_request(upstream_request.clone(), self.config.flatten_content);
@@ -1917,8 +2055,13 @@ impl Gateway {
     }
 
     /// Context-window length the upstream reports for the resolved catalog
-    /// model id, if any, for G3 pre-flight budgeting. A catalog-load failure is
-    /// non-fatal (logged) and yields `None` so budgeting no-ops.
+    /// model id, for G3 pre-flight budgeting's NON-ROUTING fallback (T9). The
+    /// primary budgeting path is `candidate_context_floor` over the routing
+    /// layer's `BackendCandidatePlan` (conservative MIN across the failover
+    /// chain); this is the fallback when the plan has no known limits
+    /// (non-routing single upstream / all-unknown / catalog-load failure). A
+    /// catalog-load failure is non-fatal (logged) and yields `None` so budgeting
+    /// no-ops.
     async fn upstream_model_context_limit(&self, resolved_model: &str) -> Option<i64> {
         match self.load_upstream_model_catalog().await {
             Ok(catalog) => catalog.context_limit_by_id.get(resolved_model).copied(),

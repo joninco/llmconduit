@@ -162,6 +162,26 @@ impl UpstreamClient for MockUpstream {
             })
             .collect())
     }
+
+    // T9: override `backend_candidate_plan` so the candidate carries the
+    // context limit from `set_context_limits` (the default trait impl returns
+    // `None`, which would make G3 budgeting no-op). Single-provider mock: the
+    // one candidate is `requested_model` with its configured limit (if any).
+    async fn backend_candidate_plan(
+        &self,
+        requested_model: &str,
+    ) -> llmconduit::upstream::BackendCandidatePlan {
+        let limits = self.context_limits.lock().await.clone();
+        let context_limit = limits
+            .iter()
+            .find(|(id, _)| id == requested_model)
+            .map(|(_, limit)| *limit);
+        let candidates = vec![llmconduit::upstream::BackendCandidate {
+            model: requested_model.to_string(),
+            context_limit,
+        }];
+        llmconduit::upstream::BackendCandidatePlan { candidates }
+    }
 }
 
 // ---------------------------------------------------------------------------

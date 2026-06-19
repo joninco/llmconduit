@@ -46,25 +46,34 @@ pub struct UpstreamModelEntry {
 
 const ROUTING_MODEL_CATALOG_TTL_SECS: u64 = 300;
 
+/// One pre-first-chunk serving backend: its FINAL model id (after any
+/// routing/route/exposed-alias + per-provider `upstream_model` rewrite — no
+/// further remap) and the context-window length the upstream reports for it,
+/// for G3 pre-flight budgeting (T9). `context_limit: None` ⇒ the upstream did
+/// not report a window for this model (budgeting no-ops for it).
+#[derive(Debug, Clone)]
+pub struct BackendCandidate {
+    pub model: String,
+    pub context_limit: Option<i64>,
+}
+
 /// Typed backend-candidate plan: the routing/failover layer's answer to "which
-/// backend models could serve this request pre-first-chunk?" G4 native-vision
-/// gating consumes this instead of re-deriving the candidate set in the engine
-/// (T2). The `genuine` signal — whether the request model truly resolved vs.
-/// fell back to a catalog default — is ENGINE-side (a byproduct of
-/// `normalize_upstream_model`, not a re-derived ladder; see
-/// `backend_is_native_vision`), because in non-routing mode there is no routing
-/// resolver to ask and the engine's catalog is the single resolution truth.
-/// T9 collapses `normalize_upstream_model` onto the routing catalog (G3
-/// context-limit coupling), at which point `genuine` can fold in here too.
+/// backend models could serve this request pre-first-chunk, and what context
+/// window does each report?" G4 native-vision gating consumes the candidate
+/// MODELS instead of re-deriving the set in the engine (T2); G3 pre-flight
+/// budgeting consumes the candidate CONTEXT LIMITS (conservative MIN — the
+/// strictest window across the failover chain — so a failover to a smaller
+/// model cannot overflow; unknown ⇒ no-op) instead of budgeting against the
+/// pre-routing `resolved_model` (T9). The `genuine` signal — whether the
+/// request model truly resolved vs. fell back to a catalog default — is
+/// ENGINE-side (a byproduct of `normalize_upstream_model`, not a re-derived
+/// ladder; see `backend_is_native_vision`).
 ///
-/// `candidates` is every pre-first-chunk serving backend model (the selected
-/// primary + its whole failover chain + the routing target), enumerated from
-/// the FINAL backend models the providers receive — no further
-/// `upstream_model` remap. Empty ⇒ unknown candidate set (catalog-load
-/// failure), which the gate treats as strip+offload.
+/// Empty `candidates` ⇒ unknown candidate set (catalog-load failure): the gate
+/// treats it as strip+offload, budgeting no-ops.
 #[derive(Debug, Clone)]
 pub struct BackendCandidatePlan {
-    pub candidates: Vec<String>,
+    pub candidates: Vec<BackendCandidate>,
 }
 
 #[async_trait]
@@ -120,18 +129,26 @@ pub trait UpstreamClient: Send + Sync {
         self.backend_candidate_plan(requested_model)
             .await
             .candidates
+            .into_iter()
+            .map(|candidate| candidate.model)
+            .collect()
     }
 
     /// Typed backend-candidate plan for `requested_model` — the routing/failover
-    /// layer's candidate set for G4 native-vision gating (T2). The `genuine`
+    /// layer's candidate set (model + per-candidate context limit) for G4
+    /// native-vision gating (T2) and G3 pre-flight budgeting (T9). The `genuine`
     /// signal is engine-side; this method returns only `candidates`.
     ///
     /// Default impl: a single-provider passthrough sends the request model
-    /// unchanged, so the only candidate is `requested_model` itself.
-    /// Routing/failover clients override to fold in the failover chain.
+    /// unchanged, so the only candidate is `requested_model` itself with no
+    /// known context limit (budgeting no-ops). Routing/failover clients override
+    /// to fold in the failover chain + per-provider context limits.
     async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
         BackendCandidatePlan {
-            candidates: vec![requested_model.to_string()],
+            candidates: vec![BackendCandidate {
+                model: requested_model.to_string(),
+                context_limit: None,
+            }],
         }
     }
 }
@@ -348,6 +365,12 @@ struct RoutingModelCatalog {
 #[derive(Debug, Clone, Default)]
 struct RoutingProviderModelCatalog {
     candidates: Vec<RoutingModelCandidate>,
+    /// Per-model context-window length for this provider's catalog, keyed by
+    /// model id (parsed from the SAME `/v1/models` snapshot as `candidates`).
+    /// G3 pre-flight budgeting reads this via `backend_candidate_plan` so it
+    /// budgets against the REAL per-provider window (T9), not the pre-routing
+    /// union default.
+    context_limit_by_id: HashMap<String, i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -1101,6 +1124,7 @@ impl RoutingUpstreamClient {
             };
 
             let mut provider_candidates = Vec::new();
+            let mut provider_context_limits: HashMap<String, i64> = HashMap::new();
             for entry in entries {
                 let Some((model_id, entry)) = normalized_model_entry(entry) else {
                     continue;
@@ -1111,6 +1135,7 @@ impl RoutingUpstreamClient {
                     entry,
                     RoutingModelTarget::Primary,
                     &mut provider_candidates,
+                    &mut provider_context_limits,
                     &mut union_entries,
                     &mut union_ids,
                     &mut ids_by_key,
@@ -1126,6 +1151,7 @@ impl RoutingUpstreamClient {
                         failover_provider_index: model.failover_provider_index,
                     },
                     &mut provider_candidates,
+                    &mut provider_context_limits,
                     &mut union_entries,
                     &mut union_ids,
                     &mut ids_by_key,
@@ -1134,6 +1160,7 @@ impl RoutingUpstreamClient {
             }
             provider_catalogs.push(RoutingProviderModelCatalog {
                 candidates: provider_candidates,
+                context_limit_by_id: provider_context_limits,
             });
         }
 
@@ -1341,6 +1368,7 @@ fn register_routing_model(
     entry: Value,
     target: RoutingModelTarget,
     provider_candidates: &mut Vec<RoutingModelCandidate>,
+    context_limit_by_id: &mut HashMap<String, i64>,
     union_entries: &mut Vec<Value>,
     union_ids: &mut Vec<String>,
     ids_by_key: &mut HashMap<String, Vec<RoutingModelCandidate>>,
@@ -1360,6 +1388,13 @@ fn register_routing_model(
         .any(|candidate| candidate.model_id == model_id)
     {
         provider_candidates.push(candidate.clone());
+    }
+    // Preserve the per-provider context limit for G3 budgeting (T9). Synthetic
+    // bare-string entries (no object body) carry no limit ⇒ None.
+    if let Value::Object(map) = &entry
+        && let Some(limit) = entry_context_limit(map)
+    {
+        context_limit_by_id.insert(model_id.clone(), limit);
     }
     ids_by_key.entry(key).or_default().push(candidate);
     if seen_union_ids.insert(model_id.clone()) {
@@ -1435,17 +1470,20 @@ impl UpstreamClient for FailoverUpstreamClient {
     /// `request_for_provider`) or the request model when it sends through
     /// unchanged (G4 round-2 #1). We enumerate ALL providers (not just
     /// currently-available ones): cooldown is transient, so a fallback that is
-    /// non-native must still force strip+offload. `candidate_backend_models`
+    /// non-native must still force strip+offload. Context limits are `None`
+    /// (a failover chain does not load per-provider `/v1/models` catalogs, so
+    /// G3 budgeting no-ops — matching pre-T9 behavior). `candidate_backend_models`
     /// (trait default) projects from this.
     async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
         let candidates = self
             .providers
             .iter()
-            .map(|provider| {
-                provider
+            .map(|provider| BackendCandidate {
+                model: provider
                     .upstream_model
                     .clone()
-                    .unwrap_or_else(|| requested_model.to_string())
+                    .unwrap_or_else(|| requested_model.to_string()),
+                context_limit: None,
             })
             .collect();
         BackendCandidatePlan { candidates }
@@ -1463,15 +1501,22 @@ impl UpstreamClient for RoutingUpstreamClient {
     }
 
     /// Typed backend-candidate plan using the SAME route/catalog resolution as
-    /// `stream_chat_completion` (G4 review #2 + round-2 #1). Candidates only;
-    /// the `genuine` signal is engine-side (see `BackendCandidatePlan`).
+    /// `stream_chat_completion` (G4 review #2 + round-2 #1). Each candidate
+    /// carries its per-provider context limit for G3 budgeting (T9); the
+    /// `genuine` signal is engine-side (see `BackendCandidatePlan`).
     ///
-    /// A route resolves to one backend model. A catalog match dispatches to a
-    /// routing provider: the PRIMARY target may fail over across that
-    /// provider's whole failover chain (so all of its candidate models count),
-    /// while a fallback/exposed-alias target serves only that single provider's
-    /// model. A catalog-load failure or empty catalog yields an empty candidate
-    /// set, which the safe invariant treats as "unknown → strip+offload".
+    /// A route resolves to one backend model (route providers are synthetic
+    /// single-model upstreams with no `/v1/models` context window ⇒ `None`).
+    /// A catalog match dispatches to a routing provider: the PRIMARY target may
+    /// fail over across that provider's whole nested failover chain (so all of
+    /// its candidate models count), while a fallback/exposed-alias target serves
+    /// only that single provider's model. Per-provider context limits come from
+    /// the routing catalog's `context_limit_by_id` (populated from the SAME
+    /// `/v1/models` snapshot as the candidate ids); nested-failover models not
+    /// in this provider's catalog carry `None` (G3 no-ops for them, same as
+    /// pre-T9). A catalog-load failure or empty catalog yields an empty candidate
+    /// set, which the safe invariant treats as "unknown → strip+offload" and
+    /// budgeting treats as no-op.
     async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
         let Ok(catalog) = self.load_catalog().await else {
             return BackendCandidatePlan {
@@ -1484,28 +1529,66 @@ impl UpstreamClient for RoutingUpstreamClient {
             };
         };
         let candidates = match resolution {
-            RoutingResolution::Route { model_id, .. } => vec![model_id],
+            RoutingResolution::Route { model_id, .. } => vec![BackendCandidate {
+                model: model_id,
+                context_limit: None,
+            }],
             RoutingResolution::Catalog(candidate) => {
                 let Some(provider) = self.providers.get(candidate.provider_index) else {
                     return BackendCandidatePlan {
                         candidates: Vec::new(),
                     };
                 };
+                // Per-provider context limits come from the SELECTED routing
+                // provider's primary `/v1/models` snapshot. They are keyed by
+                // the primary's OWN model ids, so the limit is authoritative
+                // ONLY for the primary's own model (`candidate.model_id`).
+                // Nested-failover / exposed-fallback models are served by OTHER
+                // upstreams whose `/v1/models` is not loaded here; looking them
+                // up in the primary's map could borrow the WRONG window when an
+                // id coincidentally matches, so they carry `None` (G3 no-ops for
+                // them — T9 R2 HIGH fix).
+                let primary_limits =
+                    &catalog.provider_catalogs[candidate.provider_index].context_limit_by_id;
+                let primary_limit = primary_limits.get(&candidate.model_id).copied();
                 match candidate.target {
-                    // Primary: the whole nested failover chain may serve.
-                    RoutingModelTarget::Primary => {
-                        provider
-                            .client
-                            .candidate_backend_models(&candidate.model_id)
-                            .await
-                    }
-                    // Fallback/exposed-alias: only this one provider serves.
+                    // Primary: the whole nested failover chain may serve. Only
+                    // Primary: the whole nested failover chain may serve. Only
+                    // the chain's FIRST candidate (index 0 — the selected
+                    // provider's own model, whose `/v1/models` snapshot populates
+                    // `primary_limits`) carries `primary_limit`. All later chain
+                    // candidates are nested-failover models served by OTHER
+                    // upstreams whose `/v1/models` is not loaded here ⇒ `None`
+                    // (G3 no-ops for them — never borrow the primary's window for
+                    // a different provider, even if the model id matches). This
+                    // is provider-identity scoping, not model-string scoping
+                    // (T9 R3 HIGH fix).
+                    RoutingModelTarget::Primary => provider
+                        .client
+                        .candidate_backend_models(&candidate.model_id)
+                        .await
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, model)| BackendCandidate {
+                            context_limit: (index == 0).then_some(primary_limit).flatten(),
+                            model,
+                        })
+                        .collect(),
+                    // Fallback/exposed-alias: served by a nested failover
+                    // provider whose own `/v1/models` is not loaded here ⇒ None
+                    // (G3 no-ops; the failover provider's window is unknown at
+                    // this layer, so no false cap / no wrong-window borrow).
                     RoutingModelTarget::Fallback {
                         failover_provider_index,
-                    } => provider
-                        .failover_provider_model(failover_provider_index)
-                        .map(|model| vec![model])
-                        .unwrap_or_else(|| vec![candidate.model_id.clone()]),
+                    } => {
+                        let model = provider
+                            .failover_provider_model(failover_provider_index)
+                            .unwrap_or_else(|| candidate.model_id.clone());
+                        vec![BackendCandidate {
+                            context_limit: None,
+                            model,
+                        }]
+                    }
                 }
             }
         };
@@ -3314,7 +3397,11 @@ fn extract_model_context_limits(body: &Value) -> Vec<(String, i64)> {
         .collect()
 }
 
-pub(crate) fn sanitize_chat_request(
+/// `pub` so the G3 test oracle (`tests/port_server.rs`) can independently
+/// normalize a recorded request through the SAME terminal leaf transform the
+/// estimator uses, without calling the production estimator (T9: breaks the
+/// self-referential oracle, G3 MEDIUM #19).
+pub fn sanitize_chat_request(
     mut request: ChatCompletionRequest,
     flatten_content: bool,
 ) -> ChatCompletionRequest {
@@ -4854,6 +4941,7 @@ mod resolve_match_kind_tests {
         RoutingModelCatalog {
             provider_catalogs: vec![RoutingProviderModelCatalog {
                 candidates: vec![candidate],
+                context_limit_by_id: HashMap::new(),
             }],
             union_entries: Vec::new(),
             union_ids: vec![model.to_string()],

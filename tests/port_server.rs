@@ -53,25 +53,64 @@ use llmconduit::models::responses::ToolSpec;
 
 const MARGIN: i64 = 128;
 
-/// Oracle for `engine::estimate_input_tokens`, computed from the upstream chat
-/// request the mock ACTUALLY RECEIVED. It reuses the production
-/// `estimate_request_from_lowered` (one source of truth) — which applies the
-/// SAME `sanitize_chat_request` the leaf applies (content flattening etc.) — and
-/// counts `ceil(bytes/4)` of the serialized result. Because it reads the
-/// recorded payload AND shares the estimator's construction + sanitize, it
-/// tracks the exact wire bytes across future lowering/sanitize changes.
+/// INDEPENDENT oracle for `engine::estimate_input_tokens` (T9: no longer calls
+/// the production `estimate_request_from_lowered`). It builds the SAME common
+/// base the estimator counts: the recorded `messages`/`tools`/`response_format`,
+/// the run_turn seam's default `tool_choice:"auto"`, and lower-bound-safe EMPTY
+/// additives (no `model`/`reasoning_effort`/`max_output_tokens`/scalars/
+/// `extra_body` — matching the estimator's lower-bound omissions). It runs that
+/// through `sanitize_chat_request` (the terminal leaf transform, the one shared
+/// seam) and counts `ceil(bytes/4)`. Constructing the request literal here
+/// (rather than calling the production builder) makes the oracle INDEPENDENT:
+/// if the estimator's construction drifts, the expected budget diverges and the
+/// test fails, so the self-referential loop (G3 MEDIUM #19) is broken.
 fn estimate_from_recorded(recorded: &ChatCompletionRequest, flatten_content: bool) -> i64 {
-    let tools = recorded.tools.clone().unwrap_or_default();
-    let request = llmconduit::engine::estimate_request_from_lowered(
-        &recorded.messages,
-        &tools,
-        &recorded.response_format,
-        flatten_content,
-    );
-    let bytes = serde_json::to_vec(&request)
+    let request = ChatCompletionRequest {
+        // Lower-bound-safe additives, matching the estimator: the real `model`
+        // (on the wire, so counting it is safe), everything else empty/None.
+        model: recorded.model.clone(),
+        reasoning_effort: None,
+        max_output_tokens: None,
+        temperature: None,
+        top_p: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stop: None,
+        extra_body: std::collections::BTreeMap::new(),
+        // Common base from the recorded (lowered + sanitized) request:
+        messages: recorded.messages.clone(),
+        tools: recorded.tools.clone(),
+        response_format: recorded.response_format.clone(),
+        // Mirror the run_turn seam's default; `sanitize_chat_request` clears it
+        // when there are no tools.
+        tool_choice: Some(json!("auto")),
+        stream: true,
+        parallel_tool_calls: false,
+        stream_options: Some(llmconduit::models::chat::StreamOptions {
+            include_usage: true,
+        }),
+    };
+    let sanitized = llmconduit::upstream::sanitize_chat_request(request, flatten_content);
+    let bytes = serde_json::to_vec(&sanitized)
         .expect("serialize estimate request")
         .len();
     bytes.div_ceil(4) as i64
+}
+
+/// Minimal valid chat-completion SSE body for wiremock upstreams in the routing
+/// G3 test: one content chunk + a usage chunk + `[DONE]`. Just enough for the
+/// non-streaming `/v1/responses` path to complete without an upstream-error 502.
+fn minimal_chat_sse_body() -> String {
+    let chunk = json!({
+        "id": "chat-1",
+        "choices": [{
+            "index": 0,
+            "delta": {"content": "ok"},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    });
+    format!("data: {chunk}\n\ndata: [DONE]\n\n")
 }
 
 /// Run a single non-tool turn through the gateway with a known per-model context
@@ -427,4 +466,180 @@ async fn preflight_rejects_context_exhausted() {
         })
         .count();
     assert_eq!(chat_posts, 0, "rejected request must not POST to upstream");
+}
+
+/// T9: in ROUTING mode, G3 budgeting reads the candidate's context limit from
+/// the routing layer's `BackendCandidatePlan` (per-provider `/v1/models`), not
+/// the pre-routing engine union catalog. A routing provider whose primary
+/// reports a context window must cap an explicit `max_output_tokens` to that
+/// window minus the estimated input and the fixed 128 margin.
+#[tokio::test]
+async fn preflight_routing_caps_against_provider_context_window() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "routed-model", "max_model_len": 4_096}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(minimal_chat_sse_body()),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = config_for(&server.uri());
+    config.upstreams = vec![llmconduit::config::UpstreamConfig {
+        name: "routed".to_string(),
+        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
+        upstream_api_key: None,
+        upstream_model: None,
+        upstream_chat_kwargs: serde_json::Map::new(),
+        upstream_request_log_path: None,
+        fallback_upstreams: Vec::new(),
+    }];
+
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "routed-model",
+                        "stream": false,
+                        "input": "hello",
+                        "max_output_tokens": 1_000_000,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "request within the routed window must succeed"
+    );
+    // The upstream POST the wiremock received carries the CAPPED budget. The
+    // independent oracle (estimate from the recorded request) is not available
+    // here (no in-process mock), so assert the cap is bounded by the window:
+    // it must be < context (4_096) and > 0, proving budgeting fired against the
+    // routing provider's reported window rather than no-opping or using the
+    // huge request value.
+    let chat_posts: Vec<_> = server
+        .received_requests()
+        .await
+        .expect("requests")
+        .into_iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
+        })
+        .collect();
+    assert_eq!(chat_posts.len(), 1, "exactly one upstream chat POST");
+    let posted: serde_json::Value =
+        serde_json::from_slice(&chat_posts[0].body).expect("posted json");
+    // `max_output_tokens` serializes as `max_tokens` on the chat wire.
+    let capped = posted["max_tokens"].as_i64().expect("cap present");
+    assert!(
+        capped > 0 && capped < 4_096,
+        "budget capped against the routing provider's 4_096 window: got {capped}"
+    );
+}
+
+/// T9 HIGH-fix guard: in top-level-failover mode (`fallback_upstreams` set, no
+/// `upstreams`/`model_routes`), `is_plain_single_provider()` is FALSE, so the
+/// engine-union catalog is NOT a budgeting fallback. The `FailoverUpstreamClient`
+/// candidate plan carries `None` limits (it does not load `/v1/models`), so
+/// budgeting must NO-OP — even though the primary's `/v1/models` reports a
+/// window (the engine union WOULD have it). This distinguishes the candidate-
+/// plan path from the pre-T9 engine-union path: pre-T9 budgeted against the
+/// engine union for `resolved_model` and would CAP here; post-T9 it no-ops
+/// (G1 reactive retry stays the net for the failover chain).
+#[tokio::test]
+async fn preflight_top_level_failover_no_ops_without_candidate_limit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "primary-model", "max_model_len": 4_096}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(minimal_chat_sse_body()),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = config_for(&server.uri());
+    config.fallback_upstreams = vec![llmconduit::config::FallbackUpstreamConfig {
+        name: "fallback".to_string(),
+        upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
+        upstream_api_key: None,
+        upstream_model: Some("fallback-model".to_string()),
+        exposed_model: None,
+        upstream_chat_kwargs: serde_json::Map::new(),
+        upstream_request_log_path: None,
+    }];
+    // The primary also serves (top-level fallback_upstreams ⇒ FailoverUpstreamClient
+    // with the primary as provider 0 + the fallback as provider 1).
+    assert!(!config.is_plain_single_provider());
+
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "primary-model",
+                        "stream": false,
+                        "input": "hello",
+                        "max_output_tokens": 1_000_000,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "no false 400 in top-level-failover mode without a candidate limit"
+    );
+    let chat_posts: Vec<_> = server
+        .received_requests()
+        .await
+        .expect("requests")
+        .into_iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
+        })
+        .collect();
+    assert_eq!(chat_posts.len(), 1, "exactly one upstream chat POST");
+    let posted: serde_json::Value =
+        serde_json::from_slice(&chat_posts[0].body).expect("posted json");
+    // Budgeting no-op'd: the huge request value flows through UNCAPPED. (G3
+    // never synthesizes a cap; G1 reactive retry handles overflow downstream.)
+    assert_eq!(
+        posted["max_tokens"].as_i64(),
+        Some(1_000_000),
+        "top-level-failover with no candidate limit ⇒ budgeting no-op (uncapped)"
+    );
 }

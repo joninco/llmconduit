@@ -170,14 +170,16 @@ impl UpstreamClient for MockUpstream {
             .collect())
     }
 
-    // T2: override `backend_candidate_plan` (the single source of truth); the
-    // trait default projects `candidate_backend_models` from it. Injecting a
+    // T2/T9: override `backend_candidate_plan` (the single source of truth);
+    // the trait default projects `candidate_backend_models` from it. Injecting a
     // configured candidate set simulates a failover chain for G4 gating tests.
+    // Context limits are `None` here (the G4 mock does not model `/v1/models`
+    // context windows; G3 budgeting tests use the shared `common::MockUpstream`).
     async fn backend_candidate_plan(
         &self,
         requested_model: &str,
     ) -> llmconduit::upstream::BackendCandidatePlan {
-        let candidates = match self
+        let models = match self
             .candidate_models
             .lock()
             .expect("candidate models lock")
@@ -186,6 +188,13 @@ impl UpstreamClient for MockUpstream {
             Some(models) => models,
             None => vec![requested_model.to_string()],
         };
+        let candidates = models
+            .into_iter()
+            .map(|model| llmconduit::upstream::BackendCandidate {
+                model,
+                context_limit: None,
+            })
+            .collect();
         llmconduit::upstream::BackendCandidatePlan { candidates }
     }
 }
