@@ -1155,10 +1155,11 @@ impl Gateway {
         // the wire. The leaf is the single point that knows the FINAL provider
         // model after routing/failover, so it (not the engine) applies that
         // model's `reasoning_effort_map`. Kept raw — not the model-agnostic clamp
-        // — so xhigh/max stay distinct; the clamped top-level `reasoning_effort`
-        // is left intact (models without a map keep it; mapped models like GLM
-        // ignore the top-level field, and leaving it keeps the G3 estimate a safe
-        // lower bound since the map fragment is purely additive in extra_body).
+        // — so xhigh/max stay distinct. A model WITHOUT a map keeps its clamped
+        // top-level `reasoning_effort`; a mapped model has it CLEARED at the leaf
+        // (the fragment relays effort via chat_template_kwargs instead). The G3
+        // estimate omits `reasoning_effort` entirely, so it stays a safe lower
+        // bound either way (see `estimate_request_from_lowered`).
         // Drop any client-supplied value first: the marker is engine-owned, and a
         // request that smuggles it through `extra_body` must NOT be trusted as the
         // canonical effort.
