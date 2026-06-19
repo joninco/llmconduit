@@ -42,7 +42,8 @@ to avoid over-matching. Tests: `tests/port_errors.rs`.
 validation/lowering errors before budgeting, so no new error path) produces `LoweredTurn`.
 `estimate_input_tokens(&lowered, flatten_content)` builds the chat request from the lowered fields and
 runs the SAME `sanitize_chat_request` the leaf runs (`engine::estimate_request_from_lowered`), then
-`ceil(bytes/4)` — the EXACT POST body. Cap an EXPLICITLY-requested `max_output_tokens` to
+`ceil(bytes/4)` of the post-sanitize lowered body (NOT the full wire body — additive leaf merges are
+omitted; see below). Cap an EXPLICITLY-requested `max_output_tokens` to
 `min(requested, context − est − 128)`; fixed 128 margin; `est+margin ≥ context` ⇒ HTTP 400 before any
 `tokio::spawn`/upstream POST. **No floor, no synthesized cap, never raises; mutates only the typed field.**
 
