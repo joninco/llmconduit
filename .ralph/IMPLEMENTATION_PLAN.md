@@ -1,10 +1,10 @@
 # IMPLEMENTATION_PLAN.md — llmconduit gap implementation
 
-Implements 7 of the 9 gaps in `GAPS.md` (G4 image-agent + G7 route-config deferred — LOW priority and
-architecturally divergent). Specs: `.ralph/specs/*`. Review gate: `.ralph/REVIEW_PROTOCOL.md`.
+Implements the 7 core gaps in `GAPS.md`, plus the owner-directed EXTENDED RUN of the originally-deferred
+G4 (image agent) + G7 (route config) + the descoped G3 keep-alive-peek. Specs: `.ralph/specs/*`. Review gate: `.ralph/REVIEW_PROTOCOL.md`.
 
 ## Executive summary
-**Status: 7/7 implemented (P1, G5, G1, G2, G8, G6, G3 ✅). Run COMPLETE.** Loop validated: build → cargo test/clippy/fmt → Codex-xhigh review → fix → re-review APPROVED.
+**Status: core 7/7 ✅ + EXTENDED RUN COMPLETE ✅ (G3-peek, G7, G4 — owner-directed, all Codex-xhigh APPROVED). ALL 9 GAPS + P1 + G3-peek DONE.** Loop validated: build → cargo test/clippy/fmt → Codex-xhigh review → fix → re-review APPROVED.
 Execution: **serial (`--agents 1`)** — G1/G2/G3 all edit `src/engine.rs`, so parallel runs would
 conflict; serial also keeps the per-gap Codex-xhigh review gate clean. Run with
 `/ralph-orchestrate --agents 1 --no-review` (built-in multi-model review disabled; this plan's
@@ -93,6 +93,9 @@ per-gap Codex review replaces it).
 | 5 | G2 Kimi/DeepSeek family kwargs (provider-leaf) | `d1e626e` | Codex-xhigh APPROVED (R3) |
 | 6 | G8 reasoning promotion/suppression (Anthropic) | `8297ca6` | Codex-xhigh APPROVED (R3) |
 | 7 | G6 SSE per-frame buffer cap (DoS guard) | `881cfe1` | Codex-xhigh APPROVED |
+| 8 | G3 keep-alive peek — found redundant w/ G8+axum; contracted via mutation-verified tests | `50720eb` | Codex-xhigh APPROVED (R4) |
+| 9 | G7 glob routes + `--model-route` CLI + TOML config | `5dceac6` | Codex-xhigh APPROVED (R5) |
+| 10 | G4 image agent (vision offload — VisionClient seam, strip/cache, server-tool dispatcher) | `0a5ba94` | Codex-xhigh APPROVED (R10) |
 
 ## Discoveries (encode lessons — read before related tasks)
 - **Effort normalization is single-sourced** in `responses_to_chat::normalize_reasoning_effort`
