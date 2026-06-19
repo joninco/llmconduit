@@ -237,11 +237,10 @@ modules. Pure structural extraction.
 **Depends on:** 11.7.
 
 ### Task 11.9 — Move G3 budgeting behind route/provider resolution + single request builder
-**Priority:** HIGH · **Spec:** `.ralph/specs/T9-budgeting-layer-move.md`
-Move G3 budgeting to upstream dispatch (post route/provider resolution), or budget against a
-conservative-min candidate set with unknown=no-op; one first-upstream-request builder for estimate +
-dispatch; independent test oracle (not reusing the production estimator).
-**Files:** `src/engine.rs`, `src/upstream.rs`, `tests/port_server.rs`.
+**Priority:** HIGH · **Spec:** `.ralph/specs/T9-budgeting-layer-move.md` · **Commit:** `6b901fe`
+**Status:** Codex-xhigh APPROVED (R4). G3 budgeting now budgets against the CONSERVATIVE MIN of
+the per-candidate context windows in `BackendCandidatePlan` (extended: `candidates: Vec<BackendCandidate { model, context_limit }>`), not the pre-routing `resolved_model` alone. `RoutingUpstreamClient::backend_candidate_plan` attaches each candidate's per-provider limit from a new `RoutingProviderModelCatalog.context_limit_by_id` (populated in `refresh_catalog` from the same `/v1/models` snapshot); provider-identity scoping (chain index 0 only gets `primary_limit`; fallback/route candidates `None`) prevents wrong-window borrow. `candidate_context_floor` = min of known limits; unknown ⇒ no-op; empty ⇒ no-op. Engine-union fallback gated to `Config::is_plain_single_provider` only (routing/top-level-failover no-op when plan has no limit). Single builder `build_upstream_chat_request` + `UpstreamRequestAdditives` replace both the shadow `estimate_request_from_lowered` literal and the `run_turn` dispatch literal; `for_estimate` uses real `resolved_model` (threaded) + lower-bound-safe empties. Independent oracle `estimate_from_recorded` builds its own literal + `sanitize_chat_request` (now pub) + ceil(bytes/4) — no call to the production estimator (breaks G3 MEDIUM #19 self-reference). New tests: `preflight_routing_caps_against_provider_context_window`, `preflight_top_level_failover_no_ops_without_candidate_limit`. `estimate_request_from_lowered` private. **Deferred:** `RoutingResolution::Route` candidates carry `None` (route providers are synthetic; routing catalog doesn't load their /v1/models — pre-T9 no-op, not a regression); `normalize_upstream_model` ladder dedup (T2 deferral) remains for id resolution.
+**Files:** `src/engine.rs`, `src/upstream.rs`, `src/config.rs`, `tests/port_server.rs`, `tests/common/mod.rs`, `tests/gateway.rs`.
 **Depends on:** 11.1.
 
 ### Task 11.10 — AppError failover policy + upstream retry logging
