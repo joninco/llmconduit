@@ -1656,8 +1656,10 @@ mod tests {
             std::env::remove_var("OPENAI_API_KEY");
             std::env::set_var("OPENAI_API_KEY", "fallback-key-67890");
         }
-        let mut config = PersistedConfig::default();
-        config.upstream_api_key = None;
+        let mut config = PersistedConfig {
+            upstream_api_key: None,
+            ..Default::default()
+        };
         apply_env_overrides(&mut config);
         assert_eq!(
             config.upstream_api_key,

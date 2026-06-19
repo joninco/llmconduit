@@ -49,10 +49,15 @@ use wiremock::matchers::header;
 use wiremock::matchers::method;
 use wiremock::matchers::path;
 
+/// Queue of canned chunk-streams: each inner `Vec` is one response's chunk
+/// sequence (or per-chunk error), popped front-to-back across upstream calls.
+type CannedResponses =
+    Arc<Mutex<VecDeque<Vec<Result<ChatCompletionChunk, llmconduit::error::AppError>>>>>;
+
 #[derive(Clone, Default)]
 struct MockUpstream {
     requests: Arc<Mutex<Vec<ChatCompletionRequest>>>,
-    responses: Arc<Mutex<VecDeque<Vec<Result<ChatCompletionChunk, llmconduit::error::AppError>>>>>,
+    responses: CannedResponses,
     supported_models: Arc<Mutex<Vec<String>>>,
     supported_model_queries: Arc<Mutex<usize>>,
     /// When `Some`, the full pre-first-chunk candidate backend model set this
