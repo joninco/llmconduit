@@ -5,7 +5,7 @@ G4 (image agent) + G7 (route config) + the descoped G3 keep-alive-peek. Specs: `
 (historical design inputs — see "Spec status" below). Review gate: `.ralph/REVIEW_PROTOCOL.md`.
 
 ## Executive summary
-**Status: core 7/7 ✅ + EXTENDED RUN COMPLETE ✅ (G3-peek, G7, G4 — owner-directed, all Codex-xhigh APPROVED). ALL 9 GAPS + P1 + G3-peek DONE, plus a post-run `reasoning_effort_map` rework (leaf-applied, reserved-key deleted).** Loop validated: build → cargo test/clippy/fmt → Codex-xhigh review → fix → re-review APPROVED.
+**Status: core 7/7 ✅ + EXTENDED RUN COMPLETE ✅ (G3-peek, G7, G4 — owner-directed, all Codex-xhigh APPROVED). ALL 9 GAPS + P1 + G3-peek DONE, plus a post-run `reasoning_effort_map` rework (leaf-applied, reserved-key deleted), plus a per-gap thermo-nuclear code-quality review (10 gaps reviewed; bounded fixes in `07117b2`; 11 deferred follow-ups tracked as Topic 11 on branch `ralph/thermo-followups`).** Loop validated: build → cargo test/clippy/fmt → Codex-xhigh review → fix → re-review APPROVED.
 
 ## Spec status
 `.ralph/specs/*.md` are **historical design inputs** written before implementation; their `OPEN QUESTION` /
@@ -129,3 +129,101 @@ dispatcher, per-session LRU+TTL `ImageCache`, gating. Tests: `tests/gateway.rs` 
   the SAME `sanitize_chat_request` (`engine::estimate_request_from_lowered`), then `ceil(bytes/4)`. Omit the
   ADDITIVE leaf merges AND `reasoning_effort` (which the leaf may clear/map) — all only shrink or are
   additive, so the estimate stays a safe lower bound. Keep G3 OUT of the kwargs-merge seam.
+
+---
+
+## Topic 11 — Thermo-nuclear code-quality follow-ups
+
+> **Source:** `/ralph-guide-update` on 2026-06-19, from the per-gap thermo-nuclear review
+> (`/tmp/thermo-synthesis.md`, raw verdicts `/tmp/thermo-gap-review.md`).
+> Bounded fixes already shipped in `07117b2`; these are the DEFERRED items, grouped into 11 specs.
+> Branch: `ralph/thermo-followups`. Review gate: `.ralph/REVIEW_PROTOCOL.md` (Codex-xhigh) per task.
+> **Sequencing:** T1 → (T2, T9); T7 → T8; T5 ↔ T6 coordinate; T10, T11 independent. T1 first (it
+> builds the typed resolver T2/T9 consume).
+
+### Task 11.1 — Leaf-side profile resolution (template_family + upstream_chat_kwargs)
+**Priority:** HIGH · **Spec:** `.ralph/specs/T1-leaf-profile-resolution.md`
+Move `template_family` + `upstream_chat_kwargs` resolution from the engine (pre-routing) to
+`upstream::finalize_request_for_backend`, mirroring `reasoning_effort_policies`. Introduce a
+`BackendChatRequest` wrapper (remove `#[serde(skip)]` side-channel fields). Collapses the triply-
+duplicated model-precedence truth. **Touches the effort leaf → live-verify `claude --effort
+high/max/off` on :5022.**
+**Files:** `src/config.rs`, `src/engine.rs`, `src/upstream.rs`, `src/models/chat.rs`, tests.
+**Blocks:** 11.2, 11.9.
+
+### Task 11.2 — Typed routing-candidate plan (delete G4 side-channel vision gating)
+**Priority:** HIGH · **Spec:** `.ralph/specs/T2-routing-candidate-plan.md`
+Delete `request_model_genuinely_resolves` + side-channel native-vision gating (`engine.rs:759`);
+return a typed backend-candidate plan from the real routing/failover layer; reuse for G4 gating.
+**Files:** `src/engine.rs`, `src/upstream.rs` (routing), tests.
+**Depends on:** 11.1.
+
+### Task 11.3 — Extract ToolDeltaGate from run_turn
+**Priority:** HIGH · **Spec:** `.ralph/specs/T3-tooldeltagate-extraction.md`
+Extract the `analyzeImage` delta-buffer state machine + duplicated monitor/SSE emission paths out
+of `run_turn` (`engine.rs:1277`) into a `ToolDeltaGate` with unit tests.
+**Files:** `src/engine.rs` (+ new module), tests.
+
+### Task 11.4 — Split vision.rs + image-agent test suite
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/T4-vision-module-split.md`
+Split `src/vision.rs` (1,364 lines) into `vision/{cache,strip,client}.rs` + `src/redaction.rs`;
+move the image-agent suite + `MockVisionClient` to `tests/image_agent.rs`. Pure structural move.
+**Files:** `src/vision.rs` (+ new files), `src/redaction.rs`, `tests/gateway.rs`, `tests/image_agent.rs`.
+
+### Task 11.5 — Bytes-specialized SSE guard (cap before copy)
+**Priority:** HIGH · **Spec:** `.ralph/specs/T5-sse-guard-bytes.md`
+Specialize the bounded stream adapter to `Bytes`; scan borrowed bytes before yielding; retain only
+the ≤3-byte carry. Removes the O(chunk) pre-rejection allocation (`upstream.rs:2474`, `2636`).
+**Files:** `src/upstream.rs` (or the guard module from 11.6).
+**Coordinates with:** 11.6 (place in the new module if both land).
+
+### Task 11.6 — Extract SSE guard module + shrink port_streaming.rs
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/T6-sse-guard-extract.md`
+Extract the SSE grammar state machine + `SseFrameGuard` to `src/sse_guard.rs`; make it `pub(crate)`
+(white-box tests → module unit tests); shrink `tests/port_streaming.rs` (1,432 lines) to acceptance
+cases; remove "Codex round" archaeology.
+**Files:** `src/upstream.rs`, `src/sse_guard.rs` (new), `tests/port_streaming.rs`.
+
+### Task 11.7 — Typed terminal reason in the canonical response
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/T7-typed-terminal-reason.md`
+Carry a typed terminal reason (or map all non-stop → non-clean) so promotion gating uses an explicit
+reason, not `event_type == "response.completed"` (`responses_to_anthropic.rs:468`).
+**Files:** `src/models/responses.rs`, `src/engine.rs`, `src/adapters/responses_to_anthropic.rs`, tests.
+**Blocks:** 11.8.
+
+### Task 11.8 — Extract ReasoningEgressState from responses_to_anthropic
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/T8-reasoning-egress-state.md`
+Extract `reasoning_buffer`/`reasoning_signature`/`content_started`/`has_tool_calls` + flush logic
+into a `ReasoningEgressState` typed state machine; split the 2,020-line converter into focused
+modules. Pure structural extraction.
+**Files:** `src/adapters/responses_to_anthropic.rs` (+ new files), tests.
+**Depends on:** 11.7.
+
+### Task 11.9 — Move G3 budgeting behind route/provider resolution + single request builder
+**Priority:** HIGH · **Spec:** `.ralph/specs/T9-budgeting-layer-move.md`
+Move G3 budgeting to upstream dispatch (post route/provider resolution), or budget against a
+conservative-min candidate set with unknown=no-op; one first-upstream-request builder for estimate +
+dispatch; independent test oracle (not reusing the production estimator).
+**Files:** `src/engine.rs`, `src/upstream.rs`, `tests/port_server.rs`.
+**Depends on:** 11.1.
+
+### Task 11.10 — AppError failover policy + upstream retry logging
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/T10-error-policy-and-logging.md`
+Remove `failover_eligible` from `AppError` (upstream-attempt disposition/variant); log the G1
+shrink-and-retry POST (logged-send helper).
+**Files:** `src/error.rs`, `src/upstream.rs`, `analyze-log`.
+
+### Task 11.11 — Streaming + logging test-quality cleanups
+**Priority:** LOW–MEDIUM · **Spec:** `.ralph/specs/T11-streaming-test-quality.md`
+G3-peek keepalive parameterization across all 3 routes + scheduler-magic harness cleanup; G5
+removal-race test seam; G3 catalog-parser dedup (`extract_model_context_limits`); G7
+`port_config.rs` split.
+**Files:** `tests/port_streaming_peek.rs`, `tests/port_logging.rs`, `src/upstream.rs`, `tests/port_config.rs`.
+**Depends on:** 11.1 (for the catalog-parser dedup item).
+
+## Thermo-nuclear review — invalid findings (NOT tasks)
+- **G8 `emit_thinking` suppression:** toggle does not exist in the codebase; G8 spec acceptance
+  criterion is explicitly conditional ("if an emit-thinking toggle is added"). Re-derive if/when
+  the toggle is added.
+- **G5 `.jsonl` exclusion:** explicit G5 spec acceptance criterion ("Only `*.json` / `*.ndjson` are
+  eligible; other extensions are skipped"). By design.
