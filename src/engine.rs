@@ -72,6 +72,13 @@ pub struct Gateway {
     monitor: MonitorHub,
     raw_output: Option<RawOutput>,
     upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
+    /// Throttle state for the "requested model not served → fell back to the
+    /// default catalog model" WARN. Every request resolves the model TWICE (the
+    /// HTTP layer to label the response, then the engine to drive the upstream
+    /// call), so without throttling a persistent mismatch logs the same WARN
+    /// twice per request forever. Keyed by requested model; fires once per
+    /// catalog-TTL window, mirroring claude-relay's once-per-detection logging.
+    model_fallback_warned: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -415,6 +422,7 @@ impl Gateway {
             monitor,
             raw_output,
             upstream_model_catalog: Arc::new(Mutex::new(None)),
+            model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1791,18 +1799,62 @@ impl Gateway {
             // the route match + upstream-model rewrite.
             return model.to_string();
         }
-        let normalized = catalog
-            .canonical_unique(model)
-            .or_else(|| catalog.default_id())
-            .unwrap_or_else(|| model.to_string());
-        if normalized != model {
-            tracing::info!(
-                requested_model = %model,
-                normalized_model = %normalized,
-                "normalized upstream model name from backend catalog"
-            );
+        if let Some(canonical) = catalog.canonical_unique(model) {
+            if canonical != model {
+                tracing::info!(
+                    requested_model = %model,
+                    normalized_model = %canonical,
+                    "normalized upstream model name from backend catalog"
+                );
+            }
+            return canonical;
         }
-        normalized
+        // No exact id, ad-hoc route, or canonical-key match: fall back to the
+        // first catalog model (claude-relay parity). A NON-BLANK requested model
+        // that lands here is a genuine mismatch — the loaded backend model
+        // differs from what the client asked for — so surface it at WARN. A
+        // blank/absent model defaulting to the first catalog id is expected and
+        // stays at INFO.
+        match catalog.default_id() {
+            Some(default) if model.trim().is_empty() => {
+                tracing::info!(
+                    fallback_model = %default,
+                    "no model requested; using the default catalog model"
+                );
+                default
+            }
+            Some(default) => {
+                if self.should_warn_model_fallback(model) {
+                    tracing::warn!(
+                        requested_model = %model,
+                        fallback_model = %default,
+                        "requested model is not served by any configured upstream; falling back to the default catalog model"
+                    );
+                }
+                default
+            }
+            None => model.to_string(),
+        }
+    }
+
+    /// Rate-limit the model-fallback WARN to once per catalog-TTL window per
+    /// requested model. A request resolves its model twice (HTTP label + engine
+    /// dispatch), and a mismatch usually persists across many requests, so an
+    /// un-throttled WARN would flood the log. Stale entries are pruned on access
+    /// so the map stays bounded even under random/hostile model names.
+    fn should_warn_model_fallback(&self, requested_model: &str) -> bool {
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(UPSTREAM_MODEL_CATALOG_TTL_SECS);
+        let mut warned = self
+            .model_fallback_warned
+            .lock()
+            .expect("model fallback warn lock poisoned");
+        warned.retain(|_, last| now.duration_since(*last) < window);
+        if warned.contains_key(requested_model) {
+            return false;
+        }
+        warned.insert(requested_model.to_string(), now);
+        true
     }
 
     async fn load_upstream_model_catalog(&self) -> AppResult<UpstreamModelCatalog> {

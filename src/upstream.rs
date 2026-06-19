@@ -332,6 +332,24 @@ enum RoutingModelTarget {
     Fallback { failover_provider_index: usize },
 }
 
+/// Which `RoutingModelCatalog::resolve` rule matched a request model. Carried
+/// out to the dispatch site purely for diagnostics: a `Default` match means the
+/// requested model was NOT served by any upstream and we fell back to the first
+/// catalog model — worth a WARN so an operator notices a model-name mismatch
+/// (e.g. the loaded vLLM model differs from what clients request). The rest are
+/// expected and log at INFO or below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchKind {
+    /// Rule 1: exact catalog model id.
+    ExactId,
+    /// Rules 2-3: ad-hoc route name or glob.
+    Route,
+    /// Rule 4: unique canonical-key catalog match (case/punctuation normalized).
+    CanonicalKey,
+    /// Rule 5: no match; fell back to the first catalog model.
+    Default,
+}
+
 #[derive(Debug, Clone)]
 struct RoutingFallbackExposedModel {
     model_id: String,
@@ -958,15 +976,11 @@ impl RoutingUpstreamClient {
         request: &ChatCompletionRequest,
         model_id: &str,
         provider_name: &str,
+        kind: MatchKind,
     ) -> ChatCompletionRequest {
         let mut routed_request = request.clone();
         if routed_request.model != model_id {
-            tracing::info!(
-                requested_model = %routed_request.model,
-                routed_model = %model_id,
-                provider = %provider_name,
-                "routed request model to upstream catalog model"
-            );
+            log_model_resolution(&routed_request.model, model_id, provider_name, kind);
             routed_request.model = model_id.to_string();
         }
         routed_request
@@ -1075,7 +1089,7 @@ impl RoutingModelCatalog {
     ///
     /// Routes therefore slot strictly between an exact id and the
     /// canonical/default fallbacks; a glob never overrides an exact match.
-    fn resolve(&self, requested_model: &str) -> Option<RoutingResolution> {
+    fn resolve(&self, requested_model: &str) -> Option<(RoutingResolution, MatchKind)> {
         let trimmed = requested_model.trim();
         if !trimmed.is_empty() {
             // 1. Exact catalog model id.
@@ -1086,19 +1100,25 @@ impl RoutingModelCatalog {
                     .find(|candidate| candidate.model_id == trimmed)
                 {
                     debug_assert_eq!(candidate.provider_index, provider_index);
-                    return Some(RoutingResolution::Catalog(candidate.clone()));
+                    return Some((
+                        RoutingResolution::Catalog(candidate.clone()),
+                        MatchKind::ExactId,
+                    ));
                 }
             }
 
             // 2. Exact ad-hoc route name (case-insensitive), then 3. glob route.
             if let Some(route) = self.match_route(trimmed) {
-                return Some(RoutingResolution::Route {
-                    route_provider_index: route.route_provider_index,
-                    model_id: route
-                        .upstream_model
-                        .clone()
-                        .unwrap_or_else(|| trimmed.to_string()),
-                });
+                return Some((
+                    RoutingResolution::Route {
+                        route_provider_index: route.route_provider_index,
+                        model_id: route
+                            .upstream_model
+                            .clone()
+                            .unwrap_or_else(|| trimmed.to_string()),
+                    },
+                    MatchKind::Route,
+                ));
             }
 
             // 4. Unique canonical-key catalog match.
@@ -1110,12 +1130,18 @@ impl RoutingModelCatalog {
                     .iter()
                     .find(|candidate| candidate.model_id == model_id)
                     .cloned()
-                    .map(RoutingResolution::Catalog);
+                    .map(|candidate| {
+                        (
+                            RoutingResolution::Catalog(candidate),
+                            MatchKind::CanonicalKey,
+                        )
+                    });
             }
         }
 
         // 5. Default catalog candidate.
-        self.default_candidate().map(RoutingResolution::Catalog)
+        self.default_candidate()
+            .map(|candidate| (RoutingResolution::Catalog(candidate), MatchKind::Default))
     }
 
     /// Match a request model against ad-hoc routes: an exact name (case
@@ -1153,6 +1179,32 @@ impl RoutingModelCatalog {
             "object": "list",
             "data": self.union_entries,
         })
+    }
+}
+
+/// Log a request-model rewrite at a level reflecting WHY it happened. A
+/// `Default` match means the requested model was not served by any upstream —
+/// the operator likely loaded a different model than clients ask for, so it goes
+/// to WARN. Expected normalizations (canonical-key) and ad-hoc routes stay at
+/// INFO. Callers invoke this only when the model actually changed.
+fn log_model_resolution(requested: &str, resolved: &str, provider: &str, kind: MatchKind) {
+    if requested == resolved {
+        return;
+    }
+    if kind == MatchKind::Default {
+        tracing::warn!(
+            requested_model = %requested,
+            routed_model = %resolved,
+            provider = %provider,
+            "requested model is not served by any configured upstream; falling back to the default catalog model"
+        );
+    } else {
+        tracing::info!(
+            requested_model = %requested,
+            routed_model = %resolved,
+            provider = %provider,
+            "routed request model to upstream catalog model"
+        );
     }
 }
 
@@ -1342,7 +1394,7 @@ impl UpstreamClient for RoutingUpstreamClient {
         let Ok(catalog) = self.load_catalog().await else {
             return Vec::new();
         };
-        let Some(resolution) = catalog.resolve(requested_model) else {
+        let Some((resolution, _kind)) = catalog.resolve(requested_model) else {
             return Vec::new();
         };
         match resolution {
@@ -1376,8 +1428,19 @@ impl UpstreamClient for RoutingUpstreamClient {
         request: &ChatCompletionRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
-        let catalog = self.load_catalog().await?;
-        let resolution = catalog.resolve(&request.model).ok_or_else(|| {
+        let catalog = self.load_catalog().await.map_err(|err| {
+            tracing::warn!(
+                requested_model = %request.model,
+                error = %err,
+                "failed to load upstream model catalog (is the backend reachable?)"
+            );
+            err
+        })?;
+        let (resolution, match_kind) = catalog.resolve(&request.model).ok_or_else(|| {
+            tracing::warn!(
+                requested_model = %request.model,
+                "upstream model catalog is empty; no model to serve (is the backend serving any model?)"
+            );
             AppError::upstream("no models are currently available from configured upstreams")
         })?;
         if let RoutingResolution::Route {
@@ -1386,7 +1449,7 @@ impl UpstreamClient for RoutingUpstreamClient {
         } = &resolution
         {
             let provider = self.route_provider(*route_provider_index)?;
-            let routed_request = self.routed_request(request, model_id, &provider.name);
+            let routed_request = self.routed_request(request, model_id, &provider.name, match_kind);
             return provider
                 .client
                 .stream_chat_completion_with_timeout(&routed_request, request_timeout)
@@ -1401,7 +1464,8 @@ impl UpstreamClient for RoutingUpstreamClient {
             .ok_or_else(|| {
                 AppError::internal("resolved upstream provider index was out of range")
             })?;
-        let routed_request = self.routed_request(request, &resolution.model_id, &provider.name);
+        let routed_request =
+            self.routed_request(request, &resolution.model_id, &provider.name, match_kind);
         match resolution.target {
             RoutingModelTarget::Primary => {
                 provider
@@ -1436,7 +1500,11 @@ impl UpstreamClient for RoutingUpstreamClient {
     ) -> AppResult<reqwest::Response> {
         let catalog = self.load_catalog().await?;
         let requested_model = proxy_body_model(&body).unwrap_or_default();
-        let resolution = catalog.resolve(&requested_model).ok_or_else(|| {
+        let (resolution, match_kind) = catalog.resolve(&requested_model).ok_or_else(|| {
+            tracing::warn!(
+                requested_model = %requested_model,
+                "upstream model catalog is empty; no model to serve (is the backend serving any model?)"
+            );
             AppError::upstream("no models are currently available from configured upstreams")
         })?;
         if let RoutingResolution::Route {
@@ -1445,6 +1513,7 @@ impl UpstreamClient for RoutingUpstreamClient {
         } = &resolution
         {
             let provider = self.route_provider(*route_provider_index)?;
+            log_model_resolution(&requested_model, model_id, &provider.name, match_kind);
             let body = proxy_body_with_model(body, model_id);
             return provider.client.proxy_completions(headers, body).await;
         }
@@ -1457,6 +1526,12 @@ impl UpstreamClient for RoutingUpstreamClient {
             .ok_or_else(|| {
                 AppError::internal("resolved upstream provider index was out of range")
             })?;
+        log_model_resolution(
+            &requested_model,
+            &resolution.model_id,
+            &provider.name,
+            match_kind,
+        );
         let body = proxy_body_with_model(body, &resolution.model_id);
         match resolution.target {
             RoutingModelTarget::Primary => provider.client.proxy_completions(headers, body).await,
@@ -4055,5 +4130,83 @@ mod tests {
             .expect("second item")
             .expect_err("oversized chunk errors");
         assert!(err.to_string().contains("exceeded"));
+    }
+}
+
+#[cfg(test)]
+mod resolve_match_kind_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Single-provider catalog serving exactly `model`, with the canonical-key
+    /// index populated so rule-4 normalization is exercised too.
+    fn catalog_serving(model: &str) -> RoutingModelCatalog {
+        let candidate = RoutingModelCandidate {
+            provider_index: 0,
+            model_id: model.to_string(),
+            target: RoutingModelTarget::Primary,
+        };
+        let mut ids_by_key = HashMap::new();
+        ids_by_key.insert(canonical_model_key(model), vec![candidate.clone()]);
+        RoutingModelCatalog {
+            provider_catalogs: vec![RoutingProviderModelCatalog {
+                candidates: vec![candidate],
+            }],
+            union_entries: Vec::new(),
+            union_ids: vec![model.to_string()],
+            ids_by_key,
+            routes: Vec::new(),
+        }
+    }
+
+    fn resolved_id(resolution: &RoutingResolution) -> &str {
+        match resolution {
+            RoutingResolution::Catalog(candidate) => &candidate.model_id,
+            RoutingResolution::Route { model_id, .. } => model_id,
+        }
+    }
+
+    #[test]
+    fn exact_id_reports_exact_match() {
+        let (resolution, kind) = catalog_serving("served-model")
+            .resolve("served-model")
+            .expect("resolves");
+        assert_eq!(kind, MatchKind::ExactId);
+        assert_eq!(resolved_id(&resolution), "served-model");
+    }
+
+    #[test]
+    fn case_or_punctuation_variant_reports_canonical_key() {
+        // Not an exact id (case differs), so it must normalize via the canonical
+        // key rather than silently dropping to the default fallback.
+        let (resolution, kind) = catalog_serving("served-model")
+            .resolve("SERVED_MODEL")
+            .expect("resolves");
+        assert_eq!(kind, MatchKind::CanonicalKey);
+        assert_eq!(resolved_id(&resolution), "served-model");
+    }
+
+    #[test]
+    fn unknown_model_reports_default_fallback() {
+        // The claude-relay parity case: an incoming `claude-opus-*` name that the
+        // backend does not serve falls back to the first catalog model, tagged
+        // Default so the dispatch site logs a WARN.
+        let (resolution, kind) = catalog_serving("served-model")
+            .resolve("claude-opus-4")
+            .expect("falls back to default");
+        assert_eq!(kind, MatchKind::Default);
+        assert_eq!(resolved_id(&resolution), "served-model");
+    }
+
+    #[test]
+    fn empty_catalog_resolves_to_none() {
+        let empty = RoutingModelCatalog {
+            provider_catalogs: Vec::new(),
+            union_entries: Vec::new(),
+            union_ids: Vec::new(),
+            ids_by_key: HashMap::new(),
+            routes: Vec::new(),
+        };
+        assert!(empty.resolve("anything").is_none());
     }
 }
