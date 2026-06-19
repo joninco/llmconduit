@@ -177,23 +177,28 @@ const CONTEXT_BUDGET_MARGIN_TOKENS: i64 = 128;
 struct ContextBudgetError;
 
 /// Build the chat request whose serialized bytes the G3 estimate counts: the
-/// LOWERED payload (`messages`/`tools`/`reasoning_effort`/`response_format`)
-/// passed through the SAME `sanitize_chat_request` the upstream leaf applies
-/// before POSTing (`flatten_content` from config). This is the terminal layer —
-/// nothing transforms the body below `sanitize_chat_request` — so counting it
-/// makes an over-count structurally impossible (e.g. multi-part text content is
-/// flattened to a bare string here exactly as on the wire).
+/// LOWERED payload (`messages`/`tools`/`response_format`) passed through the SAME
+/// `sanitize_chat_request` the upstream leaf applies before POSTing
+/// (`flatten_content` from config). This is the terminal layer — nothing
+/// transforms the body below `sanitize_chat_request` — so counting it makes an
+/// over-count structurally impossible (e.g. multi-part text content is flattened
+/// to a bare string here exactly as on the wire).
 ///
 /// The ADDITIVE fields the leaf merges later (`extra_body`/`upstream_chat_kwargs`,
 /// G2 family `chat_template_kwargs`, `temperature`/`stop`/penalties) are
 /// deliberately OMITTED — they only ever GROW the real payload, so leaving them
 /// out keeps the estimate a safe lower bound and keeps G3 out of the
-/// kwargs-merge seam (whose entanglement caused the original G3 thrash). `pub`
-/// so the test oracle reuses this exact construction (one source of truth).
+/// kwargs-merge seam (whose entanglement caused the original G3 thrash).
+///
+/// `reasoning_effort` is ALSO omitted: a per-model `reasoning_effort_map` clears
+/// the top-level field at the leaf and relays effort through the additive
+/// `chat_template_kwargs` instead, so the field is not guaranteed on the wire.
+/// Omitting it can only SHRINK the estimate, preserving the lower-bound proof in
+/// both the mapped (cleared) and unmapped (kept) cases. `pub` so the test oracle
+/// reuses this exact construction (one source of truth).
 pub fn estimate_request_from_lowered(
     messages: &[ChatMessage],
     tools: &[crate::models::chat::ChatTool],
-    reasoning_effort: &Option<String>,
     response_format: &Option<Value>,
     flatten_content: bool,
 ) -> ChatCompletionRequest {
@@ -206,7 +211,7 @@ pub fn estimate_request_from_lowered(
         // when there are no tools, matching the wire body.
         tool_choice: Some(Value::String("auto".to_string())),
         parallel_tool_calls: false,
-        reasoning_effort: reasoning_effort.clone(),
+        reasoning_effort: None,
         response_format: response_format.clone(),
         stream_options: Some(StreamOptions {
             include_usage: true,
@@ -247,7 +252,6 @@ fn estimate_input_tokens(lowered: &LoweredTurn, flatten_content: bool) -> i64 {
     let request = estimate_request_from_lowered(
         &lowered.messages,
         &lowered.tools,
-        &lowered.reasoning_effort,
         &lowered.response_format,
         flatten_content,
     );
@@ -1155,6 +1159,10 @@ impl Gateway {
         // is left intact (models without a map keep it; mapped models like GLM
         // ignore the top-level field, and leaving it keeps the G3 estimate a safe
         // lower bound since the map fragment is purely additive in extra_body).
+        // Drop any client-supplied value first: the marker is engine-owned, and a
+        // request that smuggles it through `extra_body` must NOT be trusted as the
+        // canonical effort.
+        upstream_extra_body.remove(crate::upstream::CANONICAL_REASONING_EFFORT_KEY);
         if let Some(raw_effort) = request
             .reasoning
             .as_ref()
@@ -1197,8 +1205,13 @@ impl Gateway {
                 client_chat_template_kwargs: client_chat_template_kwargs.clone(),
             };
             if self.monitor.is_enabled() {
-                let upstream_debug_request =
+                let mut upstream_debug_request =
                     sanitize_chat_request(upstream_request.clone(), self.config.flatten_content);
+                // The reserved raw-effort marker is leaf-internal (stripped before
+                // the wire); keep it out of the debug-UI preview too.
+                upstream_debug_request
+                    .extra_body
+                    .remove(crate::upstream::CANONICAL_REASONING_EFFORT_KEY);
                 let upstream_preview =
                     preview_json_limited_with_images(&upstream_debug_request, 128 * 1024);
                 self.monitor.emit(

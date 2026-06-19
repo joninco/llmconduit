@@ -521,16 +521,26 @@ impl UpstreamClient for ReqwestUpstreamClient {
         let mut request = request.clone();
         // Strip the engine's reserved raw-effort marker BEFORE family injection,
         // logging, and the POST so it never reaches the wire, then apply this
-        // FINAL model's reasoning_effort_map (after family, so the map overrides
-        // family defaults; client kwargs re-asserted last inside the apply).
+        // FINAL model's reasoning_effort_map.
         let raw_effort = request
             .extra_body
             .remove(CANONICAL_REASONING_EFFORT_KEY)
             .and_then(|value| value.as_str().map(str::to_string));
+        let effort_fragment =
+            reasoning_effort_fragment(&self.effort_policies, &request.model, raw_effort.as_deref());
+        // When the map places effort (in chat_template_kwargs), CLEAR the
+        // top-level `reasoning_effort` BEFORE family injection: a mapped backend
+        // reads the template knob, so a leftover top-level value would either be
+        // ignored (GLM) or, worse, seed a CONTRADICTORY value via the DeepSeek
+        // family setdefault. G3's estimate omits this field, so clearing it keeps
+        // the pre-flight estimate a safe lower bound.
+        if effort_fragment.is_some() {
+            request.reasoning_effort = None;
+        }
         apply_family_chat_template_kwargs(&mut request);
-        if let Some(fragment) =
-            reasoning_effort_fragment(&self.effort_policies, &request.model, raw_effort.as_deref())
-        {
+        if let Some(fragment) = effort_fragment {
+            // Applied AFTER family so the map overrides family defaults; client
+            // kwargs are re-asserted last inside the apply.
             apply_reasoning_effort_fragment(&mut request, &fragment);
         }
         let request = sanitize_chat_request(request, self.flatten_content);
@@ -1684,11 +1694,19 @@ fn reasoning_effort_fragment(
     raw_effort: Option<&str>,
 ) -> Option<Value> {
     let policy = policies.get(model).or_else(|| {
+        // No exact id match: fall back to a canonical-key match, but ONLY when it
+        // is unambiguous. Two profile names sharing a canonical key would make the
+        // pick order-dependent, so require exactly one and otherwise apply no
+        // policy (deterministic; the engine keeps its clamped top-level effort).
         let key = canonical_model_key(model);
-        policies
+        let mut matches = policies
             .iter()
-            .find(|(name, _)| canonical_model_key(name) == key)
-            .map(|(_, policy)| policy)
+            .filter(|(name, _)| canonical_model_key(name) == key)
+            .map(|(_, policy)| policy);
+        match (matches.next(), matches.next()) {
+            (Some(policy), None) => Some(policy),
+            _ => None,
+        }
     })?;
     let level = raw_effort
         .map(str::trim)
@@ -3239,6 +3257,13 @@ mod tests {
         assert!(reasoning_effort_fragment(&p, "GLM-5.2-NVFP4-MTP", Some("medium")).is_none());
         // Unknown model -> None.
         assert!(reasoning_effort_fragment(&p, "other-model", Some("high")).is_none());
+
+        // Ambiguous canonical match (two profiles, same canonical key, neither an
+        // exact id match) -> no policy, deterministically.
+        let mut ambiguous = glm_effort_policies();
+        let dup = ambiguous["GLM-5.2-NVFP4-MTP"].clone();
+        ambiguous.insert("glm5.2nvfp4mtp".to_string(), dup);
+        assert!(reasoning_effort_fragment(&ambiguous, "GLM!5.2!NVFP4!MTP", Some("high")).is_none());
     }
 
     #[test]

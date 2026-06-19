@@ -65,7 +65,6 @@ fn estimate_from_recorded(recorded: &ChatCompletionRequest, flatten_content: boo
     let request = llmconduit::engine::estimate_request_from_lowered(
         &recorded.messages,
         &tools,
-        &recorded.reasoning_effort,
         &recorded.response_format,
         flatten_content,
     );
