@@ -350,6 +350,11 @@ mod integration {
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
             template_family: None,
         }
     }

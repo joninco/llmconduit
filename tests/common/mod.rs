@@ -183,11 +183,20 @@ pub fn test_gateway_with_config(
     search: MockSearch,
     config: Config,
 ) -> Arc<Gateway> {
+    // These shared port_* tests never exercise the image agent (off in
+    // `test_config`), so a real `ReqwestVisionClient` that is never called and a
+    // cache derived from config satisfy the constructor.
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
         config,
         ReplayStore::new(1000),
         Arc::new(upstream),
         Arc::new(search),
+        vision,
+        image_cache,
         MonitorHub::new(128),
         None,
     ))
@@ -218,6 +227,11 @@ pub fn test_config() -> Config {
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
+        image_agent_enabled: false,
+        vision_url: None,
+        vision_model: None,
+        image_cache_max_size: 100,
+        image_cache_ttl_secs: 300,
         template_family: None,
     }
 }

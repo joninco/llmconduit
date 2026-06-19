@@ -29,6 +29,11 @@ pub enum ToolKind {
     LocalShell,
     ToolSearch,
     WebSearch,
+    /// G4 server-side image analysis (`analyzeImage`). Registered ONLY when the
+    /// image agent is active for the turn (see `lower_request`'s
+    /// `image_agent_active`), so a client-supplied `analyzeImage` tool on a
+    /// non-image turn still classifies as a normal client `Function`.
+    ImageAnalysis,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +101,20 @@ pub fn lower_request(
     request: &ResponsesRequest,
     baseline_messages: Vec<ChatMessage>,
 ) -> AppResult<LoweredTurn> {
+    lower_request_with_image_agent(request, baseline_messages, false)
+}
+
+/// Like [`lower_request`], but `image_agent_active` decides whether an
+/// `analyzeImage` tool classifies as the server-side [`ToolKind::ImageAnalysis`]
+/// (true, the gateway runs it) or a plain client `Function` (false). The engine
+/// passes `true` only on turns where G4 gating activated the image agent, so a
+/// caller that happens to define its own `analyzeImage` tool on a text turn is
+/// unaffected.
+pub fn lower_request_with_image_agent(
+    request: &ResponsesRequest,
+    baseline_messages: Vec<ChatMessage>,
+    image_agent_active: bool,
+) -> AppResult<LoweredTurn> {
     validate_request(request)?;
     let mut messages = baseline_messages;
     if messages.is_empty() && !request.instructions.is_empty() {
@@ -110,7 +129,7 @@ pub fn lower_request(
         });
     }
     let tools = lower_tools(&request.tools)?;
-    let registry = build_tool_registry(&request.tools)?;
+    let registry = build_tool_registry(&request.tools, image_agent_active)?;
     let mut pending_reasoning: Option<PendingReasoning> = None;
     for item in &request.input {
         match item {
@@ -574,10 +593,20 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
     Ok(tools)
 }
 
-fn build_tool_registry(specs: &[ToolSpec]) -> AppResult<ToolRegistry> {
+fn build_tool_registry(specs: &[ToolSpec], image_agent_active: bool) -> AppResult<ToolRegistry> {
     let mut by_name = HashMap::new();
     for spec in specs {
         let lowered_kinds: Vec<(String, ToolKind)> = match spec {
+            // G4: on an active image-agent turn, classify the injected (or
+            // caller-supplied) `analyzeImage` function as the server-side
+            // ImageAnalysis tool so the engine runs it instead of handing it to
+            // the client. On a non-image turn it stays a normal client Function.
+            ToolSpec::Function { name, .. }
+                if image_agent_active
+                    && name.eq_ignore_ascii_case(crate::vision::ANALYZE_IMAGE_TOOL_NAME) =>
+            {
+                vec![(name.clone(), ToolKind::ImageAnalysis)]
+            }
             ToolSpec::Function { name, .. } => vec![(
                 name.clone(),
                 ToolKind::Function {

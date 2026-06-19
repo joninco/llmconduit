@@ -74,11 +74,18 @@ use tower::ServiceExt;
 /// `common::test_gateway` is fixed to `MockUpstream`), reusing the standard
 /// `common::test_config`.
 fn gateway_with_upstream<U: UpstreamClient + 'static>(upstream: U) -> Arc<Gateway> {
+    let config = common::test_config();
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
-        common::test_config(),
+        config,
         ReplayStore::new(1000),
         Arc::new(upstream),
         Arc::new(MockSearch::default()),
+        vision,
+        image_cache,
         MonitorHub::disabled(),
         None,
     ))

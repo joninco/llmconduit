@@ -27,6 +27,23 @@ const ESTIMATED_OUTPUT_TOKEN_BYTES: usize = 4;
 /// web-search turn legitimately continues with reasoning after the results.
 const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 
+/// Whether a tool name is a server-side tool the converter must swallow from the
+/// canonical Responses stream so it never becomes an Anthropic `tool_use` block.
+/// This is ONLY Brave `web_search`: the engine still streams its
+/// `function_call_arguments` (the search is surfaced separately via
+/// `response.web_search_results`), so the converter has to drop them, and the
+/// turn ends `end_turn` so post-search reasoning is not gated as "late".
+///
+/// NOTE (round-7 #2): `analyzeImage` is deliberately NOT hidden by name here. On
+/// an active image-agent turn the engine classifies it as the server-side
+/// ImageAnalysis tool and NEVER emits its delta/done/item events into the stream
+/// at all, so the converter never sees them. On an INACTIVE turn `analyzeImage`
+/// is a legitimate CLIENT tool that must surface normally — name-hiding it would
+/// wrongly swallow the client's tool.
+fn is_hidden_server_tool(name: &str) -> bool {
+    name == WEB_SEARCH_TOOL_NAME
+}
+
 enum ContentBlockState {
     Text { index: usize },
     ToolUse { index: usize, call_id: String },
@@ -267,11 +284,12 @@ impl AnthropicStreamConverter {
             return;
         }
         let name = data.get("name").and_then(Value::as_str).unwrap_or_default();
-        // Server-side web search: swallow its streamed arguments. The search is
-        // surfaced via `response.web_search_results`, so opening a client
-        // tool_use block here would duplicate it, flip the turn to `tool_use`,
-        // and trip the late-reasoning gate against the post-search reasoning.
-        if name == WEB_SEARCH_TOOL_NAME {
+        // Server-side tools (web_search, analyzeImage): swallow streamed
+        // arguments. web_search is surfaced via `response.web_search_results`;
+        // analyzeImage is fully internal (G4). Opening a client tool_use block
+        // here would leak it, flip the turn to `tool_use`, and trip the
+        // late-reasoning gate against the post-tool reasoning.
+        if is_hidden_server_tool(name) {
             return;
         }
         let Some(delta) = data.get("delta").and_then(Value::as_str) else {
@@ -302,10 +320,14 @@ impl AnthropicStreamConverter {
         let Some(call_id) = data.get("call_id").and_then(Value::as_str) else {
             return;
         };
-        // Server-side web search: swallow it (surfaced via web_search_results).
-        // Must precede the `has_tool_calls` flip so the turn ends `end_turn` and
-        // the post-search reasoning is not gated as "late".
-        if data.get("name").and_then(Value::as_str) == Some(WEB_SEARCH_TOOL_NAME) {
+        // Server-side tools (web_search, analyzeImage): swallow. Must precede the
+        // `has_tool_calls` flip so the turn ends `end_turn` and post-tool
+        // reasoning is not gated as "late".
+        if data
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(is_hidden_server_tool)
+        {
             return;
         }
         self.has_tool_calls = true;
@@ -364,6 +386,16 @@ impl AnthropicStreamConverter {
                 // or the turn ends (-> promote to text / keep as thinking).
             }
             "function_call" | "custom_tool_call" => {
+                // G4: a server-side `analyzeImage` function_call is hidden like
+                // `web_search_call` (review #3) — never surfaced as a tool_use
+                // block. The engine already keeps it out of the public stream.
+                if item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_hidden_server_tool)
+                {
+                    return;
+                }
                 self.close_open_block(output);
                 self.emit_tool_use_block(item, output);
             }

@@ -60,6 +60,21 @@ pub struct Config {
     /// before unbounded accumulation. The inbound-request-body cap in `http.rs`
     /// does NOT cover this response-read path.
     pub max_sse_frame_bytes: usize,
+    /// Master switch for the G4 image agent (vision offload). When `false` the
+    /// strip/cache seam and `analyzeImage` tool injection are skipped entirely
+    /// and images flow to the upstream unchanged.
+    pub image_agent_enabled: bool,
+    /// OpenAI-compatible chat-completions endpoint of the vision backend the
+    /// image agent forwards stripped images to. `None` disables the agent even
+    /// when `image_agent_enabled` is true (no endpoint to call), matching
+    /// claude-relay's "skip without `vision_url`" gate.
+    pub vision_url: Option<Url>,
+    /// Model id sent to the vision backend.
+    pub vision_model: Option<String>,
+    /// Per-session LRU image-cache capacity.
+    pub image_cache_max_size: usize,
+    /// Per-session image-cache TTL (seconds).
+    pub image_cache_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +272,13 @@ pub struct PersistedModelProfile {
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_family: Option<String>,
+    /// Per-profile override for whether the resolved backend can natively see
+    /// images (G4). `Some(true)` forces the image agent OFF for this profile
+    /// (the backend is multimodal); `Some(false)` forces text-only handling
+    /// even for a name the family sniff would treat as native-vision. `None`
+    /// defers to the name-based default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_vision: Option<bool>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
 }
@@ -277,6 +299,8 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             #[serde(default)]
             template_family: Option<String>,
             #[serde(default)]
+            native_vision: Option<bool>,
+            #[serde(default)]
             upstream_chat_kwargs: JsonMap<String, JsonValue>,
             #[serde(default, flatten)]
             shorthand_upstream_chat_kwargs: JsonMap<String, JsonValue>,
@@ -284,16 +308,18 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
 
         let raw = RawPersistedModelProfile::deserialize(deserializer)?;
         let mut upstream_chat_kwargs = raw.shorthand_upstream_chat_kwargs;
-        // `template_family` is a recognized profile knob, not a chat-template
-        // shorthand kwarg, so drop any copy the `flatten` swept into the
-        // shorthand bucket (it lives in its own typed field).
+        // `template_family`/`native_vision` are recognized profile knobs, not
+        // chat-template shorthand kwargs, so drop any copy the `flatten` swept
+        // into the shorthand bucket (they live in their own typed fields).
         upstream_chat_kwargs.remove("template_family");
+        upstream_chat_kwargs.remove("native_vision");
         merge_json_maps(&mut upstream_chat_kwargs, &raw.upstream_chat_kwargs);
         Ok(Self {
             extends: raw.extends,
             upstream_model: raw.upstream_model,
             system_prompt_prefix: raw.system_prompt_prefix,
             template_family: raw.template_family,
+            native_vision: raw.native_vision,
             upstream_chat_kwargs,
         })
     }
@@ -304,6 +330,8 @@ pub struct ModelProfile {
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
     pub template_family: Option<String>,
+    /// Per-profile native-vision override (G4); see `PersistedModelProfile`.
+    pub native_vision: Option<bool>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
 }
 
@@ -414,6 +442,22 @@ pub struct PersistedConfig {
     /// unterminated frame is rejected before unbounded buffer growth.
     #[serde(default = "default_max_sse_frame_bytes")]
     pub max_sse_frame_bytes: usize,
+    /// Master switch for the G4 image agent (vision offload). Off by default so
+    /// the gateway's text-first design is preserved unless explicitly opted in.
+    #[serde(default)]
+    pub image_agent_enabled: bool,
+    /// OpenAI-compatible chat-completions endpoint of the vision backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_url: Option<String>,
+    /// Model id sent to the vision backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_model: Option<String>,
+    /// Per-session LRU image-cache capacity.
+    #[serde(default = "default_image_cache_max_size")]
+    pub image_cache_max_size: usize,
+    /// Per-session image-cache TTL (seconds).
+    #[serde(default = "default_image_cache_ttl_secs")]
+    pub image_cache_ttl_secs: u64,
 }
 
 fn default_bind_addr() -> String {
@@ -468,6 +512,18 @@ fn default_max_sse_frame_bytes() -> usize {
     8 * 1024 * 1024
 }
 
+/// Default per-session image-cache capacity (G4). Generous enough for a normal
+/// multi-image turn while bounding memory.
+fn default_image_cache_max_size() -> usize {
+    100
+}
+
+/// Default per-session image-cache TTL in seconds (G4), matching claude-relay's
+/// 300s default.
+fn default_image_cache_ttl_secs() -> u64 {
+    300
+}
+
 impl Default for PersistedConfig {
     fn default() -> Self {
         Self {
@@ -496,6 +552,11 @@ impl Default for PersistedConfig {
             debug_log_max_age_hours: None,
             min_completion_tokens: default_min_completion_tokens(),
             max_sse_frame_bytes: default_max_sse_frame_bytes(),
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: default_image_cache_max_size(),
+            image_cache_ttl_secs: default_image_cache_ttl_secs(),
         }
     }
 }
@@ -603,6 +664,12 @@ impl Config {
         let model_profiles =
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
         let model_routes = resolve_model_routes(&config.model_routes)?;
+        let vision_url = match trim_nonempty(config.vision_url.as_deref()) {
+            Some(url) => {
+                Some(Url::parse(&url).map_err(|err| format!("invalid vision_url: {err}"))?)
+            }
+            None => None,
+        };
         Ok(Self {
             bind_addr,
             upstream_base_url,
@@ -651,6 +718,13 @@ impl Config {
             // Floor at 1 KiB so a misconfigured tiny/zero cap cannot reject every
             // normal frame; the default is far larger.
             max_sse_frame_bytes: config.max_sse_frame_bytes.max(1024),
+            image_agent_enabled: config.image_agent_enabled,
+            vision_url,
+            vision_model: trim_nonempty(config.vision_model.as_deref()),
+            // Floor the capacity at 1 so a misconfigured zero does not make the
+            // cache evict every image immediately and silently disable the agent.
+            image_cache_max_size: config.image_cache_max_size.max(1),
+            image_cache_ttl_secs: config.image_cache_ttl_secs,
         })
     }
 
@@ -713,6 +787,19 @@ impl Config {
             .or_else(|| self.template_family.clone())
     }
 
+    /// Direct, PROFILE-ONLY `native_vision` lookup for EXACTLY `model` (G4
+    /// round-9 #1). Looks up the profile keyed on `model` and returns its
+    /// (already template-resolved) `native_vision`, with NO `upstream_model`
+    /// remap. This is the ONLY native_vision accessor G4 gating uses: each input
+    /// is already a final backend model (a candidate) or the literal request
+    /// model, so re-applying the `upstream_model` remap would judge a DIFFERENT
+    /// model's profile than the one the provider receives / than the request
+    /// actually carries.
+    pub fn profile_native_vision(&self, model: &str) -> Option<bool> {
+        self.model_profile(model)
+            .and_then(|profile| profile.native_vision)
+    }
+
     pub fn resolve_system_prompt_prefix(&self, request_model: &str) -> Option<String> {
         let upstream_model = self.resolve_upstream_model(request_model);
         self.resolve_system_prompt_prefix_for_resolved_model(request_model, &upstream_model)
@@ -769,6 +856,7 @@ struct ResolvedModelProfile {
     upstream_model: Option<String>,
     system_prompt_prefixes: Vec<String>,
     template_family: Option<String>,
+    native_vision: Option<bool>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
 }
 
@@ -778,6 +866,7 @@ impl ResolvedModelProfile {
             upstream_model: self.upstream_model,
             system_prompt_prefix: join_prompt_prefixes(self.system_prompt_prefixes),
             template_family: normalize_template_family(self.template_family.as_deref()),
+            native_vision: self.native_vision,
             upstream_chat_kwargs: self.upstream_chat_kwargs,
         }
     }
@@ -959,6 +1048,9 @@ fn merge_resolved_model_profile(
     if source.template_family.is_some() {
         destination.template_family = source.template_family;
     }
+    if source.native_vision.is_some() {
+        destination.native_vision = source.native_vision;
+    }
     destination
         .system_prompt_prefixes
         .extend(source.system_prompt_prefixes);
@@ -977,6 +1069,9 @@ fn merge_persisted_model_profile(
     }
     if let Some(template_family) = trim_nonempty(source.template_family.as_deref()) {
         destination.template_family = Some(template_family);
+    }
+    if source.native_vision.is_some() {
+        destination.native_vision = source.native_vision;
     }
     if let Some(system_prompt_prefix) = trim_nonempty(source.system_prompt_prefix.as_deref()) {
         destination
@@ -1262,6 +1357,32 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
         && parsed >= 1
     {
         config.max_sse_frame_bytes = parsed;
+    }
+    if let Ok(value) = env::var("LLMCONDUIT_IMAGE_AGENT_ENABLED")
+        && let Ok(parsed) = value.trim().parse::<bool>()
+    {
+        config.image_agent_enabled = parsed;
+    }
+    if let Ok(value) = env::var("LLMCONDUIT_VISION_URL")
+        && !value.trim().is_empty()
+    {
+        config.vision_url = Some(value);
+    }
+    if let Ok(value) = env::var("LLMCONDUIT_VISION_MODEL")
+        && !value.trim().is_empty()
+    {
+        config.vision_model = Some(value);
+    }
+    if let Ok(value) = env::var("LLMCONDUIT_IMAGE_CACHE_MAX_SIZE")
+        && let Ok(parsed) = value.trim().parse::<usize>()
+        && parsed >= 1
+    {
+        config.image_cache_max_size = parsed;
+    }
+    if let Ok(value) = env::var("LLMCONDUIT_IMAGE_CACHE_TTL_SECS")
+        && let Ok(parsed) = value.trim().parse::<u64>()
+    {
+        config.image_cache_ttl_secs = parsed;
     }
 }
 
@@ -1628,6 +1749,7 @@ mod tests {
                         JsonValue::Bool(true),
                     )]),
                     template_family: None,
+                    native_vision: None,
                 },
             )]),
             model_profiles: BTreeMap::from_iter([(
@@ -1644,6 +1766,7 @@ mod tests {
                         }),
                     )]),
                     template_family: None,
+                    native_vision: None,
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1657,6 +1780,11 @@ mod tests {
             debug_log_max_age_hours: Some(48),
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
         };
@@ -1694,6 +1822,7 @@ mod tests {
                         }),
                     )]),
                     template_family: None,
+                    native_vision: None,
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1707,6 +1836,11 @@ mod tests {
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
@@ -1732,6 +1866,7 @@ mod tests {
     fn profile_with_family(family: &str) -> PersistedModelProfile {
         PersistedModelProfile {
             template_family: Some(family.to_string()),
+            native_vision: None,
             ..PersistedModelProfile::default()
         }
     }
@@ -1824,6 +1959,7 @@ mod tests {
                         ),
                     ]),
                     template_family: None,
+                    native_vision: None,
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1837,6 +1973,11 @@ mod tests {
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
@@ -1885,6 +2026,7 @@ mod tests {
                         }),
                     )]),
                     template_family: None,
+                    native_vision: None,
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1898,6 +2040,11 @@ mod tests {
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
@@ -1953,6 +2100,7 @@ mod tests {
                             }),
                         )]),
                         template_family: None,
+                        native_vision: None,
                     },
                 ),
                 (
@@ -1968,6 +2116,7 @@ mod tests {
                             }),
                         )]),
                         template_family: None,
+                        native_vision: None,
                     },
                 ),
             ]),
@@ -1982,6 +2131,11 @@ mod tests {
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
@@ -2031,6 +2185,7 @@ mod tests {
                             JsonValue::Bool(true),
                         )]),
                         template_family: None,
+                        native_vision: None,
                     },
                 ),
                 (
@@ -2044,6 +2199,7 @@ mod tests {
                             JsonValue::Bool(false),
                         )]),
                         template_family: None,
+                        native_vision: None,
                     },
                 ),
             ]),
@@ -2058,6 +2214,11 @@ mod tests {
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
@@ -2086,6 +2247,7 @@ mod tests {
                     system_prompt_prefix: Some("Profile prefix.".to_string()),
                     upstream_chat_kwargs: JsonMap::new(),
                     template_family: None,
+                    native_vision: None,
                 },
             )]),
             ..PersistedConfig::default()
@@ -2133,6 +2295,7 @@ mod tests {
                             ),
                         ]),
                         template_family: None,
+                        native_vision: None,
                     },
                 ),
                 (
@@ -2159,6 +2322,7 @@ mod tests {
                             ),
                         ]),
                         template_family: None,
+                        native_vision: None,
                     },
                 ),
             ]),
@@ -2186,6 +2350,7 @@ mod tests {
                         ),
                     ]),
                     template_family: None,
+                    native_vision: None,
                 },
             )]),
             ..PersistedConfig::default()
@@ -2278,6 +2443,7 @@ model_profiles:
                     system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::new(),
                     template_family: None,
+                    native_vision: None,
                 },
             )]),
             ..PersistedConfig::default()
@@ -2299,6 +2465,7 @@ model_profiles:
                         system_prompt_prefix: None,
                         upstream_chat_kwargs: JsonMap::new(),
                         template_family: None,
+                        native_vision: None,
                     },
                 ),
                 (
@@ -2309,6 +2476,7 @@ model_profiles:
                         system_prompt_prefix: None,
                         upstream_chat_kwargs: JsonMap::new(),
                         template_family: None,
+                        native_vision: None,
                     },
                 ),
             ]),
@@ -2320,6 +2488,7 @@ model_profiles:
                     system_prompt_prefix: None,
                     upstream_chat_kwargs: JsonMap::new(),
                     template_family: None,
+                    native_vision: None,
                 },
             )]),
             ..PersistedConfig::default()
@@ -2419,6 +2588,11 @@ model_profiles:
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
@@ -2456,6 +2630,7 @@ model_profiles:
                     upstream_chat_kwargs: JsonMap::new(),
                     system_prompt_prefix: None,
                     template_family: None,
+                    native_vision: None,
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -2469,6 +2644,11 @@ model_profiles:
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            image_agent_enabled: false,
+            vision_url: None,
+            vision_model: None,
+            image_cache_max_size: 100,
+            image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })

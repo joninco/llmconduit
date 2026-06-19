@@ -197,7 +197,9 @@ fn summarize_api_body(path: &str, body: &Bytes) -> String {
     match serde_json::from_slice::<Value>(body) {
         Ok(value) => summarize_json_api_body(path, &value),
         Err(err) => {
-            let preview = String::from_utf8_lossy(body);
+            // Redact image URIs from the raw preview before logging (round-4 #2):
+            // a non-JSON body could still embed a `data:`/signed image URL.
+            let preview = crate::vision::redact_image_uris(&String::from_utf8_lossy(body));
             format!(
                 "non_json parse_error={} preview={}",
                 compact_for_log(&err.to_string()),
@@ -211,10 +213,19 @@ fn payload_for_log(body: &Bytes) -> String {
     match serde_json::from_slice::<Value>(body) {
         Ok(mut value) => {
             redact_payload_secrets(&mut value);
+            // G4 round-4 #2: an inbound body under the dump limit would otherwise
+            // log raw `data:` image bytes / signed `image_url`s. Strip image URIs
+            // from every remaining string via the shared redactor BEFORE
+            // serializing, so no logged surface carries request image content.
+            crate::vision::redact_image_uris_in_value(&mut value);
             serde_json::to_string(&value)
                 .unwrap_or_else(|_| "<failed to serialize json>".to_string())
         }
-        Err(_) => String::from_utf8_lossy(body).into_owned(),
+        Err(_) => {
+            // Non-JSON body: still strip image URIs from the raw text so a
+            // `data:`/signed URL in a malformed/odd payload is not logged raw.
+            crate::vision::redact_image_uris(&String::from_utf8_lossy(body))
+        }
     }
 }
 
