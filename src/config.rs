@@ -281,6 +281,21 @@ pub struct PersistedModelProfile {
     pub native_vision: Option<bool>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    /// Per-model map from a canonical reasoning-effort level (`none`/`low`/
+    /// `medium`/`high`/`xhigh`/`max`) to a request fragment merged into the
+    /// upstream chat request — e.g. `{chat_template_kwargs: {reasoning_effort:
+    /// high}}` for GLM, or `{chat_template_kwargs: {enable_thinking: false}}` to
+    /// turn reasoning off. When a level matches, the fragment is merged (as a
+    /// default; an explicit client/configured value wins) and the top-level
+    /// `reasoning_effort` is cleared, so the fragment alone decides placement.
+    /// This lets a backend with its own effort vocabulary receive the right knob
+    /// instead of the model-agnostic low/high clamp. Empty = use the default.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub reasoning_effort_map: BTreeMap<String, JsonValue>,
+    /// Canonical level used when the client requested no effort but this model
+    /// has a `reasoning_effort_map` (e.g. GLM's template default is `max`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort_default: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for PersistedModelProfile {
@@ -302,17 +317,23 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             native_vision: Option<bool>,
             #[serde(default)]
             upstream_chat_kwargs: JsonMap<String, JsonValue>,
+            #[serde(default)]
+            reasoning_effort_map: BTreeMap<String, JsonValue>,
+            #[serde(default)]
+            reasoning_effort_default: Option<String>,
             #[serde(default, flatten)]
             shorthand_upstream_chat_kwargs: JsonMap<String, JsonValue>,
         }
 
         let raw = RawPersistedModelProfile::deserialize(deserializer)?;
         let mut upstream_chat_kwargs = raw.shorthand_upstream_chat_kwargs;
-        // `template_family`/`native_vision` are recognized profile knobs, not
-        // chat-template shorthand kwargs, so drop any copy the `flatten` swept
-        // into the shorthand bucket (they live in their own typed fields).
+        // `template_family`/`native_vision`/effort knobs are recognized profile
+        // fields, not chat-template shorthand kwargs, so drop any copy the
+        // `flatten` swept into the shorthand bucket (they live in typed fields).
         upstream_chat_kwargs.remove("template_family");
         upstream_chat_kwargs.remove("native_vision");
+        upstream_chat_kwargs.remove("reasoning_effort_map");
+        upstream_chat_kwargs.remove("reasoning_effort_default");
         merge_json_maps(&mut upstream_chat_kwargs, &raw.upstream_chat_kwargs);
         Ok(Self {
             extends: raw.extends,
@@ -321,11 +342,13 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             template_family: raw.template_family,
             native_vision: raw.native_vision,
             upstream_chat_kwargs,
+            reasoning_effort_map: raw.reasoning_effort_map,
+            reasoning_effort_default: raw.reasoning_effort_default,
         })
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelProfile {
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
@@ -333,6 +356,17 @@ pub struct ModelProfile {
     /// Per-profile native-vision override (G4); see `PersistedModelProfile`.
     pub native_vision: Option<bool>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    /// Per-model reasoning-effort map + default; see `PersistedModelProfile`.
+    pub reasoning_effort_map: BTreeMap<String, JsonValue>,
+    pub reasoning_effort_default: Option<String>,
+}
+
+/// Resolved reasoning-effort policy for a backend model: canonical effort level
+/// → request fragment, plus the default level for an effort-less request.
+#[derive(Debug, Clone)]
+pub struct ReasoningEffortPolicy {
+    pub map: BTreeMap<String, JsonValue>,
+    pub default: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -770,6 +804,29 @@ impl Config {
         kwargs
     }
 
+    /// Merged per-model reasoning-effort policy for the resolved model across its
+    /// profile chain, or `None` when no matched profile defines a
+    /// `reasoning_effort_map`. Later profiles in the match order (request-model
+    /// keyed) override earlier (resolved-model keyed) ones, mirroring
+    /// `resolve_upstream_chat_kwargs_for_resolved_model`.
+    pub fn resolve_reasoning_effort_policy(
+        &self,
+        request_model: &str,
+        resolved_model: &str,
+    ) -> Option<ReasoningEffortPolicy> {
+        let mut map: BTreeMap<String, JsonValue> = BTreeMap::new();
+        let mut default: Option<String> = None;
+        for profile in self.model_profiles_for_resolved_model(request_model, resolved_model) {
+            for (level, fragment) in &profile.reasoning_effort_map {
+                map.insert(level.trim().to_ascii_lowercase(), fragment.clone());
+            }
+            if let Some(level) = trim_nonempty(profile.reasoning_effort_default.as_deref()) {
+                default = Some(level.to_ascii_lowercase());
+            }
+        }
+        (!map.is_empty()).then_some(ReasoningEffortPolicy { map, default })
+    }
+
     /// Resolve an explicit backend chat-template family override for this
     /// turn (G2). The most-specific matched model profile wins, then the
     /// global `template_family`. Returns `None` when no override applies, in
@@ -858,6 +915,8 @@ struct ResolvedModelProfile {
     template_family: Option<String>,
     native_vision: Option<bool>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
+    reasoning_effort_map: BTreeMap<String, JsonValue>,
+    reasoning_effort_default: Option<String>,
 }
 
 impl ResolvedModelProfile {
@@ -868,6 +927,8 @@ impl ResolvedModelProfile {
             template_family: normalize_template_family(self.template_family.as_deref()),
             native_vision: self.native_vision,
             upstream_chat_kwargs: self.upstream_chat_kwargs,
+            reasoning_effort_map: self.reasoning_effort_map,
+            reasoning_effort_default: self.reasoning_effort_default,
         }
     }
 }
@@ -1058,6 +1119,14 @@ fn merge_resolved_model_profile(
         &mut destination.upstream_chat_kwargs,
         &source.upstream_chat_kwargs,
     );
+    // Effort map merges per-level (child level overrides parent level); default
+    // is set-if-some (child wins).
+    for (level, fragment) in source.reasoning_effort_map {
+        destination.reasoning_effort_map.insert(level, fragment);
+    }
+    if source.reasoning_effort_default.is_some() {
+        destination.reasoning_effort_default = source.reasoning_effort_default;
+    }
 }
 
 fn merge_persisted_model_profile(
@@ -1082,6 +1151,16 @@ fn merge_persisted_model_profile(
         &mut destination.upstream_chat_kwargs,
         &source.upstream_chat_kwargs,
     );
+    for (level, fragment) in &source.reasoning_effort_map {
+        destination
+            .reasoning_effort_map
+            .insert(level.clone(), fragment.clone());
+    }
+    if source.reasoning_effort_default.is_some() {
+        destination
+            .reasoning_effort_default
+            .clone_from(&source.reasoning_effort_default);
+    }
 }
 
 fn join_prompt_prefixes(prefixes: impl IntoIterator<Item = String>) -> Option<String> {
@@ -1419,6 +1498,51 @@ mod tests {
     use super::write_persisted_config;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn resolves_reasoning_effort_policy_from_profile_chain() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+model_profile_templates:
+  glm-effort:
+    reasoning_effort_default: max
+    reasoning_effort_map:
+      high: { chat_template_kwargs: { reasoning_effort: high } }
+      max: { chat_template_kwargs: { reasoning_effort: max } }
+      none: { chat_template_kwargs: { enable_thinking: false } }
+model_profiles:
+  GLM-5.2-NVFP4-MTP:
+    extends: [glm-effort]
+    reasoning_effort_map:
+      xhigh: { chat_template_kwargs: { reasoning_effort: max } }
+"#,
+        )
+        .expect("yaml");
+        let config = Config::from_persisted(&persisted).expect("config");
+        let policy = config
+            .resolve_reasoning_effort_policy("GLM-5.2-NVFP4-MTP", "GLM-5.2-NVFP4-MTP")
+            .expect("policy present");
+        // Default + template levels resolve; the profile ADDS xhigh on top.
+        assert_eq!(policy.default.as_deref(), Some("max"));
+        assert_eq!(
+            policy.map["high"]["chat_template_kwargs"]["reasoning_effort"],
+            json!("high")
+        );
+        assert_eq!(
+            policy.map["xhigh"]["chat_template_kwargs"]["reasoning_effort"],
+            json!("max")
+        );
+        assert_eq!(
+            policy.map["none"]["chat_template_kwargs"]["enable_thinking"],
+            json!(false)
+        );
+        // A model with no effort map resolves to no policy.
+        assert!(
+            config
+                .resolve_reasoning_effort_policy("other", "other")
+                .is_none()
+        );
+    }
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -1752,6 +1876,7 @@ mod tests {
                     )]),
                     template_family: None,
                     native_vision: None,
+                    ..Default::default()
                 },
             )]),
             model_profiles: BTreeMap::from_iter([(
@@ -1769,6 +1894,7 @@ mod tests {
                     )]),
                     template_family: None,
                     native_vision: None,
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1825,6 +1951,7 @@ mod tests {
                     )]),
                     template_family: None,
                     native_vision: None,
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -1962,6 +2089,7 @@ mod tests {
                     ]),
                     template_family: None,
                     native_vision: None,
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -2029,6 +2157,7 @@ mod tests {
                     )]),
                     template_family: None,
                     native_vision: None,
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
@@ -2103,6 +2232,7 @@ mod tests {
                         )]),
                         template_family: None,
                         native_vision: None,
+                        ..Default::default()
                     },
                 ),
                 (
@@ -2119,6 +2249,7 @@ mod tests {
                         )]),
                         template_family: None,
                         native_vision: None,
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -2188,6 +2319,7 @@ mod tests {
                         )]),
                         template_family: None,
                         native_vision: None,
+                        ..Default::default()
                     },
                 ),
                 (
@@ -2202,6 +2334,7 @@ mod tests {
                         )]),
                         template_family: None,
                         native_vision: None,
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -2250,6 +2383,7 @@ mod tests {
                     upstream_chat_kwargs: JsonMap::new(),
                     template_family: None,
                     native_vision: None,
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -2298,6 +2432,7 @@ mod tests {
                         ]),
                         template_family: None,
                         native_vision: None,
+                        ..Default::default()
                     },
                 ),
                 (
@@ -2325,6 +2460,7 @@ mod tests {
                         ]),
                         template_family: None,
                         native_vision: None,
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -2353,6 +2489,7 @@ mod tests {
                     ]),
                     template_family: None,
                     native_vision: None,
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -2446,6 +2583,7 @@ model_profiles:
                     upstream_chat_kwargs: JsonMap::new(),
                     template_family: None,
                     native_vision: None,
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -2468,6 +2606,7 @@ model_profiles:
                         upstream_chat_kwargs: JsonMap::new(),
                         template_family: None,
                         native_vision: None,
+                        ..Default::default()
                     },
                 ),
                 (
@@ -2479,6 +2618,7 @@ model_profiles:
                         upstream_chat_kwargs: JsonMap::new(),
                         template_family: None,
                         native_vision: None,
+                        ..Default::default()
                     },
                 ),
             ]),
@@ -2491,6 +2631,7 @@ model_profiles:
                     upstream_chat_kwargs: JsonMap::new(),
                     template_family: None,
                     native_vision: None,
+                    ..Default::default()
                 },
             )]),
             ..PersistedConfig::default()
@@ -2633,6 +2774,7 @@ model_profiles:
                     system_prompt_prefix: None,
                     template_family: None,
                     native_vision: None,
+                    ..Default::default()
                 },
             )]),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),

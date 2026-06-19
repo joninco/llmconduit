@@ -322,6 +322,67 @@ fn build_upstream_extra_body(
     extra_body
 }
 
+/// Apply a per-model reasoning-effort policy (config `reasoning_effort_map`):
+/// translate the RAW canonical effort level into a request fragment merged into
+/// `extra_body` (e.g. GLM's `chat_template_kwargs.reasoning_effort` for high/max,
+/// or `chat_template_kwargs.enable_thinking:false` for off), and CLEAR the
+/// top-level `reasoning_effort` so the fragment alone decides placement (some
+/// backends ignore the top-level field). The fragment merges as a DEFAULT — an
+/// explicit client/configured value already in `extra_body` wins. With no policy
+/// for this model, or a level the map does not cover, the model-agnostic clamped
+/// effort is kept unchanged (backward-compatible). Returns the final top-level
+/// `reasoning_effort`.
+fn apply_reasoning_effort_policy(
+    policy: Option<&crate::config::ReasoningEffortPolicy>,
+    raw_effort: Option<&str>,
+    clamped_effort: Option<String>,
+    extra_body: &mut BTreeMap<String, Value>,
+) -> Option<String> {
+    let Some(policy) = policy else {
+        return clamped_effort;
+    };
+    let level = raw_effort
+        .map(str::trim)
+        .filter(|level| !level.is_empty())
+        .map(str::to_ascii_lowercase)
+        .or_else(|| policy.default.clone());
+    let Some(level) = level else {
+        return clamped_effort;
+    };
+    let Some(Value::Object(fragment)) = policy.map.get(&level) else {
+        return clamped_effort;
+    };
+    for (key, value) in fragment {
+        match extra_body.get_mut(key) {
+            Some(existing) => merge_json_value_into_default(existing, value),
+            None => {
+                extra_body.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Deep-merge `source` into `destination`, PRESERVING existing destination
+/// leaves (an already-present client/configured value wins); only fills keys the
+/// destination is missing. Used to apply an effort-map fragment as a default.
+fn merge_json_value_into_default(destination: &mut Value, source: &Value) {
+    if let (Value::Object(destination_object), Value::Object(source_object)) =
+        (&mut *destination, source)
+    {
+        for (key, source_value) in source_object {
+            match destination_object.get_mut(key) {
+                Some(destination_value) => {
+                    merge_json_value_into_default(destination_value, source_value);
+                }
+                None => {
+                    destination_object.insert(key.clone(), source_value.clone());
+                }
+            }
+        }
+    }
+}
+
 fn remove_defaults_for_explicit_request_fields(
     extra_body: &mut BTreeMap<String, Value>,
     request: &ResponsesRequest,
@@ -1137,12 +1198,28 @@ impl Gateway {
             .get("chat_template_kwargs")
             .and_then(Value::as_object)
             .cloned();
-        let upstream_extra_body = build_upstream_extra_body(
+        let mut upstream_extra_body = build_upstream_extra_body(
             self.config
                 .resolve_upstream_chat_kwargs_for_resolved_model(&request.model, &upstream_model),
             &request,
             &response_format,
             &reasoning_effort,
+        );
+        // Per-model reasoning-effort mapping (e.g. GLM: claude effort -> a
+        // chat_template_kwargs fragment). Operates on the RAW canonical effort
+        // (`request.reasoning.effort`), NOT the model-agnostic clamp, so a backend
+        // with its own effort vocabulary receives the right knob; clears the
+        // top-level field when the model's map placed effort elsewhere.
+        let reasoning_effort = apply_reasoning_effort_policy(
+            self.config
+                .resolve_reasoning_effort_policy(&request.model, &upstream_model)
+                .as_ref(),
+            request
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.effort.as_deref()),
+            reasoning_effort,
+            &mut upstream_extra_body,
         );
         let normalized_stop = crate::models::chat::normalize_stop(request.stop.clone())?;
         loop {
@@ -2737,6 +2814,100 @@ mod tests {
     use crate::models::responses::ResponseItem;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn reasoning_effort_policy_maps_levels_and_clears_top_level() {
+        use super::apply_reasoning_effort_policy;
+        use crate::config::ReasoningEffortPolicy;
+        use serde_json::Value;
+        use std::collections::BTreeMap;
+
+        // GLM-shaped policy: high/max -> chat_template_kwargs.reasoning_effort,
+        // off -> enable_thinking:false, default max.
+        let policy = ReasoningEffortPolicy {
+            default: Some("max".to_string()),
+            map: BTreeMap::from_iter([
+                (
+                    "high".to_string(),
+                    json!({"chat_template_kwargs": {"reasoning_effort": "high"}}),
+                ),
+                (
+                    "max".to_string(),
+                    json!({"chat_template_kwargs": {"reasoning_effort": "max"}}),
+                ),
+                (
+                    "none".to_string(),
+                    json!({"chat_template_kwargs": {"enable_thinking": false}}),
+                ),
+            ]),
+        };
+
+        // Mapped level -> fragment merged, top-level effort cleared.
+        let mut eb: BTreeMap<String, Value> = BTreeMap::new();
+        let effort = apply_reasoning_effort_policy(
+            Some(&policy),
+            Some("high"),
+            Some("high".into()),
+            &mut eb,
+        );
+        assert_eq!(effort, None);
+        assert_eq!(
+            eb["chat_template_kwargs"]["reasoning_effort"],
+            json!("high")
+        );
+
+        // Raw effort absent -> falls back to the policy default ("max").
+        let mut eb_def: BTreeMap<String, Value> = BTreeMap::new();
+        let effort = apply_reasoning_effort_policy(Some(&policy), None, None, &mut eb_def);
+        assert_eq!(effort, None);
+        assert_eq!(
+            eb_def["chat_template_kwargs"]["reasoning_effort"],
+            json!("max")
+        );
+
+        // Off: none -> enable_thinking:false.
+        let mut eb_off: BTreeMap<String, Value> = BTreeMap::new();
+        let _ = apply_reasoning_effort_policy(Some(&policy), Some("none"), None, &mut eb_off);
+        assert_eq!(
+            eb_off["chat_template_kwargs"]["enable_thinking"],
+            json!(false)
+        );
+
+        // A level the map does not cover keeps the model-agnostic clamped effort.
+        let mut eb_un: BTreeMap<String, Value> = BTreeMap::new();
+        let effort = apply_reasoning_effort_policy(
+            Some(&policy),
+            Some("medium"),
+            Some("high".into()),
+            &mut eb_un,
+        );
+        assert_eq!(effort, Some("high".to_string()));
+        assert!(eb_un.is_empty());
+
+        // No policy at all -> clamped effort untouched.
+        let mut eb_np: BTreeMap<String, Value> = BTreeMap::new();
+        let effort =
+            apply_reasoning_effort_policy(None, Some("high"), Some("high".into()), &mut eb_np);
+        assert_eq!(effort, Some("high".to_string()));
+        assert!(eb_np.is_empty());
+
+        // An explicit client value already in extra_body wins (merge-as-default).
+        let mut eb_client: BTreeMap<String, Value> = BTreeMap::from_iter([(
+            "chat_template_kwargs".to_string(),
+            json!({"reasoning_effort": "max", "sibling": 1}),
+        )]);
+        let _ = apply_reasoning_effort_policy(
+            Some(&policy),
+            Some("high"),
+            Some("high".into()),
+            &mut eb_client,
+        );
+        assert_eq!(
+            eb_client["chat_template_kwargs"]["reasoning_effort"],
+            json!("max")
+        );
+        assert_eq!(eb_client["chat_template_kwargs"]["sibling"], json!(1));
+    }
 
     #[test]
     fn preview_text_truncates_on_char_boundary() {

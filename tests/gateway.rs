@@ -1053,6 +1053,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
                     )]),
                     template_family: None,
                     native_vision: None,
+                    ..Default::default()
                 },
             )]),
             model_routes: Vec::new(),
@@ -1108,6 +1109,7 @@ async fn prepends_profile_system_prompt_prefix_for_responses_requests() {
             upstream_chat_kwargs: JsonMap::new(),
             template_family: None,
             native_vision: None,
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -4027,6 +4029,7 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
             )]),
             template_family: None,
             native_vision: None,
+            ..Default::default()
         },
     )]);
 
@@ -4557,6 +4560,7 @@ async fn chat_completions_prepends_profile_system_prompt_prefix() {
             upstream_chat_kwargs: JsonMap::new(),
             template_family: None,
             native_vision: None,
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -5128,6 +5132,7 @@ async fn anthropic_messages_prepends_profile_system_prompt_prefix() {
             upstream_chat_kwargs: JsonMap::new(),
             template_family: None,
             native_vision: None,
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
@@ -6595,6 +6600,7 @@ async fn image_agent_profile_native_vision_override_skips() {
             template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
@@ -7386,6 +7392,7 @@ async fn image_agent_request_native_vision_override_does_not_leak_onto_fallback(
             template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
@@ -7476,6 +7483,7 @@ async fn image_agent_strips_when_kimi_alias_remaps_to_text_backend() {
             template_family: None,
             native_vision: None,
             upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
@@ -7607,6 +7615,7 @@ async fn image_agent_request_native_vision_false_on_kimi_primary_strips() {
             template_family: None,
             native_vision: Some(false),
             upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
@@ -7645,6 +7654,7 @@ async fn image_agent_request_native_vision_true_on_text_named_primary_passes_thr
             template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
@@ -7687,6 +7697,7 @@ async fn image_agent_request_native_vision_true_does_not_flip_nonnative_fallback
             template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
@@ -7843,6 +7854,7 @@ async fn gating_table_unmatched_request_override_does_not_apply_to_default() {
             template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
@@ -7888,6 +7900,7 @@ async fn gating_table_genuine_resolution_native_true_passes_through() {
             template_family: None,
             native_vision: Some(true),
             upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
@@ -7920,6 +7933,7 @@ async fn gating_table_native_false_on_resolved_primary_strips() {
             template_family: None,
             native_vision: Some(false),
             upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
         },
     )]);
     let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
@@ -8030,6 +8044,7 @@ async fn gating_table_candidate_lookup_uses_own_profile_not_remap_target() {
                 template_family: None,
                 native_vision: Some(false), // the candidate's OWN truth
                 upstream_chat_kwargs: JsonMap::new(),
+                ..Default::default()
             },
         ),
         (
@@ -8040,6 +8055,7 @@ async fn gating_table_candidate_lookup_uses_own_profile_not_remap_target() {
                 template_family: None,
                 native_vision: Some(true), // remap target — must NOT leak in
                 upstream_chat_kwargs: JsonMap::new(),
+                ..Default::default()
             },
         ),
     ]);
@@ -8085,6 +8101,7 @@ async fn gating_table_request_override_not_displaced_by_remap_target_profile() {
                 template_family: None,
                 native_vision: Some(false), // request's OWN truth
                 upstream_chat_kwargs: JsonMap::new(),
+                ..Default::default()
             },
         ),
         (
@@ -8095,6 +8112,7 @@ async fn gating_table_request_override_not_displaced_by_remap_target_profile() {
                 template_family: None,
                 native_vision: Some(true), // remap target — must NOT displace
                 upstream_chat_kwargs: JsonMap::new(),
+                ..Default::default()
             },
         ),
     ]);
