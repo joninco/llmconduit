@@ -109,12 +109,6 @@ impl UpstreamClient for MockUpstream {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<UpstreamStream, llmconduit::error::AppError> {
-        // Mirror the production leaf stripping the engine's reserved raw-effort
-        // marker so recorded requests reflect the on-wire body.
-        let mut request = request.clone();
-        request
-            .extra_body
-            .remove(llmconduit::upstream::CANONICAL_REASONING_EFFORT_KEY);
         self.requests.lock().await.push(request.clone());
         let chunks = self
             .responses

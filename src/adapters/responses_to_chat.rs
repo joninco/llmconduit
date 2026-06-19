@@ -354,20 +354,15 @@ fn normalize_chat_role(role: &str) -> String {
 }
 
 fn normalize_reasoning_effort(effort: Option<&str>) -> AppResult<Option<String>> {
-    match effort.map(str::trim).filter(|value| !value.is_empty()) {
-        None => Ok(None),
-        Some(value) => {
-            let normalized = match value.to_ascii_lowercase().as_str() {
-                "none" => "none",
-                "low" => "low",
-                "medium" | "high" => "high",
-                // Some upstreams validate this field but do not use it.
-                // Clamp unknown values to a supported non-zero effort.
-                _ => "high",
-            };
-            Ok(Some(normalized.to_string()))
-        }
-    }
+    // Carry the RAW canonical level through (trimmed + lowercased) so the upstream
+    // leaf — the single point that knows the FINAL provider model — can apply a
+    // per-model `reasoning_effort_map` (which needs `xhigh`/`max` kept distinct)
+    // or clamp it to a backend's vocabulary. The clamp lives at the leaf
+    // (`upstream::clamp_reasoning_effort`), not here.
+    Ok(effort
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase()))
 }
 
 fn hoist_system_messages(messages: &mut Vec<ChatMessage>) {
@@ -1072,51 +1067,33 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_medium_reasoning_effort_for_upstream() {
-        let mut req = base_test_request();
-        req.reasoning = Some(ReasoningRequest {
-            effort: Some("medium".to_string()),
-            summary: None,
-        });
-
-        let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("high"));
+    fn lowers_reasoning_effort_raw_for_the_leaf() {
+        // Lowering passes the canonical level through RAW (no clamp); the leaf
+        // clamps or maps it. xhigh/max stay distinct here.
+        for raw in ["none", "low", "medium", "high", "xhigh", "max"] {
+            let mut req = base_test_request();
+            req.reasoning = Some(ReasoningRequest {
+                effort: Some(raw.to_string()),
+                summary: None,
+            });
+            let result = lower_request(&req, vec![]).expect("lower_request");
+            assert_eq!(
+                result.reasoning_effort.as_deref(),
+                Some(raw),
+                "{raw} must pass through raw"
+            );
+        }
     }
 
     #[test]
-    fn clamps_invalid_reasoning_effort_for_upstream() {
+    fn lowers_reasoning_effort_trimmed_and_lowercased() {
         let mut req = base_test_request();
         req.reasoning = Some(ReasoningRequest {
-            effort: Some("max".to_string()),
+            effort: Some("  XHigh  ".to_string()),
             summary: None,
         });
-
         let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn clamps_xhigh_reasoning_effort_for_upstream() {
-        let mut req = base_test_request();
-        req.reasoning = Some(ReasoningRequest {
-            effort: Some("xhigh".to_string()),
-            summary: None,
-        });
-
-        let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("high"));
-    }
-
-    #[test]
-    fn normalizes_reasoning_effort_case_and_whitespace() {
-        let mut req = base_test_request();
-        req.reasoning = Some(ReasoningRequest {
-            effort: Some("  LoW  ".to_string()),
-            summary: None,
-        });
-
-        let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(result.reasoning_effort.as_deref(), Some("xhigh"));
     }
 
     #[test]

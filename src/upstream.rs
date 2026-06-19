@@ -519,30 +519,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // `template_family` override and the client's explicit kwargs on the
         // request; sniffing happens against `request.model`.
         let mut request = request.clone();
-        // Strip the engine's reserved raw-effort marker BEFORE family injection,
-        // logging, and the POST so it never reaches the wire, then apply this
-        // FINAL model's reasoning_effort_map.
-        let raw_effort = request
-            .extra_body
-            .remove(CANONICAL_REASONING_EFFORT_KEY)
-            .and_then(|value| value.as_str().map(str::to_string));
-        let effort_fragment =
-            reasoning_effort_fragment(&self.effort_policies, &request.model, raw_effort.as_deref());
-        // When the map places effort (in chat_template_kwargs), CLEAR the
-        // top-level `reasoning_effort` BEFORE family injection: a mapped backend
-        // reads the template knob, so a leftover top-level value would either be
-        // ignored (GLM) or, worse, seed a CONTRADICTORY value via the DeepSeek
-        // family setdefault. G3's estimate omits this field, so clearing it keeps
-        // the pre-flight estimate a safe lower bound.
-        if effort_fragment.is_some() {
-            request.reasoning_effort = None;
-        }
-        apply_family_chat_template_kwargs(&mut request);
-        if let Some(fragment) = effort_fragment {
-            // Applied AFTER family so the map overrides family defaults; client
-            // kwargs are re-asserted last inside the apply.
-            apply_reasoning_effort_fragment(&mut request, &fragment);
-        }
+        finalize_request_for_backend(&mut request, &self.effort_policies);
         let request = sanitize_chat_request(request, self.flatten_content);
         if let Some(ref logger) = self.request_logger
             && let Err(err) = logger.log(&request).await
@@ -1678,11 +1655,57 @@ pub(crate) fn detect_model_family(
     }
 }
 
-/// Reserved `extra_body` key carrying the RAW canonical reasoning-effort level
-/// (none/low/medium/high/xhigh/max) from the engine to this leaf. The leaf reads
-/// it to apply the FINAL model's `reasoning_effort_map`, then REMOVES it so it
-/// never reaches the wire or the request log.
-pub const CANONICAL_REASONING_EFFORT_KEY: &str = "__llmconduit_canonical_reasoning_effort";
+/// Finalize the chat request the backend will receive, at the leaf — the single
+/// point that knows the FINAL provider `model` after routing/failover/exposed-
+/// alias remap. Resolves and applies that model's reasoning-effort policy, then
+/// injects family `chat_template_kwargs`. `request.reasoning_effort` arrives RAW
+/// (lowering does not clamp); here it is either MAPPED or clamped.
+///
+/// MAPPED: the per-model `reasoning_effort_map` produces a fragment, so the
+/// top-level field is CLEARED (the fragment relays effort via
+/// chat_template_kwargs; a leftover top-level value would be ignored by GLM or
+/// seed a contradictory DeepSeek setdefault), then the fragment is applied AFTER
+/// family so it overrides family defaults.
+///
+/// UNMAPPED: clamped to the OpenAI-compatible `none`/`low`/`high` vocabulary.
+///
+/// The G3 estimate omits `reasoning_effort` entirely, so neither clearing nor
+/// clamping here perturbs the pre-flight lower bound.
+///
+/// `pub` so the integration-test mock upstreams mirror the production leaf.
+pub fn finalize_request_for_backend(
+    request: &mut ChatCompletionRequest,
+    effort_policies: &std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>,
+) {
+    let fragment = reasoning_effort_fragment(
+        effort_policies,
+        &request.model,
+        request.reasoning_effort.as_deref(),
+    );
+    request.reasoning_effort = if fragment.is_some() {
+        None
+    } else {
+        clamp_reasoning_effort(request.reasoning_effort.as_deref())
+    };
+    apply_family_chat_template_kwargs(request);
+    if let Some(fragment) = fragment {
+        apply_reasoning_effort_fragment(request, &fragment);
+    }
+}
+
+/// Clamp a raw reasoning-effort level to the OpenAI-compatible vocabulary a
+/// mapless backend understands: `none`/`low` pass through, everything else
+/// (`medium`/`high`/`xhigh`/`max`/unknown) collapses to `high`. This is the
+/// model-agnostic default for backends without a `reasoning_effort_map`.
+fn clamp_reasoning_effort(effort: Option<&str>) -> Option<String> {
+    let level = effort.map(str::trim).filter(|level| !level.is_empty())?;
+    let clamped = match level.to_ascii_lowercase().as_str() {
+        "none" => "none",
+        "low" => "low",
+        _ => "high",
+    };
+    Some(clamped.to_string())
+}
 
 /// Resolve the reasoning-effort fragment for the FINAL provider `model` and the
 /// raw client effort level, or `None` when the model has no policy or the level
@@ -3306,6 +3329,50 @@ mod tests {
             &json!({"chat_template_kwargs": {"enable_thinking": false}}),
         );
         assert_eq!(kwargs_of(&request)["enable_thinking"], json!(false));
+    }
+
+    #[test]
+    fn clamp_reasoning_effort_collapses_to_openai_vocabulary() {
+        use super::clamp_reasoning_effort;
+        assert_eq!(clamp_reasoning_effort(None), None);
+        assert_eq!(clamp_reasoning_effort(Some("")), None);
+        assert_eq!(
+            clamp_reasoning_effort(Some("none")).as_deref(),
+            Some("none")
+        );
+        assert_eq!(clamp_reasoning_effort(Some("low")).as_deref(), Some("low"));
+        for raw in ["medium", "high", "xhigh", "max", "unknown"] {
+            assert_eq!(
+                clamp_reasoning_effort(Some(raw)).as_deref(),
+                Some("high"),
+                "{raw} collapses to high"
+            );
+        }
+        assert_eq!(
+            clamp_reasoning_effort(Some("  XHigh ")).as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn finalize_unmapped_model_clamps_top_level_effort() {
+        use super::finalize_request_for_backend;
+        let mut request = family_request("some-plain-model");
+        request.reasoning_effort = Some("xhigh".to_string());
+        finalize_request_for_backend(&mut request, &std::collections::BTreeMap::new());
+        // No policy -> clamp; no family -> no chat_template_kwargs injected.
+        assert_eq!(request.reasoning_effort.as_deref(), Some("high"));
+        assert!(!request.extra_body.contains_key("chat_template_kwargs"));
+    }
+
+    #[test]
+    fn finalize_mapped_model_clears_top_level_and_maps_to_chat_template_kwargs() {
+        use super::finalize_request_for_backend;
+        let mut request = family_request("GLM-5.2-NVFP4-MTP");
+        request.reasoning_effort = Some("max".to_string());
+        finalize_request_for_backend(&mut request, &glm_effort_policies());
+        assert_eq!(request.reasoning_effort, None);
+        assert_eq!(kwargs_of(&request)["reasoning_effort"], json!("max"));
     }
 
     #[test]

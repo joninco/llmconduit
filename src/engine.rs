@@ -1143,39 +1143,18 @@ impl Gateway {
             .get("chat_template_kwargs")
             .and_then(Value::as_object)
             .cloned();
-        let mut upstream_extra_body = build_upstream_extra_body(
+        let upstream_extra_body = build_upstream_extra_body(
             self.config
                 .resolve_upstream_chat_kwargs_for_resolved_model(&request.model, &upstream_model),
             &request,
             &response_format,
             &reasoning_effort,
         );
-        // Thread the RAW canonical effort (none/low/medium/high/xhigh/max) to the
-        // upstream LEAF via a reserved extra_body key that the leaf STRIPS before
-        // the wire. The leaf is the single point that knows the FINAL provider
-        // model after routing/failover, so it (not the engine) applies that
-        // model's `reasoning_effort_map`. Kept raw — not the model-agnostic clamp
-        // — so xhigh/max stay distinct. A model WITHOUT a map keeps its clamped
-        // top-level `reasoning_effort`; a mapped model has it CLEARED at the leaf
-        // (the fragment relays effort via chat_template_kwargs instead). The G3
-        // estimate omits `reasoning_effort` entirely, so it stays a safe lower
-        // bound either way (see `estimate_request_from_lowered`).
-        // Drop any client-supplied value first: the marker is engine-owned, and a
-        // request that smuggles it through `extra_body` must NOT be trusted as the
-        // canonical effort.
-        upstream_extra_body.remove(crate::upstream::CANONICAL_REASONING_EFFORT_KEY);
-        if let Some(raw_effort) = request
-            .reasoning
-            .as_ref()
-            .and_then(|reasoning| reasoning.effort.as_deref())
-            .map(str::trim)
-            .filter(|effort| !effort.is_empty())
-        {
-            upstream_extra_body.insert(
-                crate::upstream::CANONICAL_REASONING_EFFORT_KEY.to_string(),
-                Value::String(raw_effort.to_ascii_lowercase()),
-            );
-        }
+        // `reasoning_effort` here is the RAW canonical level (lowering no longer
+        // clamps it). It flows onto the upstream request as-is; the leaf — the
+        // single point that knows the FINAL provider model after routing/failover
+        // — either maps it (`reasoning_effort_map`) or clamps it to the backend's
+        // vocabulary in `finalize_request_for_backend`.
         let normalized_stop = crate::models::chat::normalize_stop(request.stop.clone())?;
         loop {
             if tx.is_closed() {
@@ -1206,13 +1185,8 @@ impl Gateway {
                 client_chat_template_kwargs: client_chat_template_kwargs.clone(),
             };
             if self.monitor.is_enabled() {
-                let mut upstream_debug_request =
+                let upstream_debug_request =
                     sanitize_chat_request(upstream_request.clone(), self.config.flatten_content);
-                // The reserved raw-effort marker is leaf-internal (stripped before
-                // the wire); keep it out of the debug-UI preview too.
-                upstream_debug_request
-                    .extra_body
-                    .remove(crate::upstream::CANONICAL_REASONING_EFFORT_KEY);
                 let upstream_preview =
                     preview_json_limited_with_images(&upstream_debug_request, 128 * 1024);
                 self.monitor.emit(
