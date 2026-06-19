@@ -112,6 +112,11 @@ pub struct ReqwestUpstreamClient {
     /// upstream cannot grow the parser buffer without bound; an oversized or
     /// unterminated frame is rejected as an `AppError`.
     max_sse_frame_bytes: usize,
+    /// Per-backend-model reasoning-effort policies (keyed by resolved model id).
+    /// Applied at this leaf because it is the single point that sees the FINAL
+    /// provider model after routing/failover/exposed-alias remap. Shared (cheap
+    /// clone) across all providers; empty when no profile defines a map.
+    effort_policies: Arc<std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>>,
 }
 
 #[derive(Debug, Clone)]
@@ -455,7 +460,19 @@ impl ReqwestUpstreamClient {
             flatten_content,
             min_completion_tokens: min_completion_tokens.max(1),
             max_sse_frame_bytes: max_sse_frame_bytes.max(1024),
+            effort_policies: Arc::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    /// Attach the per-backend-model reasoning-effort policies (built once from
+    /// config). Threaded post-construction so the existing `with_options`
+    /// signature is unchanged.
+    pub fn with_effort_policies(
+        mut self,
+        policies: Arc<std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>>,
+    ) -> Self {
+        self.effort_policies = policies;
+        self
     }
 
     fn with_auth(&self, request: RequestBuilder) -> RequestBuilder {
@@ -502,7 +519,20 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // `template_family` override and the client's explicit kwargs on the
         // request; sniffing happens against `request.model`.
         let mut request = request.clone();
+        // Strip the engine's reserved raw-effort marker BEFORE family injection,
+        // logging, and the POST so it never reaches the wire, then apply this
+        // FINAL model's reasoning_effort_map (after family, so the map overrides
+        // family defaults; client kwargs re-asserted last inside the apply).
+        let raw_effort = request
+            .extra_body
+            .remove(CANONICAL_REASONING_EFFORT_KEY)
+            .and_then(|value| value.as_str().map(str::to_string));
         apply_family_chat_template_kwargs(&mut request);
+        if let Some(fragment) =
+            reasoning_effort_fragment(&self.effort_policies, &request.model, raw_effort.as_deref())
+        {
+            apply_reasoning_effort_fragment(&mut request, &fragment);
+        }
         let request = sanitize_chat_request(request, self.flatten_content);
         if let Some(ref logger) = self.request_logger
             && let Err(err) = logger.log(&request).await
@@ -1635,6 +1665,71 @@ pub(crate) fn detect_model_family(
         Some(ModelFamily::DeepSeek)
     } else {
         None
+    }
+}
+
+/// Reserved `extra_body` key carrying the RAW canonical reasoning-effort level
+/// (none/low/medium/high/xhigh/max) from the engine to this leaf. The leaf reads
+/// it to apply the FINAL model's `reasoning_effort_map`, then REMOVES it so it
+/// never reaches the wire or the request log.
+pub const CANONICAL_REASONING_EFFORT_KEY: &str = "__llmconduit_canonical_reasoning_effort";
+
+/// Resolve the reasoning-effort fragment for the FINAL provider `model` and the
+/// raw client effort level, or `None` when the model has no policy or the level
+/// (after defaulting) is not mapped. Lookup is exact, then canonical-key
+/// (case/punctuation-insensitive), mirroring catalog/profile model matching.
+fn reasoning_effort_fragment(
+    policies: &std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy>,
+    model: &str,
+    raw_effort: Option<&str>,
+) -> Option<Value> {
+    let policy = policies.get(model).or_else(|| {
+        let key = canonical_model_key(model);
+        policies
+            .iter()
+            .find(|(name, _)| canonical_model_key(name) == key)
+            .map(|(_, policy)| policy)
+    })?;
+    let level = raw_effort
+        .map(str::trim)
+        .filter(|level| !level.is_empty())
+        .map(str::to_ascii_lowercase)
+        .or_else(|| policy.default.clone())?;
+    policy.map.get(&level).cloned()
+}
+
+/// Apply a resolved reasoning-effort `fragment` to the request at the leaf, with
+/// precedence config < family < effort-map < client. The fragment is deep-merged
+/// PREFER-SOURCE into `extra_body` (so it OVERRIDES configured/family defaults
+/// already present in `chat_template_kwargs`, fixing the case where a static
+/// configured default would otherwise block a per-request mapping), then the
+/// client's own explicit `chat_template_kwargs` are re-asserted so an inbound
+/// client value still wins. Call AFTER `apply_family_chat_template_kwargs`.
+pub fn apply_reasoning_effort_fragment(request: &mut ChatCompletionRequest, fragment: &Value) {
+    let Value::Object(fragment) = fragment else {
+        return;
+    };
+    for (key, value) in fragment {
+        match request.extra_body.get_mut(key) {
+            Some(existing) => merge_json_value_prefer_source(existing, value),
+            None => {
+                request.extra_body.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    // Re-assert the client's explicit chat_template_kwargs over the effort-map
+    // fragment (precedence: client > effort-map).
+    if let Some(client_kwargs) = &request.client_chat_template_kwargs
+        && let Some(Value::Object(kwargs)) = request.extra_body.get_mut("chat_template_kwargs")
+    {
+        for (key, value) in client_kwargs {
+            match kwargs.get_mut(key) {
+                Some(existing) => merge_json_value_prefer_source(existing, value),
+                None => {
+                    kwargs.insert(key.clone(), value.clone());
+                }
+            }
+        }
     }
 }
 
@@ -3088,6 +3183,104 @@ mod tests {
         request.extra_body["chat_template_kwargs"]
             .as_object()
             .expect("chat_template_kwargs object")
+    }
+
+    fn glm_effort_policies()
+    -> std::collections::BTreeMap<String, crate::config::ReasoningEffortPolicy> {
+        std::collections::BTreeMap::from([(
+            "GLM-5.2-NVFP4-MTP".to_string(),
+            crate::config::ReasoningEffortPolicy {
+                default: Some("max".to_string()),
+                map: std::collections::BTreeMap::from([
+                    (
+                        "high".to_string(),
+                        json!({"chat_template_kwargs": {"reasoning_effort": "high"}}),
+                    ),
+                    (
+                        "max".to_string(),
+                        json!({"chat_template_kwargs": {"reasoning_effort": "max"}}),
+                    ),
+                    (
+                        "none".to_string(),
+                        json!({"chat_template_kwargs": {"enable_thinking": false}}),
+                    ),
+                ]),
+            },
+        )])
+    }
+
+    #[test]
+    fn reasoning_effort_fragment_resolves_level_default_and_canonical() {
+        use super::reasoning_effort_fragment;
+        let p = glm_effort_policies();
+        let ctk_effort = |frag: Value| frag["chat_template_kwargs"]["reasoning_effort"].clone();
+        // Exact id + explicit level.
+        assert_eq!(
+            ctk_effort(reasoning_effort_fragment(&p, "GLM-5.2-NVFP4-MTP", Some("high")).unwrap()),
+            json!("high")
+        );
+        // Canonical-key match (case/punctuation differences).
+        assert_eq!(
+            ctk_effort(reasoning_effort_fragment(&p, "glm 5.2 nvfp4 mtp", Some("max")).unwrap()),
+            json!("max")
+        );
+        // Raw absent -> policy default ("max").
+        assert_eq!(
+            ctk_effort(reasoning_effort_fragment(&p, "GLM-5.2-NVFP4-MTP", None).unwrap()),
+            json!("max")
+        );
+        // Off.
+        assert_eq!(
+            reasoning_effort_fragment(&p, "GLM-5.2-NVFP4-MTP", Some("none")).unwrap()["chat_template_kwargs"]
+                ["enable_thinking"],
+            json!(false)
+        );
+        // Level not in the map -> None (engine keeps its clamped top-level effort).
+        assert!(reasoning_effort_fragment(&p, "GLM-5.2-NVFP4-MTP", Some("medium")).is_none());
+        // Unknown model -> None.
+        assert!(reasoning_effort_fragment(&p, "other-model", Some("high")).is_none());
+    }
+
+    #[test]
+    fn effort_fragment_overrides_config_default_but_client_wins() {
+        use super::apply_reasoning_effort_fragment;
+        let fragment = json!({"chat_template_kwargs": {"reasoning_effort": "high"}});
+
+        // A configured chat_template_kwargs default is OVERRIDDEN by the map
+        // (prefer-source), fixing the "config blocks the map" case.
+        let mut request = family_request("GLM-5.2-NVFP4-MTP");
+        request.extra_body.insert(
+            "chat_template_kwargs".to_string(),
+            json!({"reasoning_effort": "max", "sibling": 1}),
+        );
+        apply_reasoning_effort_fragment(&mut request, &fragment);
+        assert_eq!(kwargs_of(&request)["reasoning_effort"], json!("high"));
+        assert_eq!(kwargs_of(&request)["sibling"], json!(1));
+
+        // An explicit CLIENT value wins over the map (client > effort-map).
+        let mut request = family_request("GLM-5.2-NVFP4-MTP");
+        request.client_chat_template_kwargs = Some(JsonMap::from_iter([(
+            "reasoning_effort".to_string(),
+            json!("max"),
+        )]));
+        apply_reasoning_effort_fragment(&mut request, &fragment);
+        assert_eq!(kwargs_of(&request)["reasoning_effort"], json!("max"));
+    }
+
+    #[test]
+    fn effort_fragment_survives_kimi_family_injection() {
+        use super::apply_reasoning_effort_fragment;
+        // Kimi injection wipes enable_thinking/reasoning_effort and forces
+        // thinking=true; applying the fragment AFTER family re-asserts the map's
+        // enable_thinking:false (fixes the Kimi-map-ignored finding).
+        let mut request = family_request("kimi-k2-instruct");
+        apply_family_chat_template_kwargs(&mut request);
+        assert_eq!(kwargs_of(&request)["thinking"], json!(true));
+        apply_reasoning_effort_fragment(
+            &mut request,
+            &json!({"chat_template_kwargs": {"enable_thinking": false}}),
+        );
+        assert_eq!(kwargs_of(&request)["enable_thinking"], json!(false));
     }
 
     #[test]

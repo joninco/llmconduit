@@ -106,6 +106,12 @@ impl UpstreamClient for MockUpstream {
         // the FINAL provider model, so the recorded request reflects what the
         // backend would actually receive.
         let mut request = request.clone();
+        // Mirror the production leaf: strip the engine's reserved raw-effort
+        // marker, then inject family kwargs from the FINAL model. (The per-model
+        // reasoning_effort_map is exercised via the real leaf in port_config.rs.)
+        request
+            .extra_body
+            .remove(llmconduit::upstream::CANONICAL_REASONING_EFFORT_KEY);
         llmconduit::upstream::apply_family_chat_template_kwargs(&mut request);
         let request = &request;
         self.requests.lock().await.push(request.clone());

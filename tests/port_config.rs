@@ -1219,3 +1219,86 @@ async fn response_headers_expose_model_fallback() {
     );
     assert_eq!(header(&exact, "x-llmconduit-requested"), None);
 }
+
+// ---------------------------------------------------------------------------
+// Per-model reasoning-effort map (applied at the upstream leaf)
+// ---------------------------------------------------------------------------
+
+/// End-to-end through the REAL upstream leaf: a request whose effort maps via a
+/// model profile's `reasoning_effort_map` reaches the backend as
+/// `chat_template_kwargs.reasoning_effort`, against the FINAL resolved model.
+/// The POST mock only fires when the body carries the mapped knob, so a 200 (vs
+/// wiremock's 404 on no-match) proves the map was applied at the leaf.
+#[tokio::test]
+async fn reasoning_effort_map_reaches_backend_chat_template_kwargs() {
+    let backend = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "GLM-test"}]})),
+        )
+        .mount(&backend)
+        .await;
+    // Only matches when the leaf placed the mapped effort in chat_template_kwargs
+    // AND resolved the request model to the served backend model.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(json!({
+            "model": "GLM-test",
+            "chat_template_kwargs": {"reasoning_effort": "high"}
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_sse_body("chat-glm", "ok")),
+        )
+        .mount(&backend)
+        .await;
+
+    let config = config_from_yaml(&format!(
+        r#"
+upstreams:
+  - name: "backend"
+    upstream_base_url: "{}/v1/"
+model_profiles:
+  GLM-test:
+    reasoning_effort_default: max
+    reasoning_effort_map:
+      high: {{ chat_template_kwargs: {{ reasoning_effort: high }} }}
+      max: {{ chat_template_kwargs: {{ reasoning_effort: max }} }}
+"#,
+        backend.uri()
+    ));
+
+    // Anthropic request with Claude Code's adaptive-thinking + output_config.effort=high,
+    // model unserved by the backend so it falls back to GLM-test.
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4",
+                        "max_tokens": 16,
+                        "stream": false,
+                        "thinking": {"type": "adaptive"},
+                        "output_config": {"effort": "high"},
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "leaf must POST chat_template_kwargs.reasoning_effort=high for the resolved GLM-test model"
+    );
+}

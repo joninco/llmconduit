@@ -74,19 +74,36 @@ pub fn build_app_with_gateway_and_options(
     // (G7); routes alone are enough to switch the gateway into the routing
     // client so route-name/glob matching applies.
     let routing_mode = !config.upstreams.is_empty() || !config.model_routes.is_empty();
+    // Per-backend-model reasoning-effort policies, shared (cheap clone) across all
+    // leaf clients so each gets the FINAL model's effort vocabulary. Copy the
+    // scalar config knobs out so the builder closure doesn't borrow `config`
+    // (which is moved into the Gateway below).
+    let effort_policies = Arc::new(config.reasoning_effort_policies());
+    let flatten_content = config.flatten_content;
+    let min_completion_tokens = config.min_completion_tokens;
+    let max_sse_frame_bytes = config.max_sse_frame_bytes;
+    let make_upstream_client =
+        |base_url: url::Url, api_key: Option<String>, log_path: Option<std::path::PathBuf>| {
+            ReqwestUpstreamClient::with_options(
+                http_client.clone(),
+                base_url,
+                api_key,
+                log_path,
+                flatten_content,
+                min_completion_tokens,
+                max_sse_frame_bytes,
+            )
+            .with_effort_policies(effort_policies.clone())
+        };
     let upstream: Arc<dyn crate::upstream::UpstreamClient> = if routing_mode {
         let providers = config
             .upstreams
             .iter()
             .map(|provider| {
-                let primary_client = ReqwestUpstreamClient::with_options(
-                    http_client.clone(),
+                let primary_client = make_upstream_client(
                     provider.upstream_base_url.clone(),
                     provider.upstream_api_key.clone(),
                     provider.upstream_request_log_path.clone(),
-                    config.flatten_content,
-                    config.min_completion_tokens,
-                    config.max_sse_frame_bytes,
                 );
                 let fallback_providers = provider
                     .fallback_upstreams
@@ -94,14 +111,10 @@ pub fn build_app_with_gateway_and_options(
                     .map(|fallback| {
                         FailoverUpstreamProvider::new(
                             fallback.name.clone(),
-                            ReqwestUpstreamClient::with_options(
-                                http_client.clone(),
+                            make_upstream_client(
                                 fallback.upstream_base_url.clone(),
                                 fallback.upstream_api_key.clone(),
                                 fallback.upstream_request_log_path.clone(),
-                                config.flatten_content,
-                                config.min_completion_tokens,
-                                config.max_sse_frame_bytes,
                             ),
                             fallback.upstream_model.clone(),
                             fallback.exposed_model.clone(),
@@ -126,14 +139,10 @@ pub fn build_app_with_gateway_and_options(
         let mut route_providers = Vec::with_capacity(config.model_routes.len());
         let mut route_specs = Vec::with_capacity(config.model_routes.len());
         for (index, route) in config.model_routes.iter().enumerate() {
-            let client = ReqwestUpstreamClient::with_options(
-                http_client.clone(),
+            let client = make_upstream_client(
                 route.upstream_base_url.clone(),
                 config.upstream_api_key.clone(),
                 config.upstream_request_log_path.clone(),
-                config.flatten_content,
-                config.min_completion_tokens,
-                config.max_sse_frame_bytes,
             );
             route_providers.push(RouteUpstreamProvider::new(
                 format!("route-{}", route.name),
@@ -153,14 +162,10 @@ pub fn build_app_with_gateway_and_options(
             route_specs,
         ))
     } else {
-        let primary_upstream = ReqwestUpstreamClient::with_options(
-            http_client.clone(),
+        let primary_upstream = make_upstream_client(
             config.upstream_base_url.clone(),
             config.upstream_api_key.clone(),
             config.upstream_request_log_path.clone(),
-            config.flatten_content,
-            config.min_completion_tokens,
-            config.max_sse_frame_bytes,
         );
         if config.fallback_upstreams.is_empty() {
             Arc::new(primary_upstream)
@@ -175,14 +180,10 @@ pub fn build_app_with_gateway_and_options(
             providers.extend(config.fallback_upstreams.iter().map(|provider| {
                 FailoverUpstreamProvider::new(
                     provider.name.clone(),
-                    ReqwestUpstreamClient::with_options(
-                        http_client.clone(),
+                    make_upstream_client(
                         provider.upstream_base_url.clone(),
                         provider.upstream_api_key.clone(),
                         provider.upstream_request_log_path.clone(),
-                        config.flatten_content,
-                        config.min_completion_tokens,
-                        config.max_sse_frame_bytes,
                     ),
                     provider.upstream_model.clone(),
                     provider.exposed_model.clone(),

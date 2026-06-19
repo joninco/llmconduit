@@ -804,27 +804,27 @@ impl Config {
         kwargs
     }
 
-    /// Merged per-model reasoning-effort policy for the resolved model across its
-    /// profile chain, or `None` when no matched profile defines a
-    /// `reasoning_effort_map`. Later profiles in the match order (request-model
-    /// keyed) override earlier (resolved-model keyed) ones, mirroring
-    /// `resolve_upstream_chat_kwargs_for_resolved_model`.
-    pub fn resolve_reasoning_effort_policy(
-        &self,
-        request_model: &str,
-        resolved_model: &str,
-    ) -> Option<ReasoningEffortPolicy> {
-        let mut map: BTreeMap<String, JsonValue> = BTreeMap::new();
-        let mut default: Option<String> = None;
-        for profile in self.model_profiles_for_resolved_model(request_model, resolved_model) {
-            for (level, fragment) in &profile.reasoning_effort_map {
-                map.insert(level.trim().to_ascii_lowercase(), fragment.clone());
-            }
-            if let Some(level) = trim_nonempty(profile.reasoning_effort_default.as_deref()) {
-                default = Some(level.to_ascii_lowercase());
-            }
-        }
-        (!map.is_empty()).then_some(ReasoningEffortPolicy { map, default })
+    /// Per-BACKEND-MODEL reasoning-effort policies, keyed by the resolved model
+    /// id (profile name). Applied at the upstream LEAF — the single point that
+    /// knows the FINAL provider model after routing/failover/exposed-alias remap
+    /// — so a route/failover target gets its OWN model's effort vocabulary rather
+    /// than the request alias's. Each profile's `reasoning_effort_map` is already
+    /// extends-merged. Only profiles that define a map are included.
+    pub fn reasoning_effort_policies(&self) -> BTreeMap<String, ReasoningEffortPolicy> {
+        self.model_profiles
+            .iter()
+            .filter(|(_, profile)| !profile.reasoning_effort_map.is_empty())
+            .map(|(name, profile)| {
+                let map = profile
+                    .reasoning_effort_map
+                    .iter()
+                    .map(|(level, fragment)| (level.trim().to_ascii_lowercase(), fragment.clone()))
+                    .collect();
+                let default = trim_nonempty(profile.reasoning_effort_default.as_deref())
+                    .map(|level| level.to_ascii_lowercase());
+                (name.clone(), ReasoningEffortPolicy { map, default })
+            })
+            .collect()
     }
 
     /// Resolve an explicit backend chat-template family override for this
@@ -1519,9 +1519,10 @@ model_profiles:
         )
         .expect("yaml");
         let config = Config::from_persisted(&persisted).expect("config");
-        let policy = config
-            .resolve_reasoning_effort_policy("GLM-5.2-NVFP4-MTP", "GLM-5.2-NVFP4-MTP")
-            .expect("policy present");
+        let policies = config.reasoning_effort_policies();
+        let policy = policies
+            .get("GLM-5.2-NVFP4-MTP")
+            .expect("GLM policy present");
         // Default + template levels resolve; the profile ADDS xhigh on top.
         assert_eq!(policy.default.as_deref(), Some("max"));
         assert_eq!(
@@ -1536,12 +1537,8 @@ model_profiles:
             policy.map["none"]["chat_template_kwargs"]["enable_thinking"],
             json!(false)
         );
-        // A model with no effort map resolves to no policy.
-        assert!(
-            config
-                .resolve_reasoning_effort_policy("other", "other")
-                .is_none()
-        );
+        // A profile with no effort map is not included.
+        assert!(!policies.contains_key("other"));
     }
     use std::collections::BTreeMap;
     use std::path::PathBuf;
