@@ -1,5 +1,7 @@
 # G8 — Reasoning promotion / suppression heuristics
 
+> **Status: SHIPPED** — historical design input. Acceptance criteria below are satisfied by the implemented code/tests; see `.ralph/IMPLEMENTATION_PLAN.md` (Task for this gap) for the final design. Open questions/verify-first notes are resolved.
+
 **Priority:** MED · **Surface:** response-translation (Responses → Anthropic) · **GAPS.md:** G8
 
 ## Purpose

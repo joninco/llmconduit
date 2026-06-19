@@ -1,5 +1,7 @@
 # G6 — SSE per-frame buffer cap (DoS guard)
 
+> **Status: SHIPPED** — historical design input. Acceptance criteria below are satisfied by the implemented code/tests; see `.ralph/IMPLEMENTATION_PLAN.md` (Task for this gap) for the final design. Open questions/verify-first notes are resolved.
+
 **Priority:** MED · **Surface:** streaming-sse · **GAPS.md:** G6 (ASSUMPTION — verify first)
 
 ## Purpose

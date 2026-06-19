@@ -1,5 +1,7 @@
 # G5 — Debug-dump log rotation
 
+> **Status: SHIPPED** — historical design input. Acceptance criteria below are satisfied by the implemented code/tests; see `.ralph/IMPLEMENTATION_PLAN.md` (Task for this gap) for the final design. Open questions/verify-first notes are resolved.
+
 **Priority:** LOW-MED · **Surface:** debug-logging · **GAPS.md:** G5
 
 ## Purpose

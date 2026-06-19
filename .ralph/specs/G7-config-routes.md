@@ -1,5 +1,7 @@
 # G7 — Config: glob routes / CLI --model-route / TOML
 
+> **Status: SHIPPED** — historical design input. Acceptance criteria below are satisfied by the implemented code/tests; see `.ralph/IMPLEMENTATION_PLAN.md` (Task for this gap) for the final design. Open questions/verify-first notes are resolved.
+
 **Priority:** LOW · **Surface:** config-loading / CLI · **GAPS.md:** G7
 "Different-by-design" routing. Port the remaining claude-relay config behaviors to llmconduit's YAML-upstreams
 model WITHOUT regressing the existing `canonical_model_key` + exposed-alias routing or the profile chain.

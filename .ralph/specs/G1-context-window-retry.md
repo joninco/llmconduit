@@ -1,5 +1,7 @@
 # G1 — Context-window-limit retry
 
+> **Status: SHIPPED** — historical design input. Acceptance criteria below are satisfied by the implemented code/tests; see `.ralph/IMPLEMENTATION_PLAN.md` (Task for this gap) for the final design. Open questions/verify-first notes are resolved.
+
 **Priority:** HIGH · **Surface:** error-mapping · **GAPS.md:** G1
 
 ## Purpose

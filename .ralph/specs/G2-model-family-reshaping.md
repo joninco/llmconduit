@@ -1,5 +1,7 @@
 # G2 — Backend model-family reshaping (Kimi / DeepSeek)
 
+> **Status: SHIPPED** — historical design input. Acceptance criteria below are satisfied by the implemented code/tests; see `.ralph/IMPLEMENTATION_PLAN.md` (Task for this gap) for the final design. Open questions/verify-first notes are resolved.
+
 **Priority:** MED · **Surface:** backend-routing · **GAPS.md:** G2
 
 ## Purpose

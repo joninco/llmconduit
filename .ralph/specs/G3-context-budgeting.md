@@ -1,5 +1,7 @@
 # G3 — Pre-flight context budgeting
 
+> **Status: SHIPPED** — historical design input. Acceptance criteria below are satisfied by the implemented code/tests; see `.ralph/IMPLEMENTATION_PLAN.md` (Task for this gap) for the final design. Open questions/verify-first notes are resolved.
+
 **Priority:** MED · **Surface:** server-http / engine · **GAPS.md:** G3
 
 ## Purpose

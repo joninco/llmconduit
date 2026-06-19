@@ -1,5 +1,7 @@
 # G4 — Image agent (vision offload)
 
+> **Status: SHIPPED** — historical design input. Acceptance criteria below are satisfied by the implemented code/tests; see `.ralph/IMPLEMENTATION_PLAN.md` (Task for this gap) for the final design. Open questions/verify-first notes are resolved.
+
 **Priority:** LOW (largest gap, 47 behaviors) · **Surface:** engine / new vision seam · **GAPS.md:** G4
 Owner directed implementation despite the "deliberately absent" architectural note. Port claude-relay's
 in-proxy vision offload to llmconduit's canonical-Responses pipeline WITHOUT violating the engine hard rules.

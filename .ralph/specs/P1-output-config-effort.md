@@ -1,5 +1,7 @@
 # P1 — Anthropic output_config.effort → reasoning.effort
 
+> **Status: SHIPPED** — historical design input. Acceptance criteria below are satisfied by the implemented code/tests; see `.ralph/IMPLEMENTATION_PLAN.md` (Task for this gap) for the final design. Open questions/verify-first notes are resolved.
+
 **Priority:** quick-win (stub already exists) · **Surface:** request-translation · **GAPS.md:** P1
 
 ## Purpose
