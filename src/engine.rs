@@ -438,41 +438,17 @@ impl Gateway {
         Arc::clone(&self.upstream)
     }
 
-    pub async fn resolve_request_model(&self, request_model: &str) -> String {
+    /// Resolve `request_model` to the served upstream model and whether the
+    /// resolution was GENUINE (the request truly maps to the served backend, not
+    /// a catalog-default fallback). `genuine` is a byproduct of the one
+    /// normalization ladder — NOT a re-derived side-channel (T2 deleted
+    /// `request_model_genuinely_resolves`, which walked the ladder a second
+    /// time). G4 native-vision gating consumes it so a request-model
+    /// `native_vision` override attaches ONLY when the request genuinely maps to
+    /// the served backend (G4 round-8 #1).
+    pub async fn resolve_request_model(&self, request_model: &str) -> (String, bool) {
         let configured_model = self.config.resolve_upstream_model(request_model);
         self.normalize_upstream_model(&configured_model).await
-    }
-
-    /// Whether `request_model` GENUINELY resolves to the served backend (G4
-    /// round-8) — i.e. `normalize_upstream_model` did NOT collapse it to the
-    /// catalog DEFAULT because it was blank/unmatched/ambiguous. Mirrors that
-    /// function's precedence exactly: an exact id, an ad-hoc route, a unique
-    /// canonical-key match, OR a pass-through when there is no default to collapse
-    /// to (empty catalog / catalog-load failure — the model flows through
-    /// unchanged, so the request model IS the served model). ONLY the
-    /// `default_id` fallback (a real, differing default) is non-genuine.
-    ///
-    /// G4 gating uses this so a request-model `native_vision` override is honored
-    /// ONLY when the request actually maps to the served backend; on a
-    /// default-fallback the override must NOT attach to the (different) default
-    /// backend (round-8 #1).
-    async fn request_model_genuinely_resolves(&self, request_model: &str) -> bool {
-        let configured_model = self.config.resolve_upstream_model(request_model);
-        let catalog = match self.load_upstream_model_catalog().await {
-            Ok(catalog) => catalog,
-            // Catalog unavailable ⇒ model flows through unchanged ⇒ genuine.
-            Err(_) => return true,
-        };
-        if catalog.exact_id(&configured_model).is_some()
-            || self.config.matches_model_route(&configured_model)
-            || catalog.canonical_unique(&configured_model).is_some()
-        {
-            return true;
-        }
-        // No genuine match: `normalize_upstream_model` collapses to `default_id`
-        // ONLY when a default exists. With no default (empty catalog) the model
-        // passes through unchanged, so the request model IS the served model.
-        catalog.default_id().is_none()
     }
 
     /// Decide whether the Chat output converter must suppress
@@ -525,7 +501,7 @@ impl Gateway {
         self: Arc<Self>,
         request: ResponsesRequest,
     ) -> AppResult<ReceiverStream<SseEvent>> {
-        let resolved_model = self.resolve_request_model(&request.model).await;
+        let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
         let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
 
         // G4 image-agent strip/cache seam. This runs AFTER model/profile
@@ -537,9 +513,12 @@ impl Gateway {
         // (images → placeholders, inject one `analyzeImage` tool + system
         // instruction, dedup) and returns a per-turn session id; we then lower
         // with the image agent active so `analyzeImage` classifies as the
-        // server-side tool and thread the session id to the executor.
+        // server-side tool and thread the session id to the executor. T2: the
+        // `request_genuine` flag (byproduct of the one normalization walk) is
+        // threaded so the gate's request-override attaches ONLY when the request
+        // genuinely maps to the served backend (round-8 #1).
         let vision_session = self
-            .activate_image_agent(&mut request, &resolved_model)
+            .activate_image_agent(&mut request, &resolved_model, request_genuine)
             .await;
 
         let (baseline_record, prefix_len) = self.find_replay_baseline(&request).await?;
@@ -686,6 +665,7 @@ impl Gateway {
         &self,
         request: &mut ResponsesRequest,
         resolved_model: &str,
+        request_genuine: bool,
     ) -> Option<String> {
         if !self.config.image_agent_enabled || self.config.vision_url.is_none() {
             return None;
@@ -698,12 +678,12 @@ impl Gateway {
         }
         // Native-vision gating decides passthrough vs strip+offload. Candidates
         // are enumerated from the RESOLVED model (where the request lands,
-        // round-4 #1); the raw `request.model` is threaded so a `native_vision`
-        // override on the request model/route can attach to the candidate it
-        // GENUINELY maps to (round-7 #1, corrected round-8 #1). See the decision
-        // table on `backend_is_native_vision`.
+        // round-4 #1); the raw `request.model` + `request_genuine` are threaded
+        // so a `native_vision` override on the request model/route can attach to
+        // the candidate it GENUINELY maps to (round-7 #1, corrected round-8 #1).
+        // See the decision table on `backend_is_native_vision`.
         if self
-            .backend_is_native_vision(&request.model, resolved_model)
+            .backend_is_native_vision(&request.model, resolved_model, request_genuine)
             .await
         {
             return None;
@@ -727,7 +707,7 @@ impl Gateway {
     /// ```text
     /// (1) Candidate set = every pre-first-chunk serving backend (selected
     ///     primary + its failover chain + routing target), enumerated from
-    ///     `resolved_model` via `candidate_backend_models`.
+    ///     `resolved_model` via `backend_candidate_plan`.
     ///     EMPTY/unknown  =>  STRIP (return false) — never fall back to a
     ///     name-looks-native model.
     ///
@@ -736,8 +716,10 @@ impl Gateway {
     ///     remap, round-9 #1), native(c) =
     ///     (2a) IF request_model GENUINELY resolves/maps to c (exact id / route /
     ///          unique canonical key — NOT the blank/unmatched/ambiguous default
-    ///          fallback, see `request_model_genuinely_resolves`) AND the LITERAL
-    ///          request model's profile sets `native_vision` => that value
+    ///          fallback; `request_genuine`, a byproduct of the ONE
+    ///          `normalize_upstream_model` walk threaded from `stream_responses`
+    ///          since T2) AND the LITERAL request model's profile sets
+    ///          `native_vision` => that value
     ///     (2b) ELSE c's OWN profile `native_vision` (keyed on c exactly) if set
     ///     (2c) ELSE name-based native detection (Kimi etc.)
     ///
@@ -754,20 +736,35 @@ impl Gateway {
     /// fallback (round-2/3). All native_vision lookups are profile-only on the
     /// exact model, so a candidate's (or the request's) `upstream_model` remap
     /// cannot make the gate judge a different model than runs (round-9 #1).
-    async fn backend_is_native_vision(&self, request_model: &str, resolved_model: &str) -> bool {
-        let candidates = self.upstream.candidate_backend_models(resolved_model).await;
+    async fn backend_is_native_vision(
+        &self,
+        request_model: &str,
+        resolved_model: &str,
+        request_genuine: bool,
+    ) -> bool {
+        // T2: the routing/failover layer owns the candidate set (typed
+        // `BackendCandidatePlan`), and `request_genuine` — a byproduct of the
+        // ONE `normalize_upstream_model` walk, threaded from `stream_responses`
+        // — owns the genuine-vs-default signal. The gate no longer re-derives
+        // the resolution ladder in the engine.
+        let candidates = self
+            .upstream
+            .backend_candidate_plan(resolved_model)
+            .await
+            .candidates;
         if candidates.is_empty() {
             // Cell 1: unknown candidate set ⇒ strip (works for every backend).
             return false;
         }
         // The request override (cell 2a) may attach to the SELECTED primary
         // candidate (index 0 — the model the resolved request lands on) only when
-        // the request model GENUINELY resolves there. On a default-fallback it
-        // does not map to that candidate, so the override is dropped entirely and
-        // every candidate uses per-candidate detection. This is a PROFILE-ONLY
-        // lookup on the LITERAL request model (round-9 #1): no `upstream_model`
-        // remap, so the remap TARGET's profile cannot displace the request's.
-        let request_override = if self.request_model_genuinely_resolves(request_model).await {
+        // the request model GENUINELY resolves there. On a default-fallback
+        // (`request_genuine == false`) it does not map to that candidate, so the
+        // override is dropped entirely and every candidate uses per-candidate
+        // detection. This is a PROFILE-ONLY lookup on the LITERAL request model
+        // (round-9 #1): no `upstream_model` remap, so the remap TARGET's profile
+        // cannot displace the request's.
+        let request_override = if request_genuine {
             self.config.profile_native_vision(request_model)
         } else {
             None
@@ -1780,12 +1777,20 @@ impl Gateway {
         Ok(())
     }
 
-    async fn normalize_upstream_model(&self, model: &str) -> String {
+    /// Resolve `model` against the upstream catalog, returning the served model
+    /// AND whether the resolution was GENUINE (true = the request truly maps to
+    /// the served backend; false = collapsed to a real, differing catalog
+    /// default because the model was blank/unmatched/ambiguous). The `genuine`
+    /// flag is a byproduct of this ONE ladder walk — not a re-derived
+    /// side-channel — so G4 gating (the only `genuine` consumer) keeps a single
+    /// resolution truth (T2 deleted `request_model_genuinely_resolves`).
+    async fn normalize_upstream_model(&self, model: &str) -> (String, bool) {
         let catalog = match self.load_upstream_model_catalog().await {
             Ok(catalog) => catalog,
             Err(err) => {
                 tracing::warn!(model, error = %err, "failed to refresh upstream model catalog");
-                return model.to_string();
+                // Catalog unavailable ⇒ model flows through unchanged ⇒ genuine.
+                return (model.to_string(), true);
             }
         };
         // Precedence (mirrors `RoutingModelCatalog::resolve`, G7; route-match
@@ -1798,12 +1803,17 @@ impl Gateway {
         //   4. default catalog id.
         // The ladder is duplicated here vs `RoutingModelCatalog::resolve` because
         // the engine normalizes against its own `UpstreamModelCatalog` (which also
-        // carries G3 context limits) rather than the routing client's catalog.
-        // T2 collapses this: it deletes `request_model_genuinely_resolves` and
-        // returns a typed backend-candidate plan from the real routing layer, so
-        // the engine stops re-deriving the ladder. Without step 2, a mixed
-        // `upstreams` + `model_routes` config would pre-normalize a route-only
-        // model to the catalog default here and the route would never fire.
+        // carries G3 context limits for G3 budgeting) rather than the routing
+        // client's catalog. T2 collapsed the GATING side-channel
+        // (`request_model_genuinely_resolves` deleted; `genuine` is now a
+        // byproduct of this walk, and the gate's candidates come from a typed
+        // `BackendCandidatePlan` on the routing layer). The ladder DEDUP here
+        // remains because `UpstreamModelCatalog::context_limit_by_id` feeds G3
+        // budgeting, which T9 moves behind route/provider resolution — at which
+        // point this fn delegates to the routing catalog and the ladder
+        // collapses. Without step 2, a mixed `upstreams` + `model_routes` config
+        // would pre-normalize a route-only model to the catalog default here and
+        // the route would never fire.
         if let Some(exact) = catalog.exact_id(model) {
             if exact != model {
                 tracing::info!(
@@ -1812,12 +1822,12 @@ impl Gateway {
                     "normalized upstream model name from backend catalog"
                 );
             }
-            return exact;
+            return (exact, true);
         }
         if self.config.matches_model_route(model) {
             // Leave the model as-is; `RoutingUpstreamClient::resolve` performs
-            // the route match + upstream-model rewrite.
-            return model.to_string();
+            // the route match + upstream-model rewrite. A route match is genuine.
+            return (model.to_string(), true);
         }
         if let Some(canonical) = catalog.canonical_unique(model) {
             if canonical != model {
@@ -1827,21 +1837,25 @@ impl Gateway {
                     "normalized upstream model name from backend catalog"
                 );
             }
-            return canonical;
+            return (canonical, true);
         }
         // No exact id, ad-hoc route, or canonical-key match: fall back to the
         // first catalog model (claude-relay parity). A NON-BLANK requested model
         // that lands here is a genuine mismatch — the loaded backend model
         // differs from what the client asked for — so surface it at WARN. A
         // blank/absent model defaulting to the first catalog id is expected and
-        // stays at INFO.
+        // stays at INFO. Both blank and non-blank default-fallbacks are
+        // NON-genuine: the served model is the catalog default, not the request
+        // model (and a blank request has no model identity to attach an override
+        // to), so a `native_vision` override on the request model must NOT
+        // attach to the (different) default backend (G4 round-8 #1).
         match catalog.default_id() {
             Some(default) if model.trim().is_empty() => {
                 tracing::info!(
                     fallback_model = %default,
                     "no model requested; using the default catalog model"
                 );
-                default
+                (default, false)
             }
             Some(default) => {
                 if self.should_warn_model_fallback(model) {
@@ -1851,9 +1865,15 @@ impl Gateway {
                         "requested model is not served by any configured upstream; falling back to the default catalog model"
                     );
                 }
-                default
+                (default, false)
             }
-            None => model.to_string(),
+            None => {
+                // No default to collapse to (empty catalog) ⇒ the model passes
+                // through unchanged, so the request model IS the served model ⇒
+                // genuine (mirrors `RoutingModelCatalog::resolve` returning None
+                // for an empty catalog).
+                (model.to_string(), true)
+            }
         }
     }
 

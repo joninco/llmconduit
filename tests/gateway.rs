@@ -170,8 +170,14 @@ impl UpstreamClient for MockUpstream {
             .collect())
     }
 
-    async fn candidate_backend_models(&self, requested_model: &str) -> Vec<String> {
-        match self
+    // T2: override `backend_candidate_plan` (the single source of truth); the
+    // trait default projects `candidate_backend_models` from it. Injecting a
+    // configured candidate set simulates a failover chain for G4 gating tests.
+    async fn backend_candidate_plan(
+        &self,
+        requested_model: &str,
+    ) -> llmconduit::upstream::BackendCandidatePlan {
+        let candidates = match self
             .candidate_models
             .lock()
             .expect("candidate models lock")
@@ -179,7 +185,8 @@ impl UpstreamClient for MockUpstream {
         {
             Some(models) => models,
             None => vec![requested_model.to_string()],
-        }
+        };
+        llmconduit::upstream::BackendCandidatePlan { candidates }
     }
 }
 
@@ -7912,6 +7919,56 @@ async fn gating_table_unmatched_request_override_does_not_apply_to_default() {
     assert!(
         has_analyze,
         "default-fallback non-native ⇒ inject analyzeImage"
+    );
+}
+
+#[tokio::test]
+async fn gating_table_blank_request_override_does_not_apply_to_default() {
+    // Round-8 #1 (blank-model half): a BLANK request model carrying a
+    // `native_vision:true` profile keyed on the empty string must NOT attach
+    // that override to the non-native catalog default. A blank request has no
+    // model identity, so it cannot "genuinely map" to the default backend —
+    // `genuine` must be false for a default-fallback regardless of blankness,
+    // and the gate must STRIP. Regression guard for the T2 `genuine` flag
+    // (engine.rs `normalize_upstream_model` blank branch).
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["text-default-v1"]).await; // non-native default
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
+        .await;
+    let mut config = image_agent_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        String::new(),
+        llmconduit::config::ModelProfile {
+            upstream_model: None,
+            system_prompt_prefix: None,
+            native_vision: Some(true),
+            upstream_chat_kwargs: JsonMap::new(),
+            ..Default::default()
+        },
+    )]);
+    let gateway = test_gateway_with_vision(upstream.clone(), MockVisionClient::default(), config);
+    // Blank model → normalizes to text-default-v1 (the catalog default).
+    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    request.model = String::new();
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    let requests = upstream.requests().await;
+    assert_eq!(
+        requests[0].model, "text-default-v1",
+        "blank model normalized to default"
+    );
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(
+        !serialized.contains("iVBORw0KGgo"),
+        "a blank-model native_vision override must NOT pass raw images to the default backend"
+    );
+    let has_analyze = requests[0]
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t.function.name == "analyzeImage"));
+    assert!(
+        has_analyze,
+        "blank-model default-fallback non-native ⇒ inject analyzeImage"
     );
 }
 

@@ -46,6 +46,27 @@ pub struct UpstreamModelEntry {
 
 const ROUTING_MODEL_CATALOG_TTL_SECS: u64 = 300;
 
+/// Typed backend-candidate plan: the routing/failover layer's answer to "which
+/// backend models could serve this request pre-first-chunk?" G4 native-vision
+/// gating consumes this instead of re-deriving the candidate set in the engine
+/// (T2). The `genuine` signal — whether the request model truly resolved vs.
+/// fell back to a catalog default — is ENGINE-side (a byproduct of
+/// `normalize_upstream_model`, not a re-derived ladder; see
+/// `backend_is_native_vision`), because in non-routing mode there is no routing
+/// resolver to ask and the engine's catalog is the single resolution truth.
+/// T9 collapses `normalize_upstream_model` onto the routing catalog (G3
+/// context-limit coupling), at which point `genuine` can fold in here too.
+///
+/// `candidates` is every pre-first-chunk serving backend model (the selected
+/// primary + its whole failover chain + the routing target), enumerated from
+/// the FINAL backend models the providers receive — no further
+/// `upstream_model` remap. Empty ⇒ unknown candidate set (catalog-load
+/// failure), which the gate treats as strip+offload.
+#[derive(Debug, Clone)]
+pub struct BackendCandidatePlan {
+    pub candidates: Vec<String>,
+}
+
 #[async_trait]
 pub trait UpstreamClient: Send + Sync {
     async fn stream_chat_completion(
@@ -91,10 +112,27 @@ pub trait UpstreamClient: Send + Sync {
     /// uses the SAFE invariant over this set (passthrough only if EVERY candidate
     /// is native-vision), so it can never disagree with the provider that serves.
     ///
-    /// The default impl (single `ReqwestUpstreamClient`) sends the request model
-    /// unchanged, so the only candidate is `requested_model` itself.
+    /// Default impl: thin projection over
+    /// [`backend_candidate_plan`](Self::backend_candidate_plan) — the single
+    /// source of truth since T2. A single-provider passthrough sends the request
+    /// model unchanged, so the only candidate is `requested_model` itself.
     async fn candidate_backend_models(&self, requested_model: &str) -> Vec<String> {
-        vec![requested_model.to_string()]
+        self.backend_candidate_plan(requested_model)
+            .await
+            .candidates
+    }
+
+    /// Typed backend-candidate plan for `requested_model` — the routing/failover
+    /// layer's candidate set for G4 native-vision gating (T2). The `genuine`
+    /// signal is engine-side; this method returns only `candidates`.
+    ///
+    /// Default impl: a single-provider passthrough sends the request model
+    /// unchanged, so the only candidate is `requested_model` itself.
+    /// Routing/failover clients override to fold in the failover chain.
+    async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
+        BackendCandidatePlan {
+            candidates: vec![requested_model.to_string()],
+        }
     }
 }
 
@@ -1392,14 +1430,16 @@ impl UpstreamClient for FailoverUpstreamClient {
             .await
     }
 
-    /// Every configured provider is a pre-first-chunk failover candidate, so the
-    /// candidate model set is each provider's effective model — its
-    /// `upstream_model` rewrite (matching `request_for_provider`) or the request
-    /// model when it sends through unchanged (G4 round-2 #1). We enumerate ALL
-    /// providers (not just currently-available ones): cooldown is transient, so
-    /// a fallback that is non-native must still force strip+offload.
-    async fn candidate_backend_models(&self, requested_model: &str) -> Vec<String> {
-        self.providers
+    /// Typed plan: a failover chain's candidate set is each provider's
+    /// effective model — its `upstream_model` rewrite (matching
+    /// `request_for_provider`) or the request model when it sends through
+    /// unchanged (G4 round-2 #1). We enumerate ALL providers (not just
+    /// currently-available ones): cooldown is transient, so a fallback that is
+    /// non-native must still force strip+offload. `candidate_backend_models`
+    /// (trait default) projects from this.
+    async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
+        let candidates = self
+            .providers
             .iter()
             .map(|provider| {
                 provider
@@ -1407,7 +1447,8 @@ impl UpstreamClient for FailoverUpstreamClient {
                     .clone()
                     .unwrap_or_else(|| requested_model.to_string())
             })
-            .collect()
+            .collect();
+        BackendCandidatePlan { candidates }
     }
 }
 
@@ -1421,26 +1462,34 @@ impl UpstreamClient for RoutingUpstreamClient {
             .await
     }
 
-    /// Candidate backend models for `requested_model` using the SAME route/
-    /// catalog resolution as `stream_chat_completion` (G4 review #2 + round-2
-    /// #1). A route resolves to one backend model. A catalog match dispatches to
-    /// a routing provider: the PRIMARY target may fail over across that
+    /// Typed backend-candidate plan using the SAME route/catalog resolution as
+    /// `stream_chat_completion` (G4 review #2 + round-2 #1). Candidates only;
+    /// the `genuine` signal is engine-side (see `BackendCandidatePlan`).
+    ///
+    /// A route resolves to one backend model. A catalog match dispatches to a
+    /// routing provider: the PRIMARY target may fail over across that
     /// provider's whole failover chain (so all of its candidate models count),
     /// while a fallback/exposed-alias target serves only that single provider's
-    /// model. A catalog-load failure yields an empty set, which the safe
-    /// invariant treats as "unknown → strip+offload".
-    async fn candidate_backend_models(&self, requested_model: &str) -> Vec<String> {
+    /// model. A catalog-load failure or empty catalog yields an empty candidate
+    /// set, which the safe invariant treats as "unknown → strip+offload".
+    async fn backend_candidate_plan(&self, requested_model: &str) -> BackendCandidatePlan {
         let Ok(catalog) = self.load_catalog().await else {
-            return Vec::new();
+            return BackendCandidatePlan {
+                candidates: Vec::new(),
+            };
         };
         let Some((resolution, _kind)) = catalog.resolve(requested_model) else {
-            return Vec::new();
+            return BackendCandidatePlan {
+                candidates: Vec::new(),
+            };
         };
-        match resolution {
+        let candidates = match resolution {
             RoutingResolution::Route { model_id, .. } => vec![model_id],
             RoutingResolution::Catalog(candidate) => {
                 let Some(provider) = self.providers.get(candidate.provider_index) else {
-                    return Vec::new();
+                    return BackendCandidatePlan {
+                        candidates: Vec::new(),
+                    };
                 };
                 match candidate.target {
                     // Primary: the whole nested failover chain may serve.
@@ -1459,7 +1508,8 @@ impl UpstreamClient for RoutingUpstreamClient {
                         .unwrap_or_else(|| vec![candidate.model_id.clone()]),
                 }
             }
-        }
+        };
+        BackendCandidatePlan { candidates }
     }
 
     async fn stream_chat_completion_with_timeout(

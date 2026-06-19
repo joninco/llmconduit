@@ -710,7 +710,7 @@ async fn post_responses(
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let served = gateway.resolve_request_model(&request.model).await;
+    let served = gateway.resolve_request_model(&request.model).await.0;
     let wants_stream = request.stream;
     let stream = gateway.stream_responses(request).await?;
     let response = if wants_stream {
@@ -736,7 +736,7 @@ async fn post_chat_completions(
     Json(request): Json<ChatCompletionRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let model = gateway.resolve_request_model(&request.model).await;
+    let model = gateway.resolve_request_model(&request.model).await.0;
     let wants_stream = request.stream;
     let include_usage = request
         .stream_options
@@ -775,7 +775,7 @@ async fn handle_post_messages(
     request: AnthropicRequest,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
-    let model = gateway.resolve_request_model(&request.model).await;
+    let model = gateway.resolve_request_model(&request.model).await.0;
     let wants_stream = request.stream;
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let stream = gateway.stream_responses(responses_request).await?;
