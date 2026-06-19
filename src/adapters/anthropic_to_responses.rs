@@ -167,11 +167,12 @@ fn apply_output_config_effort(
 
 /// Pull the raw `output_config.effort` string out of the request. Any non-empty
 /// value (trimmed) passes through verbatim as canonical `reasoning.effort`;
-/// effort validation is single-sourced in
-/// `responses_to_chat::normalize_reasoning_effort`, which lowercases, clamps
-/// unsupported levels, and maps unknown values to a supported effort at lowering
-/// time. Only missing/empty/non-string values are dropped here so they cannot
-/// clobber a budget-derived effort.
+/// effort normalization is single-sourced in
+/// `responses_to_chat::normalize_reasoning_effort` (trim + lowercase only — it
+/// no longer clamps/maps), and the per-model clamp/map happens at the upstream
+/// leaf in `upstream::finalize_request_for_backend`. Only missing/empty/
+/// non-string values are dropped here so they cannot clobber a budget-derived
+/// effort.
 fn output_config_effort(output_config: &Option<Value>) -> Option<String> {
     let effort = output_config
         .as_ref()?

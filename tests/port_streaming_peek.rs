@@ -1,4 +1,9 @@
-//! Gap G3, second half — reasoning-aware keep-alive peek.
+//! G3 keep-alive-peek contract (the *second half* of G3, separate from G3's
+//! pre-flight context budgeting). The spec-of-record is
+//! `.ralph/IMPLEMENTATION_PLAN.md` Task 8 ("G3 keep-alive peek · `50720eb`"),
+//! NOT `.ralph/specs/G3-context-budgeting.md` (which covers only the budgeting
+//! half). This file was promoted to a dedicated gap ("G3-peek") because the
+//! behavior is redundant with G8 + axum's SSE keep-alive — see the plan.
 //!
 //! claude-relay's `_peek_with_keepalive` did two things for a streaming turn:
 //! it sent SSE keep-alive comment frames while the upstream was silent, and it

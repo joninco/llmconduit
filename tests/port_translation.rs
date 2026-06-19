@@ -188,9 +188,11 @@ fn anthropic_output_config_effort_maps_to_reasoning_effort() {
     }
 }
 
-/// Effort normalization is single-sourced in
-/// `responses_to_chat::normalize_reasoning_effort`. The adapter must NOT
-/// allow-list or clamp: case variants, surrounding whitespace, and otherwise
+/// Effort normalization is split across two layers: `responses_to_chat::
+/// normalize_reasoning_effort` trims + lowercases only (it no longer
+/// clamps/maps), and the per-model clamp/map happens at the upstream leaf in
+/// `upstream::finalize_request_for_backend`. The adapter must NOT allow-list or
+/// clamp: case variants, surrounding whitespace, and otherwise
 /// unrecognized-but-non-empty values pass through to canonical
 /// `reasoning.effort` verbatim (trimmed) so the lowering step can normalize
 /// them. Dropping them here would silently divert to budget-derived effort.

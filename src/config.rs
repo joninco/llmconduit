@@ -542,8 +542,10 @@ fn default_min_completion_tokens() -> i64 {
 /// model-output SSE event (typical chunks are well under 1 MiB) so normal
 /// streaming is never affected, while still bounding a hostile/unterminated
 /// frame far below the memory a single oversized accumulation could exhaust.
+/// Returns [`crate::upstream::DEFAULT_MAX_SSE_FRAME_BYTES`], the single source
+/// of truth shared with the direct-client default.
 fn default_max_sse_frame_bytes() -> usize {
-    8 * 1024 * 1024
+    crate::upstream::DEFAULT_MAX_SSE_FRAME_BYTES
 }
 
 /// Default per-session image-cache capacity (G4). Generous enough for a normal
@@ -639,6 +641,13 @@ impl Config {
     ///   ignored by the gateway, so they are excluded here too.
     /// - Single/failover mode (`upstreams` empty): the top-level path plus the
     ///   global `fallback_upstreams` paths are active.
+    /// - Explicit-upstream routing (`upstreams` non-empty, no `model_routes`):
+    ///   per-routing-upstream primaries and their nested fallbacks.
+    /// - Routes-only (`model_routes` non-empty, `upstreams` empty): route
+    ///   providers all write the top-level `upstream_request_log_path`, so the
+    ///   single/failover branch covers them.
+    /// - Mixed (`upstreams` + `model_routes`): per-routing-upstream paths PLUS
+    ///   the top-level path (route providers always use the top-level path).
     pub fn debug_log_dirs(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = Vec::new();
         let mut push_dir = |path: Option<&PathBuf>| {
@@ -656,19 +665,28 @@ impl Config {
         };
 
         if self.upstreams.is_empty() {
-            // Single/failover mode: top-level primary + global fallbacks.
+            // Single/failover OR routes-only mode: top-level primary + global
+            // fallbacks. Route providers (G7) all write the top-level path, so
+            // this branch covers routes-only configs too.
             push_dir(self.upstream_request_log_path.as_ref());
             for fallback in &self.fallback_upstreams {
                 push_dir(fallback.upstream_request_log_path.as_ref());
             }
         } else {
-            // Routing mode: per-routing-upstream primaries and their nested
-            // fallbacks only.
+            // Explicit-upstream routing mode: per-routing-upstream primaries and
+            // their nested fallbacks.
             for upstream in &self.upstreams {
                 push_dir(upstream.upstream_request_log_path.as_ref());
                 for fallback in &upstream.fallback_upstreams {
                     push_dir(fallback.upstream_request_log_path.as_ref());
                 }
+            }
+            // In mixed mode (`upstreams` + `model_routes`), route providers
+            // still write the top-level `upstream_request_log_path`, which the
+            // loop above does not include. Add it so route-log dirs are cleaned
+            // too (no-op dedup if it coincides with a routing-upstream path).
+            if !self.model_routes.is_empty() {
+                push_dir(self.upstream_request_log_path.as_ref());
             }
         }
         dirs

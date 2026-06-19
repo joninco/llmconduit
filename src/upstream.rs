@@ -544,7 +544,11 @@ impl UpstreamClient for ReqwestUpstreamClient {
         }
 
         let body = response.text().await.unwrap_or_default();
-        if let Some(retry) = classify_context_overflow(&body, self.min_completion_tokens, None) {
+        if let Some(retry) = classify_context_overflow(
+            &body,
+            self.min_completion_tokens,
+            Some(estimate_leaf_input_tokens(&request)),
+        ) {
             let mut retried = request.clone();
             retried.max_output_tokens = Some(retry.max_completion_tokens);
             // The reduced budget lives on the typed `max_output_tokens` field
@@ -575,7 +579,13 @@ impl UpstreamClient for ReqwestUpstreamClient {
             // retry is allowed; we do not loop). Any other non-2xx is a normal
             // (failover-eligible) upstream error.
             let retry_body = retry_response.text().await.unwrap_or_default();
-            if classify_context_overflow(&retry_body, self.min_completion_tokens, None).is_some() {
+            if classify_context_overflow(
+                &retry_body,
+                self.min_completion_tokens,
+                Some(estimate_leaf_input_tokens(&retried)),
+            )
+            .is_some()
+            {
                 return Err(AppError::upstream_terminal(format!(
                     "upstream context-window overflow persisted after shrink-and-retry; \
                      failed with {retry_status}: {}",
@@ -2158,6 +2168,21 @@ static REQUESTED_TOTAL_RE: LazyLock<Regex> = LazyLock::new(|| {
     .expect("requested-total overflow regex is valid")
 });
 
+/// Coarse, deterministic CONSERVATIVE lower-bound estimate of the input tokens
+/// the leaf POSTs for `request`, mirroring `engine::estimate_input_tokens`.
+/// Used only by the G1 reactive retry's `COMPLETION_LIMIT_RE` shape (an
+/// output-only `max_model_len` error that reports the context window but NOT
+/// the prompt size); without it the retry budget would be `ctx_limit - margin`,
+/// ignoring the prompt and re-overflowing. `ceil(serialized_bytes / 4)` is the
+/// same ~4-bytes-per-token heuristic the engine uses — not a tokenizer. It
+/// runs on the sanitized, post-`finalize_request_for_backend` request, so it
+/// accounts for any family/effort kwargs merged at the leaf. The other overflow
+/// shapes extract the real input count from the error body and ignore this.
+fn estimate_leaf_input_tokens(request: &ChatCompletionRequest) -> i64 {
+    let bytes = serde_json::to_vec(request).map(|v| v.len()).unwrap_or(0);
+    bytes.div_ceil(4) as i64
+}
+
 /// Parse a non-streaming upstream error body for a context/completion
 /// token-limit overflow and compute the reduced completion budget for a retry.
 ///
@@ -2166,8 +2191,8 @@ static REQUESTED_TOTAL_RE: LazyLock<Regex> = LazyLock::new(|| {
 ///
 /// `estimated_input_tokens` supplies the prompt size for the completion-only
 /// (`max_model_len`) shape, which does not itself report the input size; the
-/// leaf upstream path passes `None` (no local estimate), matching the reference
-/// implementation's behavior when no estimate is available.
+/// leaf upstream path passes a local estimate from the sanitized request (see
+/// [`estimate_leaf_input_tokens`]).
 ///
 /// Classification uses the SAME anchored regexes the reference implementation
 /// uses (`server._context_overflow_retry_from_error`, tests
@@ -2294,11 +2319,20 @@ async fn stream_success_response(
     Ok(Box::pin(stream))
 }
 
+/// 8 MiB default upstream SSE per-frame ceiling. Comfortably above any sane
+/// single model-output SSE event (typical chunks are well under 1 MiB) so
+/// normal streaming is never affected, while still bounding a hostile/
+/// unterminated frame far below the memory a single oversized accumulation
+/// could exhaust. This is the single source of truth for the default;
+/// `config::default_max_sse_frame_bytes` and `upstream::default_max_sse_frame_bytes`
+/// both return it.
+pub(crate) const DEFAULT_MAX_SSE_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 /// 8 MiB default upstream SSE per-frame ceiling. Mirrors
 /// `config::default_max_sse_frame_bytes`; kept here so `ReqwestUpstreamClient::new`
 /// (which does not take a cap) has a sane default without depending on config.
 pub(crate) fn default_max_sse_frame_bytes() -> usize {
-    8 * 1024 * 1024
+    DEFAULT_MAX_SSE_FRAME_BYTES
 }
 
 /// Pure, synchronous per-frame byte-accounting guard for the upstream SSE read
