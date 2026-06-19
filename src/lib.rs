@@ -24,7 +24,9 @@ use crate::replay::ReplayStore;
 use crate::search::BraveSearchClient;
 use crate::upstream::FailoverUpstreamClient;
 use crate::upstream::FailoverUpstreamProvider;
+use crate::upstream::ModelRouteSpec;
 use crate::upstream::ReqwestUpstreamClient;
+use crate::upstream::RouteUpstreamProvider;
 use crate::upstream::RoutingUpstreamClient;
 use crate::upstream::RoutingUpstreamProvider;
 use std::sync::Arc;
@@ -65,7 +67,11 @@ pub fn build_app_with_gateway_and_options(
     } else {
         MonitorHub::disabled()
     };
-    let upstream: Arc<dyn crate::upstream::UpstreamClient> = if !config.upstreams.is_empty() {
+    // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
+    // (G7); routes alone are enough to switch the gateway into the routing
+    // client so route-name/glob matching applies.
+    let routing_mode = !config.upstreams.is_empty() || !config.model_routes.is_empty();
+    let upstream: Arc<dyn crate::upstream::UpstreamClient> = if routing_mode {
         let providers = config
             .upstreams
             .iter()
@@ -110,7 +116,39 @@ pub fn build_app_with_gateway_and_options(
                 )
             })
             .collect();
-        Arc::new(RoutingUpstreamClient::new(providers))
+        // Build a synthetic provider + spec per ad-hoc route (G7). Each route is
+        // a single-upstream client keyed by request-model name/glob; the glob
+        // matcher was compiled at config time.
+        let cooldown = Duration::from_secs(config.upstream_failure_cooldown_secs);
+        let mut route_providers = Vec::with_capacity(config.model_routes.len());
+        let mut route_specs = Vec::with_capacity(config.model_routes.len());
+        for (index, route) in config.model_routes.iter().enumerate() {
+            let client = ReqwestUpstreamClient::with_options(
+                http_client.clone(),
+                route.upstream_base_url.clone(),
+                config.upstream_api_key.clone(),
+                config.upstream_request_log_path.clone(),
+                config.flatten_content,
+                config.min_completion_tokens,
+                config.max_sse_frame_bytes,
+            );
+            route_providers.push(RouteUpstreamProvider::new(
+                format!("route-{}", route.name),
+                client,
+                cooldown,
+            ));
+            route_specs.push(ModelRouteSpec::new(
+                route.name.clone(),
+                route.glob.clone(),
+                index,
+                route.upstream_model.clone(),
+            ));
+        }
+        Arc::new(RoutingUpstreamClient::with_routes(
+            providers,
+            route_providers,
+            route_specs,
+        ))
     } else {
         let primary_upstream = ReqwestUpstreamClient::with_options(
             http_client.clone(),

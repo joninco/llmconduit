@@ -1,3 +1,4 @@
+use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Map as JsonMap;
@@ -24,6 +25,15 @@ pub struct Config {
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
     pub upstream_failure_cooldown_secs: u64,
     pub model_profiles: BTreeMap<String, ModelProfile>,
+    /// Ad-hoc model routes (G7). Each route maps a request-model *name* (which
+    /// may be a glob pattern such as `claude-opus-*`) to a synthetic upstream
+    /// (base URL + optional upstream model). Routes turn the gateway into
+    /// routing mode and are matched in `RoutingModelCatalog::resolve` strictly
+    /// between an exact catalog model id and the canonical-key/default
+    /// fallbacks, so an exact upstream model id always beats a glob route.
+    /// DECLARATION order is preserved (file order, then CLI `--model-route`
+    /// merged in) so the FIRST matching glob wins when two globs overlap.
+    pub model_routes: Vec<ModelRoute>,
     /// Forces the backend chat-template contract (`kimi`/`deepseek`) regardless
     /// of the model name, when family auto-detection from the model id is wrong
     /// (G2). Profile-level `template_family` overrides this global value.
@@ -61,6 +71,180 @@ pub struct UpstreamConfig {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstream_request_log_path: Option<PathBuf>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
+}
+
+/// A resolved ad-hoc model route (G7): request-model name → synthetic upstream.
+#[derive(Debug, Clone)]
+pub struct ModelRoute {
+    /// The request-model name this route matches. May be a literal id or a glob
+    /// pattern (`*`, `?`, `[...]`) such as `claude-opus-*`.
+    pub name: String,
+    /// Compiled, case-insensitive matcher when `name` is a glob pattern; `None`
+    /// for a literal name (matched with `eq_ignore_ascii_case`). Compiled once
+    /// here so an invalid pattern is a clean startup error, not a later panic.
+    pub glob: Option<Regex>,
+    /// Base URL of the synthetic upstream this route forwards to.
+    pub upstream_base_url: Url,
+    /// Optional upstream model id to send to that upstream. When `None`, the
+    /// request model flows through unchanged.
+    pub upstream_model: Option<String>,
+}
+
+impl PartialEq for ModelRoute {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.glob.as_ref().map(Regex::as_str) == other.glob.as_ref().map(Regex::as_str)
+            && self.upstream_base_url == other.upstream_base_url
+            && self.upstream_model == other.upstream_model
+    }
+}
+
+/// Persisted form of a model route. Accepts either a bare URL string
+/// (`name = "http://host:8000"`) or a table with `upstream_base_url`/`url` and
+/// `upstream_model`/`model`, mirroring claude-relay's str-or-table coercion.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(from = "RawPersistedModelRoute")]
+pub struct PersistedModelRoute {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+}
+
+/// Untagged input shape for `PersistedModelRoute`: either a bare string URL or a
+/// table with URL/model aliases.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawPersistedModelRoute {
+    Url(String),
+    Table {
+        #[serde(default)]
+        upstream_base_url: Option<String>,
+        #[serde(default)]
+        url: Option<String>,
+        #[serde(default)]
+        upstream_model: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+    },
+}
+
+impl From<RawPersistedModelRoute> for PersistedModelRoute {
+    fn from(raw: RawPersistedModelRoute) -> Self {
+        match raw {
+            RawPersistedModelRoute::Url(url) => Self {
+                upstream_base_url: Some(url),
+                upstream_model: None,
+            },
+            RawPersistedModelRoute::Table {
+                upstream_base_url,
+                url,
+                upstream_model,
+                model,
+            } => Self {
+                upstream_base_url: upstream_base_url.or(url),
+                upstream_model: upstream_model.or(model),
+            },
+        }
+    }
+}
+
+/// Ordered set of persisted model routes, keyed by request-model name.
+///
+/// A `Vec` of pairs rather than a `BTreeMap` so glob routes keep their
+/// DECLARATION order: overlapping globs are scanned first-match-wins, and a
+/// `BTreeMap` would silently re-sort keys alphabetically (e.g. `claude-*`
+/// sorting before `claude-opus-*`) and mis-route. Both serde_yaml and the
+/// `toml` crate (with `preserve_order`) yield map entries in document order, so
+/// the file order is the routing order. CLI `--model-route` specs are merged in
+/// declaration order too (replace-in-place on a name match, else append).
+///
+/// It (de)serializes as a MAP (`name: route`), not a sequence, so a config
+/// written by `write_persisted_config` round-trips back through the map
+/// deserializer; declaration order is preserved on write.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct OrderedModelRoutes(pub Vec<(String, PersistedModelRoute)>);
+
+impl OrderedModelRoutes {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Insert a route by name, replacing an existing entry IN PLACE (preserving
+    /// its position) or appending when the name is new. Used to layer CLI routes
+    /// over file routes — and to collapse duplicate keys to last-wins — without
+    /// disturbing declaration order.
+    ///
+    /// Name comparison is TRIMMED + ASCII-case-insensitive, identical to route
+    /// DISPATCH (`Config::matches_model_route` / `RoutingModelCatalog::match_route`),
+    /// so e.g. a CLI `claude-*` route overrides a file `Claude-*` route in place
+    /// rather than adding a shadowed duplicate. The replacing entry adopts the
+    /// new name (CLI/last value wins) but keeps the original position.
+    pub fn upsert(&mut self, name: String, route: PersistedModelRoute) {
+        let key = name.trim();
+        if let Some(existing) = self
+            .0
+            .iter_mut()
+            .find(|(existing, _)| existing.trim().eq_ignore_ascii_case(key))
+        {
+            existing.0 = name;
+            existing.1 = route;
+        } else {
+            self.0.push((name, route));
+        }
+    }
+}
+
+impl Serialize for OrderedModelRoutes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        // Emit as a MAP in declaration order so the written config reloads
+        // through `visit_map` (a sequence would not round-trip).
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, route) in &self.0 {
+            map.serialize_entry(name, route)?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for OrderedModelRoutes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RoutesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RoutesVisitor {
+            type Value = OrderedModelRoutes;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map of model-route name to route definition")
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let mut routes =
+                    OrderedModelRoutes(Vec::with_capacity(access.size_hint().unwrap_or(0)));
+                while let Some((name, route)) =
+                    access.next_entry::<String, PersistedModelRoute>()?
+                {
+                    // Collapse duplicate keys to last-wins (replace in place),
+                    // matching CLI-override and claude-relay dict semantics,
+                    // rather than keeping a shadowed first entry.
+                    routes.upsert(name, route);
+                }
+                Ok(routes)
+            }
+        }
+
+        deserializer.deserialize_map(RoutesVisitor)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Default)]
@@ -194,6 +378,11 @@ pub struct PersistedConfig {
     pub model_profile_templates: BTreeMap<String, PersistedModelProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_profiles: BTreeMap<String, PersistedModelProfile>,
+    /// Ad-hoc model routes (G7): request-model name (possibly a glob) →
+    /// synthetic upstream, in DECLARATION order (see `OrderedModelRoutes`). CLI
+    /// `--model-route` specs are merged in after these.
+    #[serde(default, skip_serializing_if = "OrderedModelRoutes::is_empty")]
+    pub model_routes: OrderedModelRoutes,
     /// Global override for the backend chat-template family (`kimi`/`deepseek`).
     /// A matched model profile's `template_family` takes precedence (G2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +483,7 @@ impl Default for PersistedConfig {
             upstream_failure_cooldown_secs: default_upstream_failure_cooldown_secs(),
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::new(),
+            model_routes: OrderedModelRoutes::default(),
             template_family: None,
             brave_base_url: default_brave_base_url(),
             brave_api_key: None,
@@ -312,12 +502,29 @@ impl Default for PersistedConfig {
 
 impl Config {
     pub fn from_env_and_file(path: Option<&Path>) -> Result<Self, String> {
+        Self::from_env_file_and_routes(path, &[])
+    }
+
+    /// Like `from_env_and_file`, but additionally merges `--model-route` CLI
+    /// specs (G7) after the file and env overrides, so a CLI route wins over a
+    /// file route with the same name. A malformed spec is a clean `Err`.
+    pub fn from_env_file_and_routes(
+        path: Option<&Path>,
+        route_specs: &[String],
+    ) -> Result<Self, String> {
         let mut persisted = if let Some(path) = path {
             load_persisted_config(path)?
         } else {
             load_default_persisted_config()?
         };
         apply_env_overrides(&mut persisted);
+        for spec in route_specs {
+            let (name, route) = parse_model_route_spec(spec)?;
+            // Replace a same-named file route in place (preserve its position),
+            // else append — keeps glob declaration order intact while letting
+            // CLI win on a name conflict.
+            persisted.model_routes.upsert(name, route);
+        }
         Self::from_persisted(&persisted)
     }
 
@@ -395,6 +602,7 @@ impl Config {
             .collect::<Result<Vec<_>, String>>()?;
         let model_profiles =
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
+        let model_routes = resolve_model_routes(&config.model_routes)?;
         Ok(Self {
             bind_addr,
             upstream_base_url,
@@ -424,6 +632,7 @@ impl Config {
             fallback_upstreams,
             upstream_failure_cooldown_secs: config.upstream_failure_cooldown_secs,
             model_profiles,
+            model_routes,
             template_family: normalize_template_family(config.template_family.as_deref()),
             brave_base_url,
             brave_api_key: config
@@ -450,6 +659,24 @@ impl Config {
             .and_then(|profile| profile.upstream_model.clone())
             .or_else(|| self.upstream_model.clone())
             .unwrap_or_else(|| request_model.to_string())
+    }
+
+    /// Whether `model` matches an ad-hoc `model_routes` entry by exact name
+    /// (case-insensitive) or glob, using the SAME first-match-wins semantics as
+    /// `RoutingModelCatalog::match_route` (G7). The engine consults this so a
+    /// route-bound request model is NOT pre-collapsed to a catalog/default model
+    /// before the routing client can dispatch it. Slots between an exact catalog
+    /// id and the canonical-key/default fallbacks: callers must check an exact
+    /// catalog id FIRST so a catalog id still beats a route.
+    pub fn matches_model_route(&self, model: &str) -> bool {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        self.model_routes.iter().any(|route| match &route.glob {
+            Some(glob) => glob.is_match(trimmed),
+            None => route.name.eq_ignore_ascii_case(trimmed),
+        })
     }
 
     pub fn resolve_upstream_chat_kwargs(&self, request_model: &str) -> JsonMap<String, JsonValue> {
@@ -554,6 +781,121 @@ impl ResolvedModelProfile {
             upstream_chat_kwargs: self.upstream_chat_kwargs,
         }
     }
+}
+
+/// True when a route key contains glob metacharacters and should be matched as
+/// a pattern. Mirrors claude-relay's `_is_glob_pattern` (`*`, `?`, `[`).
+pub(crate) fn is_glob_pattern(value: &str) -> bool {
+    value.contains(['*', '?', '['])
+}
+
+/// Translate a glob pattern into an anchored, case-insensitive `Regex`,
+/// approximating Python `fnmatch` semantics: `*` → any run, `?` → one char,
+/// `[...]` → a character class (with `[!...]` negation), and every other
+/// character matched literally. Returns a clean `Err` for an unparseable class
+/// so a bad route is rejected at startup instead of panicking later.
+pub(crate) fn glob_to_regex(pattern: &str) -> Result<Regex, String> {
+    let mut regex = String::with_capacity(pattern.len() + 8);
+    regex.push_str("(?i)^");
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' => regex.push_str(".*"),
+            '?' => regex.push('.'),
+            '[' => {
+                let mut class = String::from("[");
+                if matches!(chars.peek(), Some('!')) {
+                    chars.next();
+                    class.push('^');
+                }
+                // A `]` immediately after `[` / `[!` is a literal member.
+                if matches!(chars.peek(), Some(']')) {
+                    chars.next();
+                    class.push_str("\\]");
+                }
+                let mut closed = false;
+                for class_ch in chars.by_ref() {
+                    if class_ch == ']' {
+                        closed = true;
+                        break;
+                    }
+                    if matches!(class_ch, '\\' | '^') {
+                        class.push('\\');
+                    }
+                    class.push(class_ch);
+                }
+                if !closed {
+                    return Err(format!("unterminated character class in glob {pattern:?}"));
+                }
+                class.push(']');
+                regex.push_str(&class);
+            }
+            other => regex.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    regex.push('$');
+    Regex::new(&regex).map_err(|err| format!("invalid glob {pattern:?}: {err}"))
+}
+
+/// Resolve persisted model routes into ordered `ModelRoute`s. A route with a
+/// blank key, a missing/invalid `upstream_base_url`, or an uncompilable glob is
+/// a clean startup error, never a panic. Order follows DECLARATION order (file
+/// order, then CLI specs merged in before this runs), so an earlier route wins
+/// when two globs overlap.
+fn resolve_model_routes(routes: &OrderedModelRoutes) -> Result<Vec<ModelRoute>, String> {
+    let mut resolved = Vec::with_capacity(routes.0.len());
+    for (name, route) in &routes.0 {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("model_routes: route name must not be blank".to_string());
+        }
+        let base_url = trim_nonempty(route.upstream_base_url.as_deref())
+            .ok_or_else(|| format!("model_routes[{name}]: missing upstream_base_url"))?;
+        let upstream_base_url = Url::parse(&base_url)
+            .map_err(|err| format!("model_routes[{name}]: invalid upstream_base_url: {err}"))?;
+        let glob = if is_glob_pattern(name) {
+            Some(glob_to_regex(name).map_err(|err| format!("model_routes[{name}]: {err}"))?)
+        } else {
+            None
+        };
+        resolved.push(ModelRoute {
+            name: name.to_string(),
+            glob,
+            upstream_base_url,
+            upstream_model: trim_nonempty(route.upstream_model.as_deref()),
+        });
+    }
+    Ok(resolved)
+}
+
+/// Parse a `--model-route "name=url[,upstream]"` CLI spec into a persisted route
+/// (G7). Malformed specs return an `Err` so startup fails cleanly instead of
+/// panicking. Mirrors claude-relay's `parse_model_route`.
+pub fn parse_model_route_spec(spec: &str) -> Result<(String, PersistedModelRoute), String> {
+    let (name, value) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("--model-route {spec:?} must use NAME=URL[,UPSTREAM_MODEL]"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("--model-route {spec:?} is missing NAME"));
+    }
+    let (url, upstream_model) = match value.split_once(',') {
+        Some((url, upstream_model)) => (url.trim(), upstream_model.trim()),
+        None => (value.trim(), ""),
+    };
+    if url.is_empty() {
+        return Err(format!("--model-route {spec:?} is missing URL"));
+    }
+    // Validate the URL eagerly so a malformed spec is rejected here rather than
+    // surfacing later from `from_persisted`.
+    Url::parse(url).map_err(|err| format!("--model-route {spec:?}: invalid URL: {err}"))?;
+    Ok((
+        name.to_string(),
+        PersistedModelRoute {
+            upstream_base_url: Some(url.to_string()),
+            upstream_model: (!upstream_model.is_empty()).then(|| upstream_model.to_string()),
+        },
+    ))
 }
 
 fn resolve_model_profiles(
@@ -748,17 +1090,43 @@ pub fn load_default_persisted_config() -> Result<PersistedConfig, String> {
     load_persisted_config(&path)
 }
 
+/// Whether a config path is TOML (by `.toml` extension, case-insensitive). TOML
+/// configs are READ-ONLY (G7): they load via the `toml` crate but are never
+/// written (see `write_persisted_config`).
+pub fn path_is_toml(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+}
+
 pub fn load_persisted_config(path: &Path) -> Result<PersistedConfig, String> {
     if !path.exists() {
         return Ok(PersistedConfig::default());
     }
     let contents = fs::read_to_string(path)
         .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
-    serde_yaml::from_str(&contents)
-        .map_err(|err| format!("failed to parse {}: {err}", path.display()))
+    // Detect format by extension (G7). `.toml` parses via the `toml` crate;
+    // everything else (including `.yaml`/`.yml` and extensionless paths) keeps
+    // the existing YAML path byte-identical.
+    if path_is_toml(path) {
+        toml::from_str(&contents)
+            .map_err(|err| format!("failed to parse {}: {err}", path.display()))
+    } else {
+        serde_yaml::from_str(&contents)
+            .map_err(|err| format!("failed to parse {}: {err}", path.display()))
+    }
 }
 
 pub fn write_persisted_config(path: &Path, config: &PersistedConfig) -> Result<(), String> {
+    // `configure` only writes YAML. `.toml` configs are read-only: writing YAML
+    // bytes into a `.toml` file would produce a config that `load_persisted_config`
+    // then tries (and fails) to parse as TOML. Reject cleanly BEFORE touching the
+    // filesystem so no unreadable file is ever created (G7).
+    if path_is_toml(path) {
+        return Err(format!(
+            "cannot write config to {}: `configure` writes YAML; `.toml` config files are read-only \u{2014} use a `.yaml`/`.yml` path",
+            path.display()
+        ));
+    }
     let parent = path
         .parent()
         .ok_or_else(|| format!("config path has no parent: {}", path.display()))?;
@@ -918,6 +1286,7 @@ mod tests {
     use super::Config;
     use super::JsonMap;
     use super::JsonValue;
+    use super::OrderedModelRoutes;
     use super::PersistedConfig;
     use super::PersistedFallbackUpstream;
     use super::PersistedModelProfile;
@@ -1288,6 +1657,7 @@ mod tests {
             debug_log_max_age_hours: Some(48),
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            model_routes: OrderedModelRoutes::default(),
             template_family: None,
         };
         write_persisted_config(&path, &config).expect("write config");
@@ -1337,6 +1707,7 @@ mod tests {
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
         .expect("config");
@@ -1466,6 +1837,7 @@ mod tests {
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
         .expect("config");
@@ -1526,6 +1898,7 @@ mod tests {
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
         .expect("config");
@@ -1609,6 +1982,7 @@ mod tests {
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
         .expect("config");
@@ -1684,6 +2058,7 @@ mod tests {
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
         .expect("config");
@@ -2044,6 +2419,7 @@ model_profiles:
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
         .expect("config");
@@ -2093,6 +2469,7 @@ model_profiles:
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            model_routes: OrderedModelRoutes::default(),
             template_family: None,
         })
         .expect("config");

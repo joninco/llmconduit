@@ -183,9 +183,78 @@ impl RoutingUpstreamProvider {
     }
 }
 
+/// A synthetic upstream backing one or more ad-hoc model routes (G7). Unlike a
+/// catalog provider, a route provider is matched by request-model *name* (in
+/// `ModelRouteSpec`), never enumerated into the `/v1/models` union, so routes
+/// stay invisible to the model listing exactly like claude-relay's
+/// `model_routes`.
+#[derive(Debug, Clone)]
+pub struct RouteUpstreamProvider {
+    name: String,
+    client: FailoverUpstreamClient,
+}
+
+impl RouteUpstreamProvider {
+    pub fn new(name: impl Into<String>, client: ReqwestUpstreamClient, cooldown: Duration) -> Self {
+        let name = name.into();
+        Self {
+            name: name.clone(),
+            client: FailoverUpstreamClient::new(
+                vec![FailoverUpstreamProvider::new(
+                    name,
+                    client,
+                    None,
+                    None,
+                    JsonMap::new(),
+                )],
+                cooldown,
+            ),
+        }
+    }
+}
+
+/// A compiled ad-hoc model route (G7): a request-model name/glob that maps to a
+/// `RouteUpstreamProvider` and an optional upstream-model rewrite.
+#[derive(Debug, Clone)]
+pub struct ModelRouteSpec {
+    /// Request-model name this route matches (literal or glob source).
+    name: String,
+    /// Compiled glob matcher (case-insensitive). `None` for a literal name,
+    /// which is compared with `eq_ignore_ascii_case`.
+    glob: Option<Regex>,
+    /// Index into `RoutingUpstreamClient::route_providers`.
+    route_provider_index: usize,
+    /// Upstream model to send. `None` passes the request model through.
+    upstream_model: Option<String>,
+}
+
+impl ModelRouteSpec {
+    /// Build a route spec. `glob` is the pre-compiled matcher (from
+    /// `config::ModelRoute`); `route_provider_index` indexes the matching
+    /// `RouteUpstreamProvider`.
+    pub fn new(
+        name: impl Into<String>,
+        glob: Option<Regex>,
+        route_provider_index: usize,
+        upstream_model: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            glob,
+            route_provider_index,
+            upstream_model,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RoutingUpstreamClient {
     providers: Vec<RoutingUpstreamProvider>,
+    /// Synthetic providers backing ad-hoc model routes (G7), indexed by
+    /// `ModelRouteSpec::route_provider_index`. Kept separate from catalog
+    /// `providers` so routes never enter the `/v1/models` union.
+    route_providers: Vec<RouteUpstreamProvider>,
+    routes: Vec<ModelRouteSpec>,
     catalog: Arc<AsyncMutex<Option<CachedRoutingModelCatalog>>>,
 }
 
@@ -201,6 +270,10 @@ struct RoutingModelCatalog {
     union_entries: Vec<Value>,
     union_ids: Vec<String>,
     ids_by_key: HashMap<String, Vec<RoutingModelCandidate>>,
+    /// Ad-hoc routes (G7), cloned from the client each refresh. Matched purely
+    /// by request-model name, independent of the live catalog, so routes still
+    /// resolve when an upstream `/v1/models` fetch is unavailable.
+    routes: Vec<ModelRouteSpec>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -213,6 +286,20 @@ struct RoutingModelCandidate {
     provider_index: usize,
     model_id: String,
     target: RoutingModelTarget,
+}
+
+/// Outcome of resolving a request model: either a catalog candidate (served by a
+/// `RoutingUpstreamProvider`) or an ad-hoc route candidate (served by a
+/// `RouteUpstreamProvider`). Routes slot strictly between an exact catalog id
+/// and the canonical-key/default fallbacks (G7), so an exact model id always
+/// beats a glob route.
+#[derive(Debug, Clone)]
+enum RoutingResolution {
+    Catalog(RoutingModelCandidate),
+    Route {
+        route_provider_index: usize,
+        model_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -780,10 +867,53 @@ impl FailoverUpstreamClient {
 
 impl RoutingUpstreamClient {
     pub fn new(providers: Vec<RoutingUpstreamProvider>) -> Self {
+        Self::with_routes(providers, Vec::new(), Vec::new())
+    }
+
+    /// Construct with ad-hoc model routes (G7). `route_providers` are the
+    /// synthetic upstreams; `routes` map request-model names/globs to them and
+    /// must reference valid `route_provider_index` values.
+    pub fn with_routes(
+        providers: Vec<RoutingUpstreamProvider>,
+        route_providers: Vec<RouteUpstreamProvider>,
+        routes: Vec<ModelRouteSpec>,
+    ) -> Self {
         Self {
             providers,
+            route_providers,
+            routes,
             catalog: Arc::new(AsyncMutex::new(None)),
         }
+    }
+
+    /// Look up a synthetic route provider by index, mapping an out-of-range
+    /// index (a wiring bug) to an internal error rather than a panic.
+    fn route_provider(&self, index: usize) -> AppResult<&RouteUpstreamProvider> {
+        self.route_providers
+            .get(index)
+            .ok_or_else(|| AppError::internal("resolved route provider index was out of range"))
+    }
+
+    /// Clone the request and apply the resolved upstream-model rewrite, logging
+    /// once when the model actually changes. Shared by catalog and route
+    /// dispatch so both honor the same rewrite + log behavior.
+    fn routed_request(
+        &self,
+        request: &ChatCompletionRequest,
+        model_id: &str,
+        provider_name: &str,
+    ) -> ChatCompletionRequest {
+        let mut routed_request = request.clone();
+        if routed_request.model != model_id {
+            tracing::info!(
+                requested_model = %routed_request.model,
+                routed_model = %model_id,
+                provider = %provider_name,
+                "routed request model to upstream catalog model"
+            );
+            routed_request.model = model_id.to_string();
+        }
+        routed_request
     }
 
     async fn load_catalog(&self) -> AppResult<RoutingModelCatalog> {
@@ -860,7 +990,10 @@ impl RoutingUpstreamClient {
             });
         }
 
-        if union_ids.is_empty() {
+        // With ad-hoc routes (G7), an empty union is still a usable catalog:
+        // routes resolve by name without a live model listing. Only error when
+        // there are neither catalog models nor routes to dispatch to.
+        if union_ids.is_empty() && self.routes.is_empty() {
             return Err(last_error.unwrap_or_else(|| {
                 AppError::upstream("no models are currently available from configured upstreams")
             }));
@@ -871,14 +1004,25 @@ impl RoutingUpstreamClient {
             union_entries,
             union_ids,
             ids_by_key,
+            routes: self.routes.clone(),
         })
     }
 }
 
 impl RoutingModelCatalog {
-    fn resolve(&self, requested_model: &str) -> Option<RoutingModelCandidate> {
+    /// Resolve a request model to a dispatch target. Precedence (G7):
+    /// 1. exact catalog model id (an exact id always wins),
+    /// 2. exact ad-hoc route name,
+    /// 3. glob ad-hoc route name (first match wins on overlap),
+    /// 4. unique canonical-key catalog match,
+    /// 5. default (first model of the first non-empty provider catalog).
+    ///
+    /// Routes therefore slot strictly between an exact id and the
+    /// canonical/default fallbacks; a glob never overrides an exact match.
+    fn resolve(&self, requested_model: &str) -> Option<RoutingResolution> {
         let trimmed = requested_model.trim();
         if !trimmed.is_empty() {
+            // 1. Exact catalog model id.
             for (provider_index, provider) in self.provider_catalogs.iter().enumerate() {
                 if let Some(candidate) = provider
                     .candidates
@@ -886,10 +1030,22 @@ impl RoutingModelCatalog {
                     .find(|candidate| candidate.model_id == trimmed)
                 {
                     debug_assert_eq!(candidate.provider_index, provider_index);
-                    return Some(candidate.clone());
+                    return Some(RoutingResolution::Catalog(candidate.clone()));
                 }
             }
 
+            // 2. Exact ad-hoc route name (case-insensitive), then 3. glob route.
+            if let Some(route) = self.match_route(trimmed) {
+                return Some(RoutingResolution::Route {
+                    route_provider_index: route.route_provider_index,
+                    model_id: route
+                        .upstream_model
+                        .clone()
+                        .unwrap_or_else(|| trimmed.to_string()),
+                });
+            }
+
+            // 4. Unique canonical-key catalog match.
             let key = canonical_model_key(trimmed);
             if let Some(candidates) = self.ids_by_key.get(&key)
                 && let Some(model_id) = unique_candidate_model_id(candidates)
@@ -897,11 +1053,31 @@ impl RoutingModelCatalog {
                 return candidates
                     .iter()
                     .find(|candidate| candidate.model_id == model_id)
-                    .cloned();
+                    .cloned()
+                    .map(RoutingResolution::Catalog);
             }
         }
 
-        self.default_candidate()
+        // 5. Default catalog candidate.
+        self.default_candidate().map(RoutingResolution::Catalog)
+    }
+
+    /// Match a request model against ad-hoc routes: an exact name (case
+    /// insensitive) beats any glob; among globs the first declared wins.
+    fn match_route(&self, requested_model: &str) -> Option<&ModelRouteSpec> {
+        if let Some(route) = self
+            .routes
+            .iter()
+            .find(|route| route.glob.is_none() && route.name.eq_ignore_ascii_case(requested_model))
+        {
+            return Some(route);
+        }
+        self.routes.iter().find(|route| {
+            route
+                .glob
+                .as_ref()
+                .is_some_and(|glob| glob.is_match(requested_model))
+        })
     }
 
     fn default_candidate(&self) -> Option<RoutingModelCandidate> {
@@ -1089,22 +1265,28 @@ impl UpstreamClient for RoutingUpstreamClient {
         let resolution = catalog.resolve(&request.model).ok_or_else(|| {
             AppError::upstream("no models are currently available from configured upstreams")
         })?;
+        if let RoutingResolution::Route {
+            route_provider_index,
+            model_id,
+        } = &resolution
+        {
+            let provider = self.route_provider(*route_provider_index)?;
+            let routed_request = self.routed_request(request, model_id, &provider.name);
+            return provider
+                .client
+                .stream_chat_completion_with_timeout(&routed_request, request_timeout)
+                .await;
+        }
+        let RoutingResolution::Catalog(resolution) = resolution else {
+            unreachable!("route resolution handled above");
+        };
         let provider = self
             .providers
             .get(resolution.provider_index)
             .ok_or_else(|| {
                 AppError::internal("resolved upstream provider index was out of range")
             })?;
-        let mut routed_request = request.clone();
-        if routed_request.model != resolution.model_id {
-            tracing::info!(
-                requested_model = %routed_request.model,
-                routed_model = %resolution.model_id,
-                provider = %provider.name,
-                "routed request model to upstream catalog model"
-            );
-            routed_request.model = resolution.model_id;
-        }
+        let routed_request = self.routed_request(request, &resolution.model_id, &provider.name);
         match resolution.target {
             RoutingModelTarget::Primary => {
                 provider
@@ -1142,6 +1324,18 @@ impl UpstreamClient for RoutingUpstreamClient {
         let resolution = catalog.resolve(&requested_model).ok_or_else(|| {
             AppError::upstream("no models are currently available from configured upstreams")
         })?;
+        if let RoutingResolution::Route {
+            route_provider_index,
+            model_id,
+        } = &resolution
+        {
+            let provider = self.route_provider(*route_provider_index)?;
+            let body = proxy_body_with_model(body, model_id);
+            return provider.client.proxy_completions(headers, body).await;
+        }
+        let RoutingResolution::Catalog(resolution) = resolution else {
+            unreachable!("route resolution handled above");
+        };
         let provider = self
             .providers
             .get(resolution.provider_index)

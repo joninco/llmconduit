@@ -117,23 +117,37 @@ impl UpstreamModelCatalog {
         }
     }
 
-    fn normalize(&self, model: &str) -> Option<String> {
+    /// Exact catalog id match (highest precedence). `None` when the model is
+    /// blank or not an exact id.
+    fn exact_id(&self, model: &str) -> Option<String> {
         let trimmed = model.trim();
-        if !trimmed.is_empty() {
-            if let Some(exact) = self.ids.iter().find(|id| id.as_str() == trimmed) {
-                return Some(exact.clone());
-            }
-            let key = canonical_model_key(trimmed);
-            if let Some(matches) = self.ids_by_key.get(&key) {
-                let unique_ids = matches
-                    .iter()
-                    .map(String::as_str)
-                    .collect::<std::collections::HashSet<_>>();
-                if unique_ids.len() == 1 {
-                    return matches.first().cloned();
-                }
-            }
+        if trimmed.is_empty() {
+            return None;
         }
+        self.ids.iter().find(|id| id.as_str() == trimmed).cloned()
+    }
+
+    /// Unique canonical-key match (`canonical_model_key`). `None` when blank,
+    /// unmatched, or ambiguous (maps to more than one id).
+    fn canonical_unique(&self, model: &str) -> Option<String> {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let key = canonical_model_key(trimmed);
+        let matches = self.ids_by_key.get(&key)?;
+        let unique_ids = matches
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        (unique_ids.len() == 1)
+            .then(|| matches.first().cloned())
+            .flatten()
+    }
+
+    /// Default catalog id: first model of the catalog (blank/missing/ambiguous
+    /// fallback). `None` only when the catalog is empty.
+    fn default_id(&self) -> Option<String> {
         self.ids.first().cloned()
     }
 }
@@ -1350,8 +1364,34 @@ impl Gateway {
                 return model.to_string();
             }
         };
+        // Precedence (must mirror `RoutingModelCatalog::resolve`, G7):
+        //   1. exact catalog id (an exact id always wins),
+        //   2. ad-hoc route match (exact name or glob) -> pass the model through
+        //      UNCHANGED so the routing client dispatches the route instead of
+        //      collapsing an unknown route name to the catalog default,
+        //   3. unique canonical-key catalog match,
+        //   4. default catalog id.
+        // Without step 2, a mixed `upstreams` + `model_routes` config would
+        // pre-normalize a route-only model to the catalog default here and the
+        // route would never fire.
+        if let Some(exact) = catalog.exact_id(model) {
+            if exact != model {
+                tracing::info!(
+                    requested_model = %model,
+                    normalized_model = %exact,
+                    "normalized upstream model name from backend catalog"
+                );
+            }
+            return exact;
+        }
+        if self.config.matches_model_route(model) {
+            // Leave the model as-is; `RoutingUpstreamClient::resolve` performs
+            // the route match + upstream-model rewrite.
+            return model.to_string();
+        }
         let normalized = catalog
-            .normalize(model)
+            .canonical_unique(model)
+            .or_else(|| catalog.default_id())
             .unwrap_or_else(|| model.to_string());
         if normalized != model {
             tracing::info!(

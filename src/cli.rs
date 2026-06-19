@@ -36,6 +36,11 @@ pub enum Commands {
         /// Dump raw model delta text to the terminal while the gateway is running.
         #[arg(long, default_value_t = false)]
         raw: bool,
+        /// Ad-hoc model route `NAME=URL[,UPSTREAM_MODEL]`, repeatable. NAME may be
+        /// a glob (e.g. `claude-opus-*`). Merged after the config file and env
+        /// (CLI wins); a malformed spec is a clean startup error.
+        #[arg(long = "model-route", value_name = "NAME=URL[,UPSTREAM_MODEL]")]
+        model_route: Vec<String>,
     },
     /// Run the interactive configuration flow and write a config file.
     Configure {
@@ -175,6 +180,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         upstream_failure_cooldown_secs: existing.upstream_failure_cooldown_secs,
         model_profile_templates: existing.model_profile_templates.clone(),
         model_profiles: existing.model_profiles.clone(),
+        model_routes: existing.model_routes.clone(),
         template_family: existing.template_family.clone(),
         brave_base_url,
         brave_api_key: (!brave_api_key.trim().is_empty()).then_some(brave_api_key),

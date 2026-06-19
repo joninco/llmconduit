@@ -206,6 +206,7 @@ pub fn test_config() -> Config {
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: BTreeMap::new(),
+        model_routes: Vec::new(),
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: Some("test-key".to_string()),
         brave_max_results: 5,

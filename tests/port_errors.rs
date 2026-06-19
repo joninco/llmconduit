@@ -338,6 +338,7 @@ mod integration {
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
+            model_routes: Vec::new(),
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: None,
             brave_max_results: 5,

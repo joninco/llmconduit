@@ -20,6 +20,12 @@ reqwest = { version = "0.12", default-features = false, features = ["charset", "
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Read-only TOML config support (G7). `parse`+`serde` only; we never serialize
+# back to TOML (config is written as YAML), so `display` is intentionally off.
+# `preserve_order` makes the TOML deserializer iterate tables in DOCUMENT order
+# (not sorted), so `model_routes` glob precedence follows declaration order
+# identically to the YAML path — load-bearing for first-match-wins routing.
+toml = { version = "1", default-features = false, features = ["parse", "serde", "preserve_order"] }
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
