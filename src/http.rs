@@ -1155,7 +1155,7 @@ fn anthropic_model_entry(entry: &Value) -> Option<Value> {
             let capabilities = map
                 .get("capabilities")
                 .filter(|value| value.is_object())
-                .map(Value::clone)
+                .cloned()
                 .unwrap_or_else(|| infer_capabilities_from_model_id(id));
 
             Some(build_anthropic_model_entry(

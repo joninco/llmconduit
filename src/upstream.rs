@@ -634,10 +634,10 @@ impl FailoverUpstreamClient {
             .states
             .lock()
             .expect("upstream provider cooldown state lock poisoned");
-        !states
+        states
             .get(provider_index)
             .and_then(|state| state.cooling_until)
-            .is_some_and(|until| until > now)
+            .is_none_or(|until| until <= now)
     }
 
     fn cooldown_error(&self) -> AppError {

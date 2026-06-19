@@ -2093,6 +2093,7 @@ impl Gateway {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // distinct mutable tool-loop state threaded per turn
     async fn run_web_search(
         &self,
         response_id: &str,

@@ -792,6 +792,7 @@ impl MonitorState {
         );
     }
 
+    #[allow(clippy::too_many_arguments)] // distinct debug-timeline fields, not a cohesive struct
     fn push_timeline_event_with_images(
         &mut self,
         response_id: &str,
