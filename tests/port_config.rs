@@ -1134,3 +1134,88 @@ fn writing_config_to_toml_path_errors_and_creates_no_file() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// Per-request model-resolution headers (debug aid for model mismatches)
+// ---------------------------------------------------------------------------
+
+/// A request for a model the backend does not serve falls back to the loaded
+/// model, and the response is tagged with `x-llmconduit-model` (served) plus
+/// `x-llmconduit-requested` (the original) so the mismatch is visible per
+/// request — un-throttled, unlike the engine WARN. An exact match tags only the
+/// served model and omits `x-llmconduit-requested`.
+#[tokio::test]
+async fn response_headers_expose_model_fallback() {
+    let backend = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "served-model"}]})),
+        )
+        .mount(&backend)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_sse_body("chat-1", "ok")),
+        )
+        .mount(&backend)
+        .await;
+
+    let config = config_from_yaml(&format!(
+        "upstreams:\n  - name: \"local\"\n    upstream_base_url: \"{}/v1/\"\n",
+        backend.uri()
+    ));
+
+    let header = |response: &axum::response::Response, name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    let request = |model: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "model": model,
+                    "stream": false,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })
+                .to_string(),
+            ))
+            .expect("request")
+    };
+
+    // Mismatch: requested model is not served -> fallback + BOTH headers.
+    let mismatch = llmconduit::build_app(config.clone())
+        .oneshot(request("claude-opus-4"))
+        .await
+        .expect("response");
+    assert_eq!(mismatch.status().as_u16(), 200);
+    assert_eq!(
+        header(&mismatch, "x-llmconduit-model").as_deref(),
+        Some("served-model")
+    );
+    assert_eq!(
+        header(&mismatch, "x-llmconduit-requested").as_deref(),
+        Some("claude-opus-4")
+    );
+
+    // Exact match: served model requested -> served tag only, no `requested`.
+    let exact = llmconduit::build_app(config)
+        .oneshot(request("served-model"))
+        .await
+        .expect("response");
+    assert_eq!(exact.status().as_u16(), 200);
+    assert_eq!(
+        header(&exact, "x-llmconduit-model").as_deref(),
+        Some("served-model")
+    );
+    assert_eq!(header(&exact, "x-llmconduit-requested"), None);
+}

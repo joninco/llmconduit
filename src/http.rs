@@ -142,11 +142,20 @@ async fn log_api_call(request: Request, next: Next) -> Response {
 
     let request = Request::from_parts(parts, Body::from(body_bytes));
     let response = next.run(request).await;
+    // Per-request model-resolution audit: the handler tags the response with the
+    // served model (and the requested model when it differs) via
+    // `with_model_headers`; echo both here so every response record shows whether
+    // a model fell back — un-throttled, unlike the engine WARN. `requested_model`
+    // is empty when the requested model was served as-is.
+    let served_model = header_for_log(response.headers(), "x-llmconduit-model").to_string();
+    let requested_model = header_for_log(response.headers(), "x-llmconduit-requested").to_string();
     tracing::info!(
         api_call_id = %api_call_id,
         method = %method,
         path = %uri.path(),
         status = response.status().as_u16(),
+        served_model = %served_model,
+        requested_model = %requested_model,
         elapsed_ms = started_at.elapsed().as_millis(),
         "inbound API response prepared"
     );
@@ -700,13 +709,16 @@ async fn post_responses(
     State(gateway): State<Arc<Gateway>>,
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
+    let requested = request.model.clone();
+    let served = gateway.resolve_request_model(&request.model).await;
     let wants_stream = request.stream;
     let stream = gateway.stream_responses(request).await?;
-    if wants_stream {
-        Ok(stream_responses_response(stream))
+    let response = if wants_stream {
+        stream_responses_response(stream)
     } else {
-        collect_responses_response(stream).await
-    }
+        collect_responses_response(stream).await?
+    };
+    Ok(with_model_headers(response, &requested, &served))
 }
 
 async fn post_messages(
@@ -723,6 +735,7 @@ async fn post_chat_completions(
     State(gateway): State<Arc<Gateway>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> AppResult<Response> {
+    let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await;
     let wants_stream = request.stream;
     let include_usage = request
@@ -737,16 +750,12 @@ async fn post_chat_completions(
     let responses_request = chat_completions::convert_request(request)?;
     let stream = gateway.stream_responses(responses_request).await?;
 
-    if wants_stream {
-        Ok(stream_chat_completions_response(
-            model,
-            include_usage,
-            suppress_reasoning,
-            stream,
-        ))
+    let response = if wants_stream {
+        stream_chat_completions_response(model.clone(), include_usage, suppress_reasoning, stream)
     } else {
-        collect_chat_completions_response(model, suppress_reasoning, stream).await
-    }
+        collect_chat_completions_response(model.clone(), suppress_reasoning, stream).await?
+    };
+    Ok(with_model_headers(response, &requested, &model))
 }
 
 async fn post_completions(
@@ -765,16 +774,42 @@ async fn handle_post_messages(
     gateway: Arc<Gateway>,
     request: AnthropicRequest,
 ) -> AppResult<Response> {
+    let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await;
     let wants_stream = request.stream;
     let responses_request = anthropic_to_responses::convert_request(request)?;
     let stream = gateway.stream_responses(responses_request).await?;
 
-    if wants_stream {
-        stream_anthropic_response(model, stream)
+    let response = if wants_stream {
+        stream_anthropic_response(model.clone(), stream)?
     } else {
-        collect_anthropic_response(model, stream).await
+        collect_anthropic_response(model.clone(), stream).await?
+    };
+    Ok(with_model_headers(response, &requested, &model))
+}
+
+/// Tag a response with the model that actually served it, so a model mismatch
+/// (requested model not served → fell back to the loaded model) is visible
+/// PER-REQUEST to anyone inspecting the response (`curl -v`, a proxy, or
+/// response logging) without tailing the throttled engine WARN. The
+/// `x-llmconduit-requested` header is added ONLY when the requested model
+/// differs from the served one (the mismatch signal); an exact/canonical match
+/// omits it to keep the common case quiet. The `log_api_call` middleware echoes
+/// both headers into the per-request "response prepared" log line.
+fn with_model_headers(mut response: Response, requested: &str, served: &str) -> Response {
+    let headers = response.headers_mut();
+    if !served.is_empty()
+        && let Ok(value) = HeaderValue::from_str(served)
+    {
+        headers.insert(HeaderName::from_static("x-llmconduit-model"), value);
     }
+    if !requested.is_empty()
+        && !requested.eq_ignore_ascii_case(served)
+        && let Ok(value) = HeaderValue::from_str(requested)
+    {
+        headers.insert(HeaderName::from_static("x-llmconduit-requested"), value);
+    }
+    response
 }
 
 fn stream_chat_completions_response(
