@@ -30,6 +30,11 @@ git show <gap_commit_hash> | codex exec \
 
 (`codex review` is also available; `codex exec` with a piped diff is preferred for determinism.)
 
+## If Codex runs out of credits
+If a `codex` invocation returns `ERROR: Your workspace is out of credits. Add credits to continue.`,
+run `/home/jon/scripts/codex-account next` to switch to a funded account, then retry the SAME review
+command. Repeat the rotation if the next account is also empty. Do not skip or substitute the review because of a credit error.
+
 ## How — alternative (in-session subagent)
 When orchestrating in-session, spawn the `codex-agent` subagent instead, instructing it to consult
 Codex at **xhigh reasoning** with the same diff + spec + AGENTS.md context. Do NOT also spawn
