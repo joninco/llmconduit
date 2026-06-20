@@ -618,44 +618,47 @@ impl Gateway {
     /// D5: record a TERMINAL response into the metrics rings at the engine's D3
     /// terminal finalize seam — co-located with `guard.finalize(...)` so it fires at
     /// the SAME single CAS-guarded choke point (exactly once per flow, NOT from the
-    /// middleware, NOT per chunk). Sources the served model + endpoint + upstream
-    /// from the just-finalized FlowStore record (D1/D2 are the authoritative
-    /// attribution: `model_served`, `uri`, `upstream_target`), and the latency from
-    /// the guard's monotonic `elapsed`. No-op when the metrics layer is disabled OR
-    /// no `api_call_id`/record exists (the bare/non-instrumented paths), so it is
-    /// zero-overhead off the dashboard path. The record read is one extra brief lock
-    /// on the dashboard-only path; the metrics layer early-returns before any lock
-    /// when disabled.
+    /// middleware, NOT per chunk). Sources the served model + endpoint + upstream + the
+    /// flow's FINAL cumulative usage from the GUARD's own evict-safe copy
+    /// ([`TerminalMetricsInputs`](crate::dashboard_flow::TerminalMetricsInputs)) — the
+    /// endpoint captured at claim, the model/upstream/usage from the shared
+    /// `ServingToken` the guard holds — NOT by re-reading the record via `detail()`.
+    /// D5 R3 (MEDIUM): the FlowStore can prune (TTL) or evict (cap) a long-running /
+    /// high-concurrency flow BEFORE this runs, so a `detail()` re-read would `None`-out
+    /// and make the authoritative metrics layer UNDERCOUNT completed requests; recording
+    /// from the guard's own copy makes metrics independent of FlowStore retention. The
+    /// latency is the guard's monotonic `elapsed`. No-op when the metrics layer is
+    /// disabled OR the guard never finalized a live record (bare/non-instrumented
+    /// paths), so it is zero-overhead off the dashboard path. MUST be called AFTER
+    /// `guard.finalize(...)` (which assembles the inputs).
     fn record_terminal_metrics(
         &self,
-        api_call_id: &str,
+        guard: &crate::dashboard_flow::TelemetryGuard,
         status: crate::dashboard_flow::FlowStatus,
         elapsed_ms: u128,
     ) {
         if !self.metrics.is_enabled() {
             return;
         }
-        // The finalized record carries the authoritative served-model / endpoint /
-        // upstream attribution (set by D1 `open` + D2 `set_*` + D3 `finalize`) and
-        // the flow's final cumulative usage (D3 `record_usage` upserts).
-        let Some(record) = self.flow_store().detail(api_call_id) else {
+        // The guard assembled the authoritative served-model / endpoint / upstream
+        // attribution + final cumulative usage at finalize, from its claim-captured
+        // endpoint + the shared ServingToken — so this is evict-safe (no `detail()`
+        // re-read of a possibly-pruned record).
+        let Some(inputs) = guard.terminal_metrics() else {
             return;
         };
-        let served_model = record.model_served.as_deref();
-        let upstream = record.upstream_target.as_deref();
         // D5 R1 #2: record the terminal response AND the flow's FINAL cumulative token
         // usage in ONE atomic metrics call (single lock, single epoch/slot), into the
-        // SAME `{status, model, endpoint, upstream}` bucket. The D3 incremental upserts
-        // kept the record's `usage` current; we read the terminal total here and pass
-        // it alongside the count so a concurrent 5 s snapshot can never split the count
-        // and the tokens across two different 1 s slots.
+        // SAME `{status, model, endpoint, upstream}` bucket — so a concurrent 5 s
+        // snapshot can never split the count and the tokens across two different 1 s
+        // slots.
         self.metrics.record_terminal(
             status,
-            served_model,
-            &record.uri,
-            upstream,
+            inputs.model_served.as_deref(),
+            &inputs.endpoint,
+            inputs.upstream.as_deref(),
             elapsed_ms,
-            record.usage,
+            inputs.usage,
         );
     }
 
@@ -972,9 +975,11 @@ impl Gateway {
                 );
                 // D5: record the terminal into the metrics rings at the SAME seam as
                 // the finalize (co-located so a pre-spawn failure is counted exactly
-                // once, with the guard's monotonic latency). No-op when metrics off.
+                // once, with the guard's monotonic latency, from the guard's own
+                // evict-safe inputs). No-op when metrics off. Runs AFTER the finalize
+                // above, which assembled those inputs.
                 self.record_terminal_metrics(
-                    guard.api_call_id(),
+                    guard,
                     crate::dashboard_flow::FlowStatus::Failed,
                     guard.elapsed().as_millis(),
                 );
@@ -1124,13 +1129,11 @@ impl Gateway {
                 };
                 guard.finalize(status, Some(reason));
                 // D5: record the terminal into the metrics rings (sources served
-                // model + endpoint + upstream from the just-finalized record + the
-                // guard's monotonic latency). No-op when the metrics layer is off.
-                gateway.record_terminal_metrics(
-                    guard.api_call_id(),
-                    status,
-                    guard.elapsed().as_millis(),
-                );
+                // model + endpoint + upstream + final usage from the guard's own
+                // evict-safe inputs — no `detail()` re-read — + the guard's monotonic
+                // latency). No-op when the metrics layer is off. Runs AFTER
+                // `guard.finalize`, which assembled those inputs.
+                gateway.record_terminal_metrics(guard, status, guard.elapsed().as_millis());
             }
             if let Err(err) = &result {
                 if tx.is_closed() {
@@ -1368,6 +1371,14 @@ impl Gateway {
         serving_token: Arc<crate::upstream::ServingToken>,
         tx: mpsc::Sender<SseEvent>,
     ) -> AppResult<()> {
+        // D5 R3 (MEDIUM): record the resolved served model onto the shared serving
+        // token so the L1 telemetry guard (which holds the token) can attribute the
+        // metrics bucket's model at finalize WITHOUT re-reading the FlowStore record —
+        // which may be pruned/evicted by the time a long-running flow finalizes. The
+        // route/provider + final usage are also carried on the token (set by the
+        // failover/routing layers + the usage upsert below), making the guard's
+        // terminal metrics fully independent of FlowStore retention. First-writer-wins.
+        serving_token.set_model_served(upstream_model.clone());
         // D1 (R1 #9): bind this flow's `response_id` to its inbound `api_call_id`
         // exactly ONCE, at the RequestStarted emission seam (not pre-spawn). No-op
         // when the FlowStore is disabled or no `api_call_id` was threaded (the
@@ -1861,6 +1872,12 @@ impl Gateway {
                         let total = flow_usage_from_base_and_chunk(turn_base, &usage);
                         if let Some(api_call_id) = &api_call_id {
                             self.flow_store().record_usage(api_call_id, total);
+                            // D5 R3 (MEDIUM): mirror the cumulative total onto the serving
+                            // token (last-write-wins) so the L1 guard records the flow's
+                            // final usage into the metrics layer even if the FlowStore
+                            // record is pruned/evicted before finalize. Same dashboard-only
+                            // path as `record_usage`, so the disabled path stays zero-cost.
+                            serving_token.set_usage(total);
                         }
                         // D3: emit the usage event to the monitor hub. The `/debug/ws`
                         // + dashboard surfaces store it on the record + replay it in

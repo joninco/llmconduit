@@ -889,9 +889,18 @@ impl MetricsLayer {
     /// before the locks could stamp the cut EARLIER than the state it contains: under
     /// contention `snapshot_at(ts)` would return data newer than its own `taken_at_ms`,
     /// and `view(now_epoch)` would aggregate against a stale epoch while `metrics_seq`
-    /// already reflected newer samples. Sampling all metadata under the held locks makes
-    /// `taken_at_ms` ≥ every flow/sample the cut contains and keeps the epoch consistent
-    /// with the cursors.
+    /// already reflected newer samples.
+    ///
+    /// Stamp-LAST ordering (Codex D5 R3 HIGH): within the held locks the timestamp is
+    /// taken LAST — AFTER the topology `Arc` + version, the monitor cursor, and the
+    /// metrics cursor are all sampled (the flow summaries + `flow_seq` were already
+    /// read under the FlowStore lock before this closure ran). Topology and the monitor
+    /// are INDEPENDENT domains (neither is under the FlowStore or Metrics lock), so a
+    /// topology publish or a monitor emit racing this cut could land AFTER a
+    /// prematurely-stamped timestamp yet still be folded into the cut — making
+    /// `taken_at_ms` predate a field the cut carries. Sampling every independent field
+    /// FIRST and stamping the clock LAST makes `taken_at_ms` ≥ the read-time of EVERY
+    /// field the cut contains (no field is ever newer than the stamp).
     fn snapshot_with<S>(
         &self,
         flow_store: &DashboardFlowStore,
@@ -920,16 +929,27 @@ impl MetricsLayer {
             // Both held now == the atomic cut instant — sample EVERY piece of cut
             // metadata here so none of it predates the state the cut contains.
             let mut state = self.lock();
-            // Wall-clock instant of the cut, taken under the held locks so it is never
-            // earlier than any flow/sample the cut includes.
-            let taken_at_ms = now_ms();
-            let now_epoch = (taken_at_ms / 1000) as u64;
+            // D5 R3 (HIGH): sample ALL independently-mutable cut fields FIRST, then
+            // stamp the cut timestamp LAST. Topology and the monitor are INDEPENDENT
+            // domains — neither is under the FlowStore or Metrics lock — so a topology
+            // publish or a monitor emit can land AFTER a prematurely-stamped timestamp
+            // yet still be included in this cut, making `taken_at_ms` EARLIER than a
+            // field the cut contains (a "future" snapshot for topology/monitor). The
+            // `summaries` + `flow_seq` were already read under the held FlowStore lock;
+            // here we read the remaining independent fields (topology Arc + version, the
+            // monitor cursor, the metrics cursor) BEFORE taking the clock, so the cut's
+            // `taken_at_ms` is ≥ the read-time of EVERY field the cut carries.
             // ONE topology Arc capture (D4) at the cut instant.
             let topology = topology.latest();
             let topology_seq = topology.version;
             let metrics_seq = state.metrics_seq;
             // The monitor cursor, sampled at the cut instant (not pre-read by the caller).
             let monitor_seq = read_monitor_seq();
+            // Wall-clock instant of the cut, stamped LAST — after every independent
+            // field above is already sampled — so it is never earlier than any
+            // flow/sample/topology/monitor read the cut includes.
+            let taken_at_ms = now_ms();
+            let now_epoch = (taken_at_ms / 1000) as u64;
             // Cut instant fixed: release the FlowStore lock and finish the metrics-only
             // work (aggregation + push) under the metrics guard alone.
             flow_guard.release();
@@ -1697,5 +1717,112 @@ mod tests {
             "every cut's taken_at_ms is >= every contained flow's started_ms and its \
              epoch is consistent with taken_at_ms (metadata sampled inside the lock)"
         );
+    }
+
+    #[test]
+    fn snapshot_stamp_is_after_topology_and_monitor_reads() {
+        // Codex D5 R3 HIGH: topology + the monitor are INDEPENDENT domains (neither is
+        // under the FlowStore/Metrics lock), so the cut timestamp must be stamped AFTER
+        // they are read — otherwise a topology publish or monitor emit racing the cut
+        // could land after a prematurely-stamped timestamp yet still be included, making
+        // `taken_at_ms` predate a field the cut carries. Drive a concurrent topology
+        // publisher that records, for each version, the wall-clock time captured JUST
+        // BEFORE the publish (so it happens-before the version is visible to any reader),
+        // and a monitor cursor whose value IS the wall-clock ms at read time. Then assert
+        // every cut's `taken_at_ms` is ≥ the publish-time of the topology version it
+        // captured AND ≥ the monitor cursor it captured (no field newer than the stamp).
+        let metrics = MetricsLayer::new();
+        let flow = DashboardFlowStore::new();
+        let topo = ProviderHealthPublisher::default();
+        topo.publish(Vec::new());
+        // version → wall-clock ms recorded just before that version's publish.
+        let publish_times: Arc<Mutex<std::collections::HashMap<u64, u128>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let violations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cuts_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // The topology publisher: stamp the about-to-be-published version's time BEFORE
+        // publishing so the recorded time precedes the version becoming reader-visible.
+        let publisher_thread = {
+            let topo = topo.clone();
+            let publish_times = Arc::clone(&publish_times);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // `publish` bumps the version to (current + 1); record THAT version's
+                // pre-publish time, then publish. The recorded time is ≤ the swap, so a
+                // reader that sees this version did its read at/after the recorded time.
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let next_version = topo.latest().version + 1;
+                    publish_times
+                        .lock()
+                        .expect("publish_times poisoned")
+                        .insert(next_version, now_ms());
+                    topo.publish(Vec::new());
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        let snapshot_thread = {
+            let metrics = metrics.clone();
+            let flow = flow.clone();
+            let topo = topo.clone();
+            let publish_times = Arc::clone(&publish_times);
+            let stop = Arc::clone(&stop);
+            let violations = Arc::clone(&violations);
+            let cuts_seen = Arc::clone(&cuts_seen);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // The monitor cursor read returns the wall-clock ms AT read time; the
+                    // stamp-LAST ordering guarantees `taken_at_ms` is taken after it.
+                    if let Some(cut) = metrics.snapshot_with(&flow, &topo, now_ms_u64) {
+                        cuts_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // The monitor cursor was read before the timestamp was stamped.
+                        if cut.taken_at_ms < cut.cursors.monitor_seq as u128 {
+                            violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        // The topology version the cut captured was published at a time
+                        // recorded BEFORE it became visible; since topology is read before
+                        // the timestamp is stamped, that publish-time must not exceed the
+                        // stamp. (version 0 is the pre-loop seed with no recorded time.)
+                        if let Some(published_ms) = publish_times
+                            .lock()
+                            .expect("publish_times poisoned")
+                            .get(&cut.cursors.topology_seq)
+                            .copied()
+                            && cut.taken_at_ms < published_ms
+                        {
+                            violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        // Let the two independent-domain writers race the cut for a bit.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        publisher_thread.join().expect("publisher thread joins");
+        snapshot_thread.join().expect("snapshot thread joins");
+
+        assert!(
+            cuts_seen.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the snapshot thread took at least one cut while topology/monitor raced it"
+        );
+        assert_eq!(
+            violations.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "every cut's taken_at_ms is >= the topology version's publish-time AND the \
+             monitor cursor it captured (independent fields sampled before the stamp)"
+        );
+    }
+
+    /// The wall-clock epoch-ms as a `u64`, the monitor-cursor read used by the R3
+    /// stamp-ordering test: passing it as `read_monitor_seq` makes the captured
+    /// `monitor_seq` the read-time, so the test can assert `taken_at_ms` ≥ it.
+    fn now_ms_u64() -> u64 {
+        now_ms() as u64
     }
 }

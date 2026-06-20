@@ -2427,6 +2427,15 @@ fn policy_for_model<'a, V>(
 struct ServingInfo {
     route: Option<String>,
     provider: Option<String>,
+    /// D5 R3 (MEDIUM): the resolved served model + final cumulative usage, carried on
+    /// the token so the L1 telemetry guard can record terminal metrics from the token
+    /// (which it already holds) even after the FlowStore record is pruned/evicted — the
+    /// authoritative metrics layer must not undercount completed requests when retention
+    /// drops the record before finalize. `model_served` is first-writer-wins (the engine
+    /// sets the resolved model once); `usage` is last-write (the cumulative total grows
+    /// across chunks, mirroring the FlowStore `record_usage` upsert).
+    model_served: Option<String>,
+    usage: Option<crate::dashboard_flow::FlowUsage>,
 }
 
 /// Interior-mutable serving identity for one flow. A FRESH one is allocated per
@@ -2464,10 +2473,35 @@ impl ServingToken {
         }
     }
 
+    /// Record the resolved served model (D5 R3 MEDIUM), first-writer-wins. The engine
+    /// sets this once in `run_turn` from the resolved `upstream_model`, so the L1 guard
+    /// can attribute the metrics bucket's model without re-reading the (evictable) record.
+    pub fn set_model_served(&self, model: impl Into<String>) {
+        let mut info = self.lock();
+        if info.model_served.is_none() {
+            info.model_served = Some(model.into());
+        }
+    }
+
+    /// Record the flow's FINAL cumulative usage (D5 R3 MEDIUM), last-write-wins —
+    /// mirrors the FlowStore `record_usage` upsert (the cumulative total grows across
+    /// chunks). The L1 guard reads it at finalize so the metrics token sum survives a
+    /// record eviction.
+    pub fn set_usage(&self, usage: crate::dashboard_flow::FlowUsage) {
+        self.lock().usage = Some(usage);
+    }
+
     /// `(route, provider)` snapshot for D3's finalize attribution.
     pub fn snapshot(&self) -> (Option<String>, Option<String>) {
         let info = self.lock();
         (info.route.clone(), info.provider.clone())
+    }
+
+    /// `(model_served, usage)` snapshot for D5's evict-safe terminal metrics (the L1
+    /// guard reads this at finalize alongside `snapshot()`'s route/provider).
+    pub fn metrics_snapshot(&self) -> (Option<String>, Option<crate::dashboard_flow::FlowUsage>) {
+        let info = self.lock();
+        (info.model_served.clone(), info.usage)
     }
 }
 

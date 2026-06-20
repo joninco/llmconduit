@@ -91,6 +91,24 @@ pub struct FlowUsage {
     pub reasoning: i64,
 }
 
+/// The D5 metrics inputs the L1 [`TelemetryGuard`] assembles at finalize from its
+/// OWN evict-safe sources (D5 R3 MEDIUM): the `endpoint` captured at claim (when the
+/// record provably exists) + the shared `ServingToken` (which carries the resolved
+/// `model_served`, the serving route/provider, and the final cumulative usage). The
+/// engine's `record_terminal` records from THIS copy, NEVER by re-reading the record
+/// via `detail()` — the record can be pruned (TTL) or evicted (cap) BEFORE finalize,
+/// so a re-read would `None`-out and UNDERCOUNT completed requests. Sourcing from the
+/// guard makes the authoritative metrics layer independent of FlowStore retention.
+/// `endpoint` is the inbound route; `upstream` is the serving provider/route label;
+/// all are owned values (not borrows) so the snapshot survives any eviction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalMetricsInputs {
+    pub model_served: Option<String>,
+    pub endpoint: String,
+    pub upstream: Option<String>,
+    pub usage: Option<FlowUsage>,
+}
+
 /// Request-extension newtype carrying the `api_call_id` minted by `log_api_call`
 /// from the HTTP boundary down to the inference handlers + engine, so the engine
 /// can `link(response_id, api_call_id)` without re-deriving the id.
@@ -562,7 +580,14 @@ impl DashboardFlowStore {
         if !self.enabled {
             return None;
         }
-        let claim = self.lock().by_id.get(api_call_id)?.claim.clone();
+        // Read the claim Arc + the inbound route in ONE lock: the record provably
+        // exists here, so capturing `uri` now makes the metrics `endpoint` evict-safe
+        // (D5 R3 MEDIUM) — it no longer depends on the record surviving until finalize.
+        let (claim, endpoint) = {
+            let state = self.lock();
+            let record = state.by_id.get(api_call_id)?;
+            (record.claim.clone(), record.uri.clone())
+        };
         // CAS OpenL0 → ClaimedL1. Only the winner gets a guard.
         claim
             .compare_exchange(
@@ -578,6 +603,8 @@ impl DashboardFlowStore {
             claim,
             serving,
             started: Instant::now(),
+            endpoint,
+            terminal_metrics: Mutex::new(None),
         })
     }
 
@@ -760,6 +787,21 @@ pub struct TelemetryGuard {
     claim: Arc<AtomicU8>,
     serving: Arc<crate::upstream::ServingToken>,
     started: Instant,
+    /// D5 R3 (MEDIUM): the inbound route (`record.uri`), captured at CLAIM time (when
+    /// the record provably exists). The metrics `endpoint` dimension reads from this
+    /// owned copy, so it survives a later TTL prune / cap eviction of the record.
+    endpoint: String,
+    /// D5 R3 (MEDIUM): the metrics inputs the engine records at the terminal seam,
+    /// assembled at finalize from the guard's OWN evict-safe sources — the captured
+    /// `endpoint` + the shared `ServingToken` (which carries the resolved
+    /// `model_served`, the serving route/provider, and the final cumulative usage) —
+    /// NOT by re-reading the FlowStore record via `detail()`. The FlowStore can prune
+    /// (TTL) or evict (cap) a long-running / high-concurrency flow BEFORE finalize, so a
+    /// `detail()` re-read would `None`-out and make the authoritative metrics layer
+    /// UNDERCOUNT completed requests; sourcing from the guard makes metrics independent
+    /// of FlowStore retention. `Mutex` for interior mutability behind the guard's
+    /// `&self` finalize; the winning CAS writes it exactly once, before any reader.
+    terminal_metrics: Mutex<Option<TerminalMetricsInputs>>,
 }
 
 impl TelemetryGuard {
@@ -777,12 +819,29 @@ impl TelemetryGuard {
         self.started.elapsed()
     }
 
+    /// The metrics inputs the guard assembled at finalize (D5 R3 MEDIUM), or `None` if
+    /// the guard has not finalized yet. Once the guard finalizes this is always `Some`
+    /// — it is built from the guard's OWN sources (claim-captured endpoint + the shared
+    /// ServingToken), NOT the FlowStore record, so it is populated even if the record
+    /// was pruned/evicted before finalize. The engine's D5 terminal metrics seam reads
+    /// this AFTER calling [`finalize`](Self::finalize), recording independent of
+    /// FlowStore retention.
+    pub fn terminal_metrics(&self) -> Option<TerminalMetricsInputs> {
+        self.terminal_metrics
+            .lock()
+            .expect("telemetry guard terminal-metrics lock poisoned")
+            .clone()
+    }
+
     /// Explicitly finalize the flow with `status` + `terminal_reason`, attributing
     /// the serving provider read from the shared `ServingToken` (failover provider,
     /// else routing route). IDEMPOTENT via `compare_exchange(ClaimedL1 → Finalized)`:
     /// the first finalize (explicit OR the `Drop` fallback) wins; later calls
     /// no-op, so the engine's explicit terminal status is never overwritten by the
-    /// `Drop`'s `Cancelled` fallback.
+    /// `Drop`'s `Cancelled` fallback. The winning finalize ALSO assembles + stashes the
+    /// metrics inputs from the guard's own evict-safe sources (claim-captured endpoint +
+    /// the shared ServingToken; D5 R3 MEDIUM) so the engine's metrics record never
+    /// re-reads the (possibly-evicted) record.
     pub fn finalize(&self, status: FlowStatus, terminal_reason: Option<String>) {
         if self
             .claim
@@ -795,8 +854,26 @@ impl TelemetryGuard {
             .is_ok()
         {
             let (route, provider) = self.serving.snapshot();
-            // Prefer the actual serving provider; fall back to the route name.
+            // Prefer the actual serving provider; fall back to the route name. This is
+            // both the FlowStore `upstream_target` fallback AND the metrics `upstream`.
             let serving = provider.or(route);
+            // D5 R3 (MEDIUM): assemble the metrics inputs from the guard's OWN
+            // evict-safe sources — the `endpoint` captured at claim + the shared
+            // `ServingToken`'s resolved `model_served`, serving label, and final usage —
+            // so the engine's terminal metrics record never re-reads the (possibly
+            // pruned/evicted) FlowStore record. Captured BEFORE the `store.finalize`
+            // below so it is independent of whether the record still exists.
+            let (model_served, usage) = self.serving.metrics_snapshot();
+            *self
+                .terminal_metrics
+                .lock()
+                .expect("telemetry guard terminal-metrics lock poisoned") =
+                Some(TerminalMetricsInputs {
+                    model_served,
+                    endpoint: self.endpoint.clone(),
+                    upstream: serving.clone(),
+                    usage,
+                });
             self.store
                 .finalize(&self.api_call_id, status, terminal_reason, serving);
         }
@@ -1382,6 +1459,106 @@ mod tests {
             Some("https://real-url"),
             "leaf URL wins over serving-provider fallback"
         );
+    }
+
+    #[test]
+    fn terminal_metrics_survive_record_eviction_before_finalize() {
+        // D5 R3 (MEDIUM): the authoritative metrics layer must NOT undercount a
+        // completed request when the FlowStore prunes/evicts the record BEFORE the flow
+        // finalizes (a long-running / high-concurrency flow can age past the TTL or be
+        // pushed out by the count cap). The L1 guard captures `endpoint` at claim and
+        // reads `model_served`/`upstream`/`usage` off the shared ServingToken at
+        // finalize — never re-reading the (now-gone) record — so its terminal metrics
+        // inputs are fully intact and the request is still counted. Assert it for BOTH
+        // eviction mechanisms (TTL prune AND count-cap eviction).
+        for evict_via_ttl in [true, false] {
+            let store = DashboardFlowStore::new();
+            open_simple(&store, "api_1");
+            let token = serving();
+            // The engine's run_turn sets these on the token (resolved model + upserted
+            // usage); the failover/routing layer sets the provider.
+            token.set_model_served("served-m");
+            token.set_provider("backend-b");
+            token.set_usage(FlowUsage {
+                prompt: 100,
+                completion: 40,
+                total: 140,
+                cached: 10,
+                reasoning: 7,
+            });
+            let guard = store
+                .engine_guard("api_1", Arc::clone(&token))
+                .expect("claim");
+
+            // EVICT the record BEFORE finalize — the whole record is gone either way.
+            if evict_via_ttl {
+                // Age the record past the TTL, then prune at a clock beyond its window.
+                store.force_started_ms("api_1", 0);
+                store.prune_at(FLOW_TTL_MS + 100);
+            } else {
+                // Push past the count cap so the oldest (only) record is evicted.
+                for index in 0..(FLOW_CAP + 1) {
+                    open_simple(&store, &format!("filler_{index}"));
+                }
+            }
+            assert!(
+                store.detail("api_1").is_none(),
+                "the flow record is evicted before finalize (evict_via_ttl={evict_via_ttl})"
+            );
+
+            // Finalize AFTER the record is gone: the guard sources its metrics inputs
+            // from its own captured endpoint + the ServingToken, so they are intact.
+            guard.finalize(FlowStatus::Completed, None);
+            let inputs = guard
+                .terminal_metrics()
+                .expect("guard carries terminal metrics despite record eviction");
+            assert_eq!(inputs.model_served.as_deref(), Some("served-m"));
+            assert_eq!(inputs.endpoint, "/v1/responses");
+            assert_eq!(inputs.upstream.as_deref(), Some("backend-b"));
+            assert_eq!(
+                inputs.usage,
+                Some(FlowUsage {
+                    prompt: 100,
+                    completion: 40,
+                    total: 140,
+                    cached: 10,
+                    reasoning: 7,
+                })
+            );
+
+            // Feed the guard's inputs into the metrics layer exactly as the engine's
+            // `record_terminal_metrics` does, and assert the completed request IS
+            // counted (no undercount) with the real served model — never the "unknown"
+            // sentinel a None-out `detail()` re-read would have produced.
+            let metrics = crate::metrics::MetricsLayer::new();
+            metrics.record_terminal(
+                FlowStatus::Completed,
+                inputs.model_served.as_deref(),
+                &inputs.endpoint,
+                inputs.upstream.as_deref(),
+                guard.elapsed().as_millis(),
+                inputs.usage,
+            );
+            let view = metrics.view();
+            assert_eq!(
+                view.window_1m.total_count(),
+                1,
+                "the evicted-then-finalized request is still counted (evict_via_ttl={evict_via_ttl})"
+            );
+            let (key, counts) = view
+                .window_1m
+                .buckets
+                .iter()
+                .next()
+                .expect("one metrics bucket");
+            assert_eq!(
+                key.model, "served-m",
+                "served model, not the unknown sentinel"
+            );
+            assert_eq!(key.upstream, "backend-b");
+            assert_eq!(counts.prompt_tokens, 100);
+            assert_eq!(counts.completion_tokens, 40);
+        }
     }
 
     #[test]
