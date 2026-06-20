@@ -428,12 +428,28 @@ impl DashboardFlowStore {
     }
 
     /// Mark a flow terminal (D3). Stamps `status`, `finished_ms`, `elapsed_ms`
-    /// (from the record's `started_at`), and the terminal reason.
-    pub fn finalize(&self, api_call_id: &str, status: FlowStatus, terminal_reason: Option<String>) {
+    /// (`record.started_at.elapsed()` — a MONOTONIC `Instant` delta, never an
+    /// epoch-ms subtraction), the terminal reason, and the serving-provider
+    /// attribution read from D2's `ServingToken` at finalize time. The serving
+    /// provider name (failover provider, else routing route) lands in
+    /// `upstream_target` ONLY when the leaf did not already capture an upstream URL
+    /// there — so the URL the leaf saw wins, and a path that never reached the leaf
+    /// (pre-spawn early return, midstream cancel before first chunk) still records
+    /// WHO would have served it. Idempotent at the store level too: a second
+    /// finalize just re-stamps the same terminal fields (the D3 CAS guard is the
+    /// real exactly-once authority).
+    pub fn finalize(
+        &self,
+        api_call_id: &str,
+        status: FlowStatus,
+        terminal_reason: Option<String>,
+        serving_provider: Option<String>,
+    ) {
         if !self.enabled {
             return;
         }
         let terminal_reason = terminal_reason.map(cap_scalar);
+        let serving_provider = serving_provider.map(cap_scalar);
         let now = now_ms();
         let mut state = self.lock();
         state.prune_expired(now);
@@ -444,11 +460,18 @@ impl DashboardFlowStore {
             if terminal_reason.is_some() {
                 record.terminal_reason = terminal_reason.clone();
             }
+            // Don't clobber the leaf-captured upstream URL; only fill the slot when
+            // it is still empty (the pre-leaf / pre-first-chunk paths).
+            if record.upstream_target.is_none() && serving_provider.is_some() {
+                record.upstream_target = serving_provider.clone();
+            }
         });
         state.enforce_caps(self.summary_quota_bytes);
     }
 
-    /// Attach token usage (D3).
+    /// Attach token usage (D3). UPSERT semantics: the caller passes the running
+    /// CUMULATIVE total for the flow, never an increment, so a multi-chunk turn
+    /// whose usage is already cumulative does NOT double-count.
     pub fn record_usage(&self, api_call_id: &str, usage: FlowUsage) {
         if !self.enabled {
             return;
@@ -458,6 +481,67 @@ impl DashboardFlowStore {
         state.update(api_call_id, |record| {
             record.usage = Some(usage);
         });
+    }
+
+    /// Mint the D3 **L0 middleware guard** for a freshly `open`ed flow (the
+    /// `compare_exchange(OpenL0 → Finalized-Failed)` RAII fallback). Returns `None`
+    /// when the store is disabled OR the record is unknown (so a disabled store
+    /// stays a pure no-op). The middleware holds the guard across `next.run`: if the
+    /// request never reaches the engine (an extractor/`Json` rejection, a panic in a
+    /// layer above the handler) the record is still `OpenL0` at the guard's `Drop`,
+    /// which CASes it to `Finalized` and stamps a `Failed("unhandled")` terminal —
+    /// no orphan stuck `Open`. If the engine claimed it (`ClaimedL1`), the L0 `Drop`
+    /// is inert: the CAS fails and L1 owns finalization. This is SEPARATE from
+    /// [`open`](Self::open) (which stays infallible + guardless) so the store's many
+    /// internal/test callers and the D2 leaf helper — which manage the lifecycle via
+    /// the engine's L1 path, not `next.run` — are unaffected.
+    pub fn middleware_guard(&self, api_call_id: &str) -> Option<MiddlewareGuard> {
+        if !self.enabled {
+            return None;
+        }
+        let claim = self.lock().by_id.get(api_call_id)?.claim.clone();
+        Some(MiddlewareGuard {
+            store: self.clone(),
+            api_call_id: api_call_id.to_string(),
+            claim,
+        })
+    }
+
+    /// Mint the D3 **L1 engine guard** by CASing the record's claim
+    /// `OpenL0 → ClaimedL1`. Returns `None` when the store is disabled, the record
+    /// is unknown, or the CAS loses (already `ClaimedL1`/`Finalized`) — so only the
+    /// FIRST engine guard for a flow owns finalization, and a disabled store stays a
+    /// no-op. On success the engine owns finalization on EVERY exit path (the
+    /// pre-spawn early returns, the spawned body, the terminal arms) via
+    /// [`TelemetryGuard::finalize`]; its RAII `Drop` is the fallback that finalizes
+    /// `Cancelled` if a path is missed (client hang-up / panic / cancel). The guard
+    /// holds only `Arc`s + an `Instant` + an owned id, so it is `Send` and crosses
+    /// the `tokio::spawn` in `stream_responses`.
+    pub fn engine_guard(
+        &self,
+        api_call_id: &str,
+        serving: std::sync::Arc<crate::upstream::ServingToken>,
+    ) -> Option<TelemetryGuard> {
+        if !self.enabled {
+            return None;
+        }
+        let claim = self.lock().by_id.get(api_call_id)?.claim.clone();
+        // CAS OpenL0 → ClaimedL1. Only the winner gets a guard.
+        claim
+            .compare_exchange(
+                CLAIM_OPEN_L0,
+                CLAIM_CLAIMED_L1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .ok()?;
+        Some(TelemetryGuard {
+            store: self.clone(),
+            api_call_id: api_call_id.to_string(),
+            claim,
+            serving,
+            started: Instant::now(),
+        })
     }
 
     /// Live records, newest-first. Empty when disabled. Prunes expired records
@@ -528,6 +612,124 @@ impl DashboardFlowStore {
 impl Default for DashboardFlowStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// D3 **L0 (middleware) telemetry guard**: an RAII fallback that finalizes a flow
+/// record IFF it is still `OpenL0` at `Drop`. Held by `log_api_call` across
+/// `next.run`. It owns a cheap store handle (`Arc<Mutex<_>>` clone) + the record's
+/// shared `claim` `Arc`, so it carries no borrow and is trivially `Send`. The CAS
+/// (`OpenL0 → Finalized`) is the ONLY ownership-transfer mechanism — if the engine
+/// claimed the record (`ClaimedL1`) the CAS here fails and L1 owns finalization;
+/// the L0 `Drop` is then inert. This catches the narrow window where the middleware
+/// opened a record but the request NEVER reached the engine (an extractor/`Json`
+/// rejection, a layer panic): without L0 that record would be stuck `Open` forever.
+#[must_use = "the L0 middleware guard finalizes an orphan flow on Drop; hold it across next.run"]
+pub struct MiddlewareGuard {
+    store: DashboardFlowStore,
+    api_call_id: String,
+    claim: Arc<AtomicU8>,
+}
+
+impl Drop for MiddlewareGuard {
+    fn drop(&mut self) {
+        // Finalize ONLY if still OpenL0 (the engine never claimed it). Race-free:
+        // the CAS atomically transfers ownership; a concurrent L1 claim makes this
+        // fail and L1 finalizes instead.
+        if self
+            .claim
+            .compare_exchange(
+                CLAIM_OPEN_L0,
+                CLAIM_FINALIZED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.store.finalize(
+                &self.api_call_id,
+                FlowStatus::Failed,
+                Some("unhandled".to_string()),
+                None,
+            );
+        }
+    }
+}
+
+/// D3 **L1 (engine) telemetry guard**: owns finalization of a flow once it has CASed
+/// the record `OpenL0 → ClaimedL1` (via [`DashboardFlowStore::engine_guard`]). The
+/// engine calls [`finalize`](Self::finalize) on EVERY deterministic exit path
+/// (pre-spawn early returns, the spawned body's `Completed`/`Failed` arms) with the
+/// terminal status; the RAII `Drop` is the fallback that finalizes `Cancelled` if a
+/// path is missed (client hang-up mid-stream, panic, cancel). Finalization is
+/// IDEMPOTENT: it CASes `ClaimedL1 → Finalized`, so the explicit call wins and the
+/// `Drop` fallback then no-ops (and a double explicit call no-ops).
+///
+/// Holds only `Arc`s (`store` handle, shared `claim`, shared `serving`), an owned
+/// `String` id, and a monotonic `Instant` — all `Send` — so the guard moves into the
+/// `tokio::spawn` in `stream_responses` (the midstream-cancel test compiles + runs
+/// across the spawn). The serving provider for attribution is read from the shared
+/// `ServingToken` AT finalize time (not at construction), so a provider that the
+/// failover/routing layer tags AFTER the guard is built is still recorded.
+#[must_use = "the L1 engine guard finalizes the flow on Drop; bind it for the flow's lifetime"]
+pub struct TelemetryGuard {
+    store: DashboardFlowStore,
+    api_call_id: String,
+    claim: Arc<AtomicU8>,
+    serving: Arc<crate::upstream::ServingToken>,
+    started: Instant,
+}
+
+impl TelemetryGuard {
+    /// The flow's `api_call_id` (so the engine can drive `record_usage` upserts on
+    /// the SAME record the guard owns without re-threading the id separately).
+    pub fn api_call_id(&self) -> &str {
+        &self.api_call_id
+    }
+
+    /// Monotonic elapsed since the guard claimed the flow — the latency source the
+    /// engine reports, never an epoch-ms subtraction. (`finalize` also stamps the
+    /// store's own `started_at.elapsed()`; this accessor exists for callers/tests
+    /// that want the guard-relative value.)
+    pub fn elapsed(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    /// Explicitly finalize the flow with `status` + `terminal_reason`, attributing
+    /// the serving provider read from the shared `ServingToken` (failover provider,
+    /// else routing route). IDEMPOTENT via `compare_exchange(ClaimedL1 → Finalized)`:
+    /// the first finalize (explicit OR the `Drop` fallback) wins; later calls
+    /// no-op, so the engine's explicit terminal status is never overwritten by the
+    /// `Drop`'s `Cancelled` fallback.
+    pub fn finalize(&self, status: FlowStatus, terminal_reason: Option<String>) {
+        if self
+            .claim
+            .compare_exchange(
+                CLAIM_CLAIMED_L1,
+                CLAIM_FINALIZED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let (route, provider) = self.serving.snapshot();
+            // Prefer the actual serving provider; fall back to the route name.
+            let serving = provider.or(route);
+            self.store
+                .finalize(&self.api_call_id, status, terminal_reason, serving);
+        }
+    }
+}
+
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        // Fallback: a path that did not call `finalize` explicitly (client hang-up
+        // mid-stream, panic, cancel) lands here while still `ClaimedL1`. Finalize
+        // `Cancelled` — the conservative terminal for "the engine stopped owning
+        // this flow without a clean Completed/Failed". If the engine already
+        // finalized, the CAS in `finalize` already moved the claim to `Finalized`
+        // and this no-ops.
+        self.finalize(FlowStatus::Cancelled, Some("dropped".to_string()));
     }
 }
 
@@ -769,7 +971,11 @@ mod tests {
         );
         store.link("resp_1".to_string(), "api_1".to_string());
         store.record_usage("api_1", FlowUsage::default());
-        store.finalize("api_1", FlowStatus::Completed, None);
+        store.finalize("api_1", FlowStatus::Completed, None, None);
+        assert!(
+            store.middleware_guard("api_1").is_none(),
+            "disabled store mints no L0 guard"
+        );
         assert!(store.list().is_empty(), "disabled store records nothing");
         assert!(store.detail("api_1").is_none());
         assert!(store.snapshot_summaries().is_empty());
@@ -937,6 +1143,7 @@ mod tests {
             "api_1",
             FlowStatus::Completed,
             Some("response.completed".to_string()),
+            None,
         );
         let record = store.detail("api_1").expect("record");
         assert_eq!(record.status, FlowStatus::Completed);
@@ -947,6 +1154,164 @@ mod tests {
             Some("response.completed")
         );
         assert_eq!(record.usage.expect("usage").total, 15);
+    }
+
+    use std::sync::atomic::Ordering::SeqCst;
+
+    fn serving() -> Arc<crate::upstream::ServingToken> {
+        Arc::new(crate::upstream::ServingToken::default())
+    }
+
+    #[test]
+    fn l0_guard_finalizes_orphan_left_open() {
+        // The L0 middleware guard's Drop finalizes a record that was opened but
+        // NEVER claimed by the engine (extractor/JSON rejection) — no orphan Open.
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        {
+            let _guard = store.middleware_guard("api_1").expect("guard minted");
+            // While held, the record is still Open (nothing claimed it).
+            assert_eq!(store.detail("api_1").unwrap().status, FlowStatus::Open);
+        } // Drop here.
+        let record = store.detail("api_1").expect("record survives");
+        assert_eq!(
+            record.status,
+            FlowStatus::Failed,
+            "L0 Drop finalized the orphan Failed"
+        );
+        assert_eq!(record.terminal_reason.as_deref(), Some("unhandled"));
+        assert_eq!(
+            record.claim.load(SeqCst),
+            CLAIM_FINALIZED,
+            "claim CASed OpenL0 → Finalized"
+        );
+    }
+
+    #[test]
+    fn l1_claim_disarms_l0_guard() {
+        // When the engine claims the record (ClaimedL1) the L0 Drop is inert: its
+        // CAS(OpenL0 → Finalized) fails, so L1 owns finalization. No transition to
+        // Failed-unhandled occurs.
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        let l0 = store.middleware_guard("api_1").expect("L0 guard");
+        let l1 = store
+            .engine_guard("api_1", serving())
+            .expect("L1 claim wins");
+        assert_eq!(
+            store.detail("api_1").unwrap().claim.load(SeqCst),
+            CLAIM_CLAIMED_L1
+        );
+        // A SECOND engine guard cannot claim (CAS already lost OpenL0).
+        assert!(
+            store.engine_guard("api_1", serving()).is_none(),
+            "second L1 claim loses the CAS"
+        );
+        drop(l0); // inert — record is ClaimedL1, not OpenL0.
+        assert_eq!(
+            store.detail("api_1").unwrap().status,
+            FlowStatus::Open,
+            "L0 Drop did NOT finalize a claimed record"
+        );
+        l1.finalize(
+            FlowStatus::Completed,
+            Some("response.completed".to_string()),
+        );
+        assert_eq!(store.detail("api_1").unwrap().status, FlowStatus::Completed);
+    }
+
+    #[test]
+    fn l1_finalize_is_idempotent_and_drop_no_ops() {
+        // Explicit finalize wins; the Drop fallback then no-ops (does NOT overwrite
+        // Completed with the Cancelled fallback).
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        let guard = store.engine_guard("api_1", serving()).expect("claim");
+        guard.finalize(
+            FlowStatus::Completed,
+            Some("response.completed".to_string()),
+        );
+        // A second explicit finalize no-ops (CAS already Finalized).
+        guard.finalize(FlowStatus::Failed, Some("late".to_string()));
+        assert_eq!(store.detail("api_1").unwrap().status, FlowStatus::Completed);
+        drop(guard); // Drop fallback must NOT flip it to Cancelled.
+        let record = store.detail("api_1").expect("record");
+        assert_eq!(record.status, FlowStatus::Completed);
+        assert_eq!(
+            record.terminal_reason.as_deref(),
+            Some("response.completed")
+        );
+        assert_eq!(record.claim.load(SeqCst), CLAIM_FINALIZED);
+    }
+
+    #[test]
+    fn l1_drop_without_explicit_finalize_records_cancelled() {
+        // A missed exit path (cancel/panic) → Drop finalizes Cancelled, never an
+        // orphan stuck ClaimedL1.
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        {
+            let _guard = store.engine_guard("api_1", serving()).expect("claim");
+            assert_eq!(store.detail("api_1").unwrap().status, FlowStatus::Open);
+        } // Drop with no explicit finalize.
+        let record = store.detail("api_1").expect("record");
+        assert_eq!(record.status, FlowStatus::Cancelled);
+        assert_eq!(record.terminal_reason.as_deref(), Some("dropped"));
+        assert_eq!(record.claim.load(SeqCst), CLAIM_FINALIZED);
+    }
+
+    #[test]
+    fn l1_finalize_attributes_serving_provider_when_no_leaf_target() {
+        // The serving provider is read from the ServingToken AT finalize (so a
+        // provider tagged after the guard is built is still recorded), and lands in
+        // upstream_target only when the leaf left it empty.
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        let token = serving();
+        let guard = store
+            .engine_guard("api_1", Arc::clone(&token))
+            .expect("claim");
+        // Provider tagged AFTER the guard exists (mirrors failover first-chunk).
+        token.set_provider("backend-b");
+        guard.finalize(FlowStatus::Completed, None);
+        assert_eq!(
+            store.detail("api_1").unwrap().upstream_target.as_deref(),
+            Some("backend-b"),
+            "serving provider recorded as the target when the leaf set none"
+        );
+    }
+
+    #[test]
+    fn l1_finalize_does_not_clobber_leaf_upstream_target() {
+        // When the leaf already captured an upstream URL, the serving-provider
+        // attribution must NOT overwrite it.
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        store.set_upstream("api_1", Some("https://real-url".to_string()), None, None);
+        let token = serving();
+        token.set_provider("backend-b");
+        let guard = store.engine_guard("api_1", token).expect("claim");
+        guard.finalize(FlowStatus::Completed, None);
+        assert_eq!(
+            store.detail("api_1").unwrap().upstream_target.as_deref(),
+            Some("https://real-url"),
+            "leaf URL wins over serving-provider fallback"
+        );
+    }
+
+    #[test]
+    fn disabled_store_mints_no_guards() {
+        let store = DashboardFlowStore::disabled();
+        assert!(store.middleware_guard("api_1").is_none());
+        assert!(store.engine_guard("api_1", serving()).is_none());
+    }
+
+    #[test]
+    fn guards_are_send() {
+        // The L1 guard must be Send to cross the tokio::spawn in stream_responses.
+        fn assert_send<T: Send>() {}
+        assert_send::<TelemetryGuard>();
+        assert_send::<MiddlewareGuard>();
     }
 
     #[test]

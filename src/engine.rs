@@ -758,6 +758,25 @@ impl Gateway {
         request: ResponsesRequest,
         api_call_id: Option<String>,
     ) -> AppResult<ReceiverStream<SseEvent>> {
+        // D2/D3: ONE serving token per flow, allocated here (not per turn) so the L1
+        // telemetry guard built BELOW and every per-turn `BackendChatRequest` in
+        // `run_turn` share the SAME `Arc` — the failover/routing layers tag
+        // `{route, provider}` on it, and the guard reads that pair at finalize.
+        let serving_token = Arc::new(crate::upstream::ServingToken::default());
+        // D3 L1: claim the flow record (`OpenL0 → ClaimedL1`) BEFORE any pre-spawn
+        // early return. A lowering/budget failure below finalizes the record
+        // explicitly `Failed` (via `finalize_pre_spawn_err`) so it carries the right
+        // terminal — and even if a future pre-spawn path forgot to, the guard's
+        // `Drop` is the backstop (never an orphan stuck `Open`). `None` when the
+        // store is disabled or no `api_call_id` was threaded (the public
+        // `stream_responses` wrapper / non-instrumented paths), so this is
+        // zero-overhead off the dashboard path. On the success path the guard moves
+        // into the `tokio::spawn` below (it holds only `Arc`s + an `Instant`, so it
+        // is `Send`) and the spawned body finalizes it from the typed `Result`.
+        let telemetry_guard = api_call_id.as_deref().and_then(|id| {
+            self.flow_store()
+                .engine_guard(id, Arc::clone(&serving_token))
+        });
         let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
         let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
 
@@ -778,7 +797,23 @@ impl Gateway {
             .activate_image_agent(&mut request, &resolved_model, request_genuine)
             .await;
 
-        let (baseline_record, prefix_len) = self.find_replay_baseline(&request).await?;
+        // D3: a pre-spawn early return (replay baseline lookup, lowering/validation,
+        // or budgeting below) must finalize the record `Failed` with the correct
+        // reason — NOT fall through to the `Drop` fallback's `Cancelled`. Helper to
+        // finalize-then-return on the `?` paths without duplicating the guard plumbing.
+        let finalize_pre_spawn_err = |err: AppError| -> AppError {
+            if let Some(guard) = &telemetry_guard {
+                guard.finalize(
+                    crate::dashboard_flow::FlowStatus::Failed,
+                    Some(err.to_string()),
+                );
+            }
+            err
+        };
+        let (baseline_record, prefix_len) = self
+            .find_replay_baseline(&request)
+            .await
+            .map_err(&finalize_pre_spawn_err)?;
         let mut tail_request = request.clone();
         tail_request.input = request.input[prefix_len..].to_vec();
         if self.config.brave_api_key.is_none() {
@@ -815,7 +850,8 @@ impl Gateway {
                 .map(|record| record.internal_messages.clone())
                 .unwrap_or_default(),
             vision_session.is_some(),
-        )?;
+        )
+        .map_err(&finalize_pre_spawn_err)?;
 
         // G3 pre-flight context budgeting (T9: candidate-set seam). Estimate
         // over the LOWERED upstream payload (`lowered.messages`/`tools`/scalars)
@@ -858,7 +894,11 @@ impl Gateway {
             ) {
                 Ok(capped) => request.max_output_tokens = capped,
                 Err(ContextBudgetError) => {
-                    return Err(AppError::bad_request("input exceeds model context window"));
+                    // D3: pre-spawn budget failure → finalize Failed (the correct
+                    // terminal, not the Drop fallback's Cancelled) before returning.
+                    return Err(finalize_pre_spawn_err(AppError::bad_request(
+                        "input exceeds model context window",
+                    )));
                 }
             }
         }
@@ -881,9 +921,37 @@ impl Gateway {
                     // D1 (R1 #9): the engine binds `response_id → api_call_id` at
                     // the RequestStarted emission seam inside `run_turn`, not here.
                     api_call_id,
+                    // D2/D3: the shared serving token (tagged by routing/failover,
+                    // read by the guard at finalize) threaded onto every per-turn
+                    // `BackendChatRequest`.
+                    serving_token,
                     tx.clone(),
                 )
                 .await;
+            // D3 L1: finalize the flow record at THIS single choke point (the spawned
+            // body) from the typed `result`, then let the guard drop. `is_cancelled()`
+            // (HTTP 499 — client hung up) ⇒ `Cancelled`; any other error ⇒ `Failed`;
+            // `Ok` ⇒ `Completed`. The guard's own `Drop` (below, when this closure
+            // returns) is the LAST-resort fallback for a path that never reached here
+            // — a panic INSIDE `run_turn` unwinds through this closure and drops the
+            // guard, finalizing `Cancelled`. The CAS makes the explicit finalize win
+            // and the drop then no-op (idempotent).
+            if let Some(guard) = &telemetry_guard {
+                match &result {
+                    Ok(()) => guard.finalize(
+                        crate::dashboard_flow::FlowStatus::Completed,
+                        Some("response.completed".to_string()),
+                    ),
+                    Err(err) if err.is_cancelled() => guard.finalize(
+                        crate::dashboard_flow::FlowStatus::Cancelled,
+                        Some("client_disconnected".to_string()),
+                    ),
+                    Err(err) => guard.finalize(
+                        crate::dashboard_flow::FlowStatus::Failed,
+                        Some(err.to_string()),
+                    ),
+                }
+            }
             if let Err(err) = &result {
                 if tx.is_closed() {
                     gateway
@@ -1112,6 +1180,14 @@ impl Gateway {
         // captured by the dashboard FlowStore), so `link(response_id, api_call_id)`
         // fires at the RequestStarted seam below.
         api_call_id: Option<String>,
+        // D2/D3: the flow's shared serving token (allocated once in
+        // `stream_responses_with_api_call_id`, tagged by routing/failover) threaded
+        // onto every per-turn `BackendChatRequest`. The D3 L1 telemetry guard stays
+        // in the spawn closure (the single finalize choke point) rather than here, so
+        // the terminal status is classified from `run_turn`'s typed `Result`
+        // (cancelled vs failed vs completed) and the guard's `Drop` still covers a
+        // panic inside this function (it unwinds through the closure).
+        serving_token: Arc<crate::upstream::ServingToken>,
         tx: mpsc::Sender<SseEvent>,
     ) -> AppResult<()> {
         // D1 (R1 #9): bind this flow's `response_id` to its inbound `api_call_id`
@@ -1430,16 +1506,14 @@ impl Gateway {
             .get("chat_template_kwargs")
             .and_then(Value::as_object)
             .cloned();
-        // D2: a FRESH serving token per flow (per `stream_responses` call). The
-        // routing layer fills `route`, the failover layer fills `provider`. Because
-        // it is allocated here — not once in `Gateway::new` — concurrent flows never
-        // overwrite each other's `{route, provider}` (the rev2 cross-flow race).
-        // Cloned (the `Arc`, sharing the token) onto every per-turn
-        // `BackendChatRequest` below so all upstream turns of THIS flow tag the same
-        // token. `None` is impossible here — the engine always mints one — so the
-        // leaf/routing/failover layers can rely on `serving` being present in
-        // production while tests pass `None`.
-        let serving_token = Arc::new(crate::upstream::ServingToken::default());
+        // D2: the FRESH per-flow serving token is now allocated in
+        // `stream_responses_with_api_call_id` (so the D3 L1 guard built pre-spawn
+        // shares the SAME `Arc`) and threaded in. The routing layer fills `route`,
+        // the failover layer fills `provider`; because it is per-flow, concurrent
+        // flows never overwrite each other's `{route, provider}` (the rev2
+        // cross-flow race). Cloned (the `Arc`, sharing the token) onto every
+        // per-turn `BackendChatRequest` below so all upstream turns of THIS flow tag
+        // the same token.
         // `build_upstream_extra_body` now runs with EMPTY defaults: the
         // profile/global `upstream_chat_kwargs` merge at the leaf. It still
         // performs the request-extra normalization (remove typed-field defaults
@@ -1580,6 +1654,13 @@ impl Gateway {
             };
             let mut state = StreamState::default();
             let mut turn_usage: Option<ChunkUsage> = None;
+            // D3: the flow's cumulative usage BEFORE this turn. OpenAI usage chunks
+            // are cumulative WITHIN a turn, so the record's running total is
+            // `turn_base + <this turn's latest chunk>` — adding the chunk to the base
+            // of PRIOR turns, never chunk-over-chunk (which would double-count). A
+            // single authoritative `accumulated_usage.add(turn_usage)` AFTER the inner
+            // loop advances the base for the NEXT turn of a multi-turn tool loop.
+            let turn_base = accumulated_usage.snapshot();
             // G4 (review #1): per-upstream-turn gate over streamed tool-call
             // argument deltas. When the image agent is active it buffers leading
             // deltas (keyed by call_id) until the tool name resolves, then DROPS
@@ -1594,8 +1675,31 @@ impl Gateway {
                 let Some(chunk) = Self::next_upstream_chunk(&mut stream, &tx).await? else {
                     break;
                 };
-                if chunk.usage.is_some() {
-                    turn_usage = chunk.usage.clone();
+                if let Some(usage) = chunk.usage.clone() {
+                    // D3: cumulative-aware UPSERT. `total` is the flow's running
+                    // cumulative (turn_base + this cumulative chunk), NOT an
+                    // increment — so a multi-chunk turn does not double-count and a
+                    // midstream cancel keeps this LAST upserted total (never zero).
+                    let total = flow_usage_from_base_and_chunk(turn_base, &usage);
+                    if let Some(api_call_id) = &api_call_id {
+                        self.flow_store().record_usage(api_call_id, total);
+                    }
+                    // D3: emit the usage event to the monitor hub (lazy — skipped when
+                    // disabled). The `/debug/ws` + dashboard surfaces store it on the
+                    // record + replay it in `snapshot()`. The bare `ResponseUsage`
+                    // total for the CLIENT response is still computed post-loop from
+                    // `into_response_usage` (unchanged) — this is purely additive.
+                    // D5: the `MetricsLayer.record_usage` ring hook attaches HERE once
+                    // D5 exists (it does not yet — no MetricsLayer is invented now).
+                    self.monitor
+                        .emit_with(response_id.as_str(), || MonitorEventKind::Usage {
+                            prompt: total.prompt,
+                            completion: total.completion,
+                            total: total.total,
+                            cached: total.cached,
+                            reasoning: total.reasoning,
+                        });
+                    turn_usage = Some(usage);
                 }
                 let emissions = state.apply_chunk(&chunk);
                 for emission in emissions {
@@ -3503,6 +3607,21 @@ impl AccumulatedUsage {
         self.reasoning_output_tokens += reasoning_tokens.unwrap_or(0);
     }
 
+    /// D3: the running cumulative-so-far as a dashboard [`FlowUsage`] — the
+    /// `turn_base` captured at the START of each turn. Adding a within-turn chunk's
+    /// (already-cumulative) usage to this base gives the flow's CURRENT total
+    /// without double-counting prior turns. (`ChunkUsage` fields are `i64`; the
+    /// dashboard `FlowUsage` mirrors them 1:1.)
+    fn snapshot(&self) -> crate::dashboard_flow::FlowUsage {
+        crate::dashboard_flow::FlowUsage {
+            prompt: self.input_tokens,
+            completion: self.output_tokens,
+            total: self.total_tokens,
+            cached: self.cached_input_tokens,
+            reasoning: self.reasoning_output_tokens,
+        }
+    }
+
     fn into_response_usage(self) -> Option<ResponseUsage> {
         if self.total_tokens == 0 {
             return None;
@@ -3518,6 +3637,36 @@ impl AccumulatedUsage {
                 reasoning_tokens: self.reasoning_output_tokens,
             }),
         })
+    }
+}
+
+/// D3: combine the turn's CUMULATIVE base (`accumulated_usage.snapshot()` captured
+/// at turn start) with a within-turn usage chunk to get the flow's CURRENT total.
+/// OpenAI usage chunks are cumulative WITHIN a turn, so we add the chunk to the base
+/// of PRIOR turns — never accumulate chunk-over-chunk (that double-counts). Maps the
+/// `ChunkUsage` fields exactly as [`AccumulatedUsage::add`] does (nested cached /
+/// reasoning details, with the top-level `reasoning_tokens` fallback).
+fn flow_usage_from_base_and_chunk(
+    base: crate::dashboard_flow::FlowUsage,
+    chunk: &ChunkUsage,
+) -> crate::dashboard_flow::FlowUsage {
+    let cached = chunk
+        .prompt_tokens_details
+        .as_ref()
+        .map(|d| d.cached_tokens)
+        .unwrap_or(0);
+    let reasoning = chunk
+        .completion_tokens_details
+        .as_ref()
+        .map(|d| d.reasoning_tokens)
+        .or(chunk.reasoning_tokens)
+        .unwrap_or(0);
+    crate::dashboard_flow::FlowUsage {
+        prompt: base.prompt + chunk.prompt_tokens,
+        completion: base.completion + chunk.completion_tokens,
+        total: base.total + chunk.total_tokens,
+        cached: base.cached + cached,
+        reasoning: base.reasoning + reasoning,
     }
 }
 

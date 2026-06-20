@@ -71,6 +71,18 @@ pub enum MonitorEventKind {
         phase: String,
         detail: String,
     },
+    /// D3: cumulative token usage for the flow, emitted on each usage-bearing
+    /// upstream chunk. The values are the flow's RUNNING CUMULATIVE total (the turn
+    /// base plus the within-turn cumulative chunk), not an increment — so a
+    /// multi-chunk turn reports the latest total, not a sum. Also written to the
+    /// FlowStore record.
+    Usage {
+        prompt: i64,
+        completion: i64,
+        total: i64,
+        cached: i64,
+        reasoning: i64,
+    },
     Completed,
     Failed {
         message: String,
@@ -126,7 +138,29 @@ pub enum DebugWsMessage {
         response_id: String,
         reason: String,
     },
+    /// D3: cumulative token usage for a flow (running total, not an increment).
+    /// Replayed in `snapshot()` after the record's `RequestUpsert` so a late
+    /// subscriber sees the latest usage. Carries no image URIs (no-op redact arm).
+    Usage {
+        response_id: String,
+        prompt: i64,
+        completion: i64,
+        total: i64,
+        cached: i64,
+        reasoning: i64,
+    },
     SnapshotDone,
+}
+
+/// D3: the latest cumulative token usage retained on a [`DebugRequest`] so the
+/// `/debug/ws` snapshot can replay it to a late subscriber.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DebugUsage {
+    pub prompt: i64,
+    pub completion: i64,
+    pub total: i64,
+    pub cached: i64,
+    pub reasoning: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -139,6 +173,11 @@ pub struct DebugRequest {
     pub status: DebugRequestStatus,
     pub stats: DebugRequestStats,
     pub error: Option<String>,
+    /// D3: latest cumulative token usage for the flow (`None` until the first
+    /// usage-bearing chunk). Retained so `snapshot()` replays it to a late
+    /// subscriber after the `RequestUpsert`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<DebugUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -321,6 +360,19 @@ impl MonitorHub {
             messages.push(DebugWsMessage::RequestUpsert {
                 request: record.request.clone(),
             });
+            // D3: replay the latest cumulative usage (if any) right after the upsert
+            // so a late subscriber reconstructs it from the snapshot, mirroring the
+            // live `Usage` broadcast.
+            if let Some(usage) = record.request.usage {
+                messages.push(DebugWsMessage::Usage {
+                    response_id: record.request.response_id.clone(),
+                    prompt: usage.prompt,
+                    completion: usage.completion,
+                    total: usage.total,
+                    cached: usage.cached,
+                    reasoning: usage.reasoning,
+                });
+            }
             for segment in &record.segments {
                 messages.push(DebugWsMessage::SegmentAppend {
                     response_id: record.request.response_id.clone(),
@@ -394,6 +446,8 @@ fn redact_ws_message_image_uris(message: &mut DebugWsMessage) {
         }
         DebugWsMessage::Hello { .. }
         | DebugWsMessage::RequestRemove { .. }
+        // D3: Usage carries only integer token counts — no image URIs to redact.
+        | DebugWsMessage::Usage { .. }
         | DebugWsMessage::SnapshotDone => {}
     }
 }
@@ -614,6 +668,38 @@ impl MonitorState {
                 );
                 messages
             }
+            MonitorEventKind::Usage {
+                prompt,
+                completion,
+                total,
+                cached,
+                reasoning,
+            } => {
+                let mut messages = Vec::new();
+                self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
+                let usage = DebugUsage {
+                    prompt: *prompt,
+                    completion: *completion,
+                    total: *total,
+                    cached: *cached,
+                    reasoning: *reasoning,
+                };
+                if let Some(record) = self.record_mut(&event.response_id) {
+                    record.request.updated_at_ms = event.timestamp_ms;
+                    // Retain the latest cumulative usage on the record so `snapshot()`
+                    // replays it to a late subscriber.
+                    record.request.usage = Some(usage);
+                }
+                messages.push(DebugWsMessage::Usage {
+                    response_id: event.response_id.clone(),
+                    prompt: *prompt,
+                    completion: *completion,
+                    total: *total,
+                    cached: *cached,
+                    reasoning: *reasoning,
+                });
+                messages
+            }
             MonitorEventKind::Completed => {
                 let mut messages = Vec::new();
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
@@ -734,6 +820,7 @@ impl MonitorState {
                 status: DebugRequestStatus::Running,
                 stats,
                 error: None,
+                usage: None,
             },
             segments: VecDeque::new(),
             events: VecDeque::new(),
@@ -771,6 +858,7 @@ impl MonitorState {
                 status: DebugRequestStatus::Running,
                 stats: DebugRequestStats::default(),
                 error: None,
+                usage: None,
             },
             segments: VecDeque::new(),
             events: VecDeque::new(),
@@ -1220,6 +1308,64 @@ mod tests {
         assert!(snapshot.messages.iter().any(|message| matches!(
             message,
             DebugWsMessage::RequestUpsert { request } if request.response_id == "resp_1"
+        )));
+    }
+
+    #[test]
+    fn usage_event_reaches_live_subscriber_and_snapshot_replay() {
+        // D3: a `MonitorEventKind::Usage` must reach BOTH a live `subscribe()` (as a
+        // `DebugWsMessage::Usage`) AND a late subscriber's `snapshot()` replay (the
+        // record retains the latest cumulative usage and emits it after the upsert).
+        let hub = MonitorHub::new(8);
+        let mut rx = hub.subscribe();
+        hub.emit("resp_u", started("model-a"));
+        hub.emit(
+            "resp_u",
+            MonitorEventKind::Usage {
+                prompt: 100,
+                completion: 40,
+                total: 140,
+                cached: 10,
+                reasoning: 7,
+            },
+        );
+        // Live broadcast carries the Usage frame with the cumulative total.
+        let mut saw_live_usage = false;
+        while let Ok(update) = rx.try_recv() {
+            for message in &update.messages {
+                if let DebugWsMessage::Usage {
+                    response_id,
+                    total,
+                    cached,
+                    reasoning,
+                    ..
+                } = message
+                {
+                    assert_eq!(response_id, "resp_u");
+                    assert_eq!(*total, 140);
+                    assert_eq!(*cached, 10);
+                    assert_eq!(*reasoning, 7);
+                    saw_live_usage = true;
+                }
+            }
+        }
+        assert!(saw_live_usage, "live subscriber received the Usage frame");
+        // A LATE subscriber reconstructs the usage from the snapshot replay.
+        let snapshot = hub.snapshot();
+        let replayed = snapshot.messages.iter().any(|message| {
+            matches!(
+                message,
+                DebugWsMessage::Usage { response_id, prompt, completion, total, .. }
+                    if response_id == "resp_u" && *prompt == 100 && *completion == 40 && *total == 140
+            )
+        });
+        assert!(replayed, "snapshot replays the latest cumulative usage");
+        // The usage also rides on the record's RequestUpsert for clients that read it there.
+        assert!(snapshot.messages.iter().any(|message| matches!(
+            message,
+            DebugWsMessage::RequestUpsert { request }
+                if request.response_id == "resp_u"
+                    && request.usage.is_some_and(|u| u.total == 140)
         )));
     }
 

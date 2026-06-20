@@ -298,20 +298,31 @@ async fn log_api_call(
     // extension insert) and prevents HEAD/OPTIONS probes or non-whitelisted paths
     // from opening an orphan record. Secrets (auth headers, `api_key`, image URIs)
     // are redacted INLINE by the serializer/header redactor — none persist here.
-    if gateway.flow_store().is_enabled() && is_flow_capture_request(&method, uri.path()) {
-        parts
-            .extensions
-            .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
-        let inbound_body = Some(crate::dashboard_flow::capture_body(&body_bytes));
-        let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
-        gateway.flow_store().open(
-            api_call_id.clone(),
-            method.to_string(),
-            uri.path().to_string(),
-            headers_redacted,
-            inbound_body,
-        );
-    }
+    // D3 L0: the RAII middleware guard. `None` for disabled-store / non-whitelisted
+    // requests (zero overhead). When `Some`, it is held across `next.run`: if the
+    // request never reaches the engine (an extractor/`Json` rejection, a layer panic
+    // above the handler) the record is still `OpenL0` at the guard's `Drop`, which
+    // CASes it to `Finalized` + `Failed("unhandled")` — no orphan stuck `Open`. If
+    // the engine claimed it (`ClaimedL1`), the L0 `Drop` is inert and L1 owns
+    // finalization.
+    let _l0_guard =
+        if gateway.flow_store().is_enabled() && is_flow_capture_request(&method, uri.path()) {
+            parts
+                .extensions
+                .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
+            let inbound_body = Some(crate::dashboard_flow::capture_body(&body_bytes));
+            let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
+            gateway.flow_store().open(
+                api_call_id.clone(),
+                method.to_string(),
+                uri.path().to_string(),
+                headers_redacted,
+                inbound_body,
+            );
+            gateway.flow_store().middleware_guard(&api_call_id)
+        } else {
+            None
+        };
 
     let request = Request::from_parts(parts, Body::from(body_bytes));
     let response = next.run(request).await;

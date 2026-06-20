@@ -220,6 +220,66 @@ impl UpstreamClient for PendingChunkUpstream {
     }
 }
 
+/// Like [`PendingChunkUpstream`] but YIELDS a canned prefix of chunks first, THEN
+/// parks forever — so a test can drive real usage upserts (D3) before triggering a
+/// midstream cancel. `stream_polled` fires once the canned chunks are exhausted and
+/// the stream is parked; `stream_dropped` fires when the client drops the stream.
+#[derive(Clone)]
+struct ChunkThenPendingUpstream {
+    requests: Arc<Mutex<Vec<ChatCompletionRequest>>>,
+    prefix: Arc<Vec<ChatCompletionChunk>>,
+    stream_polled: Arc<Notify>,
+    stream_dropped: Arc<Notify>,
+}
+
+impl ChunkThenPendingUpstream {
+    fn new(prefix: Vec<ChatCompletionChunk>) -> Self {
+        Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            prefix: Arc::new(prefix),
+            stream_polled: Arc::new(Notify::new()),
+            stream_dropped: Arc::new(Notify::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl UpstreamClient for ChunkThenPendingUpstream {
+    async fn stream_chat_completion(
+        &self,
+        backend: &llmconduit::upstream::BackendChatRequest,
+    ) -> Result<UpstreamStream, llmconduit::error::AppError> {
+        self.requests.lock().await.push(backend.request.clone());
+        let prefix = Arc::clone(&self.prefix);
+        let stream_polled = Arc::clone(&self.stream_polled);
+        let stream_dropped = Arc::clone(&self.stream_dropped);
+        let stream = async_stream::stream! {
+            let _drop_guard = NotifyOnDrop { notify: stream_dropped };
+            for chunk in prefix.iter() {
+                yield Ok(chunk.clone());
+            }
+            // Canned chunks exhausted; signal and park so the client can cancel.
+            stream_polled.notify_waiters();
+            std::future::pending::<()>().await;
+            yield Ok(content_chunk("chat-1", "unreachable"));
+        };
+        Ok(Box::pin(stream))
+    }
+
+    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+        Err(llmconduit::error::AppError::internal("unused in this test"))
+    }
+
+    async fn supported_model_catalog(
+        &self,
+    ) -> Result<Vec<UpstreamModelEntry>, llmconduit::error::AppError> {
+        Ok(vec![UpstreamModelEntry {
+            id: "glm-5.1".to_string(),
+            context_limit: None,
+        }])
+    }
+}
+
 #[derive(Clone, Default)]
 struct MockSearch {
     queries: Arc<Mutex<Vec<String>>>,
@@ -3671,6 +3731,28 @@ fn test_gateway_with_flow_store(upstream: MockUpstream, search: MockSearch) -> A
     ))
 }
 
+/// Like [`test_gateway_with_flow_store`] but accepts ANY upstream trait object (so
+/// the D3 midstream-cancel test can use a parking mock), with the ENABLED store and
+/// a live MonitorHub.
+fn test_gateway_with_flow_store_upstream(upstream: Arc<dyn UpstreamClient>) -> Arc<Gateway> {
+    let config = test_config();
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    Arc::new(Gateway::new(
+        config,
+        ReplayStore::new(1000),
+        upstream,
+        Arc::new(MockSearch::default()),
+        vision,
+        image_cache,
+        MonitorHub::new(128),
+        None,
+        llmconduit::dashboard_flow::DashboardFlowStore::new(),
+    ))
+}
+
 #[tokio::test]
 async fn flow_store_opens_record_for_whitelisted_inference_path() {
     let upstream = MockUpstream::default();
@@ -3813,6 +3895,288 @@ async fn flow_store_disabled_path_opens_nothing() {
     assert!(
         gateway.flow_store().list().is_empty(),
         "disabled FlowStore opens nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// D3 — TelemetryGuard (L0/L1 CAS) + cumulative-aware usage.
+// ---------------------------------------------------------------------------
+
+/// Open a flow record directly in the ENABLED store (mirrors what the middleware's
+/// `log_api_call` does) so a direct `stream_responses_with_api_call_id` call drives
+/// the L1 engine guard against a live record. Returns the minted `api_call_id`.
+fn d3_open_flow(gateway: &Gateway) -> String {
+    let api_call_id = format!("api_{}", uuid::Uuid::new_v4().simple());
+    gateway.flow_store().open(
+        api_call_id.clone(),
+        "POST".to_string(),
+        "/v1/responses".to_string(),
+        llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+        None,
+    );
+    api_call_id
+}
+
+/// Poll the record's status until it is no longer `Open` (the spawned `run_turn`
+/// finalizes in a separate task AFTER the stream drains), or panic on timeout.
+async fn d3_await_terminal(
+    gateway: &Gateway,
+    api_call_id: &str,
+) -> std::sync::Arc<llmconduit::dashboard_flow::FlowRecord> {
+    for _ in 0..1000 {
+        if let Some(record) = gateway.flow_store().detail(api_call_id)
+            && record.status != llmconduit::dashboard_flow::FlowStatus::Open
+        {
+            return record;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("flow record never reached a terminal status");
+}
+
+#[tokio::test]
+async fn d3_completed_flow_finalizes_with_cumulative_usage() {
+    // A clean stream with a single cumulative usage chunk: the record finalizes
+    // Completed and its usage equals the chunk total.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "Hello")),
+            Ok(usage_chunk("chat-1", 100, 40, 140, Some(10), Some(7))),
+        ])
+        .await;
+    let gateway = test_gateway_with_flow_store(upstream, MockSearch::default());
+    let api_call_id = d3_open_flow(&gateway);
+
+    let request = base_request(vec![user_message("hi")]);
+    let stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+    let _events = collect_stream(stream).await; // drain to completion
+
+    let record = d3_await_terminal(&gateway, &api_call_id).await;
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Completed
+    );
+    let usage = record.usage.expect("usage upserted");
+    assert_eq!(usage.total, 140);
+    assert_eq!(usage.prompt, 100);
+    assert_eq!(usage.completion, 40);
+    assert_eq!(usage.cached, 10);
+    assert_eq!(usage.reasoning, 7);
+    // Monotonic latency stamped (Instant-based), terminal reason set.
+    assert!(record.elapsed_ms.is_some());
+    assert!(record.finished_ms.is_some());
+    assert_eq!(
+        record.terminal_reason.as_deref(),
+        Some("response.completed")
+    );
+    // The claim CAS reached Finalized (exactly-once).
+    assert_eq!(
+        record.claim.load(std::sync::atomic::Ordering::SeqCst),
+        llmconduit::dashboard_flow::CLAIM_FINALIZED,
+    );
+}
+
+#[tokio::test]
+async fn d3_multi_chunk_usage_does_not_double_count() {
+    // THE no-double-count test: a single turn emits MULTIPLE cumulative usage
+    // chunks. The record's usage must equal the FINAL chunk total, not the sum of
+    // the chunk totals.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "Hel")),
+            // cumulative usage grows across chunks within the SAME turn:
+            Ok(usage_chunk("chat-1", 100, 10, 110, None, None)),
+            Ok(content_chunk("chat-1", "lo")),
+            Ok(usage_chunk("chat-1", 100, 25, 125, None, None)),
+            Ok(usage_chunk("chat-1", 100, 40, 140, None, None)),
+        ])
+        .await;
+    let gateway = test_gateway_with_flow_store(upstream, MockSearch::default());
+    let api_call_id = d3_open_flow(&gateway);
+
+    let request = base_request(vec![user_message("hi")]);
+    let stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+    let _events = collect_stream(stream).await;
+
+    let record = d3_await_terminal(&gateway, &api_call_id).await;
+    let usage = record.usage.expect("usage upserted");
+    assert_eq!(
+        usage.total, 140,
+        "record holds the LAST cumulative total (140), not the sum 110+125+140"
+    );
+    assert_eq!(usage.completion, 40);
+}
+
+#[tokio::test]
+async fn d3_no_usage_chunk_leaves_usage_none() {
+    // A turn with no usage chunk contributes no usage; the record finalizes
+    // Completed with `usage = None`.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
+        .await;
+    let gateway = test_gateway_with_flow_store(upstream, MockSearch::default());
+    let api_call_id = d3_open_flow(&gateway);
+
+    let request = base_request(vec![user_message("hi")]);
+    let stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+    let _events = collect_stream(stream).await;
+
+    let record = d3_await_terminal(&gateway, &api_call_id).await;
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Completed
+    );
+    assert!(record.usage.is_none(), "no usage chunk → usage None");
+}
+
+#[tokio::test]
+async fn d3_pre_spawn_error_finalizes_failed_not_cancelled() {
+    // A PRE-SPAWN early return (here an unsupported `previous_response_id`, which
+    // fails canonical lowering BEFORE the tokio::spawn) must finalize the record
+    // Failed — NOT leave it Open and NOT fall through to the Drop fallback's
+    // Cancelled — with no usage (none was upserted before the spawn). This is the
+    // engine.rs lowering/budget pre-spawn seam.
+    let gateway = test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default());
+    let api_call_id = d3_open_flow(&gateway);
+
+    let mut request = base_request(vec![user_message("hi")]);
+    request.previous_response_id = Some("resp_does_not_exist".to_string());
+    let result = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await;
+    assert!(
+        result.is_err(),
+        "pre-spawn lowering error surfaces to the caller"
+    );
+
+    let record = gateway.flow_store().detail(&api_call_id).expect("record");
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Failed,
+        "pre-spawn error finalized Failed (not Open, not Cancelled)"
+    );
+    assert!(record.usage.is_none(), "no usage upserted pre-spawn");
+    assert!(record.elapsed_ms.is_some(), "monotonic latency stamped");
+    assert_eq!(
+        record.claim.load(std::sync::atomic::Ordering::SeqCst),
+        llmconduit::dashboard_flow::CLAIM_FINALIZED,
+    );
+}
+
+#[tokio::test]
+async fn d3_midstream_cancel_finalizes_cancelled_with_last_usage() {
+    // A midstream cancel AFTER a usage chunk: the record finalizes Cancelled and
+    // RETAINS the last upserted cumulative usage (NOT zero). This also exercises the
+    // L1 guard crossing the tokio::spawn (it compiles + runs).
+    let upstream = ChunkThenPendingUpstream::new(vec![
+        content_chunk("chat-1", "Hel"),
+        usage_chunk("chat-1", 100, 20, 120, Some(5), None),
+    ]);
+    let stream_polled = upstream.stream_polled.notified();
+    let gateway = test_gateway_with_flow_store_upstream(Arc::new(upstream.clone()));
+    let api_call_id = d3_open_flow(&gateway);
+
+    let request = base_request(vec![user_message("count")]);
+    let mut stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+
+    // Drain the early SSE events until the upstream is parked waiting for more.
+    let mut saw_total = 0;
+    while saw_total < 2 {
+        if stream.next().await.is_some() {
+            saw_total += 1;
+        } else {
+            break;
+        }
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_polled)
+        .await
+        .expect("upstream parked after its canned chunks");
+
+    // Client hangs up mid-stream.
+    drop(stream);
+
+    let record = d3_await_terminal(&gateway, &api_call_id).await;
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Cancelled,
+        "midstream cancel finalized Cancelled"
+    );
+    let usage = record.usage.expect("last usage retained, not zero");
+    assert_eq!(
+        usage.total, 120,
+        "cancel keeps the LAST upserted cumulative total"
+    );
+    assert_eq!(usage.cached, 5);
+    assert_eq!(
+        record.claim.load(std::sync::atomic::Ordering::SeqCst),
+        llmconduit::dashboard_flow::CLAIM_FINALIZED,
+    );
+}
+
+#[tokio::test]
+async fn d3_extractor_failure_l0_guard_finalizes_no_orphan() {
+    // A malformed JSON body is rejected by the axum `Json` extractor BEFORE the
+    // request reaches the engine, so the record is never ClaimedL1. The L0
+    // middleware guard's Drop finalizes it Failed("unhandled") — no orphan Open.
+    let gateway = test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(Arc::clone(&gateway));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from("{ this is not valid json"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    // axum rejects the body (4xx) before the handler runs.
+    assert!(
+        response.status().is_client_error(),
+        "extractor rejected the malformed body: {}",
+        response.status()
+    );
+
+    // The record was opened by the middleware, then finalized by the L0 Drop.
+    let records = gateway.flow_store().list();
+    assert_eq!(records.len(), 1, "one record opened by middleware");
+    let record = &records[0];
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Failed,
+        "L0 guard finalized the orphan Failed (no record stuck Open)"
+    );
+    assert_eq!(record.terminal_reason.as_deref(), Some("unhandled"));
+    assert_ne!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Open,
+        "no orphan left Open"
+    );
+    assert_eq!(
+        record.claim.load(std::sync::atomic::Ordering::SeqCst),
+        llmconduit::dashboard_flow::CLAIM_FINALIZED,
     );
 }
 
