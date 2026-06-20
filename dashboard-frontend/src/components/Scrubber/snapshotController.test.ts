@@ -281,4 +281,77 @@ describe('SnapshotController — rAF coalescing (no fetch storm)', () => {
     await Promise.resolve(); await Promise.resolve();
     expect(delivered).toEqual([9000]); // unchanged — 3000 did NOT deliver
   });
+
+  it('a cache-served latest bucket is delivered ONCE — a settling stale fetch does NOT re-deliver it (R4 finding 2)', async () => {
+    const { raf, cancelRaf, flush } = manualRaf();
+    const resolvers: Array<{ bucket: number; resolve: () => void }> = [];
+    const fetchSnapshot = vi.fn(
+      (atMs: number) =>
+        new Promise<SnapshotResponse>((res) => {
+          resolvers.push({ bucket: atMs, resolve: () => res(snap(atMs)) });
+        }),
+    );
+    const delivered: number[] = [];
+    const c = new SnapshotController({ fetchSnapshot, onSnapshot: (r) => delivered.push(r.at_ms), raf, cancelRaf });
+
+    // Prime the cache with bucket 9000 (a target the user will drag back to), via a fetch + resolve.
+    c.requestAt(9000);
+    flush();
+    await Promise.resolve();
+    resolvers[0]!.resolve();
+    await Promise.resolve(); await Promise.resolve();
+    expect(c.has(9000)).toBe(true);
+    expect(delivered).toEqual([9000]); // delivered once on the fetch resolve
+    delivered.length = 0;
+
+    // Start an OLD fetch (bucket 3000) and hold it in flight (slow backend) — this is the stale
+    // in-flight request that will later settle and try to schedule a follow-up frame.
+    c.requestAt(3000);
+    flush();
+    await Promise.resolve();
+    expect(resolvers).toHaveLength(2);
+    expect(resolvers[1]!.bucket).toBe(3000);
+
+    // The user drags back to the CACHED bucket 9000 → delivered SYNCHRONOUSLY from cache (delivery
+    // #1 of this latest target). This also moves `pendingBucket` to 9000.
+    c.requestAt(9000);
+    expect(delivered).toEqual([9000]);
+
+    // The stale 3000 fetch finally settles. `pendingBucket` is 9000 ≠ 3000, so settle() would
+    // normally schedule a follow-up frame for 9000 — but 9000 is already cached AND already
+    // delivered, so the frame must NOT re-deliver the same cut (which would re-install the frozen
+    // seek view and double-bump the store's connEpoch).
+    resolvers[1]!.resolve();
+    await Promise.resolve(); await Promise.resolve();
+    flush(); // run any follow-up frame settle() may have scheduled
+    await Promise.resolve();
+
+    // 9000 was delivered EXACTLY ONCE since the drag-back — no duplicate from the settling stale fetch.
+    expect(delivered).toEqual([9000]);
+    // No spurious refetch of 9000 either (it was served from cache throughout).
+    expect(fetchSnapshot).toHaveBeenCalledTimes(2); // 9000 (prime) + 3000 (stale) only
+  });
+
+  it('after cancel()/LIVE resume, re-seeking a previously-delivered bucket DOES deliver again (R4 finding 2)', async () => {
+    const { raf, cancelRaf, flush } = manualRaf();
+    const fetchSnapshot = vi.fn(async (atMs: number) => snap(atMs));
+    const delivered: number[] = [];
+    const c = new SnapshotController({ fetchSnapshot, onSnapshot: (r) => delivered.push(r.at_ms), raf, cancelRaf });
+
+    // Seek to 5000 → fetched + delivered, then cached.
+    c.requestAt(5000);
+    flush();
+    await Promise.resolve(); await Promise.resolve();
+    expect(delivered).toEqual([5000]);
+
+    // LIVE resume → cancel() clears the delivered marker (the frozen cut is discarded).
+    c.cancel();
+    delivered.length = 0;
+
+    // Re-seek the SAME bucket 5000 from cache: this is a genuine new seek, so it must re-install the
+    // frozen cut — i.e. deliver again (the suppression is only for a stale-settle re-fire, not a
+    // fresh user drag-back after resume).
+    c.requestAt(5000);
+    expect(delivered).toEqual([5000]); // delivered again — NOT suppressed
+  });
 });

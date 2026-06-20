@@ -682,4 +682,74 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     expect(dashboardStore.getState().connection).toBe('live');
     expect(socket.getCursors().monitor).toBe(99);
   });
+
+  it('a transient WS drop + reconnect DURING seek PRESERVES the frozen cut (seekAtMs/seekMonitorSeq intact); only live() resumes (R4 finding 1)', async () => {
+    // Captured reconnect timers so the test can fire them synchronously.
+    const pendingTimers: Array<() => void> = [];
+    const setTimer = (cb: () => void) => {
+      pendingTimers.push(cb);
+      return pendingTimers.length as unknown as ReturnType<typeof setTimeout>;
+    };
+    const clearTimer = () => {};
+    const probeAuth = vi.fn().mockResolvedValue(true); // session still valid → reconnect (no logout)
+
+    dashboardStore.getState().reset();
+    FakeSocket.instances = [];
+    const s = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), probeAuth, setTimer, clearTimer });
+    s.connect();
+    // Snapshot → live.
+    FakeSocket.instances[0]!.onmessage?.({ data: JSON.stringify(snapshot()) });
+    expect(dashboardStore.getState().connection).toBe('live');
+
+    // Drag-start: pause + land the FROZEN cut via applySeekCut (the real Scrubber path). This stamps
+    // seekAtMs/seekMonitorSeq and flips connection='seeking'.
+    s.seek();
+    dashboardStore.getState().applySeekCut({
+      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500 }],
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 42 },
+      atMs: 500, monitorSeq: 42, metrics: null, topology: null,
+    });
+    expect(dashboardStore.getState().connection).toBe('seeking');
+    expect(dashboardStore.getState().seekAtMs).toBe(500);
+    expect(dashboardStore.getState().seekMonitorSeq).toBe(42);
+
+    // A transient WS drop fires mid-seek (the bug: this used to setConnection('connecting'), clearing
+    // the seek freeze and yanking D10/D12 off the frozen cut BEFORE the user pressed LIVE).
+    FakeSocket.instances[0]!.onclose?.({ code: 1006 });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The freeze is INTACT across the drop + probe: still seeking, seek fields preserved, frozen row present.
+    expect(dashboardStore.getState().connection).toBe('seeking');
+    expect(dashboardStore.getState().seekAtMs).toBe(500);
+    expect(dashboardStore.getState().seekMonitorSeq).toBe(42);
+    expect(dashboardStore.getState().flows.has('api_frozen')).toBe(true);
+
+    // The reconnect timer fires → a fresh socket opens. The freeze must STILL survive the reconnect.
+    expect(pendingTimers.length).toBeGreaterThan(0);
+    const fire = pendingTimers.splice(0);
+    for (const cb of fire) cb();
+    expect(FakeSocket.instances).toHaveLength(2);
+    expect(dashboardStore.getState().connection).toBe('seeking');
+    expect(dashboardStore.getState().seekAtMs).toBe(500);
+
+    // The reconnected socket's snapshot is STAGED (not applied over the frozen cut).
+    const reconnectSnap: SnapshotFrame = {
+      type: 'snapshot',
+      cursors: { flow_seq: 7, metrics_seq: 7, topology_seq: 7, monitor_seq: 7 },
+      flows: [], metrics: null, topology: null,
+    };
+    FakeSocket.instances[1]!.onmessage?.({ data: JSON.stringify(reconnectSnap) });
+    expect(dashboardStore.getState().connection).toBe('seeking'); // still frozen
+    expect(dashboardStore.getState().flows.has('api_frozen')).toBe(true);
+    expect(dashboardStore.getState().seekAtMs).toBe(500);
+
+    // ONLY an explicit live() exits the freeze — applying the staged reconnect snapshot.
+    s.live();
+    expect(dashboardStore.getState().connection).toBe('live');
+    expect(dashboardStore.getState().seekAtMs).toBeNull();
+    expect(dashboardStore.getState().seekMonitorSeq).toBeNull();
+    expect(dashboardStore.getState().flows.has('api_frozen')).toBe(false);
+    expect(s.getCursors().monitor).toBe(7); // staged reconnect snapshot's cursors took effect
+  });
 });

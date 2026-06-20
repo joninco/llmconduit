@@ -142,7 +142,10 @@ export class DashboardSocket {
   connect(): void {
     if (this.ws) return;
     this.stopped = false;
-    this.store.getState().setConnection('connecting');
+    // (D11 R4 finding 1) Do NOT flip to `'connecting'` while a seek is active: a reconnect timer
+    // re-entering `connect()` mid-seek must not clear the frozen cut (`seekAtMs`/`seekMonitorSeq`).
+    // The fresh socket's snapshot is STAGED (`applySnapshotMessage`), not applied, until `live()`.
+    if (!this.paused) this.store.getState().setConnection('connecting');
     const ws = this.factory(this.url);
     // This socket's identity. Every callback below checks `this.ws === ws` (and the
     // generation) so a late event from a REPLACED socket is ignored (finding 4).
@@ -240,7 +243,14 @@ export class DashboardSocket {
     if (this.stopped) return;
     const probeGen = this.generation;
     const isStaleProbe = () => this.stopped || this.generation !== probeGen;
-    this.store.getState().setConnection('connecting');
+    // (D11 R4 finding 1) PRESERVE the seek freeze across a transient transport drop. While paused,
+    // the store holds the FROZEN seek cut (`seekAtMs`/`seekMonitorSeq`); flipping to `'connecting'`
+    // would clear those fields (setConnection nulls them) and yank D10/D12 off the frozen view
+    // BEFORE the user pressed LIVE. The transport state (reconnect/probe below) is decoupled from
+    // the seek/paused intent: the reconnect still runs and any fresh snapshot is STAGED
+    // (`applySnapshotMessage` → `pendingSnapshot`), never applied over the frozen cut. The freeze
+    // exits ONLY on an explicit `live()` or a confirmed auth failure (401/4401).
+    if (!this.paused) this.store.getState().setConnection('connecting');
     if (this.probeAuth) {
       this.probeAuth()
         .then((authed) => {

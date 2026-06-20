@@ -61,6 +61,14 @@ export class SnapshotController {
   private readonly cache = new Map<number, SnapshotResponse>();
   /** The latest requested bucket (the one a coalesced frame will fetch + deliver). */
   private pendingBucket: number | null = null;
+  /**
+   * The bucket most recently DELIVERED to `onSnapshot` (D11 R4 finding 2). A cut delivers at most
+   * once: a cache-served bucket records itself here, so a stale in-flight fetch settling afterwards
+   * does NOT re-deliver the same already-served cut (which would re-install the frozen cut and
+   * double-bump the store's `connEpoch`). Reset by `cancel()` so a fresh seek can re-deliver a
+   * bucket it landed on before the resume.
+   */
+  private lastDelivered: number | null = null;
   /** The rAF handle for the scheduled coalesced fetch (null when none scheduled). */
   private frame: number | null = null;
   /** Bucket currently being fetched (one in flight at a time). */
@@ -133,7 +141,12 @@ export class SnapshotController {
     const cached = this.cache.get(bucket);
     if (cached) {
       this.touch(bucket, cached);
-      this.deliverIfLatest(bucket, cached);
+      // (D11 R4 finding 2) This coalesced frame is reached via `settle()` after a stale in-flight
+      // fetch resolves. If the latest target was ALREADY delivered (e.g. a `requestAt` cache hit
+      // served it while the stale fetch was outstanding), do NOT re-deliver — re-firing the same
+      // cut re-installs the frozen seek view and double-bumps the store's `connEpoch`. A genuinely
+      // new target (not yet delivered) still delivers here.
+      if (this.lastDelivered !== bucket) this.deliverIfLatest(bucket, cached);
       return;
     }
     // (finding 2) STRICTLY one in flight: while ANY request is outstanding, do not start another —
@@ -182,12 +195,26 @@ export class SnapshotController {
    */
   private settle(bucket: number): void {
     this.inFlight = null;
-    if (this.pendingBucket !== null && this.pendingBucket !== bucket) this.scheduleFrame();
+    const next = this.pendingBucket;
+    if (next === null || next === bucket) return;
+    // (D11 R4 finding 2) If the newer pending bucket is ALREADY cached AND already delivered, there
+    // is nothing left to do — scheduling a follow-up frame would only re-run `runPending` to
+    // re-deliver the same cached cut (double-bumping the store's `connEpoch`). Skip it.
+    if (this.lastDelivered === next && this.cache.has(next)) return;
+    this.scheduleFrame();
   }
 
-  /** Broadcast a cut ONLY if `bucket` is still the latest requested target (finding 3). */
+  /**
+   * Broadcast a cut ONLY if `bucket` is still the latest requested target (finding 3). Records it as
+   * `lastDelivered` so the `settle()`/`runPending` follow-up path can detect an already-served cut
+   * and skip re-delivering it (D11 R4 finding 2). A direct `requestAt` cache hit and a fresh fetched
+   * resolve always deliver (real user/network progress); only the coalesced follow-up frame guards
+   * against re-firing an already-delivered cached cut.
+   */
   private deliverIfLatest(bucket: number, resp: SnapshotResponse): void {
-    if (this.pendingBucket === bucket) this.onSnapshot(resp);
+    if (this.pendingBucket !== bucket) return;
+    this.lastDelivered = bucket;
+    this.onSnapshot(resp);
   }
 
   /** Insert/refresh a cache entry as MRU and evict the LRU beyond capacity. */
@@ -220,5 +247,9 @@ export class SnapshotController {
     this.generation += 1;
     this.inFlight = null;
     this.pendingBucket = null;
+    // Clear the delivered marker so a fresh seek after a LIVE resume can re-deliver a bucket it
+    // landed on before — the resume discarded the frozen cut, so re-seeking it is a real delivery
+    // (D11 R4 finding 2).
+    this.lastDelivered = null;
   }
 }
