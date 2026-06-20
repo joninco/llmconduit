@@ -13,6 +13,7 @@ pub mod replay;
 pub mod request_log;
 pub mod search;
 pub(crate) mod sse_guard;
+pub(crate) mod tool_delta_gate;
 pub mod upstream;
 pub mod vision;
 

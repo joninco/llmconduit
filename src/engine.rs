@@ -39,11 +39,12 @@ use crate::replay::ReplayRecord;
 use crate::replay::ReplayStore;
 use crate::search::SearchClient;
 use crate::search::SearchOutcome;
+use crate::tool_delta_gate::DeltaEmission;
+use crate::tool_delta_gate::ToolDeltaGate;
 use crate::upstream::UpstreamClient;
 use crate::upstream::UpstreamModelEntry;
 use crate::upstream::canonical_model_key;
 use crate::upstream::sanitize_chat_request;
-use crate::vision::ANALYZE_IMAGE_TOOL_NAME;
 use crate::vision::ImageCache;
 use crate::vision::VisionClient;
 use crate::vision::VisionRequest;
@@ -610,6 +611,36 @@ impl Gateway {
                 .map_err(|err| AppError::internal(format!("failed to write raw output: {err}")))?;
         }
         Ok(())
+    }
+
+    /// Forward one gated `function_call_arguments` delta: mirror it to the
+    /// monitor hub and stream it as an SSE event. This is the single emission
+    /// path the [`ToolDeltaGate`] feeds — previously inlined (and duplicated)
+    /// across the fast path, the `Emit`/flush branches, and the turn-end flush.
+    async fn emit_function_call_delta(
+        &self,
+        response_id: &str,
+        tx: &mpsc::Sender<SseEvent>,
+        emission: DeltaEmission,
+    ) -> AppResult<()> {
+        let DeltaEmission {
+            call_id,
+            name,
+            delta,
+        } = emission;
+        self.monitor.emit(
+            response_id.to_string(),
+            MonitorEventKind::FunctionCallArgumentsDelta {
+                call_id: call_id.clone(),
+                delta: delta.clone(),
+            },
+        );
+        self.send_event(
+            tx,
+            function_call_args_delta_event(call_id, name, delta),
+            "failed to stream function call args delta",
+        )
+        .await
     }
 
     pub async fn stream_responses(
@@ -1412,23 +1443,16 @@ impl Gateway {
             };
             let mut state = StreamState::default();
             let mut turn_usage: Option<ChunkUsage> = None;
-            // G4 (review #1): per-upstream-turn buffer of streamed tool-call
-            // argument deltas, keyed by call_id, so the engine can decide whether
-            // to hide them ONLY once the tool name is known. Sparse upstream
-            // chunks can stream `function_call_arguments` BEFORE the function
-            // name, so a leading `analyzeImage` arg fragment would otherwise leak
-            // (name is still `None` at that point). Until the name resolves we
-            // hold the deltas; once resolved we either DROP them all (the
-            // internal `analyzeImage` tool) or flush the buffered + all later
-            // deltas in order (a real client tool). Only used when the image
-            // agent is active for the turn; otherwise deltas pass straight
-            // through with no buffering.
-            let mut analyze_delta_buffer: HashMap<String, AnalyzeDeltaState> = HashMap::new();
-            // Total bytes held across all still-`Pending` (name-unknown) buffers
-            // this turn. Bounded so a hostile/buggy upstream streaming endless
-            // arguments before ever sending a tool name cannot grow memory
-            // without limit (G4 round-2 #4, DoS guard).
-            let mut pending_buffer_bytes = 0usize;
+            // G4 (review #1): per-upstream-turn gate over streamed tool-call
+            // argument deltas. When the image agent is active it buffers leading
+            // deltas (keyed by call_id) until the tool name resolves, then DROPS
+            // the internal `analyzeImage` ones or FLUSHES client-tool ones in
+            // order — so an `analyzeImage` arg fragment can never leak even when
+            // a sparse upstream streams arguments before the name. When inactive
+            // the gate passes every delta straight through. The gate is a pure
+            // decision machine; the engine forwards its emissions via
+            // `emit_function_call_delta`.
+            let mut tool_delta_gate = ToolDeltaGate::new(vision_session.is_some());
             loop {
                 let Some(chunk) = Self::next_upstream_chunk(&mut stream, &tx).await? else {
                     break;
@@ -1525,130 +1549,20 @@ impl Gateway {
                             name,
                             delta,
                         } => {
-                            // Fast path: when the image agent is inactive there is
-                            // nothing to hide, so stream the delta unchanged.
-                            if vision_session.is_none() {
-                                self.monitor.emit(
-                                    response_id.clone(),
-                                    MonitorEventKind::FunctionCallArgumentsDelta {
-                                        call_id: call_id.clone(),
-                                        delta: delta.clone(),
-                                    },
-                                );
-                                self.send_event(
-                                    &tx,
-                                    function_call_args_delta_event(call_id, name, delta),
-                                    "failed to stream function call args delta",
-                                )
-                                .await?;
-                                continue;
-                            }
-                            // G4 (review #1): image agent active — gate each
-                            // call_id on its resolved tool name, buffering leading
-                            // deltas that arrive before the name is known so an
-                            // internal `analyzeImage` arg fragment can never leak.
-                            let is_analyze = name
-                                .as_deref()
-                                .map(|n| n.eq_ignore_ascii_case(ANALYZE_IMAGE_TOOL_NAME));
-                            let entry = analyze_delta_buffer.entry(call_id.clone()).or_insert(
-                                AnalyzeDeltaState::Pending {
-                                    buffered: Vec::new(),
-                                },
-                            );
-                            match (entry, is_analyze) {
-                                // Already decided to drop this call's deltas
-                                // (internal analyzeImage) — drop this one too.
-                                (AnalyzeDeltaState::Drop, _) => {}
-                                // Name resolved to analyzeImage now: discard any
-                                // buffered leading fragments and mark drop. The
-                                // buffered bytes leave the pending pool.
-                                (slot, Some(true)) => {
-                                    if let AnalyzeDeltaState::Pending { buffered } = slot {
-                                        pending_buffer_bytes = pending_buffer_bytes
-                                            .saturating_sub(buffered_len(buffered));
-                                    }
-                                    *slot = AnalyzeDeltaState::Drop;
-                                }
-                                // Already decided to emit (a known client tool) —
-                                // forward immediately.
-                                (AnalyzeDeltaState::Emit, _) => {
-                                    self.monitor.emit(
-                                        response_id.clone(),
-                                        MonitorEventKind::FunctionCallArgumentsDelta {
-                                            call_id: call_id.clone(),
-                                            delta: delta.clone(),
-                                        },
-                                    );
-                                    self.send_event(
-                                        &tx,
-                                        function_call_args_delta_event(call_id, name, delta),
-                                        "failed to stream function call args delta",
+                            // The gate hides internal `analyzeImage` arg deltas
+                            // (buffering leading fragments until the name resolves)
+                            // and passes client-tool deltas through. It returns the
+                            // ordered emissions to forward; an overflow of the
+                            // pending-byte cap fails the turn cleanly.
+                            let emissions =
+                                tool_delta_gate.on_delta(call_id, name, delta).map_err(|_| {
+                                    AppError::upstream(
+                                        "upstream streamed too many tool-call argument bytes before a tool name",
                                     )
+                                })?;
+                            for emission in emissions {
+                                self.emit_function_call_delta(&response_id, &tx, emission)
                                     .await?;
-                                }
-                                // Name resolved to a non-analyzeImage client tool:
-                                // flush any buffered leading fragments in order,
-                                // then this delta, and remember to emit the rest.
-                                (slot, Some(false)) => {
-                                    let buffered =
-                                        match std::mem::replace(slot, AnalyzeDeltaState::Emit) {
-                                            AnalyzeDeltaState::Pending { buffered } => buffered,
-                                            _ => Vec::new(),
-                                        };
-                                    pending_buffer_bytes = pending_buffer_bytes
-                                        .saturating_sub(buffered_len(&buffered));
-                                    for (buffered_name, buffered_delta) in buffered {
-                                        self.monitor.emit(
-                                            response_id.clone(),
-                                            MonitorEventKind::FunctionCallArgumentsDelta {
-                                                call_id: call_id.clone(),
-                                                delta: buffered_delta.clone(),
-                                            },
-                                        );
-                                        self.send_event(
-                                            &tx,
-                                            function_call_args_delta_event(
-                                                call_id.clone(),
-                                                buffered_name,
-                                                buffered_delta,
-                                            ),
-                                            "failed to stream function call args delta",
-                                        )
-                                        .await?;
-                                    }
-                                    self.monitor.emit(
-                                        response_id.clone(),
-                                        MonitorEventKind::FunctionCallArgumentsDelta {
-                                            call_id: call_id.clone(),
-                                            delta: delta.clone(),
-                                        },
-                                    );
-                                    self.send_event(
-                                        &tx,
-                                        function_call_args_delta_event(call_id, name, delta),
-                                        "failed to stream function call args delta",
-                                    )
-                                    .await?;
-                                }
-                                // Name still unknown: buffer this delta until it
-                                // resolves (or the turn ends). Enforce a per-call
-                                // AND total pending-byte cap so an upstream that
-                                // streams endless args-before-name cannot exhaust
-                                // memory; exceeding it fails the turn cleanly.
-                                (AnalyzeDeltaState::Pending { buffered }, None) => {
-                                    let delta_bytes = delta.len();
-                                    if buffered_len(buffered) + delta_bytes
-                                        > MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL
-                                        || pending_buffer_bytes + delta_bytes
-                                            > MAX_PENDING_TOOL_DELTA_BYTES_TOTAL
-                                    {
-                                        return Err(AppError::upstream(
-                                            "upstream streamed too many tool-call argument bytes before a tool name",
-                                        ));
-                                    }
-                                    buffered.push((name, delta));
-                                    pending_buffer_bytes += delta_bytes;
-                                }
                             }
                         }
                         StreamEmission::ContentPartAdded => {
@@ -1732,28 +1646,9 @@ impl Gateway {
                 let Some(call_id) = tool_call.internal_call.id.clone() else {
                     continue;
                 };
-                if let Some(AnalyzeDeltaState::Pending { buffered }) =
-                    analyze_delta_buffer.remove(&call_id)
-                {
-                    for (buffered_name, buffered_delta) in buffered {
-                        self.monitor.emit(
-                            response_id.clone(),
-                            MonitorEventKind::FunctionCallArgumentsDelta {
-                                call_id: call_id.clone(),
-                                delta: buffered_delta.clone(),
-                            },
-                        );
-                        self.send_event(
-                            &tx,
-                            function_call_args_delta_event(
-                                call_id.clone(),
-                                buffered_name,
-                                buffered_delta,
-                            ),
-                            "failed to stream function call args delta",
-                        )
+                for emission in tool_delta_gate.flush_pending_client_tool(&call_id) {
+                    self.emit_function_call_delta(&response_id, &tx, emission)
                         .await?;
-                    }
                 }
             }
             self.emit_completed_public_items(
@@ -2596,35 +2491,6 @@ impl Gateway {
         });
         Ok(())
     }
-}
-
-/// Per-call_id streaming state for G4 `analyzeImage` delta hiding (review #1).
-/// A tool call starts `Pending` (name unknown) with its leading argument deltas
-/// buffered; once the name resolves it transitions to `Drop` (internal
-/// `analyzeImage` — buffer discarded, all deltas suppressed) or `Emit` (a client
-/// tool — buffer flushed in order, later deltas forwarded).
-enum AnalyzeDeltaState {
-    Pending {
-        buffered: Vec<(Option<String>, String)>,
-    },
-    Drop,
-    Emit,
-}
-
-/// Per-call cap on still-name-unknown buffered tool-call argument bytes (G4
-/// round-2 #4 DoS guard). 256 KiB is far above any real leading
-/// arguments-before-name fragment (tool names arrive within the first chunk or
-/// two) while bounding a single hostile call.
-const MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL: usize = 256 * 1024;
-
-/// Total cap across ALL still-pending buffers in one upstream turn (G4 round-2
-/// #4). Bounds the aggregate even if an upstream opens many nameless calls.
-const MAX_PENDING_TOOL_DELTA_BYTES_TOTAL: usize = 1024 * 1024;
-
-/// Total buffered argument bytes held in a `Pending` buffer (delta payloads
-/// only; the optional name is bookkeeping).
-fn buffered_len(buffered: &[(Option<String>, String)]) -> usize {
-    buffered.iter().map(|(_, delta)| delta.len()).sum()
 }
 
 fn relax_tool_choice_after_stripping_tool(
