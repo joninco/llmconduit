@@ -330,10 +330,10 @@ coverage change). R1 (2 MEDIUM keepalive-hang + race-order, 1 LOW shadowed key) 
 > the missing `stop` arm); **12.9 bundles** both sides of the `tool_calls` wire-string contract. Obey
 > AGENTS.md "Hard rules in the engine"; do NOT re-raise the adjudicated invalid findings below.
 
-## STATUS (🔄 IN PROGRESS — 3/10)
+## STATUS (🔄 IN PROGRESS — 4/10)
 
-**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`).
-**TODO (sequenced):** 12.4, 12.5, 12.6, 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
+**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`), 12.4 (`4cd2b44`).
+**TODO (sequenced):** 12.5, 12.6, 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
 Per-task loop = read spec → implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 
@@ -362,7 +362,7 @@ rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 **Sequencing:** No deps; independent of other Topic-12 tasks (touches only monitor.rs + engine.rs emit sites).
 
 ### Task 12.4 — Delete dead config resolve_upstream_chat_kwargs methods + retarget 8 precedence tests
-**Priority:** MEDIUM · **Spec:** `.ralph/specs/U4-config-dead-resolve-and-wrong-precedence-tests.md` · **Status:** ⬜ PENDING
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/U4-config-dead-resolve-and-wrong-precedence-tests.md` · **Status:** ✅ DONE `4cd2b44` (Codex-xhigh APPROVED, round 2). Deleted all three dead `pub fn`s (`rg` → zero matches); retargeted the 8 kwargs + 2 family tests onto `BackendFinalizationPolicies::from_config` → `finalize_request_for_backend` (asserting the wire `extra_body`), renamed `request_model_profile_overrides_upstream_model_profile_kwargs` → `leaf_resolves_only_final_model_profile_not_request_alias`; family-name-sniffing models renamed to neutral ids so the per-model `template_family` override (not name sniff) drives injection; port_config family test rewritten through the public leaf seam. `model_profiles_for_resolved_model`/system-prompt-prefix path untouched. Round-1 MEDIUM (no test exercised a non-empty global base) fixed by adding a non-empty `global_upstream_chat_kwargs` with a conflicting nested key + global-only key to `resolves_profile_specific_upstream_chat_kwargs` (per-model wins on conflict, global-only survives, unprofiled model gets only the global base).
 **Thermo finding:** `Config::resolve_upstream_chat_kwargs` + `resolve_upstream_chat_kwargs_for_resolved_model` (src/config.rs:833-848) are DEAD in production (post-T1 the leaf finalizes via `BackendFinalizationPolicies::resolve_chat_kwargs`, src/upstream.rs:1858 ← finalize_request_for_backend:2011) yet 8 config tests (config.rs:2085/2220/2291/2380/2466/2606/2660/2851) assert their multi-profile merge precedence — a path the gateway no longer runs; `resolve_template_family` (config.rs:940) is likewise test-only (callers: config.rs:2120/2125/2140 + tests/port_config.rs:321/326).
 **Fix:** Delete ONLY the two `resolve_upstream_chat_kwargs*` methods and `resolve_template_family`; KEEP `model_profiles_for_resolved_model` (config.rs:987) and `resolve_system_prompt_prefix_for_resolved_model` (config.rs:970) — still live via engine.rs:864. Retarget (not delete) the 8 kwargs tests + 2 family tests onto `BackendFinalizationPolicies::from_config(&config)` → `resolve_chat_kwargs`/`finalize_request_for_backend`, asserting the REAL leaf precedence (at-most-one per-model policy via `policy_for_model` over the global base; `config < family < effort-map < client`) instead of the old 3-profile config merge. Rewrite `tests/port_config.rs::template_family_still_resolves_through_profile_chain` through the public `llmconduit::upstream::finalize_request_for_backend` seam (the private `resolve_family_override`/`resolve_chat_kwargs` are not cross-crate callable). Wire output stays byte-identical.
 **Files:** src/config.rs, tests/port_config.rs
