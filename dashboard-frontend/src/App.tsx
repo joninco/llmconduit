@@ -1,12 +1,12 @@
 /**
  * App shell (D9 §"Hash router + layout shell"): stats-strip slot (top), scrubber slot
  * (under it), view router with the four routes. Gated by auth — the login shell renders
- * when unauthenticated; a 401 anywhere bounces back to it (via authStore.bounceToLogin).
+ * when unauthenticated; a 401 anywhere routes through `teardownSession()` (cache cleared,
+ * stores reset, WS closed) which flips auth off and returns to the login shell.
  */
 import { useEffect } from 'react';
-import { getConnection } from './api/connection';
+import { getConnection, teardownSession } from './api/connection';
 import { useAuth } from './store/hooks';
-import { authStore } from './store/authStore';
 import { LoginShell } from './components/LoginShell';
 import { NavTabs } from './components/NavTabs';
 import { StatsStrip } from './components/StatsStrip';
@@ -40,8 +40,9 @@ function Dashboard() {
     try {
       await client.logout();
     } finally {
-      authStore.getState().bounceToLogin();
-      socket.disconnect();
+      // Centralized teardown: clears the REST cache + resets both stores + closes the WS,
+      // so no session-scoped data survives logout (finding 1).
+      teardownSession();
     }
   }
 

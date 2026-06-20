@@ -110,6 +110,12 @@ export class DashboardSocket {
   /** Time-travel: when paused, live frames are buffered here instead of applied. */
   private paused = false;
   private shadowBuffer: DashboardFrame[] = [];
+  /**
+   * A snapshot that arrived from a RECONNECT while seeking (finding 6). It is STAGED here
+   * rather than applied, so a reconnect-during-seek does not clobber the frozen historical
+   * cut or flip the connection to `live`. `live()` applies it on explicit resume.
+   */
+  private pendingSnapshot: SnapshotFrame | null = null;
 
   constructor(opts: DashboardSocketOptions = {}) {
     this.url = opts.url ?? defaultWsUrl();
@@ -200,6 +206,7 @@ export class DashboardSocket {
     this.snapshotApplied = false;
     this.paused = false;
     this.shadowBuffer = [];
+    this.pendingSnapshot = null;
     this.reconnectAttempts = 0;
     this.lastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0 };
   }
@@ -214,20 +221,26 @@ export class DashboardSocket {
    * Handle a transient abnormal drop (finding 7): if a `probeAuth` is configured, probe
    * the protected endpoint — a `401` (resolve `false`) bounces to login; anything else
    * reconnects. With no probe, just reconnect. `disconnect()` (stopped) cancels both.
+   *
+   * The probe is BOUND to the generation that initiated it (finding 5): if a
+   * disconnect/remount bumps the generation before the probe resolves, the stale result is
+   * ignored — it must NOT log out (or reconnect) a NEWER connection.
    */
   private handleTransientDrop(): void {
     if (this.stopped) return;
+    const probeGen = this.generation;
+    const isStaleProbe = () => this.stopped || this.generation !== probeGen;
     this.store.getState().setConnection('connecting');
     if (this.probeAuth) {
       this.probeAuth()
         .then((authed) => {
-          if (this.stopped) return;
+          if (isStaleProbe()) return; // a newer connection superseded this probe
           if (authed) this.scheduleReconnect();
           else this.bounceToLogin();
         })
         .catch(() => {
           // Probe failed for a non-auth reason (e.g. network) → treat as transient.
-          if (!this.stopped) this.scheduleReconnect();
+          if (!isStaleProbe()) this.scheduleReconnect();
         });
     } else {
       this.scheduleReconnect();
@@ -270,11 +283,17 @@ export class DashboardSocket {
   }
 
   /**
-   * Resume LIVE: replay every buffered frame in arrival order (dedup still applies),
-   * then clear the buffer and go back to applying frames as they arrive.
+   * Resume LIVE. If a reconnect happened during the seek, a fresh snapshot was STAGED
+   * (finding 6): apply it FIRST (it re-establishes the authoritative cut + cursors), then
+   * replay any buffered live frames in arrival order (dedup still applies).
    */
   live(): void {
     this.paused = false;
+    const staged = this.pendingSnapshot;
+    this.pendingSnapshot = null;
+    if (staged) {
+      this.commitSnapshot(staged); // resets store + cursors, drains early frames, marks live
+    }
     const buffered = this.shadowBuffer;
     this.shadowBuffer = [];
     for (const frame of buffered) {
@@ -332,6 +351,17 @@ export class DashboardSocket {
   }
 
   private applySnapshotMessage(snap: SnapshotFrame): void {
+    // Finding 6: a reconnect snapshot arriving WHILE SEEKING must NOT overwrite the frozen
+    // cut or flip to live. Stage it; `live()` applies it on explicit resume.
+    if (this.paused) {
+      this.pendingSnapshot = snap;
+      return;
+    }
+    this.commitSnapshot(snap);
+  }
+
+  /** Applies a snapshot to the store + cursors and drains any early-arrived frames. */
+  private commitSnapshot(snap: SnapshotFrame): void {
     this.store.getState().applySnapshot({
       cursors: snap.cursors,
       flows: snap.flows,

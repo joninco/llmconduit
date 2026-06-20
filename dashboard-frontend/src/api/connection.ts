@@ -14,6 +14,7 @@ import { DashboardSocket } from './ws';
 import { mockFetch, mockWsFactory } from './mock';
 import { isMockEnabled, readBootstrap } from '../config/env';
 import { authStore } from '../store/authStore';
+import { dashboardStore } from '../store/dashboardStore';
 import type { Domain } from './types';
 
 /** Stable query keys; the WS invalidation + the views both reference these. */
@@ -56,15 +57,6 @@ export function getConnection(): Connection {
   authStore.getState().setCsrfToken(boot.csrf_token);
   authStore.getState().setMutationsEnabled(boot.mutations_enabled);
 
-  const onUnauthorized = () => authStore.getState().bounceToLogin();
-
-  const client = new DashboardClient({
-    fetchImpl: mock ? mockFetch : undefined,
-    // Dynamic: cookie-first, bootstrap fallback — read fresh on every kill.
-    getCsrfToken: resolveCsrfToken,
-    onUnauthorized,
-  });
-
   const queryClient = new QueryClient({
     defaultOptions: {
       queries: {
@@ -74,6 +66,18 @@ export function getConnection(): Connection {
         retry: 1,
       },
     },
+  });
+
+  // Finding 1: BOTH the logout control and any 401/unauthorized handler route through the
+  // ONE centralized teardown so the sensitive REST cache + live store never survive a
+  // session boundary.
+  const onUnauthorized = () => teardownSession();
+
+  const client = new DashboardClient({
+    fetchImpl: mock ? mockFetch : undefined,
+    // Dynamic: cookie-first, bootstrap fallback — read fresh on every kill.
+    getCsrfToken: resolveCsrfToken,
+    onUnauthorized,
   });
 
   const socket = new DashboardSocket({
@@ -87,6 +91,21 @@ export function getConnection(): Connection {
 
   singleton = { client, socket, queryClient, mock };
   return singleton;
+}
+
+/**
+ * Centralized session teardown (finding 1). Disconnects the WS, CLEARS the TanStack Query
+ * cache (which holds bodies/headers/usage), and resets BOTH zustand stores to their
+ * initial state — so no session-scoped data (cached flow bodies, live frames, CSRF token,
+ * mutation flag) survives a logout or a 401. Idempotent + safe before `getConnection()`.
+ */
+export function teardownSession(): void {
+  if (singleton) {
+    singleton.socket.disconnect();
+    singleton.queryClient.clear();
+  }
+  dashboardStore.getState().reset();
+  authStore.getState().reset();
 }
 
 /** Maps an accepted WS domain to the REST queries it invalidates. */

@@ -164,13 +164,15 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     return json({ ok: true });
   }
 
-  // -- Kill (CSRF) -- `:id` == api_call_id.
+  // -- Kill (CSRF) -- `:id` == api_call_id ONLY (D13 contract). CSRF checked first
+  // (security gate), then the id must be a seeded api_call_id else 404 (finding 7).
   const killMatch = path.match(/^\/dashboard\/api\/flows\/([^/]+)\/kill$/);
   if (killMatch && method === 'POST') {
     const id = decodeURIComponent(killMatch[1] ?? '');
     const csrf = headerValue(init?.headers, 'X-CSRF-Token');
     mockKillLog.push({ id, csrf });
     if (!csrf) return json({ error: 'missing csrf' }, 403);
+    if (!isSeededApiCallId(id)) return json({ error: 'unknown api_call_id' }, 404);
     return json({ api_call_id: id, killed: true });
   }
 
@@ -189,7 +191,8 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   const detailMatch = path.match(/^\/dashboard\/api\/flows\/([^/]+)$/);
   if (detailMatch) {
     const id = decodeURIComponent(detailMatch[1] ?? '');
-    return json(buildFlowDetail(id));
+    const detail = buildFlowDetail(id); // by api_call_id ONLY
+    return detail ? json(detail) : json({ error: 'unknown api_call_id' }, 404);
   }
   if (path === '/dashboard/api/metrics') return json(buildMetrics());
   if (path === '/dashboard/api/topology') return json(buildTopology());
@@ -210,9 +213,19 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   return json({ error: `mock: no route for ${method} ${path}` }, 404);
 };
 
-function buildFlowDetail(id: string): FlowDetail {
-  // Resolve by api_call_id OR response_id (the store joins by either, like D1's detail()).
-  const base = seedFlows().find((f) => f.api_call_id === id || f.response_id === id) ?? seedFlows()[0]!;
+/** True when `id` is one of the seeded `api_call_id`s (D13 `:id = api_call_id`) — finding 7. */
+function isSeededApiCallId(id: string): boolean {
+  return seedFlows().some((f) => f.api_call_id === id);
+}
+
+/**
+ * Build the flow-detail body for a seeded `api_call_id`. Resolves by `api_call_id` ONLY
+ * (NOT response_id) per the D13 `:id = api_call_id` contract; returns `null` for an unknown
+ * id so the route answers 404 (finding 7).
+ */
+function buildFlowDetail(id: string): FlowDetail | null {
+  const base = seedFlows().find((f) => f.api_call_id === id);
+  if (!base) return null;
   return {
     flow_seq: 3,
     api_call_id: base.api_call_id,

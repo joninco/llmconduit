@@ -223,15 +223,18 @@ export interface FlowStatusPayload {
 export interface ProviderHealth {
   id: string;
   name: string;
-  route?: string | null;
-  base_url?: string | null;
+  /** REQUIRED key; value `string | null` (serde emits the key, null-not-absent) — finding 2. */
+  route: string | null;
+  /** REQUIRED non-null base URL (D4) — finding 2. */
+  base_url: string;
   status: ProviderStatus;
-  cooling_until_ms?: number | null;
-  last_error?: string | null;
+  /** REQUIRED keys whose value is `T | null` (serde always emits them) — finding 2. */
+  cooling_until_ms: number | null;
+  last_error: string | null;
   served_count: number;
   failover_count: number;
   consecutive_failures: number;
-  catalog_fetched_ms?: number | null;
+  catalog_fetched_ms: number | null;
   catalog_size: number;
 }
 
@@ -488,6 +491,14 @@ function isOptUint(v: unknown): boolean {
 function isOneOf<T extends string>(v: unknown, set: readonly T[]): v is T {
   return isStr(v) && (set as readonly string[]).includes(v);
 }
+/** REQUIRED key whose value is `string | null` (present, but may be null) — finding 2. */
+function isNullableStr(v: unknown): v is string | null {
+  return v === null || isStr(v);
+}
+/** REQUIRED key whose value is `uint | null` (present, but may be null) — finding 2. */
+function isNullableUint(v: unknown): v is number | null {
+  return v === null || isUint(v);
+}
 
 const DOMAINS: readonly Domain[] = ['flow', 'metrics', 'topology', 'monitor'];
 export function isDomain(v: unknown): v is Domain {
@@ -519,31 +530,94 @@ function isProviderHealth(v: unknown): v is ProviderHealth {
   return (
     isObj(v) &&
     isStr(v.id) && isStr(v.name) &&
-    isOptStr(v.route) && isOptStr(v.base_url) &&
+    // base_url REQUIRED non-null; route/cooling_until_ms/last_error/catalog_fetched_ms are
+    // REQUIRED keys whose value may be null (serde null-not-absent) — finding 2.
+    isNullableStr(v.route) && isStr(v.base_url) &&
     isOneOf(v.status, PROVIDER_STATUSES) &&
-    isOptUint(v.cooling_until_ms) && isOptStr(v.last_error) &&
+    isNullableUint(v.cooling_until_ms) && isNullableStr(v.last_error) &&
     isUint(v.served_count) && isUint(v.failover_count) && isUint(v.consecutive_failures) &&
-    isOptUint(v.catalog_fetched_ms) && isUint(v.catalog_size)
+    isNullableUint(v.catalog_fetched_ms) && isUint(v.catalog_size)
   );
 }
 function isTopologyEdge(v: unknown): v is TopologyEdge {
   return isObj(v) && isStr(v.from) && isStr(v.to) && isNum(v.throughput) && isNum(v.tokens_per_sec) && isNum(v.cost_per_sec);
 }
 
-/** Validates a nested `DebugWsMessage` (itself `type`-tagged) — finding 1. */
+/** Validates a complete `ModelPrice` with FINITE numbers (rejects NaN/Inf/missing) — finding 4. */
+function isModelPrice(v: unknown): v is ModelPrice {
+  return isObj(v) && isNum(v.input_per_1k) && isNum(v.output_per_1k) && isNum(v.cached_per_1k);
+}
+/** Validates a `price_table` map: every value a complete finite `ModelPrice` — finding 4. */
+function isPriceTable(v: unknown): v is Record<string, ModelPrice> {
+  return isObj(v) && Object.values(v).every(isModelPrice);
+}
+
+const DEBUG_REQUEST_STATUSES: readonly DebugRequestStatus[] = ['running', 'completed', 'failed'];
+const DEBUG_SEGMENT_KINDS: readonly DebugSegmentKind[] = ['output', 'reasoning', 'tool'];
+
+/** Fully validates `DebugRequestStats` — every field a uint (finding 3). */
+function isDebugRequestStats(v: unknown): v is DebugRequestStats {
+  return (
+    isObj(v) &&
+    isUint(v.input_items) && isUint(v.tool_count) && isUint(v.turn_count) &&
+    isUint(v.user_messages) && isUint(v.assistant_messages) && isUint(v.system_messages) &&
+    isUint(v.developer_messages) && isUint(v.reasoning_items) && isUint(v.function_calls) &&
+    isUint(v.function_outputs) && isUint(v.tool_items) && isUint(v.input_chars) &&
+    isUint(v.instructions_chars)
+  );
+}
+
+/** Fully validates a `DebugRequest` incl. its stats, status enum, and timestamps (finding 3). */
+function isDebugRequest(v: unknown): v is DebugRequest {
+  return (
+    isObj(v) &&
+    isStr(v.response_id) && isStr(v.model) &&
+    isUint(v.started_at_ms) && isUint(v.updated_at_ms) && isNullableUint(v.completed_at_ms) &&
+    isOneOf(v.status, DEBUG_REQUEST_STATUSES) &&
+    isDebugRequestStats(v.stats) &&
+    isNullableStr(v.error)
+  );
+}
+
+function isDebugEventImage(v: unknown): v is DebugEventImage {
+  return (
+    isObj(v) && isStr(v.id) && isStr(v.label) && isStr(v.path) && isStr(v.mime_type) &&
+    (v.size_bytes === undefined || isNullableUint(v.size_bytes))
+  );
+}
+
+/** Fully validates a `DebugSegment` (kind enum + timestamp + text) — finding 3. */
+function isDebugSegment(v: unknown): v is DebugSegment {
+  return isObj(v) && isUint(v.timestamp_ms) && isOneOf(v.kind, DEBUG_SEGMENT_KINDS) && isStr(v.text);
+}
+
+/** Fully validates a `DebugTimelineEvent` incl. its images array — finding 3. */
+function isDebugTimelineEvent(v: unknown): v is DebugTimelineEvent {
+  return (
+    isObj(v) && isUint(v.timestamp_ms) && isStr(v.kind) && isStr(v.summary) &&
+    (v.payload_preview === undefined || isNullableStr(v.payload_preview)) &&
+    Array.isArray(v.images) && v.images.every(isDebugEventImage)
+  );
+}
+
+/**
+ * Fully validates a nested `DebugWsMessage` (itself `type`-tagged) — findings 1+3. Every
+ * arm's nested DTO is validated (DebugRequest/stats, segment, event/images, status enums,
+ * timestamp types); no `as` cast skips validation.
+ */
 export function isDebugWsMessage(v: unknown): v is DebugWsMessage {
   if (!isObj(v) || !isStr(v.type)) return false;
   switch (v.type) {
     case 'hello':
       return isUint(v.protocol_version) && isUint(v.history_limit) && isUint(v.history_retention_ms);
     case 'request_upsert':
-      return isObj(v.request) && isStr(v.request.response_id) && isStr(v.request.model);
+      return isDebugRequest(v.request);
     case 'segment_append':
-      return isStr(v.response_id) && isObj(v.segment) && isStr((v.segment as Record<string, unknown>).text);
+      return isStr(v.response_id) && isDebugSegment(v.segment);
     case 'event_append':
-      return isStr(v.response_id) && isObj(v.event) && isStr((v.event as Record<string, unknown>).kind);
+      return isStr(v.response_id) && isDebugTimelineEvent(v.event);
     case 'request_status':
-      return isStr(v.response_id) && isOneOf(v.status, ['running', 'completed', 'failed']) && isOptUint(v.completed_at_ms) && isOptStr(v.error);
+      return isStr(v.response_id) && isOneOf(v.status, DEBUG_REQUEST_STATUSES) && isNullableUint(v.completed_at_ms) && isNullableStr(v.error);
     case 'request_remove':
       return isStr(v.response_id) && isStr(v.reason);
     case 'snapshot_done':
@@ -630,7 +704,8 @@ function isTopologyResponse(v: unknown): v is TopologyResponse {
     isObj(v) && isUint(v.topology_seq) &&
     Array.isArray(v.nodes) && v.nodes.every(isProviderHealth) &&
     Array.isArray(v.edges) && v.edges.every(isTopologyEdge) &&
-    isObj(v.price_table)
+    // Every price_table entry is a complete finite ModelPrice (finding 4).
+    isPriceTable(v.price_table)
   );
 }
 

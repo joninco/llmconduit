@@ -12,10 +12,11 @@ describe('DashboardClient — kill includes X-CSRF-Token', () => {
       fetchImpl: mockFetch,
       getCsrfToken: () => 'mock-csrf-token',
     });
-    const res = await client.kill('resp_001');
+    // `:id` == api_call_id (D13 contract).
+    const res = await client.kill('api_001');
     expect(res.killed).toBe(true);
     expect(mockKillLog).toHaveLength(1);
-    expect(mockKillLog[0]).toEqual({ id: 'resp_001', csrf: 'mock-csrf-token' });
+    expect(mockKillLog[0]).toEqual({ id: 'api_001', csrf: 'mock-csrf-token' });
   });
 
   it('mock backend rejects a kill with no CSRF token (403)', async () => {
@@ -23,8 +24,17 @@ describe('DashboardClient — kill includes X-CSRF-Token', () => {
       fetchImpl: mockFetch,
       getCsrfToken: () => null,
     });
-    await expect(client.kill('resp_001')).rejects.toThrow(/403/);
+    await expect(client.kill('api_001')).rejects.toThrow(/403/);
     expect(mockKillLog[0]?.csrf).toBeNull();
+  });
+
+  it('mock backend 404s a kill for an unknown api_call_id (finding 7)', async () => {
+    const client = new DashboardClient({
+      fetchImpl: mockFetch,
+      getCsrfToken: () => 'mock-csrf-token',
+    });
+    // A response_id is NOT a valid kill key — `:id` must be api_call_id.
+    await expect(client.kill('resp_001')).rejects.toThrow(/404/);
   });
 });
 

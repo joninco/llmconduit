@@ -10,7 +10,7 @@ import {
   MALFORMED_FRAME_JSON,
 } from './ws.fixtures';
 import { dashboardStore } from '../store/dashboardStore';
-import { isDashboardFrame, isSnapshotFrame } from './types';
+import { isDashboardFrame, isSnapshotFrame, isDebugWsMessage } from './types';
 import type { DashboardFrame, SnapshotFrame } from './types';
 
 function snapshot(): SnapshotFrame {
@@ -245,6 +245,108 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
   });
 });
 
+describe('ProviderHealth + price_table validation (findings 2 + 4)', () => {
+  const node = (over: Record<string, unknown> = {}) => ({
+    id: 'p', name: 'p', route: null, base_url: 'http://x', status: 'healthy',
+    cooling_until_ms: null, last_error: null, served_count: 0, failover_count: 0,
+    consecutive_failures: 0, catalog_fetched_ms: null, catalog_size: 0, ...over,
+  });
+  const topoFrame = (nodes: unknown[]) => ({ domain: 'topology', seq: 1, batch: [{ type: 'topology_update', nodes, edges: [] }] });
+
+  it('accepts a complete D4 ProviderHealth (nullable keys present-but-null)', () => {
+    expect(isDashboardFrame(topoFrame([node()]))).toBe(true);
+  });
+
+  it('rejects a node MISSING base_url (required non-null) — finding 2', () => {
+    const n = node();
+    delete (n as Record<string, unknown>).base_url;
+    expect(isDashboardFrame(topoFrame([n]))).toBe(false);
+  });
+
+  it('rejects a node with null base_url (must be non-null) — finding 2', () => {
+    expect(isDashboardFrame(topoFrame([node({ base_url: null })]))).toBe(false);
+  });
+
+  it('rejects a node MISSING a required nullable key (cooling_until_ms absent) — finding 2', () => {
+    const n = node();
+    delete (n as Record<string, unknown>).cooling_until_ms;
+    expect(isDashboardFrame(topoFrame([n]))).toBe(false);
+  });
+
+  it('accepts a topology snapshot whose price_table entries are complete ModelPrice', () => {
+    expect(isSnapshotFrame({
+      type: 'snapshot',
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [],
+      metrics: null,
+      topology: { topology_seq: 1, nodes: [node()], edges: [], price_table: { 'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025 } } },
+    })).toBe(true);
+  });
+
+  it('rejects a price_table entry with a non-finite number (finding 4)', () => {
+    expect(isSnapshotFrame({
+      type: 'snapshot',
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [],
+      metrics: null,
+      topology: { topology_seq: 1, nodes: [node()], edges: [], price_table: { m: { input_per_1k: Number.POSITIVE_INFINITY, output_per_1k: 0, cached_per_1k: 0 } } },
+    })).toBe(false);
+  });
+
+  it('rejects a price_table entry missing a field (finding 4)', () => {
+    expect(isSnapshotFrame({
+      type: 'snapshot',
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [],
+      metrics: null,
+      topology: { topology_seq: 1, nodes: [node()], edges: [], price_table: { m: { input_per_1k: 0.001, output_per_1k: 0.001 } } },
+    })).toBe(false);
+  });
+});
+
+describe('DebugWsMessage nested validation — full DTO, no skipped casts (findings 1 + 3)', () => {
+  const fullRequest = {
+    response_id: 'r', model: 'm', started_at_ms: 1, updated_at_ms: 1, completed_at_ms: null,
+    status: 'running',
+    stats: { input_items: 0, tool_count: 0, turn_count: 0, user_messages: 0, assistant_messages: 0, system_messages: 0, developer_messages: 0, reasoning_items: 0, function_calls: 0, function_outputs: 0, tool_items: 0, input_chars: 0, instructions_chars: 0 },
+    error: null,
+  };
+
+  it('accepts a complete request_upsert (full DebugRequest + stats)', () => {
+    expect(isDebugWsMessage({ type: 'request_upsert', request: fullRequest })).toBe(true);
+  });
+
+  it('rejects request_upsert whose request is MISSING stats (finding 3)', () => {
+    const req = { ...fullRequest } as Record<string, unknown>;
+    delete req.stats;
+    expect(isDebugWsMessage({ type: 'request_upsert', request: req })).toBe(false);
+  });
+
+  it('rejects request_upsert with an incomplete stats object (finding 3)', () => {
+    expect(isDebugWsMessage({ type: 'request_upsert', request: { ...fullRequest, stats: { input_items: 1 } } })).toBe(false);
+  });
+
+  it('rejects a bad DebugRequest status enum (finding 3)', () => {
+    expect(isDebugWsMessage({ type: 'request_upsert', request: { ...fullRequest, status: 'pending' } })).toBe(false);
+  });
+
+  it('accepts a complete segment_append; rejects a bad segment kind (finding 3)', () => {
+    expect(isDebugWsMessage({ type: 'segment_append', response_id: 'r', segment: { timestamp_ms: 1, kind: 'output', text: 'hi' } })).toBe(true);
+    expect(isDebugWsMessage({ type: 'segment_append', response_id: 'r', segment: { timestamp_ms: 1, kind: 'banana', text: 'hi' } })).toBe(false);
+  });
+
+  it('validates event_append images fully (rejects a malformed image) — finding 3', () => {
+    const okEvent = { timestamp_ms: 1, kind: 'k', summary: 's', payload_preview: null, images: [{ id: 'i', label: 'l', path: 'p', mime_type: 'image/png', size_bytes: 10 }] };
+    expect(isDebugWsMessage({ type: 'event_append', response_id: 'r', event: okEvent })).toBe(true);
+    const badImg = { ...okEvent, images: [{ id: 'i' /* missing label/path/mime */ }] };
+    expect(isDebugWsMessage({ type: 'event_append', response_id: 'r', event: badImg })).toBe(false);
+  });
+
+  it('rejects a request_status with a bad status enum (finding 3)', () => {
+    expect(isDebugWsMessage({ type: 'request_status', response_id: 'r', status: 'idle', completed_at_ms: null, error: null })).toBe(false);
+  });
+});
+
 describe('DashboardSocket — auth failure vs transient blip + reconnect (findings 3+4+7)', () => {
   /** Captured pending reconnect timers so a test can fire them synchronously. */
   let pendingTimers: Array<() => void>;
@@ -373,6 +475,28 @@ describe('DashboardSocket — auth failure vs transient blip + reconnect (findin
     newWs.onmessage?.({ data: JSON.stringify(snapshot()) });
     expect(dashboardStore.getState().connection).toBe('live');
   });
+
+  it('a STALE probe resolving after disconnect/remount does NOT bounce a newer connection (finding 5)', async () => {
+    const onUnauthorized = vi.fn();
+    // A probe we resolve MANUALLY, after the connection has been torn down + remounted.
+    let resolveProbe!: (authed: boolean) => void;
+    const probeAuth = vi.fn().mockImplementation(() => new Promise<boolean>((res) => { resolveProbe = res; }));
+    const { setTimer, clearTimer } = makeTimers();
+    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized, probeAuth, setTimer, clearTimer });
+    socket.connect();
+    // Drop → probe starts (bound to this generation), pending.
+    FakeSocket.instances[0]!.onclose?.({ code: 1006 });
+    expect(probeAuth).toHaveBeenCalledOnce();
+    // Disconnect + reconnect bumps the generation while the probe is still pending.
+    socket.disconnect();
+    socket.connect();
+    // NOW the stale probe resolves with a 401-equivalent.
+    resolveProbe(false);
+    await Promise.resolve();
+    await Promise.resolve();
+    // The stale probe must be ignored: the NEWER connection is NOT logged out.
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
 });
 
 describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
@@ -396,5 +520,31 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     expect(socket.isPaused()).toBe(false);
     expect(dashboardStore.getState().monitor).toHaveLength(8);
     expect(socket.shadowBufferLength()).toBe(0);
+  });
+
+  it('a RECONNECT snapshot arriving during seek does NOT clobber the frozen cut or flip to live (finding 6)', () => {
+    // Freeze: apply a monitor frame, then seek. The store + connection are the frozen cut.
+    socket.applyFrame(buildMonitorFrame(6));
+    expect(dashboardStore.getState().monitor).toHaveLength(4);
+    socket.seek();
+    expect(dashboardStore.getState().connection).toBe('seeking');
+
+    // A reconnect delivers a FRESH snapshot (different cut: empty flows, new cursors).
+    const reconnectSnap: SnapshotFrame = {
+      type: 'snapshot',
+      cursors: { flow_seq: 99, metrics_seq: 99, topology_seq: 99, monitor_seq: 99 },
+      flows: [], metrics: null, topology: null,
+    };
+    socket.handleParsed(reconnectSnap);
+
+    // The frozen cut is INTACT: monitor still 4, connection still seeking, cursors unchanged.
+    expect(dashboardStore.getState().monitor).toHaveLength(4);
+    expect(dashboardStore.getState().connection).toBe('seeking');
+    expect(socket.getCursors().monitor).toBe(6);
+
+    // Explicit resume applies the staged snapshot (new cut) + flips to live.
+    socket.live();
+    expect(dashboardStore.getState().connection).toBe('live');
+    expect(socket.getCursors().monitor).toBe(99);
   });
 });

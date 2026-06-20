@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { getConnection, resetConnection, queryKeys } from './connection';
+import { getConnection, resetConnection, teardownSession, queryKeys } from './connection';
+import { DashboardClient } from './client';
 import { mockKillLog, buildMonitorFrame } from './mock';
 import { authStore } from '../store/authStore';
 import { dashboardStore } from '../store/dashboardStore';
@@ -24,7 +25,7 @@ describe('connection — CSRF resolved dynamically (cookie-first) on kill (findi
     const { client } = getConnection();
     // Simulate a fresh login setting the double-submit cookie AFTER the connection booted.
     document.cookie = 'llmconduit_csrf=fresh-login-token';
-    const res = await client.kill('resp_001');
+    const res = await client.kill('api_001');
     expect(res.killed).toBe(true);
     // The kill carried the COOKIE token, not a stale bootstrap value.
     expect(mockKillLog.at(-1)?.csrf).toBe('fresh-login-token');
@@ -33,7 +34,7 @@ describe('connection — CSRF resolved dynamically (cookie-first) on kill (findi
   it('falls back to the auth-store token when no cookie is present', async () => {
     const { client } = getConnection();
     authStore.getState().setCsrfToken('store-token');
-    const res = await client.kill('resp_002');
+    const res = await client.kill('api_002');
     expect(res.killed).toBe(true);
     expect(mockKillLog.at(-1)?.csrf).toBe('store-token');
   });
@@ -88,5 +89,59 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const spy = vi.spyOn(queryClient, 'invalidateQueries');
     socket.applyFrame(buildMonitorFrame(6));
     expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe('teardownSession — clears cache + resets stores + disconnects WS (finding 1)', () => {
+  beforeEach(() => resetConnection());
+  afterEach(() => resetConnection());
+
+  it('clears the query cache, resets both stores, and disconnects the socket', () => {
+    const { socket, queryClient } = getConnection();
+    // Seed session-scoped state: a cached query, live store data, and auth secrets.
+    queryClient.setQueryData(queryKeys.flows, { flows: [], total: 0, flow_seq: 1 });
+    socket.handleParsed({
+      type: 'snapshot',
+      cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 5 },
+      flows: [], metrics: null, topology: null,
+    });
+    socket.applyFrame(buildMonitorFrame(6));
+    authStore.getState().setAuthenticated(true);
+    authStore.getState().setCsrfToken('secret-token');
+    authStore.getState().setMutationsEnabled(true);
+    const clearSpy = vi.spyOn(queryClient, 'clear');
+    const disconnectSpy = vi.spyOn(socket, 'disconnect');
+
+    teardownSession();
+
+    // REST cache cleared (no leaked bodies/usage across sessions).
+    expect(clearSpy).toHaveBeenCalledOnce();
+    expect(queryClient.getQueryData(queryKeys.flows)).toBeUndefined();
+    // WS disconnected.
+    expect(disconnectSpy).toHaveBeenCalledOnce();
+    // Live store reset.
+    expect(dashboardStore.getState().monitor).toHaveLength(0);
+    expect(dashboardStore.getState().flows.size).toBe(0);
+    expect(dashboardStore.getState().cursors.monitor_seq).toBe(0);
+    // Auth store fully reset (token + mutation flag cleared, not just `authenticated`).
+    expect(authStore.getState().authenticated).toBe(false);
+    expect(authStore.getState().csrfToken).toBeNull();
+    expect(authStore.getState().mutationsEnabled).toBe(false);
+  });
+
+  it('a real 401 from a client read routes through teardownSession (wired onUnauthorized)', async () => {
+    // Build a client wired with the SAME onUnauthorized the connection uses
+    // (teardownSession), against a fetch that 401s — then assert teardown ran.
+    const { queryClient } = getConnection();
+    queryClient.setQueryData(queryKeys.metrics, { metrics_seq: 1 });
+    authStore.getState().setAuthenticated(true);
+    authStore.getState().setCsrfToken('secret');
+    const fetch401: typeof globalThis.fetch = async () => new Response('no', { status: 401 });
+    const client = new DashboardClient({ fetchImpl: fetch401, onUnauthorized: teardownSession });
+    await expect(client.metrics()).rejects.toBeTruthy(); // 401 → UnauthorizedError
+    // The 401 fired onUnauthorized === teardownSession: cache cleared, auth reset.
+    expect(queryClient.getQueryData(queryKeys.metrics)).toBeUndefined();
+    expect(authStore.getState().authenticated).toBe(false);
+    expect(authStore.getState().csrfToken).toBeNull();
   });
 });

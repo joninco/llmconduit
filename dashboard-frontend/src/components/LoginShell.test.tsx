@@ -99,7 +99,7 @@ describe('CSRF read from bootstrap/cookie is sent on kill', () => {
     const { client } = getConnection();
     // The mock bootstrap exposes the mock CSRF token; getConnection seeded the auth store.
     expect(authStore.getState().csrfToken).toBeTruthy();
-    const res = await client.kill('resp_001');
+    const res = await client.kill('api_001');
     expect(res.killed).toBe(true);
   });
 });
