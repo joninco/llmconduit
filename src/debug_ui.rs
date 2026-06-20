@@ -250,12 +250,20 @@ const MAX_EXPIRY_WAIT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Remaining time until `session_exp` (unix secs), saturating at zero and capped
 /// at [`MAX_EXPIRY_WAIT`].
+///
+/// D7a R3 #3: the deadline is computed from the FULL sub-second wall clock, not a
+/// whole-second truncation. Truncating `now` to whole seconds rounds the
+/// remaining time UP by up to ~1s (e.g. at a true `99.9s` vs `exp=100`, an
+/// `as_secs()` now of `99` yields `1s` remaining instead of `0.1s`), so frames
+/// could be delivered for nearly a second past the signed `exp`. Subtracting the
+/// full `Duration` since epoch (seconds + nanos) closes the socket within the
+/// `exp` second.
 fn session_remaining(session_exp: u64) -> Duration {
+    let exp = Duration::from_secs(session_exp);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    Duration::from_secs(session_exp.saturating_sub(now)).min(MAX_EXPIRY_WAIT)
+        .unwrap_or(Duration::ZERO);
+    exp.saturating_sub(now).min(MAX_EXPIRY_WAIT)
 }
 
 async fn send_message(socket: &mut WebSocket, message: &DebugWsMessage) -> bool {
@@ -295,6 +303,37 @@ mod tests {
             "remaining: {remaining:?}"
         );
         assert!(remaining <= Duration::from_secs(120));
+    }
+
+    /// REGRESSION (D7a R3 #3): the remaining time to a WHOLE-SECOND `exp` must be
+    /// the true sub-second residual, NOT rounded UP to a full second. The old
+    /// `as_secs()` truncation of `now` made the remaining to the *next* whole
+    /// second always a full `1s` (so frames could ship ~1s past `exp`). Here we
+    /// capture the full-precision now, take the next whole second as `exp`, and
+    /// assert the computed remaining is below a full second (it equals
+    /// `1s - now.subsec`, always `< 1s` unless we land exactly on a tick) and
+    /// close to the full-precision expectation.
+    #[test]
+    fn remaining_uses_subsecond_precision_not_whole_second_round_up() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after epoch");
+        let exp_secs = now.as_secs() + 1;
+        let expected = Duration::from_secs(exp_secs).saturating_sub(now); // < 1s
+        let remaining = session_remaining(exp_secs);
+        // The deadline must be the sub-second residual, strictly under a full
+        // second (the truncating implementation returned exactly 1s here).
+        assert!(
+            remaining < Duration::from_secs(1),
+            "remaining to the next whole second must be sub-second, got {remaining:?}"
+        );
+        // And it must track the full-precision expectation (both sampled the
+        // clock microseconds apart, so allow a small skew).
+        let skew = remaining.abs_diff(expected);
+        assert!(
+            skew < Duration::from_millis(50),
+            "remaining {remaining:?} should match sub-second expected {expected:?} (skew {skew:?})"
+        );
     }
 
     /// The per-connection expiry timer fires once the cookie `exp` passes. We

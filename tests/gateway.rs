@@ -1953,16 +1953,19 @@ async fn non_loopback_without_token_refuses_to_register_protected_routes() {
 
 #[tokio::test]
 async fn insecure_override_non_loopback_still_enforces_real_auth() {
-    // SECURITY (finding 1): `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1` on a
-    // non-loopback bind relaxes ONLY the https-origin (TLS) requirement. With a
-    // token + valid session key configured the routes register, but `dev_open`
-    // is NOT active — real cookie/token auth is enforced. An unauthenticated
-    // request must get 401 (NOT a dev-open 200), and a valid signed cookie 200.
+    // SECURITY (finding 1; refined D7a R3 #2): `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1`
+    // on a non-loopback bind relaxes ONLY the origin *scheme* (TLS) — an explicit
+    // `http://` origin is still REQUIRED. With a token + valid session key + an
+    // explicit http origin the routes register, but `dev_open` is NOT active —
+    // real cookie/token auth is enforced. An unauthenticated request must get 401
+    // (NOT a dev-open 200), and a valid signed cookie 200.
     use base64::Engine as _;
     let env = llmconduit::dashboard_auth::DashboardEnv {
         token: Some("integration-token".to_string()),
         session_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([42u8; 32])),
-        public_origin: None, // missing https origin, relaxed by the override
+        // Explicit http origin: the override relaxes the scheme, not the
+        // exact-origin requirement (an origin-less override now refuses).
+        public_origin: Some("http://dash.lan:4000".to_string()),
         allow_insecure: true,
         allow_mutations: false,
     };
@@ -1970,7 +1973,7 @@ async fn insecure_override_non_loopback_still_enforces_real_auth() {
     // The startup decision registers under the override...
     assert!(
         llmconduit::dashboard_auth::startup_route_decision(bind, &env).should_register(),
-        "token + key + insecure override must register on non-loopback"
+        "token + key + explicit http origin + insecure override must register on non-loopback"
     );
     let (app, auth) = authed_router(bind, &env);
     // ...but dev-open is off (a token is configured), so an unauthenticated

@@ -173,6 +173,27 @@ impl PublicOrigin {
                 "{ENV_PUBLIC_ORIGIN} must be an origin only (no path): {raw}"
             ));
         }
+        // D7a R3 #5: an origin is scheme + host(+port) ONLY. Reject (rather than
+        // silently discard) any query, fragment, or userinfo/credentials — these
+        // never appear in an `Origin` header, so accepting them would let a
+        // configured value that looks meaningful (e.g. `https://h?x` or
+        // `https://user:pw@h`) normalize away its extra parts and match an origin
+        // the operator did not intend.
+        if url.query().is_some() {
+            return Err(format!(
+                "{ENV_PUBLIC_ORIGIN} must be an origin only (no query): {raw}"
+            ));
+        }
+        if url.fragment().is_some() {
+            return Err(format!(
+                "{ENV_PUBLIC_ORIGIN} must be an origin only (no fragment): {raw}"
+            ));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(format!(
+                "{ENV_PUBLIC_ORIGIN} must be an origin only (no userinfo/credentials): {raw}"
+            ));
+        }
         // Re-serialize as a bare origin so an `Origin` header (which never has a
         // trailing slash) compares byte-for-byte. The scheme is preserved so an
         // `http` override origin matches an `http` `Origin` exactly.
@@ -198,11 +219,20 @@ impl PublicOrigin {
 /// [`DashboardEnv`] and shared (behind `Arc`) as an Axum extension on the
 /// protected routes. NEVER stored on the persisted `Config`.
 pub struct DashboardAuth {
-    /// Optional bearer/login token. `None` on a loopback dev server without a
-    /// configured token — in that mode the login flow always "succeeds"
-    /// (the server is already only reachable from localhost). On a non-loopback
-    /// bind a token is REQUIRED (enforced by [`startup_route_decision`]).
-    token: Option<String>,
+    /// Whether a bearer/login token is configured. `false` on a loopback dev
+    /// server without a configured token — in that mode the login flow always
+    /// "succeeds" (the server is already only reachable from localhost). On a
+    /// non-loopback bind a token is REQUIRED (enforced by
+    /// [`startup_route_decision`]). The token itself is NOT retained in cleartext;
+    /// only its digest ([`Self::token_digest`]) is kept for the comparison.
+    has_token: bool,
+    /// Precomputed SHA-256 digest of the configured token (D7a R3 #4). Hashing the
+    /// configured token ONCE at construction — rather than on every
+    /// `verify_token` call — makes the per-request comparison run over two
+    /// fixed-width digests with NO secret-length-dependent work: only the
+    /// *presented* token is hashed per call, then the two 32-byte digests are
+    /// compared in constant time. `None` in dev-open (no token) mode.
+    token_digest: Option<[u8; 32]>,
     /// HMAC-SHA256 signing key for the session cookie (≥ 32 bytes). Decoded from
     /// base64 once; never logged, never `Debug`-printed.
     session_key: Vec<u8>,
@@ -226,7 +256,7 @@ impl std::fmt::Debug for DashboardAuth {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("DashboardAuth")
-            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .field("token", &self.has_token.then_some("[redacted]"))
             .field("session_key", &"[redacted]")
             .field(
                 "public_origin",
@@ -280,6 +310,19 @@ impl DashboardAuth {
         let loopback = bind_addr.ip().is_loopback();
         let mut warnings = Vec::new();
 
+        // D7a R3 #6: normalize the token here (trim; empty/whitespace-only → None)
+        // so a directly-constructed `DashboardEnv { token: Some("") }` /
+        // `Some("   ")` is treated as tokenless and rejected on a non-loopback
+        // bind, rather than silently becoming a blank-token (effectively
+        // tokenless, since any presented token would have to equal "") dashboard.
+        // (`from_process_env` already trims/empties, but the constructor must not
+        // rely on that for a hand-built env.)
+        let token = env
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
         // D7a R2 #4: fail closed on a tokenless non-loopback bind. A `None` token
         // means `dev_open` treats every request as authenticated; that concession
         // is loopback-only (the server is reachable solely from localhost there).
@@ -287,7 +330,7 @@ impl DashboardAuth {
         // otherwise construct a tokenless non-loopback context and register it
         // manually — so the constructor enforces the invariant independently. The
         // insecure override does NOT relax this (it only relaxes the TLS origin).
-        if !loopback && env.token.is_none() {
+        if !loopback && token.is_none() {
             return Err(format!(
                 "{ENV_TOKEN} is required on a non-loopback bind; a tokenless dashboard is \
                  fully unauthenticated (dev-open) and is a loopback-dev concession only"
@@ -327,26 +370,36 @@ impl DashboardAuth {
             None => None,
         };
 
-        // D7a R2 #2: a non-loopback bind under the insecure override with NO
+        // D7a R3 #2: a non-loopback bind under the insecure override with NO
         // configured origin cannot validate cross-site WS requests — the only
         // legitimate-origin signal would be the attacker-controllable `Host`, and
-        // `origin_allowed` never trusts `Host` off loopback. Warn that any
-        // Origin-bearing browser upgrade will be rejected until an explicit origin
-        // is set (the secure non-loopback path already requires a validated https
-        // origin via `startup_route_decision`).
+        // `origin_allowed` never trusts `Host` off loopback. The override relaxes
+        // only the TLS (scheme) requirement, NOT the exact-origin requirement, so
+        // fail closed here (mirroring the token/key fail-closed above): an explicit
+        // `http`-or-`https` origin is REQUIRED. `startup_route_decision` makes the
+        // same refusal at registration; the constructor enforces it independently
+        // so a direct caller cannot build an origin-less insecure non-loopback
+        // context.
         if !loopback && env.allow_insecure && public_origin.is_none() {
-            warnings.push(format!(
-                "{ENV_ALLOW_INSECURE}=1 on a non-loopback bind WITHOUT {ENV_PUBLIC_ORIGIN}: \
-                 browser WebSocket upgrades that send an Origin header will be REJECTED (the \
-                 Host header is attacker-controllable off loopback, so it is never trusted as \
-                 the origin); set {ENV_PUBLIC_ORIGIN} (http:// is allowed under this override) \
-                 to enable the dashboard socket"
+            return Err(format!(
+                "{ENV_ALLOW_INSECURE}=1 on a non-loopback bind requires an explicit \
+                 {ENV_PUBLIC_ORIGIN} (http:// is allowed under this override): the Host header is \
+                 attacker-controllable off loopback, so without an exact origin the dashboard \
+                 WebSocket cannot validate cross-site upgrades and the exact-origin requirement \
+                 cannot be met"
             ));
         }
 
+        // D7a R3 #4: precompute the (normalized) configured token's SHA-256 digest
+        // once so the per-request `verify_token` hashes only the *presented*
+        // token, never the secret — its runtime no longer depends on the
+        // configured token length.
+        let token_digest = token.map(|token| <[u8; 32]>::from(Sha256::digest(token.as_bytes())));
+
         Ok(DashboardAuthBuild {
             auth: Arc::new(Self {
-                token: env.token.clone(),
+                has_token: token.is_some(),
+                token_digest,
                 session_key,
                 public_origin,
                 loopback,
@@ -376,10 +429,20 @@ impl DashboardAuth {
     /// configured token. When no token is configured (loopback dev), every
     /// presented token is accepted — the server is only reachable from
     /// localhost in that mode.
+    ///
+    /// D7a R3 #4: the configured token's digest is precomputed at construction, so
+    /// here we hash ONLY the presented token and compare the two fixed-width
+    /// SHA-256 digests in constant time. The comparison work is independent of the
+    /// configured secret's length (and collision resistance subsumes the
+    /// length-equality bit: a differently sized presented token yields a different
+    /// digest).
     pub fn verify_token(&self, presented: &str) -> bool {
-        match self.token.as_deref() {
+        match self.token_digest.as_ref() {
             None => true,
-            Some(expected) => bool::from(presented.as_bytes().ct_eq_padded(expected.as_bytes())),
+            Some(expected) => {
+                let presented_digest = Sha256::digest(presented.as_bytes());
+                bool::from(presented_digest.as_slice().ct_eq(expected.as_slice()))
+            }
         }
     }
 
@@ -436,7 +499,7 @@ impl DashboardAuth {
     /// open `/debug`/`/dashboard` without a login round-trip. A logged warning
     /// at startup makes the concession explicit.
     pub fn dev_open(&self) -> bool {
-        self.token.is_none()
+        !self.has_token
     }
 
     /// Authenticate an HTTP request from its headers: dev-open mode (no token
@@ -606,9 +669,12 @@ pub enum RouteRefusal {
     /// bytes). ALWAYS fatal on a non-loopback bind — ephemeral key generation is
     /// a loopback-only dev concession.
     MissingSessionKey,
-    /// No valid `https://` `LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN`. Fatal on a
-    /// non-loopback bind UNLESS `ALLOW_INSECURE_DASHBOARD=1` relaxes the TLS
-    /// requirement.
+    /// No valid `LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN`. Fatal on a non-loopback
+    /// bind: a validated `https://` origin is required, OR — when
+    /// `ALLOW_INSECURE_DASHBOARD=1` relaxes ONLY the TLS scheme — a validated
+    /// explicit `http://`-or-`https://` origin. The override does NOT waive the
+    /// exact-origin requirement, so an origin-less insecure non-loopback bind is
+    /// still refused (D7a R3 #2).
     MissingHttpsOrigin,
 }
 
@@ -622,8 +688,9 @@ impl RouteRefusal {
             }
             Self::MissingHttpsOrigin => {
                 "a valid https:// LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN is required on a non-loopback \
-                 bind (or set LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1 to relax ONLY the TLS \
-                 requirement)"
+                 bind (or set LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1 to relax ONLY the TLS scheme \
+                 and supply an explicit http:// or https:// origin — the override does NOT waive \
+                 the exact-origin requirement)"
             }
         }
     }
@@ -655,11 +722,15 @@ impl RouteDecision {
 ///   (localhost is not TLS).
 /// - **Non-loopback bind:** require a token AND a valid session key AND a valid
 ///   `https://` public origin. `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1` relaxes
-///   ONLY the https-origin (TLS) requirement — it does NOT relax the token or
-///   session-key requirements. A tokenless non-loopback dashboard would be fully
-///   unauthenticated (`dev_open` treats every request as authed), so the token
-///   is a hard requirement regardless of the insecure override; the session key
-///   is required because ephemeral key generation is a loopback-only concession.
+///   ONLY the origin *scheme* (TLS): under it an explicit `http://`-or-`https://`
+///   origin is still REQUIRED (D7a R3 #2 — the override does NOT waive the
+///   exact-origin requirement; an origin-less insecure bind cannot validate
+///   cross-site WS upgrades off loopback and is refused). It does NOT relax the
+///   token or session-key requirements either. A tokenless non-loopback dashboard
+///   would be fully unauthenticated (`dev_open` treats every request as authed),
+///   so the token is a hard requirement regardless of the insecure override; the
+///   session key is required because ephemeral key generation is a loopback-only
+///   concession.
 ///
 /// A *malformed* public origin (bad URL / not https) counts as "missing" here
 /// so the routes refuse rather than register with an unusable origin; the
@@ -698,18 +769,31 @@ pub fn startup_route_decision(bind_addr: SocketAddr, env: &DashboardEnv) -> Rout
         };
     }
 
-    // Token + key are present, but the https origin is missing/malformed. The
-    // override relaxes ONLY this TLS requirement (and only this) — real
-    // cookie/token auth is still enforced (`dev_open` is unreachable here
-    // because a token is configured).
+    // Token + key are present, but there is no validated *https* origin. The
+    // override relaxes ONLY the TLS (scheme) requirement — it still REQUIRES an
+    // explicit, validated origin (D7a R3 #2). Without one, the WS `Origin`
+    // allow-list has nothing to match against off loopback (the `Host` header is
+    // attacker-controllable and never trusted there), so the dashboard socket is
+    // unusable AND the exact-origin requirement is violated. Accept the override
+    // ONLY when an explicit `http`-or-`https` origin parses; otherwise refuse.
     if env.allow_insecure {
-        return RouteDecision::Register {
-            warnings: vec![format!(
-                "{ENV_ALLOW_INSECURE}=1 on a non-loopback bind: serving /dashboard and /debug \
-                 over plaintext WITHOUT a validated https {ENV_PUBLIC_ORIGIN} — credentials and \
-                 transcripts may be exposed in transit (token + session auth are STILL enforced)"
-            )],
-        };
+        let has_insecure_origin = env
+            .public_origin
+            .as_deref()
+            .is_some_and(|raw| PublicOrigin::parse(raw, true).is_ok());
+        if has_insecure_origin {
+            return RouteDecision::Register {
+                warnings: vec![format!(
+                    "{ENV_ALLOW_INSECURE}=1 on a non-loopback bind: serving /dashboard and \
+                     /debug over plaintext with an explicit {ENV_PUBLIC_ORIGIN} but WITHOUT \
+                     https — credentials and transcripts may be exposed in transit (token + \
+                     session auth and the exact-origin check are STILL enforced)"
+                )],
+            };
+        }
+        // Override set but no validated explicit origin → refuse: an off-loopback
+        // bind with no exact origin cannot validate cross-site WS upgrades.
+        return RouteDecision::Refuse(RouteRefusal::MissingHttpsOrigin);
     }
     RouteDecision::Refuse(RouteRefusal::MissingHttpsOrigin)
 }
@@ -1014,8 +1098,10 @@ fn generate_session_key() -> Vec<u8> {
 }
 
 /// Constant-time, **length-independent** byte-slice equality. Used for the
-/// token, session MAC, and CSRF comparisons — all of which may compare slices
-/// of differing length (a presented token/cookie is attacker-sized).
+/// session MAC and CSRF comparisons — both of which may compare slices of
+/// differing length (a presented cookie/header is attacker-sized). (The token
+/// path no longer uses this: its configured digest is precomputed at
+/// construction, so it compares two fixed-width digests directly — D7a R3 #4.)
 ///
 /// `subtle::ConstantTimeEq` on `[u8]` requires equal lengths and would itself
 /// short-circuit (leaking length via timing) on a mismatch. Instead we hash
@@ -1075,6 +1161,23 @@ mod tests {
 
     fn build(bind: SocketAddr, env: &DashboardEnv) -> Arc<DashboardAuth> {
         DashboardAuth::from_env(bind, env).unwrap().auth
+    }
+
+    /// Construct a `DashboardAuth` directly with an explicit `loopback`/
+    /// `public_origin`. `from_env` deliberately REFUSES some of these states
+    /// (e.g. a non-loopback bind with no origin under the insecure override — D7a
+    /// R3 #2), so the raw constructor lets us still exercise the lower-level
+    /// `origin_allowed`/`authenticate_ws` invariants for those configurations.
+    fn raw_auth(loopback: bool, public_origin: Option<&str>) -> Arc<DashboardAuth> {
+        Arc::new(DashboardAuth {
+            has_token: true,
+            token_digest: Some(Sha256::digest(b"t").into()),
+            session_key: [7u8; 32].to_vec(),
+            public_origin: public_origin
+                .map(|raw| PublicOrigin::parse(raw, true).expect("valid test origin")),
+            loopback,
+            allow_mutations: false,
+        })
     }
 
     fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -1219,10 +1322,11 @@ mod tests {
     }
 
     #[test]
-    fn insecure_override_relaxes_only_https_origin() {
-        // ALLOW_INSECURE=1 + token + valid key + NO https origin → register with
-        // a warning. `dev_open` is NOT active because a token is configured:
-        // real cookie/token auth is enforced, so an unauthenticated request 401s.
+    fn insecure_override_relaxes_scheme_but_still_requires_explicit_origin() {
+        // D7a R3 #2: ALLOW_INSECURE=1 + token + valid key but NO origin → REFUSE.
+        // The override relaxes only the origin scheme (TLS); it does NOT waive the
+        // exact-origin requirement, and an origin-less off-loopback bind cannot
+        // validate cross-site WS upgrades (Host is attacker-controllable).
         let env = DashboardEnv {
             token: Some("t".to_string()),
             session_key_b64: Some(key_b64()),
@@ -1231,15 +1335,33 @@ mod tests {
             ..Default::default()
         };
         let decision = startup_route_decision(public_bind(), &env);
+        assert_eq!(
+            decision,
+            RouteDecision::Refuse(RouteRefusal::MissingHttpsOrigin),
+            "insecure override without an explicit origin must refuse"
+        );
+        assert!(!decision.should_register());
+        // The constructor fails closed on the same condition (no origin-less
+        // insecure non-loopback context can be built).
+        assert!(
+            DashboardAuth::from_env(public_bind(), &env).is_err(),
+            "from_env must fail closed without an explicit origin under the override"
+        );
+
+        // WITH an explicit http origin, the override registers (scheme relaxed)
+        // and the built context enforces real auth (token set → not dev-open).
+        let env_with_origin = DashboardEnv {
+            public_origin: Some("http://dash.lan:8080".to_string()),
+            ..env
+        };
+        let decision = startup_route_decision(public_bind(), &env_with_origin);
         match &decision {
             RouteDecision::Register { warnings } => {
                 assert!(!warnings.is_empty(), "insecure override must warn");
             }
             RouteDecision::Refuse(r) => panic!("expected register, got refuse: {r:?}"),
         }
-        // The built auth context enforces real auth (token set → not dev-open),
-        // so an unauthenticated request is rejected.
-        let auth = build(public_bind(), &env);
+        let auth = build(public_bind(), &env_with_origin);
         assert!(!auth.dev_open(), "a configured token must disable dev-open");
         assert!(
             auth.authenticate(&HeaderMap::new()).is_none(),
@@ -1254,15 +1376,17 @@ mod tests {
     }
 
     #[test]
-    fn insecure_override_registers_with_warning_when_token_and_key_present() {
-        // The override's legitimate use: token + valid key present, only the
-        // https origin relaxed (air-gapped LAN). It registers WITH a warning.
-        // (A tokenless/keyless override is covered by the dedicated
-        // `insecure_override_does_not_relax_*` tests — those must REFUSE.)
+    fn insecure_override_registers_with_warning_when_token_key_and_origin_present() {
+        // The override's legitimate use: token + valid key + an EXPLICIT (http)
+        // origin present, only the origin *scheme* (TLS) relaxed (air-gapped LAN).
+        // It registers WITH a warning. (A tokenless/keyless override is covered by
+        // the dedicated `insecure_override_does_not_relax_*` tests; an origin-less
+        // override is covered by `insecure_override_relaxes_scheme_but_still_*` —
+        // those must REFUSE.)
         let env = DashboardEnv {
             token: Some("t".to_string()),
             session_key_b64: Some(key_b64()),
-            public_origin: None,
+            public_origin: Some("http://dash.lan:8080".to_string()),
             allow_insecure: true,
             ..Default::default()
         };
@@ -1346,6 +1470,13 @@ mod tests {
             "https://dash.example.com:8443"
         );
         assert!(PublicOrigin::parse("https://dash.example.com/path", false).is_err());
+        // D7a R3 #5: query, fragment, and userinfo/credentials are rejected
+        // (never silently discarded) — an origin is scheme+host(+port) only.
+        assert!(PublicOrigin::parse("https://dash.example.com?x=1", false).is_err());
+        assert!(PublicOrigin::parse("https://dash.example.com/?x=1", false).is_err());
+        assert!(PublicOrigin::parse("https://dash.example.com#frag", false).is_err());
+        assert!(PublicOrigin::parse("https://user@dash.example.com", false).is_err());
+        assert!(PublicOrigin::parse("https://user:pw@dash.example.com", false).is_err());
         // Without the insecure override, `http://` is rejected.
         assert!(PublicOrigin::parse("http://dash.example.com", false).is_err());
         // D7a R2 #2: WITH the insecure override, an `http://` origin is accepted
@@ -1425,9 +1556,10 @@ mod tests {
 
     #[test]
     fn token_compare_rejects_length_mismatch_via_ct() {
-        // Drives the token path (which routes through ct_eq_padded): a shorter
-        // and a longer presentation are both rejected without leaking via an
-        // early length branch.
+        // Drives the token path (D7a R3 #4: presented token hashed per call, then
+        // its digest compared against the precomputed configured digest): a
+        // shorter and a longer presentation both produce a different digest and
+        // are rejected without an early length branch.
         let auth = build(public_bind(), &env_with_token());
         assert!(!auth.verify_token("s3cret-tok")); // shorter
         assert!(!auth.verify_token("s3cret-token-extra")); // longer
@@ -1596,20 +1728,15 @@ mod tests {
     }
 
     #[test]
-    fn ws_insecure_nonloopback_without_origin_rejects_host_fallback() {
-        // D7a R2 #2 (CSWSH): under the insecure override on a NON-loopback bind
-        // with NO configured PUBLIC_ORIGIN, a browser WS upgrade carrying an
-        // `Origin` must be REJECTED — the `Host`-derived same-origin fallback is
-        // loopback-only, so an attacker page on `https://evil` with a forged
-        // `Host` must NOT ride a stolen cookie.
-        let env = DashboardEnv {
-            token: Some("t".to_string()),
-            session_key_b64: Some(key_b64()),
-            public_origin: None,
-            allow_insecure: true,
-            ..Default::default()
-        };
-        let auth = build(public_bind(), &env);
+    fn ws_nonloopback_without_origin_rejects_host_fallback() {
+        // D7a R2 #2 (CSWSH): on a NON-loopback bind with NO configured
+        // PUBLIC_ORIGIN, a browser WS upgrade carrying an `Origin` must be
+        // REJECTED — the `Host`-derived same-origin fallback is loopback-only, so
+        // an attacker page on `https://evil` with a forged `Host` must NOT ride a
+        // stolen cookie. (D7a R3 #2: `from_env` now refuses to build this state
+        // via the insecure override, so we construct the raw context directly to
+        // exercise the `origin_allowed` invariant it still must uphold.)
+        let auth = raw_auth(false, None);
         let (cookie, _) = auth.issue_session();
         // Attacker supplies a matching Origin+Host (the loopback fallback would
         // have accepted this); off loopback it must be rejected.
@@ -1660,9 +1787,11 @@ mod tests {
     }
 
     #[test]
-    fn from_env_insecure_nonloopback_without_origin_warns() {
-        // The insecure-override non-loopback bind with no origin builds (token +
-        // key present) but WARNS that Origin-bearing WS upgrades will be rejected.
+    fn from_env_insecure_nonloopback_without_origin_fails_closed() {
+        // D7a R3 #2: the insecure-override non-loopback bind with NO origin now
+        // FAILS CLOSED (token + key present, but the override does not waive the
+        // exact-origin requirement — an origin-less off-loopback bind cannot
+        // validate cross-site WS upgrades).
         let env = DashboardEnv {
             token: Some("t".to_string()),
             session_key_b64: Some(key_b64()),
@@ -1670,15 +1799,17 @@ mod tests {
             allow_insecure: true,
             ..Default::default()
         };
-        let build = DashboardAuth::from_env(public_bind(), &env).unwrap();
+        let err = DashboardAuth::from_env(public_bind(), &env).unwrap_err();
         assert!(
-            build
-                .warnings
-                .iter()
-                .any(|w| w.contains("WebSocket") && w.contains("REJECTED")),
-            "expected a CSWSH warning about rejected WS upgrades: {:?}",
-            build.warnings
+            err.contains(ENV_PUBLIC_ORIGIN),
+            "expected an explicit-origin requirement error: {err}"
         );
+        // WITH an explicit http origin under the override it builds.
+        let env_ok = DashboardEnv {
+            public_origin: Some("http://dash.lan:8080".to_string()),
+            ..env
+        };
+        assert!(DashboardAuth::from_env(public_bind(), &env_ok).is_ok());
     }
 
     // -- fail-closed construction (D7a R2 #4) -----------------------------
@@ -1713,6 +1844,36 @@ mod tests {
             ..Default::default()
         };
         assert!(DashboardAuth::from_env(loopback(), &env_loopback).is_ok());
+    }
+
+    #[test]
+    fn from_env_rejects_blank_token_nonloopback() {
+        // D7a R3 #6: a directly-constructed env with an empty or whitespace-only
+        // token must be treated as tokenless (not a blank-token dashboard) and
+        // rejected on a non-loopback bind.
+        for blank in ["", "   ", "\t\n"] {
+            let env = DashboardEnv {
+                token: Some(blank.to_string()),
+                session_key_b64: Some(key_b64()),
+                public_origin: Some("https://dash.example.com".to_string()),
+                ..Default::default()
+            };
+            let err = DashboardAuth::from_env(public_bind(), &env).unwrap_err();
+            assert!(
+                err.contains(ENV_TOKEN),
+                "blank token {blank:?} must fail closed on non-loopback: {err}"
+            );
+        }
+        // On loopback a blank token is the tokenless dev concession → dev-open.
+        let env_loopback = DashboardEnv {
+            token: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let auth = build(loopback(), &env_loopback);
+        assert!(
+            auth.dev_open(),
+            "a blank token on loopback is tokenless dev-open, not a blank-secret"
+        );
     }
 
     // -- CSRF + mutation policy -------------------------------------------

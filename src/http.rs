@@ -171,11 +171,39 @@ fn is_flow_capture_request(method: &axum::http::Method, path: &str) -> bool {
 /// session secret (the login `{"token": ...}`; logout is bodyless but symmetric).
 /// D7a R2 #1: the bare JSON key `token` is NOT in the global sensitive-key set
 /// (too many legitimate `token` fields elsewhere), so the access token would leak
-/// through the small-body `body_payload` dump. We scope the fix here: the body of
-/// these endpoints is never useful to log, so we skip BOTH the `body_summary`
-/// field and the `body_payload` dump for them rather than broaden the redactor.
+/// through the small-body `body_payload` dump. D7a R3 #1: a `body_sha256` + a
+/// `body_bytes` length on a login body form an OFFLINE verification oracle — an
+/// attacker with the logs can brute-force the token against the known digest and
+/// length. So for these endpoints we suppress ALL body-derived fields (digest,
+/// length, summary, AND payload), logging only non-body metadata.
 fn is_dashboard_auth_path(path: &str) -> bool {
     matches!(path, "/dashboard/login" | "/dashboard/logout")
+}
+
+/// Body-derived tracing fields for the inbound-request log line. `None` for a
+/// dashboard auth endpoint (D7a R3 #1): emitting the body length or its SHA-256
+/// for a login body leaks an offline token-verification oracle, so an auth-path
+/// request logs NO body-derived field at all (not the digest, length, summary,
+/// nor — separately — the payload dump). `Some` for every other path carries the
+/// length, hex digest, and the (already-redacted) summary.
+struct BodyLogFields {
+    bytes: usize,
+    sha256: String,
+    summary: String,
+}
+
+/// Compute the body-derived log fields for `path`/`body`, returning `None` for a
+/// dashboard auth endpoint so the caller emits no body-derived field (D7a R3 #1
+/// — the digest + length are a token-verification oracle).
+fn body_log_fields(path: &str, body: &Bytes) -> Option<BodyLogFields> {
+    if is_dashboard_auth_path(path) {
+        return None;
+    }
+    Some(BodyLogFields {
+        bytes: body.len(),
+        sha256: hex::encode(Sha256::digest(body)),
+        summary: summarize_api_body(path, body),
+    })
 }
 
 async fn log_api_call(
@@ -208,36 +236,50 @@ async fn log_api_call(
         }
     };
 
-    let body_sha256 = hex::encode(Sha256::digest(&body_bytes));
-    // D7a R2 #1: the dashboard auth endpoints carry the session token in their
-    // body. The shared redactor does not strip a bare `token` key, so neither the
-    // summary nor the payload dump may touch these bodies — log a fixed marker.
+    // D7a R3 #1: for a dashboard auth endpoint (login/logout) NO body-derived
+    // field may be logged — a `body_sha256` + `body_bytes` length on the login
+    // body is an offline token-verification oracle. `body_log_fields` returns
+    // `None` there so we emit only non-body metadata; every other path logs the
+    // length, hex digest, and the redacted summary.
     let is_auth_path = is_dashboard_auth_path(uri.path());
-    let body_summary = if is_auth_path {
-        "[redacted: dashboard auth body]".to_string()
-    } else {
-        summarize_api_body(uri.path(), &body_bytes)
-    };
-    tracing::info!(
-        api_call_id = %api_call_id,
-        method = %method,
-        path = %uri.path(),
-        query = uri.query().unwrap_or(""),
-        content_type = %header_for_log(&headers, header::CONTENT_TYPE.as_str()),
-        user_agent = %header_for_log(&headers, header::USER_AGENT.as_str()),
-        anthropic_version = %header_for_log(&headers, "anthropic-version"),
-        anthropic_beta = %header_for_log(&headers, "anthropic-beta"),
-        openai_beta = %header_for_log(&headers, "openai-beta"),
-        request_id = %header_for_log(&headers, "x-request-id"),
-        authorization_present = headers.contains_key(header::AUTHORIZATION),
-        x_api_key_present = headers.contains_key("x-api-key"),
-        body_bytes = body_bytes.len(),
-        body_sha256 = %body_sha256,
-        body_summary = %body_summary,
-        "inbound API request"
-    );
-    // Never dump the auth-endpoint body (it carries the token); the summary above
-    // already records that a body existed and its size/digest.
+    match body_log_fields(uri.path(), &body_bytes) {
+        Some(fields) => tracing::info!(
+            api_call_id = %api_call_id,
+            method = %method,
+            path = %uri.path(),
+            query = uri.query().unwrap_or(""),
+            content_type = %header_for_log(&headers, header::CONTENT_TYPE.as_str()),
+            user_agent = %header_for_log(&headers, header::USER_AGENT.as_str()),
+            anthropic_version = %header_for_log(&headers, "anthropic-version"),
+            anthropic_beta = %header_for_log(&headers, "anthropic-beta"),
+            openai_beta = %header_for_log(&headers, "openai-beta"),
+            request_id = %header_for_log(&headers, "x-request-id"),
+            authorization_present = headers.contains_key(header::AUTHORIZATION),
+            x_api_key_present = headers.contains_key("x-api-key"),
+            body_bytes = fields.bytes,
+            body_sha256 = %fields.sha256,
+            body_summary = %fields.summary,
+            "inbound API request"
+        ),
+        // Auth endpoint: log only non-body metadata (no length, digest, summary).
+        None => tracing::info!(
+            api_call_id = %api_call_id,
+            method = %method,
+            path = %uri.path(),
+            query = uri.query().unwrap_or(""),
+            content_type = %header_for_log(&headers, header::CONTENT_TYPE.as_str()),
+            user_agent = %header_for_log(&headers, header::USER_AGENT.as_str()),
+            anthropic_version = %header_for_log(&headers, "anthropic-version"),
+            anthropic_beta = %header_for_log(&headers, "anthropic-beta"),
+            openai_beta = %header_for_log(&headers, "openai-beta"),
+            request_id = %header_for_log(&headers, "x-request-id"),
+            authorization_present = headers.contains_key(header::AUTHORIZATION),
+            x_api_key_present = headers.contains_key("x-api-key"),
+            "inbound API request"
+        ),
+    }
+    // Never dump the auth-endpoint body (it carries the token, and even its
+    // length/digest are an oracle — handled above).
     if !is_auth_path && body_bytes.len() <= API_LOG_PAYLOAD_DUMP_LIMIT_BYTES {
         tracing::info!(
             api_call_id = %api_call_id,
@@ -1435,8 +1477,43 @@ fn model_id_from_value(model: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::body_log_fields;
     use super::should_proxy_response_header;
+    use axum::body::Bytes;
     use axum::http::HeaderName;
+    use sha2::Digest as _;
+
+    /// D7a R3 #1 (REGRESSION): a `/dashboard/login` body must yield NO
+    /// body-derived log field. Emitting `body_sha256` + `body_bytes` (length) for
+    /// the login body is an offline token-verification oracle — an attacker with
+    /// the logs can brute-force the token against the digest and the known length.
+    /// So `body_log_fields` returns `None`, and the request line that follows it
+    /// carries NEITHER the token NOR its SHA-256 NOR the body length.
+    #[test]
+    fn auth_path_body_emits_no_body_derived_log_fields() {
+        let token = "s3cret-login-token";
+        let body = Bytes::from(format!(r#"{{"token":"{token}"}}"#));
+        let token_sha = hex::encode(sha2::Sha256::digest(token.as_bytes()));
+        let body_sha = hex::encode(sha2::Sha256::digest(&body));
+
+        // The login endpoint suppresses every body-derived field.
+        assert!(
+            body_log_fields("/dashboard/login", &body).is_none(),
+            "login body must produce no body-derived log fields (token oracle)"
+        );
+        // Logout is symmetric (bodyless, but the same path class).
+        assert!(body_log_fields("/dashboard/logout", &Bytes::new()).is_none());
+
+        // A normal inference path still logs the length + digest + summary, and
+        // that digest is over the body (never resembles the bare-token digest).
+        let normal =
+            body_log_fields("/v1/messages", &body).expect("non-auth path logs body-derived fields");
+        assert_eq!(normal.bytes, body.len());
+        assert_eq!(normal.sha256, body_sha);
+        // Sanity: the body digest is not the standalone token digest, so even the
+        // normal path never logs a digest of the bare token.
+        assert_ne!(normal.sha256, token_sha);
+    }
 
     /// The full RFC 7230 §6.1 hop-by-hop set; must match the canonical list and
     /// the request-direction parity test in `upstream.rs`.
