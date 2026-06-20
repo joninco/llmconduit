@@ -53,6 +53,26 @@ pub async fn dashboard_asset(Path(path): Path<String>) -> Response {
     }
 }
 
+/// Path (relative to `DASHBOARD_DIST`, e.g. `assets/index-DEADBEEF.js`) of the
+/// first file embedded under `assets/`, or `None` if that directory is empty.
+///
+/// Test-support: lets the `tests/` integration suite exercise the
+/// `/dashboard/assets/{*path}` route against an asset that is REALLY embedded in
+/// the current build, instead of hard-coding a name. The node-less stub embeds
+/// `assets/stub.txt`, while a real `LLMCONDUIT_BUILD_DASHBOARD=1` build embeds
+/// content-hashed Vite assets whose names are unknowable at source-edit time, so
+/// the same test stays green under BOTH build modes. Not `#[cfg(test)]` because
+/// integration tests link the library compiled WITHOUT `cfg(test)`; `doc(hidden)`
+/// keeps it out of the public API surface. The captured `{*path}` is the portion
+/// after `assets/`, so callers strip that prefix before requesting.
+#[doc(hidden)]
+pub fn first_embedded_asset_path() -> Option<String> {
+    DASHBOARD_DIST
+        .get_dir("assets")
+        .and_then(|assets| assets.files().next())
+        .map(|file| file.path().to_string_lossy().into_owned())
+}
+
 /// Build a `200 OK` body for an embedded file, tagging `Content-Type` from the
 /// path's extension (falling back to `application/octet-stream`).
 fn serve_file(path: &str, contents: &'static [u8]) -> Response {

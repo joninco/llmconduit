@@ -61,14 +61,22 @@ fn emit_git_provenance() {
 fn embed_dashboard() {
     // The flag is the only switch; rebuild this script when it flips.
     println!("cargo:rerun-if-env-changed=LLMCONDUIT_BUILD_DASHBOARD");
-    // Re-run when any frontend input changes, so an enabled build re-bundles.
-    // (Harmless no-ops when disabled — the stub does not read these.)
+    // Re-run when any build-affecting frontend input changes, so an enabled build
+    // re-bundles. Covers sources, dependency manifests, and every build-time
+    // config (Vite/Tailwind/PostCSS/TypeScript) — not the generated `dist/`,
+    // `node_modules/`, or `*.tsbuildinfo` caches. (Harmless no-ops when disabled —
+    // the stub does not read these.)
     for rel in [
         "src",
         "package.json",
         "package-lock.json",
         "vite.config.ts",
         "index.html",
+        "tailwind.config.ts",
+        "postcss.config.js",
+        "tsconfig.json",
+        "tsconfig.app.json",
+        "tsconfig.node.json",
     ] {
         println!("cargo:rerun-if-changed={FRONTEND_DIR}/{rel}");
     }

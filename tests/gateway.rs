@@ -1630,20 +1630,37 @@ async fn dashboard_asset_route_serves_present_asset_and_404s_missing() {
         },
     );
 
-    // A known asset embedded by the stub (`assets/stub.txt`); a real build embeds
-    // content-hashed assets whose names are unknowable here, so the stub provides
-    // this stable path purely so the asset route has a deterministic positive case.
+    // Discover an asset that is REALLY embedded in THIS build rather than hard-
+    // coding a name: the node-less stub embeds `assets/stub.txt`, while a real
+    // `LLMCONDUIT_BUILD_DASHBOARD=1` build embeds content-hashed Vite assets whose
+    // names are unknowable here. Asserting the discovered path keeps this test
+    // green under BOTH build modes. The route captures the portion after
+    // `assets/`, so strip that prefix from the returned `assets/<name>` path.
+    let asset_path = llmconduit::dashboard_ui::first_embedded_asset_path()
+        .expect("build.rs always embeds at least one asset under assets/");
+    let asset_suffix = asset_path
+        .strip_prefix("assets/")
+        .expect("embedded asset path is rooted at assets/");
     let present = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/dashboard/assets/stub.txt")
+                .uri(format!("/dashboard/assets/{asset_suffix}"))
                 .body(Body::empty())
                 .expect("request"),
         )
         .await
         .expect("response");
     assert_eq!(present.status().as_u16(), 200);
+    // The positive case must carry a sane Content-Type, not a bare 200.
+    assert!(
+        present
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|ct| !ct.is_empty()),
+        "served asset must set a non-empty Content-Type"
+    );
 
     // A path with no embedded asset must 404 (not fall through to the SPA shell).
     let missing = app
