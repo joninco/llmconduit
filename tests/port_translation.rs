@@ -15,7 +15,11 @@ use llmconduit::adapters::anthropic_to_responses;
 use llmconduit::adapters::chat_completions;
 use llmconduit::models::anthropic::AnthropicRequest;
 use llmconduit::models::chat::ChatCompletionRequest;
+use llmconduit::upstream::BackendChatRequest;
+use llmconduit::upstream::BackendFinalizationPolicies;
+use llmconduit::upstream::finalize_request_for_backend;
 use serde_json::json;
+use std::sync::Arc;
 
 fn anthropic(value: serde_json::Value) -> AnthropicRequest {
     serde_json::from_value(value).expect("valid AnthropicRequest")
@@ -122,6 +126,107 @@ fn anthropic_empty_stop_sequences_collapse_to_none() {
     .expect("convert");
     assert_eq!(result.stop, None);
     assert!(!result.extra_body.contains_key("stop"));
+}
+
+// ===========================================================================
+// Leaf-finalize gap-fill wire path (U2): a typed client `stop` must beat a
+// configured `upstream_chat_kwargs.stop`, with exactly ONE `"stop"` on the wire
+// (the client value) and NO `extra_body["stop"]`. Drives the real
+// `finalize_request_for_backend` / `merge_chat_kwargs_gap_fill` leaf path and
+// inspects `serde_json::to_value(&request)` (mirroring `reqwest .json`).
+// ===========================================================================
+
+/// Build leaf policies whose GLOBAL `upstream_chat_kwargs` carries `kwargs`.
+fn policies_with_global_kwargs(
+    kwargs: serde_json::Map<String, serde_json::Value>,
+) -> BackendFinalizationPolicies {
+    BackendFinalizationPolicies {
+        effort: Arc::new(std::collections::BTreeMap::new()),
+        template_family: Arc::new(std::collections::BTreeMap::new()),
+        global_template_family: None,
+        upstream_chat_kwargs: Arc::new(std::collections::BTreeMap::new()),
+        global_upstream_chat_kwargs: Arc::new(kwargs),
+    }
+}
+
+#[test]
+fn leaf_finalize_typed_stop_beats_configured_stop_single_wire_key() {
+    let mut request = chat(json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stop": ["CLIENT"],
+    }));
+    assert_eq!(request.stop, Some(vec!["CLIENT".to_string()]));
+
+    let policies = policies_with_global_kwargs(serde_json::Map::from_iter([(
+        "stop".to_string(),
+        json!(["CONFIGURED"]),
+    )]));
+    let mut backend = BackendChatRequest::new(request.clone(), None);
+    finalize_request_for_backend(&mut backend, &policies);
+    request = backend.request;
+
+    // Typed client value survives; the configured default never gap-fills.
+    assert_eq!(request.stop, Some(vec!["CLIENT".to_string()]));
+    assert!(
+        !request.extra_body.contains_key("stop"),
+        "configured stop must not land in extra_body"
+    );
+
+    // Real wire shape (mirrors reqwest .json(&request)): exactly one "stop".
+    let wire = serde_json::to_value(&request).expect("serialize wire request");
+    assert_eq!(wire["stop"], json!(["CLIENT"]));
+    let stop_keys = wire
+        .as_object()
+        .expect("object")
+        .keys()
+        .filter(|k| *k == "stop")
+        .count();
+    assert_eq!(stop_keys, 1, "exactly one stop key on the wire");
+}
+
+/// Provider-fallback alias collision (U2): the collapsed gap-fill helper now
+/// ALWAYS applies the max-token-alias skip, so a configured/provider
+/// `max_tokens` default cannot land alongside a client `max_completion_tokens`
+/// surviving in `extra_body` (the `/v1/responses` shape). Driven through the
+/// leaf path, which shares the SAME helper as the provider-fallback call site.
+#[test]
+fn leaf_finalize_skips_provider_max_tokens_when_client_alias_present() {
+    let mut request = chat(json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+    }));
+    // Reproduce the `/v1/responses` shape: `ResponsesRequest` types only
+    // `max_output_tokens`, so a client `max_completion_tokens` is NOT captured by
+    // a typed field and survives as a flattened `extra_body` key threaded to the
+    // backend. (On the Chat path the serde alias would absorb it; here we inject
+    // it directly to mirror the Responses-origin alias the fallback path sees.)
+    request
+        .extra_body
+        .insert("max_completion_tokens".to_string(), json!(256));
+    assert_eq!(request.max_output_tokens, None);
+    assert_eq!(
+        request.extra_body.get("max_completion_tokens"),
+        Some(&json!(256))
+    );
+
+    let policies = policies_with_global_kwargs(serde_json::Map::from_iter([(
+        "max_tokens".to_string(),
+        json!(4096),
+    )]));
+    let mut backend = BackendChatRequest::new(request, None);
+    finalize_request_for_backend(&mut backend, &policies);
+    let request = backend.request;
+
+    assert!(
+        !request.extra_body.contains_key("max_tokens"),
+        "provider max_tokens alias must not land alongside the client alias"
+    );
+    assert_eq!(
+        request.extra_body.get("max_completion_tokens"),
+        Some(&json!(256)),
+        "client alias must survive untouched"
+    );
 }
 
 #[test]

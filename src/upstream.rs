@@ -807,7 +807,7 @@ impl FailoverUpstreamClient {
         if let Some(model) = &provider.upstream_model {
             request.model = model.clone();
         }
-        merge_fallback_chat_kwargs(&mut request, &provider.upstream_chat_kwargs);
+        merge_chat_kwargs_gap_fill(&mut request, &provider.upstream_chat_kwargs);
         BackendChatRequest {
             request,
             client_chat_template_kwargs: backend.client_chat_template_kwargs.clone(),
@@ -2008,7 +2008,7 @@ pub fn finalize_request_for_backend(
     //    `build_upstream_extra_body` defaults (T1): the leaf now resolves kwargs
     //    against the FINAL model, so a routed/failover cross-family target gets
     //    its OWN kwargs, not the alias's.
-    merge_upstream_chat_kwargs(request, &policies.resolve_chat_kwargs(&request.model));
+    merge_chat_kwargs_gap_fill(request, &policies.resolve_chat_kwargs(&request.model));
     // 2. Reasoning effort: map (→ fragment, top-level cleared) or clamp.
     let fragment = reasoning_effort_fragment(
         &policies.effort,
@@ -2028,13 +2028,16 @@ pub fn finalize_request_for_backend(
     }
 }
 
-/// Merge per-model `upstream_chat_kwargs` `defaults` into the request
-/// `extra_body` with REQUEST-WINS semantics, mirroring `merge_fallback_chat_kwargs`
-/// (provider kwargs): a key already explicitly set on the request (typed field
-/// or `extra_body`) is preserved; a configured default fills the gap. Deep-merge
-/// nested objects so a configured object composes with a request object rather
-/// than clobbering sibling keys.
-fn merge_upstream_chat_kwargs(
+/// Merge `upstream_chat_kwargs` `defaults` into the request `extra_body` with
+/// REQUEST-WINS semantics. The single gap-fill helper shared by BOTH the
+/// leaf-finalize path (`finalize_request_for_backend`, per-model kwargs) and the
+/// provider-fallback path (`request_for_provider`, provider kwargs): a key
+/// already explicitly set on the request (typed field or `extra_body`) is
+/// preserved; a configured default fills the gap. Deep-merge nested objects so a
+/// configured object composes with a request object rather than clobbering
+/// sibling keys. The max-token-alias skip is ALWAYS applied (no-op when the
+/// client expressed no alias), so the alias-collision guard protects both paths.
+fn merge_chat_kwargs_gap_fill(
     request: &mut ChatCompletionRequest,
     defaults: &JsonMap<String, Value>,
 ) {
@@ -2243,23 +2246,6 @@ fn write_family_kwargs(
                 kwargs
                     .entry("reasoning_effort")
                     .or_insert_with(|| Value::String(effort.to_string()));
-            }
-        }
-    }
-}
-
-fn merge_fallback_chat_kwargs(
-    request: &mut ChatCompletionRequest,
-    defaults: &JsonMap<String, Value>,
-) {
-    for (key, value) in defaults {
-        if chat_request_field_is_set(request, key) {
-            continue;
-        }
-        match request.extra_body.get_mut(key) {
-            Some(existing) => merge_json_value_preserve_destination(existing, value),
-            None => {
-                request.extra_body.insert(key.clone(), value.clone());
             }
         }
     }
@@ -3027,8 +3013,7 @@ mod tests {
     use super::ModelFamily;
     use super::apply_family_chat_template_kwargs;
     use super::detect_model_family;
-    use super::merge_fallback_chat_kwargs;
-    use super::merge_upstream_chat_kwargs;
+    use super::merge_chat_kwargs_gap_fill;
     use super::write_family_kwargs;
     use serde_json::Map as JsonMap;
     use serde_json::json;
@@ -3413,6 +3398,87 @@ mod tests {
         assert_eq!(kwargs["thinking"], json!(true));
         assert_eq!(kwargs["preserve_thinking"], json!(true));
         assert_eq!(kwargs["configured_only"], json!(true));
+    }
+
+    /// U2 provider-fallback path: a typed client `stop` must beat a provider
+    /// `upstream_chat_kwargs.stop`, with NO `extra_body["stop"]`, driven through
+    /// the real `request_for_provider` call site (the shared gap-fill helper).
+    #[test]
+    fn request_for_provider_typed_stop_beats_provider_stop() {
+        let mut provider_kwargs = JsonMap::new();
+        provider_kwargs.insert("stop".to_string(), json!(["CONFIGURED"]));
+        let provider = FailoverUpstreamProvider::new(
+            "fallback",
+            ReqwestUpstreamClient::new(
+                reqwest::Client::new(),
+                url::Url::parse("https://example.invalid/v1").expect("url"),
+                None,
+                None,
+                true,
+                4096,
+            ),
+            None,
+            None,
+            provider_kwargs,
+        );
+        let mut base = family_backend("m", None);
+        base.request.stop = Some(vec!["CLIENT".to_string()]);
+
+        let provider_request = FailoverUpstreamClient::request_for_provider(&provider, &base);
+
+        assert_eq!(
+            provider_request.request.stop,
+            Some(vec!["CLIENT".to_string()])
+        );
+        assert!(
+            !provider_request.request.extra_body.contains_key("stop"),
+            "provider stop must not land in extra_body on the fallback path"
+        );
+    }
+
+    /// U2 provider-fallback alias collision: the collapsed helper applies the
+    /// max-token-alias skip on the fallback path too, so a provider
+    /// `max_tokens` cannot land alongside a surviving client `max_completion_tokens`
+    /// (the `/v1/responses` shape). Driven through `request_for_provider`.
+    #[test]
+    fn request_for_provider_skips_provider_max_tokens_when_client_alias_present() {
+        let mut provider_kwargs = JsonMap::new();
+        provider_kwargs.insert("max_tokens".to_string(), json!(4096));
+        let provider = FailoverUpstreamProvider::new(
+            "fallback",
+            ReqwestUpstreamClient::new(
+                reqwest::Client::new(),
+                url::Url::parse("https://example.invalid/v1").expect("url"),
+                None,
+                None,
+                true,
+                4096,
+            ),
+            None,
+            None,
+            provider_kwargs,
+        );
+        let mut base = family_backend("m", None);
+        base.request
+            .extra_body
+            .insert("max_completion_tokens".to_string(), json!(256));
+
+        let provider_request = FailoverUpstreamClient::request_for_provider(&provider, &base);
+
+        assert!(
+            !provider_request
+                .request
+                .extra_body
+                .contains_key("max_tokens"),
+            "provider max_tokens alias must not land alongside the client alias"
+        );
+        assert_eq!(
+            provider_request
+                .request
+                .extra_body
+                .get("max_completion_tokens"),
+            Some(&json!(256))
+        );
     }
 
     /// Finding 1: an explicit client `chat_template_kwargs` value still WINS
@@ -4156,28 +4222,38 @@ mod tests {
     /// (duplicate/conflicting), breaking request-wins. Covers the Anthropic path
     /// (stop_sequences → typed stop) sharing this merge with configured kwargs.
     #[test]
-    fn merge_upstream_chat_kwargs_does_not_shadow_typed_stop() {
+    fn merge_chat_kwargs_gap_fill_does_not_shadow_typed_stop() {
         let mut request = family_request("m");
         request.stop = Some(vec!["STOP".to_string()]);
         let defaults = JsonMap::from_iter([("stop".to_string(), json!(["CONFIGURED"]))]);
 
-        merge_upstream_chat_kwargs(&mut request, &defaults);
+        merge_chat_kwargs_gap_fill(&mut request, &defaults);
 
         assert_eq!(request.stop, Some(vec!["STOP".to_string()]));
         assert!(!request.extra_body.contains_key("stop"));
     }
 
-    /// Same guard for the provider-fallback kwargs merge path.
+    /// The collapsed gap-fill helper ALWAYS applies the max-token-alias skip, so
+    /// a configured/provider `max_tokens` default cannot land alongside a client
+    /// max-token alias surviving in `extra_body` (e.g. a `/v1/responses`
+    /// `max_completion_tokens`). This previously only held on the leaf path; the
+    /// fallback path now shares the same guard.
     #[test]
-    fn merge_fallback_chat_kwargs_does_not_shadow_typed_stop() {
+    fn merge_chat_kwargs_gap_fill_skips_max_token_alias_when_client_alias_present() {
         let mut request = family_request("m");
-        request.stop = Some(vec!["STOP".to_string()]);
-        let defaults = JsonMap::from_iter([("stop".to_string(), json!(["CONFIGURED"]))]);
+        request
+            .extra_body
+            .insert("max_completion_tokens".to_string(), json!(256));
+        let defaults = JsonMap::from_iter([("max_tokens".to_string(), json!(4096))]);
 
-        merge_fallback_chat_kwargs(&mut request, &defaults);
+        merge_chat_kwargs_gap_fill(&mut request, &defaults);
 
-        assert_eq!(request.stop, Some(vec!["STOP".to_string()]));
-        assert!(!request.extra_body.contains_key("stop"));
+        // The provider/config alias must NOT land alongside the client alias.
+        assert!(!request.extra_body.contains_key("max_tokens"));
+        assert_eq!(
+            request.extra_body.get("max_completion_tokens"),
+            Some(&json!(256))
+        );
     }
 }
 
