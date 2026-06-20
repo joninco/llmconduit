@@ -330,10 +330,10 @@ coverage change). R1 (2 MEDIUM keepalive-hang + race-order, 1 LOW shadowed key) 
 > the missing `stop` arm); **12.9 bundles** both sides of the `tool_calls` wire-string contract. Obey
 > AGENTS.md "Hard rules in the engine"; do NOT re-raise the adjudicated invalid findings below.
 
-## STATUS (🔄 IN PROGRESS — 2/10)
+## STATUS (🔄 IN PROGRESS — 3/10)
 
-**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`).
-**TODO (sequenced):** 12.3, 12.4, 12.5, 12.6, 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
+**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`).
+**TODO (sequenced):** 12.4, 12.5, 12.6, 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
 Per-task loop = read spec → implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 
@@ -354,7 +354,7 @@ rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 **Sequencing:** Sequence AFTER 12.1 (U1, the `anthropic_to_responses` `stop_sequences` typed-field HIGH) — both touch `stop` semantics; land 12.1 first so the typed `stop` field is populated consistently.
 
 ### Task 12.3 — Restore MonitorHub zero-overhead: lazy emit_with choke-point
-**Priority:** MEDIUM · **Spec:** `.ralph/specs/U3-monitor-zero-overhead-emit-with.md` · **Status:** ⬜ PENDING
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/U3-monitor-zero-overhead-emit-with.md` · **Status:** ✅ DONE `70ad24f` (Codex-xhigh APPROVED, round 3). Added `MonitorHub::emit_with(id, FnOnce() -> MonitorEventKind)` that early-returns before the build closure when disabled; `emit` delegates to it. Converted all eager engine.rs sites (RequestStarted count/`input_chars` fold, per-item ResponseItem/ToolPhase summarize+preview, the 3 `is_enabled()`-guarded payload previews, Failed events) into closures; call sites pass borrowed `&str` ids so the `String` alloc defers past `!enabled`; the `trailing_tool_output_items` loop is gated on `is_enabled()` (reverse-walk + Vec alloc). New disabled/enabled `emit_with` unit tests prove the closure is never invoked on `disabled()` and is invoked + reaches `snapshot()`/`subscribe()` when enabled. Round-1 (eager id clone + eager Failed) and round-2 (disabled-path trailing-tool Vec alloc) MEDIUMs fixed.
 **Thermo finding:** Eager `MonitorEventKind` construction runs on the DISABLED hot path — `RequestStarted`'s ten `input.iter().filter().count()` passes + `input_chars` fold (`src/engine.rs:1061-1299`) and per-item `summarize_response_item`/`preview_json` (full serde + 4KB image redaction, `src/engine.rs:2579-2634`) execute at unguarded sites `:1310,1528,1560,2093,2148,2239,2249,2322,2329,2384` BEFORE `MonitorHub::emit` early-returns when disabled (`src/monitor.rs:257-260`), violating "MonitorHub::disabled() = zero-overhead no-op".
 **Fix:** Add `MonitorHub::emit_with(id, impl FnOnce() -> MonitorEventKind)` to `src/monitor.rs` that checks `!self.enabled` and returns BEFORE invoking the closure, otherwise routes the owned kind through the identical sequence/prune/image-redaction/broadcast path as `emit` (`:257-285`). Convert the eager `engine.rs` sites to `emit_with(..., || …)` so traversal/summarize/preview run only when enabled, and fold the three already-guarded payload-preview sites (`:1300,:1412,:1855`) into `emit_with` to leave one disabled-check mechanism. Trivial delta sites may stay on `emit`. `MonitorEventKind` already derives `Clone + Serialize` (`src/monitor.rs:14`).
 **Files:** src/monitor.rs, src/engine.rs
