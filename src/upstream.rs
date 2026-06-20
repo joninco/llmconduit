@@ -1,6 +1,7 @@
 use crate::config::merge_json_maps;
 use crate::error::AppError;
 use crate::error::AppResult;
+use crate::error::FailoverDisposition;
 use crate::models::chat::ChatCompletionChunk;
 use crate::models::chat::ChatCompletionRequest;
 use crate::sse_guard::bounded_sse_byte_stream;
@@ -569,6 +570,29 @@ impl ReqwestUpstreamClient {
             .await
             .map_err(|err| AppError::upstream(format!("upstream chat request failed: {err}")))
     }
+
+    /// Append `request` to the JSONL request log (when configured), then POST it.
+    /// Every actual upstream chat POST goes through here so the log records both
+    /// the original request and the G1 shrink-and-retry — otherwise the retry's
+    /// reduced budget would be invisible to the JSONL log and `analyze-log`. A
+    /// log-write failure is logged and the POST proceeds (logging is observability,
+    /// not a hard dependency of serving the request).
+    async fn logged_send_chat_request(
+        &self,
+        url: &Url,
+        request: &ChatCompletionRequest,
+    ) -> AppResult<reqwest::Response> {
+        if let Some(ref logger) = self.request_logger
+            && let Err(err) = logger.log(request).await
+        {
+            tracing::warn!(
+                path = %logger.path.display(),
+                error = %err,
+                "failed to append upstream request log"
+            );
+        }
+        self.send_chat_request(url, request).await
+    }
 }
 
 #[async_trait]
@@ -589,15 +613,6 @@ impl UpstreamClient for ReqwestUpstreamClient {
         let mut backend = backend.clone();
         finalize_request_for_backend(&mut backend, &self.finalization_policies);
         let request = sanitize_chat_request(backend.request, self.flatten_content);
-        if let Some(ref logger) = self.request_logger
-            && let Err(err) = logger.log(&request).await
-        {
-            tracing::warn!(
-                path = %logger.path.display(),
-                error = %err,
-                "failed to append upstream request log"
-            );
-        }
 
         // First attempt. On a non-2xx whose body indicates a context/completion
         // token-limit overflow, shrink `max_completion_tokens` and retry ONCE.
@@ -605,7 +620,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // can never duplicate already-streamed tokens, and it stays inside the
         // leaf client so the failover/routing layers never see a context-limit
         // error as a provider failure (it is a same-provider shrink-and-retry).
-        let response = self.send_chat_request(&url, &request).await?;
+        let response = self.logged_send_chat_request(&url, &request).await?;
         let status = response.status();
         if status.is_success() {
             return stream_success_response(response, self.max_sse_frame_bytes).await;
@@ -635,7 +650,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
                 new_max_completion_tokens = retry.max_completion_tokens,
                 "upstream context-window overflow; retrying once with reduced completion budget"
             );
-            let retry_response = self.send_chat_request(&url, &retried).await?;
+            let retry_response = self.logged_send_chat_request(&url, &retried).await?;
             let retry_status = retry_response.status();
             if retry_status.is_success() {
                 return stream_success_response(retry_response, self.max_sse_frame_bytes).await;
@@ -654,11 +669,14 @@ impl UpstreamClient for ReqwestUpstreamClient {
             )
             .is_some()
             {
-                return Err(AppError::upstream_terminal(format!(
-                    "upstream context-window overflow persisted after shrink-and-retry; \
-                     failed with {retry_status}: {}",
-                    redact_and_truncate_error_body(&retry_body, 500)
-                )));
+                return Err(AppError::upstream_with_disposition(
+                    format!(
+                        "upstream context-window overflow persisted after shrink-and-retry; \
+                         failed with {retry_status}: {}",
+                        redact_and_truncate_error_body(&retry_body, 500)
+                    ),
+                    FailoverDisposition::Terminal,
+                ));
             }
             return Err(AppError::upstream(format!(
                 "upstream chat failed with {retry_status}: {}",
@@ -939,7 +957,7 @@ impl FailoverUpstreamClient {
                 .await
             {
                 Ok(stream) => stream,
-                Err(err) if !err.is_failover_eligible() => {
+                Err(err) if err.failover_disposition() == FailoverDisposition::Terminal => {
                     // Terminal same-provider error (e.g. a context overflow that
                     // survived the leaf shrink-and-retry). Trying the next
                     // provider would just overflow again, so surface it as-is and

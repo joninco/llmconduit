@@ -7,21 +7,37 @@ use std::fmt;
 
 pub type AppResult<T> = Result<T, AppError>;
 
+/// How the multi-provider `FailoverUpstreamClient`/routing layer should treat a
+/// failed upstream attempt. This is a property of the upstream-attempt OUTCOME,
+/// not a generic error policy: only the leaf upstream client decides it, and
+/// only the failover loop reads it.
+///
+/// `Failover` (the default for every error) means the attempt looks like a
+/// provider failure, so failover may retry on the next provider. `Terminal`
+/// means the failure is a same-provider concern that another provider cannot
+/// fix — surface it as-is. The sole `Terminal` case is a context-window overflow
+/// that persists *after* the leaf client's single shrink-and-retry: retrying the
+/// same oversized prompt on another provider would just overflow again (see
+/// `AGENTS.md`: context-overflow is a same-provider shrink-and-retry, not a
+/// failover trigger).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FailoverDisposition {
+    /// Provider-failure-shaped: failover may retry on the next provider.
+    #[default]
+    Failover,
+    /// Same-provider terminal: surface as-is, do not fail over.
+    Terminal,
+}
+
 #[derive(Debug)]
 pub struct AppError {
     pub status: StatusCode,
     pub message: String,
     pub client_message: String,
-    /// Whether the multi-provider `FailoverUpstreamClient` may treat this error
-    /// as a provider failure and retry the request on the next provider.
-    ///
-    /// Defaults to `true`. A context-window overflow that persists *after* the
-    /// leaf client's single shrink-and-retry is a same-provider concern, not a
-    /// provider failure, so it is surfaced with this set to `false` so failover/
-    /// routing returns it terminally instead of hammering another provider with
-    /// the same oversized prompt (see `AGENTS.md`: context-overflow is a
-    /// same-provider shrink-and-retry, not a failover trigger).
-    pub failover_eligible: bool,
+    /// The failover disposition of the upstream attempt that produced this
+    /// error. Generic errors carry the default (`Failover`); only the leaf
+    /// upstream client promotes an error to `Terminal`.
+    failover: FailoverDisposition,
 }
 
 impl AppError {
@@ -31,7 +47,7 @@ impl AppError {
             status: StatusCode::BAD_REQUEST,
             client_message: msg.clone(),
             message: msg,
-            failover_eligible: true,
+            failover: FailoverDisposition::default(),
         }
     }
 
@@ -41,7 +57,7 @@ impl AppError {
             status: StatusCode::CONFLICT,
             client_message: msg.clone(),
             message: msg,
-            failover_eligible: true,
+            failover: FailoverDisposition::default(),
         }
     }
 
@@ -51,16 +67,20 @@ impl AppError {
             status: StatusCode::BAD_GATEWAY,
             client_message: msg.clone(),
             message: msg,
-            failover_eligible: true,
+            failover: FailoverDisposition::default(),
         }
     }
 
-    /// An upstream error that must NOT trigger cross-provider failover. Used for
-    /// a context-window overflow that persists after the leaf shrink-and-retry:
-    /// trying another provider with the same prompt would just overflow again.
-    pub fn upstream_terminal(message: impl Into<String>) -> Self {
+    /// An upstream error tagged with an explicit failover disposition. The leaf
+    /// upstream client uses this to mark a context-window overflow that survived
+    /// its shrink-and-retry as `Terminal` so failover/routing surfaces it
+    /// instead of retrying the same oversized prompt on another provider.
+    pub fn upstream_with_disposition(
+        message: impl Into<String>,
+        disposition: FailoverDisposition,
+    ) -> Self {
         Self {
-            failover_eligible: false,
+            failover: disposition,
             ..Self::upstream(message)
         }
     }
@@ -70,7 +90,7 @@ impl AppError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
             client_message: "internal server error".to_string(),
-            failover_eligible: true,
+            failover: FailoverDisposition::default(),
         }
     }
 
@@ -79,7 +99,7 @@ impl AppError {
             status: StatusCode::from_u16(499).expect("valid status code"),
             message: "client disconnected".to_string(),
             client_message: "client disconnected".to_string(),
-            failover_eligible: true,
+            failover: FailoverDisposition::default(),
         }
     }
 
@@ -91,11 +111,11 @@ impl AppError {
         self.status
     }
 
-    /// True when the multi-provider failover client may retry this error on the
-    /// next provider. False for terminal same-provider errors (e.g. a context
-    /// overflow that survived the leaf shrink-and-retry).
-    pub fn is_failover_eligible(&self) -> bool {
-        self.failover_eligible
+    /// The failover disposition of the upstream attempt that produced this error.
+    /// The failover loop matches on this to decide whether to retry the next
+    /// provider (`Failover`) or surface the error terminally (`Terminal`).
+    pub fn failover_disposition(&self) -> FailoverDisposition {
+        self.failover
     }
 }
 
@@ -159,5 +179,41 @@ mod tests {
     async fn test_upstream_error_shows_detail() {
         let body = response_body_string(AppError::upstream("provider returned 500: oops")).await;
         assert!(body.contains("provider returned 500: oops"));
+    }
+
+    // Disposition equivalence vs the old `failover_eligible: bool`. The previous
+    // representation had EVERY constructor failover-eligible (`true`) except the
+    // terminal one (`false`). The typed disposition must reproduce that exact
+    // truth table: every generic constructor defaults to `Failover`, and only
+    // the explicit-disposition constructor with `Terminal` is non-failover.
+    #[test]
+    fn generic_constructors_default_to_failover_disposition() {
+        let cases = [
+            AppError::bad_request("x"),
+            AppError::conflict("x"),
+            AppError::upstream("x"),
+            AppError::internal("x"),
+            AppError::cancelled(),
+            // An upstream error explicitly tagged `Failover` stays eligible.
+            AppError::upstream_with_disposition("x", FailoverDisposition::Failover),
+        ];
+        for error in cases {
+            assert_eq!(
+                error.failover_disposition(),
+                FailoverDisposition::Failover,
+                "generic/explicit-failover errors must remain failover-eligible \
+                 (status {})",
+                error.status
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_terminal_disposition_is_not_failover() {
+        let error = AppError::upstream_with_disposition("overflow", FailoverDisposition::Terminal);
+        assert_eq!(error.failover_disposition(), FailoverDisposition::Terminal);
+        // It is still a 502 upstream error in every other respect; only the
+        // disposition differs from a plain `upstream(...)`.
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
     }
 }

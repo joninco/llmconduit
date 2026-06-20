@@ -324,6 +324,7 @@ mod integration {
     use axum::http::Request;
     use llmconduit::config::Config;
     use llmconduit::config::FallbackUpstreamConfig;
+    use uuid::Uuid;
 
     fn config_for(server_uri: &str) -> Config {
         Config {
@@ -711,5 +712,112 @@ mod integration {
             fallback_posts, 0,
             "a same-provider context overflow must NOT fail over to the next provider"
         );
+    }
+
+    /// Both the original POST and the G1 shrink-and-retry POST must land in the
+    /// JSONL request log so the reduced budget is observable to `analyze-log`.
+    /// Before T10 only the first POST was logged; here we assert the file holds
+    /// two lines (original budget, then the reduced one) and that `analyze-log`
+    /// reports the `max_tokens` change between them.
+    #[tokio::test]
+    async fn shrink_and_retry_post_is_logged() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "test-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        // First chat POST -> context-limit 400. ctx=65536, input=1000,
+        // margin=100 => reduced budget = 65536 - 100 - 1000 = 64436.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "This model's maximum context length is 65536 tokens. However, you requested \
+                 250000 output tokens and your prompt contains 1000 input tokens.",
+            ))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(chat_sse_body()),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let log_path = std::env::temp_dir().join(format!(
+            "llmconduit-retry-log-{}.jsonl",
+            Uuid::new_v4().simple()
+        ));
+        let mut config = config_for(&server.uri());
+        config.upstream_request_log_path = Some(log_path.clone());
+
+        let app = llmconduit::build_app(config);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "stream": false,
+                            "max_tokens": 250000,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status().as_u16(), 200, "turn should succeed");
+        let _ = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+
+        let logged = std::fs::read_to_string(&log_path).expect("read request log");
+        let lines: Vec<&str> = logged.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "both the original and the retry POST must be logged, got: {logged}"
+        );
+
+        let first: Value = serde_json::from_str(lines[0]).expect("first logged request");
+        assert_eq!(
+            first["max_tokens"].as_i64(),
+            Some(250000),
+            "first logged request keeps the caller's budget"
+        );
+        let retried: Value = serde_json::from_str(lines[1]).expect("retried logged request");
+        assert_eq!(
+            retried["max_tokens"].as_i64(),
+            Some(64436),
+            "second logged request carries the reduced retry budget"
+        );
+
+        // `analyze-log` diffs consecutive request lines, so the reduced budget
+        // surfaces as a changed `max_tokens` path -- both POSTs are visible to it.
+        let report =
+            llmconduit::request_log::analyze_request_log(&log_path, 10).expect("analyze log");
+        assert!(
+            report.contains("$.max_tokens"),
+            "analyze-log should report the reduced-budget retry diff, got: {report}"
+        );
+
+        let _ = std::fs::remove_file(&log_path);
     }
 }
