@@ -643,16 +643,20 @@ impl Gateway {
         };
         let served_model = record.model_served.as_deref();
         let upstream = record.upstream_target.as_deref();
-        self.metrics
-            .record_response(status, served_model, &record.uri, upstream, elapsed_ms);
-        // Record the flow's FINAL cumulative token usage ONCE (not per chunk), into
-        // the SAME bucket as the response (same terminal status), so the window's
-        // token sum is the true throughput. The D3 incremental upserts kept the
-        // record's `usage` current; we read the terminal total here.
-        if let Some(usage) = record.usage {
-            self.metrics
-                .record_usage(status, served_model, &record.uri, upstream, usage);
-        }
+        // D5 R1 #2: record the terminal response AND the flow's FINAL cumulative token
+        // usage in ONE atomic metrics call (single lock, single epoch/slot), into the
+        // SAME `{status, model, endpoint, upstream}` bucket. The D3 incremental upserts
+        // kept the record's `usage` current; we read the terminal total here and pass
+        // it alongside the count so a concurrent 5 s snapshot can never split the count
+        // and the tokens across two different 1 s slots.
+        self.metrics.record_terminal(
+            status,
+            served_model,
+            &record.uri,
+            upstream,
+            elapsed_ms,
+            record.usage,
+        );
     }
 
     /// Attach the D7 dashboard auth context (built from the environment in the

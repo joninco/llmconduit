@@ -153,19 +153,23 @@ impl Default for Histogram {
     }
 }
 
-/// The inclusive upper bound (ms) of histogram bucket `index`. Buckets are
-/// log-spaced from [`HISTOGRAM_MIN_MS`] to [`HISTOGRAM_MAX_MS`] across the first
-/// `HISTOGRAM_BUCKETS - 1` buckets; the final bucket is the overflow bucket with an
-/// effectively-infinite bound. Pure function of `index` (no per-instance state), so
+/// The inclusive upper bound (ms) of histogram bucket `index`. The finite buckets
+/// (indices `0..=HISTOGRAM_BUCKETS-2`, i.e. all but the overflow bucket) are LOG-SPACED
+/// so the FIRST finite upper bound is EXACTLY [`HISTOGRAM_MIN_MS`] (1 ms) and the LAST
+/// is EXACTLY [`HISTOGRAM_MAX_MS`] (120 s); the final bucket is the overflow bucket with
+/// an effectively-infinite bound. Pure function of `index` (no per-instance state), so
 /// the boundary ladder is computed identically at record + quantile time.
+///
+/// The fraction is `index / (HISTOGRAM_BUCKETS - 2)` (Codex D5 R1 #3) — NOT
+/// `(index+1)/(HISTOGRAM_BUCKETS-1)`, which made bucket 0's upper bound ≈ 1.5 ms and
+/// pushed the whole ladder up. With this mapping `index == 0` ⇒ frac 0 ⇒ exactly 1 ms
+/// and `index == HISTOGRAM_BUCKETS-2` ⇒ frac 1 ⇒ exactly 120 s.
 fn bucket_upper_ms(index: usize) -> f64 {
     if index >= HISTOGRAM_BUCKETS - 1 {
         return f64::INFINITY;
     }
-    // Log-space the [MIN, MAX] range across buckets 0..=HISTOGRAM_BUCKETS-2 so
-    // bucket (HISTOGRAM_BUCKETS-2) has upper bound exactly HISTOGRAM_MAX_MS.
     let span = (HISTOGRAM_MAX_MS / HISTOGRAM_MIN_MS).ln();
-    let frac = (index + 1) as f64 / (HISTOGRAM_BUCKETS - 1) as f64;
+    let frac = index as f64 / (HISTOGRAM_BUCKETS - 2) as f64;
     HISTOGRAM_MIN_MS * (span * frac).exp()
 }
 
@@ -602,6 +606,37 @@ impl MetricsState {
         self.metrics_seq = self.metrics_seq.saturating_add(1);
     }
 
+    /// Record one terminal response AND its optional final cumulative usage into all
+    /// three rings at the SAME `epoch_s`, bumping `metrics_seq` ONCE (Codex D5 R1 #2).
+    /// This is the atomic terminal path: the response count and the token totals are
+    /// applied under a SINGLE metrics-lock hold at ONE epoch/slot, so a concurrent 5 s
+    /// snapshot can never interleave between them and land the count and the tokens in
+    /// DIFFERENT 1 s slots (which separate `record_response` + `add_tokens` calls —
+    /// each computing its own `now_epoch_s()` under its own lock — could do across a
+    /// second boundary). Both join the same `{status, model, endpoint, upstream}`
+    /// bucket key, so a completed flow's count + tokens are always co-located.
+    fn record_terminal(
+        &mut self,
+        epoch_s: u64,
+        key: &BucketKey,
+        elapsed_ms: f64,
+        usage: Option<FlowUsage>,
+    ) {
+        for ring in [&mut self.ring_1m, &mut self.ring_5m, &mut self.ring_1h] {
+            let slot = ring.slot_mut(epoch_s);
+            let entry = slot.buckets.entry(key.clone()).or_default();
+            entry.count = entry.count.saturating_add(1);
+            if let Some(usage) = usage {
+                entry.prompt_tokens = entry.prompt_tokens.saturating_add(usage.prompt);
+                entry.completion_tokens = entry.completion_tokens.saturating_add(usage.completion);
+                entry.cached_tokens = entry.cached_tokens.saturating_add(usage.cached);
+                entry.reasoning_tokens = entry.reasoning_tokens.saturating_add(usage.reasoning);
+            }
+            slot.histogram.record(elapsed_ms);
+        }
+        self.metrics_seq = self.metrics_seq.saturating_add(1);
+    }
+
     /// Add a flow's token counts to the bucket for `key` at `epoch_s`. Called ONCE
     /// per flow at the terminal seam with the flow's FINAL cumulative usage, so the
     /// slot's token sum equals the window's true token throughput (no per-chunk
@@ -749,6 +784,40 @@ impl MetricsLayer {
         self.lock().add_tokens(epoch_s, &key, usage);
     }
 
+    /// **The atomic terminal record (Codex D5 R1 #2).** Records a flow's terminal
+    /// response count AND its optional FINAL cumulative token usage in a SINGLE
+    /// metrics-lock hold at ONE epoch/slot — the engine drives this once at the D3
+    /// terminal finalize seam INSTEAD of a separate `record_response` + `record_usage`
+    /// pair. Taking one lock and computing one `epoch_s` here guarantees the count and
+    /// the tokens land in the SAME 1 s slot even if a 5 s coordinated snapshot runs
+    /// concurrently: there is no window between two lock acquisitions for a snapshot to
+    /// observe the count without the tokens (or to split them across a second
+    /// boundary). The `served_model`/`endpoint`/`upstream` collapse to `"unknown"`
+    /// when absent so the key space stays bounded. No-op (zero lock, zero work) when
+    /// disabled.
+    pub fn record_terminal(
+        &self,
+        status: FlowStatus,
+        served_model: Option<&str>,
+        endpoint: &str,
+        upstream: Option<&str>,
+        elapsed_ms: u128,
+        usage: Option<FlowUsage>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let key = BucketKey {
+            status: StatusClass::from_status(status),
+            model: label_or_unknown(served_model),
+            endpoint: endpoint.to_string(),
+            upstream: label_or_unknown(upstream),
+        };
+        let epoch_s = now_epoch_s();
+        self.lock()
+            .record_terminal(epoch_s, &key, elapsed_ms as f64, usage);
+    }
+
     /// The current metrics domain sequence (the per-domain cursor). `0` when
     /// disabled.
     pub fn metrics_seq(&self) -> u64 {
@@ -768,66 +837,36 @@ impl MetricsLayer {
         self.lock().view(now)
     }
 
-    /// **The 5 s coordinated snapshot.** Takes ONE critical section in the FIXED
-    /// lock order — FlowStore mutex FIRST (via `flow_store.snapshot_summaries()`),
-    /// THEN this layer's metrics mutex — and captures ONE `Arc<ProviderHealthSnapshot>`
-    /// from the D4 publisher, producing a true atomic cut across all three stores
-    /// into a body-free [`DashboardSnapshot`]. Only this method ever holds >1 lock,
-    /// so the fixed order makes a deadlock impossible. The summaries are body-free
-    /// (NO `Arc<[u8]>`). No-op (returns `None`) when disabled. The cut is pushed onto
-    /// the bounded snapshot ring AND returned (so the caller/test can assert on it).
+    /// **The 5 s coordinated snapshot.** Takes the FIXED lock order — FlowStore mutex
+    /// FIRST, THEN this layer's metrics mutex nested under it — and captures ONE
+    /// `Arc<ProviderHealthSnapshot>` from the D4 publisher, producing a true atomic cut
+    /// across all three stores into a body-free [`DashboardSnapshot`]. Only this method
+    /// ever holds >1 lock, so the fixed order makes a deadlock impossible. The summaries
+    /// are body-free (NO `Arc<[u8]>`). No-op (returns `None`) when disabled. The cut is
+    /// pushed onto the bounded snapshot ring AND returned (so the caller/test can assert
+    /// on it).
     ///
-    /// Lock-discipline note: `snapshot_summaries()` acquires + RELEASES the FlowStore
-    /// lock before this method acquires the metrics lock (Rust scopes the guard to
-    /// the call). The fixed ORDER (Flow then Metrics) is what guarantees no deadlock
-    /// against any other code path; since no other path takes both locks, even the
-    /// brief non-overlap here cannot tear a read (no concurrent writer reorders the
-    /// two stores between the two acquisitions in a way a consumer can observe — the
-    /// captured cursors record exactly which versions were read).
+    /// Atomic-cut guarantee (Codex D5 R1 #1): the FlowStore lock is held until the
+    /// metrics lock is nested under it and the cut-defining cursors + topology `Arc` are
+    /// captured — that overlap instant IS the cut, so there is no gap in which a writer
+    /// could mutate both stores and produce a torn cut (a metrics sample for a flow
+    /// absent from the summaries). The FlowStore lock is then released and the heavier
+    /// metrics aggregation runs under the metrics lock alone (still sufficient to keep
+    /// the cut consistent — no writer can mutate metrics while it is held — and it keeps
+    /// the FlowStore critical section minimal so writers are not starved). The cursors
+    /// record exactly which versions were read at the cut.
     pub fn snapshot(
         &self,
         flow_store: &DashboardFlowStore,
         topology: &ProviderHealthPublisher,
     ) -> Option<Arc<DashboardSnapshot>> {
-        if !self.enabled {
-            return None;
-        }
-        let taken_at_ms = now_ms();
-        let now_epoch = (taken_at_ms / 1000) as u64;
-        // FIXED LOCK ORDER step 1: FlowStore (acquires + releases its mutex). The
-        // summaries + `flow_seq` are read under ONE lock acquisition so the cut's
-        // cursor provably matches the summaries (no torn cursor-vs-data read).
-        let (summaries, flow_seq) = flow_store.snapshot_summaries_with_seq();
-        // ONE topology Arc capture (D4) — a cheap clone of the latest published cut.
-        let topology = topology.latest();
-        let topology_seq = topology.version;
-        // FIXED LOCK ORDER step 2: this layer's metrics mutex (held to read the view,
-        // bump nothing, and push the cut onto the ring under the same hold).
-        let mut state = self.lock();
-        let metrics = state.view(now_epoch);
-        let metrics_seq = state.metrics_seq;
-        let cursors = DomainCursors {
-            flow_seq,
-            metrics_seq,
-            topology_seq,
-            // Monitor sequence is captured by the caller (the snapshot task has the
-            // monitor handle); the layer does not own it. Filled via `with_monitor_seq`.
-            monitor_seq: 0,
-        };
-        let cut = Arc::new(DashboardSnapshot {
-            taken_at_ms,
-            cursors,
-            summaries,
-            metrics,
-            topology,
-        });
-        state.snapshots.push(Arc::clone(&cut));
-        Some(cut)
+        self.snapshot_with_monitor_seq(flow_store, topology, 0)
     }
 
     /// Like [`snapshot`](Self::snapshot) but also records the monitor domain's
     /// sequence into the cut's cursors (the snapshot task owns the monitor handle).
-    /// Same single FlowStore→Metrics critical section + one topology Arc capture.
+    /// Same FIXED FlowStore→Metrics atomic cut (FlowStore lock held until the metrics
+    /// lock is nested + cursors/topology captured, then released) + one topology Arc.
     pub fn snapshot_with_monitor_seq(
         &self,
         flow_store: &DashboardFlowStore,
@@ -839,26 +878,44 @@ impl MetricsLayer {
         }
         let taken_at_ms = now_ms();
         let now_epoch = (taken_at_ms / 1000) as u64;
-        let (summaries, flow_seq) = flow_store.snapshot_summaries_with_seq();
-        let topology = topology.latest();
-        let topology_seq = topology.version;
-        let mut state = self.lock();
-        let metrics = state.view(now_epoch);
-        let metrics_seq = state.metrics_seq;
-        let cursors = DomainCursors {
-            flow_seq,
-            metrics_seq,
-            topology_seq,
-            monitor_seq,
-        };
-        let cut = Arc::new(DashboardSnapshot {
-            taken_at_ms,
-            cursors,
-            summaries,
-            metrics,
-            topology,
+        // FIXED LOCK ORDER, single atomic cut: hold the FlowStore lock only until the
+        // metrics lock is nested under it and the cut-defining cursors + topology Arc
+        // are captured — THAT instant is the cut. The (heavier) metrics aggregation +
+        // ring push then run under the metrics lock ALONE, after the FlowStore lock is
+        // released, so the FlowStore critical section stays minimal and concurrent
+        // writers are not starved by the snapshot's aggregation. Correctness after the
+        // early FlowStore release: the metrics lock is STILL HELD, so no writer can
+        // complete a both-stores mutation (every metrics mutation needs it) and the
+        // summaries are already a copy — the cut stays internally consistent. The
+        // FlowStore lock is acquired first and never re-entered here.
+        let cut = flow_store.with_summaries_under_lock(|flow_guard, summaries, flow_seq| {
+            // ONE topology Arc capture (D4) while the FlowStore lock is still held.
+            let topology = topology.latest();
+            let topology_seq = topology.version;
+            // FIXED LOCK ORDER step 2: nest the metrics mutex under the FlowStore lock —
+            // both held now == the atomic cut instant — and read the cut cursor.
+            let mut state = self.lock();
+            let metrics_seq = state.metrics_seq;
+            // Cut instant fixed: release the FlowStore lock and finish the metrics-only
+            // work (aggregation + push) under the metrics guard alone.
+            flow_guard.release();
+            let metrics = state.view(now_epoch);
+            let cursors = DomainCursors {
+                flow_seq,
+                metrics_seq,
+                topology_seq,
+                monitor_seq,
+            };
+            let cut = Arc::new(DashboardSnapshot {
+                taken_at_ms,
+                cursors,
+                summaries,
+                metrics,
+                topology,
+            });
+            state.snapshots.push(Arc::clone(&cut));
+            cut
         });
-        state.snapshots.push(Arc::clone(&cut));
         Some(cut)
     }
 
@@ -1060,14 +1117,18 @@ mod tests {
             assert!(upper > previous, "bucket {index} upper {upper} increasing");
             previous = upper;
         }
+        // D5 R1 #3: the FIRST finite upper bound is EXACTLY 1 ms (not ≈1.5 ms) and the
+        // LAST finite upper bound is EXACTLY 120 s — the endpoints are pinned, with the
+        // ladder log-spaced between them.
         assert!(
-            (bucket_upper_ms(0) - HISTOGRAM_MIN_MS * (/* one step */1.0_f64).max(1.0)).abs()
-                < bucket_upper_ms(0),
-            "bucket 0 near the min bound"
+            (bucket_upper_ms(0) - HISTOGRAM_MIN_MS).abs() < 1e-9,
+            "bucket 0 upper {} == exactly 1 ms",
+            bucket_upper_ms(0)
         );
         assert!(
-            (bucket_upper_ms(HISTOGRAM_BUCKETS - 2) - HISTOGRAM_MAX_MS).abs() < 1.0,
-            "last finite bucket == 120s"
+            (bucket_upper_ms(HISTOGRAM_BUCKETS - 2) - HISTOGRAM_MAX_MS).abs() < 1e-6,
+            "last finite bucket {} == exactly 120 s",
+            bucket_upper_ms(HISTOGRAM_BUCKETS - 2)
         );
         assert!(bucket_upper_ms(HISTOGRAM_BUCKETS - 1).is_infinite());
     }
@@ -1156,6 +1217,83 @@ mod tests {
         assert_eq!(counts.completion_tokens, 60);
         assert_eq!(counts.cached_tokens, 15);
         assert_eq!(counts.reasoning_tokens, 10);
+    }
+
+    #[test]
+    fn record_terminal_co_locates_count_and_tokens_in_one_slot_and_bumps_seq_once() {
+        // D5 R1 #2: the atomic terminal record applies the response count + the final
+        // usage under ONE lock at ONE epoch — the count and the tokens always land in
+        // the SAME bucket (same key) and the seq bumps exactly once. We assert both the
+        // co-location (count and all token fields present on the single bucket) and the
+        // single seq bump (vs. two for separate record_response + record_usage calls).
+        let metrics = MetricsLayer::new();
+        assert_eq!(metrics.metrics_seq(), 0);
+        metrics.record_terminal(
+            FlowStatus::Completed,
+            Some("served-m"),
+            "/v1/responses",
+            Some("provider-a"),
+            42,
+            Some(FlowUsage {
+                prompt: 100,
+                completion: 40,
+                total: 140,
+                cached: 10,
+                reasoning: 7,
+            }),
+        );
+        // ONE atomic mutation ⇒ exactly one seq bump (not two).
+        assert_eq!(metrics.metrics_seq(), 1, "atomic terminal bumps seq once");
+        let view = metrics.view();
+        // Exactly one bucket: the count AND the tokens co-located on the same key.
+        assert_eq!(
+            view.window_1m.buckets.len(),
+            1,
+            "count + tokens share a slot"
+        );
+        let (key, counts) = view
+            .window_1m
+            .buckets
+            .iter()
+            .next()
+            .expect("the single terminal bucket");
+        assert_eq!(key.status, StatusClass::Success);
+        assert_eq!(key.model, "served-m");
+        assert_eq!(counts.count, 1, "response counted");
+        assert_eq!(
+            counts.prompt_tokens, 100,
+            "tokens in the SAME bucket as count"
+        );
+        assert_eq!(counts.completion_tokens, 40);
+        assert_eq!(counts.cached_tokens, 10);
+        assert_eq!(counts.reasoning_tokens, 7);
+        // Latency landed too (one bucket carries the histogram sample window-wide).
+        assert!(view.window_1m.percentiles().p50 > 0.0, "latency recorded");
+        // All three windows agree (the single epoch fed every ring).
+        assert_eq!(view.window_5m.total_count(), 1);
+        assert_eq!(view.window_1h.total_count(), 1);
+    }
+
+    #[test]
+    fn record_terminal_without_usage_records_count_only() {
+        // A terminal with no usage (e.g. a pre-spawn failure) records the count + the
+        // latency but no tokens — still one atomic seq bump.
+        let metrics = MetricsLayer::new();
+        metrics.record_terminal(
+            FlowStatus::Failed,
+            None,
+            "/v1/chat/completions",
+            None,
+            7,
+            None,
+        );
+        assert_eq!(metrics.metrics_seq(), 1);
+        let view = metrics.view();
+        let (key, counts) = view.window_1m.buckets.iter().next().expect("bucket");
+        assert_eq!(key.status, StatusClass::Error);
+        assert_eq!(counts.count, 1);
+        assert_eq!(counts.prompt_tokens, 0, "no tokens recorded");
+        assert_eq!(counts.completion_tokens, 0);
     }
 
     #[test]

@@ -909,8 +909,18 @@ impl ReqwestUpstreamClient {
             return;
         };
         let captured = crate::dashboard_flow::capture_body_from_value(request);
-        self.flow_store
-            .set_upstream(response_id, None, None, Some(captured));
+        // D5 R1 #4: thread the FINALIZED served model into the FlowStore record. This
+        // leaf is the single point that sees the post-routing/failover/alias-remap +
+        // post-`sanitize_chat_request` `request.model`, i.e. the model the backend
+        // actually answered as. Without it the record's `model_served` stays `None`
+        // and every metrics bucket collapses to the `"unknown"` model. The store
+        // `cap_scalar`-bounds it; `set_upstream` only overwrites when `Some`.
+        self.flow_store.set_upstream(
+            response_id,
+            None,
+            Some(request.model.clone()),
+            Some(captured),
+        );
     }
 }
 
@@ -5151,6 +5161,90 @@ mod tests {
         );
         // The same record joins by response_id too.
         assert!(store.detail(&response_id).is_some());
+        // D5 R1 #4: the leaf now threads the FINALIZED served model into the record,
+        // so `model_served` is the real model — NOT `None` (which would collapse every
+        // metrics bucket to "unknown").
+        assert_eq!(
+            record.model_served.as_deref(),
+            Some("served-model"),
+            "leaf populated model_served with the finalized request model"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaf_populated_model_served_reaches_metrics_bucket_not_unknown() {
+        // End-to-end (D5 R1 #4): the leaf threads the finalized served model into the
+        // FlowStore record; the engine's terminal seam reads `record.model_served` and
+        // records it into the MetricsLayer. Drive that whole path and assert the
+        // metrics bucket carries the REAL model, never the "unknown" sentinel.
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let store = DashboardFlowStore::new();
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+        let client = d2_capturing_client(&server.uri(), store.clone());
+
+        let request = family_request("served-model");
+        let backend = BackendChatRequest::new(
+            request,
+            None,
+            Some(response_id),
+            Some(Arc::new(super::ServingToken::default())),
+        );
+        let mut stream = client
+            .stream_chat_completion(&backend)
+            .await
+            .expect("stream opens");
+        while stream.next().await.is_some() {}
+
+        // The leaf captured the served model onto the record.
+        let record = store.detail(&api_call_id).expect("record");
+        assert_eq!(record.model_served.as_deref(), Some("served-model"));
+
+        // Simulate the engine terminal seam: finalize + record the terminal into the
+        // metrics layer sourcing the served model from the record (exactly as
+        // `Gateway::record_terminal_metrics` does).
+        store.finalize(
+            &api_call_id,
+            crate::dashboard_flow::FlowStatus::Completed,
+            None,
+            None,
+        );
+        let metrics = crate::metrics::MetricsLayer::new();
+        let finalized = store.detail(&api_call_id).expect("finalized record");
+        metrics.record_terminal(
+            finalized.status,
+            finalized.model_served.as_deref(),
+            &finalized.uri,
+            finalized.upstream_target.as_deref(),
+            finalized.elapsed_ms.unwrap_or(0),
+            finalized.usage,
+        );
+
+        // The metrics bucket carries the REAL served model — NOT "unknown".
+        let view = metrics.view();
+        let (key, _counts) = view
+            .window_1m
+            .buckets
+            .iter()
+            .next()
+            .expect("a metrics bucket");
+        assert_eq!(
+            key.model, "served-model",
+            "metrics bucket carries the real served model, not the unknown sentinel"
+        );
+        assert_ne!(
+            key.model, "unknown",
+            "served model did not collapse to unknown"
+        );
     }
 
     #[tokio::test]

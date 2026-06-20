@@ -241,6 +241,25 @@ impl SnapshotFlowSummary {
     }
 }
 
+/// An opaque RAII hold on the FlowStore lock handed to
+/// [`DashboardFlowStore::with_summaries_under_lock`]'s closure. It exposes NOTHING of
+/// the private interior state — its only purpose is to let the closure decide WHEN the
+/// FlowStore lock is released (by dropping it / calling [`release`](Self::release)),
+/// so the snapshot can release FlowStore the instant it has nested the metrics lock
+/// and captured the cut cursors, then run the heavier metrics aggregation under the
+/// metrics lock alone. Dropping the guard releases the lock. Empty (holds nothing) on
+/// the disabled path.
+pub struct FlowSnapshotGuard<'a> {
+    guard: Option<std::sync::MutexGuard<'a, DashboardFlowState>>,
+}
+
+impl FlowSnapshotGuard<'_> {
+    /// Release the FlowStore lock now (explicit form of dropping the guard). Idempotent.
+    pub fn release(mut self) {
+        self.guard = None;
+    }
+}
+
 /// Interior state of the store, guarded by the single `Mutex`. `by_id` and `order`
 /// are ALWAYS mutated together (no exterior LRU). `link_index` maps a
 /// `response_id` to its owning `api_call_id` so `detail` can join by either id.
@@ -610,17 +629,35 @@ impl DashboardFlowStore {
             .collect()
     }
 
-    /// Body-free snapshot summaries PLUS the per-domain `seq` captured under the
-    /// SAME lock acquisition (D5). This is the accessor the 5 s coordinated snapshot
-    /// task uses so the cut's `flow_seq` provably matches the summaries it carries —
-    /// a separate `snapshot_summaries()` + `flow_seq()` pair could TEAR (a concurrent
-    /// mutation between the two lock acquisitions would bump `seq` after the
-    /// summaries were read). Pruning happens once, before BOTH are read, so the
-    /// returned seq already reflects any prune the read performed. Empty + `0` when
-    /// disabled.
-    pub fn snapshot_summaries_with_seq(&self) -> (Vec<SnapshotFlowSummary>, u64) {
+    /// Run `f` with the body-free summaries + the FlowStore `seq` while the FlowStore
+    /// mutex is STILL HELD (D5 single-critical-section snapshot, Codex D5 R1 #1). The
+    /// 5 s coordinated snapshot uses this so it can acquire the MetricsLayer mutex (the
+    /// FIXED FlowStore→Metrics order) and capture the topology `Arc` WHILE this lock is
+    /// still held — making the cut a single atomic instant across all three stores. The
+    /// alternative — read summaries + seq, RELEASE this lock, THEN take the metrics lock
+    /// — leaves a torn-cut window: a concurrent writer could mutate BOTH stores in the
+    /// gap, so a cut would include a metrics sample for a flow absent from the summaries.
+    ///
+    /// `f` receives a [`FlowSnapshotGuard`] it OWNS, so it can `drop` the FlowStore lock
+    /// the MOMENT it has acquired the metrics lock + captured the cut-defining cursors —
+    /// then run the (heavier) metrics aggregation under the metrics lock ALONE. Holding
+    /// the metrics lock is sufficient to keep the cut consistent after the FlowStore
+    /// release: no writer can complete a both-stores mutation while the metrics lock is
+    /// held (every metrics mutation needs it), and the summaries are already a snapshot
+    /// copy. Releasing FlowStore early keeps its critical section minimal so concurrent
+    /// writers are not starved by the snapshot's aggregation work.
+    ///
+    /// The FIXED lock order is FlowStore→Metrics: `f` is the ONLY place that acquires a
+    /// second lock while this one is held, and it MUST NOT re-enter the FlowStore (it
+    /// touches only Metrics + topology), so no deadlock is possible. Pruning happens
+    /// once, before the summaries are built, so the seq already reflects any prune. When
+    /// disabled, `f` runs with an empty guard + `(Vec::new(), 0)` and no lock is taken.
+    pub fn with_summaries_under_lock<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(FlowSnapshotGuard<'_>, Vec<SnapshotFlowSummary>, u64) -> R,
+    {
         if !self.enabled {
-            return (Vec::new(), 0);
+            return f(FlowSnapshotGuard { guard: None }, Vec::new(), 0);
         }
         let mut state = self.lock();
         state.prune_expired(now_ms());
@@ -631,7 +668,10 @@ impl DashboardFlowStore {
             .filter_map(|id| state.by_id.get(id))
             .map(|record| SnapshotFlowSummary::from_record(record))
             .collect();
-        (summaries, state.seq)
+        let seq = state.seq;
+        // Hand the guard to `f` so it controls when the FlowStore lock is released
+        // (after it has nested the metrics lock under this one).
+        f(FlowSnapshotGuard { guard: Some(state) }, summaries, seq)
     }
 
     /// Test-only: prune at a caller-supplied clock so the TTL is deterministically
