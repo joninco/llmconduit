@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream;
 use llmconduit::config::Config;
+use llmconduit::config::PersistedConfig;
 use llmconduit::engine::Gateway;
 use llmconduit::engine::SseEvent;
 use llmconduit::error::AppError;
@@ -436,6 +437,14 @@ pub fn test_config() -> Config {
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
     }
+}
+
+/// Build a `Config` from inline YAML, applying the standard `from_persisted`
+/// resolution. Keeps routing/profile resolution identical to production for the
+/// config + routing test suites.
+pub fn config_from_yaml(yaml: &str) -> Config {
+    let persisted: PersistedConfig = serde_yaml::from_str(yaml).expect("yaml config");
+    Config::from_persisted(&persisted).expect("resolve config")
 }
 
 pub fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {

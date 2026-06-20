@@ -20,11 +20,14 @@
 //!      axum's `KeepAlive::new()` (`http.rs` `stream_anthropic_response` /
 //!      `stream_chat_completions_response` / `stream_responses_response`),
 //!      whose `KeepAliveStream` emits a `:`-comment ping after each idle
-//!      interval (15s default). The test drives a real, IDLE Anthropic SSE
-//!      response (a `PendingUpstream` that stalls after the engine's prologue)
-//!      through the http.rs path, advances the paused clock past the interval,
-//!      and asserts a keep-alive comment frame appears in the response body — so
-//!      deleting `.keep_alive(...)` makes it fail (no ping is ever emitted).
+//!      interval (15s default). The test is PARAMETERIZED across all three
+//!      front-end streaming ingress routes (`/v1/messages`,
+//!      `/v1/chat/completions`, `/v1/responses`): for each it drives a real,
+//!      IDLE SSE response (a `PendingUpstream` that stalls after the engine's
+//!      prologue) through the http.rs path, advances the paused clock past the
+//!      interval, and asserts a keep-alive comment frame appears in the response
+//!      body — so deleting `.keep_alive(...)` from any of the three builders
+//!      makes the matching route fail (no ping is ever emitted).
 //!   2. ANTHROPIC-EGRESS reasoning-only deferral/promotion — the
 //!      `responses_to_anthropic::AnthropicStreamConverter` (gap G8) DEFERS
 //!      reasoning: it emits NO content block while only reasoning has arrived,
@@ -47,15 +50,11 @@
 mod common;
 
 use common::MockSearch;
-use common::base_request;
-use common::test_gateway;
-use common::user_message;
 
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Request;
 use futures::StreamExt;
-use futures::poll;
 use llmconduit::adapters::responses_to_anthropic::AnthropicStreamConverter;
 use llmconduit::engine::Gateway;
 use llmconduit::engine::SseEvent;
@@ -70,7 +69,6 @@ use llmconduit::upstream::UpstreamModelEntry;
 use llmconduit::upstream::UpstreamStream;
 use serde_json::json;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::Duration;
 use tower::ServiceExt;
 
@@ -133,165 +131,192 @@ impl UpstreamClient for PendingUpstream {
     }
 }
 
-/// Drive a real, IDLE Anthropic `/v1/messages` SSE response through the http.rs
-/// streaming path and assert axum's keep-alive timer emits a `:`-comment ping
-/// once the idle interval elapses. Uses paused time (`start_paused`) so the test
-/// is deterministic and instant.
+/// The three front-end streaming ingress routes, each built with
+/// `.keep_alive(axum::response::sse::KeepAlive::new())` in its own `http.rs`
+/// builder (`stream_anthropic_response` / `stream_chat_completions_response` /
+/// `stream_responses_response`). A minimal STREAMING request body for each — the
+/// `PendingUpstream` makes every one of them go idle after the engine prologue.
+struct IngressRoute {
+    /// Test label, also the human name in assertion messages.
+    name: &'static str,
+    /// Ingress path under test.
+    uri: &'static str,
+    /// `http.rs` builder this route exercises (for the failure message).
+    builder: &'static str,
+}
+
+fn streaming_routes() -> [IngressRoute; 3] {
+    [
+        IngressRoute {
+            name: "anthropic /v1/messages",
+            uri: "/v1/messages",
+            builder: "http.rs::stream_anthropic_response",
+        },
+        IngressRoute {
+            name: "chat /v1/chat/completions",
+            uri: "/v1/chat/completions",
+            builder: "http.rs::stream_chat_completions_response",
+        },
+        IngressRoute {
+            name: "responses /v1/responses",
+            uri: "/v1/responses",
+            builder: "http.rs::stream_responses_response",
+        },
+    ]
+}
+
+/// A minimal streaming request body for `route`, all asking for the same model
+/// the `PendingUpstream` serves. The wire shape differs per ingress but each
+/// reaches the engine and stalls on the pending upstream, going idle.
+fn streaming_body(uri: &str) -> serde_json::Value {
+    match uri {
+        "/v1/messages" => json!({
+            "model": "glm-5.1",
+            "max_tokens": 1024,
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }),
+        "/v1/chat/completions" => json!({
+            "model": "glm-5.1",
+            "stream": true,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }),
+        "/v1/responses" => json!({
+            "model": "glm-5.1",
+            "stream": true,
+            "input": "hi"
+        }),
+        other => panic!("no streaming body defined for {other}"),
+    }
+}
+
+/// Drive a real, IDLE SSE response through the `http.rs` streaming path for one
+/// ingress route and assert axum's keep-alive timer emits a `:`-comment ping
+/// once the idle interval elapses. Paused time (`start_paused`) keeps it
+/// deterministic and instant.
 ///
-/// FAILS FAST IF `.keep_alive(...)` IS REMOVED from
-/// `http.rs::stream_anthropic_response`: without the `KeepAliveStream` wrapper
-/// the idle body never produces a ping. The test only ever polls the body
-/// (never `.await`s it), so after advancing the paused clock past the interval a
-/// still-`Pending` body triggers an immediate `panic!` — a deterministic
-/// failure, not a hang on the permanently-pending upstream.
-#[tokio::test(start_paused = true)]
-async fn anthropic_idle_stream_emits_keepalive_ping() {
+/// Harness (no scheduler protocol): advance the paused clock PAST the 15s
+/// keep-alive interval FIRST, so its `Sleep` is already expired, then drain
+/// frames. Every frame is now wanted — the engine prologue, then the ping the
+/// expired timer produces the moment the inner stream is idle — so we just read
+/// until the `:` comment. The `KEEPALIVE_FRAME_BUDGET` cap is purely a mutation
+/// tripwire: deleting `.keep_alive(...)` removes the `KeepAliveStream`, no ping
+/// is ever produced, and the drain hits the cap and `panic!`s fast (a clean
+/// deterministic failure, not a hang on the permanently-pending upstream).
+async fn assert_idle_stream_emits_keepalive_ping(route: &IngressRoute) {
     let app = llmconduit::build_app_from_gateway(gateway_with_upstream(PendingUpstream));
 
-    let body = json!({
-        "model": "glm-5.1",
-        "max_tokens": 1024,
-        "stream": true,
-        "messages": [{ "role": "user", "content": "hi" }]
-    });
+    let body = streaming_body(route.uri);
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/messages")
+                .uri(route.uri)
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_string(&body).expect("serialize")))
                 .expect("request"),
         )
         .await
         .expect("response");
-    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "{} streaming request must start a 200 SSE response",
+        route.name
+    );
 
     let mut body = response.into_body().into_data_stream();
 
-    // STEP 1 — drain the engine prologue until the body is genuinely IDLE.
-    // The spawned engine/converter tasks emit a few frames (Anthropic `ping` /
-    // `message_start`) before stalling on the permanently-pending upstream. Poll
-    // (never `.await`) the body, yielding to the runtime between polls so those
-    // spawned tasks make progress. A single `Pending` is NOT proof of idle — a
-    // prologue frame may still be propagating through the multi-stage pipeline
-    // (engine task -> mpsc -> converter task -> mpsc -> ReceiverStream ->
-    // KeepAliveStream), which can take several scheduler passes. We declare idle
-    // only after several CONSECUTIVE `Pending` polls (each separated by a
-    // `yield_now`) with the paused clock UNCHANGED: once the prologue is fully
-    // drained the permanently-pending upstream guarantees the body stays pending
-    // forever (until the clock advances), so no number of further yields can
-    // produce a frame. A keep-alive frame must not appear here (the interval has
-    // not elapsed); if one somehow did, that already proves keep-alive is wired.
-    const IDLE_CONFIRM_POLLS: usize = 16;
+    // Expire the keep-alive interval up front. The builder's `KeepAlive::new()`
+    // started its `Sleep` when the response was constructed; advancing past it
+    // means the very next moment the inner stream is idle, `KeepAliveStream`
+    // yields the `:` ping.
+    tokio::time::advance(Duration::from_secs(16)).await;
+
+    // Drain frames until the keep-alive comment. Prologue frames (a handful, per
+    // route) arrive first and are skipped; the ping is GUARANTEED to follow on a
+    // correctly-wired stream (the timer already fired), so this read terminates.
+    // The cap only bites when keep-alive is removed (no ping ever) — turning the
+    // permanently-pending upstream's hang into a fast, explicit failure.
+    const KEEPALIVE_FRAME_BUDGET: usize = 64;
     let mut saw_keepalive = false;
-    let mut idle = false;
-    let mut consecutive_pending = 0;
-    for _ in 0..256 {
-        let mut next = std::pin::pin!(body.next());
-        match poll!(next.as_mut()) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                consecutive_pending = 0;
+    for _ in 0..KEEPALIVE_FRAME_BUDGET {
+        match body.next().await {
+            Some(Ok(bytes)) => {
                 if bytes.starts_with(b":") {
                     saw_keepalive = true;
                     break;
                 }
-                // Prologue frame; keep draining.
+                // Engine prologue / converter frame; keep draining.
             }
-            Poll::Ready(Some(Err(err))) => panic!("stream error draining prologue: {err}"),
-            Poll::Ready(None) => panic!("stream ended before going idle (no keep-alive possible)"),
-            Poll::Pending => {
-                consecutive_pending += 1;
-                if consecutive_pending >= IDLE_CONFIRM_POLLS {
-                    idle = true;
-                    break;
-                }
-            }
-        }
-        // Let the spawned engine/converter tasks advance (no clock movement).
-        tokio::task::yield_now().await;
-    }
-
-    // STEP 2 — the decisive lock. Advance the paused clock past the 15s
-    // keep-alive interval, then POLL THE IDLE BODY EXACTLY ONCE. With
-    // `.keep_alive(...)` configured, the elapsed `Sleep` makes axum's
-    // `KeepAliveStream` yield the `:` comment immediately, so this poll is
-    // `Ready`. Without it, the body has nothing to wake it and the poll is
-    // `Pending` — we `panic!` at once instead of `.await`ing (which would hang
-    // forever on the permanently-pending upstream → a CI timeout, not a clean
-    // failure). This is the assertion that breaks if keep-alive is removed.
-    if !saw_keepalive {
-        assert!(idle, "body never reached the idle state to test keep-alive");
-        tokio::time::advance(Duration::from_secs(16)).await;
-        let mut next = std::pin::pin!(body.next());
-        match poll!(next.as_mut()) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                assert!(
-                    bytes.starts_with(b":"),
-                    "idle Anthropic SSE body produced a non-keepalive frame after the \
-                     interval elapsed: {:?}",
-                    String::from_utf8_lossy(&bytes)
-                );
-                saw_keepalive = true;
-            }
-            Poll::Ready(Some(Err(err))) => panic!("stream error after advance: {err}"),
-            Poll::Ready(None) => panic!("idle stream ended without a keep-alive ping"),
-            Poll::Pending => panic!(
-                "idle Anthropic SSE body produced NO keep-alive ping after advancing past the \
-                 interval: `.keep_alive(...)` appears removed from \
-                 http.rs::stream_anthropic_response (fast deterministic failure, not a hang)"
+            Some(Err(err)) => panic!("{}: stream error draining frames: {err}", route.name),
+            None => panic!(
+                "{}: idle SSE stream ended without a keep-alive ping ({} appears to have dropped \
+                 `.keep_alive(...)`)",
+                route.name, route.builder
             ),
         }
     }
 
     assert!(
         saw_keepalive,
-        "an idle Anthropic SSE response must emit a `:` keep-alive comment \
-         (axum KeepAlive in http.rs::stream_anthropic_response)"
+        "{}: an idle SSE response produced NO `:` keep-alive comment within {} frames after the \
+         interval elapsed — `.keep_alive(...)` appears removed from {} (deterministic failure, \
+         not a hang)",
+        route.name, KEEPALIVE_FRAME_BUDGET, route.builder
     );
 }
 
+/// G3-peek keep-alive, parameterized across ALL THREE streaming ingress routes
+/// (Anthropic, Chat, Responses): each must emit axum's `:` keep-alive comment on
+/// an idle stream once the interval elapses. Deleting `.keep_alive(...)` from any
+/// of the three `http.rs` builders fails the corresponding route here.
+#[tokio::test(start_paused = true)]
+async fn idle_streams_emit_keepalive_ping_across_all_routes() {
+    for route in streaming_routes() {
+        assert_idle_stream_emits_keepalive_ping(&route).await;
+    }
+}
+
 /// Companion sanity lock (the idle-ping test above is the STRONG behavioral
-/// lock): a streaming response also advertises the keep-alive transport headers
-/// set in the same http.rs builder block as `.keep_alive(...)`
-/// (`Connection: keep-alive`, `X-Accel-Buffering: no`). Cheap coverage of the
-/// canonical Responses path; not a substitute for observing the ping.
+/// lock): every streaming route also advertises the keep-alive transport headers
+/// set in the same `http.rs` builder block as `.keep_alive(...)`
+/// (`Connection: keep-alive`, `X-Accel-Buffering: no`). Cheap header coverage
+/// across all three routes; not a substitute for observing the ping.
 #[tokio::test]
-async fn responses_stream_advertises_keep_alive_headers() {
-    let upstream = common::MockUpstream::default();
-    upstream
-        .push_response(vec![Ok(common::content_chunk("chat-1", "hi"))])
-        .await;
-    let app = llmconduit::build_app_from_gateway(test_gateway(upstream, MockSearch::default()));
+async fn streams_advertise_keep_alive_headers_across_all_routes() {
+    for route in streaming_routes() {
+        let app = llmconduit::build_app_from_gateway(gateway_with_upstream(PendingUpstream));
+        let body = streaming_body(route.uri);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(route.uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
 
-    let mut request = base_request(vec![user_message("hi")]);
-    request.stream = true;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/v1/responses")
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&request).expect("serialize")))
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-
-    assert_eq!(response.status().as_u16(), 200);
-    let headers = response.headers();
-    assert_eq!(
-        headers.get("connection").and_then(|v| v.to_str().ok()),
-        Some("keep-alive"),
-        "streaming response must advertise Connection: keep-alive"
-    );
-    assert_eq!(
-        headers
-            .get("x-accel-buffering")
-            .and_then(|v| v.to_str().ok()),
-        Some("no"),
-        "streaming response must disable proxy buffering"
-    );
+        assert_eq!(response.status().as_u16(), 200, "{}", route.name);
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("connection").and_then(|v| v.to_str().ok()),
+            Some("keep-alive"),
+            "{}: streaming response must advertise Connection: keep-alive",
+            route.name
+        );
+        assert_eq!(
+            headers
+                .get("x-accel-buffering")
+                .and_then(|v| v.to_str().ok()),
+            Some("no"),
+            "{}: streaming response must disable proxy buffering",
+            route.name
+        );
+    }
 }
 
 // --------------------------------------------------------------------------

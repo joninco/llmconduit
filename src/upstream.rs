@@ -358,6 +358,11 @@ struct RoutingModelCatalog {
     provider_catalogs: Vec<RoutingProviderModelCatalog>,
     union_entries: Vec<Value>,
     union_ids: Vec<String>,
+    /// Context-window length keyed by union model id, parsed from the SAME
+    /// first-seen `/v1/models` entry that populated `union_entries`/`union_ids`.
+    /// `supported_model_catalog` reads it directly so the union catalog is parsed
+    /// once at refresh rather than reparsed from `union_entries` per call.
+    union_context_limit_by_id: HashMap<String, i64>,
     ids_by_key: HashMap<String, Vec<RoutingModelCandidate>>,
     /// Ad-hoc routes (G7), cloned from the client each refresh. Matched purely
     /// by request-model name, independent of the live catalog, so routes still
@@ -1125,6 +1130,7 @@ impl RoutingUpstreamClient {
         let mut provider_catalogs = Vec::with_capacity(self.providers.len());
         let mut union_entries = Vec::new();
         let mut union_ids = Vec::new();
+        let mut union_context_limit_by_id: HashMap<String, i64> = HashMap::new();
         let mut ids_by_key: HashMap<String, Vec<RoutingModelCandidate>> = HashMap::new();
         let mut seen_union_ids = HashSet::new();
         let mut last_error = None;
@@ -1158,6 +1164,7 @@ impl RoutingUpstreamClient {
                     &mut provider_context_limits,
                     &mut union_entries,
                     &mut union_ids,
+                    &mut union_context_limit_by_id,
                     &mut ids_by_key,
                     &mut seen_union_ids,
                 );
@@ -1174,6 +1181,7 @@ impl RoutingUpstreamClient {
                     &mut provider_context_limits,
                     &mut union_entries,
                     &mut union_ids,
+                    &mut union_context_limit_by_id,
                     &mut ids_by_key,
                     &mut seen_union_ids,
                 );
@@ -1197,6 +1205,7 @@ impl RoutingUpstreamClient {
             provider_catalogs,
             union_entries,
             union_ids,
+            union_context_limit_by_id,
             ids_by_key,
             routes: self.routes.clone(),
         })
@@ -1391,6 +1400,7 @@ fn register_routing_model(
     context_limit_by_id: &mut HashMap<String, i64>,
     union_entries: &mut Vec<Value>,
     union_ids: &mut Vec<String>,
+    union_context_limit_by_id: &mut HashMap<String, i64>,
     ids_by_key: &mut HashMap<String, Vec<RoutingModelCandidate>>,
     seen_union_ids: &mut HashSet<String>,
 ) {
@@ -1418,6 +1428,15 @@ fn register_routing_model(
     }
     ids_by_key.entry(key).or_default().push(candidate);
     if seen_union_ids.insert(model_id.clone()) {
+        // Capture the first-seen entry's context limit alongside the union id,
+        // so the union catalog is parsed once here instead of being reparsed
+        // from `union_entries` in `supported_model_catalog`. Reads the SAME
+        // `entry_context_limit` over the SAME first-seen entry.
+        if let Value::Object(map) = &entry
+            && let Some(limit) = entry_context_limit(map)
+        {
+            union_context_limit_by_id.insert(model_id.clone(), limit);
+        }
         union_ids.push(model_id);
         union_entries.push(entry);
     }
@@ -1742,17 +1761,14 @@ impl UpstreamClient for RoutingUpstreamClient {
         // Build from the cached union catalog directly (single snapshot) rather
         // than re-serializing `union_body()` through the default `list_models()`
         // path: the union ids are authoritative, and any context length is read
-        // from the same merged entries.
+        // from `union_context_limit_by_id`, parsed once at catalog refresh from
+        // the same first-seen entries.
         let catalog = self.load_catalog().await?;
-        let limit_by_id: HashMap<String, i64> =
-            extract_model_context_limits(&Value::Array(catalog.union_entries.clone()))
-                .into_iter()
-                .collect();
         Ok(catalog
             .union_ids
             .into_iter()
             .map(|id| {
-                let context_limit = limit_by_id.get(&id).copied();
+                let context_limit = catalog.union_context_limit_by_id.get(&id).copied();
                 UpstreamModelEntry { id, context_limit }
             })
             .collect())
@@ -2861,20 +2877,6 @@ fn model_entries_from_body(body: &Value) -> Vec<Value> {
     }
 }
 
-/// Parse `(id, context_limit)` pairs from a `/v1/models` body for G3 budgeting,
-/// omitting entries with no positive context length. Used by the routing client
-/// to read context limits from its already-merged union entries.
-fn extract_model_context_limits(body: &Value) -> Vec<(String, i64)> {
-    model_entries_from_body(body)
-        .iter()
-        .filter_map(|entry| {
-            let map = entry.as_object()?;
-            let id = map.get("id").and_then(Value::as_str)?;
-            Some((id.to_string(), entry_context_limit(map)?))
-        })
-        .collect()
-}
-
 /// `pub` so the G3 test oracle (`tests/port_server.rs`) can independently
 /// normalize a recorded request through the SAME terminal leaf transform the
 /// estimator uses, without calling the production estimator (T9: breaks the
@@ -2971,7 +2973,6 @@ mod tests {
     use super::ReqwestUpstreamClient;
     use super::UpstreamModelEntry;
     use super::UpstreamRequestLogger;
-    use super::extract_model_context_limits;
     use super::extract_supported_model_catalog;
     use super::sanitize_chat_request;
     use crate::models::chat::ChatCompletionRequest;
@@ -4064,14 +4065,20 @@ mod tests {
 
     #[test]
     fn extract_supported_model_catalog_reads_ids_and_context_limits_in_one_pass() {
-        // Same snapshot yields ids AND limits: first positive context key wins,
-        // and an entry with no positive context length keeps its id with a
+        // Same snapshot yields ids AND limits: the first positive context key
+        // wins, the search exercises EVERY alias key in precedence order
+        // (`max_input_tokens` > `context_length` > `context_window` >
+        // `max_context_length` > `max_model_len`), and an entry with no positive
+        // context length (zero, missing, or a bare string) keeps its id with a
         // `None` limit (budgeting no-ops for it, but it still resolves).
         let body = serde_json::json!({
             "data": [
                 {"id": "a", "max_input_tokens": 1000, "context_length": 9999},
                 {"id": "b", "context_window": 2048},
-                {"id": "c", "context_length": 0},
+                {"id": "c", "max_context_length": 32768},
+                {"id": "d", "max_model_len": 4096},
+                {"id": "e", "context_length": 0},
+                {"id": "f"},
                 "bare",
             ]
         });
@@ -4089,6 +4096,18 @@ mod tests {
                 },
                 UpstreamModelEntry {
                     id: "c".to_string(),
+                    context_limit: Some(32768)
+                },
+                UpstreamModelEntry {
+                    id: "d".to_string(),
+                    context_limit: Some(4096)
+                },
+                UpstreamModelEntry {
+                    id: "e".to_string(),
+                    context_limit: None
+                },
+                UpstreamModelEntry {
+                    id: "f".to_string(),
                     context_limit: None
                 },
                 UpstreamModelEntry {
@@ -4100,40 +4119,8 @@ mod tests {
     }
 
     #[test]
-    fn extract_model_context_limits_reads_first_positive_key() {
-        // Prefers `max_input_tokens`, then falls back through the alias keys;
-        // skips entries with no positive context length (string ids, zero,
-        // missing) so budgeting no-ops for them.
-        let body = serde_json::json!({
-            "data": [
-                {"id": "a", "max_input_tokens": 1000, "context_length": 9999},
-                {"id": "b", "context_window": 2048},
-                {"id": "c", "max_model_len": 4096},
-                {"id": "d", "context_length": 0},
-                {"id": "e"},
-                "bare-string-id",
-            ]
-        });
-
-        let limits = extract_model_context_limits(&body);
-        assert_eq!(
-            limits,
-            vec![
-                ("a".to_string(), 1000),
-                ("b".to_string(), 2048),
-                ("c".to_string(), 4096),
-            ]
-        );
-    }
-
-    #[test]
-    fn extract_model_context_limits_handles_models_array_and_empty() {
-        let body = serde_json::json!({"models": [{"id": "x", "max_context_length": 32768}]});
-        assert_eq!(
-            extract_model_context_limits(&body),
-            vec![("x".to_string(), 32768)]
-        );
-        assert!(extract_model_context_limits(&serde_json::json!({})).is_empty());
+    fn extract_supported_model_catalog_handles_empty_body() {
+        assert!(extract_supported_model_catalog(&serde_json::json!({})).is_empty());
     }
 }
 
@@ -4159,6 +4146,7 @@ mod resolve_match_kind_tests {
             }],
             union_entries: Vec::new(),
             union_ids: vec![model.to_string()],
+            union_context_limit_by_id: HashMap::new(),
             ids_by_key,
             routes: Vec::new(),
         }
@@ -4209,6 +4197,7 @@ mod resolve_match_kind_tests {
             provider_catalogs: Vec::new(),
             union_entries: Vec::new(),
             union_ids: Vec::new(),
+            union_context_limit_by_id: HashMap::new(),
             ids_by_key: HashMap::new(),
             routes: Vec::new(),
         };

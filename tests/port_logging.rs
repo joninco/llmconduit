@@ -8,7 +8,9 @@
 //! (no extra dev-dependency required).
 
 use llmconduit::log_rotation::cleanup_dump_files;
+use llmconduit::log_rotation::cleanup_dump_files_with_remover;
 use std::fs;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -157,20 +159,44 @@ fn mixed_old_and_recent_files() {
 #[test]
 fn tolerates_removal_race_without_double_count() {
     let dir = TempDir::new();
-    // Two eligible old files; one is removed before cleanup runs to simulate a
-    // concurrent deletion race. Cleanup must still complete and count only the
-    // file it actually removed (no double-increment for the vanished file).
+    // Two eligible old files. A concurrent deletion race is modeled by an
+    // injected remover that returns `Err` for `raced.json` (as if it vanished
+    // between the directory read and the `remove_file` call) while really
+    // removing everything else. This drives the removal-error-tolerance branch
+    // for real — `remove` actually returns `Err` — instead of pre-deleting the
+    // file so it never reaches `remove_file` (which would exercise nothing).
     let raced = dir.write("raced.json");
     let survivor = dir.write("survivor.json");
     backdate(&raced, Duration::from_secs(3 * 3600));
     backdate(&survivor, Duration::from_secs(3 * 3600));
 
-    // Simulate the race: remove `raced` out from under the cleanup pass.
-    fs::remove_file(&raced).expect("pre-remove raced file");
+    let mut remove_attempts: Vec<PathBuf> = Vec::new();
+    let deleted = cleanup_dump_files_with_remover(dir.path(), MAX_AGE, SystemTime::now(), |path| {
+        remove_attempts.push(path.to_path_buf());
+        if path.file_name().and_then(|name| name.to_str()) == Some("raced.json") {
+            // The file raced away under us: removal fails.
+            Err(io::Error::new(io::ErrorKind::NotFound, "raced away"))
+        } else {
+            fs::remove_file(path)
+        }
+    });
 
-    let deleted = cleanup_dump_files(dir.path(), MAX_AGE, SystemTime::now());
-
-    // Only `survivor` could be deleted; the already-gone `raced` is not counted.
-    assert_eq!(deleted, 1);
-    assert!(!survivor.exists());
+    // Cleanup attempted BOTH eligible files (so the loop genuinely continued
+    // past the failing removal), but counts only the one it actually removed.
+    assert_eq!(deleted, 1, "only the successful removal is counted");
+    assert!(
+        remove_attempts.iter().any(|p| p.ends_with("raced.json")),
+        "the failing file's removal must actually be attempted: {remove_attempts:?}"
+    );
+    assert!(
+        remove_attempts.iter().any(|p| p.ends_with("survivor.json")),
+        "cleanup must continue to the survivor after the failed removal: {remove_attempts:?}"
+    );
+    // `survivor` was really deleted; the raced file is left as our remover never
+    // removed it (it returned `Err`).
+    assert!(!survivor.exists(), "the survivor is removed for real");
+    assert!(
+        raced.exists(),
+        "the raced file was not removed (remover returned Err)"
+    );
 }

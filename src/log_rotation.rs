@@ -34,6 +34,21 @@ const ELIGIBLE_EXTENSIONS: [&str; 2] = ["json", "ndjson"];
 /// This is blocking IO; do not call it directly on the async runtime. Use
 /// [`spawn_cleanup`] from async contexts.
 pub fn cleanup_dump_files(dir: &Path, max_age: Duration, now: SystemTime) -> usize {
+    cleanup_dump_files_with_remover(dir, max_age, now, |path| fs::remove_file(path))
+}
+
+/// [`cleanup_dump_files`] with the per-file removal injected, so a test can drive
+/// the removal-error-tolerance path deterministically (force `Err` for one
+/// eligible file and confirm cleanup still removes the rest, counting only the
+/// successes) without racing the filesystem. Production always passes
+/// [`fs::remove_file`]; this is the same `now`-injection seam the rest of the
+/// module already relies on, extended to the removal call.
+pub fn cleanup_dump_files_with_remover(
+    dir: &Path,
+    max_age: Duration,
+    now: SystemTime,
+    mut remove: impl FnMut(&Path) -> std::io::Result<()>,
+) -> usize {
     // Missing directory (or a path that isn't a directory) -> nothing to do.
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -67,7 +82,7 @@ pub fn cleanup_dump_files(dir: &Path, max_age: Duration, now: SystemTime) -> usi
 
         if is_older_than_cutoff(&metadata, cutoff) {
             // Tolerate races: only count a deletion that actually succeeded.
-            match fs::remove_file(&path) {
+            match remove(&path) {
                 Ok(()) => deleted += 1,
                 Err(error) => {
                     tracing::debug!(
