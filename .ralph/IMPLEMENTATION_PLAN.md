@@ -330,14 +330,14 @@ coverage change). R1 (2 MEDIUM keepalive-hang + race-order, 1 LOW shadowed key) 
 > the missing `stop` arm); **12.9 bundles** both sides of the `tool_calls` wire-string contract. Obey
 > AGENTS.md "Hard rules in the engine"; do NOT re-raise the adjudicated invalid findings below.
 
-## STATUS (⬜ PENDING — 0/10)
+## STATUS (🔄 IN PROGRESS — 1/10)
 
 **TODO (sequenced):** 12.1, 12.2 (HIGH) → 12.3, 12.4, 12.5, 12.6, 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
 Per-task loop = read spec → implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 
 ### Task 12.1 — Anthropic stop_sequences honor OPENAI_MAX_STOP=4 hard-rule (400)
-**Priority:** HIGH · **Spec:** `.ralph/specs/U1-stop-sequences-hardrule.md` · **Status:** ⬜ PENDING
+**Priority:** HIGH · **Spec:** `.ralph/specs/U1-stop-sequences-hardrule.md` · **Status:** ✅ DONE `7d80dc6` (Codex-xhigh APPROVED, round 2). Routed `stop_sequences` through `normalize_stop` into typed `ResponsesRequest.stop`; removed `extra_body["stop"]` smuggling. Round-1 HIGH (configured `stop` default shadowing typed `stop` → dup wire key) fixed by adding the `"stop" => request.stop.is_some()` arm to `chat_request_field_is_set` (the 12.2 arm, landed early) + `merge_{upstream,fallback}_chat_kwargs_does_not_shadow_typed_stop` regressions. **12.2 now narrows to the helper-collapse + remaining wire/alias tests — its `"stop"` arm is already in place.**
 **Thermo finding:** Anthropic `stop_sequences` are mapped RAW into `extra_body["stop"]` (`src/adapters/anthropic_to_responses.rs:39-45`) while typed `ResponsesRequest.stop` stays `None` (`:79`); the OPENAI_MAX_STOP_SEQUENCES=4 → 400 ceiling in `normalize_stop` (`src/models/chat.rs:84-101`) only runs on the typed field (`src/engine.rs:1383`), so >4 sequences silently bypass the "400, not truncate" hard rule.
 **Fix:** Route `request.stop_sequences` through `crate::models::chat::normalize_stop` inside `convert_request` and assign the result to the typed `ResponsesRequest.stop`; delete the `extra_body.insert("stop", …)` smuggling at `:39-45`. `convert_request` already returns `AppResult` so the >4 → `AppError::bad_request` propagates as a 400. Empty / all-empty lists collapse to `None` via the same normalizer.
 **Files:** src/adapters/anthropic_to_responses.rs, src/models/chat.rs, tests/port_translation.rs
