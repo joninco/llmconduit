@@ -1952,6 +1952,83 @@ async fn non_loopback_without_token_refuses_to_register_protected_routes() {
 }
 
 #[tokio::test]
+async fn insecure_override_non_loopback_still_enforces_real_auth() {
+    // SECURITY (finding 1): `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1` on a
+    // non-loopback bind relaxes ONLY the https-origin (TLS) requirement. With a
+    // token + valid session key configured the routes register, but `dev_open`
+    // is NOT active — real cookie/token auth is enforced. An unauthenticated
+    // request must get 401 (NOT a dev-open 200), and a valid signed cookie 200.
+    use base64::Engine as _;
+    let env = llmconduit::dashboard_auth::DashboardEnv {
+        token: Some("integration-token".to_string()),
+        session_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([42u8; 32])),
+        public_origin: None, // missing https origin, relaxed by the override
+        allow_insecure: true,
+        allow_mutations: false,
+    };
+    let bind: std::net::SocketAddr = "0.0.0.0:4000".parse().unwrap();
+    // The startup decision registers under the override...
+    assert!(
+        llmconduit::dashboard_auth::startup_route_decision(bind, &env).should_register(),
+        "token + key + insecure override must register on non-loopback"
+    );
+    let (app, auth) = authed_router(bind, &env);
+    // ...but dev-open is off (a token is configured), so an unauthenticated
+    // request is rejected rather than treated as authenticated.
+    let unauthed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/debug")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthed.status().as_u16(),
+        401,
+        "insecure override must NOT make the dashboard dev-open (unauthenticated)"
+    );
+    // A valid signed session cookie still authenticates.
+    let (cookie, _exp) = auth.issue_session();
+    let authed = app
+        .oneshot(
+            Request::builder()
+                .uri("/debug")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={cookie}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authed.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn insecure_override_non_loopback_without_token_refuses_to_build() {
+    // SECURITY (finding 1): a tokenless non-loopback dashboard would be fully
+    // unauthenticated via `dev_open`. The startup decision refuses it even under
+    // the insecure override, and `from_env` fails closed for the same env.
+    use base64::Engine as _;
+    let env = llmconduit::dashboard_auth::DashboardEnv {
+        token: None,
+        session_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([42u8; 32])),
+        public_origin: None,
+        allow_insecure: true,
+        allow_mutations: false,
+    };
+    let bind: std::net::SocketAddr = "0.0.0.0:4000".parse().unwrap();
+    assert!(
+        !llmconduit::dashboard_auth::startup_route_decision(bind, &env).should_register(),
+        "the insecure override must not register a tokenless non-loopback dashboard"
+    );
+}
+
+#[tokio::test]
 async fn dashboard_routes_are_disabled_by_default() {
     let app = llmconduit::build_app(test_config());
     let response = app

@@ -22,6 +22,7 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -121,18 +122,29 @@ pub async fn debug_ws(
 async fn debug_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_exp: u64) {
     let mut receiver = gateway.subscribe_monitor();
     let snapshot = gateway.debug_snapshot();
-    for message in snapshot.messages {
-        if !send_message(&mut socket, &message).await {
-            return;
-        }
-    }
 
-    // Close the socket when the session cookie expires (no WS outliving its
-    // cookie). `session_exp == u64::MAX` (dev-open: no token configured) yields
-    // an effectively-infinite timer that never fires; a real cookie carries a
+    // Arm the expiry timer BEFORE replaying the retained snapshot. The socket
+    // must close at the cookie `exp` even mid-snapshot — under backpressure a
+    // near-expired cookie could otherwise keep receiving snapshot frames after
+    // `exp`. `session_exp == u64::MAX` (dev-open: no token configured) yields an
+    // effectively-infinite timer that never fires; a real cookie carries a
     // bounded future `exp`.
     let expiry = wait_for_session_expiry(session_exp);
     tokio::pin!(expiry);
+
+    // Snapshot replay, racing the expiry timer: a cookie that expires during
+    // replay closes the socket instead of finishing the (possibly large)
+    // backlog. The race is factored into `replay_snapshot` over a `FrameSink` so
+    // it is unit-testable with a paused clock + a mock sink (the socket itself
+    // can't be constructed off a real upgrade).
+    match replay_snapshot(&snapshot.messages, expiry.as_mut(), &mut socket).await {
+        ReplayOutcome::Completed => {}
+        ReplayOutcome::Expired => {
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+        ReplayOutcome::SendFailed => return,
+    }
 
     loop {
         tokio::select! {
@@ -157,6 +169,56 @@ async fn debug_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_exp:
             }
         }
     }
+}
+
+/// A sink for one monitor frame. Abstracts the WS socket so the snapshot-replay
+/// race ([`replay_snapshot`]) is unit-testable with a mock sink — an
+/// `axum` `WebSocket` can't be constructed off a real upgrade in a unit test.
+trait FrameSink {
+    /// Send one frame; `false` means the peer is gone (replay should stop).
+    fn send_frame(&mut self, message: &DebugWsMessage) -> impl Future<Output = bool>;
+}
+
+impl FrameSink for WebSocket {
+    fn send_frame(&mut self, message: &DebugWsMessage) -> impl Future<Output = bool> {
+        send_message(self, message)
+    }
+}
+
+/// Outcome of [`replay_snapshot`]: the retained backlog drained fully, the
+/// session expired mid-replay (caller must send the WS `Close`), or a send
+/// failed (peer gone — caller returns).
+#[derive(Debug, PartialEq, Eq)]
+enum ReplayOutcome {
+    Completed,
+    Expired,
+    SendFailed,
+}
+
+/// Replay the retained snapshot `messages` into `sink`, racing each send against
+/// the already-armed `expiry` future. If `expiry` resolves first — even between
+/// frames, under backpressure — replay stops with [`ReplayOutcome::Expired`] so
+/// the socket closes at the cookie `exp` instead of finishing a large backlog
+/// past expiry. A failed send yields [`ReplayOutcome::SendFailed`]. The race is
+/// `biased` so a ready expiry wins deterministically over a ready send (the
+/// connection must not outlive `exp`).
+async fn replay_snapshot(
+    messages: &[DebugWsMessage],
+    mut expiry: std::pin::Pin<&mut (impl Future<Output = ()> + ?Sized)>,
+    sink: &mut impl FrameSink,
+) -> ReplayOutcome {
+    for message in messages {
+        tokio::select! {
+            biased;
+            _ = expiry.as_mut() => return ReplayOutcome::Expired,
+            sent = sink.send_frame(message) => {
+                if !sent {
+                    return ReplayOutcome::SendFailed;
+                }
+            }
+        }
+    }
+    ReplayOutcome::Completed
 }
 
 /// Sleep until the session `exp` (unix secs) is reached, then return. A
@@ -252,5 +314,107 @@ mod tests {
         waiter
             .await
             .expect("already-expired wait completes immediately");
+    }
+
+    fn snapshot_msgs(n: usize) -> Vec<DebugWsMessage> {
+        (0..n).map(|_| DebugWsMessage::SnapshotDone).collect()
+    }
+
+    /// A mock [`FrameSink`]: counts sends, optionally sleeps per send to model
+    /// backpressure, and optionally "fails" (peer gone) at a given send index.
+    struct MockSink {
+        sent: usize,
+        per_send: Duration,
+        fail_at: Option<usize>,
+    }
+
+    impl MockSink {
+        fn instant() -> Self {
+            Self {
+                sent: 0,
+                per_send: Duration::ZERO,
+                fail_at: None,
+            }
+        }
+    }
+
+    impl FrameSink for MockSink {
+        async fn send_frame(&mut self, _message: &DebugWsMessage) -> bool {
+            // Count BEFORE the await so a frame whose send is cancelled by the
+            // expiry race does not count as sent (the select drops this future).
+            // We increment only once we've committed to delivering it.
+            if self.per_send > Duration::ZERO {
+                tokio::time::sleep(self.per_send).await;
+            }
+            self.sent += 1;
+            !matches!(self.fail_at, Some(at) if self.sent == at)
+        }
+    }
+
+    /// A non-expiring session replays the whole backlog.
+    #[tokio::test(start_paused = true)]
+    async fn replay_completes_and_sends_all_when_not_expired() {
+        let expiry = wait_for_session_expiry(now_unix() + 3600);
+        tokio::pin!(expiry);
+        let mut sink = MockSink::instant();
+        let outcome = replay_snapshot(&snapshot_msgs(5), expiry.as_mut(), &mut sink).await;
+        assert_eq!(outcome, ReplayOutcome::Completed);
+        assert_eq!(sink.sent, 5, "every retained frame replayed");
+    }
+
+    /// REGRESSION (finding 4): the expiry timer is armed BEFORE snapshot replay.
+    /// An already-expired cookie must close the socket WITHOUT replaying any
+    /// retained frame — previously the snapshot was flushed before the timer was
+    /// armed, so a near-/already-expired cookie still received snapshot frames.
+    #[tokio::test(start_paused = true)]
+    async fn replay_with_expired_cookie_sends_nothing_and_closes() {
+        let expiry = wait_for_session_expiry(now_unix().saturating_sub(10));
+        tokio::pin!(expiry);
+        let mut sink = MockSink::instant();
+        let outcome = replay_snapshot(&snapshot_msgs(5), expiry.as_mut(), &mut sink).await;
+        assert_eq!(
+            outcome,
+            ReplayOutcome::Expired,
+            "an already-expired cookie must yield Expired (socket gets a Close)"
+        );
+        assert_eq!(sink.sent, 0, "no snapshot frame may be sent after exp");
+    }
+
+    /// A cookie that expires PART-WAY through a slow (backpressured) replay stops
+    /// mid-snapshot with `Expired` rather than draining the whole backlog past
+    /// `exp`. Each send blocks (simulating backpressure); under the paused clock
+    /// tokio auto-advances to the earliest timer, so the expiry deadline wins.
+    #[tokio::test(start_paused = true)]
+    async fn replay_expiring_mid_backlog_stops_early() {
+        // exp 5s out; each frame takes 2s to flush → a later send straddles exp.
+        let expiry = wait_for_session_expiry(now_unix() + 5);
+        tokio::pin!(expiry);
+        let mut sink = MockSink {
+            sent: 0,
+            per_send: Duration::from_secs(2),
+            fail_at: None,
+        };
+        let outcome = replay_snapshot(&snapshot_msgs(100), expiry.as_mut(), &mut sink).await;
+        assert_eq!(outcome, ReplayOutcome::Expired);
+        assert!(
+            (1..100).contains(&sink.sent),
+            "replay stopped mid-backlog at exp (sent {} of 100)",
+            sink.sent
+        );
+    }
+
+    /// A peer that drops mid-replay surfaces `SendFailed` (caller returns).
+    #[tokio::test(start_paused = true)]
+    async fn replay_send_failure_short_circuits() {
+        let expiry = wait_for_session_expiry(now_unix() + 3600);
+        tokio::pin!(expiry);
+        let mut sink = MockSink {
+            sent: 0,
+            per_send: Duration::ZERO,
+            fail_at: Some(2), // the 2nd send "fails"
+        };
+        let outcome = replay_snapshot(&snapshot_msgs(5), expiry.as_mut(), &mut sink).await;
+        assert_eq!(outcome, ReplayOutcome::SendFailed);
+        assert_eq!(sink.sent, 2, "stopped at the failing send");
     }
 }

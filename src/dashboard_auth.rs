@@ -49,6 +49,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use hmac::Hmac;
 use hmac::Mac;
 use serde::Deserialize;
+use sha2::Digest;
 use sha2::Sha256;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -238,18 +239,22 @@ impl DashboardAuth {
     ///
     /// Rules (mirrors the spec):
     /// - `LLMCONDUIT_DASHBOARD_SESSION_KEY`: must decode to ≥ 32 bytes when set.
-    ///   On a loopback bind it may be auto-generated (logged as temporary);
-    ///   on a non-loopback bind it is REQUIRED.
+    ///   On a loopback bind it may be auto-generated (logged as temporary); on a
+    ///   non-loopback bind it is REQUIRED — a missing key fails closed here (no
+    ///   silent ephemeral key), independent of [`startup_route_decision`].
     /// - `LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN`: must be a valid `https://` origin
     ///   when set; required on a non-loopback bind (unless insecure override).
-    /// - `LLMCONDUIT_DASHBOARD_TOKEN`: required on a non-loopback bind (unless
-    ///   insecure override); optional (dev concession) on loopback.
+    /// - `LLMCONDUIT_DASHBOARD_TOKEN`: required on a non-loopback bind (the
+    ///   insecure override does NOT relax this); optional (dev concession) on
+    ///   loopback, where `dev_open` then authenticates every request.
     ///
-    /// Returns `Err` only for a malformed value (bad base64 / too-short key /
-    /// bad origin). The *route-registration* refusal (missing required secrets
-    /// on a non-loopback bind) is a separate, testable decision —
-    /// [`startup_route_decision`] — so a misconfigured production server refuses
-    /// to expose the routes rather than failing to construct the auth context.
+    /// Returns `Err` for a malformed value (bad base64 / too-short key / bad
+    /// origin) OR a missing session key on a non-loopback bind. The
+    /// *route-registration* refusal (missing token/key/origin on a non-loopback
+    /// bind) is a separate, testable decision — [`startup_route_decision`] — so a
+    /// misconfigured production server refuses to expose the routes; this
+    /// constructor additionally fails closed so a direct caller cannot obtain an
+    /// auto-keyed non-loopback context.
     pub fn from_env(
         bind_addr: SocketAddr,
         env: &DashboardEnv,
@@ -259,20 +264,26 @@ impl DashboardAuth {
 
         let session_key = match env.session_key_b64.as_deref() {
             Some(encoded) => decode_session_key(encoded)?,
-            None => {
+            None if loopback => {
                 // No key configured. On loopback we auto-generate an ephemeral
-                // one (sessions do not survive a restart — documented). On a
-                // non-loopback bind a key is required; we still generate one so
-                // the auth context is constructible, but the route decision will
-                // refuse to register the protected routes.
-                let generated = generate_session_key();
-                if loopback {
-                    warnings.push(format!(
-                        "{ENV_SESSION_KEY} not set; generated a temporary loopback-dev signing key \
-                         (sessions reset on restart; the key is never logged)"
-                    ));
-                }
-                generated
+                // one (sessions do not survive a restart — documented).
+                warnings.push(format!(
+                    "{ENV_SESSION_KEY} not set; generated a temporary loopback-dev signing key \
+                     (sessions reset on restart; the key is never logged)"
+                ));
+                generate_session_key()
+            }
+            None => {
+                // Non-loopback bind with no key: ephemeral auto-generation is a
+                // loopback-only concession. Refuse rather than silently signing
+                // sessions with a per-process key the operator never set. (The
+                // route decision also refuses this, but `from_env` fails closed
+                // independently so a direct caller can't get an auto-keyed
+                // non-loopback context.)
+                return Err(format!(
+                    "{ENV_SESSION_KEY} is required on a non-loopback bind (>= {MIN_SESSION_KEY_BYTES} \
+                     decoded bytes of base64); ephemeral key generation is loopback-dev only"
+                ));
             }
         };
 
@@ -530,21 +541,32 @@ impl MutationPolicy for DashboardAuth {
 /// Why the protected routes were refused (for a precise startup log/test).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteRefusal {
+    /// No `LLMCONDUIT_DASHBOARD_TOKEN`. ALWAYS fatal on a non-loopback bind —
+    /// the `ALLOW_INSECURE_DASHBOARD` override does NOT relax this (a tokenless
+    /// non-loopback dashboard would be fully unauthenticated via `dev_open`).
     MissingToken,
+    /// No valid `LLMCONDUIT_DASHBOARD_SESSION_KEY` (missing or < 32 decoded
+    /// bytes). ALWAYS fatal on a non-loopback bind — ephemeral key generation is
+    /// a loopback-only dev concession.
+    MissingSessionKey,
+    /// No valid `https://` `LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN`. Fatal on a
+    /// non-loopback bind UNLESS `ALLOW_INSECURE_DASHBOARD=1` relaxes the TLS
+    /// requirement.
     MissingHttpsOrigin,
-    MissingTokenAndOrigin,
 }
 
 impl RouteRefusal {
     pub fn reason(self) -> &'static str {
         match self {
             Self::MissingToken => "LLMCONDUIT_DASHBOARD_TOKEN is required on a non-loopback bind",
-            Self::MissingHttpsOrigin => {
-                "a valid https:// LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN is required on a non-loopback bind"
+            Self::MissingSessionKey => {
+                "a valid LLMCONDUIT_DASHBOARD_SESSION_KEY (>= 32 decoded bytes of base64) is \
+                 required on a non-loopback bind"
             }
-            Self::MissingTokenAndOrigin => {
-                "LLMCONDUIT_DASHBOARD_TOKEN and a valid https:// LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN \
-                 are required on a non-loopback bind"
+            Self::MissingHttpsOrigin => {
+                "a valid https:// LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN is required on a non-loopback \
+                 bind (or set LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1 to relax ONLY the TLS \
+                 requirement)"
             }
         }
     }
@@ -571,10 +593,16 @@ impl RouteDecision {
 /// Decide whether the protected routes may register.
 ///
 /// - **Loopback bind:** always register. A missing token is a dev concession
-///   (warned); a missing https origin is fine (localhost is not TLS).
-/// - **Non-loopback bind:** require BOTH a token AND a valid `https://` public
-///   origin. If either is missing, REFUSE — unless `ALLOW_INSECURE_DASHBOARD=1`,
-///   which registers anyway with a loud warning (air-gapped LAN escape hatch).
+///   (warned, and `dev_open` authenticates every request — reachable ONLY here);
+///   a missing session key is auto-generated; a missing https origin is fine
+///   (localhost is not TLS).
+/// - **Non-loopback bind:** require a token AND a valid session key AND a valid
+///   `https://` public origin. `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1` relaxes
+///   ONLY the https-origin (TLS) requirement — it does NOT relax the token or
+///   session-key requirements. A tokenless non-loopback dashboard would be fully
+///   unauthenticated (`dev_open` treats every request as authed), so the token
+///   is a hard requirement regardless of the insecure override; the session key
+///   is required because ephemeral key generation is a loopback-only concession.
 ///
 /// A *malformed* public origin (bad URL / not https) counts as "missing" here
 /// so the routes refuse rather than register with an unusable origin; the
@@ -591,35 +619,49 @@ pub fn startup_route_decision(bind_addr: SocketAddr, env: &DashboardEnv) -> Rout
         return RouteDecision::Register { warnings };
     }
 
-    let has_token = env.token.is_some();
+    // Non-loopback. The token and session key are ALWAYS required (the insecure
+    // override never relaxes them); the https origin is required UNLESS overridden.
+    if env.token.is_none() {
+        return RouteDecision::Refuse(RouteRefusal::MissingToken);
+    }
+    if !has_valid_session_key(env) {
+        return RouteDecision::Refuse(RouteRefusal::MissingSessionKey);
+    }
+
     let has_https_origin = env
         .public_origin
         .as_deref()
         .is_some_and(|raw| PublicOrigin::parse(raw).is_ok());
-
-    if has_token && has_https_origin {
+    if has_https_origin {
         return RouteDecision::Register {
             warnings: Vec::new(),
         };
     }
 
+    // Token + key are present, but the https origin is missing/malformed. The
+    // override relaxes ONLY this TLS requirement (and only this) — real
+    // cookie/token auth is still enforced (`dev_open` is unreachable here
+    // because a token is configured).
     if env.allow_insecure {
         return RouteDecision::Register {
             warnings: vec![format!(
                 "{ENV_ALLOW_INSECURE}=1 on a non-loopback bind: serving /dashboard and /debug \
-                 WITHOUT the required token/https-origin guarantees — credentials and transcripts \
-                 may be exposed in plaintext"
+                 over plaintext WITHOUT a validated https {ENV_PUBLIC_ORIGIN} — credentials and \
+                 transcripts may be exposed in transit (token + session auth are STILL enforced)"
             )],
         };
     }
+    RouteDecision::Refuse(RouteRefusal::MissingHttpsOrigin)
+}
 
-    let refusal = match (has_token, has_https_origin) {
-        (false, false) => RouteRefusal::MissingTokenAndOrigin,
-        (false, true) => RouteRefusal::MissingToken,
-        (true, false) => RouteRefusal::MissingHttpsOrigin,
-        (true, true) => unreachable!("handled by the register branch above"),
-    };
-    RouteDecision::Refuse(refusal)
+/// Whether `env` carries a session key that decodes to a valid (≥ 32 byte) HMAC
+/// key. Mirrors [`decode_session_key`] so the startup decision refuses a
+/// non-loopback bind whose key is missing or too short BEFORE
+/// [`DashboardAuth::from_env`] would silently auto-generate an ephemeral one.
+fn has_valid_session_key(env: &DashboardEnv) -> bool {
+    env.session_key_b64
+        .as_deref()
+        .is_some_and(|encoded| decode_session_key(encoded).is_ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -910,25 +952,36 @@ fn generate_session_key() -> Vec<u8> {
     key
 }
 
-/// Constant-time byte-slice equality that does not early-return on a length
-/// mismatch. `subtle::ConstantTimeEq` requires equal lengths; we fold the
-/// length check into the comparison so callers don't branch on `len()` (which
-/// would leak length via timing). Unequal lengths always compare not-equal.
+/// Constant-time, **length-independent** byte-slice equality. Used for the
+/// token, session MAC, and CSRF comparisons — all of which may compare slices
+/// of differing length (a presented token/cookie is attacker-sized).
+///
+/// `subtle::ConstantTimeEq` on `[u8]` requires equal lengths and would itself
+/// short-circuit (leaking length via timing) on a mismatch. Instead we hash
+/// BOTH sides to a fixed 32-byte SHA-256 digest and compare the digests in
+/// constant time, then fold in a constant-time length-equality bit. Because the
+/// comparison always runs over two fixed-width digests, the work is independent
+/// of either input's length, and there is NO early return / branch on the
+/// secret-dependent comparison: the length bit is combined with a bitwise `&`
+/// on the `subtle::Choice`, which is constant-time. Hashing also means an
+/// attacker observing timing learns nothing about the secret's contents
+/// (digests of unequal inputs differ pseudo-randomly).
 trait CtEqPadded {
     fn ct_eq_padded(&self, other: &[u8]) -> subtle::Choice;
 }
 
 impl CtEqPadded for [u8] {
     fn ct_eq_padded(&self, other: &[u8]) -> subtle::Choice {
-        // Length inequality → definitely not equal, but still walk a fixed
-        // amount of work. We MAC-compare equal-length byte strings in practice
-        // (HMAC outputs, UUID tokens), so the common path is the true
-        // constant-time `ct_eq`; the length guard only short-circuits the
-        // degenerate unequal-length case.
-        if self.len() != other.len() {
-            return subtle::Choice::from(0);
-        }
-        self.ct_eq(other)
+        // Fixed-width digests → the constant-time compare runs over 32 bytes
+        // regardless of input length (no length-dependent work, no early
+        // return). SHA-256 is a fixed pre-comparison transform on both sides.
+        let lhs = Sha256::digest(self);
+        let rhs = Sha256::digest(other);
+        // Length-equality is folded in (constant-time `&`) so distinct-length
+        // inputs that happen to collide in digest still compare not-equal,
+        // WITHOUT branching on `len()` before the compare.
+        let len_eq = (self.len() as u64).ct_eq(&(other.len() as u64));
+        lhs.ct_eq(rhs.as_slice()) & len_eq
     }
 }
 
@@ -990,8 +1043,10 @@ mod tests {
 
     #[test]
     fn non_loopback_without_https_origin_refuses_routes() {
+        // Token + key present so the https-origin check is the one that fires.
         let env = DashboardEnv {
             token: Some("t".to_string()),
+            session_key_b64: Some(key_b64()),
             public_origin: None,
             ..Default::default()
         };
@@ -1004,9 +1059,11 @@ mod tests {
 
     #[test]
     fn non_loopback_with_http_origin_is_treated_as_missing() {
-        // A non-https origin is not a valid PUBLIC_ORIGIN → refuse.
+        // A non-https origin is not a valid PUBLIC_ORIGIN → refuse (token + key
+        // present so the origin check is reached).
         let env = DashboardEnv {
             token: Some("t".to_string()),
+            session_key_b64: Some(key_b64()),
             public_origin: Some("http://dash.example.com".to_string()),
             ..Default::default()
         };
@@ -1018,12 +1075,114 @@ mod tests {
     }
 
     #[test]
-    fn non_loopback_without_token_or_origin_refuses_with_combined_reason() {
+    fn non_loopback_bare_env_refuses_on_token_first() {
+        // With nothing configured, the token is the first (and unrelaxable)
+        // requirement checked → MissingToken (not origin).
         let env = DashboardEnv::default();
+        let decision = startup_route_decision(public_bind(), &env);
+        assert_eq!(decision, RouteDecision::Refuse(RouteRefusal::MissingToken));
+    }
+
+    #[test]
+    fn non_loopback_with_token_but_no_session_key_refuses() {
+        // Token + https origin present but NO session key → refuse (ephemeral
+        // key generation is loopback-only; the spec requires the key here).
+        let env = DashboardEnv {
+            token: Some("t".to_string()),
+            session_key_b64: None,
+            public_origin: Some("https://dash.example.com".to_string()),
+            ..Default::default()
+        };
         let decision = startup_route_decision(public_bind(), &env);
         assert_eq!(
             decision,
-            RouteDecision::Refuse(RouteRefusal::MissingTokenAndOrigin)
+            RouteDecision::Refuse(RouteRefusal::MissingSessionKey)
+        );
+    }
+
+    #[test]
+    fn non_loopback_with_short_session_key_refuses() {
+        // A present-but-too-short key is as good as missing for the predicate.
+        let env = DashboardEnv {
+            token: Some("t".to_string()),
+            session_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([1u8; 16])),
+            public_origin: Some("https://dash.example.com".to_string()),
+            ..Default::default()
+        };
+        let decision = startup_route_decision(public_bind(), &env);
+        assert_eq!(
+            decision,
+            RouteDecision::Refuse(RouteRefusal::MissingSessionKey)
+        );
+    }
+
+    // -- insecure override: relaxes ONLY https, never the token/key -----------
+
+    #[test]
+    fn insecure_override_does_not_relax_missing_token() {
+        // ALLOW_INSECURE=1 on a non-loopback bind with NO token must STILL refuse:
+        // a tokenless dashboard is `dev_open` (every request authed) — an
+        // unauthenticated dashboard on a LAN. The override only relaxes TLS.
+        let env = DashboardEnv {
+            token: None,
+            session_key_b64: Some(key_b64()),
+            public_origin: None,
+            allow_insecure: true,
+            ..Default::default()
+        };
+        let decision = startup_route_decision(public_bind(), &env);
+        assert_eq!(
+            decision,
+            RouteDecision::Refuse(RouteRefusal::MissingToken),
+            "insecure override must NOT register a tokenless non-loopback dashboard"
+        );
+        assert!(!decision.should_register());
+    }
+
+    #[test]
+    fn insecure_override_does_not_relax_missing_session_key() {
+        // ALLOW_INSECURE=1 + token but NO session key → still refuse (key is not
+        // a TLS concern; only the https origin is relaxed).
+        let env = DashboardEnv {
+            token: Some("t".to_string()),
+            session_key_b64: None,
+            public_origin: None,
+            allow_insecure: true,
+            ..Default::default()
+        };
+        let decision = startup_route_decision(public_bind(), &env);
+        assert_eq!(
+            decision,
+            RouteDecision::Refuse(RouteRefusal::MissingSessionKey)
+        );
+    }
+
+    #[test]
+    fn insecure_override_relaxes_only_https_origin() {
+        // ALLOW_INSECURE=1 + token + valid key + NO https origin → register with
+        // a warning. `dev_open` is NOT active because a token is configured:
+        // real cookie/token auth is enforced, so an unauthenticated request 401s.
+        let env = DashboardEnv {
+            token: Some("t".to_string()),
+            session_key_b64: Some(key_b64()),
+            public_origin: None,
+            allow_insecure: true,
+            ..Default::default()
+        };
+        let decision = startup_route_decision(public_bind(), &env);
+        match &decision {
+            RouteDecision::Register { warnings } => {
+                assert!(!warnings.is_empty(), "insecure override must warn");
+            }
+            RouteDecision::Refuse(r) => panic!("expected register, got refuse: {r:?}"),
+        }
+        // The built auth context enforces real auth (token set → not dev-open),
+        // so an unauthenticated request is rejected.
+        let auth = build(public_bind(), &env);
+        assert!(!auth.dev_open(), "a configured token must disable dev-open");
+        assert!(
+            auth.authenticate(&HeaderMap::new()).is_none(),
+            "no cookie/bearer → unauthenticated even under the insecure override"
         );
     }
 
@@ -1034,8 +1193,15 @@ mod tests {
     }
 
     #[test]
-    fn insecure_override_registers_with_warning() {
+    fn insecure_override_registers_with_warning_when_token_and_key_present() {
+        // The override's legitimate use: token + valid key present, only the
+        // https origin relaxed (air-gapped LAN). It registers WITH a warning.
+        // (A tokenless/keyless override is covered by the dedicated
+        // `insecure_override_does_not_relax_*` tests — those must REFUSE.)
         let env = DashboardEnv {
+            token: Some("t".to_string()),
+            session_key_b64: Some(key_b64()),
+            public_origin: None,
             allow_insecure: true,
             ..Default::default()
         };
@@ -1151,6 +1317,46 @@ mod tests {
         };
         let auth = build(loopback(), &env);
         assert!(auth.verify_token("anything"));
+    }
+
+    // -- length-independent constant-time compare -------------------------
+
+    #[test]
+    fn ct_eq_padded_equal_is_true() {
+        assert!(bool::from(b"abcdef".ct_eq_padded(b"abcdef")));
+        // Empty == empty.
+        assert!(bool::from(b"".ct_eq_padded(b"")));
+        // Works at the HMAC width we compare in practice.
+        let a = [7u8; 32];
+        assert!(bool::from(a.ct_eq_padded(&[7u8; 32])));
+    }
+
+    #[test]
+    fn ct_eq_padded_unequal_same_length_is_false() {
+        assert!(!bool::from(b"abcdef".ct_eq_padded(b"abcdeg")));
+        let mut b = [7u8; 32];
+        b[31] = 8;
+        assert!(!bool::from([7u8; 32].ct_eq_padded(&b)));
+    }
+
+    #[test]
+    fn ct_eq_padded_different_length_is_false() {
+        // A prefix/suffix relationship must NOT compare equal, and the length
+        // bit is folded in even when one side is empty.
+        assert!(!bool::from(b"abc".ct_eq_padded(b"abcdef")));
+        assert!(!bool::from(b"abcdef".ct_eq_padded(b"abc")));
+        assert!(!bool::from(b"".ct_eq_padded(b"x")));
+        assert!(!bool::from(b"x".ct_eq_padded(b"")));
+    }
+
+    #[test]
+    fn token_compare_rejects_length_mismatch_via_ct() {
+        // Drives the token path (which routes through ct_eq_padded): a shorter
+        // and a longer presentation are both rejected without leaking via an
+        // early length branch.
+        let auth = build(public_bind(), &env_with_token());
+        assert!(!auth.verify_token("s3cret-tok")); // shorter
+        assert!(!auth.verify_token("s3cret-token-extra")); // longer
     }
 
     // -- session cookie sign/verify ---------------------------------------
