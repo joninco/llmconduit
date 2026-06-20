@@ -9,8 +9,8 @@ import { getConnection, teardownSession } from './api/connection';
 import { useAuth } from './store/hooks';
 import { LoginShell } from './components/LoginShell';
 import { NavTabs } from './components/NavTabs';
-import { StatsStrip } from './components/StatsStrip';
-import { Scrubber } from './components/Scrubber';
+import { StatsStrip } from './components/StatsStrip/StatsStrip';
+import { Scrubber } from './components/Scrubber/Scrubber';
 import { useHashRoute } from './router/useHashRoute';
 import { VIEW_BY_ROUTE } from './views/registry';
 
