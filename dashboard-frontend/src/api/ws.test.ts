@@ -75,12 +75,36 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     socket.handleParsed(JSON.parse(GOLDEN_METRIC_TICK_FRAME_JSON));
     socket.handleParsed(JSON.parse(GOLDEN_TOPOLOGY_FRAME_JSON));
     const st = dashboardStore.getState();
-    // Flows are keyed by api_call_id.
-    expect(st.flows.get('api_001')?.status).toBe('completed');
+    // Flows are keyed by api_call_id; the reconciled contract carries BOTH ids (R4).
+    const flow = st.flows.get('api_001');
+    expect(flow?.status).toBe('completed');
+    expect(flow?.api_call_id).toBe('api_001');
+    expect(flow?.response_id).toBe('resp_001');
     expect(st.metrics?.reqs_per_sec).toBe(4.2);
     expect(st.topologyNodes).toHaveLength(1);
     expect(st.topologyNodes[0]?.status).toBe('healthy');
     expect(st.topologyEdges).toHaveLength(1);
+  });
+
+  it('usage/flow_status: api_call_id REQUIRED, response_id OPTIONAL (R4 reconciliation)', () => {
+    // response_id ABSENT → still valid (optional secondary correlation).
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'usage', api_call_id: 'api_x', prompt: 1, completion: 1, total: 2, cached: 0, reasoning: 0 }],
+    })).toBe(true);
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'flow_status', api_call_id: 'api_x', status: 'open', usage: null, started_ms: 1 }],
+    })).toBe(true);
+    // api_call_id MISSING (only the superseded response_id) → REJECTED.
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'usage', response_id: 'resp_x', prompt: 1, completion: 1, total: 2, cached: 0, reasoning: 0 }],
+    })).toBe(false);
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'flow_status', response_id: 'resp_x', status: 'open', usage: null, started_ms: 1 }],
+    })).toBe(false);
   });
 
   it('drops a stale frame WHOLESALE when seq <= last_seq[domain]', () => {

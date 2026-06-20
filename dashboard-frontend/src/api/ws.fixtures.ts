@@ -51,6 +51,10 @@ export const GOLDEN_MONITOR_FRAME_JSON = JSON.stringify({
 });
 
 /** A standalone `usage` frame (flow domain), keyed by `api_call_id`. */
+// `usage` + `flow_status` carry BOTH `api_call_id` (REQUIRED authoritative key, D1/D13)
+// AND `response_id` (OPTIONAL secondary correlation). D7's spec sketch field names
+// (response_id/served_model) are illustrative + superseded — see types.ts "CONTRACT
+// RECONCILIATION". These bytes are the exact orchestrator-reconciled D7 target.
 export const GOLDEN_USAGE_FRAME_JSON = JSON.stringify({
   domain: 'flow',
   seq: 4,
@@ -59,7 +63,7 @@ export const GOLDEN_USAGE_FRAME_JSON = JSON.stringify({
   ],
 });
 
-/** A `flow_status` frame (flow domain), keyed by `api_call_id`. */
+/** A `flow_status` frame (flow domain), keyed by `api_call_id`; carries `response_id` + `model_served` too. */
 export const GOLDEN_FLOW_STATUS_FRAME_JSON = JSON.stringify({
   domain: 'flow',
   seq: 5,

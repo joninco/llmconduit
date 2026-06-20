@@ -157,10 +157,22 @@ export interface MonitorPayload {
   message: DebugWsMessage;
 }
 
-/** Per-flow usage update. Keyed by `api_call_id` (the authoritative flow key). */
+/**
+ * Per-flow usage update.
+ *
+ * CONTRACT RECONCILIATION (orchestrator-reconciled across D1/D7/D13 — specs are frozen and
+ * NOT edited): the AUTHORITATIVE wire shape = D1's `FlowRecord` (keyed by `api_call_id`) +
+ * D13 (`/flows/:id` with `:id == api_call_id`). D7's spec SKETCH shows `Usage{response_id,
+ * …}` — that field name is ILLUSTRATIVE (the spec uses block-comment placeholders) and is
+ * SUPERSEDED. D7 emits BOTH ids: `api_call_id` (REQUIRED — the authoritative correlation
+ * key for the flow row) plus `response_id` (OPTIONAL — retained as a secondary correlation
+ * to the engine's response id). Validator: require `api_call_id`, accept optional `response_id`.
+ */
 export interface UsagePayload {
   type: 'usage';
+  /** REQUIRED authoritative flow key (matches D1 FlowRecord + D13 `:id`). */
   api_call_id: ApiCallId;
+  /** OPTIONAL secondary correlation id (the engine response id); coexists with api_call_id. */
   response_id?: ResponseId | null;
   prompt: number;
   completion: number;
@@ -199,16 +211,28 @@ export interface MetricTickPayload {
 }
 
 /**
- * Per-flow status update. Keyed by `api_call_id` (matches D1's record key + D6 kill key);
- * `response_id` is optional and coexists. `model_served`/`upstream_target` may be absent
- * until D2 attaches them (mirrors the `Option<String>` fields on `FlowRecord`).
+ * Per-flow status update.
+ *
+ * CONTRACT RECONCILIATION (orchestrator-reconciled across D1/D7/D13 — specs are frozen and
+ * NOT edited): the AUTHORITATIVE wire shape = D1's `FlowRecord` (keyed by `api_call_id`,
+ * field `model_served`) + D13 (`/flows/:id` with `:id == api_call_id`). D7's spec SKETCH
+ * shows `FlowStatus{response_id, served_model, …}` — those field names are ILLUSTRATIVE
+ * (the spec uses block-comment placeholders) and are SUPERSEDED. D7 emits `api_call_id`
+ * (REQUIRED — authoritative key + D6 kill key), `response_id` (OPTIONAL — secondary
+ * correlation), and `model_served` (the served identity; the sketch's `served_model` is
+ * superseded). `model_served`/`upstream_target` may be absent until D2 attaches them
+ * (mirrors the `Option<String>` fields on `FlowRecord`). Validator: require `api_call_id`,
+ * accept optional `response_id`.
  */
 export interface FlowStatusPayload {
   type: 'flow_status';
+  /** REQUIRED authoritative flow key (matches D1 FlowRecord + D6 kill + D13 `:id`). */
   api_call_id: ApiCallId;
+  /** OPTIONAL secondary correlation id (the engine response id); coexists with api_call_id. */
   response_id?: ResponseId | null;
   status: FlowStatus;
   model_requested?: string | null;
+  /** Served identity (D1 `model_served`; supersedes D7 sketch's `served_model`). */
   model_served?: string | null;
   upstream_target?: string | null;
   usage: Usage | null;
