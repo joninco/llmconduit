@@ -12,6 +12,7 @@ pub mod raw;
 pub mod replay;
 pub mod request_log;
 pub mod search;
+pub(crate) mod sse_guard;
 pub mod upstream;
 pub mod vision;
 

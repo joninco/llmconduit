@@ -558,10 +558,10 @@ fn default_min_completion_tokens() -> i64 {
 /// model-output SSE event (typical chunks are well under 1 MiB) so normal
 /// streaming is never affected, while still bounding a hostile/unterminated
 /// frame far below the memory a single oversized accumulation could exhaust.
-/// Returns [`crate::upstream::DEFAULT_MAX_SSE_FRAME_BYTES`], the single source
+/// Returns [`crate::sse_guard::DEFAULT_MAX_SSE_FRAME_BYTES`], the single source
 /// of truth shared with the direct-client default.
 fn default_max_sse_frame_bytes() -> usize {
-    crate::upstream::DEFAULT_MAX_SSE_FRAME_BYTES
+    crate::sse_guard::DEFAULT_MAX_SSE_FRAME_BYTES
 }
 
 /// Default per-session image-cache capacity (G4). Generous enough for a normal
