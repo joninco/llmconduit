@@ -330,10 +330,10 @@ coverage change). R1 (2 MEDIUM keepalive-hang + race-order, 1 LOW shadowed key) 
 > the missing `stop` arm); **12.9 bundles** both sides of the `tool_calls` wire-string contract. Obey
 > AGENTS.md "Hard rules in the engine"; do NOT re-raise the adjudicated invalid findings below.
 
-## STATUS (🔄 IN PROGRESS — 7/10)
+## STATUS (🔄 IN PROGRESS — 8/10)
 
-**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`), 12.4 (`4cd2b44`), 12.5 (`adc5dd7`), 12.6 (`9a42909`), 12.7 (`56c34b2`).
-**TODO (sequenced):** 12.8, 12.9, 12.10 (LOW).
+**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`), 12.4 (`4cd2b44`), 12.5 (`adc5dd7`), 12.6 (`9a42909`), 12.7 (`56c34b2`), 12.8 (`854978b`).
+**TODO (sequenced):** 12.9, 12.10 (LOW).
 Per-task loop = read spec → implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 
@@ -394,7 +394,7 @@ rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 **Sequencing:** Depends on T3 (ToolDeltaGate extraction, FINAL). Self-contained within `src/tool_delta_gate.rs`; no engine or wire change; parallelizable with other Topic-12 tasks.
 
 ### Task 12.8 — Replace flaky wall-clock sleep() test sync with deterministic Notify
-**Priority:** LOW · **Spec:** `.ralph/specs/U8-image-agent-flaky-sleep.md` · **Status:** ⬜ PENDING
+**Priority:** LOW · **Spec:** `.ralph/specs/U8-image-agent-flaky-sleep.md` · **Status:** ✅ DONE `854978b` (Codex-xhigh APPROVED, round 1). `MockVisionClient` gained `entered`/`dropped` `Arc<Notify>` + `.notified()` accessors (entered fires post-request-record in `analyze`; dropped via a `NotifyOnDrop` drop guard on the cancellation path); `block_on`/`requests`/`push_outcome` unchanged. Cancellation test captures both futures up front, awaits `timeout(1s, entered)` before `drop(stream)` and `timeout(1s, dropped)` after (50ms sleep gone, `len()==1` kept); redaction test replaces 100ms sleep with bounded `timeout(1s, poll-until-non-empty)` (all three content assertions + cleanup kept). No `sleep` left (grep-clean); test-only, no `src/` change. 347 + 47 + … tests green.
 **Thermo finding:** Two flaky wall-clock `sleep()` test-sync points — `image_agent_cancellation_drops_vision_work` (`tests/image_agent.rs:379`, 50ms) and `upstream_request_log_redacts_image_data_when_agent_disabled` (`tests/image_agent.rs:1629`, 100ms, race admitted in-comment) — instead of the bounded `Notify`/timeout idiom already in `tests/gateway.rs:5764-5773`.
 **Fix:** Add `entered`/`dropped` `Arc<Notify>` fields + accessors to `MockVisionClient` (`tests/common/mod.rs:301`): notify `entered` at the top of `analyze` after recording the request (`:334`), and fire `dropped` from a drop guard inside `analyze` (mirroring `NotifyOnDrop` at `tests/gateway.rs:179-187`). Rewrite the cancellation test to `await timeout(1s, entered)` before `drop(stream)` and `timeout(1s, dropped)` after, replacing the 50ms sleep. Replace the 100ms sleep in the redaction test with a bounded poll-until-non-empty wrapped in `timeout(1s, …)`. Test-only; no `src/` change and no wire-byte change; all existing assertions preserved.
 **Files:** tests/common/mod.rs, tests/image_agent.rs
