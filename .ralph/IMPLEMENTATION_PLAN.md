@@ -141,11 +141,12 @@ dispatcher, per-session LRU+TTL `ImageCache`, gating. Tests: `tests/gateway.rs` 
 > **Sequencing:** T1 → (T2, T9); T7 → T8; T5 ↔ T6 coordinate; T10, T11 independent. T1 first (it
 > builds the typed resolver T2/T9 consume).
 
-## STATUS (T10 APPROVED — orchestrator resume session `thermo-followups-resume`)
+## STATUS (✅ COMPLETE — all 11 APPROVED — orchestrator resume session `thermo-followups-resume`)
 
-**DONE (Codex-xhigh APPROVED + committed):** T1, T2, T7, T8, T9, T6, T5, T3, T4, T10 (10 of 11).
-**REMAINING:** T11 (streaming/logging test-quality + catalog-parser dedup, depends on T1). Fresh agent; serial.
-**Review log:** `/tmp/thermo-followup-review.md` holds 10 verdicts (T1×2, T2×3, T7×2, T8×1, T9×4, T6×2, T5×2, T3×4, T4×2, T10×2).
+**DONE (Codex-xhigh APPROVED + committed):** T1, T2, T7, T8, T9, T6, T5, T3, T4, T10, T11 (11 of 11 ✅).
+Topic 11 thermo-nuclear follow-ups COMPLETE. No deferred/halted items; every task converged to a clean
+Codex-xhigh APPROVED.
+**Review log:** `/tmp/thermo-followup-review.md` holds 11 verdicts (T1×2, T2×3, T7×2, T8×1, T9×4, T6×2, T5×2, T3×4, T4×2, T10×2, T11×2).
 **Per-task loop** = implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → append verdict to `/tmp/thermo-followup-review.md` → update this plan. STOP when all 11
 APPROVED (see `.ralph/GOAL.md`).
@@ -299,11 +300,20 @@ LOW (pub visibility) fixed in `960e63c`. 3 tests added.
 **Files:** `src/error.rs`, `src/upstream.rs`, `tests/port_errors.rs`.
 
 ### Task 11.11 — Streaming + logging test-quality cleanups
-**Priority:** LOW–MEDIUM · **Spec:** `.ralph/specs/T11-streaming-test-quality.md`
-G3-peek keepalive parameterization across all 3 routes + scheduler-magic harness cleanup; G5
-removal-race test seam; G3 catalog-parser dedup (`extract_model_context_limits`); G7
-`port_config.rs` split.
-**Files:** `tests/port_streaming_peek.rs`, `tests/port_logging.rs`, `src/upstream.rs`, `tests/port_config.rs`.
+**Priority:** LOW–MEDIUM · **Spec:** `.ralph/specs/T11-streaming-test-quality.md` · **Commits:** `31fc5f9` + `8c12092`
+**Status:** ✅ Codex-xhigh APPROVED (R2). (1) G3-peek keepalive parameterized 1→3 ingress routes via an
+`IngressRoute` table + `assert_idle_stream_emits_keepalive_ping`; scheduler-magic replaced with
+advance(16s)-then-read, each read bounded by a paused-time `tokio::time::timeout` (absent ping → clean
+panic, not a hang); mutation-verified per route. (2) G5 removal-race: new
+`cleanup_dump_files_with_remover(dir, max_age, now, remove)` DI seam; the injected remover fails its first
+call / succeeds the second → order-independent proof the loop continues past an `Err`. (3) G3
+catalog-parser dedup: `extract_model_context_limits` deleted; limits now stored in
+`RoutingModelCatalog.union_context_limit_by_id` (populated in `register_routing_model`'s first-seen branch
+over the same `entry_context_limit` → byte-identical; `entry_context_limit` remains the single key
+parser); each of the 5 keys now has isolated positive test coverage + a precedence entry. (4) G7
+`port_config.rs` 1383 → `port_config.rs` 514 + new `port_config_routing.rs` 633 (27 → 27 tests, zero
+coverage change). R1 (2 MEDIUM keepalive-hang + race-order, 1 LOW shadowed key) fixed in `8c12092`.
+**Files:** `tests/port_streaming_peek.rs`, `tests/port_logging.rs`, `src/upstream.rs`, `tests/port_config.rs`, `tests/port_config_routing.rs` (new), `tests/common/mod.rs`.
 **Depends on:** 11.1 (for the catalog-parser dedup item).
 
 ## Thermo-nuclear review — invalid findings (NOT tasks)
