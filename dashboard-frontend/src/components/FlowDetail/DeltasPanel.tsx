@@ -2,14 +2,16 @@
  * Streamed-deltas sub-panel (D10): renders the live `segment_append` stream for the flow's
  * response. Output text is BRIGHT, reasoning is DIM, and tool-call segments render as
  * EXPANDABLE cards (collapsed to the tool name, expand to show the call payload). Consecutive
- * output (or reasoning) segments are coalesced into one block so the rendered stream reads like
- * the model's actual output rather than one node per token.
+ * same-kind segments are coalesced into one block so the rendered stream reads like the model's
+ * actual output rather than one node per token. This INCLUDES tool segments: a real tool call's
+ * arguments stream as MANY adjacent `tool` fragments, so adjacent tool segments accumulate into
+ * ONE card rather than one card per fragment (finding 2).
  */
 import { useState } from 'react';
 import type { DebugSegment } from '../../api/types';
 import { cn } from '../../lib/cn';
 
-/** A coalesced run of same-kind segments (output/reasoning) or a single tool segment. */
+/** A coalesced run of adjacent same-kind segments (output / reasoning / one tool call). */
 interface Block {
   kind: DebugSegment['kind'];
   text: string;
@@ -17,12 +19,17 @@ interface Block {
   ts: number;
 }
 
-/** Coalesces adjacent output/reasoning segments; tool segments stay discrete (each a card). */
+/**
+ * Coalesces adjacent same-kind segments into one block. Output/reasoning runs read as one
+ * passage; an adjacent run of `tool` segments (the streamed argument fragments of a single tool
+ * call) accumulates into ONE card so a fragmented tool call is not split across many cards
+ * (finding 2). A different kind in between (or a non-adjacent tool run) starts a fresh block.
+ */
 function coalesce(segments: DebugSegment[]): Block[] {
   const blocks: Block[] = [];
   for (const seg of segments) {
     const last = blocks[blocks.length - 1];
-    if (seg.kind !== 'tool' && last && last.kind === seg.kind) {
+    if (last && last.kind === seg.kind) {
       last.text += seg.text;
     } else {
       blocks.push({ kind: seg.kind, text: seg.text, ts: seg.timestamp_ms });

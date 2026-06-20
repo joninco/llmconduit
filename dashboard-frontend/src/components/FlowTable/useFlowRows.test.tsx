@@ -95,3 +95,43 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
     expect(merged?.cost).toBe(0.99); // live roll-up preferred over REST
   });
 });
+
+describe('useFlowRows — time-travel seek shows ONLY the frozen snapshot (finding 1)', () => {
+  beforeEach(() => resetWorld());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('does not leak post-seek REST flows into the frozen snapshot rows', async () => {
+    // The `/flows` REST list carries a flow that started AFTER the seeked instant ("the future").
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_future', status: 'open', started_ms: 1_700_000_999_999 })]);
+    // The store holds the FROZEN snapshot the scrubber paused on (one historical flow).
+    seedFlows([makeFlow({ api_call_id: 'api_snapshot', status: 'completed', started_ms: 1_700_000_000_000 })]);
+    // Enter seek (D11 paused) BEFORE render — the live REST merge must be suppressed.
+    act(() => dashboardStore.getState().setConnection('seeking'));
+
+    const { result } = renderRows();
+    // Give any (suppressed) fetch a tick to (not) resolve into the merge.
+    await act(async () => { await Promise.resolve(); });
+
+    const ids = result.current.rows.map((r) => r.api_call_id);
+    expect(ids).toContain('api_snapshot'); // the frozen snapshot row renders
+    expect(ids).not.toContain('api_future'); // the post-seek REST flow does NOT leak in
+    expect(result.current.total).toBe(1); // only the snapshot row is counted
+  });
+
+  it('resumes merging the REST list once back LIVE', async () => {
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_future', status: 'open', started_ms: 1_700_000_999_999 })]);
+    seedFlows([makeFlow({ api_call_id: 'api_snapshot', status: 'completed', started_ms: 1_700_000_000_000 })]);
+    act(() => dashboardStore.getState().setConnection('seeking'));
+    const { result } = renderRows();
+    await act(async () => { await Promise.resolve(); });
+    expect(result.current.rows.map((r) => r.api_call_id)).not.toContain('api_future');
+
+    // Leave seek → live: the REST query enables, fires, and its rows re-join the merge.
+    act(() => dashboardStore.getState().setConnection('live'));
+    await waitFor(() => expect(result.current.rows.some((r) => r.api_call_id === 'api_future')).toBe(true));
+  });
+});

@@ -114,8 +114,26 @@ function walk(path: string, left: unknown, right: unknown, leftHas: boolean, rig
     }
     return;
   }
-  // At least one side is a scalar, OR the container TYPES differ (object vs array vs scalar).
+  // CONTAINER TYPE CHANGE (object↔array): both sides are containers but of different types, so
+  // there is no positional/key correspondence to recurse into. The node itself is `changed`, and
+  // because each side's children render their own lines, mark EVERY old descendant `removed` (left
+  // pane) and EVERY new descendant `added` (right pane) — otherwise the swapped subtree's lines
+  // stay unclassified (finding 3). `markSubtree` overwrites the node tint last so it stays `changed`.
+  if (isContainer(left) && isContainer(right)) {
+    markSubtree(path, left, 'removed', out);
+    markSubtree(path, right, 'added', out);
+    out.set(path, 'changed');
+    return;
+  }
+  // At least one side is a scalar (scalar↔scalar or scalar↔container): a single tint at this path.
+  // A scalar has no descendants, so a scalar↔container swap is just `changed` here (the lone
+  // container side's interior is intentionally not separately tinted — the whole value was replaced).
   out.set(path, leafEqual(left, right) ? 'unchanged' : 'changed');
+}
+
+/** A container is a plain object or an array (the two recursable JSON shapes). */
+function isContainer(v: unknown): v is Record<string, unknown> | unknown[] {
+  return isPlainObject(v) || Array.isArray(v);
 }
 
 /**
@@ -183,5 +201,25 @@ export function diffLayers(left: unknown, right: unknown): DiffMap {
   const out = new Map<string, DiffKind>();
   if (left === undefined || right === undefined) return out;
   walk(ROOT_PATH, left, right, true, true, out);
+  return out;
+}
+
+/**
+ * Tints for the MIDDLE pane (B), which sits between two comparisons: it is the RIGHT side of
+ * A→B (so its `added`/`changed` paths show how the gateway built B from A) AND the LEFT side of
+ * B→C (so a field B carries that C drops must show as `removed`). This overlays the two maps:
+ * an A→B `added`/`changed` classification wins (that is the primary "what B introduced" story);
+ * otherwise a B→C `removed` surfaces a field dropped on the way to C. Rendered with side `both`
+ * (JsonPane) so all three kinds tint. Without this, pane B never shows B→C removals (finding 4).
+ */
+export function combineMiddleDiff(ab: DiffMap, bc: DiffMap): DiffMap {
+  const out = new Map<string, DiffKind>(ab);
+  for (const [path, kind] of bc) {
+    if (kind !== 'removed') continue;
+    const abKind = out.get(path);
+    // Keep an A→B added/changed tint; only fill a removed where A→B did not already flag it.
+    if (abKind === 'added' || abKind === 'changed') continue;
+    out.set(path, 'removed');
+  }
   return out;
 }

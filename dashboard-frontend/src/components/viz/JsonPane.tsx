@@ -31,24 +31,24 @@ function ensureJsonLanguage(): void {
   registered = true;
 }
 
-/** Which side of a layer comparison this pane is on. */
-export type DiffSide = 'left' | 'right';
+/**
+ * Which side of a layer comparison this pane is on. `both` is the MIDDLE pane (B): it is the
+ * right side of A→B and the left side of B→C at once, so it surfaces added/changed AND removed
+ * (the diff is pre-merged by `combineMiddleDiff`) — finding 4.
+ */
+export type DiffSide = 'left' | 'right' | 'both';
 
 /**
  * Background tint for a path's `DiffKind`, from the design tokens (palette `diff*`). A `left`
  * pane only surfaces `removed` (a field dropped by the next layer); a `right` pane surfaces
- * `added`/`changed`. `unchanged` and the irrelevant side get no tint.
+ * `added`/`changed`; the `both` middle pane surfaces all three. `unchanged` and the irrelevant
+ * side get no tint.
  */
 function tintFor(kind: DiffKind | undefined, side: DiffSide): string | undefined {
   if (!kind) return undefined;
-  if (side === 'right') {
-    if (kind === 'added') return colors.diffAddBg;
-    if (kind === 'changed') return colors.diffContextBg;
-    return undefined;
-  }
-  // left pane
-  if (kind === 'removed') return colors.diffRemoveBg;
-  if (kind === 'changed') return colors.diffContextBg;
+  if (kind === 'changed') return colors.diffContextBg; // changed tints on every side
+  if (kind === 'added') return side === 'left' ? undefined : colors.diffAddBg;
+  if (kind === 'removed') return side === 'right' ? undefined : colors.diffRemoveBg;
   return undefined;
 }
 

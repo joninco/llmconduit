@@ -37,6 +37,39 @@ describe('DeltasPanel — output/reasoning/tool from segment_append', () => {
     expect(getByTestId('tool-card-body').textContent).toContain('get_weather');
   });
 
+  it('coalesces fragmented tool-arg deltas into ONE card (finding 2)', () => {
+    // A real tool call streams its arguments as MANY adjacent `tool` fragments. They must
+    // accumulate into a SINGLE card (not one card per fragment), and the reassembled JSON drives
+    // the tool-name label.
+    const { getByTestId, queryAllByTestId } = render(
+      <DeltasPanel
+        segments={[
+          seg('tool', '{"name":"get_'),
+          seg('tool', 'weather","arg'),
+          seg('tool', 'uments":{"city":"SF"}}'),
+        ]}
+      />,
+    );
+    const cards = queryAllByTestId('tool-card');
+    expect(cards).toHaveLength(1); // one coalesced card, not three
+    // Collapsed label resolves the tool name from the REASSEMBLED argument JSON.
+    expect(cards[0]!.textContent).toContain('get_weather');
+    // Expanded body shows the full accumulated argument fragments.
+    fireEvent.click(cards[0]!.querySelector('button')!);
+    expect(getByTestId('tool-card-body').textContent).toContain('"city":"SF"');
+  });
+
+  it('keeps DISTINCT tool runs separated by another kind as separate cards', () => {
+    // A tool run, then output, then another tool run → two cards (only ADJACENT tool fragments
+    // coalesce; an intervening output kind starts a fresh block).
+    const { queryAllByTestId } = render(
+      <DeltasPanel
+        segments={[seg('tool', '{"name":"a"}'), seg('output', 'mid'), seg('tool', '{"name":"b"}')]}
+      />,
+    );
+    expect(queryAllByTestId('tool-card')).toHaveLength(2);
+  });
+
   it('shows the empty state with no segments', () => {
     const { getByTestId } = render(<DeltasPanel segments={[]} />);
     expect(getByTestId('deltas-empty')).toBeTruthy();

@@ -24,8 +24,9 @@ import { StatusChip } from '../FlowTable/StatusChip';
 import { fmtCost, fmtElapsed, fmtModelPair } from '../FlowTable/format';
 import { elapsedMs, flowCost } from '../FlowTable/flowModel';
 import { JsonPane } from '../viz/JsonPane';
-import { diffLayers } from './diff';
+import { combineMiddleDiff, diffLayers } from './diff';
 import { joinMonitor } from './monitorJoin';
+import { mergeDeltas, normalizeRestDeltas } from './deltas';
 import { DeltasPanel } from './DeltasPanel';
 import { Timeline } from './Timeline';
 import { useScrollSync } from './useScrollSync';
@@ -44,9 +45,19 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   const responseId = liveFlow?.response_id ?? detail?.response_id ?? null;
   const join = useMemo(() => joinMonitor(monitor, responseId), [monitor, responseId]);
 
+  // Deltas shown in the sub-panel = the REST replay (base, so a reloaded/completed flow keeps its
+  // streamed output) MERGED with the live monitor segments (appended) — finding 5.
+  const segments = useMemo(
+    () => mergeDeltas(normalizeRestDeltas(detail?.deltas), join.segments),
+    [detail?.deltas, join.segments],
+  );
+
   // Structural diffs between the captured layers (path → kind).
   const diffAB = useMemo(() => diffLayers(detail?.inbound_body, detail?.normalized), [detail?.inbound_body, detail?.normalized]);
   const diffBC = useMemo(() => diffLayers(detail?.normalized, detail?.upstream_body), [detail?.normalized, detail?.upstream_body]);
+  // Pane B sits between both comparisons: it shows what A→B added/changed AND what B→C removes,
+  // so it renders the COMBINED middle diff with side `both` (finding 4).
+  const diffBMiddle = useMemo(() => combineMiddleDiff(diffAB, diffBC), [diffAB, diffBC]);
 
   const sync = useScrollSync(3);
   const isActive = status === 'open';
@@ -105,8 +116,8 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         <JsonPane
           label="B · normalized"
           value={detail?.normalized}
-          diff={diffAB}
-          side="right"
+          diff={diffBMiddle}
+          side="both"
           emptyLabel={emptyBodyLabel(seeking)}
           scrollRef={sync.refFor(1)}
           onScroll={sync.bind(1)}
@@ -139,7 +150,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         <div className="sticky top-0 z-10 border-b border-line bg-panel-raised px-3 py-1 text-[10px] uppercase tracking-wide text-text-muted">
           deltas
         </div>
-        <DeltasPanel segments={join.segments} />
+        <DeltasPanel segments={segments} />
       </div>
     </section>
   );

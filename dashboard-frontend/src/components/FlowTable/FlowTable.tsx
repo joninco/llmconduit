@@ -24,9 +24,17 @@ import { useFlowRows } from './useFlowRows';
 const ROW_HEIGHT = 30;
 const OVERSCAN = 12;
 
-/** Best-effort client label from the row — the mock has none, so fall back to the method. */
+/**
+ * HONEST client (user-agent) label for the row. The flow summary does NOT yet carry a
+ * user-agent — surfacing one is a separate D13 backend task — so this renders a real
+ * user-agent/client field IF the summary ever gains one, else the unavailable marker. It must
+ * NOT mislabel the HTTP method (`POST`) as the client, which it previously did (finding 6).
+ */
 function clientLabel(flow: FlowSummary): string {
-  return flow.method;
+  // Read defensively: the field is not on `FlowSummary` today, but if the backend adds one of
+  // these we surface it without a code change. Until then this honestly renders "—".
+  const f = flow as FlowSummary & { client?: string | null; user_agent?: string | null };
+  return f.client ?? f.user_agent ?? '—';
 }
 
 interface ColumnWidths {

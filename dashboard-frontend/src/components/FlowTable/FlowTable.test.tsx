@@ -125,4 +125,17 @@ describe('FlowTable — live WS update + interactions', () => {
     fireEvent.click(getAllByTestId('flow-row')[0]!.querySelector('button')!);
     expect(onSelect).toHaveBeenCalledWith('api_click');
   });
+
+  it('the client column does NOT mislabel the HTTP method; renders "—" when absent (finding 6)', () => {
+    // The summary carries no user-agent yet, so the client cell must be the honest unavailable
+    // marker — NOT the request method (POST), which it previously showed.
+    seedFlows([makeFlow({ api_call_id: 'api_client', method: 'POST', status: 'completed' })]);
+    const { getAllByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    const row = getAllByTestId('flow-row')[0]!;
+    // The 3rd grid cell is the client column (time, id, client, …).
+    const cells = row.querySelector('button')!.children;
+    const clientCell = cells[2] as HTMLElement;
+    expect(clientCell.textContent).toBe('—');
+    expect(clientCell.textContent).not.toBe('POST');
+  });
 });

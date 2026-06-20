@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { diffLayers, deepEqual } from './diff';
+import { diffLayers, deepEqual, combineMiddleDiff } from './diff';
 
 /**
  * The structural diff is the heart of the inspector. These lock the per-JSON-path contract:
@@ -95,6 +95,68 @@ describe('diffLayers — structural per-path classification', () => {
     expect(d.get('$["x[0]"]')).toBe('changed');
     // It must NOT be mistaken for an array index path.
     expect(d.get('$.x[0]')).toBeUndefined();
+  });
+
+  it('on a CONTAINER type change (object→array) marks old descendants removed + new added (finding 3)', () => {
+    // `tools` flips object → array: there is no key/index correspondence, so the node is `changed`
+    // and EVERY old descendant (object side) is `removed` while EVERY new descendant (array side)
+    // is `added` — otherwise the swapped subtree's lines stay unclassified.
+    const left = { tools: { name: 'search', params: { q: 'hi' } } };
+    const right = { tools: [{ name: 'search' }] };
+    const d = diffLayers(left, right);
+    expect(d.get('$.tools')).toBe('changed'); // the container node itself
+    // Old (object) descendants → removed.
+    expect(d.get('$.tools.name')).toBe('removed');
+    expect(d.get('$.tools.params')).toBe('removed');
+    expect(d.get('$.tools.params.q')).toBe('removed');
+    // New (array) descendants → added.
+    expect(d.get('$.tools[0]')).toBe('added');
+    expect(d.get('$.tools[0].name')).toBe('added');
+  });
+
+  it('array→object container type change classifies descendants too (finding 3)', () => {
+    const left = { x: [1, 2] };
+    const right = { x: { a: 1 } };
+    const d = diffLayers(left, right);
+    expect(d.get('$.x')).toBe('changed');
+    expect(d.get('$.x[0]')).toBe('removed');
+    expect(d.get('$.x[1]')).toBe('removed');
+    expect(d.get('$.x.a')).toBe('added');
+  });
+
+  it('still treats a scalar↔object swap as a single changed (no phantom child paths)', () => {
+    // Regression guard for the existing contract: a SCALAR on one side has no descendants, so the
+    // container-type-change branch must not fire — it stays a lone `changed`.
+    const d = diffLayers({ tool: 'name' }, { tool: { name: 'x' } });
+    expect(d.get('$.tool')).toBe('changed');
+    expect(d.get('$.tool.name')).toBeUndefined();
+  });
+});
+
+describe('combineMiddleDiff — pane B shows A→B added/changed AND B→C removed (finding 4)', () => {
+  it('surfaces a B-only field that C drops as removed in the middle map', () => {
+    // 3 layers: A → B adds `b_only`; B → C drops it. Pane B (the middle) must show `b_only`
+    // as removed (it leaves on the way to C), while still showing what A→B introduced.
+    const a = { keep: 1 };
+    const b = { keep: 1, b_only: 2 }; // A→B added b_only
+    const c = { keep: 1 }; // B→C removed b_only
+    const ab = diffLayers(a, b);
+    const bc = diffLayers(b, c);
+    const mid = combineMiddleDiff(ab, bc);
+    // A→B classified b_only as added; B→C drops it. The added (what B introduced) wins so the
+    // primary "new in B" story is kept, but the field is still classified (not unchanged).
+    expect(mid.get('$.b_only')).toBe('added');
+    // A field present in B and C alike (unchanged A→B, unchanged B→C) stays unclassified-as-change.
+    expect(mid.get('$.keep')).toBe('unchanged');
+  });
+
+  it('marks a field UNCHANGED A→B but dropped B→C as removed in pane B', () => {
+    const a = { keep: 1, drops: 'x' };
+    const b = { keep: 1, drops: 'x' }; // unchanged A→B
+    const c = { keep: 1 }; // B→C removes `drops`
+    const mid = combineMiddleDiff(diffLayers(a, b), diffLayers(b, c));
+    // `drops` was not added/changed by A→B, so the B→C removal surfaces in pane B.
+    expect(mid.get('$.drops')).toBe('removed');
   });
 });
 

@@ -92,6 +92,11 @@ function distinct(rows: FlowSummary[], pick: (r: FlowSummary) => (string | null 
 export function useFlowRows(filters: FlowFilters): FlowRowsResult {
   const order = useDashboard((s) => s.flowOrder);
   const flows = useDashboard((s) => s.flows);
+  // Time-travel: while seeking (D11 paused on a historical cut), the store holds the FROZEN
+  // snapshot summaries. Merging the live `/flows` REST list (or live WS rows) here would leak
+  // flows/state from AFTER the seeked timestamp into the frozen view, so we render the snapshot
+  // rows ALONE while seeking and resume the live merge on LIVE (HIGH finding 1).
+  const seeking = useDashboard((s) => s.connection === 'seeking');
   const { client } = getConnection();
 
   // The REST list — the PRODUCTION data source for the table. It seeds rows the live store has
@@ -100,11 +105,15 @@ export function useFlowRows(filters: FlowFilters): FlowRowsResult {
   // Enabled for BOTH the real backend (where it is authoritative) and the mock (its `mockFetch`
   // answers `/flows`). Component tests that drive the store directly seed `resetWorld()` with a
   // real bootstrap and no live server, so the fetch simply fails/stays empty without churn.
+  // DISABLED while seeking: the REST list is live (post-seek) data that must not bleed into the
+  // frozen snapshot (finding 1).
   const query = useQuery({
     queryKey: queryKeys.flows,
     queryFn: () => client.flows(),
+    enabled: !seeking,
   });
-  const queryData = query.data;
+  // Ignore any cached REST result while seeking so the frozen snapshot stands alone.
+  const queryData = seeking ? undefined : query.data;
 
   const merged = useMemo(
     () => mergeRows(order, flows, queryData?.flows ?? []),

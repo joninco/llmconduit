@@ -115,6 +115,52 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     expect(dashboardStore.getState().flows.get(MOCK_KILL_UNAUTHORIZED_ID)).toBeUndefined();
   });
 
+  it('pane B marks a field present in B but dropped by C as removed (finding 4)', async () => {
+    // A crafted 3-layer fixture where `b_only` exists in B (normalized) but is dropped in C
+    // (upstream). Pane B must visibly tint `b_only` as REMOVED (it leaves on the way to C), which
+    // the A→B-only diff never showed. `api_replay` is unknown to the mock so /flows/:id 404s and
+    // does NOT overwrite the injected detail.
+    seedFlows([makeFlow({ api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', started_ms: 1_700_000_000_000 })]);
+    const detail: FlowDetailDto = {
+      flow_seq: 1, api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed',
+      deltas: [], started_ms: 1_700_000_000_000,
+      // `b_only` is present in A and B alike (unchanged A→B) but dropped by C — so the ONLY signal
+      // for it is the B→C removal, which must surface in pane B (it would be invisible under the
+      // A→B-only diff that pane B previously used).
+      inbound_body: { model: 'gpt-4o', keep: 1, b_only: 'dropped-next' },
+      normalized: { model: 'llama-3.1-70b', keep: 1, b_only: 'dropped-next' },
+      upstream_body: { model: 'llama-3.1-70b', keep: 1 }, // b_only dropped here
+    };
+    const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_replay" onClose={noop} />);
+    act(() => queryClient.setQueryData(['flows', 'api_replay'], detail));
+    await waitFor(() => expect(getByTestId('jsonpane-code-B · normalized').querySelectorAll('.json-line').length).toBeGreaterThan(0));
+    const paneB = getByTestId('jsonpane-code-B · normalized');
+    const bOnlyLine = paneB.querySelector('.json-line[data-path="$.b_only"]') as HTMLElement | null;
+    // The B-only field that C drops is tinted removed in pane B (combined middle diff).
+    expect(bOnlyLine?.dataset.diff).toBe('removed');
+  });
+
+  it('replays REST detail.deltas into the deltas panel for a completed flow (finding 5)', async () => {
+    // A completed flow loaded via REST has NO live monitor segments — its streamed output lives
+    // only in `detail.deltas`. The deltas panel must replay them rather than show "no deltas".
+    // `api_replay` is unknown to the mock so the 404 won't replace the injected detail.
+    seedFlows([makeFlow({ api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', started_ms: 1_700_000_000_000 })]);
+    const detail: FlowDetailDto = {
+      flow_seq: 1, api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed',
+      started_ms: 1_700_000_000_000,
+      inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
+      deltas: [
+        { sequence: 1, kind: 'response.created', payload: {}, ts_ms: 1 }, // lifecycle → dropped
+        { sequence: 2, kind: 'response.output_text.delta', payload: { text: 'Replayed ' }, ts_ms: 2 },
+        { sequence: 3, kind: 'response.output_text.delta', payload: { text: 'output' }, ts_ms: 3 },
+      ],
+    };
+    const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_replay" onClose={noop} />);
+    act(() => queryClient.setQueryData(['flows', 'api_replay'], detail));
+    // The replayed deltas render (coalesced) even with NO live monitor frames pushed.
+    await waitFor(() => expect(getByTestId('deltas-panel').textContent).toContain('Replayed output'));
+  });
+
   it('detail cost roll-up shows even when the live row carries no cost (finding 4)', async () => {
     // api_001's live row (seeded in beforeEach) has NO cost/usage; the mock /flows/:id detail
     // carries the server roll-up cost. The header must surface that roll-up, not "—".
