@@ -629,6 +629,10 @@ impl Gateway {
             name,
             delta,
         } = emission;
+        // The monitor and the SSE event each consume an owned `call_id`/`delta`
+        // for this one fragment, so one clone of each is inherent here — the
+        // pre-T3 inline code cloned identically at every emission site. `call_id`
+        // and `delta` are then MOVED into the SSE event (their last use).
         self.monitor.emit(
             response_id.to_string(),
             MonitorEventKind::FunctionCallArgumentsDelta {
@@ -666,6 +670,10 @@ impl Gateway {
                 buffered,
                 trailing,
             } => {
+                // One `call_id.clone()` per buffered fragment: each fragment is a
+                // distinct emission that needs its own owned id, exactly as the
+                // pre-T3 inline loop did (parity, no regression). The trailing
+                // delta is the id's last use, so it MOVES `call_id` (no clone).
                 for (name, delta) in buffered {
                     self.emit_function_call_delta(
                         response_id,
@@ -678,9 +686,17 @@ impl Gateway {
                     )
                     .await?;
                 }
-                if let Some(emission) = trailing {
-                    self.emit_function_call_delta(response_id, tx, emission)
-                        .await?;
+                if let Some((name, delta)) = trailing {
+                    self.emit_function_call_delta(
+                        response_id,
+                        tx,
+                        DeltaEmission {
+                            call_id,
+                            name,
+                            delta,
+                        },
+                    )
+                    .await?;
                 }
             }
         }

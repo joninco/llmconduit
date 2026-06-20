@@ -79,13 +79,15 @@ pub(crate) enum DeltaDecision {
     /// tool).
     One(DeltaEmission),
     /// A client tool's name just resolved: emit the buffered leading fragments
-    /// in order under `call_id`, then the optional `trailing` triggering delta.
-    /// `buffered` is the gate's own moved-out buffer (no copy). Used both for
-    /// the in-stream resolve (with `trailing`) and the turn-end flush (without).
+    /// in order under `call_id`, then the optional `trailing` triggering delta
+    /// (its `(name, delta)` — it shares `call_id`, so the id is NOT duplicated
+    /// here; the engine pairs it with `call_id`). `buffered` is the gate's own
+    /// moved-out buffer (no copy). Used both for the in-stream resolve (with
+    /// `trailing`) and the turn-end flush (without).
     Flush {
         call_id: String,
         buffered: Vec<(Option<String>, String)>,
-        trailing: Option<DeltaEmission>,
+        trailing: Option<(Option<String>, String)>,
     },
 }
 
@@ -150,13 +152,23 @@ impl ToolDeltaGate {
         let is_analyze = name
             .as_deref()
             .map(|n| n.eq_ignore_ascii_case(ANALYZE_IMAGE_TOOL_NAME));
-        let entry = self
+        // Borrowed lookup: the map keys on `&str`, so resolving an already-seen
+        // call needs NO clone (unlike `entry(call_id.clone())`, which cloned on
+        // every delta). The owned key is cloned only the first time a call_id is
+        // seen — inherent, as the map must own its key.
+        if !self.buffer.contains_key(call_id.as_str()) {
+            self.buffer.insert(
+                call_id.clone(),
+                AnalyzeDeltaState::Pending {
+                    buffered: Vec::new(),
+                },
+            );
+        }
+        let slot = self
             .buffer
-            .entry(call_id.clone())
-            .or_insert(AnalyzeDeltaState::Pending {
-                buffered: Vec::new(),
-            });
-        match (entry, is_analyze) {
+            .get_mut(call_id.as_str())
+            .expect("entry inserted above");
+        match (slot, is_analyze) {
             // Already decided to drop this call's deltas (internal analyzeImage)
             // — drop this one too.
             (AnalyzeDeltaState::Drop, _) => Ok(DeltaDecision::None),
@@ -173,7 +185,7 @@ impl ToolDeltaGate {
                 Ok(DeltaDecision::None)
             }
             // Already decided to emit (a known client tool) — forward
-            // immediately.
+            // immediately. `call_id` is MOVED into the emission (last use).
             (AnalyzeDeltaState::Emit, _) => Ok(DeltaDecision::One(DeltaEmission {
                 call_id,
                 name,
@@ -183,28 +195,29 @@ impl ToolDeltaGate {
             // leading fragments in order, then this delta, and remember to emit
             // the rest. The buffer is MOVED out of the gate (no copy); the engine
             // iterates it in place. When nothing was buffered (the common case:
-            // the name arrived with the first delta) collapse to `One` so this
-            // path allocates nothing.
+            // the name arrived with the first delta) collapse to `One`, MOVING
+            // `call_id` into the emission so this path allocates nothing.
             (slot, Some(false)) => {
                 let buffered = match std::mem::replace(slot, AnalyzeDeltaState::Emit) {
                     AnalyzeDeltaState::Pending { buffered } => buffered,
                     _ => Vec::new(),
                 };
-                let emission = DeltaEmission {
-                    call_id: call_id.clone(),
-                    name,
-                    delta,
-                };
                 if buffered.is_empty() {
-                    return Ok(DeltaDecision::One(emission));
+                    return Ok(DeltaDecision::One(DeltaEmission {
+                        call_id,
+                        name,
+                        delta,
+                    }));
                 }
                 self.pending_buffer_bytes = self
                     .pending_buffer_bytes
                     .saturating_sub(buffered_len(&buffered));
+                // `call_id` lives on `Flush`; the trailing delta shares it, so we
+                // carry only its `(name, delta)` rather than duplicating the id.
                 Ok(DeltaDecision::Flush {
                     call_id,
                     buffered,
-                    trailing: Some(emission),
+                    trailing: Some((name, delta)),
                 })
             }
             // Name still unknown: buffer this delta until it resolves (or the
@@ -277,18 +290,15 @@ mod tests {
                 call_id,
                 buffered,
                 trailing,
-            } => {
-                let mut out: Vec<DeltaEmission> = buffered
-                    .into_iter()
-                    .map(|(name, delta)| DeltaEmission {
-                        call_id: call_id.clone(),
-                        name,
-                        delta,
-                    })
-                    .collect();
-                out.extend(trailing);
-                out
-            }
+            } => buffered
+                .into_iter()
+                .chain(trailing)
+                .map(|(name, delta)| DeltaEmission {
+                    call_id: call_id.clone(),
+                    name,
+                    delta,
+                })
+                .collect(),
         }
     }
 
@@ -382,7 +392,8 @@ mod tests {
             DeltaDecision::Flush {
                 call_id: "c1".into(),
                 buffered: vec![(None, "{\"a".into()), (None, "\":1".into())],
-                trailing: Some(em("c1", Some("lookup"), "}")),
+                // trailing shares `call_id` — carries only (name, delta).
+                trailing: Some((Some("lookup".into()), "}".into())),
             }
         );
         assert_eq!(
