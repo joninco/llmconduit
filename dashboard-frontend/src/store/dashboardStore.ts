@@ -115,10 +115,14 @@ export interface DashboardState {
    */
   captureLiveBaseline: () => LiveBaseline;
   /**
-   * ATOMICALLY reinstall a previously-captured live baseline (D11 R2 finding 1). One `set` restores
-   * the live rows/cursors/monitor and clears any seek freeze (`seekAtMs`/`seekMonitorSeq`) so the
-   * frozen cut is fully gone; the socket then replays shadow-buffered frames on top. Crosses a
-   * boundary (frozen cut → live store), so the monotonic epoch advances (finding 1).
+   * ATOMICALLY reinstall a previously-captured live baseline AND flip back to `'live'` (D11 R2
+   * finding 1 + D11 R3). ONE `set` restores the live rows/cursors/monitor, clears the seek freeze
+   * (`seekAtMs`/`seekMonitorSeq`) so the frozen cut is fully gone, AND sets `connection='live'` —
+   * so the transition to live and the restored baseline land together BEFORE the socket replays any
+   * shadow-buffered frame. Were the live flip deferred to a trailing `setConnection('live')`, the
+   * replay would run live data into the store while `connection` was still `'seeking'`, the exact
+   * state D10 must never observe (never 'seeking' with live rows). Crosses a boundary (frozen cut →
+   * live store), so the monotonic epoch advances (finding 1).
    */
   restoreLiveBaseline: (baseline: LiveBaseline) => void;
   applySnapshot: (snap: {
@@ -237,6 +241,11 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
 
   restoreLiveBaseline: (baseline) =>
     set((s) => ({
+      // Flip back to LIVE in the SAME atomic update as the baseline restore (D11 R3): the socket
+      // replays shadow-buffered frames AFTER this returns, so deferring the flip to a trailing
+      // `setConnection('live')` would expose `connection==='seeking'` with restored/replayed live
+      // rows — the invariant D10 relies on (never 'seeking' with live data). One `set` closes it.
+      connection: 'live',
       // Crosses a boundary (frozen cut → live store); bump the monotonic epoch (finding 1).
       connEpoch: s.connEpoch + 1,
       // The frozen cut is fully gone — clear the seek freeze so elapsed ticks + the monitor unbounds.

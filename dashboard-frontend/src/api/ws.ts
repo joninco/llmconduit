@@ -309,11 +309,17 @@ export class DashboardSocket {
    * Resume LIVE. The store currently holds the FROZEN seek cut (`applySeekCut`), so before replaying
    * the shadow buffer we MUST re-establish the live store, else buffered frames would replay onto the
    * frozen cut and the rows/cursors between the cut and the pause would stay missing/rewound while
-   * `connection==='live'` (finding 1). Two re-baseline paths:
+   * `connection==='live'` (finding 1). Two re-baseline paths, each of which flips to `'live'`
+   * ATOMICALLY with its store restore BEFORE any frame replays (D11 R3 — never replay live data
+   * while `connection==='seeking'`):
    *  - a RECONNECT during the seek STAGED a fresh snapshot (finding 6): apply it FIRST — it is the
-   *    authoritative current cut + cursors (and supersedes the now-stale captured baseline);
+   *    authoritative current cut + cursors (and supersedes the now-stale captured baseline). It
+   *    flips to live inside `commitSnapshot`, before draining early frames;
    *  - otherwise RESTORE the live baseline captured at `seek()` (the up-to-date pre-seek live state).
+   *    `restoreLiveBaseline` flips `connection='live'` in the SAME atomic update as the restore.
    * Then replay buffered live frames in arrival order (dedup still applies) on top of the live store.
+   * The trailing `setConnection('live')` is a no-op for both re-baseline paths (already live); it
+   * only covers the degenerate case where neither a staged snapshot nor a baseline exists.
    */
   live(): void {
     this.paused = false;
@@ -322,9 +328,10 @@ export class DashboardSocket {
     const baseline = this.liveBaseline;
     this.liveBaseline = null;
     if (staged) {
-      this.commitSnapshot(staged); // resets store + cursors, drains early frames, marks live
+      this.commitSnapshot(staged); // resets store + cursors, marks live, drains early frames
     } else if (baseline) {
-      // Re-establish the up-to-date live store so buffered frames don't replay onto the frozen cut.
+      // Re-establish the up-to-date live store AND flip to live atomically, so buffered frames don't
+      // replay onto the frozen cut nor under a stale `connection==='seeking'`.
       this.store.getState().restoreLiveBaseline(baseline);
     }
     const buffered = this.shadowBuffer;
@@ -332,6 +339,9 @@ export class DashboardSocket {
     for (const frame of buffered) {
       this.applyFrame(frame);
     }
+    // Degenerate fallback only (no staged snapshot, no baseline). The re-baseline paths above
+    // already flipped to live atomically, so this is a no-op there (re-applying 'live' won't bump
+    // the epoch — see setConnection).
     this.store.getState().setConnection('live');
   }
 

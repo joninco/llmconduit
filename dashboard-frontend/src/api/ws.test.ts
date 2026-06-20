@@ -602,6 +602,56 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     expect(socket.shadowBufferLength()).toBe(0);
   });
 
+  it('live() resume NEVER exposes `seeking` with restored/replayed live rows — the flip is atomic with the baseline restore, before replay (R3 finding 1)', () => {
+    // A live flow row + advanced cursor exist before seeking (the baseline to restore).
+    const liveFlow: DashboardFrame = {
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'flow_status', api_call_id: 'api_live', status: 'open', usage: null, started_ms: 1000 }],
+    };
+    expect(socket.applyFrame(liveFlow)).toBe(true);
+
+    // Drag-start: pause + capture the live baseline, then land the FROZEN cut ('seeking').
+    socket.seek();
+    dashboardStore.getState().applySeekCut({
+      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500 }],
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      atMs: 500, monitorSeq: 0, metrics: null, topology: null,
+    });
+    expect(dashboardStore.getState().connection).toBe('seeking');
+
+    // A live frame arrives mid-seek and shadow-buffers (replayed on resume).
+    const bufferedFlow: DashboardFrame = {
+      domain: 'flow', seq: 2,
+      batch: [{ type: 'flow_status', api_call_id: 'api_buffered', status: 'open', usage: null, started_ms: 2000 }],
+    };
+    socket.handleParsed(bufferedFlow);
+
+    // Invariant checker on EVERY store transition for the duration of live(): if `connection` is ever
+    // observed `'seeking'` while a LIVE (non-frozen) row is present, the flip was NOT atomic with the
+    // baseline restore — the exact non-atomic window D10 must never see. The frozen-only cut state
+    // ('seeking' with `api_frozen` and NO live/buffered row) is the legitimate pre-resume state and
+    // is not a violation.
+    const violations: string[] = [];
+    const unsub = dashboardStore.subscribe((s) => {
+      if (s.connection === 'seeking') {
+        if (s.flows.has('api_live')) violations.push('seeking with restored live row (api_live)');
+        if (s.flows.has('api_buffered')) violations.push('seeking with replayed buffered row (api_buffered)');
+      }
+    });
+
+    socket.live();
+    unsub();
+
+    // No transition during resume showed live data under `connection==='seeking'`.
+    expect(violations).toEqual([]);
+    // And the end state is correct: live, with the restored + replayed rows and the frozen cut gone.
+    const st = dashboardStore.getState();
+    expect(st.connection).toBe('live');
+    expect(st.flows.has('api_live')).toBe(true);
+    expect(st.flows.has('api_buffered')).toBe(true);
+    expect(st.flows.has('api_frozen')).toBe(false);
+  });
+
   it('a RECONNECT snapshot arriving during seek does NOT clobber the frozen cut or flip to live (finding 6)', () => {
     // Freeze: apply a monitor frame, then seek. `seek()` PAUSES the live feed; the store is flipped
     // to the frozen 'seeking' cut separately (the Scrubber does this atomically via `applySeekCut` —
