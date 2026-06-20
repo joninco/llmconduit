@@ -255,9 +255,26 @@ impl MonitorHub {
     }
 
     pub fn emit(&self, response_id: impl Into<String>, kind: MonitorEventKind) {
+        self.emit_with(response_id, || kind);
+    }
+
+    /// Like [`emit`](Self::emit) but builds the [`MonitorEventKind`] LAZILY: when
+    /// the hub is disabled (`MonitorHub::disabled()`), this returns BEFORE invoking
+    /// `build`, so no event-construction work (input traversal/count passes,
+    /// `summarize_response_item`, `preview_json`/serde serialization, image-card
+    /// collection or redaction) runs on the production hot path. When enabled, the
+    /// owned `MonitorEventKind` from `build` flows through the IDENTICAL
+    /// sequence-bump / `apply_event` / `prune_expired` / image-URI-redaction /
+    /// `tx.send` path as `emit`, so wire/`/debug/ws` output is byte-identical.
+    pub fn emit_with(
+        &self,
+        response_id: impl Into<String>,
+        build: impl FnOnce() -> MonitorEventKind,
+    ) {
         if !self.enabled {
             return;
         }
+        let kind = build();
         let mut state = self.state.lock().expect("monitor state lock poisoned");
         state.last_sequence = state.last_sequence.saturating_add(1);
         let event = MonitorEvent {
@@ -1145,6 +1162,62 @@ mod tests {
     use super::MonitorHub;
     use super::MonitorState;
     use std::collections::VecDeque;
+
+    #[test]
+    fn emit_with_skips_closure_when_disabled() {
+        // Zero-overhead invariant: on a disabled hub the build closure must NEVER
+        // run, so no event-construction work executes on the production hot path.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        let hub = MonitorHub::disabled();
+        let invoked = AtomicBool::new(false);
+        hub.emit_with("resp_1", || {
+            invoked.store(true, Ordering::SeqCst);
+            panic!("closure must not run when the hub is disabled");
+        });
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "disabled hub must not invoke the build closure"
+        );
+        // And nothing reaches the snapshot.
+        let snapshot = hub.snapshot();
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .all(|message| !matches!(message, DebugWsMessage::RequestUpsert { .. })),
+            "disabled hub records nothing"
+        );
+    }
+
+    #[test]
+    fn emit_with_invokes_closure_when_enabled() {
+        // Mirror: an enabled hub DOES invoke the closure and the built event
+        // reaches both a live subscriber and the snapshot.
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        let hub = MonitorHub::new(8);
+        let mut rx = hub.subscribe();
+        let invoked = AtomicBool::new(false);
+        hub.emit_with("resp_1", || {
+            invoked.store(true, Ordering::SeqCst);
+            started("model-a")
+        });
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "enabled hub must invoke the build closure"
+        );
+        let update = rx.try_recv().expect("live broadcast delivered");
+        assert!(update.messages.iter().any(|message| matches!(
+            message,
+            DebugWsMessage::RequestUpsert { request } if request.response_id == "resp_1"
+        )));
+        let snapshot = hub.snapshot();
+        assert!(snapshot.messages.iter().any(|message| matches!(
+            message,
+            DebugWsMessage::RequestUpsert { request } if request.response_id == "resp_1"
+        )));
+    }
 
     #[test]
     fn snapshot_replays_history_as_websocket_messages() {

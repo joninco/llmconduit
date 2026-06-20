@@ -633,13 +633,12 @@ impl Gateway {
         // for this one fragment, so one clone of each is inherent here — the
         // pre-T3 inline code cloned identically at every emission site. `call_id`
         // and `delta` are then MOVED into the SSE event (their last use).
-        self.monitor.emit(
-            response_id.to_string(),
+        self.monitor.emit_with(response_id, || {
             MonitorEventKind::FunctionCallArgumentsDelta {
                 call_id: call_id.clone(),
                 delta: delta.clone(),
-            },
-        );
+            }
+        });
         self.send_event(
             tx,
             function_call_args_delta_event(call_id, name, delta),
@@ -832,20 +831,18 @@ impl Gateway {
                 .await;
             if let Err(err) = &result {
                 if tx.is_closed() {
-                    gateway.monitor.emit(
-                        response_id,
-                        MonitorEventKind::Failed {
+                    gateway
+                        .monitor
+                        .emit_with(response_id.as_str(), || MonitorEventKind::Failed {
                             message: "client disconnected".to_string(),
-                        },
-                    );
+                        });
                     return;
                 }
-                gateway.monitor.emit(
-                    response_id,
-                    MonitorEventKind::Failed {
+                gateway
+                    .monitor
+                    .emit_with(response_id.as_str(), || MonitorEventKind::Failed {
                         message: err.to_string(),
-                    },
-                );
+                    });
                 let _ = gateway
                     .send_event(&tx, failure_event(err), "failed to send response.failed")
                     .await;
@@ -1058,8 +1055,7 @@ impl Gateway {
         vision_session: Option<String>,
         tx: mpsc::Sender<SseEvent>,
     ) -> AppResult<()> {
-        self.monitor.emit(
-            response_id.clone(),
+        self.monitor.emit_with(response_id.as_str(), || {
             MonitorEventKind::RequestStarted {
                 model: request.model.clone(),
                 input_items: request.input.len(),
@@ -1295,26 +1291,27 @@ impl Gateway {
                     })
                     .sum(),
                 instructions_chars: request.instructions.chars().count(),
-            },
-        );
-        if self.monitor.is_enabled() {
+            }
+        });
+        self.monitor.emit_with(response_id.as_str(), || {
             let request_preview = preview_json_limited_with_images(&request, 128 * 1024);
-            self.monitor.emit(
-                response_id.clone(),
-                MonitorEventKind::RequestPayload {
-                    payload_preview: request_preview.text,
-                    images: request_preview.images,
-                },
-            );
-        }
-        for item in trailing_tool_output_items(&request.input) {
-            self.monitor.emit(
-                response_id.clone(),
-                MonitorEventKind::ToolPhase {
-                    phase: "client_tool_result".to_string(),
-                    detail: summarize_response_item(item),
-                },
-            );
+            MonitorEventKind::RequestPayload {
+                payload_preview: request_preview.text,
+                images: request_preview.images,
+            }
+        });
+        // `trailing_tool_output_items` reverse-walks the request tail and
+        // allocates a `Vec`, so gate the whole loop on `is_enabled()` to keep the
+        // disabled (`MonitorHub::disabled()`) path zero-overhead — the inner
+        // `emit_with` closures defer `summarize_response_item` past the same check.
+        if self.monitor.is_enabled() {
+            for item in trailing_tool_output_items(&request.input) {
+                self.monitor
+                    .emit_with(response_id.as_str(), || MonitorEventKind::ToolPhase {
+                        phase: "client_tool_result".to_string(),
+                        detail: summarize_response_item(item),
+                    });
+            }
         }
         self.send_event(
             &tx,
@@ -1409,83 +1406,80 @@ impl Gateway {
                     extra_body: upstream_extra_body.clone(),
                 },
             );
-            if self.monitor.is_enabled() {
+            self.monitor.emit_with(response_id.as_str(), || {
                 let upstream_debug_request =
                     sanitize_chat_request(upstream_request.clone(), self.config.flatten_content);
                 let upstream_preview =
                     preview_json_limited_with_images(&upstream_debug_request, 128 * 1024);
-                self.monitor.emit(
-                    response_id.clone(),
-                    MonitorEventKind::UpstreamRequest {
-                        request_index: upstream_request_index,
-                        message_count: upstream_debug_request.messages.len(),
-                        prompt_chars: upstream_debug_request
-                            .messages
-                            .iter()
-                            .map(|message| {
-                                message.role.chars().count()
-                                    + message
-                                        .name
-                                        .as_ref()
-                                        .map(|name| name.chars().count())
-                                        .unwrap_or(0)
-                                    + message
-                                        .tool_call_id
-                                        .as_ref()
-                                        .map(|call_id| call_id.chars().count())
-                                        .unwrap_or(0)
-                                    + message
-                                        .reasoning_content
-                                        .as_ref()
-                                        .map(|text| text.chars().count())
-                                        .unwrap_or(0)
-                                    + message
-                                        .content
-                                        .as_ref()
-                                        .map(|content| content.to_string().chars().count())
-                                        .unwrap_or(0)
-                                    + message
-                                        .tool_calls
-                                        .as_ref()
-                                        .map(|tool_calls| {
-                                            tool_calls
-                                                .iter()
-                                                .map(|tool_call| {
-                                                    serde_json::to_string(tool_call)
-                                                        .unwrap_or_default()
-                                                        .chars()
-                                                        .count()
-                                                })
-                                                .sum::<usize>()
-                                        })
-                                        .unwrap_or(0)
+                MonitorEventKind::UpstreamRequest {
+                    request_index: upstream_request_index,
+                    message_count: upstream_debug_request.messages.len(),
+                    prompt_chars: upstream_debug_request
+                        .messages
+                        .iter()
+                        .map(|message| {
+                            message.role.chars().count()
+                                + message
+                                    .name
+                                    .as_ref()
+                                    .map(|name| name.chars().count())
+                                    .unwrap_or(0)
+                                + message
+                                    .tool_call_id
+                                    .as_ref()
+                                    .map(|call_id| call_id.chars().count())
+                                    .unwrap_or(0)
+                                + message
+                                    .reasoning_content
+                                    .as_ref()
+                                    .map(|text| text.chars().count())
+                                    .unwrap_or(0)
+                                + message
+                                    .content
+                                    .as_ref()
+                                    .map(|content| content.to_string().chars().count())
+                                    .unwrap_or(0)
+                                + message
+                                    .tool_calls
+                                    .as_ref()
+                                    .map(|tool_calls| {
+                                        tool_calls
+                                            .iter()
+                                            .map(|tool_call| {
+                                                serde_json::to_string(tool_call)
+                                                    .unwrap_or_default()
+                                                    .chars()
+                                                    .count()
+                                            })
+                                            .sum::<usize>()
+                                    })
+                                    .unwrap_or(0)
+                        })
+                        .sum::<usize>()
+                        + upstream_debug_request
+                            .tools
+                            .as_ref()
+                            .map(|tools| {
+                                tools
+                                    .iter()
+                                    .map(|tool| {
+                                        serde_json::to_string(tool)
+                                            .unwrap_or_default()
+                                            .chars()
+                                            .count()
+                                    })
+                                    .sum::<usize>()
                             })
-                            .sum::<usize>()
-                            + upstream_debug_request
-                                .tools
-                                .as_ref()
-                                .map(|tools| {
-                                    tools
-                                        .iter()
-                                        .map(|tool| {
-                                            serde_json::to_string(tool)
-                                                .unwrap_or_default()
-                                                .chars()
-                                                .count()
-                                        })
-                                        .sum::<usize>()
-                                })
-                                .unwrap_or(0)
-                            + upstream_debug_request
-                                .extra_body
-                                .values()
-                                .map(|value| value.to_string().chars().count())
-                                .sum::<usize>(),
-                        payload_preview: upstream_preview.text,
-                        images: upstream_preview.images,
-                    },
-                );
-            }
+                            .unwrap_or(0)
+                        + upstream_debug_request
+                            .extra_body
+                            .values()
+                            .map(|value| value.to_string().chars().count())
+                            .sum::<usize>(),
+                    payload_preview: upstream_preview.text,
+                    images: upstream_preview.images,
+                }
+            });
             if tx.is_closed() {
                 return Err(AppError::cancelled());
             }
@@ -1525,14 +1519,13 @@ impl Gateway {
                     match emission {
                         StreamEmission::OutputItemAdded(item) => {
                             let target = event_state.register_item(&item);
-                            self.monitor.emit(
-                                response_id.clone(),
+                            self.monitor.emit_with(response_id.as_str(), || {
                                 MonitorEventKind::ResponseItem {
                                     event: "response.output_item.added".to_string(),
                                     summary: summarize_response_item(&item),
                                     payload_preview: preview_json(&item),
-                                },
-                            );
+                                }
+                            });
                             self.send_event(
                                 &tx,
                                 output_item_added_event(item, target.output_index),
@@ -1542,12 +1535,11 @@ impl Gateway {
                         }
                         StreamEmission::OutputTextDelta(delta) => {
                             let target = event_state.active_message_target()?;
-                            self.monitor.emit(
-                                response_id.clone(),
+                            self.monitor.emit_with(response_id.as_str(), || {
                                 MonitorEventKind::OutputTextDelta {
                                     delta: delta.clone(),
-                                },
-                            );
+                                }
+                            });
                             self.send_event(
                                 &tx,
                                 output_text_delta_event(target.item_id, target.output_index, delta),
@@ -1557,14 +1549,13 @@ impl Gateway {
                         }
                         StreamEmission::ReasoningItemAdded(item) => {
                             let target = event_state.register_item(&item);
-                            self.monitor.emit(
-                                response_id.clone(),
+                            self.monitor.emit_with(response_id.as_str(), || {
                                 MonitorEventKind::ResponseItem {
                                     event: "response.output_item.added".to_string(),
                                     summary: summarize_response_item(&item),
                                     payload_preview: preview_json(&item),
-                                },
-                            );
+                                }
+                            });
                             self.send_event(
                                 &tx,
                                 output_item_added_event(item, target.output_index),
@@ -1574,12 +1565,11 @@ impl Gateway {
                         }
                         StreamEmission::ReasoningTextDelta(delta) => {
                             let target = event_state.active_reasoning_target()?;
-                            self.monitor.emit(
-                                response_id.clone(),
+                            self.monitor.emit_with(response_id.as_str(), || {
                                 MonitorEventKind::ReasoningTextDelta {
                                     delta: delta.clone(),
-                                },
-                            );
+                                }
+                            });
                             self.send_event(
                                 &tx,
                                 reasoning_text_delta_event(
@@ -1667,12 +1657,11 @@ impl Gateway {
                             .await?;
                         }
                         StreamEmission::RefusalDelta(delta) => {
-                            self.monitor.emit(
-                                response_id.clone(),
+                            self.monitor.emit_with(response_id.as_str(), || {
                                 MonitorEventKind::RefusalDelta {
                                     delta: delta.clone(),
-                                },
-                            );
+                                }
+                            });
                             self.send_event(
                                 &tx,
                                 refusal_delta_event(delta),
@@ -1852,17 +1841,14 @@ impl Gateway {
             },
             terminal_reason: Some(terminal_reason),
         };
-        if self.monitor.is_enabled() {
+        self.monitor.emit_with(response_id.as_str(), || {
             let final_preview = preview_json_limited_with_images(&resource, 128 * 1024);
-            self.monitor.emit(
-                response_id.clone(),
-                MonitorEventKind::FinalResponse {
-                    status: resource.status.clone(),
-                    payload_preview: final_preview.text,
-                    images: final_preview.images,
-                },
-            );
-        }
+            MonitorEventKind::FinalResponse {
+                status: resource.status.clone(),
+                payload_preview: final_preview.text,
+                images: final_preview.images,
+            }
+        });
         if is_incomplete {
             self.send_event(
                 &tx,
@@ -2090,14 +2076,12 @@ impl Gateway {
                 )
                 .await?;
             }
-            self.monitor.emit(
-                response_id.to_string(),
-                MonitorEventKind::ResponseItem {
+            self.monitor
+                .emit_with(response_id, || MonitorEventKind::ResponseItem {
                     event: "response.output_item.done".to_string(),
                     summary: summarize_response_item(&reasoning),
                     payload_preview: preview_json(&reasoning),
-                },
-            );
+                });
             self.send_event(
                 tx,
                 output_item_done_event(reasoning, target.output_index),
@@ -2145,14 +2129,12 @@ impl Gateway {
             }
             public_history.push(message.clone());
             response_output.push(message.clone());
-            self.monitor.emit(
-                response_id.to_string(),
-                MonitorEventKind::ResponseItem {
+            self.monitor
+                .emit_with(response_id, || MonitorEventKind::ResponseItem {
                     event: "response.output_item.done".to_string(),
                     summary: summarize_response_item(&message),
                     payload_preview: preview_json(&message),
-                },
-            );
+                });
             self.send_event(
                 tx,
                 output_item_done_event(message, target.output_index),
@@ -2236,24 +2218,20 @@ impl Gateway {
                     )
                     .await?;
                 }
-                self.monitor.emit(
-                    response_id.to_string(),
-                    MonitorEventKind::ToolPhase {
+                self.monitor
+                    .emit_with(response_id, || MonitorEventKind::ToolPhase {
                         phase: "client_tool_handoff".to_string(),
                         detail: summarize_response_item(&tool_call.public_item),
-                    },
-                );
+                    });
                 let target = event_state.target_for_item(&tool_call.public_item);
                 public_history.push(tool_call.public_item.clone());
                 response_output.push(tool_call.public_item.clone());
-                self.monitor.emit(
-                    response_id.to_string(),
-                    MonitorEventKind::ResponseItem {
+                self.monitor
+                    .emit_with(response_id, || MonitorEventKind::ResponseItem {
                         event: "response.output_item.done".to_string(),
                         summary: summarize_response_item(&tool_call.public_item),
                         payload_preview: preview_json(&tool_call.public_item),
-                    },
-                );
+                    });
                 self.send_event(
                     tx,
                     output_item_done_event(tool_call.public_item.clone(), target.output_index),
@@ -2319,21 +2297,17 @@ impl Gateway {
             status: Some("in_progress".to_string()),
             action: None,
         };
-        self.monitor.emit(
-            response_id.to_string(),
-            MonitorEventKind::ToolPhase {
+        self.monitor
+            .emit_with(response_id, || MonitorEventKind::ToolPhase {
                 phase: "provider_tool_detected".to_string(),
                 detail: summarize_response_item(&tool_call.public_item),
-            },
-        );
-        self.monitor.emit(
-            response_id.to_string(),
-            MonitorEventKind::ResponseItem {
+            });
+        self.monitor
+            .emit_with(response_id, || MonitorEventKind::ResponseItem {
                 event: "response.output_item.added".to_string(),
                 summary: summarize_response_item(&partial),
                 payload_preview: preview_json(&partial),
-            },
-        );
+            });
         let partial_target = event_state.register_item(&partial);
         self.send_event(
             tx,
@@ -2343,13 +2317,11 @@ impl Gateway {
         .await?;
 
         let query = extract_web_search_query(action, &tool_call.arguments)?;
-        self.monitor.emit(
-            response_id.to_string(),
-            MonitorEventKind::ToolPhase {
+        self.monitor
+            .emit_with(response_id, || MonitorEventKind::ToolPhase {
                 phase: "provider_tool_running".to_string(),
                 detail: format!("web_search {query}"),
-            },
-        );
+            });
         if tx.is_closed() {
             return Err(AppError::cancelled());
         }
@@ -2381,14 +2353,12 @@ impl Gateway {
         let completed_target = event_state.target_for_item(&completed);
         public_history.push(completed.clone());
         response_output.push(completed.clone());
-        self.monitor.emit(
-            response_id.to_string(),
-            MonitorEventKind::ResponseItem {
+        self.monitor
+            .emit_with(response_id, || MonitorEventKind::ResponseItem {
                 event: "response.output_item.done".to_string(),
                 summary: summarize_response_item(&completed),
                 payload_preview: preview_json(&completed),
-            },
-        );
+            });
         self.send_event(
             tx,
             output_item_done_event(completed, completed_target.output_index),
@@ -2431,13 +2401,11 @@ impl Gateway {
             "failed to send web_search results",
         )
         .await?;
-        self.monitor.emit(
-            response_id.to_string(),
-            MonitorEventKind::ToolPhase {
+        self.monitor
+            .emit_with(response_id, || MonitorEventKind::ToolPhase {
                 phase: "provider_tool_completed".to_string(),
                 detail: format!("web_search result {}", preview_text(&outcome.formatted)),
-            },
-        );
+            });
 
         current_messages.push(ChatMessage {
             role: "tool".to_string(),
@@ -2488,17 +2456,15 @@ impl Gateway {
         }
         let vision_request =
             VisionRequest::from_arguments(&tool_call.arguments, session_id, &self.image_cache);
-        self.monitor.emit(
-            response_id.to_string(),
-            MonitorEventKind::ToolPhase {
+        self.monitor
+            .emit_with(response_id, || MonitorEventKind::ToolPhase {
                 phase: "image_analysis_running".to_string(),
                 detail: format!(
                     "analyzeImage ids={:?} images={}",
                     vision_request.image_ids,
                     vision_request.images.len()
                 ),
-            },
-        );
+            });
 
         let result_text = if vision_request.images.is_empty() {
             // No requested id resolved to a cached image. Surface a model-visible
@@ -2528,13 +2494,11 @@ impl Gateway {
                 },
             }
         };
-        self.monitor.emit(
-            response_id.to_string(),
-            MonitorEventKind::ToolPhase {
+        self.monitor
+            .emit_with(response_id, || MonitorEventKind::ToolPhase {
                 phase: "image_analysis_completed".to_string(),
                 detail: format!("analyzeImage result {}", preview_text(&result_text)),
-            },
-        );
+            });
 
         // Inject the description as the tool result keyed to the model's
         // `analyzeImage` call id, so the follow-up upstream turn sees it. Nothing
