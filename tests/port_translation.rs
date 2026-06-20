@@ -162,7 +162,7 @@ fn leaf_finalize_typed_stop_beats_configured_stop_single_wire_key() {
         "stop".to_string(),
         json!(["CONFIGURED"]),
     )]));
-    let mut backend = BackendChatRequest::new(request.clone(), None);
+    let mut backend = BackendChatRequest::new(request.clone(), None, None, None);
     finalize_request_for_backend(&mut backend, &policies);
     request = backend.request;
 
@@ -214,7 +214,7 @@ fn leaf_finalize_skips_provider_max_tokens_when_client_alias_present() {
         "max_tokens".to_string(),
         json!(4096),
     )]));
-    let mut backend = BackendChatRequest::new(request, None);
+    let mut backend = BackendChatRequest::new(request, None, None, None);
     finalize_request_for_backend(&mut backend, &policies);
     let request = backend.request;
 

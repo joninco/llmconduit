@@ -363,7 +363,7 @@ fn leaf_family_chat_template_kwargs(config: &Config, backend_model: &str) -> ser
         extra_body: std::collections::BTreeMap::new(),
     };
     let policies = BackendFinalizationPolicies::from_config(config);
-    let mut backend = BackendChatRequest::new(request, None);
+    let mut backend = BackendChatRequest::new(request, None, None, None);
     finalize_request_for_backend(&mut backend, &policies);
     backend
         .request

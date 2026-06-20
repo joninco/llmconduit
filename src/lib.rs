@@ -134,6 +134,10 @@ pub fn build_app_with_gateway_and_options(
                 max_sse_frame_bytes,
             )
             .with_finalization_policies(finalization_policies.clone())
+            // D2: every leaf shares the dashboard FlowStore handle (a cheap `Clone`
+            // of the inner `Arc<Mutex>`; `disabled()` no-ops when the debug UI is
+            // off) so the single point that sees the on-wire body can capture it.
+            .with_flow_store(flow_store.clone())
         };
     let upstream: Arc<dyn crate::upstream::UpstreamClient> = if routing_mode {
         let providers = config
@@ -208,7 +212,10 @@ pub fn build_app_with_gateway_and_options(
             config.upstream_request_log_path.clone(),
         );
         if config.fallback_upstreams.is_empty() {
-            Arc::new(primary_upstream)
+            // D2: the BARE leaf is the engine's upstream directly — no routing/
+            // failover layer owns the `provider` serving field, so mark this leaf to
+            // synthesize `provider = "primary"`.
+            Arc::new(primary_upstream.into_bare_primary())
         } else {
             let mut providers = vec![FailoverUpstreamProvider::new(
                 "primary",

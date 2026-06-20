@@ -179,6 +179,22 @@ pub struct ReqwestUpstreamClient {
     /// model after routing/failover/exposed-alias remap (T1). Shared (cheap
     /// clone) across all providers; empty when no profile defines any.
     finalization_policies: BackendFinalizationPolicies,
+    /// D2 capture seam: the dashboard FlowStore handle (a cheap `Clone` sharing the
+    /// inner `Arc<Mutex<_>>`). The leaf is the SINGLE point that sees the TRUE
+    /// on-wire chat-completions body — POST `finalize_request_for_backend` +
+    /// `sanitize_chat_request` (and, on the shrink path, the RETRY body) — so it
+    /// captures `upstream_body` here via the capped/redacting serializer. Defaults
+    /// to `disabled()` (every store op no-ops, zero overhead); the DI root threads
+    /// the live store in via `with_flow_store` when the debug UI is on.
+    flow_store: crate::dashboard_flow::DashboardFlowStore,
+    /// D2 bare-leaf marker: `true` ONLY when this leaf is the engine's upstream
+    /// DIRECTLY (lib.rs `Arc::new(primary_upstream)` — no routing/failover wrapper
+    /// owns the `provider` serving field). Then the leaf synthesizes
+    /// `provider = "primary"`. A leaf nested INSIDE a failover/routing client leaves
+    /// this `false` so it never clobbers the real provider name the wrapper records
+    /// on first-chunk success (the leaf runs BEFORE that success, so a
+    /// first-writer-wins tag here would otherwise win over the true provider).
+    tag_primary_provider: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -534,6 +550,12 @@ impl ReqwestUpstreamClient {
             min_completion_tokens: min_completion_tokens.max(1),
             max_sse_frame_bytes: max_sse_frame_bytes.max(1024),
             finalization_policies: BackendFinalizationPolicies::default(),
+            // Default to the no-op store (D2); the DI root threads the live one in
+            // via `with_flow_store` only when the debug UI is enabled.
+            flow_store: crate::dashboard_flow::DashboardFlowStore::disabled(),
+            // Default OFF: a leaf only tags `provider = "primary"` when the DI root
+            // marks it the bare/direct engine upstream via `into_bare_primary`.
+            tag_primary_provider: false,
         }
     }
 
@@ -546,6 +568,29 @@ impl ReqwestUpstreamClient {
         policies: BackendFinalizationPolicies,
     ) -> Self {
         self.finalization_policies = policies;
+        self
+    }
+
+    /// Attach the dashboard FlowStore handle (D2). Threaded post-construction (like
+    /// `with_finalization_policies`) so the `with_options` signature is unchanged;
+    /// the handle is a cheap `Clone` of the shared store (or `disabled()`). Once
+    /// attached, the leaf captures the POST-`sanitize` on-wire upstream body into
+    /// the flow's record keyed by its `response_id`.
+    pub(crate) fn with_flow_store(
+        mut self,
+        flow_store: crate::dashboard_flow::DashboardFlowStore,
+    ) -> Self {
+        self.flow_store = flow_store;
+        self
+    }
+
+    /// Mark this leaf the BARE/direct engine upstream (D2): the DI root calls this
+    /// ONLY for the single-upstream `Arc::new(primary_upstream)` path, where no
+    /// routing/failover layer owns the `provider` serving field. Then the leaf
+    /// synthesizes `provider = "primary"`. Leaves nested inside a failover/routing
+    /// client never call this, so they don't clobber the real provider name.
+    pub(crate) fn into_bare_primary(mut self) -> Self {
+        self.tag_primary_provider = true;
         self
     }
 
@@ -578,16 +623,28 @@ impl ReqwestUpstreamClient {
             .map_err(|err| AppError::upstream(format!("upstream chat request failed: {err}")))
     }
 
-    /// Append `request` to the JSONL request log (when configured), then POST it.
-    /// Every actual upstream chat POST goes through here so the log records both
-    /// the original request and the G1 shrink-and-retry — otherwise the retry's
-    /// reduced budget would be invisible to the JSONL log and `analyze-log`. A
-    /// log-write failure is logged and the POST proceeds (logging is observability,
-    /// not a hard dependency of serving the request).
+    /// Append `request` to the JSONL request log (when configured), capture the
+    /// TRUE on-wire upstream body into the dashboard FlowStore (D2), then POST it.
+    /// Every actual upstream chat POST goes through here so BOTH the JSONL log and
+    /// the dashboard inspector record the original request AND the G1 shrink-and-
+    /// retry — otherwise the retry's reduced budget would be invisible. A log-write
+    /// failure is logged and the POST proceeds (logging is observability, not a hard
+    /// dependency of serving the request).
+    ///
+    /// `response_id` keys the FlowStore capture; the leaf only knows the flow's
+    /// `resp_{uuid}` (threaded on `BackendChatRequest`), and the store joins it to
+    /// the owning `api_call_id` via its link index. The captured body is THIS
+    /// `request` — the POST-`finalize_request_for_backend` + `sanitize_chat_request`
+    /// (and, on the retry call, the shrunk) request — i.e. exactly the bytes
+    /// `send_chat_request` serializes onto the wire, copied through the capped +
+    /// redacting serializer so no oversized/secret body is retained (a slice of the
+    /// 256 MiB inbound buffer is NEVER taken — this is a fresh serialization of the
+    /// already-parsed typed request).
     async fn logged_send_chat_request(
         &self,
         url: &Url,
         request: &ChatCompletionRequest,
+        response_id: Option<&str>,
     ) -> AppResult<reqwest::Response> {
         if let Some(ref logger) = self.request_logger
             && let Err(err) = logger.log(request).await
@@ -598,7 +655,28 @@ impl ReqwestUpstreamClient {
                 "failed to append upstream request log"
             );
         }
+        self.capture_upstream_body(response_id, request);
         self.send_chat_request(url, request).await
+    }
+
+    /// D2 capture: store the on-wire upstream body for `response_id` through the
+    /// capped, redacting serializer. No-op when the store is `disabled()` or no
+    /// `response_id` is threaded (tests / non-engine paths). The transient
+    /// `serde_json::to_vec` materializes the same bytes reqwest's `.json(request)`
+    /// would; only the capped `Arc<[u8]>` (at most `BODY_CAP`) is retained.
+    fn capture_upstream_body(&self, response_id: Option<&str>, request: &ChatCompletionRequest) {
+        if !self.flow_store.is_enabled() {
+            return;
+        }
+        let Some(response_id) = response_id else {
+            return;
+        };
+        let Ok(on_wire) = serde_json::to_vec(request) else {
+            return;
+        };
+        let captured = crate::dashboard_flow::capture_body(&on_wire);
+        self.flow_store
+            .set_upstream(response_id, None, None, Some(captured));
     }
 }
 
@@ -619,6 +697,22 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // is re-asserted last so an explicit client value still wins).
         let mut backend = backend.clone();
         finalize_request_for_backend(&mut backend, &self.finalization_policies);
+        // D2: the flow's `response_id` keys the on-wire capture below. Capture it
+        // BEFORE `backend.request` is moved into `sanitize_chat_request` so the
+        // first + retry send sites can both pass `response_id.as_deref()`.
+        let response_id = backend.response_id.clone();
+        // D2 bare-leaf path: when this leaf is the engine's upstream DIRECTLY (no
+        // routing/failover wrapper — lib.rs `Arc::new(primary_upstream)`, marked via
+        // `into_bare_primary`), nothing upstream tags the serving provider. Synthesize
+        // `"primary"` so every flow carries a provider. A leaf nested inside a
+        // failover/routing client is NOT marked, so it never runs this — otherwise
+        // (first-writer-wins) it would clobber the real provider name the wrapper
+        // records on first-chunk success, since the leaf runs BEFORE that success.
+        if self.tag_primary_provider
+            && let Some(serving) = &backend.serving
+        {
+            serving.set_provider("primary");
+        }
         let request = sanitize_chat_request(backend.request, self.flatten_content);
 
         // First attempt. On a non-2xx whose body indicates a context/completion
@@ -627,7 +721,9 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // can never duplicate already-streamed tokens, and it stays inside the
         // leaf client so the failover/routing layers never see a context-limit
         // error as a provider failure (it is a same-provider shrink-and-retry).
-        let response = self.logged_send_chat_request(&url, &request).await?;
+        let response = self
+            .logged_send_chat_request(&url, &request, response_id.as_deref())
+            .await?;
         let status = response.status();
         if status.is_success() {
             return stream_success_response(response, self.max_sse_frame_bytes).await;
@@ -657,7 +753,11 @@ impl UpstreamClient for ReqwestUpstreamClient {
                 new_max_completion_tokens = retry.max_completion_tokens,
                 "upstream context-window overflow; retrying once with reduced completion budget"
             );
-            let retry_response = self.logged_send_chat_request(&url, &retried).await?;
+            // D2: the retry is the body that ACTUALLY goes on the wire on the shrink
+            // path, so the capture must reflect the shrunk request (same `response_id`).
+            let retry_response = self
+                .logged_send_chat_request(&url, &retried, response_id.as_deref())
+                .await?;
             let retry_status = retry_response.status();
             if retry_status.is_success() {
                 return stream_success_response(retry_response, self.max_sse_frame_bytes).await;
@@ -813,6 +913,10 @@ impl FailoverUpstreamClient {
         BackendChatRequest {
             request,
             client_chat_template_kwargs: backend.client_chat_template_kwargs.clone(),
+            // D2: carry the flow identity + shared serving token forward (clone the
+            // `Arc`, not the token) so the leaf still captures + tags this flow.
+            response_id: backend.response_id.clone(),
+            serving: backend.serving.clone(),
         }
     }
 
@@ -980,6 +1084,14 @@ impl FailoverUpstreamClient {
             match Self::prefetch_first_chunk(stream, request_timeout).await {
                 Ok((first_chunk, stream)) => {
                     self.mark_provider_success(provider_index);
+                    // D2: this provider produced the first chunk, so it is the ACTUAL
+                    // serving provider (not a fallback that was tried and skipped —
+                    // AGENTS.md steering). The failover layer owns the `provider`
+                    // serving field; tag the flow's shared token here (first-writer-
+                    // wins). The same `Arc` lives on `provider_request`; use `backend`.
+                    if let Some(serving) = &backend.serving {
+                        serving.set_provider(provider.name.clone());
+                    }
                     if provider_index > 0 {
                         tracing::info!(
                             provider = %provider.name,
@@ -1110,6 +1222,10 @@ impl RoutingUpstreamClient {
         BackendChatRequest {
             request: routed_request,
             client_chat_template_kwargs: backend.client_chat_template_kwargs.clone(),
+            // D2: carry the flow identity + shared serving token forward (clone the
+            // `Arc`, not the token).
+            response_id: backend.response_id.clone(),
+            serving: backend.serving.clone(),
         }
     }
 
@@ -1663,6 +1779,11 @@ impl UpstreamClient for RoutingUpstreamClient {
         {
             let provider = self.route_provider(*route_provider_index)?;
             let routed_request = self.routed_request(backend, model_id, &provider.name, match_kind);
+            // D2: this routing layer owns the `route` serving field — tag it with the
+            // selected route provider's name (the failover layer below owns `provider`).
+            if let Some(serving) = &routed_request.serving {
+                serving.set_route(provider.name.clone());
+            }
             return provider
                 .client
                 .stream_chat_completion_with_timeout(&routed_request, request_timeout)
@@ -1679,6 +1800,11 @@ impl UpstreamClient for RoutingUpstreamClient {
             })?;
         let routed_request =
             self.routed_request(backend, &resolution.model_id, &provider.name, match_kind);
+        // D2: tag the `route` serving field with the selected routing provider's
+        // name (first-writer-wins; the nested failover layer owns `provider`).
+        if let Some(serving) = &routed_request.serving {
+            serving.set_route(provider.name.clone());
+        }
         match resolution.target {
             RoutingModelTarget::Primary => {
                 provider
@@ -1890,6 +2016,63 @@ fn policy_for_model<'a, V>(
     }
 }
 
+/// Mutable serving identity shared (via `Arc<ServingToken>`) from the engine that
+/// mints it down to the routing + failover layers that fill it in. The route name
+/// and serving provider are written by DIFFERENT actors at DIFFERENT times on the
+/// SAME shared token (routing sets `route` when it selects a provider; failover's
+/// `mark_provider_success` sets `provider` once a provider produces a first
+/// chunk), so the fields live behind a `Mutex` for interior mutability — the
+/// `Arc<ServingToken>` itself is cheap to `Clone` (it shares) and the token derives
+/// `Debug`, keeping `BackendChatRequest`'s `#[derive(Debug, Clone)]` intact with no
+/// `Arc<dyn Fn>` callback (D2).
+#[derive(Debug, Default)]
+struct ServingInfo {
+    route: Option<String>,
+    provider: Option<String>,
+}
+
+/// Interior-mutable serving identity for one flow. A FRESH one is allocated per
+/// `stream_responses` flow by the engine, so concurrent flows never overwrite each
+/// other's `{route, provider}` (the rev2 cross-flow race). The layers below set
+/// ONLY their own field (`set_route`/`set_provider`, first-writer-wins); D3 reads
+/// the pair at finalize via [`ServingToken::snapshot`].
+#[derive(Debug, Default)]
+pub struct ServingToken {
+    inner: Mutex<ServingInfo>,
+}
+
+impl ServingToken {
+    fn lock(&self) -> std::sync::MutexGuard<'_, ServingInfo> {
+        self.inner.lock().expect("serving token lock poisoned")
+    }
+
+    /// Record the selected route name (routing layer). First write wins so a
+    /// fallback retry cannot clobber the route the flow actually served on.
+    pub fn set_route(&self, route: impl Into<String>) {
+        let mut info = self.lock();
+        if info.route.is_none() {
+            info.route = Some(route.into());
+        }
+    }
+
+    /// Record the serving provider name (failover layer, on first-chunk success;
+    /// or the synthetic `"primary"` tag on the bare leaf path). First write wins so
+    /// the token reflects the ACTUAL serving provider, not a fallback that was tried
+    /// and skipped (AGENTS.md steering).
+    pub fn set_provider(&self, provider: impl Into<String>) {
+        let mut info = self.lock();
+        if info.provider.is_none() {
+            info.provider = Some(provider.into());
+        }
+    }
+
+    /// `(route, provider)` snapshot for D3's finalize attribution.
+    pub fn snapshot(&self) -> (Option<String>, Option<String>) {
+        let info = self.lock();
+        (info.route.clone(), info.provider.clone())
+    }
+}
+
 /// Leaf-boundary wrapper carrying finalization metadata that does NOT belong on
 /// the wire DTO `ChatCompletionRequest`. Built at the leaf boundary (in the
 /// engine, before dispatch) from per-model policies keyed by the FINAL
@@ -1910,23 +2093,45 @@ fn policy_for_model<'a, V>(
 /// `thinking:true`). Threading the pure client value lets the leaf re-overlay
 /// ONLY the client's keys so an explicit client value still wins over the family
 /// default (precedence: config < family < effort-map < client).
+///
+/// `response_id` + `serving` are the D2 dashboard identity: the flow's
+/// `resp_{uuid}` (so the leaf can join its on-wire capture to the FlowStore record)
+/// and the shared `Arc<ServingToken>` the routing/failover layers fill in. Both are
+/// `Option` and additive; production sets them ONLY at the engine's
+/// `BackendChatRequest::new`, and the failover/routing rebuilds CLONE the `Arc`s
+/// forward so the same token threads through the whole dispatch.
 #[derive(Debug, Clone)]
 pub struct BackendChatRequest {
     pub request: ChatCompletionRequest,
     pub client_chat_template_kwargs: Option<JsonMap<String, Value>>,
+    /// The flow's `resp_{uuid}` API id (D2), used to key the leaf's on-wire
+    /// upstream-body capture into the FlowStore. `None` outside the engine path
+    /// (tests / the failover rebuild before the engine sets it).
+    pub response_id: Option<String>,
+    /// Shared mutable serving identity (D2). Allocated fresh per flow by the engine;
+    /// the routing layer sets `route`, the failover layer sets `provider`.
+    pub serving: Option<Arc<ServingToken>>,
 }
 
 impl BackendChatRequest {
     /// Wrap a wire request with the client's explicit `chat_template_kwargs`
-    /// (captured pre-merge by the engine). The leaf resolves family/kwargs from
-    /// policies keyed by `request.model` inside `finalize_request_for_backend`.
+    /// (captured pre-merge by the engine) plus the D2 dashboard identity
+    /// (`response_id` + the shared `serving` token). The leaf resolves family/kwargs
+    /// from policies keyed by `request.model` inside `finalize_request_for_backend`.
+    /// This is the SINGLE production construction point that sets `response_id` +
+    /// `serving`; the failover/routing rebuilds clone the `Arc`s forward and the
+    /// test helpers pass `None` for both.
     pub fn new(
         request: ChatCompletionRequest,
         client_chat_template_kwargs: Option<JsonMap<String, Value>>,
+        response_id: Option<String>,
+        serving: Option<Arc<ServingToken>>,
     ) -> Self {
         Self {
             request,
             client_chat_template_kwargs,
+            response_id,
+            serving,
         }
     }
 }
@@ -3037,6 +3242,7 @@ mod tests {
     use super::FailoverUpstreamClient;
     use super::FailoverUpstreamProvider;
     use super::ModelFamily;
+    use super::UpstreamClient as _;
     use super::apply_family_chat_template_kwargs;
     use super::detect_model_family;
     use super::merge_chat_kwargs_gap_fill;
@@ -3099,11 +3305,14 @@ mod tests {
     }
 
     /// Wrap a family-request with optional client kwargs into the leaf wrapper.
+    /// TEST helper — excluded from the D2 dashboard identity (passes `None` for both
+    /// `response_id` and `serving`); only the engine's production
+    /// `BackendChatRequest::new` sets them.
     fn family_backend(
         model: &str,
         client_kwargs: Option<JsonMap<String, Value>>,
     ) -> BackendChatRequest {
-        BackendChatRequest::new(family_request(model), client_kwargs)
+        BackendChatRequest::new(family_request(model), client_kwargs, None, None)
     }
 
     /// Empty finalization policies (no effort map, no family override, no
@@ -4279,6 +4488,406 @@ mod tests {
         assert_eq!(
             request.extra_body.get("max_completion_tokens"),
             Some(&json!(256))
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // D2: BackendChatRequest identity (response_id + ServingToken) — the
+    // production rebuilds preserve both, and a per-flow token prevents the
+    // cross-flow `{route, provider}` overwrite race.
+    // -------------------------------------------------------------------
+
+    /// A throwaway leaf client (the URL/auth are irrelevant — these tests exercise
+    /// the pure request-rebuild helpers, no network).
+    fn d2_leaf_client() -> ReqwestUpstreamClient {
+        ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            url::Url::parse("https://upstream.test/v1").expect("url"),
+            None,
+            None,
+            true,
+            4096,
+        )
+    }
+
+    /// A `BackendChatRequest` carrying a fresh serving token + response_id, exactly
+    /// as the engine mints it per flow.
+    fn d2_backend_with_identity(model: &str, response_id: &str) -> BackendChatRequest {
+        BackendChatRequest::new(
+            family_request(model),
+            None,
+            Some(response_id.to_string()),
+            Some(Arc::new(super::ServingToken::default())),
+        )
+    }
+
+    #[test]
+    fn failover_rebuild_preserves_response_id_and_shares_serving_arc() {
+        // `request_for_provider` is the failover production rebuild. It must carry
+        // `response_id` forward AND clone the SAME `Arc<ServingToken>` (so a tag set
+        // on the rebuilt request is visible on the original — they share the token).
+        let backend = d2_backend_with_identity("glm-x", "resp_failover");
+        let provider = FailoverUpstreamProvider::new(
+            "p0",
+            d2_leaf_client(),
+            Some("upstream-model".to_string()),
+            None,
+            JsonMap::new(),
+        );
+        let rebuilt = FailoverUpstreamClient::request_for_provider(&provider, &backend);
+        assert_eq!(rebuilt.response_id.as_deref(), Some("resp_failover"));
+        let orig = backend.serving.as_ref().expect("original token");
+        let reb = rebuilt.serving.as_ref().expect("rebuilt token");
+        assert!(
+            Arc::ptr_eq(orig, reb),
+            "the rebuild must clone (share) the Arc, not allocate a new token"
+        );
+        // Proof they share: a tag through the rebuilt request is observable on the
+        // original (same underlying token).
+        reb.set_provider("p0");
+        assert_eq!(orig.snapshot().1.as_deref(), Some("p0"));
+    }
+
+    #[test]
+    fn routing_rebuild_preserves_response_id_and_shares_serving_arc() {
+        // `routed_request` is the routing production rebuild. Same contract.
+        let routing = super::RoutingUpstreamClient::new(Vec::new());
+        let backend = d2_backend_with_identity("requested", "resp_routing");
+        let rebuilt = routing.routed_request(
+            &backend,
+            "served-model",
+            "prov-a",
+            super::MatchKind::ExactId,
+        );
+        assert_eq!(rebuilt.response_id.as_deref(), Some("resp_routing"));
+        assert_eq!(rebuilt.request.model, "served-model");
+        let orig = backend.serving.as_ref().expect("original token");
+        let reb = rebuilt.serving.as_ref().expect("rebuilt token");
+        assert!(
+            Arc::ptr_eq(orig, reb),
+            "routing rebuild must share the serving Arc"
+        );
+        reb.set_route("prov-a");
+        assert_eq!(orig.snapshot().0.as_deref(), Some("prov-a"));
+    }
+
+    #[test]
+    fn serving_token_fields_are_first_writer_wins_and_independent() {
+        // route and provider are set by different layers; each is first-writer-wins
+        // and the two fields are independent.
+        let token = super::ServingToken::default();
+        token.set_route("route-1");
+        token.set_route("route-2"); // ignored
+        token.set_provider("prov-1");
+        token.set_provider("prov-2"); // ignored
+        assert_eq!(
+            token.snapshot(),
+            (Some("route-1".to_string()), Some("prov-1".to_string()))
+        );
+    }
+
+    #[test]
+    fn concurrent_flows_have_independent_serving_tokens() {
+        // The rev2 race: a CLIENT-WIDE token would let flow B's provider overwrite
+        // flow A's. A FRESH token per flow (what the engine allocates) keeps each
+        // flow's `{route, provider}` distinct even under concurrent writes. Two
+        // flows, each with its OWN token threaded through a failover rebuild — assert
+        // no cross-flow bleed.
+        let provider_a =
+            FailoverUpstreamProvider::new("vllm-a", d2_leaf_client(), None, None, JsonMap::new());
+        let provider_b =
+            FailoverUpstreamProvider::new("sglang-b", d2_leaf_client(), None, None, JsonMap::new());
+        let backend_a = d2_backend_with_identity("m", "resp_a");
+        let backend_b = d2_backend_with_identity("m", "resp_b");
+        let token_a = Arc::clone(backend_a.serving.as_ref().unwrap());
+        let token_b = Arc::clone(backend_b.serving.as_ref().unwrap());
+
+        // Distinct tokens up front (each flow minted its own).
+        assert!(!Arc::ptr_eq(&token_a, &token_b));
+
+        let handles: Vec<_> = [
+            (backend_a, provider_a, "route-a", "vllm-a"),
+            (backend_b, provider_b, "route-b", "sglang-b"),
+        ]
+        .into_iter()
+        .map(|(backend, provider, route, provider_name)| {
+            std::thread::spawn(move || {
+                // The routing layer tags route on the rebuilt request's token; the
+                // failover layer tags provider on first-chunk success.
+                let rebuilt = FailoverUpstreamClient::request_for_provider(&provider, &backend);
+                rebuilt.serving.as_ref().unwrap().set_route(route);
+                rebuilt
+                    .serving
+                    .as_ref()
+                    .unwrap()
+                    .set_provider(provider_name);
+            })
+        })
+        .collect();
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+
+        // No cross-flow overwrite: each flow's token holds ONLY its own values.
+        assert_eq!(
+            token_a.snapshot(),
+            (Some("route-a".to_string()), Some("vllm-a".to_string())),
+            "flow A kept its own serving identity"
+        );
+        assert_eq!(
+            token_b.snapshot(),
+            (Some("route-b".to_string()), Some("sglang-b".to_string())),
+            "flow B kept its own serving identity — no bleed from A"
+        );
+    }
+
+    // ---- D2 leaf on-wire capture (real ReqwestUpstreamClient ↔ wiremock) ----
+
+    use crate::dashboard_flow::DashboardFlowStore;
+    use futures::StreamExt as _;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method as wm_method;
+    use wiremock::matchers::path as wm_path;
+
+    /// A minimal valid upstream SSE success body (`bounded_sse_byte_stream` parses
+    /// it, so `stream_chat_completion` returns Ok and the capture is observable).
+    fn d2_sse_ok_body() -> String {
+        "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\
+         \"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n\
+         data: [DONE]\n\n"
+            .to_string()
+    }
+
+    /// Open + link a flow in the store so the leaf's `set_upstream(response_id, …)`
+    /// resolves to a live record. Returns the `(api_call_id, response_id)`.
+    fn d2_open_linked_flow(store: &DashboardFlowStore) -> (String, String) {
+        let api_call_id = "api_leaf".to_string();
+        let response_id = "resp_leaf".to_string();
+        store.open(
+            api_call_id.clone(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+            None,
+        );
+        store.link(response_id.clone(), api_call_id.clone());
+        (api_call_id, response_id)
+    }
+
+    /// A real leaf client pointed at `server`, with the ENABLED store attached.
+    fn d2_capturing_client(server_uri: &str, store: DashboardFlowStore) -> ReqwestUpstreamClient {
+        ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{server_uri}/v1/").parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        )
+        .with_flow_store(store)
+    }
+
+    #[tokio::test]
+    async fn leaf_captures_post_sanitize_upstream_body_not_pre_leaf() {
+        // The captured `upstream_body` must be the POST-`sanitize_chat_request` body.
+        // Probe: send `tool_choice="auto"` with NO tools — the PRE-leaf body carries
+        // it, but `sanitize_chat_request` CLEARS it. If capture were pre-leaf, the
+        // stored body would still contain `"tool_choice"`. We also set
+        // `max_output_tokens` to assert the on-wire `max_tokens` rename round-trips.
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let store = DashboardFlowStore::new();
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+        let client = d2_capturing_client(&server.uri(), store.clone());
+
+        let mut request = family_request("served-model");
+        request.tool_choice = Some(json!("auto")); // cleared by sanitize (no tools)
+        request.max_output_tokens = Some(1234);
+        let backend = BackendChatRequest::new(
+            request,
+            None,
+            Some(response_id.clone()),
+            Some(Arc::new(super::ServingToken::default())),
+        );
+
+        let mut stream = client
+            .stream_chat_completion(&backend)
+            .await
+            .expect("stream opens");
+        while stream.next().await.is_some() {}
+
+        let record = store.detail(&api_call_id).expect("record");
+        let body = record
+            .upstream_body
+            .as_ref()
+            .expect("upstream_body captured");
+        let value: serde_json::Value =
+            serde_json::from_slice(body).expect("captured upstream body is valid JSON");
+        assert_eq!(value["model"], json!("served-model"));
+        assert_eq!(
+            value["max_tokens"],
+            json!(1234),
+            "on-wire `max_tokens` (renamed from max_output_tokens) captured"
+        );
+        assert!(
+            value.get("tool_choice").is_none(),
+            "auto tool_choice with no tools was sanitized away → capture is POST-sanitize, not pre-leaf: {value}"
+        );
+        // The same record joins by response_id too.
+        assert!(store.detail(&response_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn leaf_captures_retry_body_on_shrink_path() {
+        // On a context-overflow, the leaf shrinks `max_tokens` and retries ONCE. The
+        // captured `upstream_body` must equal the RETRY (shrunk) body — the bytes
+        // that ACTUALLY went on the wire — not the first oversized attempt. wiremock
+        // returns the overflow 400 first, then a 200, using `up_to_n_times` + an
+        // expect-order scenario.
+        let server = MockServer::start().await;
+        let overflow = "This model's maximum context length is 202752 tokens. \
+            However, you requested 64000 output tokens and your prompt contains 139000 input tokens.";
+        // First call: 400 overflow.
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(overflow))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Second call: 200 success.
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let store = DashboardFlowStore::new();
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+        let client = d2_capturing_client(&server.uri(), store.clone());
+
+        let mut request = family_request("served-model");
+        // Oversized budget that the shrink path will reduce. 202752 - 100 - 139000.
+        request.max_output_tokens = Some(64000);
+        let backend = BackendChatRequest::new(
+            request,
+            None,
+            Some(response_id),
+            Some(Arc::new(super::ServingToken::default())),
+        );
+
+        let mut stream = client
+            .stream_chat_completion(&backend)
+            .await
+            .expect("retry stream opens");
+        while stream.next().await.is_some() {}
+
+        let record = store.detail(&api_call_id).expect("record");
+        let body = record
+            .upstream_body
+            .as_ref()
+            .expect("upstream_body captured");
+        let value: serde_json::Value =
+            serde_json::from_slice(body).expect("captured retry body is valid JSON");
+        assert_eq!(
+            value["max_tokens"],
+            json!(63652),
+            "captured body is the SHRUNK retry body (202752-100-139000), not the 64000 first attempt: {value}"
+        );
+    }
+
+    /// A leaf pointed at `server` that returns the SSE 200 success body; `bare`
+    /// marks it the direct engine upstream (D2 `into_bare_primary`).
+    async fn d2_ok_leaf(server: &MockServer, bare: bool) -> ReqwestUpstreamClient {
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
+            )
+            .mount(server)
+            .await;
+        let leaf = ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        );
+        if bare { leaf.into_bare_primary() } else { leaf }
+    }
+
+    #[tokio::test]
+    async fn bare_leaf_tags_provider_primary() {
+        // When the leaf is the engine's upstream DIRECTLY (marked `into_bare_primary`),
+        // it synthesizes `provider = "primary"` so every flow carries a provider.
+        let server = MockServer::start().await;
+        let client = d2_ok_leaf(&server, true).await;
+        let token = Arc::new(super::ServingToken::default());
+        let backend =
+            BackendChatRequest::new(family_request("m"), None, None, Some(Arc::clone(&token)));
+        let mut stream = client
+            .stream_chat_completion(&backend)
+            .await
+            .expect("stream opens");
+        while stream.next().await.is_some() {}
+
+        assert_eq!(
+            token.snapshot().1.as_deref(),
+            Some("primary"),
+            "bare leaf path tags a synthetic `primary` provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_failover_leaf_does_not_clobber_real_provider() {
+        // A leaf NESTED in a failover client must NOT tag `"primary"` — otherwise
+        // (first-writer-wins, and the leaf runs before the failover's first-chunk
+        // success) it would win over the REAL provider name. Drive the failover
+        // client end-to-end and assert the token carries the provider's name.
+        let server = MockServer::start().await;
+        let leaf = d2_ok_leaf(&server, false).await; // NOT bare — it is wrapped
+        let failover = FailoverUpstreamClient::new(
+            vec![FailoverUpstreamProvider::new(
+                "real-vllm",
+                leaf,
+                None,
+                None,
+                JsonMap::new(),
+            )],
+            std::time::Duration::from_secs(0),
+        );
+        let token = Arc::new(super::ServingToken::default());
+        let backend =
+            BackendChatRequest::new(family_request("m"), None, None, Some(Arc::clone(&token)));
+        let mut stream = failover
+            .stream_chat_completion(&backend)
+            .await
+            .expect("stream opens");
+        while stream.next().await.is_some() {}
+
+        assert_eq!(
+            token.snapshot().1.as_deref(),
+            Some("real-vllm"),
+            "the failover layer's real provider name wins; the nested leaf did NOT tag `primary`"
         );
     }
 }

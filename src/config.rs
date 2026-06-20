@@ -1613,7 +1613,7 @@ mod tests {
     /// returned map isolates kwargs precedence.
     fn leaf_chat_kwargs(config: &Config, backend_model: &str) -> JsonMap<String, JsonValue> {
         let policies = BackendFinalizationPolicies::from_config(config);
-        let mut backend = BackendChatRequest::new(leaf_request(backend_model), None);
+        let mut backend = BackendChatRequest::new(leaf_request(backend_model), None, None, None);
         finalize_request_for_backend(&mut backend, &policies);
         backend.request.extra_body.into_iter().collect()
     }

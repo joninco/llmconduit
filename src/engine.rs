@@ -1430,6 +1430,16 @@ impl Gateway {
             .get("chat_template_kwargs")
             .and_then(Value::as_object)
             .cloned();
+        // D2: a FRESH serving token per flow (per `stream_responses` call). The
+        // routing layer fills `route`, the failover layer fills `provider`. Because
+        // it is allocated here — not once in `Gateway::new` — concurrent flows never
+        // overwrite each other's `{route, provider}` (the rev2 cross-flow race).
+        // Cloned (the `Arc`, sharing the token) onto every per-turn
+        // `BackendChatRequest` below so all upstream turns of THIS flow tag the same
+        // token. `None` is impossible here — the engine always mints one — so the
+        // leaf/routing/failover layers can rely on `serving` being present in
+        // production while tests pass `None`.
+        let serving_token = Arc::new(crate::upstream::ServingToken::default());
         // `build_upstream_extra_body` now runs with EMPTY defaults: the
         // profile/global `upstream_chat_kwargs` merge at the leaf. It still
         // performs the request-extra normalization (remove typed-field defaults
@@ -1554,6 +1564,11 @@ impl Gateway {
             let backend_request = crate::upstream::BackendChatRequest::new(
                 upstream_request.clone(),
                 client_chat_template_kwargs.clone(),
+                // D2: thread the flow's `resp_{uuid}` so the leaf can key its on-wire
+                // capture to this flow's FlowStore record, and share the per-flow
+                // serving token so routing/failover can tag `{route, provider}`.
+                Some(response_id.clone()),
+                Some(Arc::clone(&serving_token)),
             );
             let mut stream = tokio::select! {
                 biased;

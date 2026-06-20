@@ -258,7 +258,7 @@ struct DashboardFlowState {
 /// operation early-returns and `is_enabled()` is `false`. `Clone` (the inner state
 /// is behind `Arc<Mutex<_>>`, exactly like `MonitorHub`) so it threads into the
 /// `#[derive(Clone)] Gateway` like the monitor does.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DashboardFlowStore {
     enabled: bool,
     state: Arc<Mutex<DashboardFlowState>>,
@@ -369,10 +369,12 @@ impl DashboardFlowStore {
 
     /// Attach the upstream target + served model identity + upstream body (D2). The
     /// body is a [`CapturedBody`] (provably redacted + capped); scalars are
-    /// `cap_scalar`-bounded.
+    /// `cap_scalar`-bounded. `id` may be the flow's `api_call_id` OR its
+    /// `response_id` (the leaf only knows the latter): `update` joins by either via
+    /// the link index, mirroring `detail`.
     pub fn set_upstream(
         &self,
-        api_call_id: &str,
+        id: &str,
         upstream_target: Option<String>,
         model_served: Option<String>,
         upstream_body: Option<CapturedBody>,
@@ -385,7 +387,7 @@ impl DashboardFlowStore {
         let upstream_body = upstream_body.map(CapturedBody::into_arc);
         let mut state = self.lock();
         state.prune_expired(now_ms());
-        state.update(api_call_id, |record| {
+        state.update(id, |record| {
             if upstream_target.is_some() {
                 record.upstream_target = upstream_target.clone();
             }
@@ -546,12 +548,28 @@ impl DashboardFlowState {
         self.by_id.insert(api_call_id, record);
     }
 
-    /// Copy-on-write mutate the record for `api_call_id`: clone the inner record
-    /// (the `claim` `Arc` is shared, NOT deep-copied, so D3's atomic identity
-    /// persists), apply `edit`, and swap the `Arc` back in. Adjusts
-    /// `live_summary_bytes` by the byte delta. No-op when the record is absent.
-    fn update(&mut self, api_call_id: &str, edit: impl FnOnce(&mut FlowRecord)) {
-        let Some(existing) = self.by_id.get(api_call_id) else {
+    /// Resolve any flow id — an `api_call_id` (direct `by_id` key) OR a
+    /// `response_id` (via the link index) — to the owning `api_call_id`. Mirrors
+    /// the dual-id join `detail` already performs so the mutators below can be
+    /// driven by EITHER id (D2's leaf only knows the flow's `response_id`; D3 also
+    /// keys by it). `None` when the id matches no live record.
+    fn resolve_id(&self, id: &str) -> Option<String> {
+        if self.by_id.contains_key(id) {
+            return Some(id.to_string());
+        }
+        self.link_index.get(id).cloned()
+    }
+
+    /// Copy-on-write mutate the record for `id` (an `api_call_id` OR a linked
+    /// `response_id`): clone the inner record (the `claim` `Arc` is shared, NOT
+    /// deep-copied, so D3's atomic identity persists), apply `edit`, and swap the
+    /// `Arc` back in. Adjusts `live_summary_bytes` by the byte delta. No-op when the
+    /// id resolves to no record.
+    fn update(&mut self, id: &str, edit: impl FnOnce(&mut FlowRecord)) {
+        let Some(api_call_id) = self.resolve_id(id) else {
+            return;
+        };
+        let Some(existing) = self.by_id.get(&api_call_id) else {
             return;
         };
         let before = existing.summary_bytes();
@@ -562,7 +580,7 @@ impl DashboardFlowState {
             .live_summary_bytes
             .saturating_sub(before)
             .saturating_add(after);
-        self.by_id.insert(api_call_id.to_string(), Arc::new(next));
+        self.by_id.insert(api_call_id, Arc::new(next));
     }
 
     /// Drop records whose age exceeds the TTL, keyed off `started_ms` vs a
@@ -861,6 +879,33 @@ mod tests {
                 Some(format!("resp_{i}").as_str())
             );
         }
+    }
+
+    #[test]
+    fn mutators_resolve_by_response_id_via_link_index() {
+        // D2 needs the id-keyed mutators (here `set_upstream`/`set_normalized`) to
+        // accept the flow's `response_id` — the leaf only knows that — and join it to
+        // the owning `api_call_id` via the link index, exactly like `detail`.
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        store.link("resp_1".to_string(), "api_1".to_string());
+        // Drive the mutators by RESPONSE_ID, not api_call_id.
+        store.set_upstream(
+            "resp_1",
+            Some("https://upstream".to_string()),
+            Some("served-m".to_string()),
+            Some(cap(b"{\"on\":\"wire\"}")),
+        );
+        store.set_normalized("resp_1", Some("requested-m".to_string()), None);
+        let record = store.detail("api_1").expect("record");
+        assert_eq!(record.upstream_target.as_deref(), Some("https://upstream"));
+        assert_eq!(record.model_served.as_deref(), Some("served-m"));
+        assert_eq!(record.model_requested.as_deref(), Some("requested-m"));
+        let body = record.upstream_body.as_ref().expect("upstream body set");
+        assert_eq!(&**body, b"{\"on\":\"wire\"}");
+        // An unknown id still no-ops (no panic, no record).
+        store.set_upstream("resp_unknown", Some("x".to_string()), None, None);
+        assert!(store.detail("resp_unknown").is_none());
     }
 
     #[test]

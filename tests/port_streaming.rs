@@ -105,6 +105,8 @@ async fn real_upstream_normal_stream_is_unaffected() {
         .stream_chat_completion(&llmconduit::upstream::BackendChatRequest::new(
             chat_request(),
             None,
+            None,
+            None,
         ))
         .await
         .expect("stream opens");
@@ -156,6 +158,8 @@ async fn real_upstream_oversized_frame_is_rejected_as_error() {
     let mut stream = client
         .stream_chat_completion(&llmconduit::upstream::BackendChatRequest::new(
             chat_request(),
+            None,
+            None,
             None,
         ))
         .await
