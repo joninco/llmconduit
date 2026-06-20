@@ -1,0 +1,146 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { act, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
+import { FlowDetail } from './FlowDetail';
+import { dashboardStore } from '../../store/dashboardStore';
+import { authStore } from '../../store/authStore';
+import { mockKillLog } from '../../api/mock';
+import { makeFlow, renderWithQuery, resetWorld, seedFlows } from '../testHarness';
+import type { DebugWsMessage, FlowDetail as FlowDetailDto } from '../../api/types';
+
+function noop() {}
+
+/** Push a monitor message into the live ring. */
+function pushMonitor(msg: DebugWsMessage): void {
+  act(() => dashboardStore.getState().pushMonitor(msg));
+}
+
+describe('FlowDetail — 3-pane inspector (mock backend)', () => {
+  beforeEach(() => {
+    // Mock mode: mockFetch answers /flows/:id + the kill route.
+    resetWorld({ mock: true });
+    authStore.getState().setMutationsEnabled(true);
+    authStore.getState().setCsrfToken('mock-csrf-token');
+    mockKillLog.length = 0;
+    // The live store knows api_001 (open, linked to resp_001) so the join + kill work.
+    seedFlows([makeFlow({ api_call_id: 'api_001', response_id: 'resp_001', status: 'open', model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', started_ms: 1_700_000_000_000 })]);
+  });
+  afterEach(cleanup);
+
+  it('renders all 3 bodies and tints the diff between layers (A→B→C)', async () => {
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    // The /flows/:id query resolves the three bodies.
+    await waitFor(() => expect(getByTestId('jsonpane-code-A · inbound').querySelectorAll('.json-line').length).toBeGreaterThan(0));
+    const paneB = getByTestId('jsonpane-code-B · normalized');
+    const paneC = getByTestId('jsonpane-code-C · upstream');
+    expect(paneB.querySelectorAll('.json-line').length).toBeGreaterThan(0);
+    expect(paneC.querySelectorAll('.json-line').length).toBeGreaterThan(0);
+    // The mock bodies differ at $.model (gpt-4o → llama) and add $.stream on C — tinted lines exist.
+    const tintedB = paneB.querySelectorAll('.json-line[data-diff]');
+    const tintedC = paneC.querySelectorAll('.json-line[data-diff]');
+    expect(tintedB.length + tintedC.length).toBeGreaterThan(0);
+  });
+
+  it('scroll-syncs the panes (scrolling A mirrors to B and C)', async () => {
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('jsonpane-scroll-A · inbound')).toBeTruthy());
+    const a = getByTestId('jsonpane-scroll-A · inbound');
+    const b = getByTestId('jsonpane-scroll-B · normalized');
+    const c = getByTestId('jsonpane-scroll-C · upstream');
+    a.scrollTop = 40;
+    fireEvent.scroll(a);
+    expect(b.scrollTop).toBe(40);
+    expect(c.scrollTop).toBe(40);
+  });
+
+  it('Timeline tab populates from monitor event_append; deltas render output + tool card', async () => {
+    const { getByTestId, getByRole } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+
+    // Stream a timeline event + segments (output + a tool call) for resp_001.
+    pushMonitor({ type: 'event_append', response_id: 'resp_001', event: { timestamp_ms: 1, kind: 'response.created', summary: 'created', images: [] } });
+    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 2, kind: 'output', text: 'Hello world' } });
+    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 3, kind: 'tool', text: JSON.stringify({ name: 'search' }) } });
+
+    // Deltas sub-panel shows the output text + an expandable tool card.
+    expect(getByTestId('deltas-panel').textContent).toContain('Hello world');
+    const card = getByTestId('tool-card');
+    expect(card.textContent).toContain('search');
+    fireEvent.click(card.querySelector('button')!);
+    expect(getByTestId('tool-card-body')).toBeTruthy();
+
+    // Timeline tab populates.
+    fireEvent.click(getByRole('tab', { name: 'Timeline' }));
+    expect(within(getByTestId('tabpanel-timeline')).getByText('response.created')).toBeTruthy();
+  });
+
+  it('kill POSTs with the CSRF header and optimistically flips the row to cancelled', async () => {
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('kill-button')).toBeTruthy());
+    fireEvent.click(getByTestId('kill-button'));
+
+    // Optimistic: the live row flips to cancelled immediately.
+    expect(dashboardStore.getState().flows.get('api_001')?.status).toBe('cancelled');
+    // The POST carried the X-CSRF-Token (D7 double-submit).
+    await waitFor(() => expect(mockKillLog.at(-1)?.id).toBe('api_001'));
+    expect(mockKillLog.at(-1)?.csrf).toBe('mock-csrf-token');
+    await waitFor(() => expect(getByTestId('kill-done')).toBeTruthy());
+  });
+
+  it('a server 403 (no CSRF) is handled: rolls back + shows mutations-disabled', async () => {
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('kill-button')).toBeTruthy());
+    // Clear the token AFTER the connection seeded it, so the kill omits X-CSRF-Token → mock 403.
+    // (getConnection re-seeds auth from the bootstrap on (re)build, so we override post-render.)
+    act(() => authStore.getState().setCsrfToken(null));
+    document.cookie = 'llmconduit_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+    fireEvent.click(getByTestId('kill-button'));
+    // Forbidden state surfaces and the optimistic flip is rolled back to open.
+    await waitFor(() => expect(getByTestId('kill-forbidden')).toBeTruthy());
+    expect(dashboardStore.getState().flows.get('api_001')?.status).toBe('open');
+  });
+
+  it('kill button is gated OFF (disabled, no POST) when mutations are disabled', async () => {
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('kill-button')).toBeTruthy());
+    // Disable mutations AFTER the connection seeded the bootstrap value (which is `true` in mock).
+    act(() => authStore.getState().setMutationsEnabled(false));
+    const btn = getByTestId('kill-button');
+    expect(btn).toBeDisabled();
+    expect(btn.getAttribute('title')).toBe('mutations disabled');
+    // A disabled button cannot dispatch a click → no kill POST is ever attempted.
+    fireEvent.click(btn);
+    expect(mockKillLog).toHaveLength(0);
+  });
+});
+
+describe('FlowDetail — time-travel seek + body eviction', () => {
+  beforeEach(() => {
+    resetWorld({ mock: true });
+    // An id the mock does NOT know (so /flows/:id 404s and never overwrites our injected
+    // body-free detail) — modeling a historical flow whose live body was evicted (D5).
+    seedFlows([makeFlow({ api_call_id: 'api_evicted', response_id: 'resp_evicted', status: 'completed', started_ms: 1_700_000_000_000 })]);
+  });
+  afterEach(cleanup);
+
+  it('shows the snapshot badge and "body evicted (snapshot)" when seeking with no body', async () => {
+    // A detail with evicted bodies (absent fields) — what /flows/:id returns post-eviction.
+    const evicted: FlowDetailDto = {
+      flow_seq: 1, api_call_id: 'api_evicted', response_id: 'resp_evicted', status: 'completed',
+      deltas: [], started_ms: 1_700_000_000_000,
+      // inbound_body / normalized / upstream_body intentionally ABSENT (evicted).
+    };
+    const { queryClient } = renderWithQuery(<FlowDetail apiCallId="api_evicted" onClose={noop} />);
+    // Seed the body-free detail (the 404 fetch error won't replace manually-set data).
+    act(() => queryClient.setQueryData(['flows', 'api_evicted'], evicted));
+    // Enter seek (D11 paused) — the store connection flips to 'seeking'.
+    act(() => dashboardStore.getState().setConnection('seeking'));
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="seek-badge"]')).toBeTruthy();
+    });
+    // Each pane shows the evicted placeholder (with the snapshot qualifier) rather than JSON.
+    const empties = document.querySelectorAll('[data-testid^="jsonpane-empty-"]');
+    expect(empties.length).toBe(3);
+    expect(empties[0]!.textContent).toContain('body evicted');
+  });
+});

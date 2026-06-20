@@ -16,16 +16,7 @@ function ViewFrame({ title, subtitle, children }: { title: string; subtitle: str
   );
 }
 
-export function FlowsView() {
-  const flowCount = useDashboard((s) => s.flowOrder.length);
-  return (
-    <ViewFrame title="Flows" subtitle="Transformation inspector — implemented in D10.">
-      <p className="text-sm text-text-muted">
-        Live flows in store: <span className="tabular-nums text-accent">{flowCount}</span>
-      </p>
-    </ViewFrame>
-  );
-}
+// FlowsView moved to ./FlowsView.tsx (D10 — the real transformation inspector).
 
 export function TopologyView() {
   const nodes = useDashboard((s) => s.topologyNodes.length);
