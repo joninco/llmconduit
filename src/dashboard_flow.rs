@@ -44,6 +44,7 @@ use std::sync::atomic::AtomicU8;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+use tokio_util::sync::CancellationToken;
 
 /// Record cap: reuse the monitor's `REQUEST_EVENT_LIMIT` (512) so the dashboard
 /// store does not invent a second retention dial (D1 constraint).
@@ -69,6 +70,111 @@ pub const CLAIM_OPEN_L0: u8 = 0;
 pub const CLAIM_CLAIMED_L1: u8 = 1;
 /// CAS claim state: the flow is finalized; no further telemetry writes (D3).
 pub const CLAIM_FINALIZED: u8 = 2;
+
+/// D6 **AbortHub**: the live-cancellation registry keyed by `api_call_id` (= the
+/// flow `:id`), so `POST /dashboard/api/flows/:id/kill` can cancel a stuck server-side
+/// stream WITHOUT rekeying (the `:id` IS the `api_call_id`; spec D6 decision).
+///
+/// Lifecycle is owned by the D3 L1 [`TelemetryGuard`], NOT the kill route: the guard
+/// REGISTERS its [`CancellationToken`] under `api_call_id` the instant it CASes
+/// `OpenL0 → ClaimedL1` (the SAME claim seam that makes it the flow's sole telemetry
+/// writer), and REMOVES it on EVERY finalize path (the CAS-winning explicit
+/// `Completed`/`Failed` AND the `Drop` fallback). So the map is bounded by the
+/// in-flight stream count — never the 512-record history — and a finished flow leaks
+/// no entry. Cancellation composes with (never replaces) the engine's existing
+/// `tx.closed()` client-hangup checks: a kill flips the token, every cancel site
+/// surfaces `AppError::cancelled()` (HTTP 499) exactly like a hang-up, with no token
+/// duplication (AGENTS.md "Failover only pre-first-chunk": a mid-stream cancel is a
+/// cancel, not a retry).
+///
+/// `Clone` shares the inner `Arc<Mutex<_>>` (like `DashboardFlowStore`/`MonitorHub`)
+/// so it threads into the `#[derive(Clone)] Gateway`. `disabled()` mirrors the
+/// zero-overhead pattern: when the debug UI is off the guard never registers and
+/// [`abort`](Self::abort) is a no-op `false`, so production keeps no map + no lock.
+#[derive(Clone, Debug)]
+pub struct AbortHub {
+    enabled: bool,
+    handles: Arc<Mutex<HashMap<String, CancellationToken>>>,
+}
+
+impl AbortHub {
+    /// Enabled hub (debug UI on).
+    pub fn new() -> Self {
+        Self {
+            enabled: true,
+            handles: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// No-op hub (debug UI off). `register`/`remove` early-return and `abort` is
+    /// always `false`, so production keeps zero overhead.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            handles: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CancellationToken>> {
+        self.handles.lock().expect("abort hub lock poisoned")
+    }
+
+    /// Register the flow's cancellation token under `api_call_id`. Called ONLY by the
+    /// L1 guard at its claim seam, so at most one token per in-flight flow. No-op when
+    /// disabled.
+    fn register(&self, api_call_id: &str, token: CancellationToken) {
+        if !self.enabled {
+            return;
+        }
+        self.lock().insert(api_call_id.to_string(), token);
+    }
+
+    /// Remove the flow's token. Called by the L1 guard on EVERY finalize path (so the
+    /// map never retains a finished flow). Idempotent — a second remove (Drop after an
+    /// explicit finalize) is a no-op. No-op when disabled.
+    fn remove(&self, api_call_id: &str) {
+        if !self.enabled {
+            return;
+        }
+        self.lock().remove(api_call_id);
+    }
+
+    /// Cancel the live stream for `api_call_id`, returning whether a live token was
+    /// found (the kill route maps `true → 200`, `false → 404` for an unknown or
+    /// already-finished flow). Cancelling flips the shared [`CancellationToken`]; the
+    /// engine's compose-with-`tx.closed()` sites then surface `AppError::cancelled()`
+    /// (499) and the guard's `Drop` finalizes `Cancelled`, which also removes the
+    /// entry. We do NOT remove here: removal stays the guard's single responsibility,
+    /// so a double-kill is a harmless idempotent `cancel()` (already-cancelled tokens
+    /// stay cancelled) rather than a removal race with the finalizing guard.
+    pub fn abort(&self, api_call_id: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let Some(token) = self.lock().get(api_call_id).cloned() else {
+            return false;
+        };
+        token.cancel();
+        true
+    }
+
+    /// Number of live registered tokens. The no-leak invariant: this returns to 0 once
+    /// all in-flight flows finalize (the guard removes on every terminal path), so the
+    /// map is bounded by the in-flight stream count, never the 512-record history. `0`
+    /// when disabled. Primarily a test/observability seam.
+    pub fn live_len(&self) -> usize {
+        if !self.enabled {
+            return 0;
+        }
+        self.lock().len()
+    }
+}
+
+impl Default for AbortHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Lifecycle status of a flow. `Open` at creation; D3 moves it to a terminal
 /// state. Serializes snake_case for the dashboard REST/WS surface.
@@ -576,6 +682,7 @@ impl DashboardFlowStore {
         &self,
         api_call_id: &str,
         serving: std::sync::Arc<crate::upstream::ServingToken>,
+        abort_hub: &AbortHub,
     ) -> Option<TelemetryGuard> {
         if !self.enabled {
             return None;
@@ -597,6 +704,14 @@ impl DashboardFlowStore {
                 std::sync::atomic::Ordering::Acquire,
             )
             .ok()?;
+        // D6: the CAS winner is the flow's sole telemetry writer, so it is also the
+        // sole owner of the AbortHub entry. Register the kill token HERE (the same
+        // claim seam) and remove it on EVERY finalize path below — so the map is
+        // bounded by in-flight streams and a finished flow leaks nothing. The token
+        // is cloned onto the guard so the engine can compose `token.is_cancelled()`
+        // alongside every `tx.closed()` client-hangup check.
+        let abort_token = CancellationToken::new();
+        abort_hub.register(api_call_id, abort_token.clone());
         Some(TelemetryGuard {
             store: self.clone(),
             api_call_id: api_call_id.to_string(),
@@ -605,6 +720,8 @@ impl DashboardFlowStore {
             started: Instant::now(),
             endpoint,
             terminal_metrics: Mutex::new(None),
+            abort_hub: abort_hub.clone(),
+            abort_token,
         })
     }
 
@@ -802,6 +919,18 @@ pub struct TelemetryGuard {
     /// of FlowStore retention. `Mutex` for interior mutability behind the guard's
     /// `&self` finalize; the winning CAS writes it exactly once, before any reader.
     terminal_metrics: Mutex<Option<TerminalMetricsInputs>>,
+    /// D6: the AbortHub this guard registered its kill token into at claim time. The
+    /// CAS-winning `finalize` (and the `Drop` fallback) REMOVES the `api_call_id` entry
+    /// so a finished flow never leaks a token (the map stays bounded by in-flight
+    /// streams). Cheap `Arc`-sharing clone; `disabled()` makes remove a no-op.
+    abort_hub: AbortHub,
+    /// D6: the flow's cancellation token, registered in `abort_hub` under
+    /// `api_call_id`. The engine reads it via [`abort_token`](Self::abort_token) and
+    /// composes `is_cancelled()`/`cancelled()` alongside every `tx.closed()` check, so a
+    /// kill surfaces `AppError::cancelled()` (499) exactly like a client hang-up. The
+    /// token is NOT cancelled by `Drop` — a clean Completed/Failed flow must leave it
+    /// uncancelled; only an explicit `abort()` flips it.
+    abort_token: CancellationToken,
 }
 
 impl TelemetryGuard {
@@ -809,6 +938,15 @@ impl TelemetryGuard {
     /// the SAME record the guard owns without re-threading the id separately).
     pub fn api_call_id(&self) -> &str {
         &self.api_call_id
+    }
+
+    /// D6: the flow's cancellation token (a cheap `Arc`-sharing clone). The engine
+    /// threads this into `run_turn` and composes `is_cancelled()` (the poll sites) /
+    /// `cancelled()` (the `tokio::select!` sites) ALONGSIDE every existing `tx.closed()`
+    /// client-hangup check, so a `Gateway::abort` surfaces `AppError::cancelled()` (499)
+    /// just like a hang-up — never duplicating or replaying tokens.
+    pub fn abort_token(&self) -> CancellationToken {
+        self.abort_token.clone()
     }
 
     /// Monotonic elapsed since the guard claimed the flow — the latency source the
@@ -876,6 +1014,13 @@ impl TelemetryGuard {
                 });
             self.store
                 .finalize(&self.api_call_id, status, terminal_reason, serving);
+            // D6: drop the kill token from the AbortHub on the SAME CAS-winning path
+            // that finalizes the record — so EVERY terminal (explicit Completed/Failed
+            // here, OR the `Drop` fallback's Cancelled) removes the entry exactly once.
+            // No finished flow leaks a token; the map stays bounded by in-flight streams,
+            // not the 512-record history. Inside the CAS guard so a double finalize (the
+            // Drop after an explicit call) does not double-remove.
+            self.abort_hub.remove(&self.api_call_id);
         }
     }
 }
@@ -1325,6 +1470,96 @@ mod tests {
     }
 
     #[test]
+    fn d6_guard_registers_token_on_claim_and_removes_on_finalize() {
+        // The L1 guard REGISTERS its kill token in the AbortHub at claim time and
+        // REMOVES it on an explicit finalize — so a Completed flow leaks no entry.
+        let store = DashboardFlowStore::new();
+        let hub = AbortHub::new();
+        open_simple(&store, "api_1");
+        assert_eq!(hub.live_len(), 0, "no token before claim");
+
+        let guard = store.engine_guard("api_1", serving(), &hub).expect("claim");
+        assert_eq!(hub.live_len(), 1, "token registered at claim");
+        assert!(
+            !guard.abort_token().is_cancelled(),
+            "token starts uncancelled"
+        );
+
+        guard.finalize(FlowStatus::Completed, Some("done".to_string()));
+        assert_eq!(
+            hub.live_len(),
+            0,
+            "token removed on explicit finalize (no leak)"
+        );
+    }
+
+    #[test]
+    fn d6_guard_removes_token_on_drop_fallback() {
+        // A missed-exit Drop (cancel/panic) also removes the AbortHub entry via the
+        // SAME CAS-winning finalize path — no leak even without an explicit finalize.
+        let store = DashboardFlowStore::new();
+        let hub = AbortHub::new();
+        open_simple(&store, "api_1");
+        {
+            let _guard = store.engine_guard("api_1", serving(), &hub).expect("claim");
+            assert_eq!(hub.live_len(), 1);
+        } // Drop with no explicit finalize.
+        assert_eq!(
+            hub.live_len(),
+            0,
+            "Drop fallback removed the token (no leak)"
+        );
+    }
+
+    #[test]
+    fn d6_abort_cancels_live_token_and_reports_found() {
+        // abort() flips the live flow's token and reports `true`; the guard's clone of
+        // the SAME token observes the cancellation (shared Arc), so the engine's
+        // compose sites will surface cancelled().
+        let store = DashboardFlowStore::new();
+        let hub = AbortHub::new();
+        open_simple(&store, "api_1");
+        let guard = store.engine_guard("api_1", serving(), &hub).expect("claim");
+        let token = guard.abort_token();
+
+        assert!(hub.abort("api_1"), "live token found + cancelled");
+        assert!(token.is_cancelled(), "the guard's token observes the kill");
+
+        // Idempotent: a second abort of the still-registered flow re-cancels (still
+        // true) without panicking — removal stays the guard's job.
+        assert!(
+            hub.abort("api_1"),
+            "double-kill is idempotent while registered"
+        );
+    }
+
+    #[test]
+    fn d6_abort_unknown_or_finished_id_reports_not_found() {
+        let store = DashboardFlowStore::new();
+        let hub = AbortHub::new();
+        // Unknown id (never registered).
+        assert!(!hub.abort("nope"), "unknown id → false");
+
+        open_simple(&store, "api_1");
+        let guard = store.engine_guard("api_1", serving(), &hub).expect("claim");
+        guard.finalize(FlowStatus::Completed, None); // removes the entry
+        assert!(
+            !hub.abort("api_1"),
+            "already-finished id → false (entry already removed)"
+        );
+    }
+
+    #[test]
+    fn d6_disabled_hub_is_a_noop() {
+        // A disabled hub (debug UI off) never registers and abort is always false, so
+        // production keeps zero overhead.
+        let hub = AbortHub::disabled();
+        hub.register("api_1", CancellationToken::new());
+        assert_eq!(hub.live_len(), 0, "disabled hub stores nothing");
+        assert!(!hub.abort("api_1"), "disabled hub abort is always false");
+    }
+
+    #[test]
     fn l0_guard_finalizes_orphan_left_open() {
         // The L0 middleware guard's Drop finalizes a record that was opened but
         // NEVER claimed by the engine (extractor/JSON rejection) — no orphan Open.
@@ -1358,7 +1593,7 @@ mod tests {
         open_simple(&store, "api_1");
         let l0 = store.middleware_guard("api_1").expect("L0 guard");
         let l1 = store
-            .engine_guard("api_1", serving())
+            .engine_guard("api_1", serving(), &AbortHub::new())
             .expect("L1 claim wins");
         assert_eq!(
             store.detail("api_1").unwrap().claim.load(SeqCst),
@@ -1366,7 +1601,9 @@ mod tests {
         );
         // A SECOND engine guard cannot claim (CAS already lost OpenL0).
         assert!(
-            store.engine_guard("api_1", serving()).is_none(),
+            store
+                .engine_guard("api_1", serving(), &AbortHub::new())
+                .is_none(),
             "second L1 claim loses the CAS"
         );
         drop(l0); // inert — record is ClaimedL1, not OpenL0.
@@ -1388,7 +1625,9 @@ mod tests {
         // Completed with the Cancelled fallback).
         let store = DashboardFlowStore::new();
         open_simple(&store, "api_1");
-        let guard = store.engine_guard("api_1", serving()).expect("claim");
+        let guard = store
+            .engine_guard("api_1", serving(), &AbortHub::new())
+            .expect("claim");
         guard.finalize(
             FlowStatus::Completed,
             Some("response.completed".to_string()),
@@ -1413,7 +1652,9 @@ mod tests {
         let store = DashboardFlowStore::new();
         open_simple(&store, "api_1");
         {
-            let _guard = store.engine_guard("api_1", serving()).expect("claim");
+            let _guard = store
+                .engine_guard("api_1", serving(), &AbortHub::new())
+                .expect("claim");
             assert_eq!(store.detail("api_1").unwrap().status, FlowStatus::Open);
         } // Drop with no explicit finalize.
         let record = store.detail("api_1").expect("record");
@@ -1431,7 +1672,7 @@ mod tests {
         open_simple(&store, "api_1");
         let token = serving();
         let guard = store
-            .engine_guard("api_1", Arc::clone(&token))
+            .engine_guard("api_1", Arc::clone(&token), &AbortHub::new())
             .expect("claim");
         // Provider tagged AFTER the guard exists (mirrors failover first-chunk).
         token.set_provider("backend-b");
@@ -1452,7 +1693,9 @@ mod tests {
         store.set_upstream("api_1", Some("https://real-url".to_string()), None, None);
         let token = serving();
         token.set_provider("backend-b");
-        let guard = store.engine_guard("api_1", token).expect("claim");
+        let guard = store
+            .engine_guard("api_1", token, &AbortHub::new())
+            .expect("claim");
         guard.finalize(FlowStatus::Completed, None);
         assert_eq!(
             store.detail("api_1").unwrap().upstream_target.as_deref(),
@@ -1487,7 +1730,7 @@ mod tests {
                 reasoning: 7,
             });
             let guard = store
-                .engine_guard("api_1", Arc::clone(&token))
+                .engine_guard("api_1", Arc::clone(&token), &AbortHub::new())
                 .expect("claim");
 
             // EVICT the record BEFORE finalize — the whole record is gone either way.
@@ -1565,7 +1808,11 @@ mod tests {
     fn disabled_store_mints_no_guards() {
         let store = DashboardFlowStore::disabled();
         assert!(store.middleware_guard("api_1").is_none());
-        assert!(store.engine_guard("api_1", serving()).is_none());
+        assert!(
+            store
+                .engine_guard("api_1", serving(), &AbortHub::new())
+                .is_none()
+        );
     }
 
     #[test]

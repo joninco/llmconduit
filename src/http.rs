@@ -5,6 +5,8 @@ use crate::adapters::chat_completions::ChatCompletionStreamConverter;
 use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
 use crate::dashboard_auth::DashboardAuth;
+use crate::dashboard_auth::MutationDenied;
+use crate::dashboard_auth::MutationPolicy;
 use crate::dashboard_auth::dashboard_login;
 use crate::dashboard_auth::dashboard_logout;
 use crate::dashboard_auth::require_session;
@@ -28,6 +30,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::body::to_bytes;
+use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::Request;
 use axum::extract::State;
@@ -151,6 +154,84 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .merge(open)
         // Scope the auth context to ONLY the protected routes (not `/v1/*`).
         .layer(Extension(auth))
+}
+
+/// D6 — the outcome of a `POST /dashboard/api/flows/:id/kill` attempt, decoupled from
+/// axum so the policy + abort logic is unit-testable against a MOCK [`MutationPolicy`]
+/// (the spec's "compiles + tests against a mocked auth/CSRF gate"). The axum handler is
+/// the only place that maps this to an HTTP status.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FlowKillOutcome {
+    /// A live token was found and cancelled → `200 OK`.
+    Killed,
+    /// No live flow for that `api_call_id` (unknown OR already finished) → `404`.
+    NotFound,
+    /// The mutation policy refused (mutations disabled, or CSRF missing/invalid) → the
+    /// `MutationDenied` status (`403`). Carries the reason so the body can be precise.
+    Denied(MutationDenied),
+}
+
+/// D6 — the pure kill core: authorize the mutation, then cancel the flow. Separated
+/// from the axum handler so tests drive it with a mock `MutationPolicy` + a real
+/// `Gateway` (no HTTP stack). CSRF/mutation gating runs FIRST (a refused mutation must
+/// not even probe whether the id is live — no existence oracle for an unauthorized
+/// caller); only an authorized request consults the AbortHub. `gateway.abort` is
+/// idempotent, so a double-kill of a still-live flow simply re-cancels an
+/// already-cancelled token (`true` both times until the guard removes it), and a kill
+/// of a finished/unknown flow is `false` → 404.
+pub fn flow_kill_outcome(
+    policy: &dyn MutationPolicy,
+    headers: &HeaderMap,
+    gateway: &Gateway,
+    api_call_id: &str,
+) -> FlowKillOutcome {
+    if let Err(denied) = policy.authorize_mutation(headers) {
+        return FlowKillOutcome::Denied(denied);
+    }
+    if gateway.abort(api_call_id) {
+        FlowKillOutcome::Killed
+    } else {
+        FlowKillOutcome::NotFound
+    }
+}
+
+/// D6 — the `POST /dashboard/api/flows/:id/kill` handler. `:id` IS the flow's
+/// `api_call_id` (the AbortHub key == the route param, no rekeying — spec decision), so
+/// it cancels the live server-side stream: a `200` flips the flow's `CancellationToken`
+/// and the engine's compose-with-`tx.closed()` sites surface `AppError::cancelled()`
+/// (499) to the client while the L1 guard finalizes the record `Cancelled`; a `404`
+/// means no live flow. The mutation+CSRF gate (`LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS` +
+/// a double-submit CSRF token) is enforced via the shared `DashboardAuth`
+/// [`MutationPolicy`] BEFORE any abort. Behind `require_session` when registered (D13),
+/// so an unauthenticated caller is already 401'd before reaching here.
+///
+/// REGISTRATION is D13's job (this is the only mutation route in the phase; replay is
+/// deferred). The handler is provided here so D6 ships the kill behavior + tests
+/// independent of D13's route table (breaking the D6↔D13 cycle).
+pub async fn dashboard_flow_kill(
+    State(gateway): State<Arc<Gateway>>,
+    Extension(auth): Extension<Arc<DashboardAuth>>,
+    Path(api_call_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let response = match flow_kill_outcome(auth.as_ref(), &headers, gateway.as_ref(), &api_call_id)
+    {
+        FlowKillOutcome::Killed => {
+            (StatusCode::OK, Json(serde_json::json!({"killed": true}))).into_response()
+        }
+        FlowKillOutcome::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "no live flow for that id"})),
+        )
+            .into_response(),
+        FlowKillOutcome::Denied(denied) => (
+            denied.status(),
+            Json(serde_json::json!({"error": denied.message()})),
+        )
+            .into_response(),
+    };
+    // Dashboard API responses are never cached (mutation result, auth-scoped).
+    crate::dashboard_auth::no_store(response)
 }
 
 /// Whether a request is an instrumented inference flow (D1, incl. R1 #1): the

@@ -4465,6 +4465,234 @@ async fn d3_midstream_cancel_finalizes_cancelled_with_last_usage() {
 }
 
 #[tokio::test]
+async fn d6_kill_midchunk_terminates_stream_cancelled_no_leak() {
+    // D6 CORE: a server-side kill (NOT a client hang-up) of a live, parked stream
+    // cancels it cleanly — the record finalizes Cancelled, the upstream stream is torn
+    // down (no orphan/dup), the client stream ends with a terminal `response.failed`
+    // (not a half-open hang), and the AbortHub leaks no entry. `abort()` while the
+    // CLIENT is still connected (tx NOT closed) proves the kill composes with — does
+    // not depend on — the `tx.closed()` hang-up path.
+    let upstream = ChunkThenPendingUpstream::new(vec![
+        content_chunk("chat-1", "Hel"),
+        usage_chunk("chat-1", 100, 20, 120, Some(5), None),
+    ]);
+    let stream_polled = upstream.stream_polled.notified();
+    let stream_dropped = upstream.stream_dropped.notified();
+    let gateway = test_gateway_with_flow_store_upstream(Arc::new(upstream.clone()));
+    let api_call_id = d3_open_flow(&gateway);
+
+    let request = base_request(vec![user_message("count")]);
+    let mut stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+
+    // Drain the early SSE events until the upstream is parked waiting for more.
+    let mut early = Vec::new();
+    while early.len() < 2 {
+        match stream.next().await {
+            Some(event) => early.push(event),
+            None => break,
+        }
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_polled)
+        .await
+        .expect("upstream parked after its canned chunks");
+
+    // The token is registered while the flow is live.
+    assert_eq!(
+        gateway.abort_hub().live_len(),
+        1,
+        "live flow registered exactly one kill token"
+    );
+
+    // SERVER-SIDE kill (client still connected — we still hold `stream`).
+    assert!(
+        gateway.abort(&api_call_id),
+        "abort found the live token → true"
+    );
+
+    // The stream terminates cleanly: it yields a terminal `response.failed` (the engine
+    // surfaced cancelled() and emitted the terminal event) and then ENDS — collecting
+    // the remainder must not hang.
+    let mut saw_failed = false;
+    let drain = async {
+        while let Some(event) = stream.next().await {
+            if event.event == "response.failed" {
+                saw_failed = true;
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+        .await
+        .expect("killed stream terminated (did not hang)");
+    assert!(
+        saw_failed,
+        "killed stream ended with a terminal response.failed, not a half-open hang"
+    );
+
+    // The upstream stream was actually dropped — the engine tore down upstream work on
+    // cancel (no orphan task, no duplicated/replayed tokens).
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_dropped)
+        .await
+        .expect("upstream stream dropped on kill (engine cancelled upstream work)");
+
+    // The record finalized Cancelled (the kill is a cancel, not a failure), keeping the
+    // last upserted usage, and the AbortHub leaked no entry.
+    let record = d3_await_terminal(&gateway, &api_call_id).await;
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Cancelled,
+        "server-side kill finalized Cancelled"
+    );
+    assert_eq!(
+        record.usage.expect("last usage retained").total,
+        120,
+        "kill keeps the LAST upserted cumulative total"
+    );
+    assert_eq!(
+        record.claim.load(std::sync::atomic::Ordering::SeqCst),
+        llmconduit::dashboard_flow::CLAIM_FINALIZED,
+    );
+    assert_eq!(
+        gateway.abort_hub().live_len(),
+        0,
+        "no AbortHub entry leaks after the killed flow finalized"
+    );
+}
+
+#[tokio::test]
+async fn d6_completed_flow_leaves_no_abort_hub_entry() {
+    // No-leak invariant on the HAPPY path: a cleanly Completed flow removes its kill
+    // token (the guard removes on the explicit Completed finalize too, not just Drop),
+    // so the map is bounded by in-flight streams, never the 512-record history.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "Hello")),
+            Ok(usage_chunk("chat-1", 100, 40, 140, None, None)),
+        ])
+        .await;
+    let gateway = test_gateway_with_flow_store_upstream(Arc::new(upstream));
+    let api_call_id = d3_open_flow(&gateway);
+
+    let request = base_request(vec![user_message("hi")]);
+    let stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+    let _events = collect_stream(stream).await; // drain to completion
+
+    let record = d3_await_terminal(&gateway, &api_call_id).await;
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Completed
+    );
+    assert_eq!(
+        gateway.abort_hub().live_len(),
+        0,
+        "Completed flow removed its kill token (no leak)"
+    );
+    // A kill of the now-finished flow is a 404-class miss (the entry is gone).
+    assert!(
+        !gateway.abort(&api_call_id),
+        "abort of a finished flow returns false (→ 404)"
+    );
+}
+
+#[tokio::test]
+async fn d6_abort_unknown_flow_returns_false() {
+    // 404-class: aborting an id that was never registered returns false. (The kill
+    // handler maps this to 404; here we assert the Gateway primitive directly.)
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hi"))])
+        .await;
+    let gateway = test_gateway_with_flow_store_upstream(Arc::new(upstream));
+    assert!(
+        !gateway.abort("api_does_not_exist"),
+        "unknown api_call_id → false (→ 404)"
+    );
+}
+
+/// D6 — a mock `MutationPolicy` so the kill handler logic is testable without the real
+/// `DashboardAuth`/CSRF stack (spec: "compiles + tests against a mocked auth/CSRF
+/// gate"). Drives the three gate states the route maps to 403/200/404.
+struct MockMutationPolicy {
+    decision: Result<(), llmconduit::dashboard_auth::MutationDenied>,
+}
+
+impl llmconduit::dashboard_auth::MutationPolicy for MockMutationPolicy {
+    fn mutations_enabled(&self) -> bool {
+        self.decision.is_ok()
+    }
+    fn authorize_mutation(
+        &self,
+        _headers: &axum::http::HeaderMap,
+    ) -> Result<(), llmconduit::dashboard_auth::MutationDenied> {
+        self.decision
+    }
+}
+
+#[tokio::test]
+async fn d6_kill_handler_outcome_maps_authorize_then_abort() {
+    use llmconduit::dashboard_auth::MutationDenied;
+    use llmconduit::http::FlowKillOutcome;
+    use llmconduit::http::flow_kill_outcome;
+
+    let upstream = ChunkThenPendingUpstream::new(vec![content_chunk("chat-1", "Hel")]);
+    let stream_polled = upstream.stream_polled.notified();
+    let gateway = test_gateway_with_flow_store_upstream(Arc::new(upstream.clone()));
+    let api_call_id = d3_open_flow(&gateway);
+    let headers = axum::http::HeaderMap::new();
+
+    // A DENIED policy short-circuits BEFORE any abort — no existence oracle for an
+    // unauthorized caller — even though no flow is live yet anyway.
+    let denied = MockMutationPolicy {
+        decision: Err(MutationDenied::CsrfInvalid),
+    };
+    assert_eq!(
+        flow_kill_outcome(&denied, &headers, gateway.as_ref(), &api_call_id),
+        FlowKillOutcome::Denied(MutationDenied::CsrfInvalid),
+        "denied policy → Denied (→ 403), no abort attempted"
+    );
+
+    // Now bring a stream live so an AUTHORIZED kill finds the token.
+    let request = base_request(vec![user_message("count")]);
+    let mut stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+    // Drive past the canned chunk so the upstream is parked + the token registered.
+    let _ = stream.next().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_polled)
+        .await
+        .expect("upstream parked");
+
+    let allowed = MockMutationPolicy { decision: Ok(()) };
+    assert_eq!(
+        flow_kill_outcome(&allowed, &headers, gateway.as_ref(), &api_call_id),
+        FlowKillOutcome::Killed,
+        "authorized kill of a live flow → Killed (→ 200)"
+    );
+
+    // Drain so the flow finalizes + the token is removed.
+    let drain = async { while stream.next().await.is_some() {} };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain).await;
+    let _ = d3_await_terminal(&gateway, &api_call_id).await;
+
+    // An authorized kill of the now-finished flow → NotFound (404).
+    assert_eq!(
+        flow_kill_outcome(&allowed, &headers, gateway.as_ref(), &api_call_id),
+        FlowKillOutcome::NotFound,
+        "authorized kill of a finished flow → NotFound (→ 404)"
+    );
+}
+
+#[tokio::test]
 async fn d3_cancel_during_send_finalizes_cancelled_not_failed() {
     // D3 R1 #1: a client that drops the SSE receiver while the engine is BLOCKED
     // inside `send_event`'s `tx.send().await` (the channel is full because the

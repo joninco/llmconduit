@@ -41,6 +41,12 @@ sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
+# D6 AbortHub: `CancellationToken` for server-side flow kill. Race-free `cancelled()`
+# future (no lost-wakeup, unlike a hand-rolled `Notify`) composed alongside every
+# engine `tx.closed()` client-hangup select. Already a transitive dep; the `rt` feature
+# is the one that gates `tokio_util::sync::CancellationToken` (it pulls in the token's
+# `futures-util` + `tokio/sync` machinery) in tokio-util 0.7.
+tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 url = "2"

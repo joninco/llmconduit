@@ -101,6 +101,14 @@ pub struct Gateway {
     /// (NOT the middleware); the 5 s snapshot task reads it under the fixed
     /// FlowStore→Metrics lock order.
     metrics: crate::metrics::MetricsLayer,
+    /// D6 AbortHub: the live-cancellation registry keyed by `api_call_id`, so the
+    /// dashboard kill route can cancel a stuck server-side stream. Gated identically to
+    /// the FlowStore (enabled iff `flow_store.is_enabled()`), because the D3 L1 guard —
+    /// which registers/removes the kill token — only exists on the enabled FlowStore
+    /// path. `disabled()` makes every op a no-op (no map, no lock), so production keeps
+    /// zero overhead. Cloning the Gateway shares the inner `Arc`, keeping the derived
+    /// `Clone`.
+    abort_hub: crate::dashboard_flow::AbortHub,
     /// Throttle state for the "requested model not served → fell back to the
     /// default catalog model" WARN. Every request resolves the model TWICE (the
     /// HTTP layer to label the response, then the engine to drive the upstream
@@ -579,6 +587,15 @@ impl Gateway {
         raw_output: Option<RawOutput>,
         flow_store: crate::dashboard_flow::DashboardFlowStore,
     ) -> Self {
+        // D6: gate the AbortHub on the SAME flag as the FlowStore — the L1 guard that
+        // owns the kill token's lifecycle only exists when the store is enabled, so a
+        // disabled store ⇒ a disabled hub (no map, no lock) keeps production overhead
+        // at zero without widening this constructor or touching the DI root.
+        let abort_hub = if flow_store.is_enabled() {
+            crate::dashboard_flow::AbortHub::new()
+        } else {
+            crate::dashboard_flow::AbortHub::disabled()
+        };
         Self {
             config,
             replay_store,
@@ -589,6 +606,7 @@ impl Gateway {
             monitor,
             raw_output,
             flow_store,
+            abort_hub,
             dashboard_auth: None,
             upstream_model_catalog: Arc::new(Mutex::new(None)),
             provider_health: ProviderHealthPublisher::default(),
@@ -685,6 +703,26 @@ impl Gateway {
     /// debug UI is off, in which case every store op is a no-op.
     pub fn flow_store(&self) -> &crate::dashboard_flow::DashboardFlowStore {
         &self.flow_store
+    }
+
+    /// D6: access the AbortHub (the live-cancellation registry keyed by `api_call_id`).
+    /// Disabled (every op a no-op) when the debug UI is off.
+    pub fn abort_hub(&self) -> &crate::dashboard_flow::AbortHub {
+        &self.abort_hub
+    }
+
+    /// D6: cancel the live server-side stream for `api_call_id`, returning whether a
+    /// live token was found (`true` ⇒ a stream was cancelled; `false` ⇒ unknown or
+    /// already-finished flow — the kill route maps this to `200`/`404`). The kill flips
+    /// the flow's shared `CancellationToken`; the engine's cancel sites (composed with
+    /// the existing `tx.closed()` client-hangup checks) then surface
+    /// `AppError::cancelled()` (HTTP 499) and the L1 guard's `Drop` finalizes the record
+    /// `Cancelled` (which also removes the token from the hub). No tokens are duplicated
+    /// or replayed — a mid-stream kill is a cancel, not a retry (AGENTS.md "Failover
+    /// only pre-first-chunk"). The mutation+CSRF gate is applied by the route layer
+    /// (D7/D13 via [`MutationPolicy`](crate::dashboard_auth::MutationPolicy)), NOT here.
+    pub fn abort(&self, api_call_id: &str) -> bool {
+        self.abort_hub.abort(api_call_id)
     }
 
     pub fn config(&self) -> &Config {
@@ -941,8 +979,20 @@ impl Gateway {
         // is `Send`) and the spawned body finalizes it from the typed `Result`.
         let telemetry_guard = api_call_id.as_deref().and_then(|id| {
             self.flow_store()
-                .engine_guard(id, Arc::clone(&serving_token))
+                .engine_guard(id, Arc::clone(&serving_token), self.abort_hub())
         });
+        // D6: the flow's cancellation token. The L1 guard registered it in the AbortHub
+        // under `api_call_id` (so the kill route can flip it) and exposes a clone here;
+        // the engine composes it with every `tx.closed()` client-hangup check below so a
+        // kill surfaces `AppError::cancelled()` (499) exactly like a hang-up. Off the
+        // dashboard path (no guard — disabled store or no `api_call_id`) this is a fresh
+        // never-cancelled token, so the compose sites are uniform and zero-overhead (an
+        // atomic-load `false` + a `cancelled()` future that never fires) with no per-site
+        // `Option` branching.
+        let abort_token = telemetry_guard
+            .as_ref()
+            .map(|guard| guard.abort_token())
+            .unwrap_or_default();
         let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
         let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
 
@@ -1102,6 +1152,9 @@ impl Gateway {
                     // `BackendChatRequest`.
                     serving_token,
                     tx.clone(),
+                    // D6: the flow's kill token, composed with every `tx.closed()`
+                    // client-hangup check inside `run_turn` + its helpers.
+                    abort_token,
                 )
                 .await;
             // D3 L1: finalize the flow record at THIS single choke point (the spawned
@@ -1370,6 +1423,12 @@ impl Gateway {
         // panic inside this function (it unwinds through the closure).
         serving_token: Arc<crate::upstream::ServingToken>,
         tx: mpsc::Sender<SseEvent>,
+        // D6: the flow's cancellation token (registered in the AbortHub by the L1 guard
+        // under `api_call_id`). COMPOSED with — never a replacement for — every existing
+        // `tx.closed()` client-hangup check: a kill flips this token and each cancel site
+        // surfaces `AppError::cancelled()` (499) just like a hang-up, with no token
+        // duplication. A fresh never-cancelled token off the dashboard path.
+        abort_token: tokio_util::sync::CancellationToken,
     ) -> AppResult<()> {
         // D5 R3 (MEDIUM): record the resolved served model onto the shared serving
         // token so the L1 telemetry guard (which holds the token) can attribute the
@@ -1711,7 +1770,9 @@ impl Gateway {
         // vocabulary in `finalize_request_for_backend`.
         let normalized_stop = crate::models::chat::normalize_stop(request.stop.clone())?;
         loop {
-            if tx.is_closed() {
+            // D6: compose the kill token with the client-hangup check — a dashboard
+            // `abort()` flips `abort_token`, surfacing `cancelled()` (499) like a hang-up.
+            if tx.is_closed() || abort_token.is_cancelled() {
                 return Err(AppError::cancelled());
             }
             upstream_request_index += 1;
@@ -1812,7 +1873,8 @@ impl Gateway {
                     images: upstream_preview.images,
                 }
             });
-            if tx.is_closed() {
+            // D6: compose kill with hangup before opening the upstream stream.
+            if tx.is_closed() || abort_token.is_cancelled() {
                 return Err(AppError::cancelled());
             }
             let backend_request = crate::upstream::BackendChatRequest::new(
@@ -1827,6 +1889,9 @@ impl Gateway {
             let mut stream = tokio::select! {
                 biased;
                 _ = tx.closed() => return Err(AppError::cancelled()),
+                // D6: a kill while awaiting the upstream connect cancels it (499), same
+                // as a hang-up. `biased` keeps the cancel branches highest-priority.
+                _ = abort_token.cancelled() => return Err(AppError::cancelled()),
                 result = self.upstream.stream_chat_completion_with_timeout(
                     &backend_request,
                     self.config.request_timeout,
@@ -1852,7 +1917,8 @@ impl Gateway {
             // `emit_function_call_delta`.
             let mut tool_delta_gate = ToolDeltaGate::new(vision_session.is_some());
             loop {
-                let Some(chunk) = Self::next_upstream_chunk(&mut stream, &tx).await? else {
+                let Some(chunk) = Self::next_upstream_chunk(&mut stream, &tx, &abort_token).await?
+                else {
                     break;
                 };
                 if let Some(usage) = chunk.usage.clone() {
@@ -2081,7 +2147,9 @@ impl Gateway {
                 &mut event_state,
             )
             .await?;
-            if tx.is_closed() {
+            // D6: compose kill with hangup after emitting the completed items, before
+            // deciding whether to loop for another turn.
+            if tx.is_closed() || abort_token.is_cancelled() {
                 return Err(AppError::cancelled());
             }
             if let Some(message) = finalized.internal_assistant_message.clone() {
@@ -2094,6 +2162,7 @@ impl Gateway {
                 &response_id,
                 &finalized,
                 &tx,
+                &abort_token,
                 vision_session.as_deref(),
                 &mut current_messages,
                 &mut public_history,
@@ -2391,10 +2460,14 @@ impl Gateway {
     async fn next_upstream_chunk(
         stream: &mut crate::upstream::UpstreamStream,
         tx: &mpsc::Sender<SseEvent>,
+        // D6: the flow's kill token, composed with the `tx.closed()` hangup branch so a
+        // dashboard kill cancels the in-flight chunk read (499) just like a hang-up.
+        abort_token: &tokio_util::sync::CancellationToken,
     ) -> AppResult<Option<ChatCompletionChunk>> {
         tokio::select! {
             biased;
             _ = tx.closed() => Err(AppError::cancelled()),
+            _ = abort_token.cancelled() => Err(AppError::cancelled()),
             result = stream.next() => match result {
                 Some(chunk) => chunk.map(Some),
                 None => Ok(None),
@@ -2517,13 +2590,17 @@ impl Gateway {
         response_id: &str,
         finalized: &FinalizedAssistantTurn,
         tx: &mpsc::Sender<SseEvent>,
+        // D6: the flow's kill token, composed with `tx.closed()` here and forwarded to
+        // the server-tool executors (web search / vision) so a dashboard kill cancels a
+        // stuck tool call (499) the same as a hang-up.
+        abort_token: &tokio_util::sync::CancellationToken,
         vision_session: Option<&str>,
         current_messages: &mut Vec<ChatMessage>,
         public_history: &mut Vec<ResponseItem>,
         response_output: &mut Vec<ResponseItem>,
         event_state: &mut ResponseEventState,
     ) -> AppResult<()> {
-        if tx.is_closed() {
+        if tx.is_closed() || abort_token.is_cancelled() {
             return Err(AppError::cancelled());
         }
         let can_search = self.config.brave_api_key.is_some();
@@ -2598,6 +2675,7 @@ impl Gateway {
                         tool_call,
                         vision_session,
                         tx,
+                        abort_token,
                         current_messages,
                     )
                     .await?;
@@ -2607,6 +2685,7 @@ impl Gateway {
                         response_id,
                         tool_call,
                         tx,
+                        abort_token,
                         current_messages,
                         public_history,
                         response_output,
@@ -2625,6 +2704,9 @@ impl Gateway {
         response_id: &str,
         tool_call: &ResolvedToolCall,
         tx: &mpsc::Sender<SseEvent>,
+        // D6: the flow's kill token, composed with this executor's `tx.closed()` checks
+        // so a dashboard kill cancels a stuck/slow Brave search (499) like a hang-up.
+        abort_token: &tokio_util::sync::CancellationToken,
         current_messages: &mut Vec<ChatMessage>,
         public_history: &mut Vec<ResponseItem>,
         response_output: &mut Vec<ResponseItem>,
@@ -2667,7 +2749,7 @@ impl Gateway {
                 phase: "provider_tool_running".to_string(),
                 detail: format!("web_search {query}"),
             });
-        if tx.is_closed() {
+        if tx.is_closed() || abort_token.is_cancelled() {
             return Err(AppError::cancelled());
         }
         // The search backend (Brave) has no internal timeout; without this
@@ -2677,6 +2759,8 @@ impl Gateway {
         let outcome: SearchOutcome = tokio::select! {
             biased;
             _ = tx.closed() => return Err(AppError::cancelled()),
+            // D6: a kill during the search cancels it (499), same as a hang-up.
+            _ = abort_token.cancelled() => return Err(AppError::cancelled()),
             result = timeout(self.config.request_timeout, self.search.search(&query)) => match result {
                 Ok(Ok(outcome)) => outcome,
                 Ok(Err(err)) => SearchOutcome {
@@ -2781,6 +2865,9 @@ impl Gateway {
         tool_call: &ResolvedToolCall,
         vision_session: Option<&str>,
         tx: &mpsc::Sender<SseEvent>,
+        // D6: the flow's kill token, composed with this executor's `tx.closed()` checks
+        // so a dashboard kill cancels a stuck/slow vision call (499) like a hang-up.
+        abort_token: &tokio_util::sync::CancellationToken,
         current_messages: &mut Vec<ChatMessage>,
     ) -> AppResult<()> {
         let ResponseItem::FunctionCall { .. } = &tool_call.public_item else {
@@ -2794,7 +2881,7 @@ impl Gateway {
         let session_id = vision_session.ok_or_else(|| {
             AppError::internal("analyzeImage dispatched without a vision session")
         })?;
-        if tx.is_closed() {
+        if tx.is_closed() || abort_token.is_cancelled() {
             return Err(AppError::cancelled());
         }
         let vision_request =
@@ -2823,6 +2910,8 @@ impl Gateway {
             tokio::select! {
                 biased;
                 _ = tx.closed() => return Err(AppError::cancelled()),
+                // D6: a kill during the vision call cancels it (499), same as a hang-up.
+                _ = abort_token.cancelled() => return Err(AppError::cancelled()),
                 result = timeout(self.config.request_timeout, self.vision.analyze(&vision_request)) => match result {
                     // Round-3 #3: redact the SUCCESS description before it is
                     // logged (monitor preview below) or injected as a tool
