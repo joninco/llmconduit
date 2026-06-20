@@ -35,13 +35,30 @@ export function isMockEnabled(): boolean {
 }
 
 /**
- * Reads the SPA bootstrap. With a real Rust shell this is `window.__LLMCONDUIT_DASHBOARD__`.
- * Under the mock we synthesize an UNAUTHENTICATED bootstrap (the login shell renders, and
- * a successful mock login flips auth) carrying the mock CSRF token + mutations enabled.
+ * Validates + normalizes a raw `window.__LLMCONDUIT_DASHBOARD__` object into a
+ * `DashboardBootstrap` (finding 6). The FROZEN field names D7 emits are exactly
+ * `authenticated: boolean`, `csrf_token: string | null`, `mutations_enabled: boolean`.
+ * Missing/ill-typed fields default safely (unauthenticated, no token, mutations off) so a
+ * malformed embed can never crash boot or silently grant mutations.
+ */
+export function parseBootstrap(raw: unknown): DashboardBootstrap {
+  const obj = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>;
+  return {
+    authenticated: obj.authenticated === true,
+    csrf_token: typeof obj.csrf_token === 'string' ? obj.csrf_token : null,
+    mutations_enabled: obj.mutations_enabled === true,
+  };
+}
+
+/**
+ * Reads the SPA bootstrap. With a real Rust shell this is `window.__LLMCONDUIT_DASHBOARD__`
+ * (validated via `parseBootstrap`). Under the mock we synthesize an UNAUTHENTICATED
+ * bootstrap (the login shell renders; a successful mock login flips auth) carrying the
+ * mock CSRF token + mutations enabled.
  */
 export function readBootstrap(): DashboardBootstrap {
   if (typeof window !== 'undefined' && window.__LLMCONDUIT_DASHBOARD__) {
-    return window.__LLMCONDUIT_DASHBOARD__;
+    return parseBootstrap(window.__LLMCONDUIT_DASHBOARD__);
   }
   return {
     authenticated: false,

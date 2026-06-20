@@ -57,7 +57,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     });
     socket.applyFrame({
       domain: 'flow', seq: 1,
-      batch: [{ type: 'flow_status', response_id: 'r1', status: 'streaming', served_model: 'm', upstream_target: 'u', usage: null, elapsed_ms: 5 }],
+      batch: [{ type: 'flow_status', api_call_id: 'api_r1', status: 'open', model_served: 'm', upstream_target: 'u', usage: null, started_ms: 1000, elapsed_ms: 5 }],
     });
     expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.flows });
   });
@@ -73,7 +73,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     // seq 5 <= cursor 5 → dropped, no invalidation.
     socket.applyFrame({
       domain: 'flow', seq: 5,
-      batch: [{ type: 'flow_status', response_id: 'r1', status: 'streaming', served_model: 'm', upstream_target: 'u', usage: null, elapsed_ms: 5 }],
+      batch: [{ type: 'flow_status', api_call_id: 'api_r1', status: 'open', model_served: 'm', upstream_target: 'u', usage: null, started_ms: 1000, elapsed_ms: 5 }],
     });
     expect(spy).not.toHaveBeenCalled();
   });

@@ -14,8 +14,11 @@
  *    sibling `DebugWsMessage`s under one `sequence`), so no sibling is ever dropped.
  *  - feed the zustand dashboard store; notify `onFrameApplied(domain)` AFTER an accepted
  *    frame so the composition root can drive TanStack Query invalidation (finding 10).
- *  - auth failure handling (finding 3): a rejected WS upgrade surfaces as an error or an
- *    ABNORMAL close (not a clean 1000) — both bounce to login via `onUnauthorized`.
+ *  - auth failure vs. transient blip (finding 7): an EXPLICIT `4401` close → bounce to
+ *    login. Any OTHER abnormal close/error is treated as a transient network blip: the
+ *    socket schedules a reconnect (capped backoff) AND, to detect a silently-expired
+ *    session, runs a protected HTTP probe (`probeAuth`) — a `401` from the probe bounces
+ *    to login; otherwise it reconnects. A valid session therefore survives a 1006 blip.
  *  - reconnect safety (finding 4): each opened socket carries a generation id; every
  *    callback is guarded by an identity check so a late `close`/`error` from an OLD socket
  *    cannot clobber a freshly reconnected one (StrictMode mount→unmount→remount).
@@ -31,13 +34,15 @@ import type {
   Domain,
   SnapshotFrame,
 } from './types';
-import { assertNever, isDashboardFrame, isSnapshotFrame, monitorMessage } from './types';
+import { assertNever, isDashboardFrame, isSnapshotFrame } from './types';
 import { dashboardStore } from '../store/dashboardStore';
 
 /** Clean WS close code (RFC 6455 §7.4.1). Anything else after open == abnormal. */
 const WS_NORMAL_CLOSE = 1000;
-/** Our convention for an explicit auth/expiry close from the server. */
+/** Our convention for an explicit auth/expiry close from the server (→ bounce to login). */
 const WS_AUTH_CLOSE = 4401;
+/** Reconnect backoff schedule (ms) for transient blips; index clamps at the last entry. */
+const RECONNECT_BACKOFF_MS = [500, 1000, 2000, 5000, 10000];
 
 /** Minimal structural subset of `WebSocket` we depend on (eases mocking). */
 export interface WsLike {
@@ -54,10 +59,21 @@ export type WebSocketFactory = (url: string) => WsLike;
 export interface DashboardSocketOptions {
   url?: string;
   factory?: WebSocketFactory;
-  /** Called on a WS auth failure (upgrade reject / abnormal close / error) → bounce to login. */
+  /** Called ONLY on a confirmed auth failure (explicit 4401 close, or a probe `401`). */
   onUnauthorized?: () => void;
   /** Fired AFTER an accepted (post-dedup) frame so the caller can invalidate REST queries. */
   onFrameApplied?: (domain: Domain) => void;
+  /**
+   * Protected-endpoint auth probe used after a TRANSIENT abnormal close (finding 7).
+   * Resolves `true` if the session is still valid (→ reconnect), `false` if it returned
+   * `401` (→ bounce to login). If omitted, a transient blip just reconnects (no probe).
+   */
+  probeAuth?: () => Promise<boolean>;
+  /** Whether to auto-reconnect on transient blips. Default true. Disabled in unit tests. */
+  autoReconnect?: boolean;
+  /** Injected timer (test seam). Defaults to `setTimeout`. */
+  setTimer?: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  clearTimer?: (h: ReturnType<typeof setTimeout>) => void;
   /** Store the socket feeds. Defaults to the singleton dashboard store. */
   store?: typeof dashboardStore;
 }
@@ -69,13 +85,22 @@ export class DashboardSocket {
   private readonly factory: WebSocketFactory;
   private readonly onUnauthorized: (() => void) | undefined;
   private readonly onFrameApplied: ((domain: Domain) => void) | undefined;
+  private readonly probeAuth: (() => Promise<boolean>) | undefined;
+  private readonly autoReconnect: boolean;
+  private readonly setTimer: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
+  private readonly clearTimer: (h: ReturnType<typeof setTimeout>) => void;
   private readonly store: typeof dashboardStore;
 
   private ws: WsLike | null = null;
   /** Monotonic id of the CURRENT socket; stale-callback guard compares against it. */
   private generation = 0;
-  /** Whether the current socket reached a clean/auth close (so error after that is ignored). */
+  /** Whether the current socket reached a terminal close (so error after that is ignored). */
   private closedCleanly = false;
+  /** Set true by `disconnect()` so a pending reconnect/probe is abandoned. */
+  private stopped = false;
+  /** Consecutive transient reconnect attempts (drives the backoff index). */
+  private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Per-domain dedup cursors. */
   private lastSeq: LastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0 };
@@ -91,12 +116,17 @@ export class DashboardSocket {
     this.factory = opts.factory ?? ((u: string) => new WebSocket(u) as unknown as WsLike);
     this.onUnauthorized = opts.onUnauthorized;
     this.onFrameApplied = opts.onFrameApplied;
+    this.probeAuth = opts.probeAuth;
+    this.autoReconnect = opts.autoReconnect ?? true;
+    this.setTimer = opts.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
+    this.clearTimer = opts.clearTimer ?? ((h) => clearTimeout(h));
     this.store = opts.store ?? dashboardStore;
   }
 
   /** Opens the socket and wires handlers. Idempotent if already connected. */
   connect(): void {
     if (this.ws) return;
+    this.stopped = false;
     this.store.getState().setConnection('connecting');
     const ws = this.factory(this.url);
     // This socket's identity. Every callback below checks `this.ws === ws` (and the
@@ -109,6 +139,8 @@ export class DashboardSocket {
 
     ws.onopen = () => {
       if (!isCurrent()) return;
+      // A successful open clears the transient-reconnect backoff.
+      this.reconnectAttempts = 0;
       // Live state begins after the snapshot is applied; marked 'live' there.
     };
     ws.onmessage = (ev) => {
@@ -123,35 +155,36 @@ export class DashboardSocket {
       this.ws = null;
       this.closedCleanly = true;
       if (code === WS_AUTH_CLOSE) {
-        // Explicit auth/expiry close → bounce to login.
-        this.store.getState().setConnection('error');
-        this.onUnauthorized?.();
+        // EXPLICIT auth/expiry close → confirmed auth failure → bounce to login.
+        this.bounceToLogin();
       } else if (code === undefined || code === WS_NORMAL_CLOSE) {
-        // Clean close (our own disconnect, or server 1000).
+        // Clean close (our own disconnect, or server 1000) — do not reconnect.
         this.store.getState().setConnection('closed');
       } else {
-        // ABNORMAL close (e.g. 1006) — an upgrade reject / dropped session surfaces here,
-        // NOT as a clean 4401. Treat as an auth failure and bounce to login (finding 3).
-        this.store.getState().setConnection('error');
-        this.onUnauthorized?.();
+        // ABNORMAL close (e.g. 1006): a transient network blip OR a silently-expired
+        // session. Do NOT log out blindly (finding 7) — probe + reconnect.
+        this.handleTransientDrop();
       }
     };
     ws.onerror = () => {
       if (!isCurrent()) return;
-      // A handshake/upgrade failure fires `error` (often with no usable close frame).
-      // Treat it as an auth failure → bounce to login (finding 3). Guard against a
-      // duplicate bounce if a close already handled it.
+      // An error often precedes a close; if a close already handled it, skip. Otherwise
+      // treat as a transient drop (probe + reconnect), NOT an automatic logout.
       if (this.closedCleanly) return;
       this.detach(ws);
       this.ws = null;
       this.closedCleanly = true;
-      this.store.getState().setConnection('error');
-      this.onUnauthorized?.();
+      this.handleTransientDrop();
     };
   }
 
-  /** Closes the socket and resets dedup/snapshot/buffer state. */
+  /** Closes the socket and resets dedup/snapshot/buffer/reconnect state. */
   disconnect(): void {
+    this.stopped = true;
+    if (this.reconnectTimer !== null) {
+      this.clearTimer(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     const ws = this.ws;
     if (ws) {
       this.detach(ws);
@@ -167,7 +200,52 @@ export class DashboardSocket {
     this.snapshotApplied = false;
     this.paused = false;
     this.shadowBuffer = [];
+    this.reconnectAttempts = 0;
     this.lastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0 };
+  }
+
+  /** Confirmed auth failure: mark error + bounce to login (no reconnect). */
+  private bounceToLogin(): void {
+    this.store.getState().setConnection('error');
+    this.onUnauthorized?.();
+  }
+
+  /**
+   * Handle a transient abnormal drop (finding 7): if a `probeAuth` is configured, probe
+   * the protected endpoint — a `401` (resolve `false`) bounces to login; anything else
+   * reconnects. With no probe, just reconnect. `disconnect()` (stopped) cancels both.
+   */
+  private handleTransientDrop(): void {
+    if (this.stopped) return;
+    this.store.getState().setConnection('connecting');
+    if (this.probeAuth) {
+      this.probeAuth()
+        .then((authed) => {
+          if (this.stopped) return;
+          if (authed) this.scheduleReconnect();
+          else this.bounceToLogin();
+        })
+        .catch(() => {
+          // Probe failed for a non-auth reason (e.g. network) → treat as transient.
+          if (!this.stopped) this.scheduleReconnect();
+        });
+    } else {
+      this.scheduleReconnect();
+    }
+  }
+
+  /** Schedule a reconnect with capped backoff (no-op if auto-reconnect is off/stopped). */
+  private scheduleReconnect(): void {
+    if (this.stopped || !this.autoReconnect) return;
+    if (this.reconnectTimer !== null) return; // one in flight
+    const idx = Math.min(this.reconnectAttempts, RECONNECT_BACKOFF_MS.length - 1);
+    const delay = RECONNECT_BACKOFF_MS[idx] ?? RECONNECT_BACKOFF_MS[RECONNECT_BACKOFF_MS.length - 1]!;
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = this.setTimer(() => {
+      this.reconnectTimer = null;
+      if (this.stopped || this.ws) return;
+      this.connect();
+    }, delay);
   }
 
   /** Detaches all handlers from a socket so it can never call back into the instance. */
@@ -313,11 +391,12 @@ export class DashboardSocket {
     const store = this.store.getState();
     switch (payload.type) {
       case 'monitor':
-        // Flattened wire form: extract the DebugWsMessage half (see types WIRE CONTRACT).
-        store.pushMonitor(monitorMessage(payload));
+        // The monitor arm NESTS an itself-tagged DebugWsMessage under `message`
+        // (see types WIRE CONTRACT — it is NOT flattened).
+        store.pushMonitor(payload.message);
         return;
       case 'usage':
-        store.patchUsage(payload.response_id, {
+        store.patchUsage(payload.api_call_id, {
           prompt: payload.prompt,
           completion: payload.completion,
           total: payload.total,
@@ -340,14 +419,8 @@ export class DashboardSocket {
         });
         return;
       case 'flow_status':
-        store.patchFlowStatus({
-          response_id: payload.response_id,
-          status: payload.status,
-          served_model: payload.served_model,
-          upstream_target: payload.upstream_target,
-          usage: payload.usage,
-          elapsed_ms: payload.elapsed_ms,
-        });
+        // Keyed by api_call_id (the store keys flows by api_call_id).
+        store.patchFlowStatus(payload);
         return;
       case 'topology_update':
         store.setTopology(payload.nodes, payload.edges);

@@ -8,6 +8,7 @@
  */
 import { createStore } from 'zustand/vanilla';
 import type {
+  FlowStatusPayload,
   FlowSummary,
   MetricsResponse,
   ProviderHealth,
@@ -25,7 +26,7 @@ export interface DashboardState {
   /** Last applied per-domain seq (mirrors the socket's dedup cursors for display). */
   cursors: SeqCursors;
 
-  /** Flow rows keyed by response_id (insertion order preserved via `flowOrder`). */
+  /** Flow rows keyed by `api_call_id` (insertion order preserved via `flowOrder`). */
   flows: Map<string, FlowSummary>;
   flowOrder: string[];
 
@@ -48,15 +49,10 @@ export interface DashboardState {
     topology: TopologyResponse | null;
   }) => void;
   upsertFlow: (flow: FlowSummary) => void;
-  patchFlowStatus: (p: {
-    response_id: string;
-    status: FlowSummary['status'];
-    served_model: string;
-    upstream_target: string;
-    usage: Usage | null;
-    elapsed_ms: number;
-  }) => void;
-  patchUsage: (response_id: string, usage: Usage) => void;
+  /** Patch from a `flow_status` WS payload (keyed by `api_call_id`). */
+  patchFlowStatus: (p: FlowStatusPayload) => void;
+  /** Patch usage onto a flow by `api_call_id`. */
+  patchUsage: (apiCallId: string, usage: Usage) => void;
   setMetrics: (m: MetricsResponse) => void;
   setTopology: (nodes: ProviderHealth[], edges: TopologyEdge[]) => void;
   pushMonitor: (msg: DebugWsMessage) => void;
@@ -93,8 +89,8 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
       const flows = new Map<string, FlowSummary>();
       const flowOrder: string[] = [];
       for (const f of snap.flows) {
-        flows.set(f.response_id, f);
-        flowOrder.push(f.response_id);
+        flows.set(f.api_call_id, f);
+        flowOrder.push(f.api_call_id);
       }
       return {
         cursors: snap.cursors,
@@ -110,42 +106,47 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
   upsertFlow: (flow) =>
     set((s) => {
       const flows = new Map(s.flows);
-      const existed = flows.has(flow.response_id);
-      flows.set(flow.response_id, flow);
+      const existed = flows.has(flow.api_call_id);
+      flows.set(flow.api_call_id, flow);
       return {
         flows,
-        flowOrder: existed ? s.flowOrder : [flow.response_id, ...s.flowOrder],
+        flowOrder: existed ? s.flowOrder : [flow.api_call_id, ...s.flowOrder],
       };
     }),
 
   patchFlowStatus: (p) =>
     set((s) => {
       const flows = new Map(s.flows);
-      const prev = flows.get(p.response_id);
+      const prev = flows.get(p.api_call_id);
       const next: FlowSummary = {
-        response_id: p.response_id,
-        status: p.status,
-        model_requested: prev?.model_requested ?? p.served_model,
-        model_served: p.served_model,
-        upstream_target: p.upstream_target,
+        api_call_id: p.api_call_id,
+        response_id: p.response_id ?? prev?.response_id ?? null,
+        method: prev?.method ?? 'POST',
+        uri: prev?.uri ?? '',
+        model_requested: p.model_requested ?? prev?.model_requested ?? null,
+        model_served: p.model_served ?? prev?.model_served ?? null,
+        upstream_target: p.upstream_target ?? prev?.upstream_target ?? null,
         usage: p.usage ?? prev?.usage ?? null,
-        started_ms: prev?.started_ms ?? Date.now() - p.elapsed_ms,
-        elapsed_ms: p.elapsed_ms,
+        status: p.status,
+        started_ms: prev?.started_ms ?? p.started_ms,
+        finished_ms: prev?.finished_ms ?? null,
+        elapsed_ms: p.elapsed_ms ?? prev?.elapsed_ms ?? null,
+        terminal_reason: prev?.terminal_reason ?? null,
         cost: prev?.cost ?? null,
       };
-      flows.set(p.response_id, next);
+      flows.set(p.api_call_id, next);
       return {
         flows,
-        flowOrder: prev ? s.flowOrder : [p.response_id, ...s.flowOrder],
+        flowOrder: prev ? s.flowOrder : [p.api_call_id, ...s.flowOrder],
       };
     }),
 
-  patchUsage: (response_id, usage) =>
+  patchUsage: (apiCallId, usage) =>
     set((s) => {
-      const prev = s.flows.get(response_id);
+      const prev = s.flows.get(apiCallId);
       if (!prev) return {};
       const flows = new Map(s.flows);
-      flows.set(response_id, { ...prev, usage });
+      flows.set(apiCallId, { ...prev, usage });
       return { flows };
     }),
 

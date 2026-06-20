@@ -51,13 +51,13 @@ describe('useImperativeViz — StrictMode-safe cleanup', () => {
   });
 });
 
-describe('useImperativeViz — a REAL d3-force simulation is stopped on teardown (finding 7)', () => {
+describe('useImperativeViz — a REAL d3-force simulation is stopped on teardown (findings 7+8)', () => {
   beforeEach(() => {
     resetForceDemoState();
     cleanup();
   });
 
-  it('StrictMode double-invoke stops the live simulation and clears its tick handler', () => {
+  it('StrictMode double-invoke CALLS simulation.stop() and clears its tick handler', () => {
     const { unmount } = render(
       <StrictMode>
         <ForceDemoViz />
@@ -66,16 +66,21 @@ describe('useImperativeViz — a REAL d3-force simulation is stopped on teardown
     // A real forceSimulation was created and is tracked.
     expect(forceDemoState.simulation).not.toBeNull();
     // StrictMode double-invokes: setup ran twice, and the discarded first mount was torn
-    // down (cleanup >= 1). Every torn-down simulation was stopped with its tick cleared.
+    // down (cleanup >= 1). Finding 8: `simulation.stop()` was actually CALLED on teardown
+    // (a missing stop() call would leave stopCalls at 0 and fail here), and every
+    // torn-down sim had its tick handler cleared.
     expect(forceDemoState.setups).toBeGreaterThanOrEqual(2);
     expect(forceDemoState.cleanups).toBeGreaterThanOrEqual(1);
+    expect(forceDemoState.stopCalls).toBe(forceDemoState.cleanups);
     expect(forceDemoState.allTickHandlersCleared).toBe(true);
     expect(forceDemoState.stoppedCleanly).toBe(forceDemoState.cleanups);
 
     unmount();
-    // After unmount the LIVE simulation is also torn down: fully balanced (no leak), and
-    // its tick handler is now cleared so the alpha-decay timer can never re-fire it.
+    // After unmount the LIVE simulation is also torn down: fully balanced (no leak),
+    // stop() called for every setup, tick handler cleared so the alpha-decay timer can
+    // never re-fire it.
     expect(forceDemoState.cleanups).toBe(forceDemoState.setups);
+    expect(forceDemoState.stopCalls).toBe(forceDemoState.setups);
     expect(forceDemoState.allTickHandlersCleared).toBe(true);
     expect(forceDemoState.simulation?.on('tick')).toBeUndefined();
   });

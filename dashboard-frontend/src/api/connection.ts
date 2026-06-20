@@ -80,6 +80,9 @@ export function getConnection(): Connection {
     factory: mock ? mockWsFactory : undefined,
     onUnauthorized,
     onFrameApplied: (domain) => invalidateForDomain(queryClient, domain),
+    // Finding 7: after a transient WS drop, probe a protected endpoint — only a 401
+    // bounces to login; otherwise the socket reconnects.
+    probeAuth: () => client.probeAuth(),
   });
 
   singleton = { client, socket, queryClient, mock };

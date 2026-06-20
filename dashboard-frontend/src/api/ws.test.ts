@@ -10,6 +10,7 @@ import {
   MALFORMED_FRAME_JSON,
 } from './ws.fixtures';
 import { dashboardStore } from '../store/dashboardStore';
+import { isDashboardFrame, isSnapshotFrame } from './types';
 import type { DashboardFrame, SnapshotFrame } from './types';
 
 function snapshot(): SnapshotFrame {
@@ -57,13 +58,15 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     expect(socket.getCursors().monitor).toBe(6);
   });
 
-  it('decodes the GOLDEN flattened Monitor fixture (the exact D7 bytes) → all 4 apply', () => {
+  it('decodes the GOLDEN nested Monitor fixture (the exact D7 bytes) → all 4 apply', () => {
     socket.handleParsed(JSON.parse(GOLDEN_MONITOR_FRAME_JSON));
     const monitor = dashboardStore.getState().monitor;
     expect(monitor).toHaveLength(4);
-    // The flattened DebugWsMessage fields decoded correctly (no nested `message`).
-    expect(monitor[0]?.kind).toBe('request.normalized');
-    expect(monitor[3]?.payload).toEqual({ text: ', world' });
+    // The NESTED, itself-tagged DebugWsMessage decoded correctly (no flattening).
+    expect(monitor[0]?.type).toBe('request_upsert');
+    const last = monitor[3];
+    expect(last?.type).toBe('request_status');
+    if (last?.type === 'request_status') expect(last.status).toBe('completed');
   });
 
   it('decodes the GOLDEN usage / flow_status / metric_tick / topology fixtures', () => {
@@ -72,9 +75,11 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     socket.handleParsed(JSON.parse(GOLDEN_METRIC_TICK_FRAME_JSON));
     socket.handleParsed(JSON.parse(GOLDEN_TOPOLOGY_FRAME_JSON));
     const st = dashboardStore.getState();
-    expect(st.flows.get('resp_001')?.status).toBe('completed');
+    // Flows are keyed by api_call_id.
+    expect(st.flows.get('api_001')?.status).toBe('completed');
     expect(st.metrics?.reqs_per_sec).toBe(4.2);
     expect(st.topologyNodes).toHaveLength(1);
+    expect(st.topologyNodes[0]?.status).toBe('healthy');
     expect(st.topologyEdges).toHaveLength(1);
   });
 
@@ -98,24 +103,24 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
       domain: 'flow',
       seq: 1,
       batch: [{
-        type: 'flow_status', response_id: 'resp_1', status: 'streaming',
-        served_model: 'm', upstream_target: 'u', usage: null, elapsed_ms: 100,
+        type: 'flow_status', api_call_id: 'api_1', status: 'open',
+        model_served: 'm', upstream_target: 'u', usage: null, started_ms: 1000, elapsed_ms: 100,
       }],
     };
     expect(socket.applyFrame(flowFrame)).toBe(true);
-    expect(dashboardStore.getState().flowOrder).toContain('resp_1');
+    expect(dashboardStore.getState().flowOrder).toContain('api_1');
     expect(socket.getCursors().flow).toBe(1);
     expect(socket.getCursors().monitor).toBe(6);
   });
 
   it('applies a standalone usage frame to the store (finding 9)', () => {
-    // Seed a flow so usage can patch it.
+    // Seed a flow so usage can patch it (keyed by api_call_id).
     socket.applyFrame({
       domain: 'flow', seq: 1,
-      batch: [{ type: 'flow_status', response_id: 'resp_001', status: 'streaming', served_model: 'm', upstream_target: 'u', usage: null, elapsed_ms: 10 }],
+      batch: [{ type: 'flow_status', api_call_id: 'api_001', status: 'open', model_served: 'm', upstream_target: 'u', usage: null, started_ms: 1000, elapsed_ms: 10 }],
     });
-    expect(socket.applyFrame(buildUsageFrame(2, 'resp_001'))).toBe(true);
-    expect(dashboardStore.getState().flows.get('resp_001')?.usage).toEqual({
+    expect(socket.applyFrame(buildUsageFrame(2, 'api_001'))).toBe(true);
+    expect(dashboardStore.getState().flows.get('api_001')?.usage).toEqual({
       prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 16,
     });
   });
@@ -160,50 +165,193 @@ describe('DashboardSocket — malformed frames do NOT mutate cursor or store (fi
   });
 });
 
-describe('DashboardSocket — auth failure + reconnect safety (findings 3 + 4)', () => {
+describe('frame validation — enums, unsigned-int seq, domain↔payload compatibility (finding 5)', () => {
+  const goodFlow: DashboardFrame = {
+    domain: 'flow',
+    seq: 1,
+    batch: [{ type: 'flow_status', api_call_id: 'a', status: 'open', usage: null, started_ms: 1 }],
+  };
+
+  it('accepts a well-formed frame', () => {
+    expect(isDashboardFrame(goodFlow)).toBe(true);
+  });
+
+  it('rejects a NEGATIVE seq', () => {
+    expect(isDashboardFrame({ ...goodFlow, seq: -1 })).toBe(false);
+  });
+
+  it('rejects a FRACTIONAL seq', () => {
+    expect(isDashboardFrame({ ...goodFlow, seq: 1.5 })).toBe(false);
+  });
+
+  it('rejects an unknown flow status string', () => {
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'flow_status', api_call_id: 'a', status: 'streaming', usage: null, started_ms: 1 }],
+    })).toBe(false);
+  });
+
+  it('rejects a metric_tick payload under the FLOW domain (domain↔payload mismatch)', () => {
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'metric_tick', reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, windows: { m1: win(), m5: win(), h1: win() } }],
+    })).toBe(false);
+  });
+
+  it('rejects a flow_status payload under the TOPOLOGY domain', () => {
+    expect(isDashboardFrame({
+      domain: 'topology', seq: 1,
+      batch: [{ type: 'flow_status', api_call_id: 'a', status: 'open', usage: null, started_ms: 1 }],
+    })).toBe(false);
+  });
+
+  it('rejects an unknown provider status in a topology node', () => {
+    expect(isDashboardFrame({
+      domain: 'topology', seq: 1,
+      batch: [{ type: 'topology_update', nodes: [{ id: 'x', name: 'x', status: 'degraded', served_count: 0, failover_count: 0, consecutive_failures: 0, catalog_size: 0 }], edges: [] }],
+    })).toBe(false);
+  });
+
+  function win() {
+    return { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0 };
+  }
+});
+
+describe('snapshot validation — full shape before applying (finding 4)', () => {
+  it('accepts a fully-valid snapshot', () => {
+    expect(isSnapshotFrame({
+      type: 'snapshot',
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [{ api_call_id: 'a', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1 }],
+      metrics: null, topology: null,
+    })).toBe(true);
+  });
+
+  it('rejects a snapshot whose cursors are not all unsigned ints', () => {
+    expect(isSnapshotFrame({
+      type: 'snapshot',
+      cursors: { flow_seq: -1, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [], metrics: null, topology: null,
+    })).toBe(false);
+  });
+
+  it('rejects a snapshot with an invalid summary (bad status)', () => {
+    expect(isSnapshotFrame({
+      type: 'snapshot',
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [{ api_call_id: 'a', method: 'POST', uri: '/x', status: 'bogus', started_ms: 1 }],
+      metrics: null, topology: null,
+    })).toBe(false);
+  });
+});
+
+describe('DashboardSocket — auth failure vs transient blip + reconnect (findings 3+4+7)', () => {
+  /** Captured pending reconnect timers so a test can fire them synchronously. */
+  let pendingTimers: Array<() => void>;
+  function makeTimers() {
+    pendingTimers = [];
+    const setTimer = (cb: () => void) => {
+      pendingTimers.push(cb);
+      return pendingTimers.length as unknown as ReturnType<typeof setTimeout>;
+    };
+    const clearTimer = () => {};
+    return { setTimer, clearTimer };
+  }
+  function flushTimers() {
+    const due = pendingTimers;
+    pendingTimers = [];
+    for (const cb of due) cb();
+  }
+
   beforeEach(() => {
     dashboardStore.getState().reset();
     FakeSocket.instances = [];
   });
 
-  it('an ABNORMAL close (upgrade-rejected, code 1006) bounces to login', () => {
+  it('an EXPLICIT 4401 close bounces to login (no reconnect)', () => {
     const onUnauthorized = vi.fn();
-    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized });
-    socket.connect();
-    const ws = FakeSocket.instances[0]!;
-    ws.onclose?.({ code: 1006 }); // abnormal — handshake rejected / dropped
-    expect(onUnauthorized).toHaveBeenCalledOnce();
-    expect(dashboardStore.getState().connection).toBe('error');
-  });
-
-  it('an explicit 4401 close bounces to login', () => {
-    const onUnauthorized = vi.fn();
-    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized });
+    const { setTimer, clearTimer } = makeTimers();
+    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized, setTimer, clearTimer });
     socket.connect();
     FakeSocket.instances[0]!.onclose?.({ code: 4401 });
     expect(onUnauthorized).toHaveBeenCalledOnce();
+    expect(pendingTimers).toHaveLength(0); // no reconnect scheduled for a confirmed auth failure
   });
 
-  it('an onerror (handshake failure with no close) bounces to login', () => {
+  it('a 1006 blip with a STILL-VALID session reconnects — does NOT log out (finding 7)', async () => {
     const onUnauthorized = vi.fn();
-    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized });
+    const probeAuth = vi.fn().mockResolvedValue(true); // session still valid
+    const { setTimer, clearTimer } = makeTimers();
+    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized, probeAuth, setTimer, clearTimer });
+    socket.connect();
+    FakeSocket.instances[0]!.onclose?.({ code: 1006 });
+    // The probe runs; await its resolution.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(probeAuth).toHaveBeenCalledOnce();
+    expect(onUnauthorized).not.toHaveBeenCalled(); // NOT logged out
+    expect(pendingTimers.length).toBeGreaterThan(0); // a reconnect was scheduled
+    // Firing the reconnect timer opens a fresh socket.
+    flushTimers();
+    expect(FakeSocket.instances).toHaveLength(2);
+  });
+
+  it('a 1006 blip whose probe returns 401 bounces to login (finding 7)', async () => {
+    const onUnauthorized = vi.fn();
+    const probeAuth = vi.fn().mockResolvedValue(false); // probe got a 401
+    const { setTimer, clearTimer } = makeTimers();
+    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized, probeAuth, setTimer, clearTimer });
+    socket.connect();
+    FakeSocket.instances[0]!.onclose?.({ code: 1006 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(probeAuth).toHaveBeenCalledOnce();
+    expect(onUnauthorized).toHaveBeenCalledOnce(); // bounced
+    expect(pendingTimers).toHaveLength(0); // no reconnect after a confirmed auth failure
+  });
+
+  it('an onerror with a valid-session probe reconnects (not logout)', async () => {
+    const onUnauthorized = vi.fn();
+    const probeAuth = vi.fn().mockResolvedValue(true);
+    const { setTimer, clearTimer } = makeTimers();
+    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized, probeAuth, setTimer, clearTimer });
     socket.connect();
     FakeSocket.instances[0]!.onerror?.(new Event('error'));
-    expect(onUnauthorized).toHaveBeenCalledOnce();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(pendingTimers.length).toBeGreaterThan(0);
   });
 
-  it('a clean close (code 1000) does NOT bounce to login', () => {
+  it('a clean close (code 1000) does NOT bounce or reconnect', () => {
     const onUnauthorized = vi.fn();
-    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized });
+    const { setTimer, clearTimer } = makeTimers();
+    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized, setTimer, clearTimer });
     socket.connect();
     FakeSocket.instances[0]!.onclose?.({ code: 1000 });
     expect(onUnauthorized).not.toHaveBeenCalled();
     expect(dashboardStore.getState().connection).toBe('closed');
+    expect(pendingTimers).toHaveLength(0);
+  });
+
+  it('disconnect() cancels a pending reconnect (no socket re-open)', async () => {
+    const probeAuth = vi.fn().mockResolvedValue(true);
+    const { setTimer, clearTimer } = makeTimers();
+    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), probeAuth, setTimer, clearTimer });
+    socket.connect();
+    FakeSocket.instances[0]!.onclose?.({ code: 1006 });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(pendingTimers.length).toBeGreaterThan(0);
+    socket.disconnect(); // cancels the reconnect
+    flushTimers(); // even if a stale timer fires, stopped guards it
+    expect(FakeSocket.instances).toHaveLength(1); // no new socket opened
   });
 
   it('StrictMode reconnect: an OLD socket late close does NOT clobber the live socket (finding 4)', () => {
     const onUnauthorized = vi.fn();
-    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized });
+    const { setTimer, clearTimer } = makeTimers();
+    const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized, setTimer, clearTimer });
     // mount → unmount → remount (StrictMode dev double-invoke).
     socket.connect();
     const oldWs = FakeSocket.instances[0]!;
@@ -218,8 +366,9 @@ describe('DashboardSocket — auth failure + reconnect safety (findings 3 + 4)',
     // The captured OLD handler fires a late abnormal close AFTER the new socket is live.
     staleOnClose?.({ code: 1006 });
 
-    // The generation guard makes the stale event a no-op: no bounce, no state clobber.
+    // The generation guard makes the stale event a no-op: no bounce, no reconnect, no clobber.
     expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(pendingTimers).toHaveLength(0);
     // The new socket still drives state — prove it by applying a snapshot through it.
     newWs.onmessage?.({ data: JSON.stringify(snapshot()) });
     expect(dashboardStore.getState().connection).toBe('live');

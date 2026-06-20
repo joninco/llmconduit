@@ -8,24 +8,27 @@
  *
  * Spec: D9 §"Design system tokens".
  */
-import { PALETTE, FONTS, TAILWIND_COLOR_VARS } from './palette';
+import { PALETTE, FONTS, TAILWIND_COLOR_VARS, CSS_CHANNEL_VARS } from './palette';
+import type { ProviderStatus } from '../api/types';
 
 /** The palette token object (re-exported from the DOM-free single source). */
 export const colors = PALETTE;
 
 /**
- * Maps a provider health string (the wire `ProviderStatus`) to its token color.
- * Centralized so every view colors status identically.
+ * Maps the wire `ProviderStatus` (healthy/cooling/down — the EXACT D4 enum) to its token
+ * color. Centralized so every view colors status identically. `statusColor()` falls back
+ * to muted for any unexpected value.
  */
-export const STATUS_COLOR: Record<string, string> = {
+export const STATUS_COLOR: Record<ProviderStatus, string> = {
   healthy: colors.statusHealthy,
-  serving: colors.statusHealthy,
   cooling: colors.statusCooling,
-  degraded: colors.statusCooling,
   down: colors.statusDown,
-  error: colors.statusDown,
-  unknown: colors.textMuted,
 };
+
+/** Resolve a status color with a safe fallback for unexpected values. */
+export function statusColor(status: string): string {
+  return (STATUS_COLOR as Record<string, string>)[status] ?? colors.textMuted;
+}
 
 export const fonts = FONTS;
 
@@ -63,29 +66,21 @@ export function prefersReducedMotion(): boolean {
 
 /**
  * THE mapping of CSS custom-property name → value, derived from the palette single source
- * (./palette.ts). `applyTokensToRoot` writes these vars at boot; Tailwind references them
- * via `var(--color-*)`; index.css carries no palette literals. Imperative viz (d3/uPlot/
- * canvas) that cannot use CSS vars reads the raw values from `colors` (same literals).
+ * (./palette.ts). Color vars are RGB CHANNEL triples ("R G B") so Tailwind's
+ * `rgb(var(--color-*) / <alpha>)` opacity utilities work (finding 9); font vars are the
+ * family strings. `applyTokensToRoot` writes them at boot; index.css carries no palette
+ * literals. Imperative viz (d3/uPlot/canvas) reads hex from `colors` instead.
  */
 export const cssVarMap: Record<string, string> = {
-  '--color-bg': colors.bg,
-  '--color-panel': colors.panel,
-  '--color-panel-raised': colors.panelRaised,
-  '--color-line': colors.line,
-  '--color-status-healthy': colors.statusHealthy,
-  '--color-status-cooling': colors.statusCooling,
-  '--color-status-down': colors.statusDown,
-  '--color-accent': colors.accent,
-  '--color-meta': colors.meta,
-  '--color-text': colors.text,
-  '--color-text-muted': colors.textMuted,
+  ...CSS_CHANNEL_VARS,
   '--font-ui': fonts.ui,
   '--font-mono': fonts.mono,
 };
 
 /**
- * Tailwind color theme (Tailwind color KEY → `var(--color-*)`), re-exported from the
- * DOM-free palette module so tailwind.config.ts can import it under the Node tsconfig.
+ * Tailwind color theme (Tailwind color KEY → `rgb(var(--color-*) / <alpha-value>)`),
+ * re-exported from the DOM-free palette module so tailwind.config.ts can import it under
+ * the Node tsconfig.
  */
 export const tailwindColorVars = TAILWIND_COLOR_VARS;
 

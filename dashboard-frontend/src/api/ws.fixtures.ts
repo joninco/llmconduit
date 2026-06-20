@@ -3,45 +3,79 @@
  * `/dashboard/ws`. These are the concrete contract target: the decode tests assert the
  * SPA decodes these verbatim, and D7 should round-trip its serializer against them.
  *
- * Tagging: internally tagged `#[serde(tag = "type", rename_all = "snake_case")]`. The
- * `Monitor` newtype variant is FLATTENED — `DebugWsMessage` fields sit inline next to
- * `"type": "monitor"` (NO nested `message` wrapper). See types.ts "WIRE CONTRACT".
+ * Tagging: `DashboardPayload` is internally tagged `#[serde(tag = "type", rename_all =
+ * "snake_case")]`. The `Monitor` arm NESTS a `DebugWsMessage` under `message` — and that
+ * `DebugWsMessage` is ITSELF `#[serde(tag = "type", rename_all = "snake_case")]` (the real
+ * `src/monitor.rs` enum: hello/request_upsert/segment_append/event_append/request_status/
+ * request_remove/snapshot_done). It is NOT flattened (both carry `type`). See types.ts
+ * "WIRE CONTRACT". Flow keys are `api_call_id`; FlowStatus = open/completed/failed/cancelled.
  *
  * Stored as JSON strings (not objects) so the test exercises the real `JSON.parse`
  * decode path a browser WebSocket `onmessage` would hit.
  */
 
 /**
- * One `DashboardFrame` for the Monitor domain: ONE envelope per `DebugUpdate`
- * (seq = `DebugUpdate.sequence` = 6), `batch` = its 4 sibling `DebugWsMessage`s, each
- * flattened under `type:"monitor"`. The dedup test asserts ALL 4 apply.
+ * One `DashboardFrame` for the Monitor domain: ONE envelope (seq = `DebugUpdate.sequence`
+ * = 6), `batch` = 4 sibling `DashboardPayload::Monitor`s, each nesting a real
+ * itself-tagged `DebugWsMessage`. The dedup test asserts ALL 4 apply.
  */
 export const GOLDEN_MONITOR_FRAME_JSON = JSON.stringify({
   domain: 'monitor',
   seq: 6,
   batch: [
-    { type: 'monitor', kind: 'request.normalized', response_id: 'resp_001', sequence: 6, payload: { model: 'llama-3.1-70b' }, ts_ms: 1718900000000 },
-    { type: 'monitor', kind: 'upstream.request', response_id: 'resp_001', sequence: 6, payload: { target: 'vllm-a' }, ts_ms: 1718900000001 },
-    { type: 'monitor', kind: 'response.delta', response_id: 'resp_001', sequence: 6, payload: { text: 'Hello' }, ts_ms: 1718900000002 },
-    { type: 'monitor', kind: 'response.delta', response_id: 'resp_001', sequence: 6, payload: { text: ', world' }, ts_ms: 1718900000003 },
+    {
+      type: 'monitor',
+      message: {
+        type: 'request_upsert',
+        request: {
+          response_id: 'resp_001',
+          model: 'llama-3.1-70b',
+          started_at_ms: 1718900000000,
+          updated_at_ms: 1718900000000,
+          completed_at_ms: null,
+          status: 'running',
+          stats: {
+            input_items: 3, tool_count: 0, turn_count: 1, user_messages: 1,
+            assistant_messages: 0, system_messages: 1, developer_messages: 0,
+            reasoning_items: 0, function_calls: 0, function_outputs: 0, tool_items: 0,
+            input_chars: 42, instructions_chars: 0,
+          },
+          error: null,
+        },
+      },
+    },
+    { type: 'monitor', message: { type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 1718900000001, kind: 'output', text: 'Hello' } } },
+    { type: 'monitor', message: { type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 1718900000002, kind: 'output', text: ', world' } } },
+    { type: 'monitor', message: { type: 'request_status', response_id: 'resp_001', status: 'completed', completed_at_ms: 1718900000003, error: null } },
   ],
 });
 
-/** A standalone `usage` frame (flow domain). */
+/** A standalone `usage` frame (flow domain), keyed by `api_call_id`. */
 export const GOLDEN_USAGE_FRAME_JSON = JSON.stringify({
   domain: 'flow',
   seq: 4,
   batch: [
-    { type: 'usage', response_id: 'resp_001', prompt: 812, completion: 240, total: 1052, cached: 128, reasoning: 0 },
+    { type: 'usage', api_call_id: 'api_001', response_id: 'resp_001', prompt: 812, completion: 240, total: 1052, cached: 128, reasoning: 0 },
   ],
 });
 
-/** A `flow_status` frame (flow domain). */
+/** A `flow_status` frame (flow domain), keyed by `api_call_id`. */
 export const GOLDEN_FLOW_STATUS_FRAME_JSON = JSON.stringify({
   domain: 'flow',
   seq: 5,
   batch: [
-    { type: 'flow_status', response_id: 'resp_001', status: 'completed', served_model: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 0 }, elapsed_ms: 3100 },
+    {
+      type: 'flow_status',
+      api_call_id: 'api_001',
+      response_id: 'resp_001',
+      status: 'completed',
+      model_requested: 'gpt-4o',
+      model_served: 'llama-3.1-70b',
+      upstream_target: 'vllm-a',
+      usage: { prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 0 },
+      started_ms: 1718900000000,
+      elapsed_ms: 3100,
+    },
   ],
 });
 
@@ -63,7 +97,7 @@ export const GOLDEN_METRIC_TICK_FRAME_JSON = JSON.stringify({
   ],
 });
 
-/** A `topology_update` frame (topology domain). */
+/** A `topology_update` frame (topology domain) — D4 `ProviderHealth` node shape. */
 export const GOLDEN_TOPOLOGY_FRAME_JSON = JSON.stringify({
   domain: 'topology',
   seq: 2,
@@ -71,7 +105,12 @@ export const GOLDEN_TOPOLOGY_FRAME_JSON = JSON.stringify({
     {
       type: 'topology_update',
       nodes: [
-        { id: 'vllm-a', name: 'vllm-a (8001)', status: 'healthy', base_url: 'http://localhost:8001', in_flight: 3, error_streak: 0, tokens_per_sec: 142 },
+        {
+          id: 'vllm-a', name: 'vllm-a (8001)', route: null, base_url: 'http://localhost:8001',
+          status: 'healthy', cooling_until_ms: null, last_error: null,
+          served_count: 1280, failover_count: 0, consecutive_failures: 0,
+          catalog_fetched_ms: 1718899995000, catalog_size: 12,
+        },
       ],
       edges: [
         { from: 'gateway', to: 'vllm-a', throughput: 4.2, tokens_per_sec: 142, cost_per_sec: 0.003 },
@@ -85,6 +124,16 @@ export const MALFORMED_FRAME_JSON = JSON.stringify({
   domain: 'flow',
   seq: 99,
   batch: [
-    { type: 'usage', response_id: 'resp_x' /* missing prompt/completion/total/cached/reasoning */ },
+    { type: 'usage', api_call_id: 'api_x' /* missing prompt/completion/total/cached/reasoning */ },
   ],
 });
+
+/**
+ * GOLDEN BOOTSTRAP — the exact `window.__LLMCONDUIT_DASHBOARD__` object D7 embeds
+ * (finding 6). Frozen field names: `authenticated`, `csrf_token`, `mutations_enabled`.
+ */
+export const GOLDEN_BOOTSTRAP = {
+  authenticated: true,
+  csrf_token: 'csrf-abc123',
+  mutations_enabled: true,
+} as const;

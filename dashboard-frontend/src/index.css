@@ -5,9 +5,9 @@
 /*
  * The palette + font LITERALS live ONLY in src/design/palette.ts (finding 8).
  * `applyTokensToRoot` (tokens.ts) writes every `--color-*`/`--font-*` CSS var onto :root
- * in main.tsx BEFORE first paint, and Tailwind utilities reference those vars — so NO
- * palette literals appear here. The lone literal below is a single anti-FOUC background
- * fallback for the pre-JS frame.
+ * in main.tsx BEFORE first paint. Color vars are RGB CHANNEL triples ("R G B") — finding 9 —
+ * so they must be wrapped in `rgb(...)` here (and Tailwind wraps them automatically). No
+ * palette literals appear below except the single anti-FOUC pre-JS background fallback.
  */
 html {
   background: #0d0f12; /* anti-FOUC fallback only; authoritative value is palette.ts bg */
@@ -21,8 +21,8 @@ body,
 
 body {
   margin: 0;
-  background: var(--color-bg);
-  color: var(--color-text);
+  background: rgb(var(--color-bg));
+  color: rgb(var(--color-text));
   font-family: var(--font-ui);
   /* Tabular figures everywhere numbers appear; chips also opt in explicitly. */
   font-variant-numeric: tabular-nums;

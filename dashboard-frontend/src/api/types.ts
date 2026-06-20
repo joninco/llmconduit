@@ -1,35 +1,53 @@
 /**
  * Wire types — the FROZEN contract between the Rust gateway and this SPA.
  *
- * Sources (the oracle):
- *  - D7 §"Batched WS envelope": `DashboardFrame { domain, seq, batch: DashboardPayload[] }`,
- *    `Domain = Flow | Metrics | Topology | Monitor`, and the `DashboardPayload` enum arms.
- *  - D13 §"Jobs to Be Done": the REST endpoint response shapes (per-domain seq cursors).
+ * These mirror the ACTUAL implemented Rust DTOs (not guesses):
+ *  - `src/dashboard_flow.rs` (D1): `FlowStatus` (open/completed/failed/cancelled),
+ *    `FlowUsage` (i64 prompt/completion/total/cached/reasoning), `SnapshotFlowSummary`
+ *    (keyed by `api_call_id`, with optional `response_id`).
+ *  - `src/monitor.rs`: `DebugWsMessage` is itself `#[serde(tag="type", rename_all="snake_case")]`
+ *    with arms hello/request_upsert/segment_append/event_append/request_status/request_remove/
+ *    snapshot_done — modeled as a real discriminated union below.
+ *  - `.ralph/specs/D4-...md`: `ProviderHealth` (id/name/route/base_url/status/cooling_until_ms/
+ *    last_error/served_count/failover_count/consecutive_failures/catalog_fetched_ms/catalog_size).
+ *  - `.ralph/specs/D7-...md` + `.ralph/specs/D13-...md`: the WS envelope + REST shapes.
  *
- * Discriminated unions are exhaustive and `any`-free (D9 constraint). The `assertNever`
- * helper turns a missing switch arm into a COMPILE error.
+ * Discriminated unions are exhaustive and `any`-free (D9 constraint). `assertNever` turns a
+ * missing switch arm into a COMPILE error. Runtime validators (bottom of file) reject any
+ * frame whose shape/enum/seq does not match BEFORE it can mutate state.
  */
 
 // ---------------------------------------------------------------------------
 // Shared scalars
 // ---------------------------------------------------------------------------
 
-/** Server-assigned per-call identifier. `:id` in the REST routes == `api_call_id`. */
+/**
+ * Authoritative per-call identifier minted at the HTTP boundary (`api_call_id`). The REST
+ * routes' `:id` == `api_call_id` (D13); detail + kill route by it. Distinct from
+ * `response_id` (the engine's id) — the two COEXIST on a flow and must not be conflated.
+ */
+export type ApiCallId = string;
+/** The engine-assigned response id; optional on a flow until `link()` binds it. */
 export type ResponseId = string;
 
-/** Terminal lifecycle states of a flow. Mirrors the Rust `TerminalReason` wire strings. */
-export type FlowStatus =
-  | 'streaming'
-  | 'completed'
-  | 'failed'
-  | 'cancelled'
-  | 'killed'
-  | 'replayed';
+/** Lifecycle status of a flow — the EXACT `FlowStatus` enum from `dashboard_flow.rs`. */
+export type FlowStatus = 'open' | 'completed' | 'failed' | 'cancelled';
+export const FLOW_STATUSES: readonly FlowStatus[] = ['open', 'completed', 'failed', 'cancelled'];
 
-/** Provider health state used by topology nodes + status chips. */
-export type ProviderStatus = 'healthy' | 'serving' | 'cooling' | 'degraded' | 'down' | 'error' | 'unknown';
+/** Provider health state — the EXACT D4 `ProviderHealth.status` (snake_case serialize). */
+export type ProviderStatus = 'healthy' | 'cooling' | 'down';
+export const PROVIDER_STATUSES: readonly ProviderStatus[] = ['healthy', 'cooling', 'down'];
 
-/** Token-accounting block attached to flows + usage frames. */
+/** The debug request lifecycle status (`DebugRequestStatus`, monitor.rs). */
+export type DebugRequestStatus = 'running' | 'completed' | 'failed';
+/** Debug segment kind (`DebugSegmentKind`, monitor.rs). */
+export type DebugSegmentKind = 'output' | 'reasoning' | 'tool';
+
+/**
+ * Token-accounting block (`FlowUsage`). The Rust fields are `i64`; we keep them `number`
+ * and the validators require finite values. (Non-negative is the contract but not enforced
+ * here, since a transient negative would be a Rust bug, not a wire-poisoning vector.)
+ */
 export interface Usage {
   prompt: number;
   completion: number;
@@ -39,65 +57,111 @@ export interface Usage {
 }
 
 // ---------------------------------------------------------------------------
-// Monitor (debug) messages — the `/debug/ws` bare `DebugWsMessage`, carried inside
-// a `Monitor` payload arm. A single originating `DebugUpdate` (one `sequence`) carries
-// a `Vec<DebugWsMessage>`, so the batched envelope MUST surface every sibling.
+// DebugWsMessage — the REAL discriminated union from `src/monitor.rs`
+// (`#[serde(tag="type", rename_all="snake_case")]`). Carried (nested) inside the
+// `Monitor` payload arm. A single `DebugUpdate` (one `sequence`) bundles a `Vec` of
+// these, so the batched envelope MUST surface every sibling.
 // ---------------------------------------------------------------------------
 
-/**
- * The bare debug-stream message. We keep the body loosely typed (`unknown` payload)
- * because `/debug/ws` carries heterogeneous transcript events; views narrow on `kind`.
- * NOTE: `unknown` (not `any`) preserves type-safety — consumers must narrow.
- */
-export interface DebugWsMessage {
-  kind: string;
-  response_id?: ResponseId;
-  sequence?: number;
-  /** Heterogeneous event body; narrow by `kind` at the use site. */
-  payload?: unknown;
-  ts_ms?: number;
+export interface DebugEventImage {
+  id: string;
+  label: string;
+  path: string;
+  mime_type: string;
+  size_bytes?: number | null;
 }
+
+export interface DebugRequestStats {
+  input_items: number;
+  tool_count: number;
+  turn_count: number;
+  user_messages: number;
+  assistant_messages: number;
+  system_messages: number;
+  developer_messages: number;
+  reasoning_items: number;
+  function_calls: number;
+  function_outputs: number;
+  tool_items: number;
+  input_chars: number;
+  instructions_chars: number;
+}
+
+export interface DebugRequest {
+  response_id: string;
+  model: string;
+  started_at_ms: number;
+  updated_at_ms: number;
+  completed_at_ms?: number | null;
+  status: DebugRequestStatus;
+  stats: DebugRequestStats;
+  error?: string | null;
+}
+
+export interface DebugSegment {
+  timestamp_ms: number;
+  kind: DebugSegmentKind;
+  text: string;
+}
+
+export interface DebugTimelineEvent {
+  timestamp_ms: number;
+  kind: string;
+  summary: string;
+  payload_preview?: string | null;
+  images: DebugEventImage[];
+}
+
+export type DebugWsMessage =
+  | { type: 'hello'; protocol_version: number; history_limit: number; history_retention_ms: number }
+  | { type: 'request_upsert'; request: DebugRequest }
+  | { type: 'segment_append'; response_id: string; segment: DebugSegment }
+  | { type: 'event_append'; response_id: string; event: DebugTimelineEvent }
+  | {
+      type: 'request_status';
+      response_id: string;
+      status: DebugRequestStatus;
+      completed_at_ms?: number | null;
+      error?: string | null;
+    }
+  | { type: 'request_remove'; response_id: string; reason: string }
+  | { type: 'snapshot_done' };
+
+export const DEBUG_WS_KINDS: readonly DebugWsMessage['type'][] = [
+  'hello',
+  'request_upsert',
+  'segment_append',
+  'event_append',
+  'request_status',
+  'request_remove',
+  'snapshot_done',
+];
 
 // ---------------------------------------------------------------------------
 // DashboardPayload — the discriminated union (D7). Discriminant: `type`.
 //
 // WIRE CONTRACT (frozen target for D7 — the Rust side MUST match this):
-//   The Rust `DashboardPayload` enum is serialized INTERNALLY TAGGED via
-//   `#[serde(tag = "type", rename_all = "snake_case")]`. With internal tagging serde
-//   FLATTENS a newtype variant's inner struct fields alongside the tag, so
-//   `Monitor(DebugWsMessage)` serializes as:
-//       { "type": "monitor", "kind": "...", "response_id": "...", "sequence": N,
-//         "payload": <any>, "ts_ms": N }
-//   i.e. the `DebugWsMessage` fields are INLINE next to `type` — there is NO nested
-//   `{ "message": {...} }` wrapper. `MonitorPayload` below therefore extends
-//   `DebugWsMessage` (flattened), and the decoder reads the message fields off the
-//   payload object directly. The other arms are plain internally-tagged structs.
-//   The golden fixture in `ws.fixtures.ts` is the exact byte-for-byte target D7 emits.
+//   `DashboardPayload` is internally tagged `#[serde(tag = "type", rename_all = "snake_case")]`.
+//   Its `Monitor` arm holds a `DebugWsMessage`, which is ITSELF `type`-tagged — so the
+//   monitor payload NESTS the message under `message` (it CANNOT be flattened: both carry a
+//   `type` field and would collide). Wire shape:
+//       { "type": "monitor", "message": { "type": "segment_append", "response_id": "...",
+//                                          "segment": { ... } } }
+//   The other arms are plain internally-tagged structs (fields inline next to `type`).
+//   `ws.fixtures.ts` holds the exact byte-for-byte target bytes D7 must emit.
 // ---------------------------------------------------------------------------
 
-/**
- * The Monitor arm: one per `DebugWsMessage` in the originating `DebugUpdate` batch.
- * FLATTENED — the `DebugWsMessage` fields sit inline alongside the `type` discriminant
- * (see the WIRE CONTRACT note above). `monitorMessage()` extracts the message half.
- */
-export interface MonitorPayload extends DebugWsMessage {
+/** The Monitor arm: one per `DebugWsMessage` in the originating `DebugUpdate` batch. */
+export interface MonitorPayload {
   type: 'monitor';
+  message: DebugWsMessage;
 }
 
-/** Extracts the `DebugWsMessage` carried (flattened) inside a `MonitorPayload`. */
-export function monitorMessage(p: MonitorPayload): DebugWsMessage {
-  return {
-    kind: p.kind,
-    response_id: p.response_id,
-    sequence: p.sequence,
-    payload: p.payload,
-    ts_ms: p.ts_ms,
-  };
-}
-
+/** Per-flow usage update. Keyed by `api_call_id` (the authoritative flow key). */
 export interface UsagePayload {
   type: 'usage';
-  response_id: ResponseId;
+  api_call_id: ApiCallId;
+  response_id?: ResponseId | null;
   prompt: number;
   completion: number;
   total: number;
@@ -134,26 +198,41 @@ export interface MetricTickPayload {
   };
 }
 
+/**
+ * Per-flow status update. Keyed by `api_call_id` (matches D1's record key + D6 kill key);
+ * `response_id` is optional and coexists. `model_served`/`upstream_target` may be absent
+ * until D2 attaches them (mirrors the `Option<String>` fields on `FlowRecord`).
+ */
 export interface FlowStatusPayload {
   type: 'flow_status';
-  response_id: ResponseId;
+  api_call_id: ApiCallId;
+  response_id?: ResponseId | null;
   status: FlowStatus;
-  served_model: string;
-  upstream_target: string;
+  model_requested?: string | null;
+  model_served?: string | null;
+  upstream_target?: string | null;
   usage: Usage | null;
-  elapsed_ms: number;
+  started_ms: number;
+  elapsed_ms?: number | null;
 }
 
-/** A single provider's health snapshot (topology node). */
+/**
+ * One provider's health snapshot (topology node) — the EXACT D4 `ProviderHealth` DTO.
+ * `route` is set only by the routing client; the counters drive the topology view.
+ */
 export interface ProviderHealth {
   id: string;
   name: string;
+  route?: string | null;
+  base_url?: string | null;
   status: ProviderStatus;
-  base_url?: string;
-  in_flight: number;
-  cooldown_until_ms?: number | null;
-  error_streak: number;
-  tokens_per_sec: number;
+  cooling_until_ms?: number | null;
+  last_error?: string | null;
+  served_count: number;
+  failover_count: number;
+  consecutive_failures: number;
+  catalog_fetched_ms?: number | null;
+  catalog_size: number;
 }
 
 export interface TopologyUpdatePayload {
@@ -186,6 +265,18 @@ export interface DashboardFrame {
   batch: DashboardPayload[];
 }
 
+/**
+ * Which payload `type`s are legal under each domain (finding 5: a `metric_tick` under
+ * domain `flow` is invalid → rejected). Monitor frames carry only `monitor`; flow frames
+ * carry flow_status/usage; etc.
+ */
+export const DOMAIN_PAYLOADS: Record<Domain, ReadonlySet<DashboardPayload['type']>> = {
+  flow: new Set(['flow_status', 'usage']),
+  metrics: new Set(['metric_tick']),
+  topology: new Set(['topology_update']),
+  monitor: new Set(['monitor']),
+};
+
 /** The first WS message after connect: a full snapshot the live frames build upon. */
 export interface SnapshotFrame {
   type: 'snapshot';
@@ -209,18 +300,30 @@ export interface SeqCursors {
   monitor_seq: number;
 }
 
-/** Row in the flow table (`GET /flows`). */
+/**
+ * Row in the flow table (`GET /flows`) — mirrors D1's `SnapshotFlowSummary` (body-free).
+ * Keyed by `api_call_id`; `response_id`, models, target, usage, and the timing fields are
+ * optional exactly as the Rust `Option<_>` fields are. `cost` is a D13 roll-up addition.
+ */
 export interface FlowSummary {
-  response_id: ResponseId;
+  api_call_id: ApiCallId;
+  response_id?: ResponseId | null;
+  method: string;
+  uri: string;
+  model_requested?: string | null;
+  model_served?: string | null;
+  upstream_target?: string | null;
+  usage?: Usage | null;
   status: FlowStatus;
-  model_requested: string;
-  model_served: string;
-  upstream_target: string;
-  usage: Usage | null;
   started_ms: number;
-  elapsed_ms: number;
+  finished_ms?: number | null;
+  elapsed_ms?: number | null;
+  terminal_reason?: string | null;
   cost?: number | null;
 }
+
+/** Body-free frozen summary in a snapshot — identical shape to `FlowSummary` (D1). */
+export type SnapshotFlowSummary = FlowSummary;
 
 /** `GET /dashboard/api/flows` */
 export interface FlowsResponse {
@@ -238,7 +341,7 @@ export interface FlowsQuery {
   limit?: number;
 }
 
-/** A single streamed delta replayed into the inspector. */
+/** A single streamed delta replayed into the inspector (from MonitorHub snapshot). */
 export interface FlowDelta {
   sequence: number;
   kind: string;
@@ -247,22 +350,30 @@ export interface FlowDelta {
   ts_ms?: number;
 }
 
-/** `GET /dashboard/api/flows/:id` — the 3-pane inspector body. */
+/**
+ * `GET /dashboard/api/flows/:id` — the 3-pane inspector body (D13). The summary fields +
+ * the three captured bodies (absent, not error, when evicted) + replayed deltas. Keyed by
+ * `api_call_id`.
+ */
 export interface FlowDetail {
   flow_seq: number;
-  /** Absent (not error) when the body has been evicted. */
+  api_call_id: ApiCallId;
+  response_id?: ResponseId | null;
+  /** Absent when the body has been evicted by the summary-byte quota (D1). */
   inbound_body?: unknown;
   inbound_headers?: Record<string, string>;
   normalized?: unknown;
   upstream_body?: unknown;
-  model_requested: string;
-  model_served: string;
-  upstream_target: string;
-  usage: Usage | null;
+  model_requested?: string | null;
+  model_served?: string | null;
+  upstream_target?: string | null;
+  usage?: Usage | null;
+  status: FlowStatus;
   deltas: FlowDelta[];
   terminal_reason?: string | null;
   started_ms: number;
-  elapsed_ms: number;
+  finished_ms?: number | null;
+  elapsed_ms?: number | null;
   cost?: number | null;
 }
 
@@ -312,17 +423,6 @@ export interface CatalogEntry {
   context_limit: number;
 }
 
-/** Body-free frozen summary in a snapshot. */
-export interface SnapshotFlowSummary {
-  response_id: ResponseId;
-  status: FlowStatus;
-  model_served: string;
-  upstream_target: string;
-  usage: Usage | null;
-  started_ms: number;
-  elapsed_ms: number;
-}
-
 /** `GET /dashboard/api/snapshot?at=<unix_ms>` */
 export interface SnapshotResponse {
   cursors: SeqCursors;
@@ -334,7 +434,7 @@ export interface SnapshotResponse {
 
 /** `POST /dashboard/api/flows/:id/kill` */
 export interface KillResponse {
-  response_id: ResponseId;
+  api_call_id: ApiCallId;
   killed: boolean;
 }
 
@@ -347,7 +447,11 @@ export interface LoginRequest {
   token: string;
 }
 
-/** SPA bootstrap embedded by the Rust shell (D7 double-submit CSRF echo + auth state). */
+/**
+ * SPA bootstrap embedded by the Rust shell at `window.__LLMCONDUIT_DASHBOARD__` (D7). The
+ * frozen field name for auth state is `authenticated` (boolean). `csrf_token` is the
+ * double-submit token echo; `mutations_enabled` gates the kill control.
+ */
 export interface DashboardBootstrap {
   authenticated: boolean;
   csrf_token: string | null;
@@ -355,9 +459,9 @@ export interface DashboardBootstrap {
 }
 
 // ---------------------------------------------------------------------------
-// Runtime validation (the WS pipe must NOT trust the wire — D9 finding 6).
-// A frame is validated WHOLLY (envelope + every payload arm) BEFORE the socket
-// touches any cursor or store, so a malformed frame drops without partial apply.
+// Runtime validation (the WS pipe must NOT trust the wire — findings 4/5/6).
+// A frame is validated WHOLLY (envelope + every payload arm, exact enums, unsigned-int
+// seq, domain↔payload compatibility) BEFORE the socket touches any cursor or store.
 // ---------------------------------------------------------------------------
 
 function isObj(v: unknown): v is Record<string, unknown> {
@@ -366,18 +470,39 @@ function isObj(v: unknown): v is Record<string, unknown> {
 function isNum(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v);
 }
+/** A non-negative integer (the wire `u64`/`u128`/`usize` fields). */
+function isUint(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0;
+}
 function isStr(v: unknown): v is string {
   return typeof v === 'string';
+}
+/** Optional string: absent, null, or a string. */
+function isOptStr(v: unknown): boolean {
+  return v === undefined || v === null || isStr(v);
+}
+/** Optional unsigned int: absent, null, or a uint. */
+function isOptUint(v: unknown): boolean {
+  return v === undefined || v === null || isUint(v);
+}
+function isOneOf<T extends string>(v: unknown, set: readonly T[]): v is T {
+  return isStr(v) && (set as readonly string[]).includes(v);
 }
 
 const DOMAINS: readonly Domain[] = ['flow', 'metrics', 'topology', 'monitor'];
 export function isDomain(v: unknown): v is Domain {
-  return isStr(v) && (DOMAINS as readonly string[]).includes(v);
+  return isOneOf(v, DOMAINS);
 }
 
-function isUsageOrNull(v: unknown): v is Usage | null {
-  if (v === null) return true;
+function isUsage(v: unknown): v is Usage {
   return isObj(v) && isNum(v.prompt) && isNum(v.completion) && isNum(v.total) && isNum(v.cached) && isNum(v.reasoning);
+}
+function isUsageOrNull(v: unknown): v is Usage | null {
+  return v === null || isUsage(v);
+}
+/** Optional usage: absent, null, or a valid usage. */
+function isOptUsage(v: unknown): boolean {
+  return v === undefined || isUsageOrNull(v);
 }
 
 function isMetricWindow(v: unknown): v is MetricWindow {
@@ -386,24 +511,73 @@ function isMetricWindow(v: unknown): v is MetricWindow {
     isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min)
   );
 }
+function isMetricWindows(v: unknown): boolean {
+  return isObj(v) && isMetricWindow(v.m1) && isMetricWindow(v.m5) && isMetricWindow(v.h1);
+}
+
+function isProviderHealth(v: unknown): v is ProviderHealth {
+  return (
+    isObj(v) &&
+    isStr(v.id) && isStr(v.name) &&
+    isOptStr(v.route) && isOptStr(v.base_url) &&
+    isOneOf(v.status, PROVIDER_STATUSES) &&
+    isOptUint(v.cooling_until_ms) && isOptStr(v.last_error) &&
+    isUint(v.served_count) && isUint(v.failover_count) && isUint(v.consecutive_failures) &&
+    isOptUint(v.catalog_fetched_ms) && isUint(v.catalog_size)
+  );
+}
+function isTopologyEdge(v: unknown): v is TopologyEdge {
+  return isObj(v) && isStr(v.from) && isStr(v.to) && isNum(v.throughput) && isNum(v.tokens_per_sec) && isNum(v.cost_per_sec);
+}
+
+/** Validates a nested `DebugWsMessage` (itself `type`-tagged) — finding 1. */
+export function isDebugWsMessage(v: unknown): v is DebugWsMessage {
+  if (!isObj(v) || !isStr(v.type)) return false;
+  switch (v.type) {
+    case 'hello':
+      return isUint(v.protocol_version) && isUint(v.history_limit) && isUint(v.history_retention_ms);
+    case 'request_upsert':
+      return isObj(v.request) && isStr(v.request.response_id) && isStr(v.request.model);
+    case 'segment_append':
+      return isStr(v.response_id) && isObj(v.segment) && isStr((v.segment as Record<string, unknown>).text);
+    case 'event_append':
+      return isStr(v.response_id) && isObj(v.event) && isStr((v.event as Record<string, unknown>).kind);
+    case 'request_status':
+      return isStr(v.response_id) && isOneOf(v.status, ['running', 'completed', 'failed']) && isOptUint(v.completed_at_ms) && isOptStr(v.error);
+    case 'request_remove':
+      return isStr(v.response_id) && isStr(v.reason);
+    case 'snapshot_done':
+      return true;
+    default:
+      return false;
+  }
+}
 
 /** Validates a single decoded payload against its `type` arm. */
 export function isDashboardPayload(v: unknown): v is DashboardPayload {
   if (!isObj(v) || !isStr(v.type)) return false;
   switch (v.type) {
     case 'monitor':
-      // Flattened DebugWsMessage: `kind` is the only required field.
-      return isStr(v.kind);
+      // Nested, itself-tagged DebugWsMessage (NOT flattened) — finding 1.
+      return isDebugWsMessage(v.message);
     case 'usage':
-      return isStr(v.response_id) && isNum(v.prompt) && isNum(v.completion) && isNum(v.total) && isNum(v.cached) && isNum(v.reasoning);
+      return (
+        isStr(v.api_call_id) && isOptStr(v.response_id) &&
+        isNum(v.prompt) && isNum(v.completion) && isNum(v.total) && isNum(v.cached) && isNum(v.reasoning)
+      );
     case 'metric_tick':
       return (
         isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
         isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-        isObj(v.windows) && isMetricWindow(v.windows.m1) && isMetricWindow(v.windows.m5) && isMetricWindow(v.windows.h1)
+        isMetricWindows(v.windows)
       );
     case 'flow_status':
-      return isStr(v.response_id) && isStr(v.status) && isStr(v.served_model) && isStr(v.upstream_target) && isUsageOrNull(v.usage) && isNum(v.elapsed_ms);
+      return (
+        isStr(v.api_call_id) && isOptStr(v.response_id) &&
+        isOneOf(v.status, FLOW_STATUSES) &&
+        isOptStr(v.model_requested) && isOptStr(v.model_served) && isOptStr(v.upstream_target) &&
+        isUsageOrNull(v.usage) && isUint(v.started_ms) && isOptUint(v.elapsed_ms)
+      );
     case 'topology_update':
       return Array.isArray(v.nodes) && Array.isArray(v.edges) && v.nodes.every(isProviderHealth) && v.edges.every(isTopologyEdge);
     default:
@@ -411,24 +585,68 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
   }
 }
 
-function isProviderHealth(v: unknown): v is ProviderHealth {
-  return isObj(v) && isStr(v.id) && isStr(v.name) && isStr(v.status) && isNum(v.in_flight) && isNum(v.error_streak) && isNum(v.tokens_per_sec);
-}
-function isTopologyEdge(v: unknown): v is TopologyEdge {
-  return isObj(v) && isStr(v.from) && isStr(v.to) && isNum(v.throughput) && isNum(v.tokens_per_sec) && isNum(v.cost_per_sec);
+/**
+ * Validates the whole batched envelope: a valid `domain`, an UNSIGNED-INTEGER `seq`
+ * (rejects negative/fractional — finding 5), every payload valid, AND every payload's
+ * `type` legal under `domain` (domain↔payload compatibility — finding 5).
+ */
+export function isDashboardFrame(v: unknown): v is DashboardFrame {
+  if (!isObj(v) || !isDomain(v.domain) || !isUint(v.seq) || !Array.isArray(v.batch)) {
+    return false;
+  }
+  const allowed = DOMAIN_PAYLOADS[v.domain];
+  return v.batch.every((p) => isDashboardPayload(p) && allowed.has(p.type));
 }
 
-/** Validates the whole batched envelope: domain + seq + EVERY payload in the batch. */
-export function isDashboardFrame(v: unknown): v is DashboardFrame {
+function isSeqCursors(v: unknown): v is SeqCursors {
+  return isObj(v) && isUint(v.flow_seq) && isUint(v.metrics_seq) && isUint(v.topology_seq) && isUint(v.monitor_seq);
+}
+
+/** Validates a body-free flow summary (each snapshot summary — finding 4). */
+function isFlowSummary(v: unknown): v is FlowSummary {
   return (
-    isObj(v) && isDomain(v.domain) && isNum(v.seq) &&
-    Array.isArray(v.batch) && v.batch.every(isDashboardPayload)
+    isObj(v) &&
+    isStr(v.api_call_id) && isOptStr(v.response_id) &&
+    isStr(v.method) && isStr(v.uri) &&
+    isOptStr(v.model_requested) && isOptStr(v.model_served) && isOptStr(v.upstream_target) &&
+    isOptUsage(v.usage) &&
+    isOneOf(v.status, FLOW_STATUSES) &&
+    isUint(v.started_ms) && isOptUint(v.finished_ms) && isOptUint(v.elapsed_ms) &&
+    isOptStr(v.terminal_reason)
   );
 }
 
-/** Validates a snapshot envelope (loose on nested cursor presence). */
+function isMetricsResponse(v: unknown): v is MetricsResponse {
+  return (
+    isObj(v) && isUint(v.metrics_seq) &&
+    isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
+    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
+    isMetricWindows(v.windows)
+  );
+}
+
+function isTopologyResponse(v: unknown): v is TopologyResponse {
+  return (
+    isObj(v) && isUint(v.topology_seq) &&
+    Array.isArray(v.nodes) && v.nodes.every(isProviderHealth) &&
+    Array.isArray(v.edges) && v.edges.every(isTopologyEdge) &&
+    isObj(v.price_table)
+  );
+}
+
+/**
+ * Fully validates a snapshot envelope (finding 4): cursors are the four unsigned-int
+ * fields, every summary is a valid body-free flow summary, and metrics/topology are either
+ * null or their full valid shapes — BEFORE the snapshot can be applied.
+ */
 export function isSnapshotFrame(v: unknown): v is SnapshotFrame {
-  return isObj(v) && v.type === 'snapshot' && isObj(v.cursors) && Array.isArray(v.flows);
+  return (
+    isObj(v) && v.type === 'snapshot' &&
+    isSeqCursors(v.cursors) &&
+    Array.isArray(v.flows) && v.flows.every(isFlowSummary) &&
+    (v.metrics === null || isMetricsResponse(v.metrics)) &&
+    (v.topology === null || isTopologyResponse(v.topology))
+  );
 }
 
 // ---------------------------------------------------------------------------

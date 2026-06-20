@@ -12,12 +12,12 @@
 import type {
   CatalogEntry,
   DashboardFrame,
-  DashboardPayload,
   DebugWsMessage,
   FlowDetail,
   FlowSummary,
   FlowsResponse,
   MetricsResponse,
+  MonitorPayload,
   ProviderHealth,
   SnapshotFrame,
   SnapshotResponse,
@@ -29,13 +29,13 @@ import type { WsLike } from './ws';
 const MOCK_CSRF = 'mock-csrf-token';
 
 // ---------------------------------------------------------------------------
-// Seed data
+// Seed data — shapes mirror the REAL Rust DTOs (D1 FlowSummary, D4 ProviderHealth).
 // ---------------------------------------------------------------------------
 
 const NODES: ProviderHealth[] = [
-  { id: 'vllm-a', name: 'vllm-a (8001)', status: 'healthy', base_url: 'http://localhost:8001', in_flight: 3, error_streak: 0, tokens_per_sec: 142 },
-  { id: 'vllm-b', name: 'vllm-b (8002)', status: 'cooling', base_url: 'http://localhost:8002', in_flight: 1, cooldown_until_ms: Date.now() + 8000, error_streak: 2, tokens_per_sec: 61 },
-  { id: 'openai', name: 'openai-proxy', status: 'down', base_url: 'https://api.openai.com', in_flight: 0, error_streak: 7, tokens_per_sec: 0 },
+  { id: 'vllm-a', name: 'vllm-a (8001)', route: null, base_url: 'http://localhost:8001', status: 'healthy', cooling_until_ms: null, last_error: null, served_count: 1280, failover_count: 0, consecutive_failures: 0, catalog_fetched_ms: Date.now() - 5000, catalog_size: 12 },
+  { id: 'vllm-b', name: 'vllm-b (8002)', route: null, base_url: 'http://localhost:8002', status: 'cooling', cooling_until_ms: Date.now() + 8000, last_error: 'connection refused', served_count: 610, failover_count: 3, consecutive_failures: 2, catalog_fetched_ms: Date.now() - 9000, catalog_size: 8 },
+  { id: 'openai', name: 'openai-proxy', route: 'cloud', base_url: 'https://api.openai.com', status: 'down', cooling_until_ms: Date.now() + 30000, last_error: '503 upstream', served_count: 42, failover_count: 9, consecutive_failures: 7, catalog_fetched_ms: null, catalog_size: 0 },
 ];
 
 const PRICE_TABLE: TopologyResponse['price_table'] = {
@@ -52,9 +52,9 @@ const CATALOG: CatalogEntry[] = [
 function seedFlows(): FlowSummary[] {
   const now = Date.now();
   return [
-    { response_id: 'resp_001', status: 'streaming', model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 812, completion: 240, total: 1052, cached: 128, reasoning: 0 }, started_ms: now - 2400, elapsed_ms: 2400, cost: 0.0061 },
-    { response_id: 'resp_002', status: 'completed', model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 1500, completion: 980, total: 2480, cached: 0, reasoning: 120 }, started_ms: now - 12000, elapsed_ms: 4200, cost: 0.0019 },
-    { response_id: 'resp_003', status: 'failed', model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai', usage: null, started_ms: now - 30000, elapsed_ms: 800, cost: null },
+    { api_call_id: 'api_001', response_id: 'resp_001', method: 'POST', uri: '/v1/responses', status: 'open', model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 812, completion: 240, total: 1052, cached: 128, reasoning: 0 }, started_ms: now - 2400, finished_ms: null, elapsed_ms: 2400, terminal_reason: null, cost: 0.0061 },
+    { api_call_id: 'api_002', response_id: 'resp_002', method: 'POST', uri: '/v1/chat/completions', status: 'completed', model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 1500, completion: 980, total: 2480, cached: 0, reasoning: 120 }, started_ms: now - 12000, finished_ms: now - 7800, elapsed_ms: 4200, terminal_reason: 'response.completed', cost: 0.0019 },
+    { api_call_id: 'api_003', response_id: null, method: 'POST', uri: '/v1/responses', status: 'failed', model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai', usage: null, started_ms: now - 30000, finished_ms: now - 29200, elapsed_ms: 800, terminal_reason: 'upstream 503', cost: null },
   ];
 }
 
@@ -95,32 +95,42 @@ function buildSnapshot(): SnapshotFrame {
 
 /**
  * A multi-message `Monitor` frame: ONE envelope (seq = originating DebugUpdate.sequence)
- * whose `batch` carries several sibling `DebugWsMessage`s — the `DebugUpdate`-equivalent.
- * The dedup test asserts ALL of these apply (none dropped).
+ * whose `batch` carries several sibling `DashboardPayload::Monitor`s, each NESTING a real
+ * itself-`type`-tagged `DebugWsMessage` (request_upsert / segment_append / request_status —
+ * the actual `src/monitor.rs` arms). The dedup test asserts ALL apply (none dropped).
  */
 export function buildMonitorFrame(seq = 6, responseId = 'resp_001'): DashboardFrame {
-  const siblings: DebugWsMessage[] = [
-    { kind: 'request.normalized', response_id: responseId, sequence: seq, payload: { model: 'llama-3.1-70b' }, ts_ms: Date.now() },
-    { kind: 'upstream.request', response_id: responseId, sequence: seq, payload: { target: 'vllm-a' }, ts_ms: Date.now() },
-    { kind: 'response.delta', response_id: responseId, sequence: seq, payload: { text: 'Hello' }, ts_ms: Date.now() },
-    { kind: 'response.delta', response_id: responseId, sequence: seq, payload: { text: ', world' }, ts_ms: Date.now() },
+  const now = Date.now();
+  const messages: DebugWsMessage[] = [
+    {
+      type: 'request_upsert',
+      request: {
+        response_id: responseId, model: 'llama-3.1-70b', started_at_ms: now, updated_at_ms: now,
+        completed_at_ms: null, status: 'running',
+        stats: { input_items: 3, tool_count: 0, turn_count: 1, user_messages: 1, assistant_messages: 0, system_messages: 1, developer_messages: 0, reasoning_items: 0, function_calls: 0, function_outputs: 0, tool_items: 0, input_chars: 42, instructions_chars: 0 },
+        error: null,
+      },
+    },
+    { type: 'segment_append', response_id: responseId, segment: { timestamp_ms: now, kind: 'output', text: 'Hello' } },
+    { type: 'segment_append', response_id: responseId, segment: { timestamp_ms: now, kind: 'output', text: ', world' } },
+    { type: 'request_status', response_id: responseId, status: 'completed', completed_at_ms: now, error: null },
   ];
   return {
     domain: 'monitor',
     seq,
-    // FLATTENED wire form: DebugWsMessage fields inline alongside `type:'monitor'`
-    // (see types.ts WIRE CONTRACT) — no nested `message` wrapper.
-    batch: siblings.map((m): DashboardPayload => ({ type: 'monitor', ...m })),
+    // NESTED wire form: each payload is `{type:'monitor', message:<DebugWsMessage>}`
+    // (the message is itself `type`-tagged) — see types.ts WIRE CONTRACT.
+    batch: messages.map((message): MonitorPayload => ({ type: 'monitor', message })),
   };
 }
 
 /** A standalone `usage` frame (flow domain) — exercises the `usage` payload arm (finding 9). */
-export function buildUsageFrame(seq: number, responseId = 'resp_001'): DashboardFrame {
+export function buildUsageFrame(seq: number, apiCallId = 'api_001'): DashboardFrame {
   return {
     domain: 'flow',
     seq,
     batch: [
-      { type: 'usage', response_id: responseId, prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 16 },
+      { type: 'usage', api_call_id: apiCallId, response_id: 'resp_001', prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 16 },
     ],
   };
 }
@@ -154,14 +164,14 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     return json({ ok: true });
   }
 
-  // -- Kill (CSRF) --
+  // -- Kill (CSRF) -- `:id` == api_call_id.
   const killMatch = path.match(/^\/dashboard\/api\/flows\/([^/]+)\/kill$/);
   if (killMatch && method === 'POST') {
     const id = decodeURIComponent(killMatch[1] ?? '');
     const csrf = headerValue(init?.headers, 'X-CSRF-Token');
     mockKillLog.push({ id, csrf });
     if (!csrf) return json({ error: 'missing csrf' }, 403);
-    return json({ response_id: id, killed: true });
+    return json({ api_call_id: id, killed: true });
   }
 
   // -- Reads --
@@ -169,6 +179,10 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     let flows = seedFlows();
     const status = qs.get('status');
     if (status) flows = flows.filter((f) => f.status === status);
+    const model = qs.get('model');
+    if (model) flows = flows.filter((f) => f.model_requested === model || f.model_served === model);
+    const upstream = qs.get('upstream');
+    if (upstream) flows = flows.filter((f) => f.upstream_target === upstream);
     const resp: FlowsResponse = { flows, total: flows.length, flow_seq: 3 };
     return json(resp);
   }
@@ -182,13 +196,11 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   if (path === '/dashboard/api/catalog') return json(CATALOG);
   if (path === '/dashboard/api/snapshot') {
     const atMs = Number(qs.get('at') ?? Date.now());
+    // Snapshot summaries are body-free FlowSummary objects (identical shape, D1).
     const snap: SnapshotResponse = {
       cursors: { flow_seq: 3, metrics_seq: 1, topology_seq: 1, monitor_seq: 5 },
       at_ms: atMs,
-      summaries: seedFlows().map((f) => ({
-        response_id: f.response_id, status: f.status, model_served: f.model_served,
-        upstream_target: f.upstream_target, usage: f.usage, started_ms: f.started_ms, elapsed_ms: f.elapsed_ms,
-      })),
+      summaries: seedFlows(),
       metrics: buildMetrics(),
       topology: buildTopology(),
     };
@@ -199,9 +211,12 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
 };
 
 function buildFlowDetail(id: string): FlowDetail {
-  const base = seedFlows().find((f) => f.response_id === id) ?? seedFlows()[0]!;
+  // Resolve by api_call_id OR response_id (the store joins by either, like D1's detail()).
+  const base = seedFlows().find((f) => f.api_call_id === id || f.response_id === id) ?? seedFlows()[0]!;
   return {
     flow_seq: 3,
+    api_call_id: base.api_call_id,
+    response_id: base.response_id,
     inbound_body: { model: base.model_requested, messages: [{ role: 'user', content: 'Hi' }] },
     inbound_headers: { 'content-type': 'application/json', authorization: 'Bearer ***' },
     normalized: { model: base.model_served, input: [{ role: 'user', content: 'Hi' }] },
@@ -210,13 +225,15 @@ function buildFlowDetail(id: string): FlowDetail {
     model_served: base.model_served,
     upstream_target: base.upstream_target,
     usage: base.usage,
+    status: base.status,
     deltas: [
       { sequence: 1, kind: 'response.created', payload: {}, ts_ms: base.started_ms },
       { sequence: 2, kind: 'response.delta', payload: { text: 'Hello' }, ts_ms: base.started_ms + 200 },
       { sequence: 3, kind: 'response.delta', payload: { text: ', world' }, ts_ms: base.started_ms + 400 },
     ],
-    terminal_reason: base.status === 'completed' ? 'stop' : null,
+    terminal_reason: base.terminal_reason,
     started_ms: base.started_ms,
+    finished_ms: base.finished_ms,
     elapsed_ms: base.elapsed_ms,
     cost: base.cost ?? null,
   };
@@ -293,11 +310,14 @@ export class MockWebSocket implements WsLike {
       seq: ++this.seq.flow,
       batch: [{
         type: 'flow_status',
+        api_call_id: 'api_001',
         response_id: 'resp_001',
         status: 'completed',
-        served_model: 'llama-3.1-70b',
+        model_requested: 'gpt-4o',
+        model_served: 'llama-3.1-70b',
         upstream_target: 'vllm-a',
         usage: { prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 0 },
+        started_ms: Date.now() - 3100,
         elapsed_ms: 3100,
       }],
     };

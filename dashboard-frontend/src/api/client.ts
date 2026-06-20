@@ -92,6 +92,23 @@ export class DashboardClient {
     await this.fetchImpl('/dashboard/logout', { method: 'POST', credentials: 'include' });
   }
 
+  /**
+   * Lightweight protected-endpoint probe (finding 7): a cheap GET used by the WS layer
+   * after a transient drop to decide reconnect-vs-logout. Returns `true` if the session is
+   * still valid, `false` ONLY on a `401`. It does NOT fire `onUnauthorized` itself (the
+   * caller decides); a non-401 error (network) resolves `true` so a blip reconnects rather
+   * than logging the user out. Probes `/metrics` (a small, always-present read).
+   */
+  async probeAuth(): Promise<boolean> {
+    try {
+      const res = await this.fetchImpl(`${this.basePath}/metrics`, { credentials: 'include' });
+      return res.status !== 401;
+    } catch {
+      // Network failure ≠ auth failure: stay logged in, let the socket reconnect.
+      return true;
+    }
+  }
+
   // -- Reads (cursor-bearing) ----------------------------------------------
 
   flows(query: FlowsQuery = {}): Promise<FlowsResponse> {
