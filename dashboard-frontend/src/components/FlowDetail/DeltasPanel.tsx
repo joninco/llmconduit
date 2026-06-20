@@ -6,12 +6,20 @@
  * actual output rather than one node per token. This INCLUDES tool segments: a real tool call's
  * arguments stream as MANY adjacent `tool` fragments, so adjacent tool segments accumulate into
  * ONE card rather than one card per fragment (finding 2).
+ *
+ * But TWO DISTINCT tool calls must not merge into one card just because they are kind-adjacent
+ * (finding 5). The backend (`src/monitor.rs::append_function_call_delta`) introduces each distinct
+ * call with an explicit boundary line — `tool arguments <id>:` — and coalesces same-kind text
+ * server-side, so a single `tool` segment can hold several calls concatenated. We therefore split
+ * a coalesced tool block on that boundary marker into one card PER call, rather than on `kind`
+ * adjacency alone. A tool block with no marker (e.g. a lone streamed call whose fragments carry no
+ * header) stays a single card.
  */
 import { useState } from 'react';
 import type { DebugSegment } from '../../api/types';
 import { cn } from '../../lib/cn';
 
-/** A coalesced run of adjacent same-kind segments (output / reasoning / one tool call). */
+/** A coalesced run of adjacent same-kind segments (output / reasoning / one or more tool calls). */
 interface Block {
   kind: DebugSegment['kind'];
   text: string;
@@ -19,10 +27,24 @@ interface Block {
   ts: number;
 }
 
+/** A rendered card: an output/reasoning passage, or a SINGLE tool call's payload. */
+interface Card {
+  kind: DebugSegment['kind'];
+  text: string;
+  ts: number;
+}
+
+/**
+ * The explicit per-call boundary the backend writes ahead of each distinct function call's
+ * argument stream: `tool arguments <short_id>:` on its own line (monitor.rs). Splitting on it
+ * separates concatenated calls into distinct cards (finding 5).
+ */
+const TOOL_CALL_BOUNDARY = /^tool arguments .*:\s*$/;
+
 /**
  * Coalesces adjacent same-kind segments into one block. Output/reasoning runs read as one
  * passage; an adjacent run of `tool` segments (the streamed argument fragments of a single tool
- * call) accumulates into ONE card so a fragmented tool call is not split across many cards
+ * call) accumulates into ONE block so a fragmented tool call is not split across many cards
  * (finding 2). A different kind in between (or a non-adjacent tool run) starts a fresh block.
  */
 function coalesce(segments: DebugSegment[]): Block[] {
@@ -38,10 +60,41 @@ function coalesce(segments: DebugSegment[]): Block[] {
   return blocks;
 }
 
-export function DeltasPanel({ segments }: { segments: DebugSegment[] }) {
-  const blocks = coalesce(segments);
+/**
+ * Splits a coalesced `tool` block into one card per DISTINCT call, cutting on the backend's
+ * `tool arguments <id>:` boundary line (finding 5). Text before the first boundary (a streamed
+ * call whose fragments carry no header — the finding-2 case) is its own card, so a single
+ * markerless tool block stays ONE card. Non-tool blocks pass through unchanged.
+ */
+function splitToolCalls(block: Block): Card[] {
+  if (block.kind !== 'tool') return [{ kind: block.kind, text: block.text, ts: block.ts }];
+  const lines = block.text.split('\n');
+  const cards: Card[] = [];
+  let current: string[] = [];
+  const flush = () => {
+    if (current.length === 0) return;
+    const text = current.join('\n').trim();
+    if (text !== '') cards.push({ kind: 'tool', text, ts: block.ts });
+    current = [];
+  };
+  for (const line of lines) {
+    // A boundary line STARTS a new card (it is the per-call header), and is kept as that card's
+    // first line so the label can still resolve from the call's argument JSON that follows.
+    if (TOOL_CALL_BOUNDARY.test(line)) flush();
+    current.push(line);
+  }
+  flush();
+  // A tool block that produced nothing printable still renders one (empty) card so the run isn't
+  // silently dropped.
+  return cards.length > 0 ? cards : [{ kind: 'tool', text: block.text, ts: block.ts }];
+}
 
-  if (blocks.length === 0) {
+export function DeltasPanel({ segments }: { segments: DebugSegment[] }) {
+  // Coalesce adjacent same-kind runs, then split each tool block into one card per distinct call
+  // (finding 5) — output/reasoning blocks pass through as single cards.
+  const cards = coalesce(segments).flatMap(splitToolCalls);
+
+  if (cards.length === 0) {
     return (
       <div className="px-3 py-4 text-xs italic text-text-muted" data-testid="deltas-empty">
         No streamed deltas yet.
@@ -51,19 +104,19 @@ export function DeltasPanel({ segments }: { segments: DebugSegment[] }) {
 
   return (
     <div className="flex flex-col gap-1.5 px-3 py-2" data-testid="deltas-panel">
-      {blocks.map((b, i) =>
-        b.kind === 'tool' ? (
-          <ToolCard key={`${b.ts}-${i}`} text={b.text} />
+      {cards.map((c, i) =>
+        c.kind === 'tool' ? (
+          <ToolCard key={`${c.ts}-${i}`} text={c.text} />
         ) : (
           <pre
-            key={`${b.ts}-${i}`}
-            data-segment-kind={b.kind}
+            key={`${c.ts}-${i}`}
+            data-segment-kind={c.kind}
             className={cn(
               'whitespace-pre-wrap break-words font-mono text-xs leading-relaxed',
-              b.kind === 'output' ? 'text-text' : 'italic text-text-muted',
+              c.kind === 'output' ? 'text-text' : 'italic text-text-muted',
             )}
           >
-            {b.text}
+            {c.text}
           </pre>
         ),
       )}
@@ -99,15 +152,25 @@ function ToolCard({ text }: { text: string }) {
   );
 }
 
-/** Best-effort one-line label for a tool segment: a JSON `name`, else the first line. */
+/**
+ * Best-effort one-line label for a tool card. The card may lead with the backend's
+ * `tool arguments <id>:` header (finding 5); we strip it and resolve the label from the argument
+ * JSON that follows (a `name`/`tool`/`function` field). Falls back to the header line (showing the
+ * call id) or the first non-empty line when there is no parseable JSON.
+ */
 function toolLabel(text: string): string {
+  const lines = text.split('\n');
+  const headerIdx = lines.findIndex((l) => TOOL_CALL_BOUNDARY.test(l));
+  const header = headerIdx >= 0 ? lines[headerIdx]! : null;
+  // The argument body is everything after the header (or the whole text when there is no header).
+  const body = (headerIdx >= 0 ? lines.slice(headerIdx + 1) : lines).join('\n').trim();
   try {
-    const obj = JSON.parse(text) as Record<string, unknown>;
+    const obj = JSON.parse(body) as Record<string, unknown>;
     const name = obj.name ?? obj.tool ?? obj.function;
     if (typeof name === 'string') return name;
   } catch {
-    // not JSON — fall through to first-line
+    // not JSON — fall through to the header / first-line label
   }
-  const firstLine = text.split('\n', 1)[0] ?? '';
-  return firstLine.length > 60 ? `${firstLine.slice(0, 57)}…` : firstLine;
+  const fallback = header ?? body.split('\n', 1)[0] ?? '';
+  return fallback.length > 60 ? `${fallback.slice(0, 57)}…` : fallback;
 }

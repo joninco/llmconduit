@@ -70,6 +70,39 @@ describe('DeltasPanel — output/reasoning/tool from segment_append', () => {
     expect(queryAllByTestId('tool-card')).toHaveLength(2);
   });
 
+  it('splits CONSECUTIVE distinct tool calls on the backend boundary marker (finding 5)', () => {
+    // The backend (monitor.rs) coalesces same-kind text server-side and introduces each distinct
+    // call with a `tool arguments <id>:` line. So two adjacent calls arrive as ONE `tool` segment
+    // (no intervening kind). Grouping by kind alone merged them into one card; splitting on the
+    // boundary marker yields one card PER call, each labeled from its own argument JSON.
+    const text = [
+      'tool arguments call_aaa:',
+      '{"name":"get_weather","arguments":{"city":"SF"}}',
+      'tool arguments call_bbb:',
+      '{"name":"get_time","arguments":{"tz":"PT"}}',
+    ].join('\n');
+    const { getAllByTestId } = render(<DeltasPanel segments={[seg('tool', text)]} />);
+    const cards = getAllByTestId('tool-card');
+    expect(cards).toHaveLength(2); // two distinct calls, not one merged card
+    // Each card resolves its OWN tool name from the argument JSON after its header.
+    expect(cards[0]!.textContent).toContain('get_weather');
+    expect(cards[1]!.textContent).toContain('get_time');
+    // Expanding the first shows only its own payload (not the second call's args).
+    fireEvent.click(cards[0]!.querySelector('button')!);
+    const body = document.querySelector('[data-testid="tool-card-body"]')!;
+    expect(body.textContent).toContain('"city":"SF"');
+    expect(body.textContent).not.toContain('get_time');
+  });
+
+  it('keeps a single markerless tool call (fragments, no header) as ONE card alongside finding 2', () => {
+    // A lone call streamed as fragments carries no boundary header → it must remain one card (the
+    // boundary split must not over-split a markerless block).
+    const { queryAllByTestId } = render(
+      <DeltasPanel segments={[seg('tool', '{"name":"only_'), seg('tool', 'one"}')]} />,
+    );
+    expect(queryAllByTestId('tool-card')).toHaveLength(1);
+  });
+
   it('shows the empty state with no segments', () => {
     const { getByTestId } = render(<DeltasPanel segments={[]} />);
     expect(getByTestId('deltas-empty')).toBeTruthy();

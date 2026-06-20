@@ -65,20 +65,35 @@ export function normalizeRestDeltas(deltas: FlowDelta[] | undefined): DebugSegme
 
 /**
  * Merges the REST replay (base) with the live monitor segments (appended). The replay anchors the
- * stream for a reloaded/completed flow; live segments continue it. When the live ring re-streams
- * the same history the replay already holds, the live stream STARTS by repeating the replayed
- * segments — so we drop the live prefix that matches the replay head (by kind+text, since the two
- * sources may carry different timestamps) and append only the genuinely newer tail. Order is
- * preserved: replay first, then the un-duplicated live remainder.
+ * stream for a reloaded/completed flow; live segments continue it. The two sources OVERLAP at the
+ * seam: the live ring retains the recent history the replay already holds, so the END of `rest`
+ * and the START of `live` repeat the same segments. We remove that overlap by finding the LONGEST
+ * suffix of `rest` that equals a prefix of `live` (by kind+text — timestamps may differ between
+ * sources) and appending only the live tail past it. So REST `[A,B]` + live `[B,C]` joins to
+ * `[A,B,C]` (the shared `B` is not duplicated), not `[A,B,B,C]` (finding 6). A prefix-only compare
+ * missed a PARTIAL overlap like this — it only caught a live head that duplicated the replay HEAD.
+ * Order is preserved: replay first, then the un-duplicated live remainder.
  */
 export function mergeDeltas(rest: DebugSegment[], live: DebugSegment[]): DebugSegment[] {
   if (rest.length === 0) return live;
   if (live.length === 0) return rest;
   const sameSeg = (a: DebugSegment, b: DebugSegment) => a.kind === b.kind && a.text === b.text;
-  // Skip the leading live segments that duplicate the replay (live re-sends history-then-live).
-  let skip = 0;
-  while (skip < live.length && skip < rest.length && sameSeg(live[skip]!, rest[skip]!)) {
-    skip += 1;
+  // Longest k such that rest's last k segments === live's first k segments. Start from the largest
+  // feasible overlap and shrink, so the seam joins cleanly even when live re-sends many segments.
+  const maxOverlap = Math.min(rest.length, live.length);
+  let overlap = 0;
+  for (let k = maxOverlap; k > 0; k -= 1) {
+    let matches = true;
+    for (let i = 0; i < k; i += 1) {
+      if (!sameSeg(rest[rest.length - k + i]!, live[i]!)) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      overlap = k;
+      break;
+    }
   }
-  return [...rest, ...live.slice(skip)];
+  return [...rest, ...live.slice(overlap)];
 }

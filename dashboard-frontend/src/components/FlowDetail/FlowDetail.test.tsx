@@ -215,4 +215,50 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     expect(empties.length).toBe(3);
     expect(empties[0]!.textContent).toContain('body evicted');
   });
+
+  it('DISABLES the kill button while seeking — no mutation against the frozen cut (finding 2)', async () => {
+    // A historically-OPEN flow in the frozen snapshot. While seeking, the kill must be disabled so
+    // the optimistic patch cannot mutate the frozen store row (and no abort POST is sent).
+    seedFlows([makeFlow({ api_call_id: 'api_open_hist', response_id: 'resp_open_hist', status: 'open', started_ms: 1_700_000_000_000 })]);
+    authStore.getState().setMutationsEnabled(true);
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_open_hist" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('kill-button')).toBeTruthy());
+    // Enter seek.
+    act(() => dashboardStore.getState().setConnection('seeking'));
+    const btn = getByTestId('kill-button');
+    expect(btn).toBeDisabled();
+    expect(btn.getAttribute('title')).toBe('paused (time-travel)');
+    // A disabled button cannot click; even a forced kill is a no-op (store row stays 'open').
+    fireEvent.click(btn);
+    expect(dashboardStore.getState().flows.get('api_open_hist')?.status).toBe('open');
+  });
+
+  it('derives cost + elapsed from the FROZEN snapshot while seeking — no Date.now / live cost (finding 3)', async () => {
+    // The frozen snapshot row is OPEN with a server roll-up cost; the LIVE /flows/:id detail
+    // carries a DIFFERENT (post-seek) cost and a long elapsed. While seeking, the header must show
+    // the frozen row's cost and an elapsed that does NOT tick against wall-clock Date.now().
+    seedFlows([makeFlow({
+      api_call_id: 'api_frozen', response_id: 'resp_frozen', status: 'open',
+      started_ms: 1_700_000_000_000, cost: 0.1234,
+    })]);
+    const liveDetail: FlowDetailDto = {
+      flow_seq: 1, api_call_id: 'api_frozen', response_id: 'resp_frozen', status: 'open',
+      deltas: [], started_ms: 1_700_000_000_000,
+      inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
+      cost: 0.9999, elapsed_ms: 999_000, // live values that must NOT bleed into the frozen view
+    };
+    const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_frozen" onClose={noop} />);
+    act(() => queryClient.setQueryData(['flows', 'api_frozen'], liveDetail));
+    act(() => dashboardStore.getState().setConnection('seeking'));
+    await waitFor(() => expect(document.querySelector('[data-testid="seek-badge"]')).toBeTruthy());
+
+    const text = getByTestId('flow-detail').textContent ?? '';
+    // Frozen roll-up cost shown; the live REST cost is NOT used.
+    expect(text).toContain('$0.1234');
+    expect(text).not.toContain('$1.00'); // 0.9999 would round to $1.00
+    // Elapsed for the OPEN frozen flow reads 0ms (frozen started==now), never a live-ticked value
+    // from Date.now() and never the live detail's 999000ms (→ 16m39s).
+    expect(text).toContain('0ms');
+    expect(text).not.toContain('16m');
+  });
 });

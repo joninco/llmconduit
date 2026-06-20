@@ -94,13 +94,17 @@ export function useFlowDetail(apiCallId: string | null) {
 
   const kill = useCallback(
     (id: string) => {
+      // No mutations against a frozen cut: while seeking (D11 paused) the store holds the
+      // historical snapshot, and the optimistic `patchFlowStatus` would mutate it (finding 2).
+      // The kill button is already disabled while seeking; this guards a programmatic call too.
+      if (seeking) return;
       if (!mutationsEnabled) {
         setKillState({ phase: 'forbidden' });
         return;
       }
       killMutation.mutate(id);
     },
-    [killMutation, mutationsEnabled],
+    [killMutation, mutationsEnabled, seeking],
   );
 
   return {

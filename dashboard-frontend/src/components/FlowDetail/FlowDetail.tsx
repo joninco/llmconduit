@@ -65,27 +65,32 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   // Cost from the MERGED flow+detail data: prefer the server roll-up (detail.cost, else the live
   // row's cost), and only fall back to usage×price when neither roll-up exists. Building a merged
   // summary (live status/usage wins; roll-up cost + detail fields fill gaps) lets `flowCost` apply
-  // its own roll-up-first precedence, so a live row LACKING cost no longer hides `detail.cost`
-  // (finding 4).
+  // its own roll-up-first precedence, so a live row LACKING cost no longer hides `detail.cost`.
+  //
+  // SEEK coherence (finding 3): while seeking, `liveFlow` IS the frozen snapshot row and `detail`
+  // is LIVE `/flows/:id` (post-seek) — so cost must derive EXCLUSIVELY from the frozen summary,
+  // never the live REST roll-up. We drop `detail` from the merge while seeking; the frozen row's
+  // own `cost`/`usage` stand alone.
   const cost = useMemo(() => {
-    if (!liveFlow && !detail) return null;
+    const summary = seeking ? null : detail;
+    if (!liveFlow && !summary) return null;
     const merged: FlowSummary = {
-      ...(detail ?? {}),
+      ...(summary ?? {}),
       ...(liveFlow ?? {}),
       api_call_id: apiCallId,
       method: liveFlow?.method ?? 'POST',
       uri: liveFlow?.uri ?? '',
-      status: status ?? liveFlow?.status ?? detail?.status ?? 'open',
-      started_ms: liveFlow?.started_ms ?? detail?.started_ms ?? 0,
+      status: status ?? liveFlow?.status ?? summary?.status ?? 'open',
+      started_ms: liveFlow?.started_ms ?? summary?.started_ms ?? 0,
       // Roll-up precedence: server detail roll-up first, then the live row's own roll-up.
-      cost: detail?.cost ?? liveFlow?.cost ?? null,
+      cost: summary?.cost ?? liveFlow?.cost ?? null,
       // Freshest usage/model for the usage×price fallback: live row first, then detail.
-      usage: liveFlow?.usage ?? detail?.usage ?? null,
-      model_served: liveFlow?.model_served ?? detail?.model_served ?? null,
-      model_requested: liveFlow?.model_requested ?? detail?.model_requested ?? null,
+      usage: liveFlow?.usage ?? summary?.usage ?? null,
+      model_served: liveFlow?.model_served ?? summary?.model_served ?? null,
+      model_requested: liveFlow?.model_requested ?? summary?.model_requested ?? null,
     };
     return flowCost(merged, priceTable);
-  }, [liveFlow, detail, apiCallId, status, priceTable]);
+  }, [liveFlow, detail, apiCallId, status, priceTable, seeking]);
 
   return (
     <section className="flex min-h-0 w-[46%] min-w-[420px] flex-col border-l border-line bg-panel" data-testid="flow-detail" aria-label="flow detail">
@@ -188,7 +193,14 @@ function DetailHeader({
   const modelReq = flow?.model_requested ?? detail?.model_requested;
   const modelServed = flow?.model_served ?? detail?.model_served;
   const upstream = flow?.upstream_target ?? detail?.upstream_target ?? '—';
-  const elapsed = flow ? elapsedMs(flow, Date.now()) : detail?.elapsed_ms ?? null;
+  // Elapsed: live = `elapsedMs` (which ticks an OPEN flow against `now`). SEEK coherence
+  // (finding 3): a frozen cut must NOT read wall-clock `Date.now()` — that would leak time
+  // elapsed AFTER the seeked instant. While seeking we pass the frozen `started_ms` as `now`, so
+  // an open flow reads 0 (no live ticking) and a finished flow still derives `finished-started`
+  // from the frozen row. We also prefer the frozen row's roll-up over the live REST `detail`.
+  const elapsed = flow
+    ? elapsedMs(flow, seeking ? flow.started_ms : Date.now())
+    : (seeking ? null : detail?.elapsed_ms ?? null);
 
   return (
     <header className="flex shrink-0 flex-col gap-2 border-b border-line bg-panel-raised px-3 py-2">
@@ -201,7 +213,7 @@ function DetailHeader({
           </span>
         )}
         <div className="ml-auto flex items-center gap-2">
-          <KillControl isActive={isActive} mutationsEnabled={mutationsEnabled} killState={killState} onKill={onKill} />
+          <KillControl isActive={isActive} mutationsEnabled={mutationsEnabled} seeking={seeking} killState={killState} onKill={onKill} />
           <button
             type="button"
             onClick={onClose}
@@ -231,11 +243,13 @@ function DetailHeader({
 function KillControl({
   isActive,
   mutationsEnabled,
+  seeking,
   killState,
   onKill,
 }: {
   isActive: boolean;
   mutationsEnabled: boolean;
+  seeking: boolean;
   killState: KillState;
   onKill: () => void;
 }) {
@@ -249,13 +263,18 @@ function KillControl({
     return <span className="text-xs text-status-down" data-testid="kill-error" title={killState.message}>kill failed</span>;
   }
   if (!isActive) return null;
+  // Kill mutates LIVE state; a frozen historical cut must not be mutable (finding 2). While
+  // seeking we DISABLE the button — the optimistic `patchFlowStatus` would otherwise mutate the
+  // frozen store row and the POST would abort a flow the operator is only inspecting in the past.
+  const disabled = !mutationsEnabled || seeking || killState.phase === 'killing';
+  const title = seeking ? 'paused (time-travel)' : mutationsEnabled ? 'abort this flow' : 'mutations disabled';
   return (
     <Button
       variant="danger"
       onClick={onKill}
-      disabled={!mutationsEnabled || killState.phase === 'killing'}
+      disabled={disabled}
       data-testid="kill-button"
-      title={mutationsEnabled ? 'abort this flow' : 'mutations disabled'}
+      title={title}
     >
       {killState.phase === 'killing' ? 'killing…' : 'Kill'}
     </Button>

@@ -6,10 +6,11 @@
  *     (connection.ts finding 10). It seeds rows the store has not seen and stays the source of
  *     server-only fields (terminal_reason, cost roll-up) until a live frame supersedes them.
  *
- * The store wins on conflict (it carries the freshest status/usage). `flowOrder` defines
- * newest-on-top; query-only rows are appended after the live ones, sorted by `started_ms` desc
- * so the union stays newest-first. Filtering + the distinct model/upstream option lists are
- * derived here so the table and filter bar share one computation.
+ * The store wins on conflict (it carries the freshest status/usage). `flowOrder` defines the
+ * live-row identity, but the MERGED union is sorted GLOBALLY by `started_ms` descending so a
+ * newer REST-only row can never sort below an older live row (finding 4) — newest-on-top holds
+ * regardless of source. Filtering + the distinct model/upstream option lists are derived here so
+ * the table and filter bar share one computation.
  */
 import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
@@ -41,9 +42,9 @@ function mergeRows(
   const restById = new Map(queryFlows.map((f) => [f.api_call_id, f]));
   const seen = new Set<string>();
   const merged: FlowSummary[] = [];
-  // Live rows first, in store order (newest-prepended ⇒ already newest-first). The live row's
-  // status/usage WIN, but `cost`/`terminal_reason` fall back to the REST roll-up when the live
-  // frame lacks them — so a live update never blanks the server's cost/terminal_reason.
+  // Live rows first, in store order. The live row's status/usage WIN, but `cost`/`terminal_reason`
+  // fall back to the REST roll-up when the live frame lacks them — so a live update never blanks
+  // the server's cost/terminal_reason.
   for (const id of order) {
     const f = flows.get(id);
     if (f) {
@@ -51,9 +52,16 @@ function mergeRows(
       seen.add(id);
     }
   }
-  // REST-only rows the store has not seen yet, newest (by started_ms) first.
-  const extras = queryFlows.filter((f) => !seen.has(f.api_call_id)).sort((a, b) => b.started_ms - a.started_ms);
-  merged.push(...extras);
+  // REST-only rows the store has not seen yet.
+  for (const f of queryFlows) {
+    if (!seen.has(f.api_call_id)) merged.push(f);
+  }
+  // Sort the COMBINED union GLOBALLY by `started_ms` descending so newest-on-top holds across
+  // BOTH sources — a newer REST-only row must not sort below an older live row just because the
+  // live rows were emitted first (finding 4). Stable tiebreak keeps deterministic ordering for
+  // equal timestamps. (`flowOrder` already tracks live newest-prepended, so for an all-live list
+  // this preserves the existing order.)
+  merged.sort((a, b) => b.started_ms - a.started_ms);
   return merged;
 }
 

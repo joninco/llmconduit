@@ -46,8 +46,9 @@ describe('mergeDeltas — REST replay (base) + live (appended)', () => {
     expect(mergeDeltas(rest, live)).toEqual([seg('output', 'Hello'), seg('output', ' more')]);
   });
 
-  it('drops the live prefix that duplicates the replay head (no doubling)', () => {
-    // The live ring re-streams history then continues: the leading duplicate is skipped.
+  it('drops a live head that fully duplicates the replay (no doubling)', () => {
+    // The live ring re-streams the full history then continues: the whole replay is the seam
+    // overlap, so only the genuinely newer tail (C) is appended.
     const rest = [seg('output', 'A'), seg('output', 'B')];
     const live = [seg('output', 'A'), seg('output', 'B'), seg('output', 'C')];
     expect(mergeDeltas(rest, live)).toEqual([seg('output', 'A'), seg('output', 'B'), seg('output', 'C')]);
@@ -56,5 +57,37 @@ describe('mergeDeltas — REST replay (base) + live (appended)', () => {
   it('falls back cleanly when only one source has content', () => {
     expect(mergeDeltas([], [seg('output', 'live')])).toEqual([seg('output', 'live')]);
     expect(mergeDeltas([seg('output', 'rest')], [])).toEqual([seg('output', 'rest')]);
+  });
+
+  it('joins a PARTIAL seam overlap without duplicating the shared segment (finding 6)', () => {
+    // REST ends with B; the live ring starts at B (its retained tail) and continues to C. A
+    // prefix-only compare left B duplicated; the longest REST-suffix / live-prefix overlap removes
+    // exactly the shared B so the seam reads [A, B, C].
+    const rest = [seg('output', 'A'), seg('output', 'B')];
+    const live = [seg('output', 'B'), seg('output', 'C')];
+    expect(mergeDeltas(rest, live)).toEqual([seg('output', 'A'), seg('output', 'B'), seg('output', 'C')]);
+  });
+
+  it('removes a multi-segment seam overlap (live re-sends several tail segments)', () => {
+    const rest = [seg('output', 'A'), seg('output', 'B'), seg('output', 'C')];
+    const live = [seg('output', 'B'), seg('output', 'C'), seg('output', 'D')];
+    expect(mergeDeltas(rest, live)).toEqual([
+      seg('output', 'A'), seg('output', 'B'), seg('output', 'C'), seg('output', 'D'),
+    ]);
+  });
+
+  it('appends the whole live run when there is NO seam overlap', () => {
+    const rest = [seg('output', 'A')];
+    const live = [seg('output', 'B'), seg('output', 'C')];
+    expect(mergeDeltas(rest, live)).toEqual([seg('output', 'A'), seg('output', 'B'), seg('output', 'C')]);
+  });
+
+  it('does not treat a same-kind-but-different-text seam as an overlap', () => {
+    // Bx ≠ B: no real overlap, so nothing is dropped (kind matching alone must not collapse them).
+    const rest = [seg('output', 'A'), seg('output', 'B')];
+    const live = [seg('output', 'Bx'), seg('output', 'C')];
+    expect(mergeDeltas(rest, live)).toEqual([
+      seg('output', 'A'), seg('output', 'B'), seg('output', 'Bx'), seg('output', 'C'),
+    ]);
   });
 });

@@ -96,6 +96,42 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
   });
 });
 
+describe('useFlowRows — combined union is globally newest-on-top (finding 4)', () => {
+  beforeEach(() => resetWorld());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('sorts a newer REST-only row ABOVE an older live row (not just appended after)', async () => {
+    // The live store holds an OLDER flow; the REST list seeds a NEWER, store-unseen flow. Appending
+    // REST rows after live ones would sort the newer REST row BELOW the older live one — the global
+    // started_ms-desc sort must place the newer REST row on top.
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_rest_new', status: 'completed', started_ms: 1_700_000_500_000 })]);
+    seedFlows([makeFlow({ api_call_id: 'api_live_old', status: 'open', started_ms: 1_700_000_000_000 })]);
+
+    const { result } = renderRows();
+    await waitFor(() => expect(result.current.rows.some((r) => r.api_call_id === 'api_rest_new')).toBe(true));
+    const ids = result.current.rows.map((r) => r.api_call_id);
+    // Newer REST row is first; the older live row follows — newest-on-top across BOTH sources.
+    expect(ids).toEqual(['api_rest_new', 'api_live_old']);
+  });
+
+  it('orders multiple live rows by started_ms desc regardless of store insertion order', async () => {
+    // Two live rows whose store order is oldest-first; the global sort must still surface newest-on-top.
+    stubFlowsFetch([]);
+    seedFlows([
+      makeFlow({ api_call_id: 'api_a_old', status: 'completed', started_ms: 1_700_000_000_000 }),
+      makeFlow({ api_call_id: 'api_b_new', status: 'completed', started_ms: 1_700_000_900_000 }),
+    ]);
+    const { result } = renderRows();
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    const ids = result.current.rows.map((r) => r.api_call_id);
+    expect(ids).toEqual(['api_b_new', 'api_a_old']);
+  });
+});
+
 describe('useFlowRows — time-travel seek shows ONLY the frozen snapshot (finding 1)', () => {
   beforeEach(() => resetWorld());
   afterEach(() => {
