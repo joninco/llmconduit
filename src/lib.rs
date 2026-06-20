@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod cli;
 pub mod config;
 pub mod dashboard_flow;
+pub mod dashboard_ui;
 pub mod debug_ui;
 pub mod engine;
 pub mod error;

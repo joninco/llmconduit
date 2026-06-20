@@ -1568,6 +1568,97 @@ async fn serves_embedded_debug_web_ui_when_enabled() {
 }
 
 #[tokio::test]
+async fn dashboard_routes_are_disabled_by_default() {
+    let app = llmconduit::build_app(test_config());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // Gated behind `--with-debug-ui`; off → not registered → fallback 404.
+    assert_eq!(response.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn serves_embedded_dashboard_shell_when_enabled() {
+    let app = llmconduit::build_app_with_options(
+        test_config(),
+        llmconduit::AppOptions {
+            with_debug_ui: true,
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/html; charset=utf-8")
+    );
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body = String::from_utf8(body_bytes.to_vec()).expect("utf8 body");
+    // Default suite runs against the node-less stub embedded by build.rs; a real
+    // `LLMCONDUIT_BUILD_DASHBOARD=1` build embeds the SPA shell instead. Assert
+    // only the invariant shared by both: a non-empty HTML document.
+    assert!(body.to_ascii_lowercase().contains("<!doctype html"));
+    assert!(!body.is_empty());
+}
+
+#[tokio::test]
+async fn dashboard_asset_route_serves_present_asset_and_404s_missing() {
+    let app = llmconduit::build_app_with_options(
+        test_config(),
+        llmconduit::AppOptions {
+            with_debug_ui: true,
+        },
+    );
+
+    // A known asset embedded by the stub (`assets/stub.txt`); a real build embeds
+    // content-hashed assets whose names are unknowable here, so the stub provides
+    // this stable path purely so the asset route has a deterministic positive case.
+    let present = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/assets/stub.txt")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(present.status().as_u16(), 200);
+
+    // A path with no embedded asset must 404 (not fall through to the SPA shell).
+    let missing = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/assets/does-not-exist-9f8e7d.js")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(missing.status().as_u16(), 404);
+}
+
+#[tokio::test]
 async fn fallback_models_endpoint_filters_to_provider_model_override() {
     let primary = MockServer::start().await;
     let fallback = MockServer::start().await;

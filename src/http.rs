@@ -4,6 +4,8 @@ use crate::adapters::chat_completions::ChatCompletionCollector;
 use crate::adapters::chat_completions::ChatCompletionStreamConverter;
 use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
+use crate::dashboard_ui::dashboard_asset;
+use crate::dashboard_ui::dashboard_index;
 use crate::debug_ui::debug_index;
 use crate::debug_ui::debug_ws;
 use crate::engine::Gateway;
@@ -76,6 +78,11 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         router
             .route("/debug", get(debug_index))
             .route("/debug/ws", get(debug_ws))
+            // D8 dashboard SPA: shell + embedded static assets, gated by the same
+            // `--with-debug-ui` flag (off → not registered). D7 wraps these with
+            // auth/CSP later. `{*path}` captures the asset path under `assets/`.
+            .route("/dashboard", get(dashboard_index))
+            .route("/dashboard/assets/{*path}", get(dashboard_asset))
     } else {
         router
     };
