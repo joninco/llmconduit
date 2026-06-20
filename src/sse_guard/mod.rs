@@ -68,6 +68,13 @@ pub(crate) struct SseFrameGuard {
     /// ambiguous) instead of a boundary-prefix. Cleared the moment a non-EOL byte
     /// (real frame content) ends the run.
     in_eol_run: bool,
+    /// High-water mark of the bytes this guard has ever OWNED in its deferred carry
+    /// across all `accept`/`finish` calls. After T5 the scan borrows each chunk and
+    /// the only buffer the guard owns is the carry (`<=3` bytes), so this stays
+    /// tiny no matter how large a single oversized chunk is — the test seam that
+    /// proves the guard never materializes an O(chunk) buffer.
+    #[cfg(test)]
+    peak_owned_carry_bytes: usize,
 }
 
 impl SseFrameGuard {
@@ -88,6 +95,8 @@ impl SseFrameGuard {
             since_boundary: 0,
             carry: Vec::new(),
             in_eol_run: true,
+            #[cfg(test)]
+            peak_owned_carry_bytes: 0,
         }
     }
 
@@ -97,6 +106,14 @@ impl SseFrameGuard {
     #[cfg(test)]
     pub(crate) fn max_frame_bytes(&self) -> usize {
         self.max_frame_bytes
+    }
+
+    /// High-water mark of bytes this guard has ever owned in its deferred carry.
+    /// Test seam for the T5 guarantee that an oversized chunk is rejected without
+    /// the guard materializing an O(chunk) buffer (the carry stays `<=3` bytes).
+    #[cfg(test)]
+    pub(crate) fn peak_owned_carry_bytes(&self) -> usize {
+        self.peak_owned_carry_bytes
     }
 
     /// Account for one incoming chunk. Returns `Err` the moment ANY single SSE
@@ -154,6 +171,13 @@ impl SseFrameGuard {
         self.since_boundary = since_boundary;
         self.carry = carry;
         self.in_eol_run = in_eol_run;
+        // The scan borrowed the chunk; the only buffer the guard now owns is the
+        // deferred carry. Record its high-water mark so a test can prove it stays
+        // bounded (<=3 bytes) regardless of how large a chunk we just scanned.
+        #[cfg(test)]
+        {
+            self.peak_owned_carry_bytes = self.peak_owned_carry_bytes.max(self.carry.len());
+        }
         Ok(())
     }
 }
@@ -192,20 +216,23 @@ impl SseFrameGuard {
 /// travels the transport-error channel as an `std::io::Error` whose message is the
 /// `AppError`'s, which `stream_success_response` re-wraps — output is never
 /// silently truncated.
-pub(crate) fn bounded_sse_byte_stream<S, B>(
+pub(crate) fn bounded_sse_byte_stream<S>(
     stream: S,
     max_frame_bytes: usize,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>>
 where
-    S: Stream<Item = Result<B, reqwest::Error>>,
-    B: AsRef<[u8]>,
+    S: Stream<Item = Result<Bytes, reqwest::Error>>,
 {
     async_stream::stream! {
         let mut guard = SseFrameGuard::new(max_frame_bytes);
         let mut stream = std::pin::pin!(stream);
         while let Some(result) = stream.next().await {
             let bytes = match result {
-                Ok(bytes) => Bytes::copy_from_slice(bytes.as_ref()),
+                // `reqwest::Response::bytes_stream()` already yields `Bytes`, so we
+                // take ownership directly — no `copy_from_slice` (T5). The guard
+                // scans the BORROWED bytes below; the SAME ref-counted `Bytes` is
+                // then handed downstream, so no chunk-sized buffer is ever copied.
+                Ok(bytes) => bytes,
                 Err(err) => {
                     yield Err(std::io::Error::other(format!(
                         "failed to read upstream SSE bytes: {err}"
@@ -214,7 +241,9 @@ where
                 }
             };
             // Reject BEFORE forwarding so the parser never sees the over-cap bytes.
-            if let Err(err) = guard.accept(bytes.as_ref()) {
+            // The cap is enforced against the borrowed slice, before the chunk is
+            // forwarded — an oversized frame is rejected without copying it.
+            if let Err(err) = guard.accept(&bytes) {
                 yield Err(std::io::Error::other(err.to_string()));
                 return;
             }
@@ -246,9 +275,113 @@ enum EolToken {
     None,
 }
 
-fn eol_token_at(buf: &[u8], i: usize, at_eof: bool) -> EolToken {
-    match buf.get(i) {
-        Some(b'\r') => match buf.get(i + 1) {
+/// A read-only, index-addressable byte sequence the SSE scanner walks one byte at
+/// a time. The point of the abstraction is that the production scan never needs
+/// the bytes contiguous: it can read across the seam of the tiny deferred carry
+/// and the BORROWED upstream chunk without copying the chunk into a guard-owned
+/// buffer (T5). A plain `&[u8]` is the trivial impl, so the white-box tests pass
+/// byte literals unchanged; [`JoinedBuf`] is the carry-plus-chunk view used in
+/// production.
+trait ByteSource {
+    /// Total logical length in bytes.
+    fn len(&self) -> usize;
+
+    /// The byte at `i`, or `None` if `i >= len()`. Returns the value (not a
+    /// reference) so a non-contiguous source can synthesize it.
+    fn byte(&self, i: usize) -> Option<u8>;
+
+    /// Materialize the suffix `[from, len())` into an owned `Vec`. In the scanner
+    /// this is only ever called for the freshly-deferred boundary-prefix carry,
+    /// which is provably <=3 bytes, so it never copies a chunk-sized buffer.
+    fn collect_from(&self, from: usize) -> Vec<u8> {
+        let n = self.len();
+        let mut out = Vec::with_capacity(n.saturating_sub(from));
+        let mut i = from;
+        while i < n {
+            out.push(self.byte(i).expect("index within len() is always present"));
+            i += 1;
+        }
+        out
+    }
+}
+
+impl ByteSource for [u8] {
+    fn len(&self) -> usize {
+        <[u8]>::len(self)
+    }
+
+    fn byte(&self, i: usize) -> Option<u8> {
+        self.get(i).copied()
+    }
+
+    fn collect_from(&self, from: usize) -> Vec<u8> {
+        self[from..].to_vec()
+    }
+}
+
+/// So the white-box scanner tests can pass byte-string literals (`b"\r\n"`, i.e.
+/// `&[u8; N]`) straight to the generic helpers without an `.as_slice()` dance.
+impl<const N: usize> ByteSource for [u8; N] {
+    fn len(&self) -> usize {
+        N
+    }
+
+    fn byte(&self, i: usize) -> Option<u8> {
+        self.get(i).copied()
+    }
+
+    fn collect_from(&self, from: usize) -> Vec<u8> {
+        self[from..].to_vec()
+    }
+}
+
+/// A non-owning view over the logical concatenation `head ++ tail`, where `head`
+/// is the tiny (<=3-byte) deferred boundary-prefix carry and `tail` is the
+/// BORROWED upstream chunk. Indexing maps into `head` then `tail`; nothing is
+/// copied. This is what lets the guard cap an oversized frame while only ever
+/// owning the carry, never an O(chunk) buffer.
+struct JoinedBuf<'a> {
+    head: &'a [u8],
+    tail: &'a [u8],
+}
+
+impl<'a> JoinedBuf<'a> {
+    /// A view of the logical suffix `[from, len())`, trimming `head`/`tail` so the
+    /// result still borrows the same underlying slices (no allocation). Used to
+    /// examine the post-final-boundary trailing segment without slicing a
+    /// contiguous buffer.
+    fn suffix(&self, from: usize) -> JoinedBuf<'a> {
+        if from <= self.head.len() {
+            JoinedBuf {
+                head: &self.head[from..],
+                tail: self.tail,
+            }
+        } else {
+            JoinedBuf {
+                head: &[],
+                tail: &self.tail[from - self.head.len()..],
+            }
+        }
+    }
+}
+
+impl ByteSource for JoinedBuf<'_> {
+    fn len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
+
+    fn byte(&self, i: usize) -> Option<u8> {
+        if i < self.head.len() {
+            Some(self.head[i])
+        } else {
+            self.tail.get(i - self.head.len()).copied()
+        }
+    }
+}
+
+fn eol_token_at(buf: &(impl ByteSource + ?Sized), i: usize, at_eof: bool) -> EolToken {
+    match buf.byte(i) {
+        Some(b'\r') => match buf.byte(i + 1) {
             Some(b'\n') => EolToken::Complete(2),    // CRLF, greedy.
             Some(_) => EolToken::Complete(1),        // lone CR proven by a following byte.
             None if at_eof => EolToken::Complete(1), // no more bytes: CR resolves to CR.
@@ -282,7 +415,7 @@ struct ScanState {
 ///
 /// Every byte consumed here is an empty-line EOL that belongs to NO data frame, so
 /// the caller charges none of them.
-fn eol_run_end(buf: &[u8], from: usize, at_eof: bool) -> (usize, EolRunStop) {
+fn eol_run_end(buf: &(impl ByteSource + ?Sized), from: usize, at_eof: bool) -> (usize, EolRunStop) {
     let mut i = from;
     loop {
         match eol_token_at(buf, i, at_eof) {
@@ -315,9 +448,10 @@ enum EolRunStop {
 /// `\r\r` (2); `\n\r\n`, `\r\n\n`, `\r\n\r`, `\r\r\n` (3); `\r\n\r\n` (4) — every
 /// mixed combo must be recognized, not just `\n\n`/`\r\r`/`\r\n\r\n`.
 ///
-/// `carry` is the tail DEFERRED by the previous call (uncharged). We rebuild
-/// `buf = carry + chunk` so a boundary straddling the chunk edge is detected, then
-/// walk it boundary by boundary:
+/// `carry` is the tail DEFERRED by the previous call (uncharged). We walk the
+/// logical concatenation `carry ++ chunk` via a non-owning [`JoinedBuf`] view (the
+/// chunk is borrowed, never copied — T5) so a boundary straddling the chunk edge
+/// is detected, then walk it boundary by boundary:
 ///   * For each completed boundary, the bytes of `buf` since the current frame
 ///     started are now CONFIRMED frame bytes (a boundary follows them): charge
 ///     them to `since_boundary` and check the cap, then reset `since_boundary` to
@@ -361,12 +495,17 @@ fn scan_frames_since_boundary(
         in_eol_run,
     } = state;
     debug_assert!(
-        carry.len() <= 3 && boundary_prefix_suffix_len(&carry) == carry.len(),
+        carry.len() <= 3 && boundary_prefix_suffix_len(carry.as_slice()) == carry.len(),
         "carry must be a pure boundary prefix of <=3 bytes"
     );
-    let mut buf = Vec::with_capacity(carry.len() + chunk.len());
-    buf.extend_from_slice(&carry);
-    buf.extend_from_slice(chunk);
+    // The scan walks the logical concatenation `carry ++ chunk` WITHOUT copying the
+    // chunk: `carry` is the tiny (<=3-byte) deferred prefix, `chunk` is borrowed
+    // (T5). An oversized frame is therefore cap-rejected while the guard only ever
+    // owns the carry, never an O(chunk) buffer.
+    let buf = JoinedBuf {
+        head: &carry,
+        tail: chunk,
+    };
 
     // `seg_start` is the `buf` index where the current in-progress frame begins;
     // `scan` is how far we have searched for the next boundary.
@@ -381,7 +520,7 @@ fn scan_frames_since_boundary(
             (end, EolRunStop::IncompleteCr) => {
                 // Still mid-run: defer the trailing lone `\r` (another empty-line
                 // EOL whose CR/CRLF nature is unresolved) and stay in the run.
-                let new_carry = buf[end..].to_vec();
+                let new_carry = buf.collect_from(end);
                 debug_assert!(new_carry.len() <= 1, "in-run carry is a lone CR");
                 return Ok(ScanState {
                     since_boundary: 0,
@@ -432,7 +571,7 @@ fn scan_frames_since_boundary(
         since_boundary = 0;
         match eol_run_end(&buf, be, at_eof) {
             (end, EolRunStop::IncompleteCr) => {
-                let new_carry = buf[end..].to_vec();
+                let new_carry = buf.collect_from(end);
                 debug_assert!(new_carry.len() <= 1, "in-run carry is a lone CR");
                 return Ok(ScanState {
                     since_boundary: 0,
@@ -458,18 +597,21 @@ fn scan_frames_since_boundary(
     // buffer if there was none). Mid-stream we defer its boundary-prefix suffix
     // uncharged and charge the rest; at EOF nothing more can arrive to complete a
     // boundary, so the whole segment is charged as part of the unterminated frame.
-    let tail = &buf[seg_start..];
+    // `tail` is a non-owning view of `[seg_start, len)` over the carry+chunk seam;
+    // only its length and last <=3 bytes are read, and the new carry it yields is
+    // <=3 bytes — so the (possibly huge) trailing segment is never materialized.
+    let tail = buf.suffix(seg_start);
     let defer = if at_eof {
         0
     } else {
-        boundary_prefix_suffix_len(tail)
+        boundary_prefix_suffix_len(&tail)
     };
     let charged = tail.len() - defer;
     since_boundary = since_boundary.saturating_add(charged);
     if since_boundary > cap {
         return Err(since_boundary);
     }
-    let new_carry = tail[charged..].to_vec();
+    let new_carry = tail.collect_from(charged);
     debug_assert!(new_carry.len() <= 3, "deferred carry must stay <=3 bytes");
     Ok(ScanState {
         since_boundary,
@@ -496,23 +638,30 @@ fn scan_frames_since_boundary(
 /// could still extend the separator — deferring them keeps the byte verdict
 /// chunking-independent; they are resolved (as complete boundaries that reset, or
 /// as charged frame bytes) on the next chunk or at EOF.
-fn boundary_prefix_suffix_len(buf: &[u8]) -> usize {
+fn boundary_prefix_suffix_len(buf: &(impl ByteSource + ?Sized)) -> usize {
     let n = buf.len();
     // 3-byte prefix `\r\n\r` of `\r\n\r\n`.
-    if n >= 3 && &buf[n - 3..] == b"\r\n\r" {
+    if n >= 3
+        && buf.byte(n - 3) == Some(b'\r')
+        && buf.byte(n - 2) == Some(b'\n')
+        && buf.byte(n - 1) == Some(b'\r')
+    {
         return 3;
     }
     // 2-byte ambiguous/partial prefixes: one EOL plus a pending CR, or a partial
     // CRLF, that could still complete or extend a boundary on the next chunk.
     if n >= 2 {
-        let last2 = &buf[n - 2..];
-        if last2 == b"\r\n" || last2 == b"\n\r" || last2 == b"\r\r" {
+        let last2 = (buf.byte(n - 2), buf.byte(n - 1));
+        if last2 == (Some(b'\r'), Some(b'\n'))
+            || last2 == (Some(b'\n'), Some(b'\r'))
+            || last2 == (Some(b'\r'), Some(b'\r'))
+        {
             return 2;
         }
     }
     // 1-byte prefix: a lone trailing `\r` (start of `\r\r`/`\r\n...`) or `\n`
     // (start of `\n\n`/`\n\r`).
-    if n >= 1 && (buf[n - 1] == b'\r' || buf[n - 1] == b'\n') {
+    if n >= 1 && (buf.byte(n - 1) == Some(b'\r') || buf.byte(n - 1) == Some(b'\n')) {
         return 1;
     }
     0
@@ -525,7 +674,11 @@ fn boundary_prefix_suffix_len(buf: &[u8]) -> usize {
 /// the separator itself are never charged to either adjacent frame). A trailing
 /// lone CR that cannot yet be disambiguated (`!at_eof`) does not complete a
 /// boundary — it is deferred into the carry instead.
-fn next_boundary(buf: &[u8], from: usize, at_eof: bool) -> Option<(usize, usize)> {
+fn next_boundary(
+    buf: &(impl ByteSource + ?Sized),
+    from: usize,
+    at_eof: bool,
+) -> Option<(usize, usize)> {
     let n = buf.len();
     let mut i = from;
     while i < n {

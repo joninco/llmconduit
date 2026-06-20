@@ -276,6 +276,71 @@ async fn bounded_stream_passes_normal_then_errors_on_oversized() {
 }
 
 // --------------------------------------------------------------------------
+// T5: cap before copy. The guard scans each chunk BORROWED and retains only the
+// <=3-byte deferred carry, so an oversized frame is rejected without the guard
+// ever materializing an O(chunk) buffer. `peak_owned_carry_bytes()` is the
+// high-water mark of bytes the guard has owned across all calls; it must stay
+// tiny no matter how large a single chunk is.
+// --------------------------------------------------------------------------
+
+/// A single oversized UNTERMINATED chunk far larger than the cap is rejected, and
+/// the guard never owns more than the <=3-byte carry while doing so — it does not
+/// copy the chunk into a guard-owned buffer before enforcing the cap. A 16 MiB
+/// chunk against a 1 MiB cap: if the guard still materialized the chunk (the
+/// pre-T5 `copy_from_slice` + `buf = carry ++ chunk`), `peak_owned_carry_bytes`
+/// would be ~16 MiB, not <=3.
+#[test]
+fn oversized_chunk_is_rejected_without_owning_a_full_copy() {
+    let cap = 1024 * 1024; // 1 MiB, well above the 1 KiB floor.
+    let mut guard = SseFrameGuard::new(cap);
+
+    // 16 MiB with no event boundary: a single hostile frame 16x the cap.
+    let hostile = vec![b'x'; 16 * 1024 * 1024];
+    let err = guard
+        .accept(&hostile)
+        .expect_err("a 16 MiB unterminated frame must be rejected at the cap");
+    assert!(err.to_string().contains("exceeded"), "got: {err}");
+
+    // The guard borrowed the chunk; the only buffer it owned is the carry.
+    assert!(
+        guard.peak_owned_carry_bytes() <= 3,
+        "guard owned {} bytes rejecting a 16 MiB chunk; it must not copy the chunk \
+         (carry is <=3 bytes)",
+        guard.peak_owned_carry_bytes()
+    );
+}
+
+/// Many large but UNDER-cap, well-formed chunks are all accepted, and the guard's
+/// owned cross-chunk state stays bounded by the <=3-byte carry the whole time —
+/// independent of chunk size. This pins the "retain only the carry" half of T5:
+/// the guard does not accumulate a per-chunk owned buffer between `accept` calls.
+#[test]
+fn large_under_cap_chunks_keep_owned_bytes_bounded() {
+    let cap = 4 * 1024 * 1024; // 4 MiB cap.
+    let mut guard = SseFrameGuard::new(cap);
+
+    // Each frame is ~1 MiB of content terminated by a boundary that is dribbled
+    // out so a deferred carry is exercised every iteration, then a fresh ~1 MiB
+    // frame — far more total bytes than the cap, but each frame is under it.
+    let body = vec![b'd'; 1024 * 1024];
+    for _ in 0..8 {
+        guard.accept(&body).expect("1 MiB frame under cap");
+        // Boundary `\r\n\r\n` split so the guard holds a multi-byte prefix carry.
+        guard.accept(b"\r").expect("carry byte");
+        guard.accept(b"\n").expect("carry byte");
+        guard.accept(b"\r\n").expect("boundary completes; resets");
+    }
+    guard.finish().expect("clean end");
+
+    assert!(
+        guard.peak_owned_carry_bytes() <= 3,
+        "guard owned {} bytes across 8x1 MiB frames; cross-chunk owned state must \
+         stay bounded by the <=3-byte carry regardless of chunk size",
+        guard.peak_owned_carry_bytes()
+    );
+}
+
+// --------------------------------------------------------------------------
 // Pure guard behavior (claude-relay test_sse.py parity)
 // --------------------------------------------------------------------------
 
