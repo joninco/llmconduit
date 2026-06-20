@@ -371,12 +371,24 @@ async fn image_agent_cancellation_drops_vision_work() {
 
     let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
     let mut stream = gateway.stream_responses(request).await.expect("stream");
-    // Drain the prologue then drop the stream while vision is blocked.
+    // Capture both `notified()` futures UP FRONT — before the actions that fire
+    // them — because `notify_waiters()` stores no permit and a future created
+    // after its trigger would miss the wake and hang to the 1s timeout.
+    let entered = vision.entered();
+    let dropped = vision.dropped();
+    // Drain the prologue, then await the vision future actually starting (its
+    // request already recorded) before dropping the stream.
     let _ = stream.next().await;
     let _ = stream.next().await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered)
+        .await
+        .expect("vision analyze should have been entered");
     drop(stream);
-    // Give the spawned task a moment to observe the closed channel.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Await the spawned turn reacting to the closed channel: the blocked vision
+    // future is dropped, firing the drop-guard signal. No wall-clock sleep.
+    tokio::time::timeout(std::time::Duration::from_secs(1), dropped)
+        .await
+        .expect("vision work should be dropped after client disconnect");
     // Vision was entered but the turn was cancelled; no panic / hang.
     assert_eq!(vision.requests().await.len(), 1);
 }
@@ -1625,14 +1637,23 @@ async fn upstream_request_log_redacts_image_data_when_agent_disabled() {
     let _ = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
         .await
         .expect("body");
-    // Give the spawn_blocking log writer a moment to flush.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    let mut contents = String::new();
-    std::fs::File::open(&log_path)
-        .expect("open log")
-        .read_to_string(&mut contents)
-        .expect("read log");
+    // Await the spawn_blocking JSONL writer flushing via a bounded poll, so a
+    // real regression fails fast instead of relying on elapsed real time.
+    let contents = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let mut contents = String::new();
+            if std::fs::File::open(&log_path)
+                .and_then(|mut f| f.read_to_string(&mut contents))
+                .is_ok()
+                && !contents.is_empty()
+            {
+                break contents;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upstream JSONL log should become non-empty");
     let _ = std::fs::remove_dir_all(&log_dir);
     assert!(!contents.is_empty(), "log should have an entry");
     assert!(

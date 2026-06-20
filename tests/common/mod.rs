@@ -306,6 +306,14 @@ pub struct MockVisionClient {
     /// When set, `analyze` waits on this notify before returning, so a test can
     /// drive cancellation/timeout deterministically.
     block_until: Arc<Mutex<Option<Arc<Notify>>>>,
+    /// Fired at the top of `analyze` once the request has been recorded, so a
+    /// test can await the vision future actually starting (and `requests()`
+    /// already observing the call) before it drops the stream.
+    entered: Arc<Notify>,
+    /// Fired from a drop guard inside `analyze`, so a test can await the spawned
+    /// turn reacting to cancellation (the future is dropped at its blocked await
+    /// point) instead of guessing with a wall-clock sleep.
+    dropped: Arc<Notify>,
 }
 
 impl MockVisionClient {
@@ -323,6 +331,33 @@ impl MockVisionClient {
     pub async fn block_on(&self, notify: Arc<Notify>) {
         *self.block_until.lock().await = Some(notify);
     }
+
+    /// `notified()` future for "analyze entered" (request already recorded).
+    /// Capture this BEFORE the action that triggers `analyze` so the wake is not
+    /// missed (`notify_waiters()` stores no permit).
+    pub fn entered(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.entered.notified()
+    }
+
+    /// `notified()` future for "analyze future dropped" (cancellation path).
+    /// Capture this BEFORE dropping the stream so the wake is not missed.
+    pub fn dropped(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.dropped.notified()
+    }
+}
+
+/// RAII guard that signals when the `analyze` future is dropped at its blocked
+/// await point, mirroring `NotifyOnDrop` in `tests/gateway.rs`. Because the
+/// future stays blocked in the cancellation test, this fires only on the
+/// drop/cancel path, so there is no need to disarm it on normal return.
+struct NotifyOnDrop {
+    notify: Arc<Notify>,
+}
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.notify.notify_waiters();
+    }
 }
 
 #[async_trait]
@@ -332,6 +367,13 @@ impl llmconduit::vision::VisionClient for MockVisionClient {
         request: &llmconduit::vision::VisionRequest,
     ) -> Result<llmconduit::vision::VisionOutcome, llmconduit::error::AppError> {
         self.requests.lock().await.push(request.clone());
+        // Signal "analyze entered" only after the request is recorded, so a test
+        // awaiting `entered()` is guaranteed that `requests()` already sees it.
+        self.entered.notify_waiters();
+        // Fire `dropped` if this future is cancelled (dropped) while blocked.
+        let _drop_guard = NotifyOnDrop {
+            notify: Arc::clone(&self.dropped),
+        };
         let blocker = self.block_until.lock().await.clone();
         if let Some(notify) = blocker {
             notify.notified().await;
