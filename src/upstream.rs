@@ -18,6 +18,7 @@ use http::HeaderName;
 use regex::Regex;
 use reqwest::RequestBuilder;
 use reqwest::StatusCode;
+use serde::Serialize;
 use serde_json::Map as JsonMap;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -29,10 +30,210 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex as AsyncMutex;
 use url::Url;
+
+/// Consecutive-failure count at or above which a cooling provider is reported
+/// `Down` (vs. transiently `Cooling`). A provider that has failed this many
+/// times in a row AND is still inside its cooldown window is shown as hard-down
+/// in the topology map; a single transient failure stays `Cooling`.
+const DOWN_THRESHOLD: u32 = 3;
+
+/// Wall-clock epoch-ms, for the serializable [`ProviderHealth`] timestamps. The
+/// upstream cooldown bookkeeping uses a monotonic [`Instant`] (immune to clock
+/// jumps); health DTOs convert a deadline to epoch-ms only at read time.
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Convert a future monotonic `Instant` deadline to an epoch-ms wall-clock value
+/// for serialization, by measuring how far in the future it is from `now` and
+/// adding that to the current epoch-ms. A deadline already in the past yields the
+/// current epoch-ms (the cooldown is effectively over). `None` ⇒ no cooldown.
+fn instant_deadline_to_epoch_ms(deadline: Option<Instant>) -> Option<u64> {
+    let deadline = deadline?;
+    let now = Instant::now();
+    let remaining = deadline.saturating_duration_since(now);
+    Some(now_epoch_ms().saturating_add(remaining.as_millis() as u64))
+}
+
+/// Per-provider serving status for the topology map (D4). `Cooling` while inside
+/// the failure cooldown window; `Down` once a cooling provider has also crossed
+/// [`DOWN_THRESHOLD`] consecutive failures; `Healthy` otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderStatus {
+    Healthy,
+    Cooling,
+    Down,
+}
+
+/// Owned, serializable per-upstream health + counters for the dashboard topology
+/// map (D4). Epoch-ms timestamps (never a monotonic `Instant`), so the DTO is
+/// self-contained across the WS/REST boundary. Every field serializes
+/// UNCONDITIONALLY (no `skip_serializing_if`) so the `Option` keys are always
+/// present as JSON `null` — the frontend D9/D10/D12 model validates this exact
+/// shape. `base_url` is REQUIRED (non-null).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderHealth {
+    /// Stable identifier for the provider (the configured provider/route name).
+    pub id: String,
+    /// Human-readable provider name (currently identical to `id`).
+    pub name: String,
+    /// The routing-provider name that owns this entry, when it is reached via a
+    /// `RoutingUpstreamClient` (`None` for a bare/failover provider).
+    pub route: Option<String>,
+    /// The upstream base URL this provider POSTs to (REQUIRED, never null).
+    pub base_url: String,
+    pub status: ProviderStatus,
+    /// Epoch-ms instant the cooldown window ends, when cooling (else `None`).
+    pub cooling_until_ms: Option<u64>,
+    /// The most recent failure message recorded for this provider (else `None`).
+    pub last_error: Option<String>,
+    /// Cumulative count of flows this provider served (produced a first chunk).
+    pub served_count: u64,
+    /// Cumulative count of times this provider was failed over FROM (a recorded
+    /// `mark_failure`).
+    pub failover_count: u64,
+    /// Consecutive failures since the last success (reset to 0 on success).
+    pub consecutive_failures: u32,
+    /// Epoch-ms instant this provider's `/v1/models` catalog was last fetched
+    /// (`None` until the first refresh; only the routing client populates it).
+    pub catalog_fetched_ms: Option<u64>,
+    /// Number of models in this provider's last catalog snapshot (`None` until
+    /// the first refresh; only the routing client populates it).
+    pub catalog_size: Option<u64>,
+}
+
+/// Cumulative per-provider serving counters held behind an `Arc` so the owning
+/// upstream struct keeps its derived `Clone` (a bare atomic field would not be
+/// `Clone`). `served_count` / `failover_count` are monotonic totals;
+/// `consecutive_failures` is reset to 0 at `mark_provider_success` and bumped at
+/// `mark_failure`. All three are plain atomics (lock-free reads for the snapshot).
+#[derive(Debug, Default)]
+pub struct ProviderMetrics {
+    served_count: AtomicU64,
+    failover_count: AtomicU64,
+    consecutive_failures: AtomicU32,
+}
+
+impl ProviderMetrics {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Record a served flow (first chunk produced) and clear the consecutive-
+    /// failure streak — the provider is healthy again. Mirrors the cooldown
+    /// clear in `mark_provider_success`.
+    fn record_success(&self) {
+        self.served_count.fetch_add(1, Ordering::Relaxed);
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a failover-away and bump the consecutive-failure streak.
+    fn record_failure(&self) {
+        self.failover_count.fetch_add(1, Ordering::Relaxed);
+        self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn served_count(&self) -> u64 {
+        self.served_count.load(Ordering::Relaxed)
+    }
+
+    fn failover_count(&self) -> u64 {
+        self.failover_count.load(Ordering::Relaxed)
+    }
+
+    fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures.load(Ordering::Relaxed)
+    }
+}
+
+/// Immutable `(fetched_ms, size)` catalog metadata pair, swapped as a single
+/// `Arc` inside `refresh_catalog` (under the existing `AsyncMutex` hold) so a
+/// lock-free `provider_health()` reader can NEVER observe a torn pair — the two
+/// fields always move together. `None`-valued `Arc` is the pre-first-refresh
+/// state (the default `CatalogMeta { fetched_ms: None, size: None }`).
+#[derive(Debug, Clone, Copy, Default)]
+struct CatalogMeta {
+    fetched_ms: Option<u64>,
+    size: Option<u64>,
+}
+
+/// A versioned, immutable container for the published per-provider health vector
+/// (D4). The `version` monotonically increments on each publication so a consumer
+/// (D5's 5 s snapshot cut, D7b's `TopologyUpdate` broadcast) can cheaply detect a
+/// change. Published on a coalesced 1 s tick AND a cooldown-deadline wake (so an
+/// IDLE cooling→Healthy transition flips with no traffic); the atomics underneath
+/// update continuously, and the snapshot reads them at publication time.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderHealthSnapshot {
+    pub version: u64,
+    pub providers: Vec<ProviderHealth>,
+}
+
+impl ProviderHealthSnapshot {
+    fn new(version: u64, providers: Vec<ProviderHealth>) -> Arc<Self> {
+        Arc::new(Self { version, providers })
+    }
+}
+
+/// The published-snapshot handle the publisher writes and consumers read (D4). A
+/// `Mutex<Arc<…>>` gives an atomic `Arc` swap on write and a cheap `Arc` clone on
+/// read (no `arc-swap` dependency); the held snapshot is immutable, so a reader's
+/// clone is never mutated underneath it. The `version` counter lives here so each
+/// publication bumps it monotonically. Cloning the publisher shares the inner
+/// `Arc` (cheap), keeping the owning Gateway `Clone`.
+#[derive(Clone)]
+pub struct ProviderHealthPublisher {
+    inner: Arc<Mutex<Arc<ProviderHealthSnapshot>>>,
+    version: Arc<AtomicU64>,
+}
+
+impl Default for ProviderHealthPublisher {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ProviderHealthSnapshot::new(0, Vec::new()))),
+            version: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl ProviderHealthPublisher {
+    /// Publish a fresh health vector as the next versioned snapshot. Bumps the
+    /// monotonic version, builds an immutable `Arc<ProviderHealthSnapshot>`, and
+    /// atomically swaps it in. Called by the coalesced 1 s publication tick and
+    /// the cooldown-deadline wake.
+    pub fn publish(&self, providers: Vec<ProviderHealth>) {
+        let version = self.version.fetch_add(1, Ordering::Relaxed) + 1;
+        let snapshot = ProviderHealthSnapshot::new(version, providers);
+        *self
+            .inner
+            .lock()
+            .expect("provider health publisher poisoned") = snapshot;
+    }
+
+    /// The latest published snapshot (a cheap `Arc` clone). The D5 snapshot task
+    /// captures exactly this one `Arc`; D7b broadcasts it as a `TopologyUpdate`.
+    pub fn latest(&self) -> Arc<ProviderHealthSnapshot> {
+        Arc::clone(
+            &self
+                .inner
+                .lock()
+                .expect("provider health publisher poisoned"),
+        )
+    }
+}
 
 pub type UpstreamStream =
     Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk, AppError>> + Send + 'static>>;
@@ -156,6 +357,19 @@ pub trait UpstreamClient: Send + Sync {
             }],
         }
     }
+
+    /// Per-upstream health + cumulative counters for the dashboard topology map
+    /// (D4). A NON-async, dyn-safe default (mirrors `supported_model_catalog`'s
+    /// default so `Arc<dyn UpstreamClient>` stays object-safe): the bare leaf and
+    /// any client that owns no provider metrics return an EMPTY vector; the
+    /// failover/routing clients override to report their providers' live status,
+    /// cumulative counters, cooldown deadline, and (routing) catalog metadata.
+    /// Reads are lock-free over the per-provider `Arc<ProviderMetrics>` /
+    /// `Arc<CatalogMeta>` plus a short cooldown-state `Mutex` hold; safe to call
+    /// from a synchronous publication tick.
+    fn provider_health(&self) -> Vec<ProviderHealth> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +418,11 @@ pub struct FailoverUpstreamProvider {
     upstream_model: Option<String>,
     exposed_model: Option<String>,
     upstream_chat_kwargs: JsonMap<String, Value>,
+    /// D4 cumulative serving counters. Behind an `Arc` so this struct keeps its
+    /// derived `Clone` (a bare atomic field would not be `Clone`) and so the
+    /// same counters survive the routing/failover REBUILD that clones the
+    /// provider (the rebuild clones the `Arc`, not the counters).
+    metrics: Arc<ProviderMetrics>,
 }
 
 impl FailoverUpstreamProvider {
@@ -220,6 +439,7 @@ impl FailoverUpstreamProvider {
             upstream_model,
             exposed_model,
             upstream_chat_kwargs,
+            metrics: ProviderMetrics::new(),
         }
     }
 }
@@ -363,6 +583,13 @@ pub struct RoutingUpstreamClient {
     route_providers: Vec<RouteUpstreamProvider>,
     routes: Vec<ModelRouteSpec>,
     catalog: Arc<AsyncMutex<Option<CachedRoutingModelCatalog>>>,
+    /// D4 catalog metadata `(fetched_ms, size)` published for the topology map.
+    /// Swapped as a SINGLE immutable `Arc<CatalogMeta>` inside `refresh_catalog`
+    /// (under the `catalog` `AsyncMutex` hold) so a lock-free `provider_health()`
+    /// reader can never observe a torn `(fetched_ms, size)` pair — the two fields
+    /// always move together. Default `Arc<CatalogMeta>` (both `None`) until the
+    /// first refresh.
+    catalog_meta: Arc<Mutex<Arc<CatalogMeta>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -592,6 +819,13 @@ impl ReqwestUpstreamClient {
     pub(crate) fn into_bare_primary(mut self) -> Self {
         self.tag_primary_provider = true;
         self
+    }
+
+    /// The configured upstream base URL as a string, for the D4 `ProviderHealth`
+    /// DTO (a REQUIRED, non-null field). The leaf is the single owner of the
+    /// concrete `base_url`, so the failover/routing layers read it from here.
+    fn base_url_string(&self) -> String {
+        self.base_url.to_string()
     }
 
     fn with_auth(&self, request: RequestBuilder) -> RequestBuilder {
@@ -878,6 +1112,81 @@ impl FailoverUpstreamClient {
             .is_none_or(|until| until <= now)
     }
 
+    /// Build the D4 `ProviderHealth` vector for this failover chain. `route` is
+    /// `Some` only when reached via a routing provider (it is then stamped on
+    /// every entry); `catalog_meta` carries the routing catalog's `(fetched_ms,
+    /// size)` for that same case (a bare failover chain has no per-chain catalog
+    /// snapshot, so it is `None`).
+    ///
+    /// Reads are lock-free over each provider's `Arc<ProviderMetrics>` /
+    /// `base_url`, plus ONE short `states` `Mutex` hold to snapshot the cooldown
+    /// deadline + last error per provider (cloned out before computing status, so
+    /// the lock is released immediately). The `(deadline, consecutive_failures)`
+    /// pair both come from this single consistent read.
+    fn provider_health_with_route(
+        &self,
+        route: Option<&str>,
+        catalog_meta: CatalogMeta,
+    ) -> Vec<ProviderHealth> {
+        // Snapshot cooldown state under one short lock hold, then drop it.
+        let states: Vec<(Option<Instant>, Option<String>)> = {
+            let guard = self
+                .states
+                .lock()
+                .expect("upstream provider cooldown state lock poisoned");
+            self.providers
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    guard
+                        .get(index)
+                        .map(|state| (state.cooling_until, state.last_error.clone()))
+                        .unwrap_or((None, None))
+                })
+                .collect()
+        };
+        let now = Instant::now();
+        self.providers
+            .iter()
+            .zip(states)
+            .map(|(provider, (cooling_until, last_error))| {
+                let consecutive_failures = provider.metrics.consecutive_failures();
+                let cooling = cooling_until.is_some_and(|until| until > now);
+                let status = if cooling {
+                    if consecutive_failures >= DOWN_THRESHOLD {
+                        ProviderStatus::Down
+                    } else {
+                        ProviderStatus::Cooling
+                    }
+                } else {
+                    ProviderStatus::Healthy
+                };
+                // Surface the cooldown deadline only while actually cooling — a
+                // stale past deadline (cleared logically by the `now` compare)
+                // would otherwise serialize a misleading future-looking value.
+                let cooling_until_ms = if cooling {
+                    instant_deadline_to_epoch_ms(cooling_until)
+                } else {
+                    None
+                };
+                ProviderHealth {
+                    id: provider.name.clone(),
+                    name: provider.name.clone(),
+                    route: route.map(ToString::to_string),
+                    base_url: provider.client.base_url_string(),
+                    status,
+                    cooling_until_ms,
+                    last_error,
+                    served_count: provider.metrics.served_count(),
+                    failover_count: provider.metrics.failover_count(),
+                    consecutive_failures,
+                    catalog_fetched_ms: catalog_meta.fetched_ms,
+                    catalog_size: catalog_meta.size,
+                }
+            })
+            .collect()
+    }
+
     fn cooldown_error(&self) -> AppError {
         let now = Instant::now();
         let states = self
@@ -944,6 +1253,10 @@ impl FailoverUpstreamClient {
         let states = Arc::clone(&self.states);
         let cooldown = self.cooldown;
         let provider_name = self.providers[provider_index].name.clone();
+        // D4: capture this provider's `Arc<ProviderMetrics>` so a mid-stream
+        // failure (which runs in the spawned stream, not through `&self`) still
+        // records the failover/consecutive-failure counters.
+        let metrics = Arc::clone(&self.providers[provider_index].metrics);
         Box::pin(async_stream::stream! {
             yield Ok(first_chunk);
             loop {
@@ -952,6 +1265,7 @@ impl FailoverUpstreamClient {
                     Ok(Some(Err(err))) => {
                         Self::mark_provider_failure(
                             &states,
+                            &metrics,
                             provider_index,
                             &provider_name,
                             cooldown,
@@ -965,6 +1279,7 @@ impl FailoverUpstreamClient {
                         let err = AppError::upstream("upstream stream timed out".to_string());
                         Self::mark_provider_failure(
                             &states,
+                            &metrics,
                             provider_index,
                             &provider_name,
                             cooldown,
@@ -987,22 +1302,40 @@ impl FailoverUpstreamClient {
             state.cooling_until = None;
             state.last_error = None;
         }
+        // D4: a served flow clears the consecutive-failure streak (mirrors the
+        // cooldown clear above) and bumps the cumulative served counter, under
+        // the same `states` lock so the cleared deadline + reset streak are
+        // observed together (a reader snapshots the deadline under this lock).
+        if let Some(provider) = self.providers.get(provider_index) {
+            provider.metrics.record_success();
+        }
     }
 
     fn mark_provider_failure(
         states: &Arc<Mutex<Vec<ProviderCooldownState>>>,
+        metrics: &Arc<ProviderMetrics>,
         provider_index: usize,
         provider_name: &str,
         cooldown: Duration,
         error: String,
     ) {
         let cooling_until = (cooldown > Duration::ZERO).then(|| Instant::now() + cooldown);
-        let mut states = states
-            .lock()
-            .expect("upstream provider cooldown state lock poisoned");
-        if let Some(state) = states.get_mut(provider_index) {
-            state.cooling_until = cooling_until;
-            state.last_error = Some(error.clone());
+        {
+            let mut states = states
+                .lock()
+                .expect("upstream provider cooldown state lock poisoned");
+            if let Some(state) = states.get_mut(provider_index) {
+                state.cooling_until = cooling_until;
+                state.last_error = Some(error.clone());
+            }
+            // D4: bump the cumulative failover counter + the consecutive-failure
+            // streak (the streak crosses `DOWN_THRESHOLD` → `Down` while cooling)
+            // WHILE the `states` lock is held, so the deadline write and the
+            // failure-count bump land in one critical section — a reader that
+            // snapshots the cooldown deadline under this same lock observes the
+            // pair consistently (it reads `consecutive_failures` right after, so
+            // a Cooling→Down step is never split across the deadline write).
+            metrics.record_failure();
         }
         if cooldown > Duration::ZERO {
             tracing::warn!(
@@ -1023,6 +1356,7 @@ impl FailoverUpstreamClient {
     fn mark_failure(&self, provider_index: usize, error: &AppError) {
         Self::mark_provider_failure(
             &self.states,
+            &self.providers[provider_index].metrics,
             provider_index,
             &self.providers[provider_index].name,
             self.cooldown,
@@ -1192,6 +1526,7 @@ impl RoutingUpstreamClient {
             route_providers,
             routes,
             catalog: Arc::new(AsyncMutex::new(None)),
+            catalog_meta: Arc::new(Mutex::new(Arc::new(CatalogMeta::default()))),
         }
     }
 
@@ -1318,6 +1653,21 @@ impl RoutingUpstreamClient {
                 AppError::upstream("no models are currently available from configured upstreams")
             }));
         }
+
+        // D4: publish the catalog metadata as a SINGLE immutable `Arc<CatalogMeta>`
+        // swap. We still hold the `catalog` `AsyncMutex` (the caller `load_catalog`
+        // owns it for this whole refresh), so the swap is serialized with the
+        // catalog write — a lock-free `provider_health()` reader sees the
+        // `(fetched_ms, size)` pair move together, never torn. `fetched_ms` is the
+        // refresh wall-clock; `size` is the union model count.
+        let meta = Arc::new(CatalogMeta {
+            fetched_ms: Some(now_epoch_ms()),
+            size: Some(union_ids.len() as u64),
+        });
+        *self
+            .catalog_meta
+            .lock()
+            .expect("routing catalog meta lock poisoned") = meta;
 
         Ok(RoutingModelCatalog {
             provider_catalogs,
@@ -1645,6 +1995,13 @@ impl UpstreamClient for FailoverUpstreamClient {
             .collect();
         BackendCandidatePlan { candidates }
     }
+
+    /// D4: a bare failover chain (no routing wrapper) reports each provider with
+    /// no `route` and no catalog metadata (a failover chain loads no per-chain
+    /// `/v1/models` snapshot — only the routing client populates catalog meta).
+    fn provider_health(&self) -> Vec<ProviderHealth> {
+        self.provider_health_with_route(None, CatalogMeta::default())
+    }
 }
 
 #[async_trait]
@@ -1750,6 +2107,37 @@ impl UpstreamClient for RoutingUpstreamClient {
             }
         };
         BackendCandidatePlan { candidates }
+    }
+
+    /// D4: aggregate per-provider health across every routing provider's nested
+    /// failover chain (stamping `route = Some(provider_name)` + the published
+    /// catalog metadata) AND every synthetic route provider's chain. A catalog
+    /// provider's entries carry the routing `(fetched_ms, size)` meta (the union
+    /// snapshot that backs catalog resolution); the ad-hoc route providers carry
+    /// no catalog meta (they resolve by name, loading no `/v1/models`). Reads are
+    /// lock-free over the per-provider metrics + the `Arc<CatalogMeta>` swap, with
+    /// only short per-chain cooldown-state lock holds.
+    fn provider_health(&self) -> Vec<ProviderHealth> {
+        let catalog_meta = **self
+            .catalog_meta
+            .lock()
+            .expect("routing catalog meta lock poisoned");
+        let mut health = Vec::new();
+        for provider in &self.providers {
+            health.extend(
+                provider
+                    .client
+                    .provider_health_with_route(Some(&provider.name), catalog_meta),
+            );
+        }
+        for route_provider in &self.route_providers {
+            health.extend(
+                route_provider
+                    .client
+                    .provider_health_with_route(Some(&route_provider.name), CatalogMeta::default()),
+            );
+        }
+        health
     }
 
     async fn stream_chat_completion_with_timeout(
@@ -5012,5 +5400,309 @@ mod resolve_match_kind_tests {
             routes: Vec::new(),
         };
         assert!(empty.resolve("anything").is_none());
+    }
+}
+
+#[cfg(test)]
+mod d4_provider_health_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A non-networked leaf pointed at `base` — `provider_health` reads its
+    /// `base_url` and the in-memory cooldown/metrics state only, so no request is
+    /// ever sent.
+    fn leaf(base: &str) -> ReqwestUpstreamClient {
+        ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            url::Url::parse(base).expect("url"),
+            None,
+            None,
+            true,
+            4096,
+        )
+    }
+
+    fn provider(name: &str, base: &str) -> FailoverUpstreamProvider {
+        FailoverUpstreamProvider::new(name, leaf(base), None, None, JsonMap::new())
+    }
+
+    /// FROZEN DTO contract (D9/D10/D12 validate this exact shape): every field
+    /// serializes, the `Option` fields appear as JSON `null` (NO
+    /// `skip_serializing_if`), `base_url` is a non-null string, `status` is the
+    /// snake_case enum, and timestamps are epoch-ms numbers.
+    #[test]
+    fn provider_health_dto_serializes_all_keys_with_null_options() {
+        let health = ProviderHealth {
+            id: "p".to_string(),
+            name: "p".to_string(),
+            route: None,
+            base_url: "https://example.invalid/v1".to_string(),
+            status: ProviderStatus::Healthy,
+            cooling_until_ms: None,
+            last_error: None,
+            served_count: 0,
+            failover_count: 0,
+            consecutive_failures: 0,
+            catalog_fetched_ms: None,
+            catalog_size: None,
+        };
+        let value = serde_json::to_value(&health).expect("serialize");
+        let obj = value.as_object().expect("object");
+        // ALL keys present, even the None-valued ones (as explicit null).
+        for key in [
+            "id",
+            "name",
+            "route",
+            "base_url",
+            "status",
+            "cooling_until_ms",
+            "last_error",
+            "served_count",
+            "failover_count",
+            "consecutive_failures",
+            "catalog_fetched_ms",
+            "catalog_size",
+        ] {
+            assert!(obj.contains_key(key), "key `{key}` must always be present");
+        }
+        assert!(obj["route"].is_null());
+        assert!(obj["cooling_until_ms"].is_null());
+        assert!(obj["last_error"].is_null());
+        assert!(obj["catalog_fetched_ms"].is_null());
+        assert!(obj["catalog_size"].is_null());
+        assert_eq!(obj["base_url"], json!("https://example.invalid/v1"));
+        assert_eq!(obj["status"], json!("healthy"));
+        // snake_case enum rendering for the other variants.
+        assert_eq!(
+            serde_json::to_value(ProviderStatus::Cooling).unwrap(),
+            json!("cooling")
+        );
+        assert_eq!(
+            serde_json::to_value(ProviderStatus::Down).unwrap(),
+            json!("down")
+        );
+    }
+
+    /// Dyn-safety + the bare default: `provider_health()` is callable through
+    /// `Arc<dyn UpstreamClient>` (object-safe) and a bare leaf reports nothing
+    /// (no provider layer owns health).
+    #[test]
+    fn bare_leaf_provider_health_is_empty_through_dyn() {
+        let client: Arc<dyn UpstreamClient> = Arc::new(leaf("https://example.invalid/v1"));
+        assert!(client.provider_health().is_empty());
+    }
+
+    /// A failover chain reports one entry per provider with the leaf's base_url,
+    /// no route (bare failover), zeroed counters initially, and Healthy status.
+    #[test]
+    fn failover_provider_health_reports_each_provider() {
+        let client = FailoverUpstreamClient::new(
+            vec![
+                provider("primary", "https://a.invalid/v1"),
+                provider("backup", "https://b.invalid/v1"),
+            ],
+            Duration::from_secs(30),
+        );
+        let health = client.provider_health();
+        assert_eq!(health.len(), 2);
+        assert_eq!(health[0].id, "primary");
+        assert_eq!(health[0].base_url, "https://a.invalid/v1");
+        assert_eq!(health[0].route, None);
+        assert_eq!(health[0].status, ProviderStatus::Healthy);
+        assert_eq!(health[0].served_count, 0);
+        assert_eq!(health[0].failover_count, 0);
+        assert_eq!(health[0].consecutive_failures, 0);
+        assert_eq!(health[0].cooling_until_ms, None);
+        assert_eq!(health[1].id, "backup");
+        assert_eq!(health[1].base_url, "https://b.invalid/v1");
+    }
+
+    /// `served_count` is cumulative and `mark_provider_success` resets the
+    /// consecutive-failure streak to 0 AND clears the cooldown — so a provider
+    /// driven to `Down` then served once returns to `Healthy`.
+    #[test]
+    fn consecutive_failures_reset_on_success_and_status_recovers() {
+        let client = FailoverUpstreamClient::new(
+            vec![provider("p", "https://a.invalid/v1")],
+            Duration::from_secs(3600),
+        );
+        let err = AppError::upstream("boom");
+        // Three consecutive failures while cooling → Down.
+        client.mark_failure(0, &err);
+        client.mark_failure(0, &err);
+        client.mark_failure(0, &err);
+        let health = client.provider_health();
+        assert_eq!(health[0].consecutive_failures, 3);
+        assert_eq!(health[0].failover_count, 3);
+        assert_eq!(health[0].status, ProviderStatus::Down);
+        assert!(health[0].cooling_until_ms.is_some());
+        assert!(health[0].last_error.is_some());
+
+        // One success clears the streak + cooldown → Healthy, served bumped.
+        client.mark_provider_success(0);
+        let health = client.provider_health();
+        assert_eq!(health[0].consecutive_failures, 0);
+        assert_eq!(health[0].failover_count, 3, "failover_count is cumulative");
+        assert_eq!(health[0].served_count, 1);
+        assert_eq!(health[0].status, ProviderStatus::Healthy);
+        assert_eq!(health[0].cooling_until_ms, None);
+        assert_eq!(health[0].last_error, None);
+    }
+
+    /// `Down` requires BOTH cooling AND `>= DOWN_THRESHOLD` consecutive failures:
+    /// one failure with a live cooldown is only `Cooling`; the third crosses into
+    /// `Down`. With a ZERO cooldown, even many failures stay `Healthy` (not
+    /// cooling), so the threshold alone never forces `Down`.
+    #[test]
+    fn down_requires_cooling_and_threshold_failures() {
+        let cooling = FailoverUpstreamClient::new(
+            vec![provider("p", "https://a.invalid/v1")],
+            Duration::from_secs(3600),
+        );
+        let err = AppError::upstream("boom");
+        cooling.mark_failure(0, &err);
+        assert_eq!(
+            cooling.provider_health()[0].status,
+            ProviderStatus::Cooling,
+            "one failure while cooling is Cooling, not Down"
+        );
+        cooling.mark_failure(0, &err);
+        cooling.mark_failure(0, &err);
+        assert_eq!(
+            cooling.provider_health()[0].status,
+            ProviderStatus::Down,
+            "three consecutive failures while cooling is Down"
+        );
+
+        // Zero cooldown: failures bump the streak but the provider is never
+        // cooling, so it stays Healthy (Down needs cooling too).
+        let no_cooldown = FailoverUpstreamClient::new(
+            vec![provider("p", "https://a.invalid/v1")],
+            Duration::ZERO,
+        );
+        for _ in 0..5 {
+            no_cooldown.mark_failure(0, &err);
+        }
+        let health = no_cooldown.provider_health();
+        assert_eq!(health[0].consecutive_failures, 5);
+        assert_eq!(
+            health[0].status,
+            ProviderStatus::Healthy,
+            "without a cooldown window, the threshold alone never forces Down"
+        );
+        assert_eq!(health[0].cooling_until_ms, None);
+    }
+
+    /// A routing client stamps `route = Some(provider_name)` on each entry and
+    /// reports the synthetic route providers too. (No catalog is loaded here, so
+    /// catalog meta stays `None` — exercised separately.)
+    #[test]
+    fn routing_provider_health_stamps_route() {
+        let routing_provider = RoutingUpstreamProvider::new(
+            "vllm-a",
+            leaf("https://a.invalid/v1"),
+            None,
+            JsonMap::new(),
+            Vec::new(),
+            Duration::from_secs(30),
+        );
+        let route_provider = RouteUpstreamProvider::new(
+            "route-claude",
+            leaf("https://r.invalid/v1"),
+            Duration::from_secs(30),
+        );
+        let client = RoutingUpstreamClient::with_routes(
+            vec![routing_provider],
+            vec![route_provider],
+            Vec::new(),
+        );
+        let health = client.provider_health();
+        // One catalog provider entry + one route provider entry.
+        assert_eq!(health.len(), 2);
+        let catalog_entry = health
+            .iter()
+            .find(|h| h.id == "vllm-a")
+            .expect("catalog provider");
+        assert_eq!(catalog_entry.route.as_deref(), Some("vllm-a"));
+        assert_eq!(catalog_entry.base_url, "https://a.invalid/v1");
+        assert_eq!(catalog_entry.catalog_fetched_ms, None);
+        assert_eq!(catalog_entry.catalog_size, None);
+        let route_entry = health
+            .iter()
+            .find(|h| h.id == "route-claude")
+            .expect("route provider");
+        assert_eq!(route_entry.route.as_deref(), Some("route-claude"));
+    }
+
+    /// No-torn-pair: concurrent `(fetched_ms, size)` swaps (each a SINGLE
+    /// `Arc<CatalogMeta>` store) interleaved with lock-free reads must NEVER yield
+    /// a half-updated pair. Each writer stores a self-consistent pair where
+    /// `size == fetched_ms` (a sentinel invariant); every reader that sees a
+    /// populated meta must observe BOTH fields from the SAME store.
+    #[test]
+    fn no_torn_catalog_meta_pair_under_concurrent_swaps() {
+        let meta: Arc<Mutex<Arc<CatalogMeta>>> =
+            Arc::new(Mutex::new(Arc::new(CatalogMeta::default())));
+        let mut handles = Vec::new();
+        // Writers: each stamps a consistent (n, n) pair.
+        for _ in 0..4 {
+            let meta = Arc::clone(&meta);
+            handles.push(std::thread::spawn(move || {
+                for n in 1..2000u64 {
+                    let next = Arc::new(CatalogMeta {
+                        fetched_ms: Some(n),
+                        size: Some(n),
+                    });
+                    *meta.lock().expect("meta lock") = next;
+                }
+            }));
+        }
+        // Readers: every populated read must have matching fields (no tear).
+        for _ in 0..4 {
+            let meta = Arc::clone(&meta);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..4000 {
+                    let snapshot = Arc::clone(&meta.lock().expect("meta lock"));
+                    if let (Some(f), Some(s)) = (snapshot.fetched_ms, snapshot.size) {
+                        assert_eq!(f, s, "fetched_ms and size must come from one swap");
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread");
+        }
+    }
+
+    /// The publisher exposes the latest immutable snapshot with a monotonically
+    /// increasing version on each publish; a held clone is never mutated under the
+    /// reader.
+    #[test]
+    fn publisher_versions_increase_monotonically() {
+        let publisher = ProviderHealthPublisher::default();
+        assert_eq!(publisher.latest().version, 0, "default starts at version 0");
+        publisher.publish(Vec::new());
+        let first = publisher.latest();
+        assert_eq!(first.version, 1);
+        publisher.publish(vec![ProviderHealth {
+            id: "p".to_string(),
+            name: "p".to_string(),
+            route: None,
+            base_url: "https://a.invalid/v1".to_string(),
+            status: ProviderStatus::Healthy,
+            cooling_until_ms: None,
+            last_error: None,
+            served_count: 0,
+            failover_count: 0,
+            consecutive_failures: 0,
+            catalog_fetched_ms: None,
+            catalog_size: None,
+        }]);
+        let second = publisher.latest();
+        assert_eq!(second.version, 2);
+        // The earlier snapshot is immutable — its version/contents are unchanged.
+        assert_eq!(first.version, 1);
+        assert!(first.providers.is_empty());
+        assert_eq!(second.providers.len(), 1);
     }
 }

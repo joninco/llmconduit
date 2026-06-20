@@ -278,6 +278,13 @@ pub fn build_app_with_gateway_and_options(
         )
         .with_dashboard_auth(dashboard_auth),
     );
+    // D4: spawn the topology-health publication task ONLY when the debug UI is on,
+    // so production keeps the zero-overhead path (no 1 s tick). Guard on a live
+    // tokio runtime so a non-async embedder that enables the debug UI does not
+    // panic in `tokio::spawn` (the `main.rs` server path always has one).
+    if options.with_debug_ui && tokio::runtime::Handle::try_current().is_ok() {
+        gateway.spawn_provider_health_publisher();
+    }
     let router_options = RouterOptions {
         with_debug_ui: options.with_debug_ui,
         register_protected_routes,

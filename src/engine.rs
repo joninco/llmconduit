@@ -42,6 +42,8 @@ use crate::search::SearchOutcome;
 use crate::tool_delta_gate::DeltaDecision;
 use crate::tool_delta_gate::DeltaEmission;
 use crate::tool_delta_gate::ToolDeltaGate;
+use crate::upstream::ProviderHealth;
+use crate::upstream::ProviderHealthPublisher;
 use crate::upstream::UpstreamClient;
 use crate::upstream::UpstreamModelEntry;
 use crate::upstream::canonical_model_key;
@@ -84,6 +86,13 @@ pub struct Gateway {
     /// the persisted `Config` (secrets are read from the environment).
     dashboard_auth: Option<Arc<crate::dashboard_auth::DashboardAuth>>,
     upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
+    /// D4 published topology health: the latest versioned
+    /// `Arc<ProviderHealthSnapshot>`, swapped by the publication task (1 s tick +
+    /// cooldown-deadline wake) when `--with-debug-ui` is on. Always present (a
+    /// cheap shared handle) so `upstream_health()` and the snapshot readers do not
+    /// branch on the debug flag; the TASK that refreshes it is gated. Cloning the
+    /// Gateway shares the inner `Arc`, keeping the derived `Clone`.
+    provider_health: ProviderHealthPublisher,
     /// Throttle state for the "requested model not served → fell back to the
     /// default catalog model" WARN. Every request resolves the model TWICE (the
     /// HTTP layer to label the response, then the engine to drive the upstream
@@ -531,6 +540,24 @@ fn merge_json_value_prefer_source(destination: &mut Value, source: &Value) {
     *destination = source.clone();
 }
 
+/// The nearest FUTURE cooldown deadline in a health vector, as a duration from
+/// now (D4 publication-task wake). Each `cooling_until_ms` is wall-clock epoch-ms;
+/// we subtract the current epoch-ms to get the remaining time. `None` when no
+/// provider is cooling (the task then just waits for the next 1 s tick). A
+/// deadline already at/behind now yields `Duration::ZERO` (wake immediately), so
+/// the elapsed window is observed on the very next recompute.
+fn next_cooldown_wake(health: &[ProviderHealth]) -> Option<std::time::Duration> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    health
+        .iter()
+        .filter_map(|provider| provider.cooling_until_ms)
+        .map(|until_ms| std::time::Duration::from_millis(until_ms.saturating_sub(now_ms)))
+        .min()
+}
+
 impl Gateway {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -556,6 +583,7 @@ impl Gateway {
             flow_store,
             dashboard_auth: None,
             upstream_model_catalog: Arc::new(Mutex::new(None)),
+            provider_health: ProviderHealthPublisher::default(),
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -591,6 +619,67 @@ impl Gateway {
 
     pub fn upstream_client(&self) -> Arc<dyn UpstreamClient> {
         Arc::clone(&self.upstream)
+    }
+
+    /// D4: the current per-upstream health + counters (lock-free read through
+    /// the `UpstreamClient` trait). This is the LIVE view computed on demand; the
+    /// publication task calls it on each tick to refresh the versioned snapshot.
+    /// Bare/single-upstream gateways return an empty vector (no provider layer
+    /// owns health), matching the trait default.
+    pub fn upstream_health(&self) -> Vec<ProviderHealth> {
+        self.upstream.provider_health()
+    }
+
+    /// D4: the published topology-health handle. D5's 5 s snapshot task captures
+    /// `latest()` (one `Arc`); D7b broadcasts it as a `TopologyUpdate`. Always
+    /// present — the refreshing TASK is what `--with-debug-ui` gates, not this
+    /// accessor.
+    pub fn provider_health_publisher(&self) -> ProviderHealthPublisher {
+        self.provider_health.clone()
+    }
+
+    /// Spawn the D4 topology-health publication task (gated by `--with-debug-ui`
+    /// at the DI root — production must NOT run this, keeping the disabled path
+    /// zero-overhead). The task COALESCES publications on a 1 s tick AND wakes
+    /// early at the nearest provider cooldown deadline, so an IDLE cooling→Healthy
+    /// transition is published with no traffic. It does NOT republish per served
+    /// flow (the atomics update continuously; the snapshot reads them at tick
+    /// time), so it allocates O(providers) at most once per second, never per
+    /// request.
+    ///
+    /// The task holds only `Arc` clones (the upstream client + the publisher), so
+    /// it is `Send + 'static` and outlives this call; it runs for the process
+    /// lifetime (the gateway is an `Arc` held by the server). Returns the
+    /// `JoinHandle` so a caller/test can abort it deterministically.
+    pub fn spawn_provider_health_publisher(&self) -> tokio::task::JoinHandle<()> {
+        let upstream = Arc::clone(&self.upstream);
+        let publisher = self.provider_health.clone();
+        // Publish an initial snapshot immediately so a consumer that reads before
+        // the first tick still sees the current health (version 1), not the empty
+        // default.
+        publisher.publish(upstream.provider_health());
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                let health = upstream.provider_health();
+                // Wake at the nearest future cooldown deadline if one is sooner
+                // than the next 1 s tick, so an idle cooling→Healthy flip is
+                // published right at the deadline (not up to a second late).
+                let next_deadline = next_cooldown_wake(&health);
+                publisher.publish(health);
+                match next_deadline {
+                    Some(wake) if wake < std::time::Duration::from_secs(1) => {
+                        // A tiny epsilon past the deadline so the recomputed status
+                        // observes the window as elapsed.
+                        tokio::time::sleep(wake + std::time::Duration::from_millis(1)).await;
+                    }
+                    _ => {
+                        tick.tick().await;
+                    }
+                }
+            }
+        })
     }
 
     /// Resolve `request_model` to the served upstream model and whether the
