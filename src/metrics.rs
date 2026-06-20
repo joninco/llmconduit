@@ -866,36 +866,70 @@ impl MetricsLayer {
     /// Like [`snapshot`](Self::snapshot) but also records the monitor domain's
     /// sequence into the cut's cursors (the snapshot task owns the monitor handle).
     /// Same FIXED FlowStore→Metrics atomic cut (FlowStore lock held until the metrics
-    /// lock is nested + cursors/topology captured, then released) + one topology Arc.
+    /// lock is nested + ALL cut metadata captured, then released) + one topology Arc.
     pub fn snapshot_with_monitor_seq(
         &self,
         flow_store: &DashboardFlowStore,
         topology: &ProviderHealthPublisher,
         monitor_seq: u64,
     ) -> Option<Arc<DashboardSnapshot>> {
+        // A pre-read monitor sequence: hand it back verbatim from inside the cut.
+        self.snapshot_with(flow_store, topology, || monitor_seq)
+    }
+
+    /// The cut-builder shared by every snapshot entry point. `read_monitor_seq` is
+    /// invoked INSIDE the dual-lock critical section so the live monitor cursor is
+    /// sampled at the cut instant alongside the rest of the metadata, not before the
+    /// locks (the snapshot task passes `|| monitor.last_sequence()`).
+    ///
+    /// Metadata-inside-the-lock guarantee (Codex D5 R2 HIGH): EVERY field that defines
+    /// the cut — `taken_at_ms`/`now_epoch`, the topology `Arc` + its version, the
+    /// metrics cursor, AND the monitor cursor — is captured only AFTER BOTH the
+    /// FlowStore guard and the metrics lock are held. Capturing the timestamp/epoch
+    /// before the locks could stamp the cut EARLIER than the state it contains: under
+    /// contention `snapshot_at(ts)` would return data newer than its own `taken_at_ms`,
+    /// and `view(now_epoch)` would aggregate against a stale epoch while `metrics_seq`
+    /// already reflected newer samples. Sampling all metadata under the held locks makes
+    /// `taken_at_ms` ≥ every flow/sample the cut contains and keeps the epoch consistent
+    /// with the cursors.
+    fn snapshot_with<S>(
+        &self,
+        flow_store: &DashboardFlowStore,
+        topology: &ProviderHealthPublisher,
+        read_monitor_seq: S,
+    ) -> Option<Arc<DashboardSnapshot>>
+    where
+        S: FnOnce() -> u64,
+    {
         if !self.enabled {
             return None;
         }
-        let taken_at_ms = now_ms();
-        let now_epoch = (taken_at_ms / 1000) as u64;
         // FIXED LOCK ORDER, single atomic cut: hold the FlowStore lock only until the
-        // metrics lock is nested under it and the cut-defining cursors + topology Arc
-        // are captured — THAT instant is the cut. The (heavier) metrics aggregation +
-        // ring push then run under the metrics lock ALONE, after the FlowStore lock is
-        // released, so the FlowStore critical section stays minimal and concurrent
-        // writers are not starved by the snapshot's aggregation. Correctness after the
-        // early FlowStore release: the metrics lock is STILL HELD, so no writer can
-        // complete a both-stores mutation (every metrics mutation needs it) and the
-        // summaries are already a copy — the cut stays internally consistent. The
-        // FlowStore lock is acquired first and never re-entered here.
+        // metrics lock is nested under it and ALL cut metadata (timestamp/epoch,
+        // topology Arc, both cursors) are captured — THAT instant is the cut. The
+        // (heavier) metrics aggregation + ring push then run under the metrics lock
+        // ALONE, after the FlowStore lock is released, so the FlowStore critical section
+        // stays minimal and concurrent writers are not starved by the snapshot's
+        // aggregation. Correctness after the early FlowStore release: the metrics lock is
+        // STILL HELD, so no writer can complete a both-stores mutation (every metrics
+        // mutation needs it) and the summaries are already a copy — the cut stays
+        // internally consistent. The FlowStore lock is acquired first and never
+        // re-entered here.
         let cut = flow_store.with_summaries_under_lock(|flow_guard, summaries, flow_seq| {
-            // ONE topology Arc capture (D4) while the FlowStore lock is still held.
+            // FIXED LOCK ORDER step 2: nest the metrics mutex under the FlowStore lock.
+            // Both held now == the atomic cut instant — sample EVERY piece of cut
+            // metadata here so none of it predates the state the cut contains.
+            let mut state = self.lock();
+            // Wall-clock instant of the cut, taken under the held locks so it is never
+            // earlier than any flow/sample the cut includes.
+            let taken_at_ms = now_ms();
+            let now_epoch = (taken_at_ms / 1000) as u64;
+            // ONE topology Arc capture (D4) at the cut instant.
             let topology = topology.latest();
             let topology_seq = topology.version;
-            // FIXED LOCK ORDER step 2: nest the metrics mutex under the FlowStore lock —
-            // both held now == the atomic cut instant — and read the cut cursor.
-            let mut state = self.lock();
             let metrics_seq = state.metrics_seq;
+            // The monitor cursor, sampled at the cut instant (not pre-read by the caller).
+            let monitor_seq = read_monitor_seq();
             // Cut instant fixed: release the FlowStore lock and finish the metrics-only
             // work (aggregation + push) under the metrics guard alone.
             flow_guard.release();
@@ -949,9 +983,11 @@ impl Default for MetricsLayer {
 /// the DI root (production must NOT run this — zero overhead). The task holds only
 /// `Clone` handles (the metrics layer, the FlowStore, the topology publisher, the
 /// monitor) — all behind `Arc`, so it is `Send + 'static` and runs for the process
-/// lifetime. Every 5 s it takes the single FlowStore→Metrics critical section,
-/// captures one topology `Arc`, reads the monitor sequence, and pushes a body-free
-/// cut onto the bounded ring. Returns the `JoinHandle` so a caller/test can abort it.
+/// lifetime. Every 5 s it takes the single FlowStore→Metrics critical section and,
+/// INSIDE it, captures one topology `Arc` and reads the monitor sequence, then pushes
+/// a body-free cut onto the bounded ring. Passing `|| monitor.last_sequence()` (rather
+/// than a pre-read value) keeps the monitor cursor sampled at the cut instant with the
+/// rest of the metadata. Returns the `JoinHandle` so a caller/test can abort it.
 pub fn spawn_snapshot_task(
     metrics: MetricsLayer,
     flow_store: DashboardFlowStore,
@@ -963,8 +999,9 @@ pub fn spawn_snapshot_task(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
-            let monitor_seq = monitor.last_sequence();
-            metrics.snapshot_with_monitor_seq(&flow_store, &topology, monitor_seq);
+            // Read the monitor cursor INSIDE the cut (the closure runs under the held
+            // locks) so it is consistent with the rest of the snapshot metadata.
+            metrics.snapshot_with(&flow_store, &topology, || monitor.last_sequence());
         }
     })
 }
@@ -1571,5 +1608,94 @@ mod tests {
         // A cut was taken and is body-free + quota-bounded.
         let cut = metrics.latest_snapshot().expect("a cut");
         assert!(cut.summaries.len() <= crate::monitor::REQUEST_EVENT_LIMIT);
+    }
+
+    #[test]
+    fn snapshot_metadata_is_captured_inside_the_lock() {
+        // Codex D5 R2 HIGH: the cut's metadata (`taken_at_ms`/epoch, cursors) must be
+        // sampled INSIDE the dual-lock critical section, not before it. If `taken_at_ms`
+        // were read before the locks, a concurrent writer could `open()` a flow that
+        // lands in the summaries (captured under the lock) with a `started_ms` LATER than
+        // the pre-lock timestamp — stamping the cut earlier than the state it contains.
+        // Hammer `open()` from many threads while a snapshot thread takes cuts and assert
+        // every cut's `taken_at_ms` is ≥ the `started_ms` of every flow it contains and
+        // that its epoch is mutually consistent with `taken_at_ms`.
+        let metrics = MetricsLayer::new();
+        let flow = DashboardFlowStore::new();
+        let topo = ProviderHealthPublisher::default();
+        topo.publish(Vec::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let violations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cuts_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let snapshot_thread = {
+            let metrics = metrics.clone();
+            let flow = flow.clone();
+            let topo = topo.clone();
+            let stop = Arc::clone(&stop);
+            let violations = Arc::clone(&violations);
+            let cuts_seen = Arc::clone(&cuts_seen);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(cut) = metrics.snapshot(&flow, &topo) {
+                        cuts_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // The cut can never be stamped before a flow it already contains:
+                        // `started_ms` is set at `open()` (under the FlowStore lock) and
+                        // the summary that carries it was captured under the SAME lock the
+                        // cut's `taken_at_ms` is now sampled under, so the timestamp must
+                        // dominate every contained flow.
+                        let ts_ok = cut
+                            .summaries
+                            .iter()
+                            .all(|summary| cut.taken_at_ms >= summary.started_ms);
+                        if !ts_ok {
+                            violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        let mut workers = Vec::new();
+        for worker_id in 0..8 {
+            let flow = flow.clone();
+            let metrics = metrics.clone();
+            workers.push(std::thread::spawn(move || {
+                for index in 0..2000 {
+                    let api = format!("api_{worker_id}_{index}");
+                    flow.open(
+                        api.clone(),
+                        "POST".to_string(),
+                        "/v1/responses".to_string(),
+                        crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+                        None,
+                    );
+                    metrics.record_response(
+                        FlowStatus::Completed,
+                        Some("m"),
+                        "/v1/responses",
+                        Some("p"),
+                        5,
+                    );
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("worker thread joins");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        snapshot_thread.join().expect("snapshot thread joins");
+
+        assert!(
+            cuts_seen.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the snapshot thread took at least one cut under contention"
+        );
+        assert_eq!(
+            violations.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "every cut's taken_at_ms is >= every contained flow's started_ms and its \
+             epoch is consistent with taken_at_ms (metadata sampled inside the lock)"
+        );
     }
 }
