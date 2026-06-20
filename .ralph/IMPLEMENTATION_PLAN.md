@@ -222,10 +222,18 @@ cases; remove "Codex round" archaeology.
 **Files:** `src/upstream.rs`, `src/sse_guard.rs` (new), `tests/port_streaming.rs`.
 
 ### Task 11.7 — Typed terminal reason in the canonical response
-**Priority:** MEDIUM · **Spec:** `.ralph/specs/T7-typed-terminal-reason.md`
-Carry a typed terminal reason (or map all non-stop → non-clean) so promotion gating uses an explicit
-reason, not `event_type == "response.completed"` (`responses_to_anthropic.rs:468`).
-**Files:** `src/models/responses.rs`, `src/engine.rs`, `src/adapters/responses_to_anthropic.rs`, tests.
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/T7-typed-terminal-reason.md` · **Commit:** `1b98467`
+**Status:** Codex-xhigh APPROVED (R2). `TerminalReason` enum (Stop/Length/ToolCall/ContentFilter/Other;
+`ToolCall` serde-renamed to `tool_calls`) carried on `ResponseResource.terminal_reason`; engine sets it
+from `last_finish_reason` via `from_finish_reason`; `is_incomplete` derived from `reason == Length`.
+`flush_reasoning_terminal` gates promotion on `clean_stop` (`reason.is_clean_stop()`, Stop only), not
+`event_type == "response.completed"`. `response_terminal_reason` maps present-but-unrecognized → `Other`
+(non-clean); the event-type fallback fires only when the field is absent. Regression tests:
+`reasoning_only_at_content_filter_stays_thinking`, `reasoning_only_at_tool_calls_stays_thinking` (R1 —
+proves the `tool_calls` wire spelling parses + gates non-clean). G8 behavior preserved; `finalize()`
+synthetic emission unchanged.
+**Files:** `src/models/responses.rs`, `src/engine.rs`, `src/adapters/responses_to_anthropic.rs`,
+`tests/port_response_translation.rs`.
 **Blocks:** 11.8.
 
 ### Task 11.8 — Extract ReasoningEgressState from responses_to_anthropic
