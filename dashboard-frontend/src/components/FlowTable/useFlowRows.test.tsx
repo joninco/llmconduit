@@ -96,6 +96,70 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
   });
 });
 
+describe('useFlowRows — a WS-created row backfills REST-authoritative fields (finding 3)', () => {
+  beforeEach(() => resetWorld());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('fills endpoint/method/uri + finished/elapsed/cost/terminal from REST, keeping live status/usage', async () => {
+    // The REST row is the authoritative request line + roll-up.
+    stubFlowsFetch([
+      makeFlow({
+        api_call_id: 'api_ws',
+        method: 'POST',
+        uri: '/v1/responses',
+        upstream_target: 'openai',
+        status: 'completed',
+        finished_ms: 1_700_000_005_000,
+        elapsed_ms: 5_000,
+        cost: 0.5,
+        terminal_reason: 'response.completed',
+      }),
+    ]);
+    // A WS-CREATED row: minted by a `flow_status` patch BEFORE the REST list arrived, so it carries
+    // PLACEHOLDER method ('POST') + uri ('') and null roll-up fields, with a live 'open' status.
+    act(() =>
+      dashboardStore.getState().patchFlowStatus({
+        type: 'flow_status',
+        api_call_id: 'api_ws',
+        response_id: null,
+        status: 'open',
+        model_requested: null,
+        model_served: null,
+        upstream_target: null,
+        usage: { prompt: 11, completion: 0, total: 11, cached: 0, reasoning: 0 },
+        started_ms: 1_700_000_000_000,
+        elapsed_ms: null,
+      }),
+    );
+    // Sanity: the WS placeholder row really has an empty uri before REST merges.
+    expect(dashboardStore.getState().flows.get('api_ws')?.uri).toBe('');
+
+    const { result } = renderRows();
+    await waitFor(() => {
+      const r = result.current.rows.find((row) => row.api_call_id === 'api_ws');
+      expect(r?.uri).toBe('/v1/responses');
+    });
+    const row = result.current.rows.find((r) => r.api_call_id === 'api_ws');
+    // REST-authoritative request line + roll-up are backfilled…
+    expect(row?.method).toBe('POST');
+    expect(row?.uri).toBe('/v1/responses');
+    expect(row?.upstream_target).toBe('openai');
+    expect(row?.finished_ms).toBe(1_700_000_005_000);
+    expect(row?.elapsed_ms).toBe(5_000);
+    expect(row?.cost).toBe(0.5);
+    expect(row?.terminal_reason).toBe('response.completed');
+    // …while the LIVE status + usage still win over the completed REST row.
+    expect(row?.status).toBe('open');
+    expect(row?.usage?.prompt).toBe(11);
+    // The store itself is untouched (merge is view-only).
+    expect(dashboardStore.getState().flows.get('api_ws')?.uri).toBe('');
+  });
+});
+
 describe('useFlowRows — combined union is globally newest-on-top (finding 4)', () => {
   beforeEach(() => resetWorld());
   afterEach(() => {

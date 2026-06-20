@@ -23,6 +23,15 @@ export type ConnectionState = 'idle' | 'connecting' | 'live' | 'seeking' | 'clos
 
 export interface DashboardState {
   connection: ConnectionState;
+  /**
+   * MONOTONIC connection-transition generation. Bumped on EVERY connection transition that changes
+   * which store the mutable slices belong to (live ↔ seek ↔ teardown ↔ fresh snapshot). Unlike the
+   * `connection` STRING (which is reusable — `live → seeking → live` returns to `'live'`), this only
+   * ever increases, so an in-flight optimistic mutation captured at dispatch can detect that the app
+   * has since crossed a boundary and refuse to write into a now-foreign store (useFlowDetail kill,
+   * finding 1). A no-op transition (same state re-applied) does NOT bump it.
+   */
+  connEpoch: number;
   /** Last applied per-domain seq (mirrors the socket's dedup cursors for display). */
   cursors: SeqCursors;
 
@@ -91,6 +100,7 @@ const emptyCursors = (): SeqCursors => ({
 
 export const dashboardStore = createStore<DashboardState>((set) => ({
   connection: 'idle',
+  connEpoch: 0,
   cursors: emptyCursors(),
   seekAtMs: null,
   seekMonitorSeq: null,
@@ -108,22 +118,30 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
   // (e.g. a test) captures the cut from the current cursor/clock; `enterSeek` is the explicit path.
   setConnection: (connection) =>
     set((s) => {
+      // Re-applying the SAME state is a no-op for the epoch (no boundary crossed).
+      if (connection === s.connection) return { connection };
+      // Any real transition advances the monotonic epoch (finding 1).
+      const connEpoch = s.connEpoch + 1;
       if (connection === 'seeking') {
-        return s.connection === 'seeking'
-          ? { connection }
-          : { connection, seekAtMs: Date.now(), seekMonitorSeq: s.cursors.monitor_seq };
+        return { connection, connEpoch, seekAtMs: Date.now(), seekMonitorSeq: s.cursors.monitor_seq };
       }
-      return { connection, seekAtMs: null, seekMonitorSeq: null };
+      return { connection, connEpoch, seekAtMs: null, seekMonitorSeq: null };
     }),
 
   enterSeek: (atMs) =>
-    set((s) => ({ connection: 'seeking', seekAtMs: atMs, seekMonitorSeq: s.cursors.monitor_seq })),
+    set((s) => ({
+      connection: 'seeking',
+      // Entering seek always crosses a boundary (live store → frozen cut), so bump the epoch.
+      connEpoch: s.connEpoch + 1,
+      seekAtMs: atMs,
+      seekMonitorSeq: s.cursors.monitor_seq,
+    })),
 
   setCursor: (domain, seq) =>
     set((s) => ({ cursors: { ...s.cursors, [domain]: seq } })),
 
   applySnapshot: (snap) =>
-    set(() => {
+    set((s) => {
       const flows = new Map<string, FlowSummary>();
       const flowOrder: string[] = [];
       for (const f of snap.flows) {
@@ -132,6 +150,9 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
       }
       return {
         cursors: snap.cursors,
+        // A fresh snapshot re-establishes the authoritative LIVE store — a boundary an in-flight
+        // optimistic mutation must not write across (it replaces every row), so bump the epoch.
+        connEpoch: s.connEpoch + 1,
         // A fresh snapshot re-establishes the authoritative LIVE cut — clear any seek freeze.
         seekAtMs: null,
         seekMonitorSeq: null,
@@ -206,8 +227,11 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
     }),
 
   reset: () =>
-    set({
+    set((s) => ({
       connection: 'idle',
+      // Teardown clears the live store — a boundary an in-flight mutation must not write across
+      // (finding 1). The epoch is the one slice that survives a reset (monotonic across the session).
+      connEpoch: s.connEpoch + 1,
       cursors: emptyCursors(),
       seekAtMs: null,
       seekMonitorSeq: null,
@@ -219,7 +243,7 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
       priceTable: {},
       monitor: [],
       monitorSeqs: [],
-    }),
+    })),
 }));
 
 export type DashboardStore = typeof dashboardStore;

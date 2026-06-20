@@ -9,9 +9,9 @@ import type { DebugWsMessage, FlowDetail as FlowDetailDto } from '../../api/type
 
 function noop() {}
 
-/** Push a monitor message into the live ring. */
-function pushMonitor(msg: DebugWsMessage): void {
-  act(() => dashboardStore.getState().pushMonitor(msg));
+/** Push a monitor message into the live ring, stamped with its arrival `monitor_seq`. */
+function pushMonitor(msg: DebugWsMessage, seq = 0): void {
+  act(() => dashboardStore.getState().pushMonitor(msg, seq));
 }
 
 describe('FlowDetail — 3-pane inspector (mock backend)', () => {
@@ -57,12 +57,12 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
 
     // Stream a timeline event + segments (output + a tool call) for resp_001. The segments arrive
-    // AFTER the mock REST replay's coverage (its deltas sit near the flow start), so the live
-    // continuation is appended past the replay cursor (deltas merge by temporal cursor — finding 3).
-    const afterReplay = Date.now() + 60_000;
-    pushMonitor({ type: 'event_append', response_id: 'resp_001', event: { timestamp_ms: 1, kind: 'response.created', summary: 'created', images: [] } });
-    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: afterReplay, kind: 'output', text: 'Hello world' } });
-    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: afterReplay + 1, kind: 'tool', text: JSON.stringify({ name: 'search' }) } });
+    // AFTER the mock REST replay's coverage — the replay's max delta `sequence` is 3, so the live
+    // continuation carries higher `monitor_seq`s (4, 5) and is appended past the replay watermark
+    // (deltas merge by MonitorHub SEQUENCE — finding 2).
+    pushMonitor({ type: 'event_append', response_id: 'resp_001', event: { timestamp_ms: 1, kind: 'response.created', summary: 'created', images: [] } }, 4);
+    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 1, kind: 'output', text: 'Hello world' } }, 4);
+    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 2, kind: 'tool', text: JSON.stringify({ name: 'search' }) } }, 5);
 
     // Deltas sub-panel shows the output text + an expandable tool card.
     expect(getByTestId('deltas-panel').textContent).toContain('Hello world');
@@ -345,5 +345,40 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     // Still frozen + only the snapshot row present.
     expect(dashboardStore.getState().connection).toBe('seeking');
     expect(dashboardStore.getState().flows.size).toBe(1);
+  });
+
+  it('a kill failing AFTER a live→seek→live round-trip does NOT re-insert the stale optimistic row (finding 1)', async () => {
+    // THE case the connection STRING could not catch: a kill is dispatched while LIVE; before the
+    // 403 resolves the app seeks then returns to LIVE. The string epoch is `'live'` at BOTH dispatch
+    // and resolve, so the old guard would have re-run `upsertFlow(prev)` — re-inserting the killed
+    // flow's prior 'open' row into the NEW live store. The monotonic generation advanced across the
+    // round-trip, so the rollback is correctly skipped.
+    const started = 1_700_000_000_000;
+    resetWorld({ mock: true });
+    authStore.getState().setMutationsEnabled(true);
+    authStore.getState().setCsrfToken('mock-csrf-token');
+    seedFlows([makeFlow({ api_call_id: 'api_001', response_id: 'resp_001', status: 'open', started_ms: started })]);
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('kill-button')).toBeTruthy());
+    // Drop the CSRF so the kill 403s and onError runs.
+    act(() => authStore.getState().setCsrfToken(null));
+    document.cookie = 'llmconduit_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+
+    // Fire the kill (optimistic flip), THEN round-trip live→seek→live while the 403 is in flight.
+    fireEvent.click(getByTestId('kill-button'));
+    expect(dashboardStore.getState().flows.get('api_001')?.status).toBe('cancelled');
+    act(() => dashboardStore.getState().setConnection('seeking'));
+    // Return to LIVE via a fresh snapshot that does NOT contain api_001 (it was killed server-side),
+    // then flip back to 'live' — exactly the socket's resume path (commitSnapshot → setConnection).
+    act(() => {
+      dashboardStore.getState().applySnapshot({ cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 }, flows: [], metrics: null, topology: null });
+      dashboardStore.getState().setConnection('live');
+    });
+    expect(dashboardStore.getState().connection).toBe('live');
+
+    // Let the 403 resolve: the generation guard skips the rollback, so api_001 is NOT re-inserted.
+    await waitFor(() => expect(getByTestId('kill-forbidden')).toBeTruthy());
+    expect(dashboardStore.getState().flows.has('api_001')).toBe(false);
+    expect(dashboardStore.getState().flows.size).toBe(0);
   });
 });

@@ -16,6 +16,18 @@
 import type { DebugSegment, DebugSegmentKind, FlowDelta } from '../../api/types';
 
 /**
+ * A `DebugSegment` tagged with its MonitorHub SEQUENCE (`monitor_seq` / `DebugUpdate.sequence`) —
+ * the authoritative cross-source merge cursor (finding 2). Both sources express position in the one
+ * stream as this seq: the REST replay carries it as `FlowDelta.sequence`, the live ring as the
+ * per-message `monitorSeqs` the socket stamps. `seq` is `null` only when a source omitted it (an old
+ * replay, or a live segment with no stamp), which forces the degraded append-verbatim fallback.
+ */
+export interface SeqSegment {
+  segment: DebugSegment;
+  seq: number | null;
+}
+
+/**
  * Classifies a REST delta's freeform `kind` string into a `DebugSegment` kind. The engine emits
  * dotted event names (`response.output_text.delta`, `response.reasoning_summary.delta`,
  * `response.function_call_arguments.delta`); we key off substrings so variants map without an
@@ -46,21 +58,22 @@ function extractText(payload: unknown): string {
 }
 
 /**
- * Normalizes the REST replay (`FlowDelta[]`) into ordered `DebugSegment`s. Sorts by `sequence`
- * (the authoritative replay order), maps each kind/payload, and DROPS deltas with no textual
- * content (pure lifecycle events) so they don't render as empty blocks. `ts_ms` seeds the
- * segment timestamp (0 when absent — replayed deltas may omit it).
+ * Normalizes the REST replay (`FlowDelta[]`) into ordered `SeqSegment`s. Sorts by `sequence` (the
+ * authoritative replay order), maps each kind/payload, carries the delta's `sequence` as the merge
+ * cursor (finding 2), and DROPS deltas with no textual content (pure lifecycle events) so they don't
+ * render as empty blocks. `ts_ms` seeds the segment timestamp for display ONLY (0 when absent — and
+ * unreliable as a cursor since MonitorHub coalescing keeps the FIRST timestamp).
  */
-export function normalizeRestDeltas(deltas: FlowDelta[] | undefined): DebugSegment[] {
+export function normalizeRestDeltas(deltas: FlowDelta[] | undefined): SeqSegment[] {
   if (!deltas || deltas.length === 0) return [];
   return [...deltas]
     .sort((a, b) => a.sequence - b.sequence)
-    .map((d): DebugSegment | null => {
+    .map((d): SeqSegment | null => {
       const text = extractText(d.payload);
       if (text === '') return null;
-      return { timestamp_ms: d.ts_ms ?? 0, kind: classifyKind(d.kind), text };
+      return { segment: { timestamp_ms: d.ts_ms ?? 0, kind: classifyKind(d.kind), text }, seq: d.sequence };
     })
-    .filter((s): s is DebugSegment => s !== null);
+    .filter((s): s is SeqSegment => s !== null);
 }
 
 /**
@@ -68,30 +81,41 @@ export function normalizeRestDeltas(deltas: FlowDelta[] | undefined): DebugSegme
  * stream for a reloaded/completed flow; live segments continue it. The two sources OVERLAP at the
  * seam: the live ring retains the recent history the replay already holds.
  *
- * We de-dup by each segment's TEMPORAL CURSOR (`timestamp_ms`), NOT by text (finding 3). Both
- * sources stamp segments from the SAME engine clock (`monitor.rs`): the REST `ts_ms` and the live
- * `timestamp_ms` are the segment's position in the one stream. So the replay COVERS the stream up
- * to its last segment's timestamp, and a live segment belongs to the un-replayed tail iff its
- * timestamp is strictly AFTER that coverage. This fixes both text-equality failures:
- *   - a partial seam overlap is removed precisely (the live head at/under the cursor is dropped);
- *   - legitimately-REPEATED identical segments (same kind+text, DISTINCT timestamps) are PRESERVED,
- *     because identity is the cursor, not the text.
- * When a side carries no usable cursor (all `timestamp_ms === 0` — e.g. a replay that omitted
- * `ts_ms`), we cannot place the seam temporally, so we fall back to APPENDING the whole live run
- * (no text-collapsing): over-keeping a duplicate is safer than silently dropping a real segment.
- * Order is preserved: replay first, then the live tail past the cursor.
+ * We de-dup by each segment's MonitorHub SEQUENCE (`seq`), NOT by `timestamp_ms` and NOT by text
+ * (finding 2). `timestamp_ms` is unusable as a cursor: MonitorHub COALESCES adjacent same-kind
+ * segments but keeps the FIRST timestamp, so a tail and its coalesced sibling can share a millisecond
+ * (a strict `>` over timestamps then drops a real same-millisecond delta, or duplicates a coalesced
+ * tail). The seq is the per-message MonitorHub cursor carried identically by BOTH sources (the REST
+ * `FlowDelta.sequence` and the live `monitorSeqs`), so it is the one monotonic watermark of stream
+ * position. The replay COVERS the stream up to its MAX seq, and a live segment belongs to the
+ * un-replayed tail iff its seq is strictly GREATER than that watermark. This:
+ *   - removes a partial/multi-segment seam overlap precisely (the live head at/under the watermark
+ *     is already in the replay and is dropped);
+ *   - preserves legitimately-repeated identical segments (same kind+text — DISTINCT seqs), because
+ *     identity is the seq, not the text;
+ *   - never drops a genuine same-millisecond delta (the seq, not the clock, places the seam).
+ * When the watermark is unusable (the replay carries NO seq on any segment — e.g. an old replay that
+ * omitted `sequence`), we cannot place the seam, so we APPEND the whole live run verbatim:
+ * over-keeping a duplicate is safer than silently dropping a real segment. Order is preserved:
+ * replay first, then the live tail past the watermark.
  */
-export function mergeDeltas(rest: DebugSegment[], live: DebugSegment[]): DebugSegment[] {
-  if (rest.length === 0) return live;
-  if (live.length === 0) return rest;
-  // The replay's coverage cursor = the max timestamp it carries. 0 ⇒ no usable cursor (see below).
-  const restCursor = rest.reduce((max, s) => Math.max(max, s.timestamp_ms), 0);
-  if (restCursor === 0) {
-    // No temporal cursor on the replay: we can't locate the seam, so append the live run verbatim.
-    return [...rest, ...live];
+export function mergeDeltas(rest: SeqSegment[], live: SeqSegment[]): DebugSegment[] {
+  if (rest.length === 0) return live.map((s) => s.segment);
+  if (live.length === 0) return rest.map((s) => s.segment);
+  // The replay's coverage watermark = the max seq it carries. A replay with no usable seq on ANY
+  // segment yields `null` → no watermark (see below). (`-Infinity` start cleanly handles an
+  // all-null replay; a single real seq lifts it to a concrete watermark.)
+  const restWatermark = rest.reduce<number | null>(
+    (max, s) => (s.seq === null ? max : Math.max(max ?? Number.NEGATIVE_INFINITY, s.seq)),
+    null,
+  );
+  if (restWatermark === null) {
+    // No seq watermark on the replay: we can't locate the seam, so append the live run verbatim.
+    return [...rest, ...live].map((s) => s.segment);
   }
   // Keep only the live segments AFTER the replay's coverage (the genuinely newer tail). A live
-  // segment at-or-before the cursor is already in the replay (the seam) and is dropped.
-  const tail = live.filter((s) => s.timestamp_ms > restCursor);
-  return [...rest, ...tail];
+  // segment at-or-before the watermark is already in the replay (the seam) and is dropped. A live
+  // segment with NO seq cannot be placed against the watermark, so it is kept (append-not-drop).
+  const tail = live.filter((s) => s.seq === null || s.seq > restWatermark);
+  return [...rest, ...tail].map((s) => s.segment);
 }

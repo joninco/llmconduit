@@ -88,12 +88,15 @@ export function useFlowDetail(apiCallId: string | null): FlowDetailView {
 
   const killMutation = useMutation({
     mutationFn: (id: string) => client.kill(id),
-    onMutate: (id: string): { prev: FlowSummary | undefined; epoch: string } => {
+    onMutate: (id: string): { prev: FlowSummary | undefined; gen: number } => {
       setKillState({ phase: 'killing' });
-      // Bind this mutation to a LIVE-state epoch: the connection state at dispatch. If the app has
-      // since left live (entered seek, or teardown) by the time the request resolves, the success/
-      // rollback callbacks IGNORE it — they must never mutate the frozen snapshot store (finding 2).
-      const epoch = liveEpoch();
+      // Bind this mutation to the MONOTONIC connection-transition generation at dispatch (finding 1).
+      // If ANY boundary is crossed before the request resolves (live→seek, seek→live, teardown, or a
+      // fresh snapshot), the generation advances and BOTH callbacks bail before any store write — so
+      // a late kill can never re-insert a stale optimistic row into a frozen cut, a re-established
+      // live store, or a torn-down store. The connection STRING was insufficient: it is reusable
+      // (`live→seek→live` returns to `'live'`), so a round-trip would have falsely matched.
+      const gen = currentGen();
       // Optimistic: flip the live row to `cancelled` right away (D10 "optimistic state update").
       const prev = dashboardStore.getState().flows.get(id);
       if (prev) {
@@ -111,24 +114,28 @@ export function useFlowDetail(apiCallId: string | null): FlowDetailView {
         };
         dashboardStore.getState().patchFlowStatus(patch);
       }
-      return { prev, epoch };
+      return { prev, gen };
     },
     onError: (err: unknown, _id, ctx) => {
+      // GENERATION GUARD (finding 1) — checked FIRST, before any store mutation. If the app crossed
+      // a connection boundary after dispatch (entered seek, returned to live, was torn down, or took
+      // a fresh snapshot), the store the optimistic row belonged to is gone; re-inserting prev would
+      // leak stale live/future data across the boundary. Surface the error but make NO store write.
+      if (!ctx || ctx.gen !== currentGen()) {
+        if (err instanceof UnauthorizedError) setKillState({ phase: 'error', message: 'session expired' });
+        else if (isForbidden(err)) setKillState({ phase: 'forbidden' });
+        else setKillState({ phase: 'error', message: err instanceof Error ? err.message : 'kill failed' });
+        return;
+      }
       if (err instanceof UnauthorizedError) {
-        // A 401 already routed through centralized teardown (connection.ts), which CLEARED the
-        // live store. Rolling back here would re-insert the optimistic row's prior value into the
-        // now-cleared store — leaking session data past the auth boundary. So on 401 we do NOT
-        // roll back; teardown wins. Reflect a generic expired-session error.
+        // A 401 routed through centralized teardown (connection.ts), which CLEARS the live store —
+        // but teardown bumps the generation, so the guard above already caught it. This remains as a
+        // belt-and-braces guard: never roll back on a 401; reflect a generic expired-session error.
         setKillState({ phase: 'error', message: 'session expired' });
         return;
       }
-      // EPOCH GUARD (finding 2): if the app entered seek (or was torn down) after dispatch, the
-      // store now holds a FROZEN snapshot — re-inserting the optimistic row's prior value would
-      // leak live/future data into the frozen cut. Skip the rollback; only surface the error.
-      if (ctx && ctx.epoch === liveEpoch() && ctx.prev) {
-        // Non-auth failure (e.g. 403) in the SAME live epoch: undo the optimistic flip.
-        dashboardStore.getState().upsertFlow(ctx.prev);
-      }
+      // Same generation (still the live store this row belongs to): undo the optimistic flip.
+      if (ctx.prev) dashboardStore.getState().upsertFlow(ctx.prev);
       if (isForbidden(err)) {
         // 403 = mutations disabled / bad CSRF (D7). Distinct UI from a generic failure.
         setKillState({ phase: 'forbidden' });
@@ -136,8 +143,13 @@ export function useFlowDetail(apiCallId: string | null): FlowDetailView {
         setKillState({ phase: 'error', message: err instanceof Error ? err.message : 'kill failed' });
       }
     },
-    onSuccess: (_res, id) => {
+    onSuccess: (_res, id, ctx) => {
       setKillState({ phase: 'killed' });
+      // GENERATION GUARD (finding 1): if a boundary was crossed after dispatch, the optimistic
+      // `cancelled` row already living in the (now foreign) store must NOT be re-asserted, and the
+      // detail query for a flow absent from the current cut must not be invalidated/refetched into
+      // it. Reflect the killed state for the user but make NO store/query effect.
+      if (!ctx || ctx.gen !== currentGen()) return;
       void queryClient.invalidateQueries({ queryKey: queryKeys.flowDetail(id) });
     },
   });
@@ -176,14 +188,15 @@ export function useFlowDetail(apiCallId: string | null): FlowDetailView {
 }
 
 /**
- * A coarse "are we LIVE" epoch for binding a kill mutation to the state at dispatch (finding 2).
- * `seeking` and the post-teardown `idle`/`closed`/`error` states are all NON-live; only `live`
- * (and the transient `connecting`) own the mutable store. The epoch is just the connection state
- * string — if it differs at resolve time, the optimistic rollback is skipped so it can't write
- * into a frozen snapshot or a torn-down store.
+ * The store's MONOTONIC connection-transition generation, for binding a kill mutation to the exact
+ * connection epoch at dispatch (finding 1). It advances on EVERY boundary crossing (live↔seek↔
+ * teardown↔fresh-snapshot) and never repeats, so — unlike the reusable connection STRING — a
+ * `live→seek→live` round-trip yields a DIFFERENT generation. If it differs at resolve time, both
+ * mutation callbacks bail before any store write, so a stale optimistic row can never be re-inserted
+ * into a frozen snapshot, a re-established live store, or a torn-down store.
  */
-function liveEpoch(): string {
-  return dashboardStore.getState().connection;
+function currentGen(): number {
+  return dashboardStore.getState().connEpoch;
 }
 
 /**

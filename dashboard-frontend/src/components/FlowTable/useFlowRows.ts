@@ -41,9 +41,11 @@ function mergeRows(
   const restById = new Map(queryFlows.map((f) => [f.api_call_id, f]));
   const seen = new Set<string>();
   const merged: FlowSummary[] = [];
-  // Live rows first, in store order. The live row's status/usage WIN, but `cost`/`terminal_reason`
-  // fall back to the REST roll-up when the live frame lacks them — so a live update never blanks
-  // the server's cost/terminal_reason.
+  // Live rows first, in store order. The live row's status/usage WIN, but the REST-authoritative
+  // request-line + roll-up fields (endpoint/method/uri, finished/elapsed, cost, terminal_reason)
+  // are backfilled from the REST row — so a WS-CREATED row stops showing placeholder method/uri
+  // once the authoritative REST row arrives (finding 3), and a live update never blanks the
+  // server's cost/terminal_reason (finding 5).
   for (const id of order) {
     const f = flows.get(id);
     if (f) {
@@ -65,20 +67,60 @@ function mergeRows(
 }
 
 /**
- * Live row wins on status/usage/timing (the socket is freshest), but RETAINS the REST roll-up
- * fields (`cost`, `terminal_reason`) when the live row's are absent (null/undefined). The
- * `flow_status` store patch defaults these to null until a frame carries them, so without this a
- * live update would drop the server's cost/terminal_reason (finding 5). Returns the live row
- * unchanged when there is no REST counterpart or nothing to backfill.
+ * Reconciles a live store row with its REST counterpart. The live frame is the FRESHEST source of
+ * the volatile flow STATE (`status`, `usage`), so those always win. But a WS-created row (one the
+ * `flow_status` patch minted before the REST list arrived) carries PLACEHOLDERS for the fields the
+ * frame cannot author — `method:'POST'`, `uri:''`, and null `finished/elapsed/cost/terminal_reason`
+ * — so it kept showing those placeholders even after the authoritative REST row landed (finding 3).
+ *
+ * Field policy:
+ *  - status / usage / started_ms: LIVE wins (the socket owns the live state + stream start).
+ *  - method / uri: REST-authoritative request line — REST wins when present (it never changes over a
+ *    flow's life, so this only replaces a WS placeholder; falls back to live if REST omitted it).
+ *  - model_requested / model_served / upstream_target / response_id: LIVE wins when present, else
+ *    REST backfills (a WS-created row may not have learned the served model/target yet).
+ *  - finished_ms / elapsed_ms / cost / terminal_reason: roll-up/terminal fields — LIVE wins when it
+ *    HAS them (a completing flow streams elapsed/finished), else the REST roll-up backfills, so a
+ *    live update never blanks the server's values (finding 5).
+ *
+ * Returns the live row UNCHANGED when nothing actually differs, to avoid needless object churn (and
+ * keep referential stability for the virtualizer).
  */
 function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): FlowSummary {
   if (!rest) return live;
-  const cost = live.cost ?? rest.cost ?? null;
-  const terminalReason = live.terminal_reason ?? rest.terminal_reason ?? null;
-  if (cost === (live.cost ?? null) && terminalReason === (live.terminal_reason ?? null)) {
-    return live; // nothing to backfill — avoid a needless object churn
-  }
-  return { ...live, cost, terminal_reason: terminalReason };
+  const merged: FlowSummary = {
+    ...live,
+    // REST-authoritative request line: replace a WS placeholder with the real value.
+    method: rest.method || live.method,
+    uri: rest.uri || live.uri,
+    // Live-first, REST-backfilled correlation/model fields.
+    response_id: live.response_id ?? rest.response_id ?? null,
+    model_requested: live.model_requested ?? rest.model_requested ?? null,
+    model_served: live.model_served ?? rest.model_served ?? null,
+    upstream_target: live.upstream_target ?? rest.upstream_target ?? null,
+    // Live-first, REST-backfilled roll-up / terminal fields.
+    finished_ms: live.finished_ms ?? rest.finished_ms ?? null,
+    elapsed_ms: live.elapsed_ms ?? rest.elapsed_ms ?? null,
+    cost: live.cost ?? rest.cost ?? null,
+    terminal_reason: live.terminal_reason ?? rest.terminal_reason ?? null,
+  };
+  return shallowEqualSummary(live, merged) ? live : merged;
+}
+
+/** True when every `FlowSummary` field is identical (so the merge can return `live` unchanged). */
+function shallowEqualSummary(a: FlowSummary, b: FlowSummary): boolean {
+  return (
+    a.method === b.method &&
+    a.uri === b.uri &&
+    (a.response_id ?? null) === (b.response_id ?? null) &&
+    (a.model_requested ?? null) === (b.model_requested ?? null) &&
+    (a.model_served ?? null) === (b.model_served ?? null) &&
+    (a.upstream_target ?? null) === (b.upstream_target ?? null) &&
+    (a.finished_ms ?? null) === (b.finished_ms ?? null) &&
+    (a.elapsed_ms ?? null) === (b.elapsed_ms ?? null) &&
+    (a.cost ?? null) === (b.cost ?? null) &&
+    (a.terminal_reason ?? null) === (b.terminal_reason ?? null)
+  );
 }
 
 function applyFilters(rows: FlowSummary[], f: FlowFilters): FlowSummary[] {

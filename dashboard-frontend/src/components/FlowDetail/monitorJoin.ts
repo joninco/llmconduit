@@ -12,6 +12,13 @@ import type { DebugSegment, DebugTimelineEvent, DebugRequest, DebugRequestStatus
 
 export interface MonitorJoin {
   segments: DebugSegment[];
+  /**
+   * The per-segment MonitorHub `monitor_seq`, sliced in LOCKSTEP with `segments` (same length/order).
+   * It is the cross-source merge cursor the deltas bridge needs (finding 2): the seq the socket
+   * stamped onto the `segment_append` frame that delivered each segment. `null` when no seq was
+   * provided (`opts.seqs` omitted), which makes the merge append the live run verbatim.
+   */
+  segmentSeqs: (number | null)[];
   events: DebugTimelineEvent[];
   /** Latest request_upsert for this response (stats/model), if any. */
   request: DebugRequest | null;
@@ -21,7 +28,7 @@ export interface MonitorJoin {
   error: string | null;
 }
 
-const EMPTY: MonitorJoin = { segments: [], events: [], request: null, status: null, error: null };
+const EMPTY: MonitorJoin = { segments: [], segmentSeqs: [], events: [], request: null, status: null, error: null };
 
 /**
  * Filters `monitor` to `responseId` and folds it into the per-flow view. Order is preserved
@@ -41,6 +48,9 @@ export function joinMonitor(
 ): MonitorJoin {
   if (!responseId) return EMPTY;
   const segments: DebugSegment[] = [];
+  // Per-segment `monitor_seq`, pushed in lockstep with `segments` (the merge cursor — finding 2).
+  // `null` for every segment when no `opts.seqs` was supplied (the merge then appends verbatim).
+  const segmentSeqs: (number | null)[] = [];
   const events: DebugTimelineEvent[] = [];
   let request: DebugRequest | null = null;
   let status: DebugRequestStatus | null = null;
@@ -61,7 +71,11 @@ export function joinMonitor(
         }
         break;
       case 'segment_append':
-        if (msg.response_id === responseId) segments.push(msg.segment);
+        if (msg.response_id === responseId) {
+          segments.push(msg.segment);
+          // Carry this segment's arrival seq (the merge watermark). No `seqs` ⇒ null (append-all).
+          segmentSeqs.push(seqs ? seqs[i] ?? null : null);
+        }
         break;
       case 'event_append':
         if (msg.response_id === responseId) events.push(msg.event);
@@ -78,5 +92,5 @@ export function joinMonitor(
     }
   }
 
-  return { segments, events, request, status, error };
+  return { segments, segmentSeqs, events, request, status, error };
 }

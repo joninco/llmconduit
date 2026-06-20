@@ -26,7 +26,7 @@ import { elapsedMs, flowCost } from '../FlowTable/flowModel';
 import { JsonPane } from '../viz/JsonPane';
 import { combineMiddleDiff, diffLayers } from './diff';
 import { joinMonitor } from './monitorJoin';
-import { mergeDeltas, normalizeRestDeltas } from './deltas';
+import { mergeDeltas, normalizeRestDeltas, type SeqSegment } from './deltas';
 import { DeltasPanel } from './DeltasPanel';
 import { Timeline } from './Timeline';
 import { useScrollSync } from './useScrollSync';
@@ -55,10 +55,16 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
 
   // Deltas shown in the sub-panel = the REST replay (base) MERGED with the live monitor segments
   // (appended) — finding 5. While seeking, the live REST replay (`detail.deltas`) is post-cut and
-  // withheld; the cut-bounded monitor join alone supplies the frozen stream (finding 1).
+  // withheld; the cut-bounded monitor join alone supplies the frozen stream (finding 1). The merge
+  // de-dups the seam by MonitorHub seq (finding 2): the live side carries `join.segmentSeqs` (the
+  // per-segment `monitor_seq`) so a coalesced/same-millisecond tail merges without dup or drop.
+  const liveSegs = useMemo<SeqSegment[]>(
+    () => join.segments.map((segment, i) => ({ segment, seq: join.segmentSeqs[i] ?? null })),
+    [join.segments, join.segmentSeqs],
+  );
   const segments = useMemo(
-    () => mergeDeltas(normalizeRestDeltas(frozenDetail?.deltas), join.segments),
-    [frozenDetail?.deltas, join.segments],
+    () => mergeDeltas(normalizeRestDeltas(frozenDetail?.deltas), liveSegs),
+    [frozenDetail?.deltas, liveSegs],
   );
 
   // Structural diffs between the captured layers (path → kind).
