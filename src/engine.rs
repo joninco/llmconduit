@@ -1436,7 +1436,13 @@ impl Gateway {
         // which may be pruned/evicted by the time a long-running flow finalizes. The
         // route/provider + final usage are also carried on the token (set by the
         // failover/routing layers + the usage upsert below), making the guard's
-        // terminal metrics fully independent of FlowStore retention. First-writer-wins.
+        // terminal metrics fully independent of FlowStore retention.
+        //
+        // D5 R4 (MEDIUM): this `upstream_model` is the engine's PRE-routing model; the
+        // leaf rewrites `request.model` on failover/routing and then finalizes the ACTUAL
+        // on-wire model onto the same token (`set_model_served_final`, which overwrites
+        // this guess). So this write is the FALLBACK for the no-leaf / error-before-
+        // dispatch path; the leaf's value wins when a flow reaches the wire.
         serving_token.set_model_served(upstream_model.clone());
         // D1 (R1 #9): bind this flow's `response_id` to its inbound `api_call_id`
         // exactly ONCE, at the RequestStarted emission seam (not pre-spawn). No-op

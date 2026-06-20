@@ -957,7 +957,21 @@ impl UpstreamClient for ReqwestUpstreamClient {
         {
             serving.set_provider("primary");
         }
+        // D5 R4 (MEDIUM): the shared serving token, captured before `backend.request` is
+        // moved into `sanitize`. The leaf finalizes the served model onto it below.
+        let serving = backend.serving.clone();
         let request = sanitize_chat_request(backend.request, self.flatten_content);
+        // D5 R4 (MEDIUM): finalize the ACTUAL on-wire model onto the shared serving
+        // token, overwriting the engine's PRE-routing guess (and any earlier
+        // failed-provider leaf write). This leaf is the single point that sees the FINAL
+        // `request.model` after provider remap + `sanitize_chat_request` — the same model
+        // captured into the FlowStore record by `capture_upstream_body` — so the D5 metrics
+        // bucket (which reads `model_served` off this token) attributes a routed/failover
+        // request to the model the backend actually answered as, not the requested one. On
+        // failover/routing the LAST leaf to run (the serving / last-tried provider) wins.
+        if let Some(serving) = &serving {
+            serving.set_model_served_final(request.model.clone());
+        }
 
         // First attempt. On a non-2xx whose body indicates a context/completion
         // token-limit overflow, shrink `max_completion_tokens` and retry ONCE.
@@ -2431,10 +2445,19 @@ struct ServingInfo {
     /// the token so the L1 telemetry guard can record terminal metrics from the token
     /// (which it already holds) even after the FlowStore record is pruned/evicted — the
     /// authoritative metrics layer must not undercount completed requests when retention
-    /// drops the record before finalize. `model_served` is first-writer-wins (the engine
-    /// sets the resolved model once); `usage` is last-write (the cumulative total grows
-    /// across chunks, mirroring the FlowStore `record_usage` upsert).
+    /// drops the record before finalize. `usage` is last-write (the cumulative total
+    /// grows across chunks, mirroring the FlowStore `record_usage` upsert).
+    ///
+    /// `model_served` is **actual-serving-attempt-wins** (D5 R4 MEDIUM), NOT
+    /// first-writer-wins: the engine pre-writes its PRE-routing guess (a fallback for the
+    /// no-leaf / error-before-dispatch path), but failover/routing rewrite `request.model`
+    /// before the leaf POSTs, so the leaf — the single point that sees the FINAL on-wire
+    /// model after provider remap + `sanitize_chat_request` — overwrites the guess with
+    /// the model the backend actually answered as. `model_finalized` records whether a
+    /// leaf has finalized the model so a later engine guess (e.g. a failover rebuild
+    /// re-entering `run_turn`) can never clobber the authoritative leaf value.
     model_served: Option<String>,
+    model_finalized: bool,
     usage: Option<crate::dashboard_flow::FlowUsage>,
 }
 
@@ -2473,14 +2496,32 @@ impl ServingToken {
         }
     }
 
-    /// Record the resolved served model (D5 R3 MEDIUM), first-writer-wins. The engine
-    /// sets this once in `run_turn` from the resolved `upstream_model`, so the L1 guard
-    /// can attribute the metrics bucket's model without re-reading the (evictable) record.
+    /// Record the engine's PRE-routing served-model GUESS (D5 R3/R4 MEDIUM). The engine
+    /// sets this once in `run_turn` from the resolved (but still pre-routing)
+    /// `upstream_model` so the L1 guard can attribute a metrics bucket even on a path that
+    /// never reaches the leaf (an error before dispatch). It is a FALLBACK only: it never
+    /// overwrites a leaf-finalized model (`model_finalized`), and among guesses it is
+    /// first-writer-wins. The leaf's [`set_model_served_final`] is authoritative — see the
+    /// `model_served` field doc for why pre-routing attribution misroutes failover/routing.
     pub fn set_model_served(&self, model: impl Into<String>) {
         let mut info = self.lock();
-        if info.model_served.is_none() {
+        if !info.model_finalized && info.model_served.is_none() {
             info.model_served = Some(model.into());
         }
+    }
+
+    /// Record the leaf-FINALIZED served model (D5 R4 MEDIUM): the actual on-wire
+    /// `request.model` after provider rewrite + `sanitize_chat_request`, the same model
+    /// the leaf captures via `set_upstream`. **Actual-serving-attempt-wins** — it
+    /// overwrites the engine's pre-routing guess (and any earlier failed-provider leaf
+    /// write), and marks the model finalized so a later engine guess cannot clobber it. On
+    /// failover/routing the LAST leaf to run is the serving (or last-tried) provider, so
+    /// the metrics bucket attributes the model the backend actually answered as — not the
+    /// requested / pre-routing one.
+    pub fn set_model_served_final(&self, model: impl Into<String>) {
+        let mut info = self.lock();
+        info.model_served = Some(model.into());
+        info.model_finalized = true;
     }
 
     /// Record the flow's FINAL cumulative usage (D5 R3 MEDIUM), last-write-wins —
@@ -5075,6 +5116,7 @@ mod tests {
 
     // ---- D2 leaf on-wire capture (real ReqwestUpstreamClient ↔ wiremock) ----
 
+    use crate::dashboard_flow::AbortHub;
     use crate::dashboard_flow::DashboardFlowStore;
     use futures::StreamExt as _;
     use wiremock::Mock;
@@ -5446,6 +5488,125 @@ mod tests {
             token.snapshot().1.as_deref(),
             Some("real-vllm"),
             "the failover layer's real provider name wins; the nested leaf did NOT tag `primary`"
+        );
+    }
+
+    #[tokio::test]
+    async fn failover_remap_metrics_bucket_is_served_model_not_requested() {
+        // D5 R4 (MEDIUM): when failover/routing rewrites `request.model`, the D5 metrics
+        // model bucket must attribute the ACTUAL on-wire (served) model — read off the
+        // shared `ServingToken` — NOT the engine's PRE-routing guess. Drive a real
+        // failover client end-to-end through the real leaf: the client requests
+        // `requested-model`, but the provider's `upstream_model` remaps it to
+        // `served-model`, so `request_for_provider` rewrites `request.model` BEFORE the
+        // leaf POSTs. The leaf finalizes `served-model` onto the token
+        // (`set_model_served_final`), overwriting the engine's pre-routing
+        // `requested-model` guess seeded below. Assert the token's metrics model (the
+        // exact value the L1 guard records) is `served-model`, and confirm it end-to-end
+        // through a real guard into the MetricsLayer bucket.
+        let server = MockServer::start().await;
+
+        // Enabled store so the leaf also captures the record (joins by response_id).
+        let store = DashboardFlowStore::new();
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+
+        // Real leaf pointed at wiremock, NOT bare (it is wrapped by failover).
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let leaf = ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        )
+        .with_flow_store(store.clone());
+
+        // The provider remaps the requested model to the model it actually serves.
+        let failover = FailoverUpstreamClient::new(
+            vec![FailoverUpstreamProvider::new(
+                "real-vllm",
+                leaf,
+                Some("served-model".to_string()),
+                None,
+                JsonMap::new(),
+            )],
+            std::time::Duration::from_secs(0),
+        );
+
+        let token = Arc::new(super::ServingToken::default());
+        // The engine pre-writes its PRE-routing guess (the requested model) onto the
+        // token, exactly as `run_turn` does before dispatch.
+        token.set_model_served("requested-model");
+
+        let backend = BackendChatRequest::new(
+            family_request("requested-model"),
+            None,
+            Some(response_id.clone()),
+            Some(Arc::clone(&token)),
+        );
+        let mut stream = failover
+            .stream_chat_completion(&backend)
+            .await
+            .expect("stream opens");
+        while stream.next().await.is_some() {}
+
+        // The authoritative value the metrics layer reads off the token is the ACTUAL
+        // served model — the leaf's finalized value overwrote the pre-routing guess.
+        let (model_served, _usage) = token.metrics_snapshot();
+        assert_eq!(
+            model_served.as_deref(),
+            Some("served-model"),
+            "token metrics model is the leaf-finalized served model, not the pre-routing guess"
+        );
+        assert_ne!(
+            model_served.as_deref(),
+            Some("requested-model"),
+            "the pre-routing requested model did NOT win"
+        );
+        // The leaf also captured the remapped model onto the FlowStore record.
+        let record = store.detail(&api_call_id).expect("record");
+        assert_eq!(record.model_served.as_deref(), Some("served-model"));
+
+        // End-to-end: drive a REAL guard finalize → MetricsLayer (exactly the engine's
+        // terminal seam) and assert the bucket model is the served model. The guard reads
+        // `model_served` off the token via `metrics_snapshot`, so this proves a
+        // failover-remapped request is bucketed under the model the backend answered as.
+        let guard = store
+            .engine_guard(&api_call_id, Arc::clone(&token), &AbortHub::new())
+            .expect("claim");
+        guard.finalize(crate::dashboard_flow::FlowStatus::Completed, None);
+        let inputs = guard.terminal_metrics().expect("terminal metrics");
+        assert_eq!(inputs.model_served.as_deref(), Some("served-model"));
+
+        let metrics = crate::metrics::MetricsLayer::new();
+        metrics.record_terminal(
+            crate::dashboard_flow::FlowStatus::Completed,
+            inputs.model_served.as_deref(),
+            &inputs.endpoint,
+            inputs.upstream.as_deref(),
+            guard.elapsed().as_millis(),
+            inputs.usage,
+        );
+        let view = metrics.view();
+        let (key, _counts) = view
+            .window_1m
+            .buckets
+            .iter()
+            .next()
+            .expect("a metrics bucket");
+        assert_eq!(
+            key.model, "served-model",
+            "D5 metrics bucket attributes the actual served model on a failover remap"
         );
     }
 }
