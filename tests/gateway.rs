@@ -1348,6 +1348,117 @@ async fn web_search_continuation_round_relaxes_forced_tool_choice() {
 }
 
 #[tokio::test]
+async fn web_search_round_ceiling_terminates_loop() {
+    // U5: a model that re-requests `web_search` every round must hit the round
+    // ceiling and error out rather than loop forever — mirroring
+    // `image_agent_round_ceiling_terminates_loop`. Queue far more forced
+    // web_search rounds than the configured limit; the loop must terminate at
+    // the effective limit (default `max_web_search_rounds: 5`) and the upstream
+    // must be called a BOUNDED number of times (==5), proving finiteness.
+    let upstream = MockUpstream::default();
+    for n in 0..12 {
+        upstream
+            .push_response(vec![Ok(tool_call_chunk(
+                &format!("chat-{n}"),
+                &format!("call_ws_{n}"),
+                "web_search",
+                "{\"query\":\"weather seattle\"}",
+            ))])
+            .await;
+    }
+    let search = MockSearch::default();
+    let gateway = test_gateway(upstream.clone(), search.clone());
+
+    // The declared web_search tool + forced tool_choice make the emitted call
+    // classify as `ToolKind::WebSearch`, so it enters the round-counting branch
+    // (without the declared tool the call is treated as a client Function and
+    // `had_web_search` stays false — a non-ceiling path).
+    let mut request = base_request(vec![user_message("weather?")]);
+    request.tools = vec![ToolSpec::WebSearch {
+        external_web_access: Some(true),
+        filters: None,
+        user_location: None,
+        search_context_size: None,
+        search_content_types: None,
+    }];
+    request.tool_choice = json!({"type": "function", "function": {"name": "web_search"}});
+
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    assert!(
+        event_names(&events).contains(&"response.failed"),
+        "web-search round ceiling must terminate the loop"
+    );
+    // Bounded: exactly the effective limit (default config caps at 5) of
+    // upstream rounds ran — not the 12 queued — so the loop is finite.
+    assert_eq!(
+        upstream.requests().await.len(),
+        5,
+        "web-search loop must stop at the configured limit (5), not run unbounded"
+    );
+    // The search client ran once per round up to the limit.
+    assert_eq!(
+        search.queries.lock().await.len(),
+        5,
+        "search must run a bounded number of times matching the round limit"
+    );
+}
+
+#[tokio::test]
+async fn web_search_round_ceiling_caps_configured_limit() {
+    // U5: `WEB_SEARCH_ROUNDS_HARD_CEILING = 25` (`src/engine.rs`) caps the
+    // configured `max_web_search_rounds` via `.min(WEB_SEARCH_ROUNDS_HARD_CEILING)`.
+    // With the config set ABOVE 25 (100), a forced web_search loop must still
+    // terminate at exactly round 25 — proving the hard ceiling overrides the
+    // higher configured value.
+    let upstream = MockUpstream::default();
+    for n in 0..40 {
+        upstream
+            .push_response(vec![Ok(tool_call_chunk(
+                &format!("chat-{n}"),
+                &format!("call_ws_{n}"),
+                "web_search",
+                "{\"query\":\"weather seattle\"}",
+            ))])
+            .await;
+    }
+    let search = MockSearch::default();
+    let mut config = test_config();
+    config.max_web_search_rounds = 100;
+    assert!(
+        config.brave_api_key.is_some(),
+        "web_search is only server-runnable when Brave is configured"
+    );
+    let gateway = test_gateway_with_config(upstream.clone(), search.clone(), config);
+
+    let mut request = base_request(vec![user_message("weather?")]);
+    request.tools = vec![ToolSpec::WebSearch {
+        external_web_access: Some(true),
+        filters: None,
+        user_location: None,
+        search_context_size: None,
+        search_content_types: None,
+    }];
+    request.tool_choice = json!({"type": "function", "function": {"name": "web_search"}});
+
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    assert!(
+        event_names(&events).contains(&"response.failed"),
+        "web-search hard ceiling must terminate the loop despite the higher config"
+    );
+    // Termination at exactly round 25 (the hard ceiling), NOT round 100.
+    assert_eq!(
+        upstream.requests().await.len(),
+        25,
+        "the .min(WEB_SEARCH_ROUNDS_HARD_CEILING) cap must stop the loop at round 25"
+    );
+    assert_eq!(
+        search.queries.lock().await.len(),
+        25,
+        "search must run exactly up to the hard ceiling, not the configured 100"
+    );
+}
+
+#[tokio::test]
 async fn degrades_gracefully_when_web_search_replay_baseline_is_missing() {
     let upstream = MockUpstream::default();
     upstream
