@@ -141,17 +141,16 @@ dispatcher, per-session LRU+TTL `ImageCache`, gating. Tests: `tests/gateway.rs` 
 > **Sequencing:** T1 → (T2, T9); T7 → T8; T5 ↔ T6 coordinate; T10, T11 independent. T1 first (it
 > builds the typed resolver T2/T9 consume).
 
-## STATUS (T5 APPROVED — orchestrator resume session `thermo-followups-resume`)
+## STATUS (T3 APPROVED — orchestrator resume session `thermo-followups-resume`)
 
-**DONE (Codex-xhigh APPROVED + committed):** T1, T2, T7, T8, T9, T6, T5 (7 of 11).
-**REMAINING (in dependency order):** T3 → T4 → T10 → T11. Serial (`--agents 1`); T3/T4/T10 are
+**DONE (Codex-xhigh APPROVED + committed):** T1, T2, T7, T8, T9, T6, T5, T3 (8 of 11).
+**REMAINING (in dependency order):** T4 → T10 → T11. Serial (`--agents 1`); T4/T10 are
 mutually independent. Each remaining task gets its OWN fresh agent (clean context per task).
-  - **T3** (extract `ToolDeltaGate` from `run_turn`): independent.
   - **T4** (split `vision.rs` 1,364 lines → `vision/{cache,strip,client}.rs` + `redaction.rs`; move
     image-agent suite to `tests/image_agent.rs`): pure structural move.
   - **T10** (AppError failover policy + G1 retry logging): independent.
   - **T11** (streaming/logging test-quality + catalog-parser dedup, depends on T1): independent.
-**Review log:** `/tmp/thermo-followup-review.md` holds 8 verdicts (T1×2, T2×3, T7×2, T8×1, T9×4, T6×2, T5×2).
+**Review log:** `/tmp/thermo-followup-review.md` holds 8 verdicts (T1×2, T2×3, T7×2, T8×1, T9×4, T6×2, T5×2, T3×4).
 **Per-task loop** = implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → append verdict to `/tmp/thermo-followup-review.md` → update this plan. STOP when all 11
 APPROVED (see `.ralph/GOAL.md`).
@@ -211,10 +210,16 @@ the gating side-channel only.
 **Depends on:** 11.1.
 
 ### Task 11.3 — Extract ToolDeltaGate from run_turn
-**Priority:** HIGH · **Spec:** `.ralph/specs/T3-tooldeltagate-extraction.md`
-Extract the `analyzeImage` delta-buffer state machine + duplicated monitor/SSE emission paths out
-of `run_turn` (`engine.rs:1277`) into a `ToolDeltaGate` with unit tests.
-**Files:** `src/engine.rs` (+ new module), tests.
+**Priority:** HIGH · **Spec:** `.ralph/specs/T3-tooldeltagate-extraction.md` · **Commits:** `39dad35` → `592631c` → `857efb6` → `b03118e`
+**Status:** ✅ Codex-xhigh APPROVED (R4). New `src/tool_delta_gate.rs` (`ToolDeltaGate`, pure decision
+machine, no tx/async/monitor deps) owns the `analyzeImage` delta-buffer state (Pending/Drop/Emit, per-call
++ total DoS caps, budget reclaim); engine drives it via one `drive_delta_decision`. Consolidated 5 literal
+duplicate emit sites → 1 `Gateway::emit_function_call_delta`. `engine.rs` −134, `run_turn` −136 (~14%); 10
+new gate unit tests. R1 (Vec-per-delta alloc MEDIUM + weak reclaim test LOW) → R2 (`DeltaDecision`
+None/One/Flush, flush MOVES the buffer; real reclaim test) → R3 (String-clone MEDIUM → borrowed lookup,
+moves) → R4 (last double-alloc LOW → `id.as_deref()`). Behavior byte-identical, emit order unchanged,
+gateway image-agent 39/39 + all suites green throughout.
+**Files:** `src/engine.rs`, `src/tool_delta_gate.rs` (new), `src/lib.rs`.
 
 ### Task 11.4 — Split vision.rs + image-agent test suite
 **Priority:** MEDIUM · **Spec:** `.ralph/specs/T4-vision-module-split.md`
