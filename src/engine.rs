@@ -1860,7 +1860,19 @@ impl Gateway {
         }
 
         let usage = accumulated_usage.into_response_usage();
-        let is_incomplete = last_finish_reason.as_deref() == Some("length");
+        // T7: typed terminal reason from the upstream finish_reason. `length` ⇒
+        // incomplete; everything else ⇒ completed. The typed reason is carried
+        // on the resource so the Anthropic converter gates reasoning-promotion
+        // on `reason.is_clean_stop()` (stop only), not on the event-type string
+        // — a future non-stop terminal reason arriving as `response.completed`
+        // can no longer wrongly promote.
+        let terminal_reason = crate::models::responses::TerminalReason::from_finish_reason(
+            last_finish_reason.as_deref(),
+        );
+        let is_incomplete = matches!(
+            terminal_reason,
+            crate::models::responses::TerminalReason::Length
+        );
         let resource = ResponseResource {
             id: response_id.clone(),
             object: "response".to_string(),
@@ -1884,6 +1896,7 @@ impl Gateway {
             } else {
                 None
             },
+            terminal_reason: Some(terminal_reason),
         };
         if self.monitor.is_enabled() {
             let final_preview = preview_json_limited_with_images(&resource, 128 * 1024);

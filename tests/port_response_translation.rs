@@ -193,6 +193,60 @@ async fn reasoning_only_at_length_stays_thinking() {
     assert_well_formed(&events);
 }
 
+/// T7: a NON-STOP terminal reason (`content_filter`) arriving as
+/// `response.completed` must NOT promote reasoning to text. Pre-T7 the converter
+/// gated promotion on `event_type == "response.completed"` and would have wrongly
+/// promoted; post-T7 it gates on the typed `terminal_reason` (`stop` only), so a
+/// `content_filter` completion stays a `thinking` block. The engine emits
+/// `response.completed` (not `incomplete`) for `content_filter`, so this proves
+/// the gate uses the typed reason, not the event type.
+#[tokio::test]
+async fn reasoning_only_at_content_filter_stays_thinking() {
+    let events = run_anthropic_stream(vec![
+        Ok(reasoning_chunk("chat-1", "filtered answer")),
+        Ok(finish_chunk("chat-1", "content_filter")),
+    ])
+    .await;
+
+    assert_eq!(
+        block_kinds(&events),
+        vec!["thinking"],
+        "content_filter terminal must stay a thinking block, not promote (T7)"
+    );
+    assert_eq!(thinking_payload(&events), "filtered answer");
+    assert!(
+        text_payload(&events).is_empty(),
+        "content_filter reasoning must not be promoted to text"
+    );
+    assert_well_formed(&events);
+}
+
+/// T7 R1: a `tool_calls` finish reason emits `response.completed` (not
+/// `incomplete`) with `terminal_reason: tool_calls`. The converter must parse
+/// the `tool_calls` wire spelling (NOT `tool_call` — the serde rename) and gate
+/// promotion on it: reasoning prefacing a tool-call batch stays a `thinking`
+/// block, never promoted. Pre-T7 (and the R1 serde mismatch) would have
+/// promoted via the `response.completed` event-type fallback.
+#[tokio::test]
+async fn reasoning_only_at_tool_calls_stays_thinking() {
+    let events = run_anthropic_stream(vec![
+        Ok(reasoning_chunk("chat-1", "let me search")),
+        Ok(finish_chunk("chat-1", "tool_calls")),
+    ])
+    .await;
+
+    assert_eq!(
+        block_kinds(&events),
+        vec!["thinking"],
+        "tool_calls terminal must stay a thinking block, not promote (T7 R1)"
+    );
+    assert!(
+        text_payload(&events).is_empty(),
+        "tool_calls reasoning must not be promoted to text"
+    );
+    assert_well_formed(&events);
+}
+
 /// reasoning carrying a signature is genuine CoT: it stays a `thinking` block
 /// (with its `signature_delta`) and is never promoted, even at `stop`.
 #[tokio::test]
@@ -202,7 +256,6 @@ async fn signed_reasoning_only_stays_thinking_at_stop() {
         Ok(finish_chunk("chat-1", "stop")),
     ])
     .await;
-
     assert_eq!(
         block_kinds(&events),
         vec!["thinking"],

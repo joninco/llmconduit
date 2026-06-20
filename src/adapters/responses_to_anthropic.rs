@@ -458,15 +458,21 @@ impl AnthropicStreamConverter {
     ) {
         self.completed = true;
         let mapped_stop_reason = response_stop_reason(data);
-        // Resolve any buffered reasoning before closing out: promote a
-        // reasoning-only turn to text only on a CLEAN completion, otherwise
-        // flush genuine CoT as thinking. Promotion is gated on
-        // `response.completed` (a true `finish_reason:stop`); EVERY
-        // `response.incomplete` terminal -- regardless of its reason
-        // (`max_output_tokens`, `content_filter`, or any future reason) -- is
-        // NOT a clean stop and must stay a `thinking` block, never promoted.
-        let clean_completed = event_type == "response.completed";
-        self.flush_reasoning_terminal(clean_completed, output);
+        // T7: resolve any buffered reasoning before closing out, promoting a
+        // reasoning-only turn to text ONLY on a CLEAN STOP (`terminal_reason:
+        // stop`). The gate reads the typed terminal reason the engine carries
+        // on the resource (not the event-type string), so a future non-stop
+        // terminal reason arriving as `response.completed` can no longer
+        // wrongly promote — `response.incomplete` is never a clean stop, and a
+        // non-`stop` `response.completed` (e.g. `content_filter`) is not
+        // either. Fallback: if the typed reason is absent (older event / a
+        // non-terminal resource), only a literal `response.completed` is
+        // treated as a clean stop (preserves the pre-T7 behavior for any path
+        // the engine did not tag).
+        let clean_stop = response_terminal_reason(data)
+            .map(|reason| reason.is_clean_stop())
+            .unwrap_or_else(|| event_type == "response.completed");
+        self.flush_reasoning_terminal(clean_stop, output);
         self.close_open_block(output);
         let usage = response_usage(data);
         if let Some(usage) = usage.as_ref() {
@@ -622,23 +628,24 @@ impl AnthropicStreamConverter {
     ///
     /// If reasoning was the *only* output this turn (no text or tool blocks),
     /// the backend put the answer in the reasoning channel: promote it to a
-    /// `text` block so the client renders it -- but ONLY on a clean completion
-    /// (`response.completed`, a true `finish_reason:stop`) and only when it is
-    /// not genuine chain-of-thought (no signature). EVERY `response.incomplete`
-    /// terminal -- whatever its reason (`max_output_tokens`, `content_filter`,
-    /// or any future reason) -- is not a clean stop, so `clean_completed` is
-    /// false and the buffer stays a `thinking` block. Once any content has
-    /// started, leftover reasoning is just a normal preface and is flushed as a
+    /// `text` block so the client renders it -- but ONLY on a CLEAN STOP (a
+    /// true `finish_reason:stop`, surfaced as `terminal_reason: stop` since
+    /// T7) and only when it is not genuine chain-of-thought (no signature).
+    /// EVERY other terminal reason -- `length` (`response.incomplete`), a
+    /// future `content_filter` arriving as `response.completed`, or any
+    /// non-`stop` reason -- is not a clean stop, so `clean_stop` is false and
+    /// the buffer stays a `thinking` block. Once any content has started,
+    /// leftover reasoning is just a normal preface and is flushed as a
     /// `thinking` block.
     fn flush_reasoning_terminal(
         &mut self,
-        clean_completed: bool,
+        clean_stop: bool,
         output: &mut Vec<AnthropicStreamEvent>,
     ) {
         if self.reasoning_buffer.is_empty() && self.reasoning_signature.is_none() {
             return;
         }
-        let promote = clean_completed
+        let promote = clean_stop
             && !self.content_started
             && !self.has_tool_calls
             && self.reasoning_signature.is_none();
@@ -1019,6 +1026,27 @@ fn response_stop_reason(data: &Value) -> Option<String> {
         });
     }
     None
+}
+
+/// Typed terminal reason the engine carries on the terminal resource (T7).
+/// `None` only when the field is ABSENT (a non-terminal resource, or an older
+/// event that the engine did not tag — the caller falls back to the event-type
+/// string). A PRESENT-but-unrecognized reason maps to `Other` (non-clean), NOT
+/// `None` — so a future reason the converter doesn't know still gates as
+/// non-clean rather than falling back to the event-type string (T7 R1 fix).
+/// Reads `data.response.terminal_reason`.
+fn response_terminal_reason(data: &Value) -> Option<crate::models::responses::TerminalReason> {
+    use crate::models::responses::TerminalReason;
+    data.get("response")
+        .and_then(|response| response.get("terminal_reason"))
+        .and_then(Value::as_str)
+        .map(|reason| match reason {
+            "stop" => TerminalReason::Stop,
+            "length" => TerminalReason::Length,
+            "tool_calls" => TerminalReason::ToolCall,
+            "content_filter" => TerminalReason::ContentFilter,
+            _ => TerminalReason::Other,
+        })
 }
 
 #[cfg(test)]

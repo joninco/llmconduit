@@ -493,6 +493,59 @@ pub struct ResponseCompletedPayload {
     pub response: ResponseResource,
 }
 
+/// Typed terminal reason for a canonical response (T7). The engine sets this
+/// from the upstream `finish_reason` at terminal emission; G8 reasoning-
+/// promotion gating reads it (`Stop` ⇒ clean stop ⇒ may promote reasoning to
+/// text) instead of string-matching the event type (`response.completed` vs
+/// `response.incomplete`), so a future non-stop terminal reason arriving as
+/// `response.completed` can no longer wrongly promote.
+///
+/// Serialized as a kebab/snake string on the wire (`"stop"`, `"length"`,
+/// `"tool_calls"`, `"content_filter"`, `"other"`). Unknown upstream finish
+/// reasons map to `Other` (non-clean ⇒ never promote).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalReason {
+    /// `finish_reason: stop` — a clean completion. The ONLY reason that permits
+    /// promoting a reasoning-only turn to a `text` block (G8).
+    Stop,
+    /// `finish_reason: length` — hit the output-token cap (`response.incomplete`,
+    /// `incomplete_details.reason: max_output_tokens`). Never promote.
+    Length,
+    /// `finish_reason: tool_calls` — the turn ended on a tool-call batch. Never
+    /// promote (the reasoning prefaced tools, not a final answer). Serialized as
+    /// `tool_calls` (matching the upstream finish_reason vocabulary), NOT
+    /// `tool_call` (which `rename_all = "snake_case"` would produce).
+    #[serde(rename = "tool_calls")]
+    ToolCall,
+    /// `finish_reason: content_filter` — upstream content filter blocked output.
+    /// Never promote.
+    ContentFilter,
+    /// Any other / unknown finish reason. Never promote (conservative: a reason
+    /// the gateway does not recognize is not a clean stop).
+    Other,
+}
+
+impl TerminalReason {
+    /// Whether this is a CLEAN STOP — the only terminal reason that permits G8
+    /// reasoning-promotion to a `text` block.
+    pub fn is_clean_stop(self) -> bool {
+        matches!(self, TerminalReason::Stop)
+    }
+
+    /// Map an upstream `finish_reason` string to a typed terminal reason.
+    /// Unknown/blank ⇒ `Other` (non-clean).
+    pub fn from_finish_reason(finish_reason: Option<&str>) -> Self {
+        match finish_reason {
+            Some("stop") => TerminalReason::Stop,
+            Some("length") => TerminalReason::Length,
+            Some("tool_calls") => TerminalReason::ToolCall,
+            Some("content_filter") => TerminalReason::ContentFilter,
+            _ => TerminalReason::Other,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponseResource {
     pub id: String,
@@ -507,6 +560,13 @@ pub struct ResponseResource {
     pub metadata: Option<HashMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
+    /// Typed terminal reason (T7). `None` only on non-terminal `response`
+    /// resources (e.g. `response.created`); the terminal `response.completed` /
+    /// `response.incomplete` event always carries it so the Anthropic converter
+    /// can gate reasoning-promotion on `reason.is_clean_stop()` rather than the
+    /// event type string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_reason: Option<TerminalReason>,
 }
 
 #[derive(Debug, Clone, Serialize)]
