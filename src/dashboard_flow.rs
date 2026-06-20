@@ -673,17 +673,23 @@ pub fn redact_headers(headers: &axum::http::HeaderMap) -> CapturedHeaders {
 }
 
 /// Cap a single retained scalar string to [`SCALAR_CAP`] bytes on a UTF-8 char
-/// boundary (D1 R1 #5 — every dynamic scalar the record keeps is bounded).
-fn cap_scalar(mut text: String) -> String {
-    if text.len() > SCALAR_CAP {
-        let bytes = text.as_bytes();
-        let mut end = SCALAR_CAP;
-        while end > 0 && (bytes[end] & 0xC0) == 0x80 {
-            end -= 1;
-        }
-        text.truncate(end);
+/// boundary (D1 R1 #5 — every dynamic scalar the record keeps is bounded). When
+/// over cap, the bounded prefix is COPIED into a FRESH `String` (D1 R2... R3 #2):
+/// `String::truncate` keeps the ORIGINAL capacity, so an oversized input would
+/// retain an unbounded backing allocation while the quota accounting only sees the
+/// 4 KiB length. Reallocating makes retained capacity == bounded length.
+fn cap_scalar(text: String) -> String {
+    if text.len() <= SCALAR_CAP {
+        return text;
     }
-    text
+    let bytes = text.as_bytes();
+    let mut end = SCALAR_CAP;
+    while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    // `to_string()` on the slice allocates exactly `end` bytes — the original
+    // (possibly huge) buffer is dropped, not retained behind a shrunk length.
+    text[..end].to_string()
 }
 
 fn now_ms() -> u128 {
@@ -1051,6 +1057,24 @@ mod tests {
         assert!(store.detail("api_39").is_some(), "newest record retained");
         assert!(store.detail("api_0").is_none(), "oldest record evicted");
         assert!(live.len() < 40, "some records were evicted");
+    }
+
+    #[test]
+    fn cap_scalar_reallocates_to_bounded_capacity() {
+        // D1 R3 #2: an oversized scalar must not retain its original (huge) backing
+        // capacity behind a shrunk length — cap_scalar copies the bounded prefix into
+        // a fresh String so capacity == bounded length.
+        let huge = "x".repeat(1024 * 1024); // 1 MiB
+        let capped = cap_scalar(huge);
+        assert!(capped.len() <= SCALAR_CAP, "length bounded");
+        assert!(
+            capped.capacity() <= SCALAR_CAP + 4,
+            "capacity bounded to ~SCALAR_CAP, not the 1 MiB original: cap={}",
+            capped.capacity()
+        );
+        // A within-cap string is returned unchanged (no needless realloc).
+        let small = "hello".to_string();
+        assert_eq!(cap_scalar(small), "hello");
     }
 
     #[test]

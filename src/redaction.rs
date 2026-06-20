@@ -461,19 +461,100 @@ impl<'a> JsonRedactor<'a> {
     }
 
     /// Copy a JSON scalar (number / `true` / `false` / `null`) through verbatim.
+    /// Copy a JSON scalar at a VALUE position — but ONLY a STRICTLY valid one
+    /// (`true`/`false`/`null` literals exactly, or a number per the JSON grammar).
+    /// An arbitrary non-JSON token (e.g. a malformed fragment `api_key=SECRET`) is
+    /// REJECTED by returning `false`, which fails the whole streaming parse so the
+    /// caller falls back to the fixed redacted marker instead of persisting the raw
+    /// token (D1 R3 #1 — `copy_scalar` previously copied any delimiter-bounded run
+    /// verbatim, leaking secrets in malformed bodies). The cursor advances past the
+    /// token only on success.
     fn copy_scalar(&mut self, out: &mut CappedWriter) -> bool {
         let start = self.pos;
-        while self.pos < self.bytes.len() {
-            match self.bytes[self.pos] {
-                b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r' => break,
-                _ => self.pos += 1,
+        let end = match self.peek() {
+            Some(b't') => self.match_literal(b"true"),
+            Some(b'f') => self.match_literal(b"false"),
+            Some(b'n') => self.match_literal(b"null"),
+            Some(b'-') | Some(b'0'..=b'9') => self.match_number(),
+            _ => None,
+        };
+        let Some(end) = end else {
+            return false;
+        };
+        self.pos = end;
+        out.write(&self.bytes[start..end]);
+        true
+    }
+
+    /// If the bytes at the cursor are EXACTLY `literal` followed by a value
+    /// terminator (delimiter / whitespace / EOF), return the end offset; else
+    /// `None`. Rejects `truefoo`, `nullx`, etc.
+    fn match_literal(&self, literal: &[u8]) -> Option<usize> {
+        let end = self.pos + literal.len();
+        if self.bytes.len() < end || &self.bytes[self.pos..end] != literal {
+            return None;
+        }
+        // The next byte (if any) must end the value, not extend the token.
+        match self.bytes.get(end) {
+            None | Some(b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') => Some(end),
+            _ => None,
+        }
+    }
+
+    /// Validate a JSON number starting at the cursor and return its end offset, or
+    /// `None` if it is not a well-formed JSON number (no leading zeros like `01`, a
+    /// digit required after `.`/`e`, and a value terminator must follow — so
+    /// `01.2.3`, `1.`, `1e`, `1x` are all rejected).
+    fn match_number(&self) -> Option<usize> {
+        let bytes = self.bytes;
+        let mut i = self.pos;
+        let len = bytes.len();
+        // Optional minus.
+        if bytes.get(i) == Some(&b'-') {
+            i += 1;
+        }
+        // Integer part: `0` alone, or `[1-9][0-9]*` (no leading zeros).
+        match bytes.get(i) {
+            Some(b'0') => {
+                i += 1;
+            }
+            Some(b'1'..=b'9') => {
+                i += 1;
+                while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+                    i += 1;
+                }
+            }
+            _ => return None,
+        }
+        // Optional fraction: `.` then at least one digit.
+        if bytes.get(i) == Some(&b'.') {
+            i += 1;
+            if !matches!(bytes.get(i), Some(b'0'..=b'9')) {
+                return None;
+            }
+            while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+                i += 1;
             }
         }
-        if self.pos == start {
-            return false;
+        // Optional exponent: `e`/`E`, optional sign, at least one digit.
+        if matches!(bytes.get(i), Some(b'e' | b'E')) {
+            i += 1;
+            if matches!(bytes.get(i), Some(b'+' | b'-')) {
+                i += 1;
+            }
+            if !matches!(bytes.get(i), Some(b'0'..=b'9')) {
+                return None;
+            }
+            while matches!(bytes.get(i), Some(b'0'..=b'9')) {
+                i += 1;
+            }
         }
-        out.write(&self.bytes[start..self.pos]);
-        true
+        // A value terminator must follow (no trailing junk like `1.2.3`/`1x`).
+        match bytes.get(i) {
+            _ if i >= len => Some(i),
+            Some(b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r') => Some(i),
+            _ => None,
+        }
     }
 
     /// Parse-skip a JSON value WITHOUT emitting it (a sensitive value whose
@@ -769,6 +850,59 @@ mod tests {
         assert!(text.contains("\"model\":\"m\""), "shallow siblings survive");
         // The result is still valid JSON.
         let _: serde_json::Value = serde_json::from_slice(&out).expect("valid json out");
+    }
+
+    #[test]
+    fn invalid_value_token_falls_back_no_raw_bytes() {
+        // D1 R3 #1: a non-JSON token at a VALUE position (e.g. `api_key=SECRET`)
+        // must NOT be copied verbatim — the whole body fails the streaming parse and
+        // hits the fixed marker, so the secret never persists.
+        let body = br#"{"x": api_key=SECRETVAL}"#;
+        let out = capture_capped_redacted(body, 128 * 1024, 4 * 1024);
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("SECRETVAL"),
+            "raw value token not persisted: {text}"
+        );
+        assert!(
+            text.starts_with("[redacted: unparseable body"),
+            "invalid value token → fixed marker: {text}"
+        );
+    }
+
+    #[test]
+    fn invalid_number_and_bad_string_escape_fall_back() {
+        // Malformed numbers and a truncated body are rejected by the strict scalar
+        // grammar / scanner → fixed marker (no raw bytes copied).
+        for body in [
+            br#"{"n": 01.2.3}"#.as_slice(),  // leading zero + double dot
+            br#"{"n": 1.}"#.as_slice(),      // digit required after '.'
+            br#"{"n": 1e}"#.as_slice(),      // digit required after exponent
+            br#"{"n": 1x9}"#.as_slice(),     // trailing junk
+            br#"{"n": truefoo}"#.as_slice(), // literal with trailing junk
+        ] {
+            let out = capture_capped_redacted(body, 128 * 1024, 4 * 1024);
+            let text = String::from_utf8_lossy(&out);
+            assert!(
+                text.starts_with("[redacted: unparseable body"),
+                "malformed scalar must fall back to the fixed marker: input={:?} out={text}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn valid_scalars_round_trip_through_strict_validation() {
+        // The strict scalar validator must still accept every well-formed JSON
+        // scalar (sign/frac/exp numbers, the three literals).
+        let body = br#"{"a":-0.5e+10,"b":true,"c":false,"d":null,"e":0,"f":42,"g":1.0E-3}"#;
+        let out = capture_capped_redacted(body, 128 * 1024, 4 * 1024);
+        let value: serde_json::Value =
+            serde_json::from_slice(&out).expect("valid scalars preserved as JSON");
+        assert_eq!(value["b"], serde_json::json!(true));
+        assert_eq!(value["d"], serde_json::Value::Null);
+        assert_eq!(value["e"], serde_json::json!(0));
+        assert_eq!(value["f"], serde_json::json!(42));
     }
 
     #[test]
