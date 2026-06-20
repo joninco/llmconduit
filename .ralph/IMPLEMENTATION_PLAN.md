@@ -330,10 +330,10 @@ coverage change). R1 (2 MEDIUM keepalive-hang + race-order, 1 LOW shadowed key) 
 > the missing `stop` arm); **12.9 bundles** both sides of the `tool_calls` wire-string contract. Obey
 > AGENTS.md "Hard rules in the engine"; do NOT re-raise the adjudicated invalid findings below.
 
-## STATUS (🔄 IN PROGRESS — 4/10)
+## STATUS (🔄 IN PROGRESS — 5/10)
 
-**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`), 12.4 (`4cd2b44`).
-**TODO (sequenced):** 12.5, 12.6, 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
+**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`), 12.4 (`4cd2b44`), 12.5 (`adc5dd7`).
+**TODO (sequenced):** 12.6, 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
 Per-task loop = read spec → implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 
@@ -370,7 +370,7 @@ rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 **Sequencing:** Depends on T1 leaf APIs already shipped (`from_config`, `finalize_request_for_backend`, `BackendChatRequest::new` all `pub`). Independent of other Topic-12 tasks; config.rs + tests only.
 
 ### Task 12.5 — Test coverage for WEB_SEARCH_ROUNDS_HARD_CEILING=25
-**Priority:** MEDIUM · **Spec:** `.ralph/specs/U5-web-search-ceiling-coverage.md` · **Status:** ⬜ PENDING
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/U5-web-search-ceiling-coverage.md` · **Status:** ✅ DONE (`adc5dd7`, Codex-xhigh APPROVED round 1) — 2 tests added to `tests/gateway.rs` (`web_search_round_ceiling_terminates_loop` bounded==5; `web_search_round_ceiling_caps_configured_limit` cfg=100→terminates at round 25); zero production change.
 **Thermo finding:** The AGENTS.md hard rule `WEB_SEARCH_ROUNDS_HARD_CEILING=25` and its `.min(25)` config cap (`src/engine.rs:1772-1781`) have ZERO test coverage; every Config literal sets `max_web_search_rounds:5` (`tests/gateway.rs:3034`) and none queues >limit forced rounds — while the sibling `IMAGE_ANALYSIS_ROUNDS_HARD_CEILING=8` IS tested (`tests/image_agent.rs:844`).
 **Fix:** Test-only, NO production change. Add a `tests/gateway.rs` test mirroring `image_agent_round_ceiling_terminates_loop`: queue a forced `web_search` `tool_call_chunk` every round for N>limit with `MockSearch::default()` canned results, assert `response.failed` ("web search round limit exceeded") plus a bounded `upstream.requests().await.len()` (==5 under default config). Add a SECOND test via `test_gateway_with_config` with `max_web_search_rounds>25` (e.g. 100) and >25 forced rounds, asserting termination by exactly round 25 — proving the `.min(WEB_SEARCH_ROUNDS_HARD_CEILING)` cap overrides the higher configured value. Do NOT lower the ceiling or touch `src/engine.rs`.
 **Files:** tests/gateway.rs
