@@ -44,15 +44,13 @@ const MAX_PENDING_TOOL_DELTA_BYTES_TOTAL: usize = 1024 * 1024;
 enum AnalyzeDeltaState {
     Pending {
         buffered: Vec<(Option<String>, String)>,
+        /// Running sum of `buffered`'s delta-payload byte lengths. Maintained
+        /// O(1) on every push so the per-call cap check never re-sums the whole
+        /// buffer (invariant: `bytes == buffered_len(buffered)` after each push).
+        bytes: usize,
     },
     Drop,
     Emit,
-}
-
-/// Total buffered argument bytes held in a `Pending` buffer (delta payloads
-/// only; the optional name is bookkeeping).
-fn buffered_len(buffered: &[(Option<String>, String)]) -> usize {
-    buffered.iter().map(|(_, delta)| delta.len()).sum()
 }
 
 /// One `function_call_arguments` delta the engine should forward to the client
@@ -161,6 +159,7 @@ impl ToolDeltaGate {
                 call_id.clone(),
                 AnalyzeDeltaState::Pending {
                     buffered: Vec::new(),
+                    bytes: 0,
                 },
             );
         }
@@ -176,10 +175,8 @@ impl ToolDeltaGate {
             // fragments and mark drop. The buffered bytes leave the pending
             // pool.
             (slot, Some(true)) => {
-                if let AnalyzeDeltaState::Pending { buffered } = slot {
-                    self.pending_buffer_bytes = self
-                        .pending_buffer_bytes
-                        .saturating_sub(buffered_len(buffered));
+                if let AnalyzeDeltaState::Pending { bytes, .. } = slot {
+                    self.pending_buffer_bytes = self.pending_buffer_bytes.saturating_sub(*bytes);
                 }
                 *slot = AnalyzeDeltaState::Drop;
                 Ok(DeltaDecision::None)
@@ -198,9 +195,9 @@ impl ToolDeltaGate {
             // the name arrived with the first delta) collapse to `One`, MOVING
             // `call_id` into the emission so this path allocates nothing.
             (slot, Some(false)) => {
-                let buffered = match std::mem::replace(slot, AnalyzeDeltaState::Emit) {
-                    AnalyzeDeltaState::Pending { buffered } => buffered,
-                    _ => Vec::new(),
+                let (buffered, bytes) = match std::mem::replace(slot, AnalyzeDeltaState::Emit) {
+                    AnalyzeDeltaState::Pending { buffered, bytes } => (buffered, bytes),
+                    _ => (Vec::new(), 0),
                 };
                 if buffered.is_empty() {
                     return Ok(DeltaDecision::One(DeltaEmission {
@@ -209,9 +206,7 @@ impl ToolDeltaGate {
                         delta,
                     }));
                 }
-                self.pending_buffer_bytes = self
-                    .pending_buffer_bytes
-                    .saturating_sub(buffered_len(&buffered));
+                self.pending_buffer_bytes = self.pending_buffer_bytes.saturating_sub(bytes);
                 // `call_id` lives on `Flush`; the trailing delta shares it, so we
                 // carry only its `(name, delta)` rather than duplicating the id.
                 Ok(DeltaDecision::Flush {
@@ -224,14 +219,15 @@ impl ToolDeltaGate {
             // turn ends). Enforce a per-call AND total pending-byte cap so an
             // upstream that streams endless args-before-name cannot exhaust
             // memory; exceeding it fails the turn cleanly.
-            (AnalyzeDeltaState::Pending { buffered }, None) => {
+            (AnalyzeDeltaState::Pending { buffered, bytes }, None) => {
                 let delta_bytes = delta.len();
-                if buffered_len(buffered) + delta_bytes > MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL
+                if *bytes + delta_bytes > MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL
                     || self.pending_buffer_bytes + delta_bytes > MAX_PENDING_TOOL_DELTA_BYTES_TOTAL
                 {
                     return Err(PendingBufferOverflow);
                 }
                 buffered.push((name, delta));
+                *bytes += delta_bytes;
                 self.pending_buffer_bytes += delta_bytes;
                 Ok(DeltaDecision::None)
             }
@@ -252,10 +248,8 @@ impl ToolDeltaGate {
     /// with no `trailing` delta.
     pub(crate) fn flush_pending_client_tool(&mut self, call_id: &str) -> DeltaDecision {
         match self.buffer.remove(call_id) {
-            Some(AnalyzeDeltaState::Pending { buffered }) if !buffered.is_empty() => {
-                self.pending_buffer_bytes = self
-                    .pending_buffer_bytes
-                    .saturating_sub(buffered_len(&buffered));
+            Some(AnalyzeDeltaState::Pending { buffered, bytes }) if !buffered.is_empty() => {
+                self.pending_buffer_bytes = self.pending_buffer_bytes.saturating_sub(bytes);
                 DeltaDecision::Flush {
                     call_id: call_id.to_string(),
                     buffered,
@@ -573,6 +567,51 @@ mod tests {
         assert_eq!(
             gate.on_delta("reclaimed".into(), None, chunk).unwrap(),
             DeltaDecision::None
+        );
+    }
+
+    #[test]
+    fn per_call_cap_accumulates_across_many_small_deltas() {
+        // Exercises the running-`bytes` accumulation path (vs. the single-huge
+        // delta in `per_call_pending_byte_cap_overflows`): MANY 1-byte nameless
+        // deltas fill EXACTLY to the per-call cap, all returning `None`, and the
+        // very next 1-byte delta overflows at the identical boundary.
+        let mut gate = ToolDeltaGate::new(true);
+        for _ in 0..MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL {
+            assert_eq!(
+                gate.on_delta("c1".into(), None, "x".into()).unwrap(),
+                DeltaDecision::None
+            );
+        }
+        // Buffer now holds exactly the per-call cap; one more byte trips it.
+        assert_eq!(
+            gate.on_delta("c1".into(), None, "x".into()),
+            Err(PendingBufferOverflow)
+        );
+    }
+
+    #[test]
+    fn empty_deltas_add_zero_to_running_per_call_bytes() {
+        // Empty-string nameless deltas push a zero-byte fragment and add 0 to the
+        // running `bytes`, so they are no-ops against the per-call cap: after an
+        // arbitrary number of them a full PER_CALL-byte chunk still buffers.
+        let mut gate = ToolDeltaGate::new(true);
+        for _ in 0..1000 {
+            assert_eq!(
+                gate.on_delta("c1".into(), None, "".into()).unwrap(),
+                DeltaDecision::None
+            );
+        }
+        // A full per-call chunk still fits (zero-byte fragments moved nothing).
+        let chunk = "y".repeat(MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL);
+        assert_eq!(
+            gate.on_delta("c1".into(), None, chunk).unwrap(),
+            DeltaDecision::None
+        );
+        // And the call is now exactly at the per-call cap — one more byte trips.
+        assert_eq!(
+            gate.on_delta("c1".into(), None, "z".into()),
+            Err(PendingBufferOverflow)
         );
     }
 }
