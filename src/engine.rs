@@ -39,6 +39,7 @@ use crate::replay::ReplayRecord;
 use crate::replay::ReplayStore;
 use crate::search::SearchClient;
 use crate::search::SearchOutcome;
+use crate::tool_delta_gate::DeltaDecision;
 use crate::tool_delta_gate::DeltaEmission;
 use crate::tool_delta_gate::ToolDeltaGate;
 use crate::upstream::UpstreamClient;
@@ -641,6 +642,49 @@ impl Gateway {
             "failed to stream function call args delta",
         )
         .await
+    }
+
+    /// Drive a [`ToolDeltaGate`] decision to the wire, in order. `None` emits
+    /// nothing; `One` forwards the single delta; `Flush` emits the gate's
+    /// moved-out buffered fragments (iterated in place, no copy) then the
+    /// optional trailing delta. Allocation-free beyond the `String`s the gate
+    /// already owns.
+    async fn drive_delta_decision(
+        &self,
+        response_id: &str,
+        tx: &mpsc::Sender<SseEvent>,
+        decision: DeltaDecision,
+    ) -> AppResult<()> {
+        match decision {
+            DeltaDecision::None => {}
+            DeltaDecision::One(emission) => {
+                self.emit_function_call_delta(response_id, tx, emission)
+                    .await?;
+            }
+            DeltaDecision::Flush {
+                call_id,
+                buffered,
+                trailing,
+            } => {
+                for (name, delta) in buffered {
+                    self.emit_function_call_delta(
+                        response_id,
+                        tx,
+                        DeltaEmission {
+                            call_id: call_id.clone(),
+                            name,
+                            delta,
+                        },
+                    )
+                    .await?;
+                }
+                if let Some(emission) = trailing {
+                    self.emit_function_call_delta(response_id, tx, emission)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub async fn stream_responses(
@@ -1552,18 +1596,16 @@ impl Gateway {
                             // The gate hides internal `analyzeImage` arg deltas
                             // (buffering leading fragments until the name resolves)
                             // and passes client-tool deltas through. It returns the
-                            // ordered emissions to forward; an overflow of the
-                            // pending-byte cap fails the turn cleanly.
-                            let emissions =
+                            // (allocation-free) decision to forward; an overflow of
+                            // the pending-byte cap fails the turn cleanly.
+                            let decision =
                                 tool_delta_gate.on_delta(call_id, name, delta).map_err(|_| {
                                     AppError::upstream(
                                         "upstream streamed too many tool-call argument bytes before a tool name",
                                     )
                                 })?;
-                            for emission in emissions {
-                                self.emit_function_call_delta(&response_id, &tx, emission)
-                                    .await?;
-                            }
+                            self.drive_delta_decision(&response_id, &tx, decision)
+                                .await?;
                         }
                         StreamEmission::ContentPartAdded => {
                             let target = event_state.active_message_target()?;
@@ -1646,10 +1688,9 @@ impl Gateway {
                 let Some(call_id) = tool_call.internal_call.id.clone() else {
                     continue;
                 };
-                for emission in tool_delta_gate.flush_pending_client_tool(&call_id) {
-                    self.emit_function_call_delta(&response_id, &tx, emission)
-                        .await?;
-                }
+                let decision = tool_delta_gate.flush_pending_client_tool(&call_id);
+                self.drive_delta_decision(&response_id, &tx, decision)
+                    .await?;
             }
             self.emit_completed_public_items(
                 &response_id,

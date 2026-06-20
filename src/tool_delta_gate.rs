@@ -11,10 +11,16 @@
 //! deltas are buffered while the name is unknown, then either DROPPED (internal
 //! `analyzeImage`) or FLUSHED in order (a real client tool, whose later deltas
 //! then forward straight through). It is a pure decision machine — it never
-//! touches the SSE channel or the monitor hub. Each method returns the ordered
-//! [`DeltaEmission`]s the engine should forward, so the engine has a single
-//! emission path instead of the four duplicated `monitor.emit + send_event`
-//! sites this consolidates.
+//! touches the SSE channel or the monitor hub. Each method returns a
+//! [`DeltaDecision`] the engine drives through its single emission path,
+//! replacing the four duplicated `monitor.emit + send_event` sites this
+//! consolidates.
+//!
+//! The decision is allocation-free on the hot path: the common single-delta
+//! forward returns [`DeltaDecision::One`] (no `Vec`), and a flush MOVES the
+//! already-allocated pending buffer out of the gate ([`DeltaDecision::Flush`])
+//! so the engine iterates it in place — no fresh per-delta allocation either
+//! way. This preserves the inline original's zero-allocation streaming.
 
 use std::collections::HashMap;
 
@@ -60,6 +66,29 @@ pub(crate) struct DeltaEmission {
     pub delta: String,
 }
 
+/// What the engine should emit for a single gated delta. Kept allocation-free on
+/// the hot path: `None`/`One` never touch the heap, and `Flush` MOVES the
+/// already-buffered fragments out of the gate so they are iterated in place
+/// rather than copied into a fresh `Vec`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeltaDecision {
+    /// Drop this delta (internal `analyzeImage`, or still buffering) — emit
+    /// nothing.
+    None,
+    /// Forward exactly one delta (fast path, or an already-resolved client
+    /// tool).
+    One(DeltaEmission),
+    /// A client tool's name just resolved: emit the buffered leading fragments
+    /// in order under `call_id`, then the optional `trailing` triggering delta.
+    /// `buffered` is the gate's own moved-out buffer (no copy). Used both for
+    /// the in-stream resolve (with `trailing`) and the turn-end flush (without).
+    Flush {
+        call_id: String,
+        buffered: Vec<(Option<String>, String)>,
+        trailing: Option<DeltaEmission>,
+    },
+}
+
 /// Returned when an upstream streams more buffered argument bytes before a tool
 /// name than the DoS caps allow. The engine maps this to `AppError::upstream`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,25 +122,26 @@ impl ToolDeltaGate {
     }
 
     /// Process one streamed `function_call_arguments` delta, returning the
-    /// ordered emissions the engine should forward.
+    /// allocation-free [`DeltaDecision`] the engine should emit.
     ///
-    /// Fast path (image agent inactive): the single delta forwards unchanged.
-    /// Active path: leading deltas buffer until the name resolves, then drop
-    /// (internal `analyzeImage`) or flush-in-order + forward (client tool).
+    /// Fast path (image agent inactive): the single delta forwards unchanged
+    /// (`One`). Active path: leading deltas buffer until the name resolves
+    /// (`None` while buffering/dropping), then drop (internal `analyzeImage`) or
+    /// flush-in-order + forward (`Flush`, moving the buffer out of the gate).
     pub(crate) fn on_delta(
         &mut self,
         call_id: String,
         name: Option<String>,
         delta: String,
-    ) -> Result<Vec<DeltaEmission>, PendingBufferOverflow> {
+    ) -> Result<DeltaDecision, PendingBufferOverflow> {
         // Fast path: when the image agent is inactive there is nothing to hide,
         // so stream the delta unchanged.
         if !self.vision_active {
-            return Ok(vec![DeltaEmission {
+            return Ok(DeltaDecision::One(DeltaEmission {
                 call_id,
                 name,
                 delta,
-            }]);
+            }));
         }
 
         // Image agent active — gate each call_id on its resolved tool name,
@@ -129,7 +159,7 @@ impl ToolDeltaGate {
         match (entry, is_analyze) {
             // Already decided to drop this call's deltas (internal analyzeImage)
             // — drop this one too.
-            (AnalyzeDeltaState::Drop, _) => Ok(Vec::new()),
+            (AnalyzeDeltaState::Drop, _) => Ok(DeltaDecision::None),
             // Name resolved to analyzeImage now: discard any buffered leading
             // fragments and mark drop. The buffered bytes leave the pending
             // pool.
@@ -140,40 +170,42 @@ impl ToolDeltaGate {
                         .saturating_sub(buffered_len(buffered));
                 }
                 *slot = AnalyzeDeltaState::Drop;
-                Ok(Vec::new())
+                Ok(DeltaDecision::None)
             }
             // Already decided to emit (a known client tool) — forward
             // immediately.
-            (AnalyzeDeltaState::Emit, _) => Ok(vec![DeltaEmission {
+            (AnalyzeDeltaState::Emit, _) => Ok(DeltaDecision::One(DeltaEmission {
                 call_id,
                 name,
                 delta,
-            }]),
+            })),
             // Name resolved to a non-analyzeImage client tool: flush any buffered
             // leading fragments in order, then this delta, and remember to emit
-            // the rest.
+            // the rest. The buffer is MOVED out of the gate (no copy); the engine
+            // iterates it in place. When nothing was buffered (the common case:
+            // the name arrived with the first delta) collapse to `One` so this
+            // path allocates nothing.
             (slot, Some(false)) => {
                 let buffered = match std::mem::replace(slot, AnalyzeDeltaState::Emit) {
                     AnalyzeDeltaState::Pending { buffered } => buffered,
                     _ => Vec::new(),
                 };
+                let emission = DeltaEmission {
+                    call_id: call_id.clone(),
+                    name,
+                    delta,
+                };
+                if buffered.is_empty() {
+                    return Ok(DeltaDecision::One(emission));
+                }
                 self.pending_buffer_bytes = self
                     .pending_buffer_bytes
                     .saturating_sub(buffered_len(&buffered));
-                let mut emissions = Vec::with_capacity(buffered.len() + 1);
-                for (buffered_name, buffered_delta) in buffered {
-                    emissions.push(DeltaEmission {
-                        call_id: call_id.clone(),
-                        name: buffered_name,
-                        delta: buffered_delta,
-                    });
-                }
-                emissions.push(DeltaEmission {
+                Ok(DeltaDecision::Flush {
                     call_id,
-                    name,
-                    delta,
-                });
-                Ok(emissions)
+                    buffered,
+                    trailing: Some(emission),
+                })
             }
             // Name still unknown: buffer this delta until it resolves (or the
             // turn ends). Enforce a per-call AND total pending-byte cap so an
@@ -188,7 +220,7 @@ impl ToolDeltaGate {
                 }
                 buffered.push((name, delta));
                 self.pending_buffer_bytes += delta_bytes;
-                Ok(Vec::new())
+                Ok(DeltaDecision::None)
             }
         }
     }
@@ -201,20 +233,23 @@ impl ToolDeltaGate {
     /// engine calls this for each finalized non-`ImageAnalysis` tool call (in
     /// `finalized.tool_calls` order) so the client receives all of its tool-arg
     /// deltas, in order, before the public items and the
-    /// `function_call_arguments.done`. Returns nothing if the call has no
-    /// pending buffer (already flushed/dropped, or never seen).
-    pub(crate) fn flush_pending_client_tool(&mut self, call_id: &str) -> Vec<DeltaEmission> {
-        if let Some(AnalyzeDeltaState::Pending { buffered }) = self.buffer.remove(call_id) {
-            buffered
-                .into_iter()
-                .map(|(buffered_name, buffered_delta)| DeltaEmission {
+    /// `function_call_arguments.done`. Returns [`DeltaDecision::None`] if the
+    /// call has no pending buffer (already flushed/dropped, or never seen);
+    /// otherwise a [`DeltaDecision::Flush`] that MOVES the buffer out (no copy)
+    /// with no `trailing` delta.
+    pub(crate) fn flush_pending_client_tool(&mut self, call_id: &str) -> DeltaDecision {
+        match self.buffer.remove(call_id) {
+            Some(AnalyzeDeltaState::Pending { buffered }) if !buffered.is_empty() => {
+                self.pending_buffer_bytes = self
+                    .pending_buffer_bytes
+                    .saturating_sub(buffered_len(&buffered));
+                DeltaDecision::Flush {
                     call_id: call_id.to_string(),
-                    name: buffered_name,
-                    delta: buffered_delta,
-                })
-                .collect()
-        } else {
-            Vec::new()
+                    buffered,
+                    trailing: None,
+                }
+            }
+            _ => DeltaDecision::None,
         }
     }
 }
@@ -231,11 +266,38 @@ mod tests {
         }
     }
 
+    /// Flatten a decision into the ordered emissions it produces, so assertions
+    /// stay expressed as the exact wire sequence (equivalent to the old
+    /// `Vec<DeltaEmission>` return) regardless of the `None`/`One`/`Flush` shape.
+    fn emissions(decision: DeltaDecision) -> Vec<DeltaEmission> {
+        match decision {
+            DeltaDecision::None => Vec::new(),
+            DeltaDecision::One(emission) => vec![emission],
+            DeltaDecision::Flush {
+                call_id,
+                buffered,
+                trailing,
+            } => {
+                let mut out: Vec<DeltaEmission> = buffered
+                    .into_iter()
+                    .map(|(name, delta)| DeltaEmission {
+                        call_id: call_id.clone(),
+                        name,
+                        delta,
+                    })
+                    .collect();
+                out.extend(trailing);
+                out
+            }
+        }
+    }
+
     #[test]
     fn inactive_gate_passes_every_delta_through_unchanged() {
         let mut gate = ToolDeltaGate::new(false);
         // Even an analyzeImage-named delta forwards verbatim when the agent is
         // inactive: a client-supplied tool of that name is a normal client tool.
+        // The fast path returns a bare `One` (no Vec).
         let out = gate
             .on_delta(
                 "c1".into(),
@@ -243,93 +305,101 @@ mod tests {
                 "{".into(),
             )
             .unwrap();
-        assert_eq!(out, vec![em("c1", Some(ANALYZE_IMAGE_TOOL_NAME), "{")]);
+        assert_eq!(
+            out,
+            DeltaDecision::One(em("c1", Some(ANALYZE_IMAGE_TOOL_NAME), "{"))
+        );
         let out = gate.on_delta("c1".into(), None, "x".into()).unwrap();
-        assert_eq!(out, vec![em("c1", None, "x")]);
+        assert_eq!(out, DeltaDecision::One(em("c1", None, "x")));
         // Nothing buffered, so the post-loop flush is a no-op.
-        assert!(gate.flush_pending_client_tool("c1").is_empty());
+        assert_eq!(gate.flush_pending_client_tool("c1"), DeltaDecision::None);
     }
 
     #[test]
     fn active_gate_drops_analyze_image_once_name_resolves() {
         let mut gate = ToolDeltaGate::new(true);
         // Leading fragment arrives before the name: buffered, nothing emitted.
-        assert!(
-            gate.on_delta("c1".into(), None, "{\"ima".into())
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            gate.on_delta("c1".into(), None, "{\"ima".into()).unwrap(),
+            DeltaDecision::None
         );
         // Name resolves to analyzeImage: buffered leading fragment is discarded,
         // this delta dropped.
-        assert!(
+        assert_eq!(
             gate.on_delta(
                 "c1".into(),
                 Some(ANALYZE_IMAGE_TOOL_NAME.into()),
                 "ge".into()
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            DeltaDecision::None
         );
         // Subsequent deltas (even name-less) stay dropped.
-        assert!(
-            gate.on_delta("c1".into(), None, "rest".into())
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            gate.on_delta("c1".into(), None, "rest".into()).unwrap(),
+            DeltaDecision::None
         );
         // Buffer was consumed into Drop, so the post-loop flush emits nothing.
-        assert!(gate.flush_pending_client_tool("c1").is_empty());
+        assert_eq!(gate.flush_pending_client_tool("c1"), DeltaDecision::None);
     }
 
     #[test]
     fn active_gate_drops_analyze_image_named_on_first_delta() {
         let mut gate = ToolDeltaGate::new(true);
         // Name known from the very first delta: dropped with no buffering.
-        assert!(
+        assert_eq!(
             gate.on_delta(
                 "c1".into(),
                 Some(ANALYZE_IMAGE_TOOL_NAME.to_ascii_uppercase()),
                 "{}".into(),
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            DeltaDecision::None
         );
-        assert!(gate.flush_pending_client_tool("c1").is_empty());
+        assert_eq!(gate.flush_pending_client_tool("c1"), DeltaDecision::None);
     }
 
     #[test]
     fn active_gate_flushes_buffered_client_deltas_in_order_then_forwards() {
         let mut gate = ToolDeltaGate::new(true);
         // Two leading fragments buffered before the name is known.
-        assert!(
-            gate.on_delta("c1".into(), None, "{\"a".into())
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            gate.on_delta("c1".into(), None, "{\"a".into()).unwrap(),
+            DeltaDecision::None
         );
-        assert!(
-            gate.on_delta("c1".into(), None, "\":1".into())
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            gate.on_delta("c1".into(), None, "\":1".into()).unwrap(),
+            DeltaDecision::None
         );
-        // Name resolves to a client tool: buffered fragments flush IN ORDER,
-        // then the triggering delta — all forwarded.
-        let out = gate
+        // Name resolves to a client tool: a single `Flush` carries the moved
+        // buffer + the triggering delta. Emit order: buffered IN ORDER, then the
+        // trigger.
+        let decision = gate
             .on_delta("c1".into(), Some("lookup".into()), "}".into())
             .unwrap();
         assert_eq!(
-            out,
+            decision,
+            DeltaDecision::Flush {
+                call_id: "c1".into(),
+                buffered: vec![(None, "{\"a".into()), (None, "\":1".into())],
+                trailing: Some(em("c1", Some("lookup"), "}")),
+            }
+        );
+        assert_eq!(
+            emissions(decision),
             vec![
                 em("c1", None, "{\"a"),
                 em("c1", None, "\":1"),
                 em("c1", Some("lookup"), "}"),
             ]
         );
-        // Now in Emit: later deltas forward straight through, one-for-one.
+        // Now in Emit: later deltas forward straight through as a bare `One`.
         let out = gate
             .on_delta("c1".into(), Some("lookup".into()), " more".into())
             .unwrap();
-        assert_eq!(out, vec![em("c1", Some("lookup"), " more")]);
+        assert_eq!(out, DeltaDecision::One(em("c1", Some("lookup"), " more")));
         // Buffer already drained by the flush; post-loop flush is a no-op.
-        assert!(gate.flush_pending_client_tool("c1").is_empty());
+        assert_eq!(gate.flush_pending_client_tool("c1"), DeltaDecision::None);
     }
 
     #[test]
@@ -337,49 +407,57 @@ mod tests {
         let mut gate = ToolDeltaGate::new(true);
         // A client tool whose args streamed entirely before its name: deltas
         // buffer and no delta ever carries the name, so nothing is emitted live.
-        assert!(
-            gate.on_delta("c1".into(), None, "{\"q".into())
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            gate.on_delta("c1".into(), None, "{\"q".into()).unwrap(),
+            DeltaDecision::None
         );
-        assert!(
-            gate.on_delta("c1".into(), None, "\":2}".into())
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            gate.on_delta("c1".into(), None, "\":2}".into()).unwrap(),
+            DeltaDecision::None
         );
         // Post-loop flush (engine drives this for each non-ImageAnalysis tool
-        // call) replays the buffered deltas in order.
-        let out = gate.flush_pending_client_tool("c1");
-        assert_eq!(out, vec![em("c1", None, "{\"q"), em("c1", None, "\":2}")]);
+        // call) moves the buffer out, no trailing delta — replayed in order.
+        let decision = gate.flush_pending_client_tool("c1");
+        assert_eq!(
+            decision,
+            DeltaDecision::Flush {
+                call_id: "c1".into(),
+                buffered: vec![(None, "{\"q".into()), (None, "\":2}".into())],
+                trailing: None,
+            }
+        );
+        assert_eq!(
+            emissions(decision),
+            vec![em("c1", None, "{\"q"), em("c1", None, "\":2}")]
+        );
         // Buffer removed: a second flush yields nothing.
-        assert!(gate.flush_pending_client_tool("c1").is_empty());
+        assert_eq!(gate.flush_pending_client_tool("c1"), DeltaDecision::None);
     }
 
     #[test]
     fn distinct_call_ids_are_gated_independently() {
         let mut gate = ToolDeltaGate::new(true);
         // c1 buffers, c2 resolves immediately to a client tool.
-        assert!(
-            gate.on_delta("c1".into(), None, "a".into())
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            gate.on_delta("c1".into(), None, "a".into()).unwrap(),
+            DeltaDecision::None
         );
         let out = gate
             .on_delta("c2".into(), Some("lookup".into()), "b".into())
             .unwrap();
-        assert_eq!(out, vec![em("c2", Some("lookup"), "b")]);
+        assert_eq!(out, DeltaDecision::One(em("c2", Some("lookup"), "b")));
         // c1 then resolves to analyzeImage and is dropped — c2 unaffected.
-        assert!(
+        assert_eq!(
             gate.on_delta(
                 "c1".into(),
                 Some(ANALYZE_IMAGE_TOOL_NAME.into()),
                 "c".into()
             )
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+            DeltaDecision::None
         );
-        assert!(gate.flush_pending_client_tool("c1").is_empty());
-        assert!(gate.flush_pending_client_tool("c2").is_empty());
+        assert_eq!(gate.flush_pending_client_tool("c1"), DeltaDecision::None);
+        assert_eq!(gate.flush_pending_client_tool("c2"), DeltaDecision::None);
     }
 
     #[test]
@@ -401,10 +479,9 @@ mod tests {
         let chunk = "y".repeat(MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL);
         let calls = MAX_PENDING_TOOL_DELTA_BYTES_TOTAL / MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL;
         for i in 0..calls {
-            assert!(
-                gate.on_delta(format!("c{i}"), None, chunk.clone())
-                    .unwrap()
-                    .is_empty()
+            assert_eq!(
+                gate.on_delta(format!("c{i}"), None, chunk.clone()).unwrap(),
+                DeltaDecision::None
             );
         }
         // The aggregate is now at the total cap; one more byte overflows.
@@ -415,31 +492,76 @@ mod tests {
     }
 
     #[test]
-    fn dropping_analyze_image_frees_pending_budget_for_other_calls() {
+    fn dropping_analyze_image_reclaims_full_total_budget() {
+        // Genuinely sensitive to the per-call subtraction in the `Some(true)`
+        // arm: fill the total pending budget EXACTLY, then drop one call and
+        // prove its bytes were reclaimed by successfully buffering that exact
+        // amount again. If reclamation were removed the final buffer would push
+        // the aggregate to TOTAL + PER_CALL and overflow instead.
         let mut gate = ToolDeltaGate::new(true);
-        // Buffer a large nameless fragment, then resolve it to analyzeImage so
-        // its bytes leave the pending pool.
         let chunk = "y".repeat(MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL);
-        assert!(
-            gate.on_delta("img".into(), None, chunk.clone())
-                .unwrap()
-                .is_empty()
+        let calls = MAX_PENDING_TOOL_DELTA_BYTES_TOTAL / MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL;
+        // Fill to EXACTLY the total cap (TOTAL == calls * PER_CALL).
+        for i in 0..calls {
+            assert_eq!(
+                gate.on_delta(format!("c{i}"), None, chunk.clone()).unwrap(),
+                DeltaDecision::None
+            );
+        }
+        // Sanity: with the budget full, any further nameless byte overflows.
+        assert_eq!(
+            gate.on_delta("probe".into(), None, "z".into()),
+            Err(PendingBufferOverflow)
         );
-        assert!(
-            gate.on_delta(
-                "img".into(),
-                Some(ANALYZE_IMAGE_TOOL_NAME.into()),
-                "".into()
-            )
-            .unwrap()
-            .is_empty()
+        // Resolve call c0 to analyzeImage: its PER_CALL bytes leave the pool.
+        assert_eq!(
+            gate.on_delta("c0".into(), Some(ANALYZE_IMAGE_TOOL_NAME.into()), "".into())
+                .unwrap(),
+            DeltaDecision::None
         );
-        // Because the budget was reclaimed, another call may buffer the same
-        // amount without overflowing the total cap.
-        assert!(
-            gate.on_delta("other".into(), None, chunk)
-                .unwrap()
-                .is_empty()
+        // Exactly the reclaimed capacity is now free: a fresh call buffering a
+        // full PER_CALL chunk must succeed (would overflow without reclaim).
+        assert_eq!(
+            gate.on_delta("reclaimed".into(), None, chunk.clone())
+                .unwrap(),
+            DeltaDecision::None
+        );
+        // And the budget is full again — one more byte overflows.
+        assert_eq!(
+            gate.on_delta("probe2".into(), None, "z".into()),
+            Err(PendingBufferOverflow)
+        );
+    }
+
+    #[test]
+    fn flushing_client_tool_reclaims_its_pending_budget() {
+        // The turn-end flush also returns a call's bytes to the pool. Fill the
+        // budget to exactly full, flush one client tool, then prove the freed
+        // capacity is reusable.
+        let mut gate = ToolDeltaGate::new(true);
+        let chunk = "y".repeat(MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL);
+        let calls = MAX_PENDING_TOOL_DELTA_BYTES_TOTAL / MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL;
+        for i in 0..calls {
+            assert_eq!(
+                gate.on_delta(format!("c{i}"), None, chunk.clone()).unwrap(),
+                DeltaDecision::None
+            );
+        }
+        // Flush c0 (a name-only client tool): emits its buffer AND frees it.
+        let decision = gate.flush_pending_client_tool("c0");
+        assert_eq!(
+            decision,
+            DeltaDecision::Flush {
+                call_id: "c0".into(),
+                buffered: vec![(None, chunk.clone())],
+                trailing: None,
+            }
+        );
+        // The reclaimed PER_CALL capacity is reusable; without the subtraction
+        // this would overflow.
+        assert_eq!(
+            gate.on_delta("reclaimed".into(), None, chunk).unwrap(),
+            DeltaDecision::None
         );
     }
 }
