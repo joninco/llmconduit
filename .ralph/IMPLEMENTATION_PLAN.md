@@ -330,9 +330,10 @@ coverage change). R1 (2 MEDIUM keepalive-hang + race-order, 1 LOW shadowed key) 
 > the missing `stop` arm); **12.9 bundles** both sides of the `tool_calls` wire-string contract. Obey
 > AGENTS.md "Hard rules in the engine"; do NOT re-raise the adjudicated invalid findings below.
 
-## STATUS (🔄 IN PROGRESS — 1/10)
+## STATUS (🔄 IN PROGRESS — 2/10)
 
-**TODO (sequenced):** 12.1, 12.2 (HIGH) → 12.3, 12.4, 12.5, 12.6, 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
+**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`).
+**TODO (sequenced):** 12.3, 12.4, 12.5, 12.6, 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
 Per-task loop = read spec → implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 
@@ -345,7 +346,7 @@ rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 **Sequencing:** FIRST in Topic 12 (HIGH, wire-contract fix). No dependencies; only consumes existing `normalize_stop`/`OPENAI_MAX_STOP_SEQUENCES` and the existing typed `ResponsesRequest.stop` field.
 
 ### Task 12.2 — Upstream `stop` field-set arm + collapse duplicate chat-kwargs merge helpers
-**Priority:** HIGH · **Spec:** `.ralph/specs/U2-upstream-stop-arm-and-merge-collapse.md` · **Status:** ⬜ PENDING
+**Priority:** HIGH · **Spec:** `.ralph/specs/U2-upstream-stop-arm-and-merge-collapse.md` · **Status:** ✅ DONE `f47357b` (Codex-xhigh APPROVED, round 2). Collapsed `merge_upstream_chat_kwargs` + `merge_fallback_chat_kwargs` into one `merge_chat_kwargs_gap_fill` that ALWAYS applies the max-token-alias skip, shared by both leaf-finalize (`:2011`) and provider-fallback (`:810`) call sites; second helper deleted. The `"stop" => request.stop.is_some()` arm was pre-landed under 12.1 (`7d80dc6`), so this task narrowed to the helper collapse. config.rs strip list untouched. Tests: leaf-finalize wire-path test asserts client stop survives + no `extra_body["stop"]` + single `"stop"` in `serde_json::to_value`; in-module `request_for_provider` tests assert typed-stop-wins + provider-`max_tokens` alias-skip on the fallback path. Round-1 MEDIUM (provider-fallback only leaf/helper-tested) fixed by adding the dedicated `request_for_provider` tests.
 **Thermo finding:** `chat_request_field_is_set` (`src/upstream.rs:2268-2285`) has no `"stop"` arm → falls to `_ => false`; a config `upstream_chat_kwargs.stop` gap-fills into the `#[serde(flatten)]` `extra_body` (`chat.rs:48`) alongside the typed `stop` (`chat.rs:47`), emitting a DUPLICATE `"stop"` wire key at the `reqwest .json` POST (`upstream.rs:573`) and dropping the client value on last-key-wins parsers; the near-identical `merge_upstream_chat_kwargs` (`:2037-2065`) vs `merge_fallback_chat_kwargs` (`:2251-2266`) fork — differing only by the max-token-alias guard (`:2047-2054`) the fallback variant lacks — is what hid it and leaks the alias collision on the `/v1/responses` provider-fallback path (engine.rs:1409, call site upstream.rs:810).
 **Fix:** Add `"stop" => request.stop.is_some(),` to `chat_request_field_is_set`. Collapse the two gap-fill helpers into one `merge_chat_kwargs_gap_fill(request, defaults)` that ALWAYS applies the max-token-alias skip (no-op when no alias present), called by both leaf-finalize (`upstream.rs:2011`) and provider-merge (`upstream.rs:810`); delete the second helper. Do NOT add a `stop` strip to `config.rs:349-352` (the typed-field arm is the fix). Verify on the wire path that exactly one `"stop"` (the client value) is emitted with no dup key.
 **Files:** src/upstream.rs, src/config.rs, tests/port_translation.rs, tests/port_routing.rs
