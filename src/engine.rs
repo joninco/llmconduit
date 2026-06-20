@@ -634,16 +634,23 @@ impl Gateway {
         self.monitor.snapshot()
     }
 
-    async fn send_event(
-        &self,
-        tx: &mpsc::Sender<SseEvent>,
-        event: SseEvent,
-        failure_message: &'static str,
-    ) -> AppResult<()> {
+    /// Forward one SSE event to the client and (in `--raw` mode) mirror it to
+    /// stdout.
+    ///
+    /// D3 (R1 #1): a `tx.send` failure has exactly ONE cause here — the SSE
+    /// receiver was dropped, i.e. the client hung up MID-SEND (not parked in
+    /// `next_upstream_chunk`'s `tx.closed()` select). `mpsc::Sender::send`
+    /// awaits capacity and only errors when every receiver is gone, so this is
+    /// unambiguously a cancellation, NOT an internal error. Returning
+    /// `AppError::cancelled()` (HTTP 499) makes this the SINGLE source of truth
+    /// so the spawned finalize choke classifies the flow `Cancelled`, honoring
+    /// the AGENTS.md hard rule that a client hang-up surfaces as cancellation.
+    /// (The `raw_output` write below is a genuine local IO fault and stays
+    /// `internal`.) The old per-call `failure_message` argument is gone because a
+    /// closed receiver is no longer a generic internal error needing a detail.
+    async fn send_event(&self, tx: &mpsc::Sender<SseEvent>, event: SseEvent) -> AppResult<()> {
         let raw_event = event.clone();
-        tx.send(event)
-            .await
-            .map_err(|_| AppError::internal(failure_message))?;
+        tx.send(event).await.map_err(|_| AppError::cancelled())?;
         if let Some(raw_output) = &self.raw_output {
             raw_output
                 .write_sse_event(&raw_event)
@@ -677,12 +684,8 @@ impl Gateway {
                 delta: delta.clone(),
             }
         });
-        self.send_event(
-            tx,
-            function_call_args_delta_event(call_id, name, delta),
-            "failed to stream function call args delta",
-        )
-        .await
+        self.send_event(tx, function_call_args_delta_event(call_id, name, delta))
+            .await
     }
 
     /// Drive a [`ToolDeltaGate`] decision to the wire, in order. `None` emits
@@ -966,9 +969,7 @@ impl Gateway {
                     .emit_with(response_id.as_str(), || MonitorEventKind::Failed {
                         message: err.to_string(),
                     });
-                let _ = gateway
-                    .send_event(&tx, failure_event(err), "failed to send response.failed")
-                    .await;
+                let _ = gateway.send_event(&tx, failure_event(err)).await;
             }
         });
         Ok(ReceiverStream::new(rx))
@@ -1457,18 +1458,9 @@ impl Gateway {
                     });
             }
         }
-        self.send_event(
-            &tx,
-            created_event(&response_id),
-            "failed to send response.created",
-        )
-        .await?;
-        self.send_event(
-            &tx,
-            in_progress_event(&response_id),
-            "failed to send response.in_progress",
-        )
-        .await?;
+        self.send_event(&tx, created_event(&response_id)).await?;
+        self.send_event(&tx, in_progress_event(&response_id))
+            .await?;
 
         let mut public_history = request.input.clone();
         let mut response_output = Vec::new();
@@ -1676,29 +1668,40 @@ impl Gateway {
                     break;
                 };
                 if let Some(usage) = chunk.usage.clone() {
-                    // D3: cumulative-aware UPSERT. `total` is the flow's running
-                    // cumulative (turn_base + this cumulative chunk), NOT an
-                    // increment — so a multi-chunk turn does not double-count and a
-                    // midstream cancel keeps this LAST upserted total (never zero).
-                    let total = flow_usage_from_base_and_chunk(turn_base, &usage);
-                    if let Some(api_call_id) = &api_call_id {
-                        self.flow_store().record_usage(api_call_id, total);
+                    // D3 (R1 #2): the cumulative-aware dashboard/monitor UPSERT is the
+                    // ONLY consumer of `total`, and both its sinks are dashboard-only
+                    // (the FlowStore `record_usage` is gated on `api_call_id`, the
+                    // monitor `emit_with` no-ops when disabled). So skip the
+                    // `flow_usage_from_base_and_chunk` construction entirely on the
+                    // production hot path — no `api_call_id` threaded AND the monitor
+                    // disabled — keeping `MonitorHub::disabled()` truly zero-overhead.
+                    // Borrow `usage` here; it is MOVED into `turn_usage` below.
+                    if api_call_id.is_some() || self.monitor.is_enabled() {
+                        // `total` is the flow's running cumulative (turn_base + this
+                        // cumulative chunk), NOT an increment — so a multi-chunk turn
+                        // does not double-count and a midstream cancel keeps this LAST
+                        // upserted total (never zero).
+                        let total = flow_usage_from_base_and_chunk(turn_base, &usage);
+                        if let Some(api_call_id) = &api_call_id {
+                            self.flow_store().record_usage(api_call_id, total);
+                        }
+                        // D3: emit the usage event to the monitor hub. The `/debug/ws`
+                        // + dashboard surfaces store it on the record + replay it in
+                        // `snapshot()`. D5: the `MetricsLayer.record_usage` ring hook
+                        // attaches HERE once D5 exists (it does not yet).
+                        self.monitor
+                            .emit_with(response_id.as_str(), || MonitorEventKind::Usage {
+                                prompt: total.prompt,
+                                completion: total.completion,
+                                total: total.total,
+                                cached: total.cached,
+                                reasoning: total.reasoning,
+                            });
                     }
-                    // D3: emit the usage event to the monitor hub (lazy — skipped when
-                    // disabled). The `/debug/ws` + dashboard surfaces store it on the
-                    // record + replay it in `snapshot()`. The bare `ResponseUsage`
-                    // total for the CLIENT response is still computed post-loop from
-                    // `into_response_usage` (unchanged) — this is purely additive.
-                    // D5: the `MetricsLayer.record_usage` ring hook attaches HERE once
-                    // D5 exists (it does not yet — no MetricsLayer is invented now).
-                    self.monitor
-                        .emit_with(response_id.as_str(), || MonitorEventKind::Usage {
-                            prompt: total.prompt,
-                            completion: total.completion,
-                            total: total.total,
-                            cached: total.cached,
-                            reasoning: total.reasoning,
-                        });
+                    // D3: the engine's own accumulated_usage advance (post-loop `add`)
+                    // and the bare `ResponseUsage` for the CLIENT response need only
+                    // the raw chunk — this assignment is ALWAYS required regardless of
+                    // the dashboard gate above.
                     turn_usage = Some(usage);
                 }
                 let emissions = state.apply_chunk(&chunk);
@@ -1716,7 +1719,6 @@ impl Gateway {
                             self.send_event(
                                 &tx,
                                 output_item_added_event(item, target.output_index),
-                                "failed to stream message start",
                             )
                             .await?;
                         }
@@ -1730,7 +1732,6 @@ impl Gateway {
                             self.send_event(
                                 &tx,
                                 output_text_delta_event(target.item_id, target.output_index, delta),
-                                "failed to stream text delta",
                             )
                             .await?;
                         }
@@ -1746,7 +1747,6 @@ impl Gateway {
                             self.send_event(
                                 &tx,
                                 output_item_added_event(item, target.output_index),
-                                "failed to stream reasoning start",
                             )
                             .await?;
                         }
@@ -1764,7 +1764,6 @@ impl Gateway {
                                     target.output_index,
                                     delta,
                                 ),
-                                "failed to stream reasoning delta",
                             )
                             .await?;
                         }
@@ -1777,7 +1776,6 @@ impl Gateway {
                                     target.output_index,
                                     signature,
                                 ),
-                                "failed to stream reasoning signature delta",
                             )
                             .await?;
                         }
@@ -1805,7 +1803,6 @@ impl Gateway {
                             self.send_event(
                                 &tx,
                                 content_part_added_event(target.item_id, target.output_index),
-                                "failed to send content_part.added",
                             )
                             .await?;
                         }
@@ -1814,7 +1811,6 @@ impl Gateway {
                             self.send_event(
                                 &tx,
                                 content_part_done_event(target.item_id, target.output_index, text),
-                                "failed to send content_part.done",
                             )
                             .await?;
                         }
@@ -1826,7 +1822,6 @@ impl Gateway {
                                     target.item_id,
                                     target.output_index,
                                 ),
-                                "failed to send reasoning_summary_part.added",
                             )
                             .await?;
                         }
@@ -1839,7 +1834,6 @@ impl Gateway {
                                     target.output_index,
                                     text,
                                 ),
-                                "failed to send reasoning_summary_part.done",
                             )
                             .await?;
                         }
@@ -1849,12 +1843,7 @@ impl Gateway {
                                     delta: delta.clone(),
                                 }
                             });
-                            self.send_event(
-                                &tx,
-                                refusal_delta_event(delta),
-                                "failed to send refusal.delta",
-                            )
-                            .await?;
+                            self.send_event(&tx, refusal_delta_event(delta)).await?;
                         }
                     }
                 }
@@ -2037,19 +2026,9 @@ impl Gateway {
             }
         });
         if is_incomplete {
-            self.send_event(
-                &tx,
-                incomplete_event(resource),
-                "failed to send response.incomplete",
-            )
-            .await?;
+            self.send_event(&tx, incomplete_event(resource)).await?;
         } else {
-            self.send_event(
-                &tx,
-                completed_event(resource),
-                "failed to send response.completed",
-            )
-            .await?;
+            self.send_event(&tx, completed_event(resource)).await?;
         }
         self.monitor.emit(response_id, MonitorEventKind::Completed);
         Ok(())
@@ -2259,7 +2238,6 @@ impl Gateway {
                         target.output_index,
                         reasoning_text,
                     ),
-                    "failed to send reasoning_summary_part.done",
                 )
                 .await?;
             }
@@ -2269,12 +2247,8 @@ impl Gateway {
                     summary: summarize_response_item(&reasoning),
                     payload_preview: preview_json(&reasoning),
                 });
-            self.send_event(
-                tx,
-                output_item_done_event(reasoning, target.output_index),
-                "failed to send reasoning done",
-            )
-            .await?;
+            self.send_event(tx, output_item_done_event(reasoning, target.output_index))
+                .await?;
         }
         if let Some(message) = finalized.message_item.clone() {
             let target = event_state.target_for_item(&message);
@@ -2297,7 +2271,6 @@ impl Gateway {
                             target.output_index,
                             full_text.clone(),
                         ),
-                        "failed to send output_text.done",
                     )
                     .await?;
                     if finalized.content_part_emitted {
@@ -2308,7 +2281,6 @@ impl Gateway {
                                 target.output_index,
                                 full_text,
                             ),
-                            "failed to send content_part.done",
                         )
                         .await?;
                     }
@@ -2322,20 +2294,12 @@ impl Gateway {
                     summary: summarize_response_item(&message),
                     payload_preview: preview_json(&message),
                 });
-            self.send_event(
-                tx,
-                output_item_done_event(message, target.output_index),
-                "failed to send message done",
-            )
-            .await?;
+            self.send_event(tx, output_item_done_event(message, target.output_index))
+                .await?;
         }
         if !finalized.refusal_text.is_empty() {
-            self.send_event(
-                tx,
-                refusal_done_event(finalized.refusal_text.clone()),
-                "failed to send refusal.done",
-            )
-            .await?;
+            self.send_event(tx, refusal_done_event(finalized.refusal_text.clone()))
+                .await?;
         }
         Ok(())
     }
@@ -2401,7 +2365,6 @@ impl Gateway {
                             name.clone(),
                             arguments.clone(),
                         ),
-                        "failed to send function call args done",
                     )
                     .await?;
                 }
@@ -2422,7 +2385,6 @@ impl Gateway {
                 self.send_event(
                     tx,
                     output_item_done_event(tool_call.public_item.clone(), target.output_index),
-                    "failed to send tool call item",
                 )
                 .await?;
             }
@@ -2499,7 +2461,6 @@ impl Gateway {
         self.send_event(
             tx,
             output_item_added_event(partial, partial_target.output_index),
-            "failed to send web_search start",
         )
         .await?;
 
@@ -2549,7 +2510,6 @@ impl Gateway {
         self.send_event(
             tx,
             output_item_done_event(completed, completed_target.output_index),
-            "failed to send web_search done",
         )
         .await?;
 
@@ -2585,7 +2545,6 @@ impl Gateway {
                     "results": result_items,
                 }),
             },
-            "failed to send web_search results",
         )
         .await?;
         self.monitor

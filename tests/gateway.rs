@@ -280,6 +280,70 @@ impl UpstreamClient for ChunkThenPendingUpstream {
     }
 }
 
+/// Yields a FLOOD of content chunks (enough that their fan-out of SSE events
+/// overflows the engine's 128-slot channel) then parks. A client that never
+/// drains the channel forces the engine to block INSIDE `send_event`'s
+/// `tx.send().await` — exercising the mid-SEND cancellation path (D3 R1 #1),
+/// distinct from `ChunkThenPendingUpstream` whose cancel lands while the engine
+/// is parked in `next_upstream_chunk`'s `tx.closed()` select. `yielded` counts
+/// chunks handed to the engine; on the current-thread test runtime it freezes
+/// EXACTLY when the engine blocks on a full channel (no other task can run while
+/// the test loops), giving a deterministic "engine is mid-send" signal with no
+/// sleep.
+#[derive(Clone)]
+struct FloodThenParkUpstream {
+    flood: usize,
+    yielded: Arc<std::sync::atomic::AtomicUsize>,
+    stream_dropped: Arc<Notify>,
+}
+
+impl FloodThenParkUpstream {
+    fn new(flood: usize) -> Self {
+        Self {
+            flood,
+            yielded: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            stream_dropped: Arc::new(Notify::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl UpstreamClient for FloodThenParkUpstream {
+    async fn stream_chat_completion(
+        &self,
+        _backend: &llmconduit::upstream::BackendChatRequest,
+    ) -> Result<UpstreamStream, llmconduit::error::AppError> {
+        let flood = self.flood;
+        let yielded = Arc::clone(&self.yielded);
+        let stream_dropped = Arc::clone(&self.stream_dropped);
+        let stream = async_stream::stream! {
+            let _drop_guard = NotifyOnDrop { notify: stream_dropped };
+            for i in 0..flood {
+                yielded.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                yield Ok(content_chunk("chat-1", &format!("tok{i} ")));
+            }
+            // Flood exhausted (only reached if the client kept draining); park so a
+            // late cancel still has a stream to drop.
+            std::future::pending::<()>().await;
+            yield Ok(content_chunk("chat-1", "unreachable"));
+        };
+        Ok(Box::pin(stream))
+    }
+
+    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+        Err(llmconduit::error::AppError::internal("unused in this test"))
+    }
+
+    async fn supported_model_catalog(
+        &self,
+    ) -> Result<Vec<UpstreamModelEntry>, llmconduit::error::AppError> {
+        Ok(vec![UpstreamModelEntry {
+            id: "glm-5.1".to_string(),
+            context_limit: None,
+        }])
+    }
+}
+
 #[derive(Clone, Default)]
 struct MockSearch {
     queries: Arc<Mutex<Vec<String>>>,
@@ -4129,6 +4193,83 @@ async fn d3_midstream_cancel_finalizes_cancelled_with_last_usage() {
     assert_eq!(usage.cached, 5);
     assert_eq!(
         record.claim.load(std::sync::atomic::Ordering::SeqCst),
+        llmconduit::dashboard_flow::CLAIM_FINALIZED,
+    );
+}
+
+#[tokio::test]
+async fn d3_cancel_during_send_finalizes_cancelled_not_failed() {
+    // D3 R1 #1: a client that drops the SSE receiver while the engine is BLOCKED
+    // inside `send_event`'s `tx.send().await` (the channel is full because the
+    // client never drained it) must finalize the flow Cancelled — NOT Failed.
+    // Before the fix `send_event` mapped a closed receiver to `AppError::internal`,
+    // which the spawned choke (is_cancelled() == false) classified Failed. This is
+    // the MID-SEND cancel path, distinct from `d3_midstream_cancel_*` whose cancel
+    // lands while parked in `next_upstream_chunk`.
+    use std::sync::atomic::Ordering;
+
+    let flood = 300; // » the 128-slot channel, so the engine blocks on send.
+    let upstream = FloodThenParkUpstream::new(flood);
+    let yielded = Arc::clone(&upstream.yielded);
+    let gateway = test_gateway_with_flow_store_upstream(Arc::new(upstream.clone()));
+    let api_call_id = d3_open_flow(&gateway);
+
+    let request = base_request(vec![user_message("flood")]);
+    // Hold the stream but NEVER poll it, so nothing drains the channel.
+    let stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+
+    // On the current-thread test runtime the spawned `run_turn` can only run while
+    // we await. Yield until the upstream's yield-count goes quiescent: that happens
+    // EXACTLY when the engine is blocked on a full channel (it cannot pull the next
+    // chunk until a send completes, and no send can complete while we never drain).
+    // A stable count across a long streak ⇒ the engine is parked mid-send.
+    let mut last = usize::MAX;
+    let mut stable = 0;
+    let mut guard = 0;
+    while stable < 200 {
+        tokio::task::yield_now().await;
+        let now = yielded.load(Ordering::SeqCst);
+        if now == last {
+            stable += 1;
+        } else {
+            stable = 0;
+            last = now;
+        }
+        guard += 1;
+        assert!(guard < 1_000_000, "engine never went quiescent (mid-send)");
+    }
+    assert!(
+        last > 0 && last < flood,
+        "engine blocked on a full channel mid-flood (yielded {last} of {flood}), \
+         i.e. parked inside tx.send — not drained to completion, not still at 0"
+    );
+
+    // Client hangs up WHILE the engine is blocked inside `tx.send().await`.
+    let stream_dropped = upstream.stream_dropped.notified();
+    drop(stream);
+    // The dropped receiver makes the pending send fail → AppError::cancelled() →
+    // the spawned `run_turn` returns and its stream drops.
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_dropped)
+        .await
+        .expect("upstream stream dropped after the client hung up mid-send");
+
+    let record = d3_await_terminal(&gateway, &api_call_id).await;
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Cancelled,
+        "client disconnect DURING a tx.send finalizes Cancelled, not Failed"
+    );
+    assert_eq!(
+        record.terminal_reason.as_deref(),
+        Some("client_disconnected"),
+        "carries the cancellation terminal reason, not an internal-error string"
+    );
+    assert_eq!(
+        record.claim.load(Ordering::SeqCst),
         llmconduit::dashboard_flow::CLAIM_FINALIZED,
     );
 }
