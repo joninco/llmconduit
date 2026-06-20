@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>llmconduit dashboard — sign in</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101214;
+      --panel: #171a1f;
+      --line: #303741;
+      --text: #edf1f5;
+      --muted: #9aa6b2;
+      --blue: #6bb6ff;
+      --red: #ff6b6b;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      display: grid;
+      place-items: center;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 28px 26px;
+      width: min(360px, 90vw);
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.4);
+    }
+    h1 { font-size: 17px; margin: 0 0 4px; }
+    p.sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+    input {
+      width: 100%;
+      background: #0d0f12;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-size: 14px;
+      outline: none;
+    }
+    input:focus { border-color: var(--blue); }
+    button {
+      margin-top: 16px;
+      width: 100%;
+      background: var(--blue);
+      color: #06121f;
+      border: 0;
+      border-radius: 8px;
+      padding: 11px 12px;
+      font-size: 14px;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: default; }
+    .error {
+      margin-top: 12px;
+      color: var(--red);
+      font-size: 13px;
+      min-height: 16px;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>llmconduit dashboard</h1>
+    <p class="sub">Enter the dashboard access token to continue.</p>
+    <form id="login-form" autocomplete="off">
+      <label for="token">Access token</label>
+      <input id="token" name="token" type="password" autocomplete="current-password" spellcheck="false" autofocus>
+      <button id="submit" type="submit">Sign in</button>
+      <div class="error" id="error" role="alert"></div>
+    </form>
+  </main>
+  <script nonce="{NONCE}">
+    const form = document.getElementById("login-form");
+    const tokenInput = document.getElementById("token");
+    const submitBtn = document.getElementById("submit");
+    const errorEl = document.getElementById("error");
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      errorEl.textContent = "";
+      submitBtn.disabled = true;
+      try {
+        const response = await fetch("/dashboard/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: tokenInput.value }),
+        });
+        if (response.ok) {
+          // The signed session cookie is now set; reload to the SPA shell.
+          window.location.reload();
+          return;
+        }
+        errorEl.textContent = response.status === 401
+          ? "Invalid token."
+          : `Sign-in failed (${response.status}).`;
+      } catch (err) {
+        errorEl.textContent = "Network error — please retry.";
+      } finally {
+        submitBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

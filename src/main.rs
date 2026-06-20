@@ -53,16 +53,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = Config::from_env_file_and_routes(Some(&path), &model_route)?;
             let bind_addr = config.bind_addr;
             run_debug_log_cleanup(&config);
-            let (app, _gateway) = build_app_with_gateway_and_options(
+            let (app, gateway) = build_app_with_gateway_and_options(
                 config,
                 raw.then(RawOutput::stdout),
                 app_options,
             );
             let listener = TcpListener::bind(bind_addr).await?;
             log_listening(bind_addr);
-            if app_options.with_debug_ui {
-                tracing::info!("debug UI available at http://{bind_addr}/debug");
-            }
+            log_debug_ui_status(&gateway, app_options, bind_addr);
             tracing::info!("using config file {}", path.display());
             axum::serve(listener, app).await?;
             Ok(())
@@ -72,12 +70,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let config = Config::from_env_and_file(Some(&path))?;
             let bind_addr = config.bind_addr;
             run_debug_log_cleanup(&config);
-            let (app, _gateway) = build_app_with_gateway_and_options(config, None, app_options);
+            let (app, gateway) = build_app_with_gateway_and_options(config, None, app_options);
             let listener = TcpListener::bind(bind_addr).await?;
             log_listening(bind_addr);
-            if app_options.with_debug_ui {
-                tracing::info!("debug UI available at http://{bind_addr}/debug");
-            }
+            log_debug_ui_status(&gateway, app_options, bind_addr);
             tracing::info!("using config file {}", path.display());
             axum::serve(listener, app).await?;
             Ok(())
@@ -95,6 +91,30 @@ fn log_listening(bind_addr: impl std::fmt::Display) {
         llmconduit::GIT_DIRTY,
         llmconduit::BUILD_TIME,
     );
+}
+
+/// Log the debug-UI / dashboard availability honestly: when `--with-debug-ui`
+/// is set, the D7 startup decision may have REFUSED to register the protected
+/// routes (non-loopback bind without a token + validated https origin). The
+/// gateway holds the auth context iff the routes registered, so we key the
+/// message off `dashboard_auth().is_some()` rather than the flag alone — and the
+/// precise refusal reason was already logged by `build_app_*` at WARN.
+fn log_debug_ui_status(
+    gateway: &llmconduit::engine::Gateway,
+    options: AppOptions,
+    bind_addr: impl std::fmt::Display,
+) {
+    if !options.with_debug_ui {
+        return;
+    }
+    if gateway.dashboard_auth().is_some() {
+        tracing::info!("debug UI + dashboard available at http://{bind_addr}/debug and /dashboard");
+    } else {
+        tracing::warn!(
+            "--with-debug-ui set but /debug and /dashboard were NOT registered \
+             (see the dashboard auth WARN above)"
+        );
+    }
 }
 
 /// Spawn opt-in age-based cleanup of debug/request-log dump files for each

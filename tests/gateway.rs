@@ -1541,6 +1541,9 @@ async fn debug_ui_is_disabled_by_default() {
 
 #[tokio::test]
 async fn serves_embedded_debug_web_ui_when_enabled() {
+    // Loopback + no token env → D7 dev-open mode: `/debug` serves without a
+    // login. The client logic now lives in the externalized `/debug/app.js`
+    // (D7) so `/debug` can ship a strict `script-src 'self'` CSP.
     let app = llmconduit::build_app_with_options(
         test_config(),
         llmconduit::AppOptions {
@@ -1558,13 +1561,394 @@ async fn serves_embedded_debug_web_ui_when_enabled() {
         .expect("response");
 
     assert_eq!(response.status().as_u16(), 200);
+    let csp = response
+        .headers()
+        .get(axum::http::header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .expect("/debug carries a CSP")
+        .to_string();
+    // The inline module script was externalized → the CSP needs NO
+    // 'unsafe-inline' in script-src.
+    assert!(csp.contains("script-src 'self'"), "csp: {csp}");
+    assert!(
+        !csp.contains("script-src 'self' 'unsafe-inline'"),
+        "/debug script-src must not allow unsafe-inline: {csp}"
+    );
+    assert!(csp.contains("frame-ancestors 'none'"), "csp: {csp}");
+    assert_security_headers(response.headers());
+
     let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
         .expect("read body");
     let body = String::from_utf8(body_bytes.to_vec()).expect("utf8 body");
-    assert!(body.contains("/debug/ws"));
     assert!(body.contains("llmconduit debug"));
+    // The script is now an external reference, not an inline module.
+    assert!(
+        body.contains("src=\"/debug/app.js\""),
+        "expected external script tag"
+    );
+    assert!(
+        !body.contains("new WebSocket"),
+        "client logic must live in /debug/app.js, not inline"
+    );
+}
+
+#[tokio::test]
+async fn debug_app_js_is_served_with_strict_csp() {
+    let app = llmconduit::build_app_with_options(
+        test_config(),
+        llmconduit::AppOptions {
+            with_debug_ui: true,
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/debug/app.js")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("text/javascript; charset=utf-8")
+    );
+    let body_bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("read body");
+    let body = String::from_utf8(body_bytes.to_vec()).expect("utf8 body");
+    // The externalized client logic — including the WS connect that used to be
+    // inline — is here.
+    assert!(body.contains("/debug/ws"));
     assert!(body.contains("new WebSocket"));
+}
+
+#[tokio::test]
+async fn dashboard_shell_carries_csp_and_bootstrap_in_dev_open() {
+    // Dev-open (loopback, no token) → `/dashboard` serves the SPA shell with the
+    // injected bootstrap object + the dashboard CSP.
+    let app = llmconduit::build_app_with_options(
+        test_config(),
+        llmconduit::AppOptions {
+            with_debug_ui: true,
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let csp = response
+        .headers()
+        .get(axum::http::header::CONTENT_SECURITY_POLICY)
+        .and_then(|v| v.to_str().ok())
+        .expect("/dashboard carries a CSP")
+        .to_string();
+    assert!(csp.contains("default-src 'self'"), "csp: {csp}");
+    assert!(csp.contains("connect-src 'self' ws: wss:"), "csp: {csp}");
+    assert!(csp.contains("frame-ancestors 'none'"), "csp: {csp}");
+    // The injected inline bootstrap is authorized by a per-response nonce.
+    assert!(
+        csp.contains("'nonce-"),
+        "dashboard CSP must carry a script nonce: {csp}"
+    );
+    assert_security_headers(response.headers());
+    // A fresh CSRF cookie accompanies the authenticated shell.
+    assert!(
+        set_cookie_values(response.headers())
+            .iter()
+            .any(|c| c.starts_with("llmconduit_csrf=")),
+        "authenticated dashboard shell must set a CSRF cookie"
+    );
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body = String::from_utf8(body_bytes.to_vec()).expect("utf8 body");
+    assert!(
+        body.contains("window.__LLMCONDUIT_DASHBOARD__"),
+        "bootstrap injected"
+    );
+    assert!(body.contains("\"authenticated\":true"));
+}
+
+// ---------------------------------------------------------------------------
+// D7a auth-gated integration tests: a router built WITH a configured token (the
+// production posture) so the 401/200 gating, login flow, login-shell, and
+// startup refusal run through the REAL axum stack — without mutating the shared
+// process environment.
+// ---------------------------------------------------------------------------
+
+/// A `DashboardEnv` with a token + https origin (production posture). Mutations
+/// off by default.
+fn authed_env() -> llmconduit::dashboard_auth::DashboardEnv {
+    use base64::Engine as _;
+    llmconduit::dashboard_auth::DashboardEnv {
+        token: Some("integration-token".to_string()),
+        session_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([42u8; 32])),
+        public_origin: Some("https://dash.example.com".to_string()),
+        allow_insecure: false,
+        allow_mutations: false,
+    }
+}
+
+/// Build a router whose protected routes are registered with a fully-configured
+/// `DashboardAuth` built from `env`, for a server bound to `bind`. Returns the
+/// router and the auth handle (so a test can mint a valid session cookie).
+fn authed_router(
+    bind: std::net::SocketAddr,
+    env: &llmconduit::dashboard_auth::DashboardEnv,
+) -> (axum::Router, Arc<llmconduit::dashboard_auth::DashboardAuth>) {
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(bind, env)
+        .expect("auth builds")
+        .auth;
+    let gateway = test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default())
+        .as_ref()
+        .clone()
+        .with_dashboard_auth(Some(Arc::clone(&auth)));
+    let router = llmconduit::http::build_router(
+        Arc::new(gateway),
+        llmconduit::http::RouterOptions {
+            with_debug_ui: true,
+            register_protected_routes: true,
+        },
+    );
+    (router, auth)
+}
+
+fn assert_security_headers(headers: &axum::http::HeaderMap) {
+    assert_eq!(
+        headers
+            .get(axum::http::header::X_FRAME_OPTIONS)
+            .and_then(|v| v.to_str().ok()),
+        Some("DENY")
+    );
+    assert_eq!(
+        headers
+            .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        headers
+            .get(axum::http::header::REFERRER_POLICY)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-referrer")
+    );
+    assert_eq!(
+        headers
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+}
+
+fn set_cookie_values(headers: &axum::http::HeaderMap) -> Vec<String> {
+    headers
+        .get_all(axum::http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(ToString::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn protected_debug_requires_session_when_token_configured() {
+    let (app, auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+
+    // No cookie → 401 no-store.
+    let unauthed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/debug")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthed.status().as_u16(), 401);
+    assert_eq!(
+        unauthed
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+
+    // A valid signed session cookie → 200.
+    let (cookie, _exp) = auth.issue_session();
+    let authed = app
+        .oneshot(
+            Request::builder()
+                .uri("/debug")
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={cookie}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authed.status().as_u16(), 200);
+}
+
+#[tokio::test]
+async fn dashboard_login_rejects_bad_token_and_sets_signed_cookie_on_success() {
+    let (app, _auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+
+    // Wrong token → 401.
+    let bad = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/login")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"token":"nope"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(bad.status().as_u16(), 401);
+
+    // Correct token → 200 + a signed HttpOnly SameSite=Strict Secure Path=/
+    // session cookie AND a non-HttpOnly CSRF cookie.
+    let ok = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/login")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"token":"integration-token"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
+    let cookies = set_cookie_values(ok.headers());
+    let session = cookies
+        .iter()
+        .find(|c| c.starts_with("llmconduit_session="))
+        .expect("session cookie set");
+    assert!(session.contains("HttpOnly"), "session: {session}");
+    assert!(session.contains("SameSite=Strict"), "session: {session}");
+    assert!(session.contains("Path=/"), "session: {session}");
+    assert!(
+        session.contains("Secure"),
+        "session (https origin): {session}"
+    );
+    assert!(session.contains("Max-Age=3600"), "session: {session}");
+    let csrf = cookies
+        .iter()
+        .find(|c| c.starts_with("llmconduit_csrf="))
+        .expect("csrf cookie set");
+    assert!(
+        !csrf.contains("HttpOnly"),
+        "csrf must be readable by the SPA: {csrf}"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_serves_login_shell_when_unauthed() {
+    let (app, _auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body = String::from_utf8(
+        axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    // The login shell, NOT the authenticated SPA bootstrap.
+    assert!(
+        body.contains("/dashboard/login"),
+        "login form posts to /dashboard/login"
+    );
+    assert!(
+        !body.contains("\"authenticated\":true"),
+        "unauthed shell must not inject an authenticated bootstrap"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_logout_clears_cookies() {
+    let (app, _auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/logout")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 204);
+    let cookies = set_cookie_values(response.headers());
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("llmconduit_session=;") && c.contains("Max-Age=0")),
+        "session cookie cleared: {cookies:?}"
+    );
+    assert!(
+        cookies
+            .iter()
+            .any(|c| c.starts_with("llmconduit_csrf=;") && c.contains("Max-Age=0")),
+        "csrf cookie cleared: {cookies:?}"
+    );
+}
+
+#[tokio::test]
+async fn non_loopback_without_token_refuses_to_register_protected_routes() {
+    // Mirror the production decision: a non-loopback bind with no token/origin
+    // → refuse. Build a router with `register_protected_routes: false` (what the
+    // startup decision yields) and confirm `/debug` is a 404, not a 401.
+    let gateway = test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default());
+    let app = llmconduit::http::build_router(
+        gateway,
+        llmconduit::http::RouterOptions {
+            with_debug_ui: true,
+            register_protected_routes: false,
+        },
+    );
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/debug")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status().as_u16(),
+        404,
+        "refused routes must not be registered (404, not 401)"
+    );
 }
 
 #[tokio::test]

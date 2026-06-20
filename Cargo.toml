@@ -14,6 +14,13 @@ dirs = "6"
 eventsource-stream = "0.2"
 futures = "0.3"
 hex = "0.4"
+# Dashboard session-cookie auth (D7): HMAC-SHA256 signing (`hmac` + the existing
+# `sha2`), constant-time comparison of tokens/MACs (`subtle`), and base64url
+# cookie encoding (`base64`). Secrets are read from the environment in the auth
+# layer and never stored on the persisted `Config`.
+base64 = "0.22"
+hmac = "0.12"
+subtle = "2"
 http = "1"
 # Embed the dashboard SPA (`$OUT_DIR/dashboard_dist/`, materialized by build.rs)
 # into the binary at compile time (D8); the `static Dir<'static>` binding in

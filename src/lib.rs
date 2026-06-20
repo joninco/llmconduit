@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod cli;
 pub mod config;
+pub mod dashboard_auth;
 pub mod dashboard_flow;
 pub mod dashboard_ui;
 pub mod debug_ui;
@@ -243,19 +244,87 @@ pub fn build_app_with_gateway_and_options(
     let vision: Arc<dyn crate::vision::VisionClient> =
         Arc::new(ReqwestVisionClient::new(http_client, &config));
     let image_cache = Arc::new(ImageCache::from_config(&config));
-    let gateway = Arc::new(Gateway::new(
-        config,
-        replay_store,
-        upstream,
-        search,
-        vision,
-        image_cache,
-        monitor,
-        raw_output,
-        flow_store,
-    ));
-    let app = build_router(Arc::clone(&gateway), options.into());
+
+    // D7 dashboard/`/debug` auth, built from the ENVIRONMENT (never from the
+    // persisted `Config`). Only constructed when the debug UI is enabled. The
+    // env snapshot + bind address also drive the route-registration decision:
+    // a non-loopback bind without a token + validated https origin REFUSES to
+    // register the protected routes (logged), unless `ALLOW_INSECURE=1`.
+    let bind_addr = config.bind_addr;
+    let (dashboard_auth, register_protected_routes) = if options.with_debug_ui {
+        build_dashboard_auth(bind_addr)
+    } else {
+        (None, false)
+    };
+
+    let gateway = Arc::new(
+        Gateway::new(
+            config,
+            replay_store,
+            upstream,
+            search,
+            vision,
+            image_cache,
+            monitor,
+            raw_output,
+            flow_store,
+        )
+        .with_dashboard_auth(dashboard_auth),
+    );
+    let router_options = RouterOptions {
+        with_debug_ui: options.with_debug_ui,
+        register_protected_routes,
+    };
+    let app = build_router(Arc::clone(&gateway), router_options);
     (app, gateway)
+}
+
+/// Build the D7 dashboard auth context + the route-registration decision for a
+/// server binding to `bind_addr`, reading secrets from the process environment.
+/// Returns `(Some(auth), true)` when the protected routes may register,
+/// `(None, false)` when the startup decision refuses them (logged) or the auth
+/// context fails to build (e.g. a malformed secret — logged). Warnings (a
+/// tokenless loopback dev server, an auto-generated key, an insecure override)
+/// are logged here so a running process is auditable.
+fn build_dashboard_auth(
+    bind_addr: std::net::SocketAddr,
+) -> (Option<Arc<crate::dashboard_auth::DashboardAuth>>, bool) {
+    use crate::dashboard_auth::DashboardEnv;
+    use crate::dashboard_auth::RouteDecision;
+    use crate::dashboard_auth::startup_route_decision;
+
+    let env = DashboardEnv::from_process_env();
+    let decision = startup_route_decision(bind_addr, &env);
+    match decision {
+        RouteDecision::Refuse(refusal) => {
+            tracing::warn!(
+                "dashboard/debug routes NOT registered: {} (set the required env vars, or \
+                 LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1 to override)",
+                refusal.reason()
+            );
+            (None, false)
+        }
+        RouteDecision::Register { warnings } => {
+            for warning in &warnings {
+                tracing::warn!("dashboard auth: {warning}");
+            }
+            match crate::dashboard_auth::DashboardAuth::from_env(bind_addr, &env) {
+                Ok(build) => {
+                    for warning in &build.warnings {
+                        tracing::warn!("dashboard auth: {warning}");
+                    }
+                    (Some(build.auth), true)
+                }
+                Err(err) => {
+                    tracing::error!(
+                        "dashboard/debug routes NOT registered: failed to build auth context: \
+                         {err}"
+                    );
+                    (None, false)
+                }
+            }
+        }
+    }
 }
 
 pub fn build_app_from_gateway(gateway: Arc<Gateway>) -> axum::Router {
@@ -276,8 +345,13 @@ pub struct AppOptions {
 
 impl From<AppOptions> for RouterOptions {
     fn from(options: AppOptions) -> Self {
+        // The `build_app_from_gateway*` path (tests, embedders) has no bind
+        // address / env snapshot to run the D7 startup decision against, so it
+        // does NOT register the protected routes — `build_app_with_gateway_and_options`
+        // is the path that computes the decision and attaches the auth context.
         Self {
             with_debug_ui: options.with_debug_ui,
+            register_protected_routes: false,
         }
     }
 }

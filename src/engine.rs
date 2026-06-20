@@ -77,6 +77,12 @@ pub struct Gateway {
     /// `DashboardFlowStore::disabled()` when `--with-debug-ui` is off, so every
     /// store op is a no-op and the production hot path is unchanged.
     flow_store: crate::dashboard_flow::DashboardFlowStore,
+    /// D7 dashboard/`/debug` auth context (env-only secrets), shared as the
+    /// router's auth-layer state. `None` when the debug UI is off OR when the
+    /// startup decision refused to register the protected routes — in either
+    /// case the auth-gated routes are simply not registered. NEVER built from
+    /// the persisted `Config` (secrets are read from the environment).
+    dashboard_auth: Option<Arc<crate::dashboard_auth::DashboardAuth>>,
     upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
     /// Throttle state for the "requested model not served → fell back to the
     /// default catalog model" WARN. Every request resolves the model TWICE (the
@@ -548,9 +554,29 @@ impl Gateway {
             monitor,
             raw_output,
             flow_store,
+            dashboard_auth: None,
             upstream_model_catalog: Arc::new(Mutex::new(None)),
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Attach the D7 dashboard auth context (built from the environment in the
+    /// DI root). Consuming builder so it threads through the `Gateway::new(...)`
+    /// → `Arc::new` construction without widening the constructor signature
+    /// (every test that builds a bare `Gateway` keeps `dashboard_auth: None`).
+    pub fn with_dashboard_auth(
+        mut self,
+        auth: Option<Arc<crate::dashboard_auth::DashboardAuth>>,
+    ) -> Self {
+        self.dashboard_auth = auth;
+        self
+    }
+
+    /// The dashboard/`/debug` auth context, when the protected routes are
+    /// registered. `None` when the debug UI is off or the startup decision
+    /// refused registration.
+    pub fn dashboard_auth(&self) -> Option<Arc<crate::dashboard_auth::DashboardAuth>> {
+        self.dashboard_auth.clone()
     }
 
     /// Access the dashboard FlowStore (D1). `is_enabled()` is `false` when the

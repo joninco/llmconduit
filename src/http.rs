@@ -4,8 +4,13 @@ use crate::adapters::chat_completions::ChatCompletionCollector;
 use crate::adapters::chat_completions::ChatCompletionStreamConverter;
 use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
+use crate::dashboard_auth::DashboardAuth;
+use crate::dashboard_auth::dashboard_login;
+use crate::dashboard_auth::dashboard_logout;
+use crate::dashboard_auth::require_session;
 use crate::dashboard_ui::dashboard_asset;
 use crate::dashboard_ui::dashboard_index;
+use crate::debug_ui::debug_app_js;
 use crate::debug_ui::debug_index;
 use crate::debug_ui::debug_ws;
 use crate::engine::Gateway;
@@ -17,6 +22,7 @@ use crate::models::responses::ResponsesRequest;
 use crate::proxy_headers::header_name_eq;
 use crate::proxy_headers::is_hop_by_hop_header;
 use crate::upstream::collect_models_response;
+use axum::Extension;
 use axum::Json;
 use axum::Router;
 use axum::body::Body;
@@ -60,6 +66,12 @@ const UNKNOWN_MODEL_CREATED_AT: &str = "1970-01-01T00:00:00Z";
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RouterOptions {
     pub with_debug_ui: bool,
+    /// D7 startup gate: whether the protected `/debug` + `/dashboard` routes may
+    /// be registered. `false` when the bind/secret configuration refuses them
+    /// (e.g. non-loopback without a token + https origin). Independent of
+    /// `with_debug_ui` so an operator sees a clear "refused to register" startup
+    /// log rather than a silent 404. Only consulted when `with_debug_ui` is set.
+    pub register_protected_routes: bool,
 }
 
 pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
@@ -74,17 +86,17 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         .route("/health", get(get_health))
         .route("/", get(get_root));
 
-    let router = if options.with_debug_ui {
-        router
-            .route("/debug", get(debug_index))
-            .route("/debug/ws", get(debug_ws))
-            // D8 dashboard SPA: shell + embedded static assets, gated by the same
-            // `--with-debug-ui` flag (off → not registered). D7 wraps these with
-            // auth/CSP later. `{*path}` captures the asset path under `assets/`.
-            .route("/dashboard", get(dashboard_index))
-            .route("/dashboard/assets/{*path}", get(dashboard_asset))
-    } else {
-        router
+    // D7: the debug UI + dashboard routes register only when `--with-debug-ui`
+    // is set AND the startup decision permits it AND the env-built auth context
+    // exists. All three hold or none of the protected routes appear (production
+    // untouched; a misconfigured non-loopback server refuses rather than serving
+    // transcripts/credentials in the clear).
+    let router = match (
+        options.with_debug_ui && options.register_protected_routes,
+        gateway.dashboard_auth(),
+    ) {
+        (true, Some(auth)) => router.merge(protected_routes(auth)),
+        _ => router,
     };
 
     router
@@ -94,6 +106,51 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
             log_api_call,
         ))
         .with_state(gateway)
+}
+
+/// The D7-gated `/debug` + `/dashboard` sub-router (state `Arc<Gateway>`, merged
+/// into the main router so it shares the outer `.with_state`).
+///
+/// Auth topology:
+/// - `/dashboard/login` + `/dashboard/logout` — read the auth `Extension` (so
+///   the handlers can sign/clear cookies) but are NOT behind `require_session`
+///   (login is how you authenticate; logout must work for any state).
+/// - `/dashboard` — auth `Extension` only; the shell handler serves the login
+///   page vs. the SPA from `Option<AuthSession>` itself (no 401).
+/// - `/dashboard/assets/{*path}` — public sub-resources (hashed, immutable); the
+///   SPA shell behind them is already gated, and the asset bytes carry no
+///   secrets.
+/// - `/debug` + `/debug/app.js` — behind `require_session` (401 when unauthed).
+/// - `/debug/ws` — self-gated inside the handler (cookie + `Origin` + `exp`); it
+///   needs to OWN the rejection so the WS `Origin` check is authoritative.
+///
+/// The shared `Arc<DashboardAuth>` is attached as a request `Extension` scoped to
+/// this sub-router so the middleware/handlers/extractors can read it
+/// (`/debug/ws` reads it via `gateway.dashboard_auth()` instead).
+fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
+    // Routes requiring a valid session (401 when missing/expired/invalid).
+    let session_gated = Router::new()
+        .route("/debug", get(debug_index))
+        .route("/debug/app.js", get(debug_app_js))
+        .route_layer(middleware::from_fn(require_session));
+
+    // Routes that read the auth context but manage their own access decision,
+    // plus the self-gated WS and the public hashed assets.
+    //
+    // D7b: the dashboard data socket plugs in as a separate `/dashboard/ws`
+    // route carrying the batched `DashboardFrame` envelope; it is intentionally
+    // NOT registered in stage D7a (no D3/D4/D5 payload types yet).
+    let open = Router::new()
+        .route("/dashboard", get(dashboard_index))
+        .route("/dashboard/login", post(dashboard_login))
+        .route("/dashboard/logout", post(dashboard_logout))
+        .route("/debug/ws", get(debug_ws))
+        .route("/dashboard/assets/{*path}", get(dashboard_asset));
+
+    session_gated
+        .merge(open)
+        // Scope the auth context to ONLY the protected routes (not `/v1/*`).
+        .layer(Extension(auth))
 }
 
 /// Whether a request is an instrumented inference flow (D1, incl. R1 #1): the
