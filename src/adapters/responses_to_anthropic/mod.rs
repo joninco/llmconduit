@@ -816,11 +816,8 @@ fn response_terminal_reason(data: &Value) -> Option<crate::models::responses::Te
     data.get("response")
         .and_then(|response| response.get("terminal_reason"))
         .and_then(Value::as_str)
-        .map(|reason| match reason {
-            "stop" => TerminalReason::Stop,
-            "length" => TerminalReason::Length,
-            "tool_calls" => TerminalReason::ToolCall,
-            "content_filter" => TerminalReason::ContentFilter,
-            _ => TerminalReason::Other,
-        })
+        // Delegate to the canonical string→variant map (the sole authoritative
+        // mapping). PRESENT-but-unrecognized ⇒ `Other` (non-clean, never falls
+        // back to the event-type string); ABSENT ⇒ `None` (T7 R1 invariant).
+        .map(|reason| TerminalReason::from_finish_reason(Some(reason)))
 }

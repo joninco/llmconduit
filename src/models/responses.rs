@@ -727,6 +727,35 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
+    fn terminal_reason_wire_strings_are_pinned() {
+        // Load-bearing wire contract: the engine serializes `TerminalReason` onto
+        // the terminal resource and the Anthropic converter re-reads these exact
+        // strings via `from_finish_reason`. The `ToolCall => "tool_calls"` case is
+        // the critical one — without `#[serde(rename = "tool_calls")]` snake_case
+        // would emit `"tool_call"`, silently degrading the converter to `Other`.
+        for (variant, expected) in [
+            (TerminalReason::Stop, "stop"),
+            (TerminalReason::Length, "length"),
+            (TerminalReason::ToolCall, "tool_calls"),
+            (TerminalReason::ContentFilter, "content_filter"),
+            (TerminalReason::Other, "other"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(variant).unwrap(),
+                serde_json::Value::String(expected.to_string()),
+                "wire string for {variant:?}",
+            );
+            // Belt-and-braces: producer spelling round-trips through the canonical
+            // mapper, so producer + consumer agree on every variant.
+            assert_eq!(
+                TerminalReason::from_finish_reason(Some(expected)),
+                variant,
+                "round-trip for {variant:?}",
+            );
+        }
+    }
+
+    #[test]
     fn response_item_message_serde_roundtrip() {
         let item = ResponseItem::Message {
             id: Some("msg_1".to_string()),
