@@ -141,14 +141,11 @@ dispatcher, per-session LRU+TTL `ImageCache`, gating. Tests: `tests/gateway.rs` 
 > **Sequencing:** T1 → (T2, T9); T7 → T8; T5 ↔ T6 coordinate; T10, T11 independent. T1 first (it
 > builds the typed resolver T2/T9 consume).
 
-## STATUS (T4 APPROVED — orchestrator resume session `thermo-followups-resume`)
+## STATUS (T10 APPROVED — orchestrator resume session `thermo-followups-resume`)
 
-**DONE (Codex-xhigh APPROVED + committed):** T1, T2, T7, T8, T9, T6, T5, T3, T4 (9 of 11).
-**REMAINING (in dependency order):** T10 → T11. Serial (`--agents 1`); T10/T11 independent. Each
-remaining task gets its OWN fresh agent (clean context per task).
-  - **T10** (AppError failover policy + G1 retry logging): independent.
-  - **T11** (streaming/logging test-quality + catalog-parser dedup, depends on T1): independent.
-**Review log:** `/tmp/thermo-followup-review.md` holds 9 verdicts (T1×2, T2×3, T7×2, T8×1, T9×4, T6×2, T5×2, T3×4, T4×2).
+**DONE (Codex-xhigh APPROVED + committed):** T1, T2, T7, T8, T9, T6, T5, T3, T4, T10 (10 of 11).
+**REMAINING:** T11 (streaming/logging test-quality + catalog-parser dedup, depends on T1). Fresh agent; serial.
+**Review log:** `/tmp/thermo-followup-review.md` holds 10 verdicts (T1×2, T2×3, T7×2, T8×1, T9×4, T6×2, T5×2, T3×4, T4×2, T10×2).
 **Per-task loop** = implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → append verdict to `/tmp/thermo-followup-review.md` → update this plan. STOP when all 11
 APPROVED (see `.ralph/GOAL.md`).
@@ -289,10 +286,17 @@ the per-candidate context windows in `BackendCandidatePlan` (extended: `candidat
 **Depends on:** 11.1.
 
 ### Task 11.10 — AppError failover policy + upstream retry logging
-**Priority:** MEDIUM · **Spec:** `.ralph/specs/T10-error-policy-and-logging.md`
-Remove `failover_eligible` from `AppError` (upstream-attempt disposition/variant); log the G1
-shrink-and-retry POST (logged-send helper).
-**Files:** `src/error.rs`, `src/upstream.rs`, `analyze-log`.
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/T10-error-policy-and-logging.md` · **Commits:** `770a19a` + `960e63c`
+**Status:** ✅ Codex-xhigh APPROVED (R2). Removed `failover_eligible: bool` + `is_failover_eligible()`
+from `AppError`; replaced with a `pub(crate) enum FailoverDisposition { Failover (default), Terminal }`
+(private field, read via `failover_disposition()`; terminal built via `upstream_with_disposition`). Enum
+lives in `error.rs` (avoids an error→upstream cycle). Eligibility truth table proven UNCHANGED (every
+generic ctor → Failover; only the persisted-G1-overflow site → Terminal; failover loop `Terminal` ⇔ old
+`!is_failover_eligible()`); before-first-chunk rule untouched. G1 shrink-and-retry POST now logged via a
+new `logged_send_chat_request` helper routing both the first + retry POST (first-POST logging parity
+preserved); `analyze-log` needs no change (the reduced `max_tokens` shows as a `$.max_tokens` diff). R1
+LOW (pub visibility) fixed in `960e63c`. 3 tests added.
+**Files:** `src/error.rs`, `src/upstream.rs`, `tests/port_errors.rs`.
 
 ### Task 11.11 — Streaming + logging test-quality cleanups
 **Priority:** LOW–MEDIUM · **Spec:** `.ralph/specs/T11-streaming-test-quality.md`
