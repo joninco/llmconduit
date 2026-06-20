@@ -609,11 +609,20 @@ impl<'a> JsonRedactor<'a> {
         false
     }
 
-    /// Scan a JSON string token INCLUDING the surrounding quotes, honoring `\"`/`\\`
-    /// escapes. Returns the `start..end` BYTE RANGE (zero-copy) or `None` if
-    /// unterminated. Cursor lands just past the closing quote. Returning a RANGE
-    /// (not an owned `String`) is what keeps capture O(CAP): a 10 MiB value is never
-    /// copied in full.
+    /// Scan a JSON string token INCLUDING the surrounding quotes, enforcing the
+    /// STRICT JSON string grammar (D1 R4 #1 — a lenient scanner deemed
+    /// `"api_key=SECRET\q"` valid, re-encoded it, and persisted the secret instead
+    /// of hitting the unparseable-body marker). Returns the `start..end` BYTE RANGE
+    /// (zero-copy) or `None` on ANY violation:
+    /// - after `\`, only `" \ / b f n r t u` are valid escapes;
+    /// - `\u` must be followed by EXACTLY 4 hex digits;
+    /// - a literal control byte (< 0x20) inside the string is rejected (JSON forbids
+    ///   unescaped control chars).
+    ///
+    /// A `None` here propagates up as a parse failure → the whole body routes to the
+    /// fixed redacted marker. Returning a RANGE (not an owned `String`) keeps capture
+    /// O(CAP): a 10 MiB value is never copied in full. Bytes come from a `&str`, so
+    /// multibyte UTF-8 (≥ 0x80) is valid content, never a control char.
     fn scan_string_raw(&mut self) -> Option<(usize, usize)> {
         if self.peek() != Some(b'"') {
             return None;
@@ -622,14 +631,37 @@ impl<'a> JsonRedactor<'a> {
         self.pos += 1; // opening quote
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
-                b'\\' => self.pos += 2,
+                b'\\' => {
+                    // An escape sequence must be well-formed.
+                    self.pos += 1;
+                    match self.bytes.get(self.pos) {
+                        Some(b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
+                            self.pos += 1;
+                        }
+                        Some(b'u') => {
+                            self.pos += 1;
+                            // Exactly 4 hex digits must follow.
+                            for _ in 0..4 {
+                                match self.bytes.get(self.pos) {
+                                    Some(c) if c.is_ascii_hexdigit() => self.pos += 1,
+                                    _ => return None,
+                                }
+                            }
+                        }
+                        // Unknown/absent escape → malformed.
+                        _ => return None,
+                    }
+                }
                 b'"' => {
                     self.pos += 1;
                     return Some((start, self.pos));
                 }
+                // JSON forbids literal control characters in a string.
+                c if c < 0x20 => return None,
                 _ => self.pos += 1,
             }
         }
+        // Ran off the end without a closing quote → unterminated/malformed.
         None
     }
 
@@ -903,6 +935,53 @@ mod tests {
         assert_eq!(value["d"], serde_json::Value::Null);
         assert_eq!(value["e"], serde_json::json!(0));
         assert_eq!(value["f"], serde_json::json!(42));
+    }
+
+    #[test]
+    fn malformed_strings_fall_back_no_secret_leak() {
+        // D1 R4 #1: a malformed JSON string must route to the fixed marker, never
+        // persist the (raw or decoded) secret. Each form carries `SECRET`.
+        let bad_escape = br#"{"x":"api_key=SECRET\q"}"#.to_vec(); // invalid escape \q
+        let incomplete_u = br#"{"x":"api_key=SECRET\uAB"}"#.to_vec(); // \u + only 2 hex
+        // A literal control byte (0x01) inside the string.
+        let mut control_byte = br#"{"x":"api_key=SECRET"#.to_vec();
+        control_byte.push(0x01);
+        control_byte.extend_from_slice(b"\"}");
+
+        for raw in [bad_escape, incomplete_u, control_byte] {
+            let out = capture_capped_redacted(&raw, 128 * 1024, 4 * 1024);
+            let text = String::from_utf8_lossy(&out);
+            assert!(
+                !text.contains("SECRET"),
+                "malformed string must not persist the secret: input={:?} out={text}",
+                String::from_utf8_lossy(&raw)
+            );
+            assert!(
+                text.starts_with("[redacted: unparseable body"),
+                "malformed string → fixed marker: input={:?} out={text}",
+                String::from_utf8_lossy(&raw)
+            );
+        }
+    }
+
+    #[test]
+    fn valid_string_escapes_round_trip() {
+        // The strict string scanner must still accept every well-formed escape
+        // (`\n`, `\"`, `\\`, `\/`, a BMP `\uXXXX`, and a surrogate PAIR) plus
+        // multibyte UTF-8 content, and preserve the decoded text.
+        // `🚀` is U+1F680 ROCKET; `ꯍ` is U+ABCD (ꯍ).
+        let body = r#"{"a":"line\nbreak \"quote\" \\slash\/ ꯍ ꯍ 🚀 café"}"#;
+        let out = capture_capped_redacted(body.as_bytes(), 128 * 1024, 4 * 1024);
+        let value: serde_json::Value =
+            serde_json::from_slice(&out).expect("valid escapes preserved as JSON");
+        let s = value["a"].as_str().expect("string");
+        assert!(s.contains("line\nbreak"), "\\n decoded");
+        assert!(s.contains("\"quote\""), "\\\" decoded");
+        assert!(s.contains("\\slash"), "\\\\ decoded");
+        assert!(s.contains('ꯍ'), "multibyte content preserved");
+        assert!(s.contains('\u{ABCD}'), "BMP \\u decoded");
+        assert!(s.contains('\u{1F680}'), "surrogate-pair rocket decoded");
+        assert!(s.contains("café"), "trailing multibyte preserved");
     }
 
     #[test]
