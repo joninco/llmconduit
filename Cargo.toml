@@ -57,8 +57,10 @@ http-body-util = "0.1"
 pretty_assertions = "1"
 # `test-util` enables tokio's paused-clock test controls (`pause`/`advance`,
 # `#[tokio::test(start_paused = true)]`) used to deterministically exercise the
-# axum SSE keep-alive idle timer in tests.
-tokio = { version = "1", features = ["test-util"] }
+# axum SSE keep-alive idle timer in tests. `net`/`io-util` drive the real-TCP WS
+# handshake test (`axum::serve` + a raw upgrade request) that exercises the
+# `/dashboard/ws` cookie+Origin auth gate end-to-end (D7b).
+tokio = { version = "1", features = ["test-util", "net", "io-util"] }
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
 # D5: criterion benches the zero-cost `MetricsLayer::disabled()` path (no work, no

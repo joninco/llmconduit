@@ -12,6 +12,7 @@ use crate::dashboard_auth::dashboard_logout;
 use crate::dashboard_auth::require_session;
 use crate::dashboard_ui::dashboard_asset;
 use crate::dashboard_ui::dashboard_index;
+use crate::dashboard_ws::dashboard_ws;
 use crate::debug_ui::debug_app_js;
 use crate::debug_ui::debug_index;
 use crate::debug_ui::debug_ws;
@@ -140,14 +141,17 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
     // Routes that read the auth context but manage their own access decision,
     // plus the self-gated WS and the public hashed assets.
     //
-    // D7b: the dashboard data socket plugs in as a separate `/dashboard/ws`
-    // route carrying the batched `DashboardFrame` envelope; it is intentionally
-    // NOT registered in stage D7a (no D3/D4/D5 payload types yet).
+    // D7b: the dashboard data socket is a separate `/dashboard/ws` route carrying
+    // the batched `DashboardFrame` envelope (Monitor/Usage/FlowStatus/MetricTick/
+    // TopologyUpdate). Like `/debug/ws` it is SELF-gated inside the handler (cookie
+    // + `Origin` allow-list + cookie-`exp` close, via D7a's `authenticate_ws`), so
+    // it OWNS its rejection and the WS `Origin` check stays authoritative.
     let open = Router::new()
         .route("/dashboard", get(dashboard_index))
         .route("/dashboard/login", post(dashboard_login))
         .route("/dashboard/logout", post(dashboard_logout))
         .route("/debug/ws", get(debug_ws))
+        .route("/dashboard/ws", get(dashboard_ws))
         .route("/dashboard/assets/{*path}", get(dashboard_asset));
 
     session_gated

@@ -2263,6 +2263,169 @@ async fn dashboard_asset_route_serves_present_asset_and_404s_missing() {
     assert_eq!(missing.status().as_u16(), 404);
 }
 
+// ---------------------------------------------------------------------------
+// D7b: the batched `/dashboard/ws` envelope — auth gate (signed cookie + Origin
+// allow-list), expiry, and the disabled-by-default posture. The frame-building /
+// per-domain-seq / byte-for-byte-fixture logic is unit-tested in
+// `src/dashboard_ws.rs` (the socket can't be constructed off a real upgrade in a
+// unit test); these assert the route's auth/Origin gating through the real stack.
+// ---------------------------------------------------------------------------
+
+/// A real WS-upgrade handshake over a genuine ephemeral TCP server (so hyper
+/// injects the `OnUpgrade` extension the `WebSocketUpgrade` extractor requires —
+/// `tower::ServiceExt::oneshot` does NOT, which is why a oneshot WS upgrade always
+/// 426s before the handler's auth runs). Writes a raw HTTP/1.1 upgrade request
+/// with the supplied `Cookie`/`Origin` headers and returns the response status
+/// line's numeric code — enough to assert the cookie+Origin auth gate end-to-end
+/// (401 reject, 101 accept) without a full WS client dependency.
+async fn ws_handshake_status(
+    router: axum::Router,
+    path: &str,
+    cookie: Option<&str>,
+    origin: Option<&str>,
+) -> u16 {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    // A real ephemeral TCP server: `axum::serve` runs hyper's full HTTP/1.1 stack
+    // over the socket (injecting the `OnUpgrade` extension the WS extractor needs),
+    // so the upgrade reaches the handler's auth check. Aborted after the request.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router.into_make_service()).await;
+    });
+
+    let mut request = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    );
+    if let Some(cookie) = cookie {
+        request.push_str(&format!("Cookie: llmconduit_session={cookie}\r\n"));
+    }
+    if let Some(origin) = origin {
+        request.push_str(&format!("Origin: {origin}\r\n"));
+    }
+    request.push_str("\r\n");
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+    client.write_all(request.as_bytes()).await.unwrap();
+    // Read the status line (the first response line is enough for the assertion).
+    let mut buf = vec![0u8; 256];
+    let n = client.read(&mut buf).await.unwrap();
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+    drop(client);
+    server.abort();
+    status
+}
+
+#[tokio::test]
+async fn dashboard_ws_is_disabled_by_default() {
+    // No `--with-debug-ui` → `/dashboard/ws` is not registered → fallback 404.
+    // (oneshot is fine here: a 404 is decided by routing before the WS extractor.)
+    let app = llmconduit::build_app(test_config());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/ws")
+                .header(axum::http::header::CONNECTION, "upgrade")
+                .header(axum::http::header::UPGRADE, "websocket")
+                .header(axum::http::header::SEC_WEBSOCKET_VERSION, "13")
+                .header(
+                    axum::http::header::SEC_WEBSOCKET_KEY,
+                    "dGhlIHNhbXBsZSBub25jZQ==",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn dashboard_ws_requires_session_cookie() {
+    // Production posture (configured token): a real WS upgrade with NO session
+    // cookie is rejected 401 before the socket upgrades.
+    let (app, _auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+    let status =
+        ws_handshake_status(app, "/dashboard/ws", None, Some("https://dash.example.com")).await;
+    assert_eq!(
+        status, 401,
+        "a WS upgrade without the signed session cookie must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_ws_rejects_cross_origin_even_with_valid_cookie() {
+    // CSWSH defense: a valid signed cookie but a CROSS-ORIGIN `Origin` (a malicious
+    // page riding a stolen cookie) must be rejected — the exact-origin allow-list
+    // is enforced for the WS upgrade independent of the cookie.
+    let (app, auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+    let (cookie, _exp) = auth.issue_session();
+    let status = ws_handshake_status(
+        app,
+        "/dashboard/ws",
+        Some(&cookie),
+        Some("https://evil.example.com"),
+    )
+    .await;
+    assert_eq!(
+        status, 401,
+        "a cross-origin WS upgrade must be rejected even with a valid cookie"
+    );
+}
+
+#[tokio::test]
+async fn dashboard_ws_accepts_valid_cookie_and_origin() {
+    // Happy path: a valid signed cookie + the exact configured Origin → the upgrade
+    // is accepted (101 Switching Protocols).
+    let (app, auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+    let (cookie, _exp) = auth.issue_session();
+    let status = ws_handshake_status(
+        app,
+        "/dashboard/ws",
+        Some(&cookie),
+        Some("https://dash.example.com"),
+    )
+    .await;
+    assert_eq!(
+        status, 101,
+        "a valid cookie + exact Origin must complete the WS upgrade"
+    );
+}
+
+#[tokio::test]
+async fn debug_ws_contract_unchanged_bare_message_route_still_gated() {
+    // D7b must NOT change `/debug/ws`: it remains a separately-registered route
+    // with the SAME cookie+Origin gate (the bare `DebugWsMessage` contract). A
+    // cookieless upgrade is still 401; a valid cookie + Origin still upgrades.
+    let (app, auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+    let unauthed = ws_handshake_status(
+        app.clone(),
+        "/debug/ws",
+        None,
+        Some("https://dash.example.com"),
+    )
+    .await;
+    assert_eq!(unauthed, 401, "/debug/ws still requires the session cookie");
+
+    let (cookie, _exp) = auth.issue_session();
+    let authed = ws_handshake_status(
+        app,
+        "/debug/ws",
+        Some(&cookie),
+        Some("https://dash.example.com"),
+    )
+    .await;
+    assert_eq!(authed, 101, "/debug/ws upgrade unchanged");
+}
+
 #[tokio::test]
 async fn fallback_models_endpoint_filters_to_provider_model_override() {
     let primary = MockServer::start().await;

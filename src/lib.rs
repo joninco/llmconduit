@@ -4,6 +4,7 @@ pub mod config;
 pub mod dashboard_auth;
 pub mod dashboard_flow;
 pub mod dashboard_ui;
+pub mod dashboard_ws;
 pub mod debug_ui;
 pub mod engine;
 pub mod error;
