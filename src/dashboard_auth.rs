@@ -154,15 +154,21 @@ impl PublicOrigin {
     /// against, rather than falling back to the attacker-controllable `Host`).
     /// Returns the normalized `scheme://host[:port]` string on success.
     pub fn parse(raw: &str, allow_insecure: bool) -> Result<Self, String> {
+        // D7a R4: NEVER interpolate the raw configured value into an error. A
+        // malformed origin may embed credentials or a query token (e.g.
+        // `https://user:pw@h` or `https://h?token=...`); echoing it into a logged
+        // / returned error would leak that secret. Every message below is generic
+        // (the env-var name + what was wrong), with no part of `raw` and no
+        // `url::ParseError` rendering (which can include the offending substring).
         let url = url::Url::parse(raw.trim())
-            .map_err(|err| format!("{ENV_PUBLIC_ORIGIN} is not a valid URL: {err}"))?;
+            .map_err(|_| format!("{ENV_PUBLIC_ORIGIN} is not a valid origin URL"))?;
         let scheme = url.scheme();
         let scheme_ok = scheme == "https" || (allow_insecure && scheme == "http");
         if !scheme_ok {
             return Err(if allow_insecure {
-                format!("{ENV_PUBLIC_ORIGIN} must use http:// or https:// (got {scheme})")
+                format!("{ENV_PUBLIC_ORIGIN} must use http:// or https://")
             } else {
-                format!("{ENV_PUBLIC_ORIGIN} must use https:// (got {scheme})")
+                format!("{ENV_PUBLIC_ORIGIN} must use https://")
             });
         }
         let host = url
@@ -170,7 +176,7 @@ impl PublicOrigin {
             .ok_or_else(|| format!("{ENV_PUBLIC_ORIGIN} has no host"))?;
         if url.path() != "/" && !url.path().is_empty() {
             return Err(format!(
-                "{ENV_PUBLIC_ORIGIN} must be an origin only (no path): {raw}"
+                "{ENV_PUBLIC_ORIGIN} must be an origin only (no path)"
             ));
         }
         // D7a R3 #5: an origin is scheme + host(+port) ONLY. Reject (rather than
@@ -178,20 +184,21 @@ impl PublicOrigin {
         // never appear in an `Origin` header, so accepting them would let a
         // configured value that looks meaningful (e.g. `https://h?x` or
         // `https://user:pw@h`) normalize away its extra parts and match an origin
-        // the operator did not intend.
+        // the operator did not intend. The error omits the raw value (D7a R4): a
+        // query/userinfo origin is exactly where a token/credential would hide.
         if url.query().is_some() {
             return Err(format!(
-                "{ENV_PUBLIC_ORIGIN} must be an origin only (no query): {raw}"
+                "{ENV_PUBLIC_ORIGIN} must be an origin only (no query)"
             ));
         }
         if url.fragment().is_some() {
             return Err(format!(
-                "{ENV_PUBLIC_ORIGIN} must be an origin only (no fragment): {raw}"
+                "{ENV_PUBLIC_ORIGIN} must be an origin only (no fragment)"
             ));
         }
         if !url.username().is_empty() || url.password().is_some() {
             return Err(format!(
-                "{ENV_PUBLIC_ORIGIN} must be an origin only (no userinfo/credentials): {raw}"
+                "{ENV_PUBLIC_ORIGIN} must be an origin only (no userinfo/credentials)"
             ));
         }
         // Re-serialize as a bare origin so an `Origin` header (which never has a
@@ -207,6 +214,15 @@ impl PublicOrigin {
     /// The normalized `https://host[:port]` string.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Whether this origin's scheme is `https`. Drives the `Secure` cookie
+    /// attribute: a `Secure` cookie is silently DISCARDED by the browser over a
+    /// plaintext `http` connection, so an `http` insecure-override origin (D7a R2
+    /// #2) must set its session/CSRF cookies WITHOUT `Secure` or login can never
+    /// complete in insecure-LAN mode.
+    pub fn is_https(&self) -> bool {
+        self.0.starts_with("https://")
     }
 }
 
@@ -409,11 +425,19 @@ impl DashboardAuth {
         })
     }
 
-    /// Whether the server should send the `Secure` cookie attribute. Tied to a
-    /// configured (https) public origin: on a loopback dev server over plain
-    /// HTTP, `Secure` cookies would never be stored by the browser.
+    /// Whether the server should send the `Secure` cookie attribute. Derived
+    /// from the VALIDATED public-origin SCHEME, not merely its presence: an
+    /// `https` origin → `Secure`; an `http` origin (only reachable under the
+    /// `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD` override — D7a R4) → NOT `Secure`,
+    /// because a browser silently DISCARDS a `Secure` cookie received over a
+    /// plaintext `http` connection, so a `Secure` login cookie could never be
+    /// stored and login would always fail in insecure-LAN mode. With no
+    /// configured origin (loopback dev over plain HTTP) there is likewise no
+    /// `Secure`.
     pub fn secure_cookies(&self) -> bool {
-        self.public_origin.is_some()
+        self.public_origin
+            .as_ref()
+            .is_some_and(PublicOrigin::is_https)
     }
 
     /// The configured public origin, if any.
@@ -1001,17 +1025,37 @@ fn append_set_cookie(headers: &mut HeaderMap, cookie: &str) {
     }
 }
 
-/// A `401 Unauthorized` with `Cache-Control: no-store`.
+/// A `401 Unauthorized` carrying the full auth-response security header set
+/// (`no-store` + CSP + nosniff/no-referrer/X-Frame-Options) — see [`no_store`].
 fn unauthorized() -> Response {
     no_store((StatusCode::UNAUTHORIZED, "unauthorized").into_response())
 }
 
-/// Stamp `Cache-Control: no-store` on a response (auth responses must not be
-/// cached by any intermediary).
+/// Stamp the common security headers on an auth response (D7a R4): a restrictive
+/// `Content-Security-Policy`, `X-Content-Type-Options: nosniff`,
+/// `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, and
+/// `Cache-Control: no-store`. EVERY auth-layer response (the 401, the login
+/// success, and the logout) flows through here so none is missing the hardening
+/// the `/dashboard` shell and `/debug` already carry. The CSP is the locked-down
+/// `default-src 'none'` form: these endpoints return JSON or a bare status, never
+/// HTML/script, so nothing legitimate needs to load and `frame-ancestors 'none'`
+/// reinforces the `X-Frame-Options: DENY` clickjacking defense.
 pub fn no_store(mut response: Response) -> Response {
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     response
 }
 
@@ -1051,11 +1095,56 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 /// ONLY on a loopback bind — `Host` is attacker-controllable off loopback, so it
 /// is never trusted there (D7a R2 #2). The strict cross-site defense off loopback
 /// is the exact `PUBLIC_ORIGIN` match plus `SameSite=Strict` on the cookie.
+///
+/// D7a R4: even on a loopback bind the `Host` is only trusted when it is a
+/// LITERAL loopback host name (`localhost`, `127.0.0.1`, `[::1]`/`::1`, with any
+/// port). A DNS-rebinding attacker (e.g. `evil.com` resolving to `127.0.0.1`)
+/// otherwise reaches `/debug/ws` with `Origin: http://evil.com` + `Host:
+/// evil.com` and would ride a stolen cookie; rejecting any non-loopback `Host`
+/// here closes that path while preserving real localhost development.
 fn same_origin_as_host(headers: &HeaderMap, origin: &str) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
+    if !is_loopback_host(host) {
+        return false;
+    }
     origin == format!("http://{host}") || origin == format!("https://{host}")
+}
+
+/// Whether a `Host` header value is a LITERAL loopback host (anti-DNS-rebinding,
+/// D7a R4). Accepts `localhost`, `127.0.0.1`, and the IPv6 loopback in both the
+/// bracketed (`[::1]`) and bare (`::1`) forms, each with an optional `:port`.
+/// Any other name — including one that merely RESOLVES to a loopback address — is
+/// rejected, so the loopback dev-open `Host` fallback cannot be reached via a
+/// rebound DNS name.
+fn is_loopback_host(host: &str) -> bool {
+    // A bare (unbracketed) IPv6 loopback never appears in a real `Host` header
+    // (RFC 7230 requires the bracketed form), but accept the exact `::1` token
+    // for the constructed-headers path before the `:port` split below would
+    // mis-parse its embedded colons.
+    if host == "::1" {
+        return true;
+    }
+    // IPv6 hosts are bracketed in a `Host` header (`[::1]` or `[::1]:port`);
+    // strip the brackets (and any port) before matching the literal address.
+    let bare = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            // `[addr]` or `[addr]:port` — the part after `]` must be empty or a
+            // `:port`, never arbitrary trailing data.
+            Some((addr, suffix)) if suffix.is_empty() || suffix.starts_with(':') => addr,
+            _ => return false,
+        }
+    } else {
+        // Non-bracketed: a single trailing `:port` may follow the name/IPv4
+        // literal. An empty port (`localhost:`) leaves the host unchanged so it
+        // still fails the literal match below.
+        host.rsplit_once(':').map_or(
+            host,
+            |(name, port)| if port.is_empty() { host } else { name },
+        )
+    };
+    matches!(bare, "localhost" | "127.0.0.1" | "::1")
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,6 +1583,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_never_leaks_token_bearing_origin() {
+        // D7a R4: a malformed origin may embed a credential or query token; the
+        // returned/logged error must NOT echo any part of it.
+        let secret = "sup3r-s3cret-token-value";
+        let inputs = [
+            format!("https://user:{secret}@dash.example.com"),
+            format!("https://dash.example.com?access={secret}"),
+            format!("https://dash.example.com/#{secret}"),
+            format!("ht!tp://{secret}.example.com"), // bad scheme/parse path
+        ];
+        for raw in inputs {
+            let err =
+                PublicOrigin::parse(&raw, true).expect_err("token-bearing origin must be rejected");
+            assert!(
+                !err.contains(secret),
+                "error leaked the secret: input={raw:?} err={err:?}"
+            );
+            // And the env-var name is still present so the operator knows what to fix.
+            assert!(err.contains(ENV_PUBLIC_ORIGIN), "err={err:?}");
+        }
+    }
+
+    #[test]
     fn debug_redacts_secrets() {
         let auth = build(loopback(), &env_with_token());
         let rendered = format!("{auth:?}");
@@ -1677,6 +1789,75 @@ mod tests {
             ("host", "127.0.0.1:4000"),
         ]);
         assert!(auth.authenticate_ws(&headers).is_some());
+    }
+
+    #[test]
+    fn ws_loopback_rejects_non_loopback_host_anti_rebinding() {
+        // D7a R4 (DNS-rebinding): on a loopback bind with NO configured
+        // PUBLIC_ORIGIN, the Host-derived fallback must accept ONLY literal
+        // loopback host names. A rebound name (`evil.com` → 127.0.0.1) supplying a
+        // matching Origin+Host must be REJECTED so it cannot reach `/debug/ws`.
+        let env = DashboardEnv {
+            public_origin: None,
+            ..env_with_token()
+        };
+        let auth = build(loopback(), &env);
+        let (cookie, _) = auth.issue_session();
+        let rebound = headers_with(&[
+            ("cookie", &format!("{SESSION_COOKIE}={cookie}")),
+            ("origin", "http://evil.com"),
+            ("host", "evil.com"),
+        ]);
+        assert!(
+            auth.authenticate_ws(&rebound).is_none(),
+            "a non-loopback (rebound) Host must be rejected even in loopback dev"
+        );
+        // Real localhost development still works (literal loopback names).
+        for (origin, host) in [
+            ("http://localhost:4000", "localhost:4000"),
+            ("http://127.0.0.1:4000", "127.0.0.1:4000"),
+            ("http://[::1]:4000", "[::1]:4000"),
+        ] {
+            let ok = headers_with(&[
+                ("cookie", &format!("{SESSION_COOKIE}={cookie}")),
+                ("origin", origin),
+                ("host", host),
+            ]);
+            assert!(
+                auth.authenticate_ws(&ok).is_some(),
+                "literal loopback host {host} must still pass"
+            );
+        }
+    }
+
+    #[test]
+    fn is_loopback_host_accepts_only_literal_loopback() {
+        // Literal loopback names (with/without port, bracketed IPv6) pass.
+        for host in [
+            "localhost",
+            "localhost:4000",
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "[::1]",
+            "[::1]:443",
+            "::1",
+        ] {
+            assert!(is_loopback_host(host), "{host} should be loopback");
+        }
+        // Anything else — including names that merely resolve to loopback, or a
+        // loopback substring — is rejected.
+        for host in [
+            "evil.com",
+            "evil.com:4000",
+            "127.0.0.1.evil.com",
+            "notlocalhost",
+            "localhost.evil.com",
+            "10.0.0.1",
+            "dash.lan:8080",
+            "",
+        ] {
+            assert!(!is_loopback_host(host), "{host} should NOT be loopback");
+        }
     }
 
     #[test]
@@ -1961,5 +2142,111 @@ mod tests {
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Path=/"));
+    }
+
+    // -- Secure cookie derives from the origin SCHEME (D7a R4) -------------
+
+    #[test]
+    fn secure_cookies_true_for_https_origin() {
+        // An https public origin → Secure cookies (the secure-transport default).
+        let auth = build(public_bind(), &env_with_token());
+        assert!(
+            auth.secure_cookies(),
+            "https origin must set Secure on the session/CSRF cookies"
+        );
+    }
+
+    #[test]
+    fn secure_cookies_false_for_http_insecure_origin() {
+        // D7a R4 (FUNCTIONAL BUG): under the insecure override an http origin must
+        // NOT set Secure — a browser DISCARDS a Secure cookie over plaintext http,
+        // so a Secure login cookie could never be stored and login would always
+        // fail in insecure-LAN mode. Derive Secure from the validated SCHEME.
+        let env = DashboardEnv {
+            token: Some("t".to_string()),
+            session_key_b64: Some(key_b64()),
+            public_origin: Some("http://dash.lan:8080".to_string()),
+            allow_insecure: true,
+            ..Default::default()
+        };
+        let auth = build(public_bind(), &env);
+        assert!(
+            !auth.secure_cookies(),
+            "http insecure-override origin must NOT set Secure (browser would discard it)"
+        );
+        // The actual login response must carry the session cookie WITHOUT Secure.
+        let (value, _) = auth.issue_session();
+        let cookie = session_cookie(&value, auth.secure_cookies());
+        assert!(
+            !cookie.contains("Secure"),
+            "insecure-LAN login cookie must omit Secure: {cookie}"
+        );
+    }
+
+    #[test]
+    fn secure_cookies_false_without_origin() {
+        // Loopback dev over plain http (no configured origin) → no Secure.
+        let env = DashboardEnv {
+            public_origin: None,
+            ..env_with_token()
+        };
+        let auth = build(loopback(), &env);
+        assert!(!auth.secure_cookies());
+    }
+
+    // -- auth-response security headers (D7a R4) --------------------------
+
+    #[test]
+    fn no_store_stamps_full_security_header_set() {
+        // EVERY auth response (401 / login / logout) must carry the hardening
+        // headers, not just no-store.
+        let resp = no_store((StatusCode::OK, "x").into_response());
+        let h = resp.headers();
+        assert_eq!(h.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+        assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert!(
+            h.get(header::CONTENT_SECURITY_POLICY)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("frame-ancestors 'none'"),
+            "CSP must lock down framing/loading on auth responses"
+        );
+    }
+
+    #[test]
+    fn unauthorized_401_carries_security_headers() {
+        let resp = unauthorized();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let h = resp.headers();
+        assert_eq!(h.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+        assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert!(h.get(header::CONTENT_SECURITY_POLICY).is_some());
+    }
+
+    #[tokio::test]
+    async fn login_response_carries_security_headers() {
+        // The successful login response must carry the headers AND its cookies.
+        let auth = build(public_bind(), &env_with_token());
+        let resp = dashboard_login(
+            Extension(Arc::clone(&auth)),
+            Ok(Json(LoginRequest {
+                token: "s3cret-token".to_string(),
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let h = resp.headers();
+        assert_eq!(h.get(header::CACHE_CONTROL).unwrap(), "no-store");
+        assert_eq!(h.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+        assert_eq!(h.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+        assert_eq!(h.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+        assert!(h.get(header::CONTENT_SECURITY_POLICY).is_some());
+        // The security headers did not clobber the Set-Cookie pair.
+        assert_eq!(h.get_all(header::SET_COOKIE).iter().count(), 2);
     }
 }
