@@ -2,7 +2,9 @@
 import type { ComponentType } from 'react';
 import type { RouteName } from '../router/useHashRoute';
 import { FlowsView } from './FlowsView';
-import { TopologyView, SankeyView, TheaterView } from './placeholders';
+import { TopologyView } from './TopologyView';
+import { SankeyView } from './SankeyView';
+import { TheaterView } from './TheaterView';
 
 export const VIEW_BY_ROUTE: Record<RouteName, ComponentType> = {
   flows: FlowsView,

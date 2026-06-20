@@ -6,6 +6,7 @@
 import { useSyncExternalStore } from 'react';
 import { dashboardStore, type DashboardState } from './dashboardStore';
 import { authStore, type AuthState } from './authStore';
+import { flowFilterStore, type FlowFilterState } from './flowFilterStore';
 
 /** Subscribe to a slice of the dashboard store. */
 export function useDashboard<T>(selector: (s: DashboardState) => T): T {
@@ -22,5 +23,14 @@ export function useAuth<T>(selector: (s: AuthState) => T): T {
     authStore.subscribe,
     () => selector(authStore.getState()),
     () => selector(authStore.getState()),
+  );
+}
+
+/** Subscribe to a slice of the SHARED FlowTable filter store (D12 cross-link). */
+export function useFlowFilter<T>(selector: (s: FlowFilterState) => T): T {
+  return useSyncExternalStore(
+    flowFilterStore.subscribe,
+    () => selector(flowFilterStore.getState()),
+    () => selector(flowFilterStore.getState()),
   );
 }

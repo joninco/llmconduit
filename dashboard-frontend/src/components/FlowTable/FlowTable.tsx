@@ -9,16 +9,16 @@
  * only the status dot animates — so scrolling never thrashes. The header is a sibling of the
  * scroll container (not virtualized) so it stays put.
  */
-import { useRef, useState } from 'react';
+import { useRef } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import type { FlowSummary, ModelPrice } from '../../api/types';
-import { useDashboard } from '../../store/hooks';
+import { useDashboard, useFlowFilter } from '../../store/hooks';
+import { flowFilterStore } from '../../store/flowFilterStore';
 import { cn } from '../../lib/cn';
 import { StatusChip } from './StatusChip';
 import { fmtClock, fmtCost, fmtElapsed, fmtModelPair, fmtTokens } from './format';
 import { elapsedMs, flowCost, isFailover, shortId, statusClass } from './flowModel';
 import { FilterBar } from './FilterBar';
-import { EMPTY_FILTERS, type FlowFilters } from './filterTypes';
 import { useFlowRows } from './useFlowRows';
 
 const ROW_HEIGHT = 30;
@@ -52,7 +52,10 @@ export function FlowTable({
   selectedId: string | null;
   onSelect: (apiCallId: string) => void;
 }) {
-  const [filters, setFilters] = useState<FlowFilters>(EMPTY_FILTERS);
+  // The filter lives in the SHARED store (D12) so Topology/Sankey clicks can drive it; the
+  // FilterBar below remains the in-table editor (its onChange writes the same store).
+  const filters = useFlowFilter((s) => s.filters);
+  const setFilters = flowFilterStore.getState().setFilters;
   const { rows, total, models, upstreams } = useFlowRows(filters);
   const priceTable = useDashboard((s) => s.priceTable);
   // SEEK coherence (finding 6): while seeking, an OPEN row's elapsed must derive from the FROZEN

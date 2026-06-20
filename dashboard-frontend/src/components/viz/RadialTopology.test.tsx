@@ -1,0 +1,119 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { StrictMode } from 'react';
+import { render, cleanup, fireEvent } from '@testing-library/react';
+import { RadialTopology } from './RadialTopology';
+import { radialTopologyState, resetRadialTopologyState } from './radialTopologyState';
+import { colors } from '../../design/tokens';
+import type { ProviderHealth, TopologyEdge } from '../../api/types';
+
+function provider(over: Partial<ProviderHealth>): ProviderHealth {
+  return {
+    id: 'p', name: 'p', route: null, base_url: 'http://x', status: 'healthy',
+    cooling_until_ms: null, last_error: null, served_count: 0, failover_count: 0,
+    consecutive_failures: 0, catalog_fetched_ms: null, catalog_size: 0, ...over,
+  };
+}
+
+const NODES: ProviderHealth[] = [
+  provider({ id: 'vllm-a', name: 'vllm-a', status: 'healthy' }),
+  provider({ id: 'vllm-b', name: 'vllm-b', status: 'cooling', cooling_until_ms: Date.now() + 8000 }),
+  provider({ id: 'openai', name: 'openai', status: 'down', last_error: '503' }),
+];
+const EDGES: TopologyEdge[] = [
+  { from: 'gateway', to: 'vllm-a', throughput: 4, tokens_per_sec: 100, cost_per_sec: 0.003 },
+];
+
+beforeEach(() => {
+  resetRadialTopologyState();
+  cleanup();
+});
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
+
+describe('RadialTopology — health-colored nodes from ProviderHealth', () => {
+  it('colors each provider node by its D4 status (healthy/cooling/down)', () => {
+    const { container } = render(
+      <RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} />,
+    );
+    const nodeEls = container.querySelectorAll('[data-testid="topo-node"]');
+    expect(nodeEls.length).toBe(3);
+    const fillFor = (id: string) =>
+      container.querySelector(`[data-node-id="${id}"] circle`)?.getAttribute('fill');
+    expect(fillFor('vllm-a')).toBe(colors.statusHealthy);
+    expect(fillFor('vllm-b')).toBe(colors.statusCooling);
+    expect(fillFor('openai')).toBe(colors.statusDown);
+  });
+
+  it('renders the gateway hub + client marker (client→gateway→providers)', () => {
+    const { container } = render(<RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} />);
+    expect(container.querySelector('[data-testid="topo-gateway"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="topo-client"]')).not.toBeNull();
+  });
+});
+
+describe('RadialTopology — click → filter wiring', () => {
+  it('clicking a provider node calls onSelectUpstream with its id', () => {
+    const onSelect = vi.fn();
+    const { container } = render(<RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={onSelect} />);
+    const node = container.querySelector('[data-node-id="openai"]')!;
+    fireEvent.click(node);
+    expect(onSelect).toHaveBeenCalledWith('openai');
+  });
+});
+
+describe('RadialTopology — cooldown tooltip hover reporting', () => {
+  it('mouseenter on a node reports its health datum + screen position via onHover', () => {
+    const onHover = vi.fn();
+    const { container } = render(<RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} onHover={onHover} />);
+    fireEvent.mouseEnter(container.querySelector('[data-node-id="vllm-b"]')!);
+    expect(onHover).toHaveBeenCalledTimes(1);
+    const arg = onHover.mock.calls[0]![0];
+    expect(arg.health.id).toBe('vllm-b');
+    expect(arg.health.cooling_until_ms).toBeGreaterThan(Date.now());
+    fireEvent.mouseLeave(container.querySelector('[data-node-id="vllm-b"]')!);
+    expect(onHover).toHaveBeenLastCalledWith(null);
+  });
+});
+
+describe('RadialTopology — prefers-reduced-motion cuts particles', () => {
+  it('emits edge particles when motion is allowed', () => {
+    const { container } = render(<RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} />);
+    expect(container.querySelectorAll('[data-testid="topo-particle"]').length).toBeGreaterThan(0);
+  });
+
+  it('emits NO particle DOM under prefers-reduced-motion: reduce', () => {
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      matches: query.includes('reduce'), media: query, onchange: null,
+      addEventListener: () => {}, removeEventListener: () => {}, addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false,
+    }));
+    const { container } = render(<RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} />);
+    expect(container.querySelectorAll('[data-testid="topo-particle"]').length).toBe(0);
+    // The edge is still drawn (just not animated/flowing).
+    expect(container.querySelectorAll('[data-testid="topo-edge"]').length).toBeGreaterThan(0);
+  });
+});
+
+describe('RadialTopology — StrictMode-safe d3-force lifecycle (findings 7+8)', () => {
+  it('double-invoke leaves ONE svg, stops every torn-down sim, clears its tick handler', () => {
+    const { container, unmount } = render(
+      <StrictMode>
+        <RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} />
+      </StrictMode>,
+    );
+    // StrictMode mounts → unmounts → remounts: exactly ONE d3-owned SVG survives (no dup).
+    expect(container.querySelectorAll('[data-testid="radial-topology-svg"]').length).toBe(1);
+    // The discarded mount was torn down: setups ran ≥2, the first cleanup ran, stop() was CALLED.
+    expect(radialTopologyState.setups).toBeGreaterThanOrEqual(2);
+    expect(radialTopologyState.cleanups).toBeGreaterThanOrEqual(1);
+    expect(radialTopologyState.stopCalls).toBe(radialTopologyState.cleanups);
+    expect(radialTopologyState.allTickHandlersCleared).toBe(true);
+
+    unmount();
+    // After unmount the live sim is also torn down: fully balanced, stop() per setup, no leak.
+    expect(radialTopologyState.cleanups).toBe(radialTopologyState.setups);
+    expect(radialTopologyState.stopCalls).toBe(radialTopologyState.setups);
+    expect(container.querySelectorAll('[data-testid="radial-topology-svg"]').length).toBe(0);
+  });
+});

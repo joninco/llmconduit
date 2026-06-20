@@ -34,6 +34,60 @@ pre,
   font-family: var(--font-mono);
 }
 
+/*
+ * D12 viz motion (CSS, NOT framer-motion — the §3.3 deferral is honored). Every keyframe below
+ * is disabled by the global `prefers-reduced-motion` block at the bottom of this file (it zeroes
+ * animation on every element), so reduced motion makes all of these static. The topology ALSO
+ * skips creating particle DOM at all under reduced motion (the JS `prefersReducedMotion()` guard),
+ * so "particles off" holds at the DOM level, not just visually.
+ */
+
+/* Topology — animated edge particles flow gateway → provider along an offset-path. */
+@keyframes topo-particle {
+  from { offset-distance: 0%; }
+  to { offset-distance: 100%; }
+}
+/* Topology — pulsing dash drift on a live edge. */
+@keyframes topo-dash {
+  to { stroke-dashoffset: -28; }
+}
+.topo-edge-flow {
+  animation: topo-dash 1.1s linear infinite;
+}
+/* Topology — a cooling provider node breathes to draw the eye. */
+@keyframes topo-cooling-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+}
+.topo-node-cooling {
+  animation: topo-cooling-pulse 1.6s ease-in-out infinite;
+}
+
+/* Sankey — pulsing dash along a cost band. */
+@keyframes sankey-dash {
+  to { stroke-dashoffset: -48; }
+}
+.sankey-band-flow {
+  animation: sankey-dash 1.4s linear infinite;
+}
+
+/* Theater — a river tile lingers in, then the entrance settles (linger-then-fade-in). */
+@keyframes river-enter {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.river-tile {
+  animation: river-enter 0.45s ease-out both;
+}
+/* Theater — the blinking output cursor while a stream is running. */
+@keyframes river-cursor-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+.river-cursor {
+  animation: river-cursor-blink 1s steps(1) infinite;
+}
+
 /* prefers-reduced-motion: cut animation/particles globally (D9). */
 @media (prefers-reduced-motion: reduce) {
   *,

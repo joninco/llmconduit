@@ -10,6 +10,7 @@ import { render, type RenderResult } from '@testing-library/react';
 import { getConnection, resetConnection } from '../api/connection';
 import { dashboardStore } from '../store/dashboardStore';
 import { authStore } from '../store/authStore';
+import { flowFilterStore } from '../store/flowFilterStore';
 import type { FlowSummary } from '../api/types';
 
 /**
@@ -24,6 +25,9 @@ export function resetWorld(opts: { mock?: boolean } = {}): void {
   resetConnection();
   dashboardStore.getState().reset();
   authStore.getState().reset();
+  // The shared FlowTable filter (D12) is a global singleton — clear it so a filter set by one
+  // test (or a Topology/Sankey cross-link) never carries into the next.
+  flowFilterStore.getState().clear();
   if (opts.mock) {
     delete window.__LLMCONDUIT_DASHBOARD__;
   } else {
