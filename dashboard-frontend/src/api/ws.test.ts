@@ -547,10 +547,15 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
   });
 
   it('a RECONNECT snapshot arriving during seek does NOT clobber the frozen cut or flip to live (finding 6)', () => {
-    // Freeze: apply a monitor frame, then seek. The store + connection are the frozen cut.
+    // Freeze: apply a monitor frame, then seek. `seek()` PAUSES the live feed; the store is flipped
+    // to the frozen 'seeking' cut separately (the Scrubber does this atomically via `applySeekCut` —
+    // D11 finding 1). Here we model the active-seek state explicitly so the staging assertions below
+    // verify a reconnect leaves the frozen cut + 'seeking' connection intact.
     socket.applyFrame(buildMonitorFrame(6));
     expect(dashboardStore.getState().monitor).toHaveLength(4);
     socket.seek();
+    expect(socket.isPaused()).toBe(true);
+    dashboardStore.getState().enterSeek(Date.now());
     expect(dashboardStore.getState().connection).toBe('seeking');
 
     // A reconnect delivers a FRESH snapshot (different cut: empty flows, new cursors).

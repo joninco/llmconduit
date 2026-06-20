@@ -276,10 +276,16 @@ export class DashboardSocket {
 
   // -- Time travel (D11) ----------------------------------------------------
 
-  /** Pause applying live frames; subsequent frames accumulate in the shadow buffer. */
+  /**
+   * Pause applying live frames; subsequent frames accumulate in the shadow buffer. This does NOT
+   * flip `connection` to `'seeking'` (D11 finding 1): pausing the live feed and EXPOSING the seek
+   * state are decoupled, so the store is never observed `seeking` while its rows/cursors are still
+   * LIVE. The Scrubber flips to `'seeking'` only atomically, via `applySeekCut`, once the fetched
+   * frozen cut lands. The shadow buffer keeps the live monitor cursor from advancing meanwhile, so
+   * the cut's `monitor_seq` is the true boundary.
+   */
   seek(): void {
     this.paused = true;
-    this.store.getState().setConnection('seeking');
   }
 
   /**

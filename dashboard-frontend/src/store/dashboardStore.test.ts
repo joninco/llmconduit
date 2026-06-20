@@ -46,7 +46,7 @@ describe('dashboardStore — monotonic connEpoch (finding 1)', () => {
     expect(live2).toBeGreaterThan(live1);
   });
 
-  it('advances on enterSeek, applySnapshot, and reset (all boundary crossings)', () => {
+  it('advances on enterSeek, applySnapshot, applySeekCut, and reset (all boundary crossings)', () => {
     dashboardStore.getState().setConnection('live');
     let prev = dashboardStore.getState().connEpoch;
 
@@ -58,7 +58,58 @@ describe('dashboardStore — monotonic connEpoch (finding 1)', () => {
     expect(dashboardStore.getState().connEpoch).toBeGreaterThan(prev);
     prev = dashboardStore.getState().connEpoch;
 
+    dashboardStore.getState().applySeekCut({ rows: [flow('b')], cursors: CURSORS, atMs: 1, monitorSeq: 0, metrics: null, topology: null });
+    expect(dashboardStore.getState().connEpoch).toBeGreaterThan(prev);
+    prev = dashboardStore.getState().connEpoch;
+
     dashboardStore.getState().reset();
     expect(dashboardStore.getState().connEpoch).toBeGreaterThan(prev);
+  });
+});
+
+/**
+ * D11 finding 1 — the seek cut installs ATOMICALLY: the store must NEVER be observed in a state
+ * where `connection==='seeking'` but the rows/cursors are still the LIVE (pre-cut) ones. A single
+ * `set` in `applySeekCut` guarantees this; these lock it so a future refactor can't reintroduce the
+ * non-atomic `enter seeking → fetch → install rows` window that let D10 render live data as frozen.
+ */
+describe('dashboardStore — atomic seek cut (finding 1)', () => {
+  beforeEach(() => dashboardStore.getState().reset());
+
+  it('never exposes `seeking` with the live (pre-cut) rows', () => {
+    // Establish a LIVE store with a distinct live row + live monitor cursor.
+    dashboardStore.getState().applySnapshot({ cursors: CURSORS, flows: [flow('live-row')], metrics: null, topology: null });
+    dashboardStore.getState().setConnection('live');
+    dashboardStore.getState().setCursor('monitor_seq', 99); // a LIVE cursor that kept advancing
+
+    // Invariant checker on EVERY store transition: if we ever read `seeking`, the rows + monitor cut
+    // must already be the FROZEN ones (the live-row / live cursor must be gone).
+    const violations: string[] = [];
+    const unsub = dashboardStore.subscribe((s) => {
+      if (s.connection === 'seeking') {
+        if (s.flows.has('live-row')) violations.push('seeking with live row still present');
+        if (s.seekMonitorSeq === 99) violations.push('seeking with the live monitor cursor (99) as the cut');
+        if (s.seekAtMs === null) violations.push('seeking with a null seekAtMs');
+      }
+    });
+
+    // The atomic install: frozen rows + cursors + cut, AND connection='seeking', in ONE update.
+    dashboardStore.getState().applySeekCut({
+      rows: [flow('frozen-row')],
+      cursors: { ...CURSORS, monitor_seq: 5 },
+      atMs: 1_700_000_000_000,
+      monitorSeq: 5,
+      metrics: null,
+      topology: null,
+    });
+    unsub();
+
+    expect(violations).toEqual([]);
+    const st = dashboardStore.getState();
+    expect(st.connection).toBe('seeking');
+    expect(st.flows.has('frozen-row')).toBe(true);
+    expect(st.flows.has('live-row')).toBe(false);
+    expect(st.seekMonitorSeq).toBe(5);
+    expect(st.seekAtMs).toBe(1_700_000_000_000);
   });
 });

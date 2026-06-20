@@ -126,4 +126,116 @@ describe('SnapshotController — rAF coalescing (no fetch storm)', () => {
     await Promise.resolve();
     expect(c.fetchCount()).toBe(0);
   });
+
+  it('holds STRICTLY ONE fetch in flight against a slow backend, then fires only the latest bucket (finding 2)', async () => {
+    const { raf, cancelRaf, flush } = manualRaf();
+    // A deferred backend: each call parks a resolver so we control completion order (a slow server).
+    const resolvers: Array<{ bucket: number; resolve: () => void }> = [];
+    const fetchSnapshot = vi.fn(
+      (atMs: number) =>
+        new Promise<SnapshotResponse>((res) => {
+          resolvers.push({ bucket: atMs, resolve: () => res(snap(atMs)) });
+        }),
+    );
+    const delivered: number[] = [];
+    const c = new SnapshotController({ fetchSnapshot, onSnapshot: (r) => delivered.push(r.at_ms), raf, cancelRaf });
+
+    // 60 rapid drags across distinct buckets, each in its OWN frame (flush per move) — the storm.
+    // The backend never resolves during the drag, so the one-in-flight guard must hold.
+    for (let i = 0; i < 60; i++) {
+      c.requestAt(10_000 + i * 1000);
+      flush();
+      await Promise.resolve();
+      // At most ONE request is ever outstanding despite 60 drags against the slow backend.
+      expect(resolvers.length).toBeLessThanOrEqual(1);
+    }
+    const firstBucket = bucketOf(10_000);
+    const latestBucket = bucketOf(10_000 + 59 * 1000);
+    // Exactly one fetch started (the first); the other 59 coalesced behind it.
+    expect(c.fetchCount()).toBe(1);
+    expect(resolvers).toHaveLength(1);
+    expect(resolvers[0]!.bucket).toBe(firstBucket);
+
+    // The slow first request finally resolves. It is NO LONGER the latest → it must NOT deliver
+    // (finding 3), and its `settle` must fire EXACTLY the latest pending bucket (finding 2).
+    resolvers[0]!.resolve();
+    await Promise.resolve(); await Promise.resolve();
+    flush(); // the follow-up frame for the latest bucket
+    await Promise.resolve();
+    expect(resolvers).toHaveLength(2);
+    expect(resolvers[1]!.bucket).toBe(latestBucket);
+
+    resolvers[1]!.resolve();
+    await Promise.resolve(); await Promise.resolve();
+    // Only the LATEST bucket was ever delivered — the stale first response was dropped.
+    expect(delivered).toEqual([latestBucket]);
+    expect(c.fetchCount()).toBe(2);
+  });
+
+  it('cancel() disarms an in-flight fetch so a late cut does not deliver after LIVE resume', async () => {
+    const { raf, cancelRaf, flush } = manualRaf();
+    const resolvers: Array<{ bucket: number; resolve: () => void }> = [];
+    const fetchSnapshot = vi.fn(
+      (atMs: number) =>
+        new Promise<SnapshotResponse>((res) => {
+          resolvers.push({ bucket: atMs, resolve: () => res(snap(atMs)) });
+        }),
+    );
+    const delivered: number[] = [];
+    const c = new SnapshotController({ fetchSnapshot, onSnapshot: (r) => delivered.push(r.at_ms), raf, cancelRaf });
+
+    // Start a seek fetch and hold it in flight (slow backend).
+    c.requestAt(4000);
+    flush();
+    await Promise.resolve();
+    expect(resolvers).toHaveLength(1);
+
+    // User hits LIVE before it lands → cancel() clears the latest-target marker.
+    c.cancel();
+
+    // The slow fetch finally resolves AFTER cancel — it must NOT deliver (no seek cut re-installed).
+    resolvers[0]!.resolve();
+    await Promise.resolve(); await Promise.resolve();
+    expect(delivered).toEqual([]);
+  });
+
+  it('a stale in-flight fetch does NOT overwrite a newer CACHED seek (finding 3)', async () => {
+    const { raf, cancelRaf, flush } = manualRaf();
+    const resolvers: Array<{ bucket: number; resolve: () => void }> = [];
+    const fetchSnapshot = vi.fn(
+      (atMs: number) =>
+        new Promise<SnapshotResponse>((res) => {
+          resolvers.push({ bucket: atMs, resolve: () => res(snap(atMs)) });
+        }),
+    );
+    const delivered: number[] = [];
+    const c = new SnapshotController({ fetchSnapshot, onSnapshot: (r) => delivered.push(r.at_ms), raf, cancelRaf });
+
+    // Prime the cache with bucket 9000 (a newer instant the user will drag back to), via a fetch.
+    c.requestAt(9000);
+    flush();
+    await Promise.resolve();
+    resolvers[0]!.resolve();
+    await Promise.resolve(); await Promise.resolve();
+    expect(c.has(9000)).toBe(true);
+    delivered.length = 0;
+
+    // Start an OLD fetch (bucket 3000) and hold it in flight (slow backend).
+    c.requestAt(3000);
+    flush();
+    await Promise.resolve();
+    expect(resolvers).toHaveLength(2);
+    expect(resolvers[1]!.bucket).toBe(3000);
+
+    // Now the user drags to the newer CACHED bucket 9000 → delivered synchronously from cache. This
+    // moves the latest-request marker to 9000 (finding 3: marker updates on a cache hit too).
+    c.requestAt(9000);
+    expect(delivered).toEqual([9000]);
+
+    // The slow OLD fetch (3000) finally resolves. Because 9000 is now the latest, the stale 3000
+    // response must be DROPPED — it must not overwrite the newer cached 9000 cut.
+    resolvers[1]!.resolve();
+    await Promise.resolve(); await Promise.resolve();
+    expect(delivered).toEqual([9000]); // unchanged — 3000 did NOT deliver
+  });
 });

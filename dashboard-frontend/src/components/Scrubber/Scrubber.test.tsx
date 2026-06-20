@@ -100,35 +100,60 @@ describe('Scrubber — hill + hover', () => {
     expect(tip.textContent).toMatch(/req\/s/);
     expect(tip.textContent).toMatch(/\d{2}:\d{2}:\d{2}/); // HH:MM:SS clock
   });
+
+  it('renders the tooltip OUTSIDE any overflow-hidden ancestor so it is not clipped (finding 4)', () => {
+    const { socket } = getConnection();
+    const { getByTestId } = renderWithQuery(<Scrubber socket={socket} />);
+    seedHill([1, 4, 2, 6, 3]);
+    fireEvent.pointerMove(getByTestId('scrubber-track'), { clientX: 100 });
+    const tip = getByTestId('scrubber-tooltip');
+    const scrubberRoot = getByTestId('scrubber');
+    // The tooltip sits ABOVE the track (`-top-9`); jsdom can't compute real clipping, so assert the
+    // STRUCTURE: no ancestor between the tooltip and the scrubber root carries `overflow-hidden`
+    // (which clipped it in the real UI). The hill's clip layer must NOT be an ancestor of the tip.
+    let el: HTMLElement | null = tip.parentElement;
+    while (el && el !== scrubberRoot) {
+      expect(el.className).not.toContain('overflow-hidden');
+      el = el.parentElement;
+    }
+    // And the clipped hill layer really does exist (the clip is scoped to it, not the track).
+    const hillClip = getByTestId('scrubber-hill').parentElement!;
+    expect(hillClip.className).toContain('overflow-hidden');
+    expect(hillClip.contains(tip)).toBe(false);
+  });
 });
 
 describe('Scrubber — seek + LIVE', () => {
-  it('clicking/dragging pauses live WS, fetches /snapshot?at=, and applies the frozen cut', async () => {
+  it('clicking/dragging pauses live WS, fetches /snapshot?at=, and atomically installs the frozen cut', async () => {
     const { socket, client } = getConnection();
     const seekSpy = vi.spyOn(socket, 'seek');
     const snapSpy = vi.spyOn(client, 'snapshot');
-    const applySpy = vi.spyOn(dashboardStore.getState(), 'applySnapshot');
+    const cutSpy = vi.spyOn(dashboardStore.getState(), 'applySeekCut');
 
     const { getByTestId } = renderWithQuery(<Scrubber socket={socket} />);
     seedHill([1, 4, 2, 6, 3]);
 
-    // Click partway along the track → enter seek.
+    // Click partway along the track → pause live WS (shadow-buffer) WITHOUT yet exposing 'seeking'.
     act(() => {
       fireEvent.pointerDown(getByTestId('scrubber-track'), { clientX: 80, pointerId: 1 });
     });
-    // Live WS applying is paused immediately (shadow-buffer).
+    // Live WS applying is paused immediately (shadow-buffer)…
     expect(seekSpy).toHaveBeenCalled();
     expect(socket.isPaused()).toBe(true);
-    expect(dashboardStore.getState().connection).toBe('seeking');
+    // …but the store is NOT yet 'seeking' — the rows/cursors are still LIVE until the cut lands
+    // (finding 1: never `seeking` with unfrozen data). The fetch is still in flight here.
+    expect(dashboardStore.getState().connection).not.toBe('seeking');
 
-    // The snapshot fetch fires (after the rAF frame) and the frozen cut is broadcast.
+    // The snapshot fetch fires (after the rAF frame) and the frozen cut is installed ATOMICALLY.
     await waitFor(() => expect(snapSpy).toHaveBeenCalled());
-    await waitFor(() => expect(applySpy).toHaveBeenCalled());
-    // After apply + re-enter-seek, the store still reads as seeking with a frozen instant.
+    await waitFor(() => expect(cutSpy).toHaveBeenCalled());
+    // Only NOW does the store read as seeking, with the frozen instant AND the cut's monitor seq.
     await waitFor(() => {
       const st = dashboardStore.getState();
       expect(st.connection).toBe('seeking');
       expect(st.seekAtMs).not.toBeNull();
+      // `seekMonitorSeq` is the SNAPSHOT's monitor_seq cut (mock = 5), not a live cursor.
+      expect(st.seekMonitorSeq).toBe(st.cursors.monitor_seq);
     });
   });
 

@@ -3,13 +3,18 @@
  *
  * Background "hill" = the reqs/s ring buffer (~30 min, 1 s granularity) derived from `metric_tick`
  * history, drawn as an SVG area path. Dragging/clicking the playhead enters SEEK:
- *   1. `socket.seek()` pauses applying live WS frames (they shadow-buffer in the socket);
- *   2. the drag's pixel-x maps to a wall-clock instant in the ring's span;
+ *   1. `socket.seek()` PAUSES applying live WS frames (they shadow-buffer in the socket) but does
+ *      NOT yet expose `connection==='seeking'` — the live cursors/rows stay current until the cut
+ *      lands, so a seek listener (D10) is never shown live data under a `seeking` flag (finding 1);
+ *   2. the drag's pixel-x maps to a wall-clock instant in the ring's span (tracked locally for the
+ *      playhead so it follows the drag even before the fetch resolves);
  *   3. `SnapshotController.requestAt(ts)` fetches `/snapshot?at=<ts>` — rAF-throttled + LRU-cached
- *      by second-bucket, so rapid drags coalesce to ≤1 fetch/frame (NO request storm);
- *   4. on resolve, the frozen body-free cut is broadcast into the store (`applySnapshot`) and the
- *      seek instant re-stamped (`enterSeek`) so D10/D12 render the frozen moment with `connection
- *      === 'seeking'` and a frozen `seekAtMs`.
+ *      by second-bucket, strictly ONE in flight (coalescing intermediate drags), so rapid drags
+ *      make ≤1 fetch/frame (NO request storm);
+ *   4. on resolve, ONE atomic `applySeekCut(...)` installs the frozen body-free cut (rows + cursors
+ *      + `seekAtMs` + `seekMonitorSeq`) AND flips `connection==='seeking'` together — so D10/D12
+ *      render the frozen moment with a frozen `seekAtMs` and the store is never `seeking` with live
+ *      rows.
  * A LIVE toggle resumes: `socket.live()` replays the buffered frames (or applies a reconnect
  * snapshot) and flips back to live. The playhead hover shows the time + reqs/s at that point.
  *
@@ -65,24 +70,27 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   void version;
   const ring = ringRef.current;
 
-  // The snapshot controller: broadcast a fetched cut as a FROZEN seek view. We apply the body-free
-  // summaries (replaces rows + clears any prior freeze + bumps epoch) THEN re-stamp the seek
-  // instant so `connection === 'seeking'` + `seekAtMs` hold for the D10/D12 seek-listeners.
+  // The snapshot controller: broadcast a fetched cut as a FROZEN seek view via ONE atomic store
+  // action. `applySeekCut` installs the frozen rows + cursors + `seekAtMs` + `seekMonitorSeq` AND
+  // flips `connection==='seeking'` in a single update — so the store is never observed `seeking`
+  // with live rows (finding 1). `seekMonitorSeq` is the SNAPSHOT's `monitor_seq` (the authoritative
+  // cut), so the D10 monitor join is bounded to the cut instant, not a live cursor.
   const controllerRef = useRef<SnapshotController | null>(null);
   if (controllerRef.current === null) {
     controllerRef.current = new SnapshotController({
       fetchSnapshot: (atMs) => client.snapshot(atMs),
       onSnapshot: (resp: SnapshotResponse) => {
-        const store = dashboardStore.getState();
-        store.applySnapshot({
+        dashboardStore.getState().applySeekCut({
+          rows: resp.summaries,
           cursors: resp.cursors,
-          flows: resp.summaries,
+          atMs: resp.at_ms,
+          monitorSeq: resp.cursors.monitor_seq,
           metrics: resp.metrics,
           topology: resp.topology,
         });
-        // Re-enter seek at the cut instant (applySnapshot cleared the freeze): rows now hold the
-        // frozen cut AND `connection==='seeking'` + `seekAtMs` are restored for the listeners.
-        store.enterSeek(resp.at_ms);
+        // The cut is now exposed; drop the local pre-fetch drag marker (the frozen `seekAtMs`
+        // drives the playhead from here).
+        setDragAtMs(null);
       },
     });
   }
@@ -94,6 +102,14 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   const trackRef = useRef<HTMLDivElement>(null);
   const [hover, setHover] = useState<{ x: number; t: number; reqs: number } | null>(null);
   const draggingRef = useRef(false);
+  // The drag instant BEFORE the frozen cut lands (finding 1): while the fetch is in flight the
+  // store is intentionally NOT yet `'seeking'` (rows stay live), so the playhead can't read
+  // `seekAtMs`. This local marker tracks the drag so the playhead follows immediately; it is
+  // cleared once the cut installs (`seekAtMs` takes over) or on resume.
+  const [dragAtMs, setDragAtMs] = useState<number | null>(null);
+  // A seek is PENDING once the user starts dragging (socket paused) until the cut lands or resume.
+  // Drives the LIVE toggle so the user can always bail out of an in-flight seek.
+  const pendingSeek = dragAtMs !== null && !seeking;
 
   /** Pixel clientX → normalized fraction across the track (0 for a missing/degenerate rect). */
   const fracFromClientX = useCallback((clientX: number): number => {
@@ -111,13 +127,17 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
     return t !== null && Number.isFinite(t) ? t : Date.now();
   }, [fracFromClientX]);
 
-  /** Begin/continue a seek at the pointer's time. Enters seek (pause) then requests the cut. */
+  /**
+   * Begin/continue a seek at the pointer's time. PAUSES live applying (shadow-buffer) but does NOT
+   * expose `'seeking'` — only the atomic `applySeekCut` (when the fetch resolves) does, so the store
+   * never reads `seeking` with live rows (finding 1). The local `dragAtMs` tracks the playhead in
+   * the meantime; the controller fetches the frozen cut (rAF-throttled, ≤1 in flight).
+   */
   const seekToClientX = useCallback(
     (clientX: number) => {
       const t = timeFromClientX(clientX);
       if (!socket.isPaused()) socket.seek(); // pause applying live frames (shadow-buffer)
-      // Mark the instant immediately so the playhead tracks the drag even before the fetch lands.
-      dashboardStore.getState().enterSeek(t);
+      setDragAtMs(t); // local playhead marker; NO store `seeking` flip until the cut lands
       controller.requestAt(t); // rAF-throttled + LRU-cached fetch of the frozen cut
     },
     [controller, socket, timeFromClientX],
@@ -153,25 +173,28 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   /** Resume LIVE: socket replays buffered frames + flips to live; cancel any pending fetch. */
   const goLive = useCallback(() => {
     controller.cancel();
+    setDragAtMs(null); // drop any in-flight drag marker
     socket.live();
   }, [controller, socket]);
 
-  // The playhead position (fraction) while seeking: derived from the frozen `seekAtMs` over the
-  // ring span; live → pinned to the right edge (now).
+  // The playhead position (fraction): the frozen `seekAtMs` once the cut lands, else the in-flight
+  // drag marker (`dragAtMs`) so the playhead follows the drag before the fetch resolves; live (no
+  // seek, no pending drag) → pinned to the right edge (now).
+  const playheadAtMs = seeking ? seekAtMs : dragAtMs;
   const playheadFrac = useMemo(() => {
     const b = reqsBounds(ring);
     if (!b || b.tEnd === b.t0) return 1;
-    if (seeking && seekAtMs !== null) {
-      return Math.min(1, Math.max(0, (seekAtMs - b.t0) / (b.tEnd - b.t0)));
+    if (playheadAtMs !== null) {
+      return Math.min(1, Math.max(0, (playheadAtMs - b.t0) / (b.tEnd - b.t0)));
     }
     return 1;
-  }, [seeking, seekAtMs, ring]);
+  }, [playheadAtMs, ring]);
 
   const hillPath = useMemo(() => buildHillPath(ring, HILL_H), [ring]);
 
   return (
     <div className="mx-4 mt-2 flex items-center gap-3 rounded-md border border-line bg-panel px-3 py-2" data-testid="scrubber">
-      {seeking ? (
+      {seeking || pendingSeek ? (
         <button
           type="button"
           onClick={goLive}
@@ -191,7 +214,9 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
         </span>
       )}
 
-      {/* The draggable timeline track + reqs/s hill. */}
+      {/* The draggable timeline track. NOTE: the track itself is NOT `overflow-hidden` (finding 4) —
+          only the inner hill layer clips, so the hover tooltip (which sits ABOVE the track at
+          `-top-9`) is not clipped away. The playhead + tooltip render here, outside the clip. */}
       <div
         ref={trackRef}
         data-testid="scrubber-track"
@@ -201,7 +226,7 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
         aria-valuemax={100}
         aria-valuenow={Math.round(playheadFrac * 100)}
         tabIndex={0}
-        className="relative h-10 flex-1 cursor-pointer select-none overflow-hidden rounded bg-panel-raised"
+        className="relative h-10 flex-1 cursor-pointer select-none rounded bg-panel-raised"
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
@@ -210,15 +235,18 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
           if (draggingRef.current) endDrag(e);
         }}
       >
-        <svg
-          className="absolute inset-0 h-full w-full"
-          viewBox={`0 0 100 ${HILL_H}`}
-          preserveAspectRatio="none"
-          aria-hidden
-          data-testid="scrubber-hill"
-        >
-          <path d={hillPath} className="fill-accent/20 stroke-accent/60" strokeWidth={0.6} vectorEffect="non-scaling-stroke" />
-        </svg>
+        {/* Inner clipped layer: only the hill is clipped to the rounded track (finding 4). */}
+        <div className="absolute inset-0 overflow-hidden rounded">
+          <svg
+            className="absolute inset-0 h-full w-full"
+            viewBox={`0 0 100 ${HILL_H}`}
+            preserveAspectRatio="none"
+            aria-hidden
+            data-testid="scrubber-hill"
+          >
+            <path d={hillPath} className="fill-accent/20 stroke-accent/60" strokeWidth={0.6} vectorEffect="non-scaling-stroke" />
+          </svg>
+        </div>
 
         {/* Playhead */}
         <div
@@ -228,7 +256,8 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
           aria-hidden
         />
 
-        {/* Hover tooltip — time + reqs/s at the point. */}
+        {/* Hover tooltip — time + reqs/s at the point. Rendered OUTSIDE the clipped hill layer so the
+            `-top-9` position is not cut off by `overflow-hidden` in the real UI (finding 4). */}
         {hover && (
           <div
             data-testid="scrubber-tooltip"

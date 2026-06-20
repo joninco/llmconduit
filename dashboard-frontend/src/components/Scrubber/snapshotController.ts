@@ -6,14 +6,20 @@
  * Contract:
  *  - `requestAt(tsMs)` is called on EVERY pointer move during a drag. The timestamp is bucketed to
  *    the second (the LRU key — the snapshot mechanism is 5 s-granular per D5, so sub-second
- *    precision is meaningless and would defeat the cache). A bucket already in the LRU delivers
- *    SYNCHRONOUSLY from cache — zero fetch.
+ *    precision is meaningless and would defeat the cache). The bucket is recorded as the LATEST
+ *    requested target BEFORE anything else (cache check included), so every delivery — cached OR
+ *    fetched — can verify it is still the latest before applying (finding 3: no stale overwrite). A
+ *    bucket already in the LRU delivers SYNCHRONOUSLY from cache — zero fetch.
  *  - A bucket NOT in the cache schedules a SINGLE rAF-coalesced fetch. Many `requestAt` calls
  *    within one frame collapse to ONE fetch of the LATEST requested bucket (intermediate buckets
  *    are skipped — you only care where the playhead landed). So N drag events ⇒ ≤1 fetch/frame.
- *  - One in-flight fetch at a time; a newer target supersedes a pending frame. A resolved fetch
- *    is cached (LRU, capacity-bounded) and, IF it is still the latest request, delivered.
- *  - `onSnapshot(resp)` broadcasts the frozen cut to the store (the caller wires `applySnapshot`).
+ *  - STRICTLY ONE in-flight fetch at a time (finding 2): while a request is in flight NO new fetch
+ *    starts, regardless of bucket. The latest requested bucket is recorded; the in-flight request's
+ *    `finally` fires EXACTLY that latest bucket (if it still needs fetching), coalescing every
+ *    intermediate drag. A slow backend therefore sees ≤1 concurrent request even under a 60 Hz drag.
+ *  - Every resolved fetch is cached (LRU, capacity-bounded) and delivered ONLY if its bucket is
+ *    still the latest requested (else a newer drag won — the stale response is dropped, finding 3).
+ *  - `onSnapshot(resp)` broadcasts the frozen cut to the store (the caller wires `applySeekCut`).
  *
  * All side-effecting seams (`fetchSnapshot`, `raf`/`cancelRaf`, `now`) are injected so the unit
  * test drives frames deterministically and asserts the fetch count without real timers.
@@ -82,19 +88,23 @@ export class SnapshotController {
   }
 
   /**
-   * Request the snapshot at `tsMs`. Cache hit → deliver synchronously (no fetch). Miss → record
-   * as the latest target and schedule a single rAF-coalesced fetch (collapsing this frame's
-   * requests to one fetch of the LATEST bucket).
+   * Request the snapshot at `tsMs`. The bucket is recorded as the LATEST target FIRST (before the
+   * cache check), so any later-resolving in-flight fetch for an older bucket can detect it is no
+   * longer latest and drop itself (finding 3). Cache hit → deliver synchronously (no fetch). Miss →
+   * schedule a single rAF-coalesced fetch (collapsing this frame's requests to one fetch of the
+   * latest bucket).
    */
   requestAt(tsMs: number): void {
     const bucket = bucketOf(tsMs);
+    // (finding 3) Mark latest BEFORE the cache check: a cache HIT must move the marker too, else a
+    // slower in-flight OLDER fetch would still see itself as latest and overwrite this newer cut.
+    this.pendingBucket = bucket;
     const cached = this.cache.get(bucket);
     if (cached) {
       this.touch(bucket, cached);
-      this.onSnapshot(cached);
+      this.deliverIfLatest(bucket, cached);
       return;
     }
-    this.pendingBucket = bucket;
     this.scheduleFrame();
   }
 
@@ -115,25 +125,50 @@ export class SnapshotController {
     const cached = this.cache.get(bucket);
     if (cached) {
       this.touch(bucket, cached);
-      this.onSnapshot(cached);
+      this.deliverIfLatest(bucket, cached);
       return;
     }
-    // One fetch in flight at a time; if the same bucket is already fetching, wait for it.
-    if (this.inFlight === bucket) return;
+    // (finding 2) STRICTLY one in flight: while ANY request is outstanding, do not start another —
+    // the running request's `finally` will pick up the latest pending bucket. This caps concurrency
+    // at 1 even when rapid drags cross many buckets against a slow backend.
+    if (this.inFlight !== null) return;
+    this.startFetch(bucket);
+  }
+
+  /** Issue exactly one fetch for `bucket`, delivering on resolve only if still the latest target. */
+  private startFetch(bucket: number): void {
     this.inFlight = bucket;
     this.fetches += 1;
     this.fetchSnapshot(bucket)
       .then((resp) => {
         this.touch(bucket, resp);
-        // Deliver only if this is STILL the latest requested bucket (else a newer drag won).
-        if (this.pendingBucket === bucket) this.onSnapshot(resp);
+        // (finding 3) Deliver only if this bucket is STILL the latest requested; a newer drag (or a
+        // newer cached delivery) that moved `pendingBucket` wins, and this stale response is dropped.
+        this.deliverIfLatest(bucket, resp);
+        this.settle(bucket);
       })
-      .catch((err) => this.onError(err))
-      .finally(() => {
-        this.inFlight = null;
-        // A newer bucket may have been requested while this was in flight → schedule it.
-        if (this.pendingBucket !== null && this.pendingBucket !== bucket) this.scheduleFrame();
+      .catch((err) => {
+        this.onError(err);
+        this.settle(bucket);
       });
+  }
+
+  /**
+   * Clear the in-flight marker and, if a NEWER bucket was requested while this fetch was running,
+   * schedule exactly ONE follow-up frame for it (finding 2: every intermediate drag is skipped —
+   * only the latest pending bucket runs). The marker is cleared HERE (in the resolve/reject handler,
+   * not a deferred `.finally`) so the very next `runPending` already sees `inFlight === null` and is
+   * not blocked by a stale in-flight value. The follow-up goes through `runPending`, whose
+   * one-in-flight guard keeps concurrency at 1.
+   */
+  private settle(bucket: number): void {
+    this.inFlight = null;
+    if (this.pendingBucket !== null && this.pendingBucket !== bucket) this.scheduleFrame();
+  }
+
+  /** Broadcast a cut ONLY if `bucket` is still the latest requested target (finding 3). */
+  private deliverIfLatest(bucket: number, resp: SnapshotResponse): void {
+    if (this.pendingBucket === bucket) this.onSnapshot(resp);
   }
 
   /** Insert/refresh a cache entry as MRU and evict the LRU beyond capacity. */
@@ -147,7 +182,12 @@ export class SnapshotController {
     }
   }
 
-  /** Cancel any scheduled frame and clear the pending target (called on resume/unmount). */
+  /**
+   * Cancel any scheduled frame and clear the pending target (called on resume/unmount). Clearing
+   * `pendingBucket` also DISARMS any still-in-flight fetch: its `deliverIfLatest` will see no
+   * matching latest target and drop the response — so a LIVE resume during an in-flight seek can't
+   * be clobbered by a late cut landing after the user already went live.
+   */
   cancel(): void {
     if (this.frame !== null) {
       this.cancelRaf(this.frame);

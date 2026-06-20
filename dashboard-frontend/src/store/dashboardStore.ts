@@ -70,6 +70,22 @@ export interface DashboardState {
   setConnection: (s: ConnectionState) => void;
   /** Enter the frozen seek cut: marks `seeking` and captures `at_ms` + the `monitor_seq` cut. */
   enterSeek: (atMs: number) => void;
+  /**
+   * ATOMICALLY install a time-travel snapshot cut (D11 finding 1). In ONE update it replaces the
+   * rows + cursors with the FROZEN snapshot AND flips `connection='seeking'` AND stamps
+   * `seekAtMs`/`seekMonitorSeq` from the cut — so the store is NEVER observed `seeking` while the
+   * rows/cursors are still LIVE. The Scrubber pauses live applying on drag-start but defers
+   * exposing `'seeking'` until the fetched cut lands here, closing the window where a seek listener
+   * (D10) could render live/current rows or unbounded monitor data under `connection==='seeking'`.
+   */
+  applySeekCut: (cut: {
+    rows: FlowSummary[];
+    cursors: SeqCursors;
+    atMs: number;
+    monitorSeq: number;
+    metrics: MetricsResponse | null;
+    topology: TopologyResponse | null;
+  }) => void;
   setCursor: (domain: keyof SeqCursors, seq: number) => void;
   applySnapshot: (snap: {
     cursors: SeqCursors;
@@ -136,6 +152,34 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
       seekAtMs: atMs,
       seekMonitorSeq: s.cursors.monitor_seq,
     })),
+
+  applySeekCut: (cut) =>
+    set((s) => {
+      const flows = new Map<string, FlowSummary>();
+      const flowOrder: string[] = [];
+      for (const f of cut.rows) {
+        flows.set(f.api_call_id, f);
+        flowOrder.push(f.api_call_id);
+      }
+      // ONE atomic update: frozen rows + cursors AND `connection='seeking'` AND the cut's
+      // `seekAtMs`/`seekMonitorSeq` install together. `seekMonitorSeq` is the SNAPSHOT's
+      // `monitor_seq` (the authoritative cut), not the live cursor — so the monitor join is bounded
+      // to the moment the cut was taken, never to a live cursor that kept advancing pre-fetch.
+      return {
+        connection: 'seeking',
+        // Crosses a boundary (whatever store → frozen cut); bump the monotonic epoch (finding 1).
+        connEpoch: s.connEpoch + 1,
+        cursors: cut.cursors,
+        seekAtMs: cut.atMs,
+        seekMonitorSeq: cut.monitorSeq,
+        flows,
+        flowOrder,
+        metrics: cut.metrics,
+        topologyNodes: cut.topology?.nodes ?? [],
+        topologyEdges: cut.topology?.edges ?? [],
+        priceTable: cut.topology?.price_table ?? {},
+      };
+    }),
 
   setCursor: (domain, seq) =>
     set((s) => ({ cursors: { ...s.cursors, [domain]: seq } })),
