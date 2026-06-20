@@ -146,17 +146,24 @@ fn env_flag(name: &str) -> bool {
 pub struct PublicOrigin(String);
 
 impl PublicOrigin {
-    /// Parse and validate a configured public origin. It MUST be an absolute
-    /// `https://` URL with a host and no path (`scheme://host[:port]`). Returns
-    /// the normalized `scheme://host[:port]` string on success.
-    pub fn parse(raw: &str) -> Result<Self, String> {
+    /// Parse and validate a configured public origin. It MUST be an absolute URL
+    /// with a host and no path (`scheme://host[:port]`). The scheme MUST be
+    /// `https`, EXCEPT that `http` is accepted when `allow_insecure` is set (the
+    /// `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD` override — D7a R2 #2: an air-gapped
+    /// non-loopback LAN running plaintext still needs an EXACT origin to match
+    /// against, rather than falling back to the attacker-controllable `Host`).
+    /// Returns the normalized `scheme://host[:port]` string on success.
+    pub fn parse(raw: &str, allow_insecure: bool) -> Result<Self, String> {
         let url = url::Url::parse(raw.trim())
             .map_err(|err| format!("{ENV_PUBLIC_ORIGIN} is not a valid URL: {err}"))?;
-        if url.scheme() != "https" {
-            return Err(format!(
-                "{ENV_PUBLIC_ORIGIN} must use https:// (got {})",
-                url.scheme()
-            ));
+        let scheme = url.scheme();
+        let scheme_ok = scheme == "https" || (allow_insecure && scheme == "http");
+        if !scheme_ok {
+            return Err(if allow_insecure {
+                format!("{ENV_PUBLIC_ORIGIN} must use http:// or https:// (got {scheme})")
+            } else {
+                format!("{ENV_PUBLIC_ORIGIN} must use https:// (got {scheme})")
+            });
         }
         let host = url
             .host_str()
@@ -167,10 +174,11 @@ impl PublicOrigin {
             ));
         }
         // Re-serialize as a bare origin so an `Origin` header (which never has a
-        // trailing slash) compares byte-for-byte.
+        // trailing slash) compares byte-for-byte. The scheme is preserved so an
+        // `http` override origin matches an `http` `Origin` exactly.
         let normalized = match url.port() {
-            Some(port) => format!("https://{host}:{port}"),
-            None => format!("https://{host}"),
+            Some(port) => format!("{scheme}://{host}:{port}"),
+            None => format!("{scheme}://{host}"),
         };
         Ok(Self(normalized))
     }
@@ -201,6 +209,13 @@ pub struct DashboardAuth {
     /// The validated public origin, when configured. Drives the `Secure` cookie
     /// attribute and the WS `Origin` allow-list.
     public_origin: Option<PublicOrigin>,
+    /// Whether the server is bound to a loopback address. D7a R2 #2: the WS
+    /// `Origin` allow-list may fall back to the request's own `Host`-derived
+    /// origin ONLY on a loopback bind (where `Host` is the localhost address the
+    /// dev is using). Off-loopback the `Host` header is attacker-controllable, so
+    /// the fallback is forbidden and an `Origin` is matched ONLY against the
+    /// configured `public_origin`.
+    loopback: bool,
     /// Whether mutating dashboard routes (the D6 kill route) may proceed.
     /// Default off → mutations are 403.
     allow_mutations: bool,
@@ -217,6 +232,7 @@ impl std::fmt::Debug for DashboardAuth {
                 "public_origin",
                 &self.public_origin.as_ref().map(PublicOrigin::as_str),
             )
+            .field("loopback", &self.loopback)
             .field("allow_mutations", &self.allow_mutations)
             .finish()
     }
@@ -249,18 +265,34 @@ impl DashboardAuth {
     ///   loopback, where `dev_open` then authenticates every request.
     ///
     /// Returns `Err` for a malformed value (bad base64 / too-short key / bad
-    /// origin) OR a missing session key on a non-loopback bind. The
-    /// *route-registration* refusal (missing token/key/origin on a non-loopback
-    /// bind) is a separate, testable decision — [`startup_route_decision`] — so a
-    /// misconfigured production server refuses to expose the routes; this
-    /// constructor additionally fails closed so a direct caller cannot obtain an
-    /// auto-keyed non-loopback context.
+    /// origin), a MISSING TOKEN on a non-loopback bind (D7a R2 #4 — fail closed so
+    /// a direct caller cannot build a tokenless `dev_open` non-loopback context),
+    /// OR a missing session key on a non-loopback bind. The *route-registration*
+    /// refusal (missing token/key/origin on a non-loopback bind) is a separate,
+    /// testable decision — [`startup_route_decision`] — so a misconfigured
+    /// production server refuses to expose the routes; this constructor
+    /// additionally fails closed on both the token and the key so a direct caller
+    /// cannot obtain an unauthenticated/auto-keyed non-loopback context.
     pub fn from_env(
         bind_addr: SocketAddr,
         env: &DashboardEnv,
     ) -> Result<DashboardAuthBuild, String> {
         let loopback = bind_addr.ip().is_loopback();
         let mut warnings = Vec::new();
+
+        // D7a R2 #4: fail closed on a tokenless non-loopback bind. A `None` token
+        // means `dev_open` treats every request as authenticated; that concession
+        // is loopback-only (the server is reachable solely from localhost there).
+        // The route decision also refuses this, but a direct caller could
+        // otherwise construct a tokenless non-loopback context and register it
+        // manually — so the constructor enforces the invariant independently. The
+        // insecure override does NOT relax this (it only relaxes the TLS origin).
+        if !loopback && env.token.is_none() {
+            return Err(format!(
+                "{ENV_TOKEN} is required on a non-loopback bind; a tokenless dashboard is \
+                 fully unauthenticated (dev-open) and is a loopback-dev concession only"
+            ));
+        }
 
         let session_key = match env.session_key_b64.as_deref() {
             Some(encoded) => decode_session_key(encoded)?,
@@ -287,16 +319,37 @@ impl DashboardAuth {
             }
         };
 
+        // An `http://` origin is accepted ONLY under the insecure override (D7a
+        // R2 #2). Off-loopback with no configured origin, the WS path will reject
+        // any browser `Origin` (no `Host` fallback) — see `origin_allowed`.
         let public_origin = match env.public_origin.as_deref() {
-            Some(raw) => Some(PublicOrigin::parse(raw)?),
+            Some(raw) => Some(PublicOrigin::parse(raw, env.allow_insecure)?),
             None => None,
         };
+
+        // D7a R2 #2: a non-loopback bind under the insecure override with NO
+        // configured origin cannot validate cross-site WS requests — the only
+        // legitimate-origin signal would be the attacker-controllable `Host`, and
+        // `origin_allowed` never trusts `Host` off loopback. Warn that any
+        // Origin-bearing browser upgrade will be rejected until an explicit origin
+        // is set (the secure non-loopback path already requires a validated https
+        // origin via `startup_route_decision`).
+        if !loopback && env.allow_insecure && public_origin.is_none() {
+            warnings.push(format!(
+                "{ENV_ALLOW_INSECURE}=1 on a non-loopback bind WITHOUT {ENV_PUBLIC_ORIGIN}: \
+                 browser WebSocket upgrades that send an Origin header will be REJECTED (the \
+                 Host header is attacker-controllable off loopback, so it is never trusted as \
+                 the origin); set {ENV_PUBLIC_ORIGIN} (http:// is allowed under this override) \
+                 to enable the dashboard socket"
+            ));
+        }
 
         Ok(DashboardAuthBuild {
             auth: Arc::new(Self {
                 token: env.token.clone(),
                 session_key,
                 public_origin,
+                loopback,
                 allow_mutations: env.allow_mutations,
             }),
             warnings,
@@ -433,20 +486,24 @@ impl DashboardAuth {
     /// browser-only, and such a client already passed the signed-cookie check.
     ///
     /// When an `Origin` IS present:
-    /// - If a `PUBLIC_ORIGIN` is configured (production), the origin must equal
-    ///   it EXACTLY. We deliberately do NOT fall back to the request's `Host`
-    ///   here: `Host` is attacker-controllable, so trusting it would let a
-    ///   page on `https://evil` with a forged `Host: evil` ride a stolen cookie.
-    /// - If NO `PUBLIC_ORIGIN` is configured (loopback/dev), we accept the
-    ///   request's own `Host`-derived origin (the served origin), since on a
-    ///   localhost bind the `Host` is the loopback address the dev is using.
+    /// - If a `PUBLIC_ORIGIN` is configured, the origin must equal it EXACTLY. We
+    ///   deliberately do NOT fall back to the request's `Host` here: `Host` is
+    ///   attacker-controllable, so trusting it would let a page on `https://evil`
+    ///   with a forged `Host: evil` ride a stolen cookie.
+    /// - If NO `PUBLIC_ORIGIN` is configured, we accept the request's own
+    ///   `Host`-derived origin (the served origin) ONLY on a LOOPBACK bind, where
+    ///   the `Host` is the localhost address the dev is using. Off loopback the
+    ///   `Host` is attacker-controllable, so with no configured origin we REJECT
+    ///   (D7a R2 #2 — CSWSH: a non-loopback insecure-override bind without a
+    ///   `PUBLIC_ORIGIN` must NOT trust a `Host`-derived origin).
     fn origin_allowed(&self, headers: &HeaderMap) -> bool {
         let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
             return true;
         };
         match self.public_origin.as_ref() {
             Some(public) => origin == public.as_str(),
-            None => same_origin_as_host(headers, origin),
+            // No configured origin: the `Host`-derived fallback is loopback-only.
+            None => self.loopback && same_origin_as_host(headers, origin),
         }
     }
 
@@ -628,10 +685,13 @@ pub fn startup_route_decision(bind_addr: SocketAddr, env: &DashboardEnv) -> Rout
         return RouteDecision::Refuse(RouteRefusal::MissingSessionKey);
     }
 
+    // Strictly https here (pass `allow_insecure: false`): this is the SECURE-path
+    // gate. A plaintext `http://` origin does not satisfy it; the override branch
+    // below handles the "no validated https origin" case.
     let has_https_origin = env
         .public_origin
         .as_deref()
-        .is_some_and(|raw| PublicOrigin::parse(raw).is_ok());
+        .is_some_and(|raw| PublicOrigin::parse(raw, false).is_ok());
     if has_https_origin {
         return RouteDecision::Register {
             warnings: Vec::new(),
@@ -901,11 +961,12 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Whether `origin` equals the request's own `scheme://host[:port]`, derived
-/// from `Host` + a `wss`/`https` hint. We can't see the TLS state of the inbound
-/// connection from the handler, so we accept either the http or https form of
-/// the request's `Host` as "same origin" — this is the LOOPBACK/served-origin
-/// path; the strict cross-site defense is the exact `PUBLIC_ORIGIN` match plus
-/// `SameSite=Strict` on the cookie.
+/// from `Host`. We can't see the TLS state of the inbound connection from the
+/// handler, so we accept either the http or https form of the request's `Host`
+/// as "same origin". The caller ([`DashboardAuth::origin_allowed`]) invokes this
+/// ONLY on a loopback bind — `Host` is attacker-controllable off loopback, so it
+/// is never trusted there (D7a R2 #2). The strict cross-site defense off loopback
+/// is the exact `PUBLIC_ORIGIN` match plus `SameSite=Strict` on the cookie.
 fn same_origin_as_host(headers: &HeaderMap, origin: &str) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         return false;
@@ -1273,19 +1334,32 @@ mod tests {
     #[test]
     fn public_origin_normalizes_to_bare_origin() {
         assert_eq!(
-            PublicOrigin::parse("https://dash.example.com/")
+            PublicOrigin::parse("https://dash.example.com/", false)
                 .unwrap()
                 .as_str(),
             "https://dash.example.com"
         );
         assert_eq!(
-            PublicOrigin::parse("https://dash.example.com:8443")
+            PublicOrigin::parse("https://dash.example.com:8443", false)
                 .unwrap()
                 .as_str(),
             "https://dash.example.com:8443"
         );
-        assert!(PublicOrigin::parse("https://dash.example.com/path").is_err());
-        assert!(PublicOrigin::parse("http://dash.example.com").is_err());
+        assert!(PublicOrigin::parse("https://dash.example.com/path", false).is_err());
+        // Without the insecure override, `http://` is rejected.
+        assert!(PublicOrigin::parse("http://dash.example.com", false).is_err());
+        // D7a R2 #2: WITH the insecure override, an `http://` origin is accepted
+        // and its scheme is preserved so it can be exact-matched against an
+        // `http` `Origin` header (an air-gapped plaintext LAN still gets an exact
+        // origin instead of a Host fallback).
+        assert_eq!(
+            PublicOrigin::parse("http://dash.lan:8080", true)
+                .unwrap()
+                .as_str(),
+            "http://dash.lan:8080"
+        );
+        // A bogus scheme is still rejected even under the override.
+        assert!(PublicOrigin::parse("ftp://dash.lan", true).is_err());
     }
 
     #[test]
@@ -1519,6 +1593,126 @@ mod tests {
             ("origin", "https://evil.example.com"),
         ]);
         assert!(auth.authenticate_ws(&headers).is_none());
+    }
+
+    #[test]
+    fn ws_insecure_nonloopback_without_origin_rejects_host_fallback() {
+        // D7a R2 #2 (CSWSH): under the insecure override on a NON-loopback bind
+        // with NO configured PUBLIC_ORIGIN, a browser WS upgrade carrying an
+        // `Origin` must be REJECTED — the `Host`-derived same-origin fallback is
+        // loopback-only, so an attacker page on `https://evil` with a forged
+        // `Host` must NOT ride a stolen cookie.
+        let env = DashboardEnv {
+            token: Some("t".to_string()),
+            session_key_b64: Some(key_b64()),
+            public_origin: None,
+            allow_insecure: true,
+            ..Default::default()
+        };
+        let auth = build(public_bind(), &env);
+        let (cookie, _) = auth.issue_session();
+        // Attacker supplies a matching Origin+Host (the loopback fallback would
+        // have accepted this); off loopback it must be rejected.
+        let forged = headers_with(&[
+            ("cookie", &format!("{SESSION_COOKIE}={cookie}")),
+            ("origin", "http://attacker.example.com"),
+            ("host", "attacker.example.com"),
+        ]);
+        assert!(
+            auth.authenticate_ws(&forged).is_none(),
+            "Host-derived origin must NOT be trusted off loopback"
+        );
+        // A non-browser client (no Origin) still passes on the cookie alone.
+        let no_origin = headers_with(&[("cookie", &format!("{SESSION_COOKIE}={cookie}"))]);
+        assert!(auth.authenticate_ws(&no_origin).is_some());
+    }
+
+    #[test]
+    fn ws_insecure_nonloopback_with_explicit_http_origin_exact_matches() {
+        // D7a R2 #2: with an EXPLICIT http PUBLIC_ORIGIN under the insecure
+        // override, the WS upgrade is accepted ONLY for that exact origin and
+        // rejected for any other — never a Host fallback.
+        let env = DashboardEnv {
+            token: Some("t".to_string()),
+            session_key_b64: Some(key_b64()),
+            public_origin: Some("http://dash.lan:8080".to_string()),
+            allow_insecure: true,
+            ..Default::default()
+        };
+        let auth = build(public_bind(), &env);
+        let (cookie, exp) = auth.issue_session();
+        let exact = headers_with(&[
+            ("cookie", &format!("{SESSION_COOKIE}={cookie}")),
+            ("origin", "http://dash.lan:8080"),
+            // A forged Host must be irrelevant when an origin is configured.
+            ("host", "attacker.example.com"),
+        ]);
+        assert_eq!(auth.authenticate_ws(&exact), Some(exp));
+        let other = headers_with(&[
+            ("cookie", &format!("{SESSION_COOKIE}={cookie}")),
+            ("origin", "http://attacker.example.com"),
+            ("host", "dash.lan:8080"),
+        ]);
+        assert!(
+            auth.authenticate_ws(&other).is_none(),
+            "only the exact configured origin is accepted"
+        );
+    }
+
+    #[test]
+    fn from_env_insecure_nonloopback_without_origin_warns() {
+        // The insecure-override non-loopback bind with no origin builds (token +
+        // key present) but WARNS that Origin-bearing WS upgrades will be rejected.
+        let env = DashboardEnv {
+            token: Some("t".to_string()),
+            session_key_b64: Some(key_b64()),
+            public_origin: None,
+            allow_insecure: true,
+            ..Default::default()
+        };
+        let build = DashboardAuth::from_env(public_bind(), &env).unwrap();
+        assert!(
+            build
+                .warnings
+                .iter()
+                .any(|w| w.contains("WebSocket") && w.contains("REJECTED")),
+            "expected a CSWSH warning about rejected WS upgrades: {:?}",
+            build.warnings
+        );
+    }
+
+    // -- fail-closed construction (D7a R2 #4) -----------------------------
+
+    #[test]
+    fn from_env_rejects_tokenless_nonloopback() {
+        // A direct caller must NOT be able to construct a tokenless non-loopback
+        // `DashboardAuth` (which would be fully unauthenticated via `dev_open`).
+        let env = DashboardEnv {
+            token: None,
+            session_key_b64: Some(key_b64()),
+            public_origin: Some("https://dash.example.com".to_string()),
+            ..Default::default()
+        };
+        let err = DashboardAuth::from_env(public_bind(), &env).unwrap_err();
+        assert!(
+            err.contains(ENV_TOKEN),
+            "tokenless non-loopback must fail closed: {err}"
+        );
+        // Even with the insecure override set (which only relaxes TLS), it refuses.
+        let env_insecure = DashboardEnv {
+            allow_insecure: true,
+            ..env
+        };
+        assert!(
+            DashboardAuth::from_env(public_bind(), &env_insecure).is_err(),
+            "insecure override must NOT relax the token requirement"
+        );
+        // The loopback dev concession still allows a tokenless build.
+        let env_loopback = DashboardEnv {
+            token: None,
+            ..Default::default()
+        };
+        assert!(DashboardAuth::from_env(loopback(), &env_loopback).is_ok());
     }
 
     // -- CSRF + mutation policy -------------------------------------------

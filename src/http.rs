@@ -167,6 +167,17 @@ fn is_flow_capture_request(method: &axum::http::Method, path: &str) -> bool {
         )
 }
 
+/// Whether `path` is a dashboard auth endpoint whose request body carries the
+/// session secret (the login `{"token": ...}`; logout is bodyless but symmetric).
+/// D7a R2 #1: the bare JSON key `token` is NOT in the global sensitive-key set
+/// (too many legitimate `token` fields elsewhere), so the access token would leak
+/// through the small-body `body_payload` dump. We scope the fix here: the body of
+/// these endpoints is never useful to log, so we skip BOTH the `body_summary`
+/// field and the `body_payload` dump for them rather than broaden the redactor.
+fn is_dashboard_auth_path(path: &str) -> bool {
+    matches!(path, "/dashboard/login" | "/dashboard/logout")
+}
+
 async fn log_api_call(
     State(gateway): State<Arc<Gateway>>,
     request: Request,
@@ -198,7 +209,15 @@ async fn log_api_call(
     };
 
     let body_sha256 = hex::encode(Sha256::digest(&body_bytes));
-    let body_summary = summarize_api_body(uri.path(), &body_bytes);
+    // D7a R2 #1: the dashboard auth endpoints carry the session token in their
+    // body. The shared redactor does not strip a bare `token` key, so neither the
+    // summary nor the payload dump may touch these bodies — log a fixed marker.
+    let is_auth_path = is_dashboard_auth_path(uri.path());
+    let body_summary = if is_auth_path {
+        "[redacted: dashboard auth body]".to_string()
+    } else {
+        summarize_api_body(uri.path(), &body_bytes)
+    };
     tracing::info!(
         api_call_id = %api_call_id,
         method = %method,
@@ -217,7 +236,9 @@ async fn log_api_call(
         body_summary = %body_summary,
         "inbound API request"
     );
-    if body_bytes.len() <= API_LOG_PAYLOAD_DUMP_LIMIT_BYTES {
+    // Never dump the auth-endpoint body (it carries the token); the summary above
+    // already records that a body existed and its size/digest.
+    if !is_auth_path && body_bytes.len() <= API_LOG_PAYLOAD_DUMP_LIMIT_BYTES {
         tracing::info!(
             api_call_id = %api_call_id,
             method = %method,

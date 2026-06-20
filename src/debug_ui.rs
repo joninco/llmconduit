@@ -157,10 +157,18 @@ async fn debug_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                 match received {
                     Ok(update) if update.sequence <= snapshot.last_sequence => {}
                     Ok(update) => {
-                        for message in update.messages {
-                            if !send_message(&mut socket, &message).await {
+                        // Race the expiry future around EVERY send in the live
+                        // batch (not just at the top of the loop): a backpressured
+                        // send must not deliver frames after the cookie `exp`. The
+                        // same expiry-raced sender used for snapshot replay closes
+                        // the socket at `exp` even mid-batch (finding D7a R2 #3).
+                        match replay_snapshot(&update.messages, expiry.as_mut(), &mut socket).await {
+                            ReplayOutcome::Completed => {}
+                            ReplayOutcome::Expired => {
+                                let _ = socket.send(Message::Close(None)).await;
                                 return;
                             }
+                            ReplayOutcome::SendFailed => return,
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => return,
@@ -195,13 +203,15 @@ enum ReplayOutcome {
     SendFailed,
 }
 
-/// Replay the retained snapshot `messages` into `sink`, racing each send against
-/// the already-armed `expiry` future. If `expiry` resolves first — even between
-/// frames, under backpressure — replay stops with [`ReplayOutcome::Expired`] so
-/// the socket closes at the cookie `exp` instead of finishing a large backlog
-/// past expiry. A failed send yields [`ReplayOutcome::SendFailed`]. The race is
-/// `biased` so a ready expiry wins deterministically over a ready send (the
-/// connection must not outlive `exp`).
+/// Send a batch of `messages` into `sink`, racing each send against the
+/// already-armed `expiry` future. Used for BOTH the retained-snapshot replay and
+/// each LIVE monitor batch (D7a R2 #3) so neither can deliver a frame past the
+/// cookie `exp`. If `expiry` resolves first — even between frames, under
+/// backpressure — sending stops with [`ReplayOutcome::Expired`] so the socket
+/// closes at `exp` instead of finishing a large backlog/batch past expiry. A
+/// failed send yields [`ReplayOutcome::SendFailed`]. The race is `biased` so a
+/// ready expiry wins deterministically over a ready send (the connection must not
+/// outlive `exp`).
 async fn replay_snapshot(
     messages: &[DebugWsMessage],
     mut expiry: std::pin::Pin<&mut (impl Future<Output = ()> + ?Sized)>,
@@ -416,5 +426,44 @@ mod tests {
         let outcome = replay_snapshot(&snapshot_msgs(5), expiry.as_mut(), &mut sink).await;
         assert_eq!(outcome, ReplayOutcome::SendFailed);
         assert_eq!(sink.sent, 2, "stopped at the failing send");
+    }
+
+    /// REGRESSION (finding D7a R2 #3): the LIVE loop reuses the SAME armed expiry
+    /// future for every monitor batch, so a backpressured live send after the
+    /// cookie `exp` stops with `Expired` (the socket gets a `Close`) instead of
+    /// delivering frames past expiry. This models the live path: the snapshot
+    /// replay completes first (cheap), then a slow live batch straddles `exp`
+    /// using the same `expiry` the live `select!` arms.
+    #[tokio::test(start_paused = true)]
+    async fn live_batch_after_exp_closes_via_shared_expiry() {
+        // exp 5s out. The snapshot drains instantly; the live batch then sends
+        // slowly (2s/frame) so a later frame crosses exp.
+        let expiry = wait_for_session_expiry(now_unix() + 5);
+        tokio::pin!(expiry);
+
+        // 1) Snapshot replay finishes before exp (instant sink).
+        let mut snap_sink = MockSink::instant();
+        assert_eq!(
+            replay_snapshot(&snapshot_msgs(3), expiry.as_mut(), &mut snap_sink).await,
+            ReplayOutcome::Completed,
+        );
+
+        // 2) A backpressured LIVE batch reusing the SAME expiry stops at exp.
+        let mut live_sink = MockSink {
+            sent: 0,
+            per_send: Duration::from_secs(2),
+            fail_at: None,
+        };
+        let outcome = replay_snapshot(&snapshot_msgs(100), expiry.as_mut(), &mut live_sink).await;
+        assert_eq!(
+            outcome,
+            ReplayOutcome::Expired,
+            "a live send after exp must close, not deliver past expiry"
+        );
+        assert!(
+            (1..100).contains(&live_sink.sent),
+            "live batch stopped mid-stream at exp (sent {} of 100)",
+            live_sink.sent
+        );
     }
 }

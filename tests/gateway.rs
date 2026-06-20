@@ -3813,6 +3813,141 @@ async fn flow_store_disabled_path_opens_nothing() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Tracing capture harness (D7a R2 #1 regression).
+//
+// `tracing` caches per-callsite interest GLOBALLY. If the process has no global
+// default subscriber, callsites are cached as "never" the first time they fire
+// (under `NoSubscriber`), and a later THREAD-LOCAL `set_default` is never even
+// consulted — the macro short-circuits. So a per-test thread-local subscriber
+// captures nothing once another test has run first.
+//
+// The fix: install ONE global subscriber for the whole test binary that fans out
+// to a per-THREAD buffer. With a real global default, callsites cache as
+// "always" and dispatch reliably. A test enables capture on its own thread,
+// drives the request (on the SAME thread via a current-thread runtime), then
+// reads its own buffer — fully isolated from any other test thread.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Per-thread capture buffer; `Some` only while a test is actively capturing
+    /// on this thread. Other threads' events are dropped (their cell is `None`).
+    static CAPTURE_BUF: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A `MakeWriter` that appends to the calling thread's `CAPTURE_BUF` when capture
+/// is active there, and discards otherwise.
+struct ThreadLocalCapture;
+
+struct ThreadLocalCaptureWriter;
+
+impl std::io::Write for ThreadLocalCaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURE_BUF.with(|cell| {
+            if let Some(sink) = cell.borrow_mut().as_mut() {
+                sink.extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalCapture {
+    type Writer = ThreadLocalCaptureWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        ThreadLocalCaptureWriter
+    }
+}
+
+/// Install the global capture subscriber exactly once for this test binary.
+fn install_capture_subscriber() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(ThreadLocalCapture)
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        // Ignore an error if some other harness already set a global default —
+        // capture simply won't see events then, which the test asserts against.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
+/// Run `body` with tracing capture active on THIS thread, returning the captured
+/// log text. The closure must drive its request on the current thread (we use a
+/// current-thread tokio runtime) so its events land in this thread's buffer.
+fn capture_logs<F: std::future::Future<Output = ()>>(body: impl FnOnce() -> F) -> String {
+    install_capture_subscriber();
+    CAPTURE_BUF.with(|cell| *cell.borrow_mut() = Some(Vec::new()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("current-thread runtime");
+    rt.block_on(body());
+    CAPTURE_BUF.with(|cell| {
+        let taken = cell.borrow_mut().take().unwrap_or_default();
+        String::from_utf8(taken).expect("utf8 log")
+    })
+}
+
+/// REGRESSION (D7a R2 #1): the dashboard ACCESS TOKEN must never reach the logs.
+/// `/dashboard/login` carries `{"token": "..."}`; the shared redactor does NOT
+/// strip a bare `token` key, so the small-body `body_payload` dump used to write
+/// it verbatim. The middleware now skips BOTH the summary and the payload dump
+/// for the auth endpoints. We drive a REAL login through the real `log_api_call`
+/// middleware with a known token and assert it appears in NO tracing field.
+#[test]
+fn login_token_is_never_logged() {
+    const KNOWN_TOKEN: &str = "SUPERSECRET-LOGIN-TOKEN-7f3a";
+
+    let logged = capture_logs(|| async {
+        // Loopback + no token env → dev-open: `/dashboard/login` registers and
+        // the (any) token verifies. The body still carries the token field that
+        // the payload dump would have leaked.
+        let app = llmconduit::build_app_with_options(
+            test_config(),
+            llmconduit::AppOptions {
+                with_debug_ui: true,
+            },
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/dashboard/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&json!({ "token": KNOWN_TOKEN })).expect("serialize"),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        // Dev-open accepts any token → 200 with the session cookies set.
+        assert_eq!(response.status().as_u16(), 200);
+    });
+
+    // The middleware DID log the request (so we know capture is wired)…
+    assert!(
+        logged.contains("/dashboard/login"),
+        "the login request was logged at all: {logged}"
+    );
+    // …but the token value must appear in NO field (summary, payload, or else).
+    assert!(
+        !logged.contains(KNOWN_TOKEN),
+        "dashboard login token leaked into the logs:\n{logged}"
+    );
+    // The payload-dump line must be skipped entirely for the auth endpoint.
+    assert!(
+        !logged.contains("inbound API request payload"),
+        "auth-endpoint body payload must not be dumped:\n{logged}"
+    );
+}
+
 fn test_gateway(upstream: MockUpstream, search: MockSearch) -> Arc<Gateway> {
     test_gateway_with_config(upstream, search, test_config())
 }
