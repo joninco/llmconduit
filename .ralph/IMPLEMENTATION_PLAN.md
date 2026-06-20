@@ -330,10 +330,10 @@ coverage change). R1 (2 MEDIUM keepalive-hang + race-order, 1 LOW shadowed key) 
 > the missing `stop` arm); **12.9 bundles** both sides of the `tool_calls` wire-string contract. Obey
 > AGENTS.md "Hard rules in the engine"; do NOT re-raise the adjudicated invalid findings below.
 
-## STATUS (🔄 IN PROGRESS — 6/10)
+## STATUS (🔄 IN PROGRESS — 7/10)
 
-**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`), 12.4 (`4cd2b44`), 12.5 (`adc5dd7`), 12.6 (`9a42909`).
-**TODO (sequenced):** 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
+**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`), 12.4 (`4cd2b44`), 12.5 (`adc5dd7`), 12.6 (`9a42909`), 12.7 (`56c34b2`).
+**TODO (sequenced):** 12.8, 12.9, 12.10 (LOW).
 Per-task loop = read spec → implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 
@@ -386,7 +386,7 @@ rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 **Sequencing:** Independent — no deps on other Topic 12 tasks; touches only the two proxy header helpers plus a new module + lib.rs registration.
 
 ### Task 12.7 — ToolDeltaGate per-call cap: O(1) running byte count (kill O(n^2) re-sum)
-**Priority:** MEDIUM · **Spec:** `.ralph/specs/U7-tool-delta-gate-running-bytes.md` · **Status:** ⬜ PENDING
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/U7-tool-delta-gate-running-bytes.md` · **Status:** ✅ DONE `56c34b2` (Codex-xhigh APPROVED, round 1). Added running `bytes: usize` to `AnalyzeDeltaState::Pending`; per-call cap is now O(1) (`*bytes + delta_bytes`), no `buffered_len` on the per-delta path; the three terminal subtractions read the running `bytes` and the unused `buffered_len` helper was removed. Cap boundaries byte-identical (256 KiB / 1 MiB). 10 existing tests unchanged + 2 new (`per_call_cap_accumulates_across_many_small_deltas`, `empty_deltas_add_zero_to_running_per_call_bytes`) = 12 green.
 **Thermo finding:** The `Pending`/`None` buffering arm re-sums the whole buffer via `buffered_len(buffered)` on every nameless delta to enforce the per-call cap (`src/tool_delta_gate.rs:229`, helper `:54-56`), making one pending call O(n^2) in delta count — 1-byte fragments under the 256 KiB cap permit 262,144 deltas → ~34.36B fragment visits (bounded DoS behind `vision_active` + operator backend).
 **Fix:** Carry a running `bytes: usize` inside the `AnalyzeDeltaState::Pending` variant (`:44-47`), initialized to `0` at the sole construction site (`:162-164`). Change the per-call cap check at `:229` to compare `bytes + delta_bytes > MAX_PENDING_TOOL_DELTA_BYTES_PER_CALL` (O(1), no `buffered_len`) and increment `bytes` alongside the existing `buffered.push(...)` at `:234-235`. The cross-call total cap already uses the O(1) `pending_buffer_bytes` counter; the three once-per-call terminal subtractions (`:180-182`, `:212-214`, `:256-258`) run once and stay correct. Cap boundaries stay byte-identical; engine callers (`engine.rs:1618`, `:1709`) untouched.
 **Files:** src/tool_delta_gate.rs
