@@ -78,9 +78,10 @@ fn anthropic_system_blocks_join_into_instructions() {
     assert!(result.instructions.contains("Second rule."));
 }
 
-/// stop_sequences are vendor-specific in Responses -> routed through extra_body.
+/// stop_sequences flow through normalize_stop into the typed `stop` field (same
+/// gate as the Chat path), not smuggled raw into extra_body["stop"].
 #[test]
-fn anthropic_stop_sequences_move_to_extra_body() {
+fn anthropic_stop_sequences_map_to_typed_stop() {
     let result = anthropic_to_responses::convert_request(anthropic(json!({
         "model": "claude-3",
         "max_tokens": 64,
@@ -88,7 +89,39 @@ fn anthropic_stop_sequences_move_to_extra_body() {
         "messages": [{"role": "user", "content": "hi"}],
     })))
     .expect("convert");
-    assert_eq!(result.extra_body.get("stop"), Some(&json!(["STOP", "END"])));
+    assert_eq!(
+        result.stop,
+        Some(vec!["STOP".to_string(), "END".to_string()])
+    );
+    assert!(!result.extra_body.contains_key("stop"));
+}
+
+/// More than 4 stop_sequences must 400 at convert time
+/// (OPENAI_MAX_STOP_SEQUENCES=4), never silently truncate and never reach upstream.
+#[test]
+fn anthropic_too_many_stop_sequences_are_rejected() {
+    let err = anthropic_to_responses::convert_request(anthropic(json!({
+        "model": "claude-3",
+        "max_tokens": 64,
+        "stop_sequences": ["A", "B", "C", "D", "E"],
+        "messages": [{"role": "user", "content": "hi"}],
+    })))
+    .expect_err("more than 4 stop_sequences must be rejected");
+    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+}
+
+/// Empty / all-empty stop_sequences collapse to None — no stray extra_body entry.
+#[test]
+fn anthropic_empty_stop_sequences_collapse_to_none() {
+    let result = anthropic_to_responses::convert_request(anthropic(json!({
+        "model": "claude-3",
+        "max_tokens": 64,
+        "stop_sequences": ["", ""],
+        "messages": [{"role": "user", "content": "hi"}],
+    })))
+    .expect("convert");
+    assert_eq!(result.stop, None);
+    assert!(!result.extra_body.contains_key("stop"));
 }
 
 #[test]

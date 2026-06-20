@@ -2280,6 +2280,7 @@ fn chat_request_field_is_set(request: &ChatCompletionRequest, key: &str) -> bool
         }
         "frequency_penalty" => request.frequency_penalty.is_some(),
         "presence_penalty" => request.presence_penalty.is_some(),
+        "stop" => request.stop.is_some(),
         _ => false,
     }
 }
@@ -3026,6 +3027,8 @@ mod tests {
     use super::ModelFamily;
     use super::apply_family_chat_template_kwargs;
     use super::detect_model_family;
+    use super::merge_fallback_chat_kwargs;
+    use super::merge_upstream_chat_kwargs;
     use super::write_family_kwargs;
     use serde_json::Map as JsonMap;
     use serde_json::json;
@@ -4145,6 +4148,36 @@ mod tests {
     #[test]
     fn extract_supported_model_catalog_handles_empty_body() {
         assert!(extract_supported_model_catalog(&serde_json::json!({})).is_empty());
+    }
+
+    /// A typed `stop` on the request counts as request-set, so a configured
+    /// `stop` default must NOT gap-fill into `extra_body["stop"]`. Otherwise the
+    /// wire would carry BOTH a typed `stop` and an `extra_body["stop"]` key
+    /// (duplicate/conflicting), breaking request-wins. Covers the Anthropic path
+    /// (stop_sequences → typed stop) sharing this merge with configured kwargs.
+    #[test]
+    fn merge_upstream_chat_kwargs_does_not_shadow_typed_stop() {
+        let mut request = family_request("m");
+        request.stop = Some(vec!["STOP".to_string()]);
+        let defaults = JsonMap::from_iter([("stop".to_string(), json!(["CONFIGURED"]))]);
+
+        merge_upstream_chat_kwargs(&mut request, &defaults);
+
+        assert_eq!(request.stop, Some(vec!["STOP".to_string()]));
+        assert!(!request.extra_body.contains_key("stop"));
+    }
+
+    /// Same guard for the provider-fallback kwargs merge path.
+    #[test]
+    fn merge_fallback_chat_kwargs_does_not_shadow_typed_stop() {
+        let mut request = family_request("m");
+        request.stop = Some(vec!["STOP".to_string()]);
+        let defaults = JsonMap::from_iter([("stop".to_string(), json!(["CONFIGURED"]))]);
+
+        merge_fallback_chat_kwargs(&mut request, &defaults);
+
+        assert_eq!(request.stop, Some(vec!["STOP".to_string()]));
+        assert!(!request.extra_body.contains_key("stop"));
     }
 }
 

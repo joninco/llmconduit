@@ -35,14 +35,11 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
     );
     let input = converted_messages.input;
     let tools = convert_tools(&request.tools);
-    let (reasoning, mut extra_body) = convert_thinking(&request.thinking);
-    if let Some(stop_sequences) = request
-        .stop_sequences
-        .as_ref()
-        .filter(|sequences| !sequences.is_empty())
-    {
-        extra_body.insert("stop".to_string(), json!(stop_sequences));
-    }
+    let (reasoning, extra_body) = convert_thinking(&request.thinking);
+    // Route Anthropic stop_sequences through the same normalize_stop gate as the
+    // Chat path so OPENAI_MAX_STOP_SEQUENCES=4 → 400 (and empty-drop) apply here too.
+    // Assign to the typed field instead of smuggling raw into extra_body["stop"].
+    let stop = crate::models::chat::normalize_stop(request.stop_sequences)?;
     let tool_choice = convert_tool_choice(request.tool_choice);
     let metadata = convert_metadata(request.metadata)?;
     let reasoning =
@@ -76,7 +73,7 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         presence_penalty: None,
         truncation: None,
         metadata,
-        stop: None,
+        stop,
         extra_body,
     })
 }
@@ -1003,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_stop_sequences_to_extra_body_stop() {
+    fn converts_stop_sequences_to_typed_stop() {
         let request = AnthropicRequest {
             model: "claude-3-5-sonnet-20241022".to_string(),
             max_tokens: Some(64),
@@ -1025,8 +1022,8 @@ mod tests {
         };
 
         let result = convert_request(request).expect("convert");
-        assert_eq!(result.stop, None);
-        assert_eq!(result.extra_body.get("stop"), Some(&json!(["</decision>"])));
+        assert_eq!(result.stop, Some(vec!["</decision>".to_string()]));
+        assert!(!result.extra_body.contains_key("stop"));
     }
 
     #[test]
