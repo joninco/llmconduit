@@ -330,10 +330,10 @@ coverage change). R1 (2 MEDIUM keepalive-hang + race-order, 1 LOW shadowed key) 
 > the missing `stop` arm); **12.9 bundles** both sides of the `tool_calls` wire-string contract. Obey
 > AGENTS.md "Hard rules in the engine"; do NOT re-raise the adjudicated invalid findings below.
 
-## STATUS (🔄 IN PROGRESS — 5/10)
+## STATUS (🔄 IN PROGRESS — 6/10)
 
-**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`), 12.4 (`4cd2b44`), 12.5 (`adc5dd7`).
-**TODO (sequenced):** 12.6, 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
+**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`), 12.4 (`4cd2b44`), 12.5 (`adc5dd7`), 12.6 (`9a42909`).
+**TODO (sequenced):** 12.7 (MEDIUM) → 12.8, 12.9, 12.10 (LOW).
 Per-task loop = read spec → implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 
@@ -378,7 +378,7 @@ rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 **Sequencing:** Independent test-only task; no deps on other Topic-12 tasks. Reuses existing `tests/gateway.rs` and `tests/common/mod.rs` helpers (no helper changes required).
 
 ### Task 12.6 — Single canonical hop-by-hop header filter for both proxy halves
-**Priority:** MEDIUM · **Spec:** `.ralph/specs/U6-hop-by-hop-header-dedup.md` · **Status:** ⬜ PENDING
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/U6-hop-by-hop-header-dedup.md` · **Status:** ✅ DONE `9a42909` (Codex-xhigh APPROVED, round 1). Hoisted the canonical `is_hop_by_hop_header`+`header_name_eq` pair into new `pub(crate) src/proxy_headers.rs`; both halves call it, duplicates deleted (grep → 1 hit each). Direction-specific extra filters preserved; wire behavior byte-identical. Added parity tests in all 3 modules (+9 unit tests).
 **Thermo finding:** `is_hop_by_hop_header` + `header_name_eq` are byte-identical duplicates in both `/v1/completions` proxy halves — `src/http.rs:937-954` (response) and `src/upstream.rs:2376-2393` (request) — so the two lists can silently drift and strip different header sets.
 **Fix:** Hoist one canonical `is_hop_by_hop_header` + `header_name_eq` pair into a shared `pub(crate)` location (e.g. new `src/proxy_headers.rs` registered in `src/lib.rs`), call it from both `should_proxy_response_header` (http.rs) and `should_proxy_request_header` (upstream.rs), and delete the second copy. Keep the 8-element RFC list and order, the ASCII-case-insensitive compare, and each direction's extra filters (request also drops authorization/host/content-length; response drops content-length) byte-identical. Add a parity test asserting both directions strip the same hop-by-hop set and pass a representative passthrough header.
 **Files:** src/http.rs, src/upstream.rs, src/lib.rs, src/proxy_headers.rs (new)
