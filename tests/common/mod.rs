@@ -352,12 +352,6 @@ pub fn test_gateway_with_vision(
     vision: MockVisionClient,
     config: Config,
 ) -> Arc<Gateway> {
-    // Build the leaf finalization policies from the test config so the mock's
-    // leaf-mirror applies the same profile/family/effort kwargs the production
-    // leaf would (T1 moved profile resolution from the engine to the leaf).
-    upstream.set_finalization_policies(
-        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
-    );
     let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(vision);
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
