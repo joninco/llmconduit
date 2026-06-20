@@ -4065,20 +4065,36 @@ mod tests {
 
     #[test]
     fn extract_supported_model_catalog_reads_ids_and_context_limits_in_one_pass() {
-        // Same snapshot yields ids AND limits: the first positive context key
-        // wins, the search exercises EVERY alias key in precedence order
-        // (`max_input_tokens` > `context_length` > `context_window` >
-        // `max_context_length` > `max_model_len`), and an entry with no positive
+        // Same snapshot yields ids AND limits. Each of the FIVE alias keys gets
+        // its own ISOLATED entry where it is the ONLY positive limit, so deleting
+        // any single alias from `entry_context_limit` flips that entry's limit to
+        // `None` and fails this test. A separate precedence entry locks the
+        // search ORDER (`max_input_tokens` > `context_length` > `context_window`
+        // > `max_context_length` > `max_model_len`). An entry with no positive
         // context length (zero, missing, or a bare string) keeps its id with a
         // `None` limit (budgeting no-ops for it, but it still resolves).
         let body = serde_json::json!({
+            // Isolated positive coverage: one entry per alias key.
             "data": [
-                {"id": "a", "max_input_tokens": 1000, "context_length": 9999},
-                {"id": "b", "context_window": 2048},
-                {"id": "c", "max_context_length": 32768},
-                {"id": "d", "max_model_len": 4096},
-                {"id": "e", "context_length": 0},
-                {"id": "f"},
+                {"id": "k_max_input_tokens", "max_input_tokens": 1000},
+                {"id": "k_context_length", "context_length": 8192},
+                {"id": "k_context_window", "context_window": 2048},
+                {"id": "k_max_context_length", "max_context_length": 32768},
+                {"id": "k_max_model_len", "max_model_len": 4096},
+                // Precedence: every key positive but DIFFERENT, so the winner
+                // pins the ordering (a lower-priority key winning would change
+                // this value). `max_input_tokens` must win.
+                {
+                    "id": "precedence",
+                    "max_input_tokens": 11,
+                    "context_length": 22,
+                    "context_window": 33,
+                    "max_context_length": 44,
+                    "max_model_len": 55,
+                },
+                // No positive limit -> None (still resolves as an id).
+                {"id": "zero", "context_length": 0},
+                {"id": "missing"},
                 "bare",
             ]
         });
@@ -4087,27 +4103,35 @@ mod tests {
             extract_supported_model_catalog(&body),
             vec![
                 UpstreamModelEntry {
-                    id: "a".to_string(),
+                    id: "k_max_input_tokens".to_string(),
                     context_limit: Some(1000)
                 },
                 UpstreamModelEntry {
-                    id: "b".to_string(),
+                    id: "k_context_length".to_string(),
+                    context_limit: Some(8192)
+                },
+                UpstreamModelEntry {
+                    id: "k_context_window".to_string(),
                     context_limit: Some(2048)
                 },
                 UpstreamModelEntry {
-                    id: "c".to_string(),
+                    id: "k_max_context_length".to_string(),
                     context_limit: Some(32768)
                 },
                 UpstreamModelEntry {
-                    id: "d".to_string(),
+                    id: "k_max_model_len".to_string(),
                     context_limit: Some(4096)
                 },
                 UpstreamModelEntry {
-                    id: "e".to_string(),
+                    id: "precedence".to_string(),
+                    context_limit: Some(11)
+                },
+                UpstreamModelEntry {
+                    id: "zero".to_string(),
                     context_limit: None
                 },
                 UpstreamModelEntry {
-                    id: "f".to_string(),
+                    id: "missing".to_string(),
                     context_limit: None
                 },
                 UpstreamModelEntry {

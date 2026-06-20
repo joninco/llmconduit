@@ -160,43 +160,59 @@ fn mixed_old_and_recent_files() {
 fn tolerates_removal_race_without_double_count() {
     let dir = TempDir::new();
     // Two eligible old files. A concurrent deletion race is modeled by an
-    // injected remover that returns `Err` for `raced.json` (as if it vanished
-    // between the directory read and the `remove_file` call) while really
-    // removing everything else. This drives the removal-error-tolerance branch
-    // for real — `remove` actually returns `Err` — instead of pre-deleting the
-    // file so it never reaches `remove_file` (which would exercise nothing).
-    let raced = dir.write("raced.json");
-    let survivor = dir.write("survivor.json");
-    backdate(&raced, Duration::from_secs(3 * 3600));
-    backdate(&survivor, Duration::from_secs(3 * 3600));
+    // injected remover that fails on its FIRST invocation (as if that file
+    // vanished between the directory read and the `remove_file` call) and really
+    // removes on every later invocation. This is ORDER-INDEPENDENT: `read_dir`
+    // yields the two files in an unspecified order, but whichever comes first
+    // gets the `Err`, so a successful removal PROVABLY follows a failed one —
+    // exercising the loop's continue-after-Err path regardless of filesystem
+    // ordering. (Pre-deleting a file, or failing a fixed filename, would not
+    // prove continuation if the successful removal happened to run first.)
+    let a = dir.write("a.json");
+    let b = dir.write("b.json");
+    backdate(&a, Duration::from_secs(3 * 3600));
+    backdate(&b, Duration::from_secs(3 * 3600));
 
     let mut remove_attempts: Vec<PathBuf> = Vec::new();
     let deleted = cleanup_dump_files_with_remover(dir.path(), MAX_AGE, SystemTime::now(), |path| {
         remove_attempts.push(path.to_path_buf());
-        if path.file_name().and_then(|name| name.to_str()) == Some("raced.json") {
-            // The file raced away under us: removal fails.
+        if remove_attempts.len() == 1 {
+            // The first eligible file raced away under us: removal fails.
             Err(io::Error::new(io::ErrorKind::NotFound, "raced away"))
         } else {
             fs::remove_file(path)
         }
     });
 
-    // Cleanup attempted BOTH eligible files (so the loop genuinely continued
-    // past the failing removal), but counts only the one it actually removed.
+    // Both eligible files were attempted (the loop genuinely continued past the
+    // first, failed removal), and only the second — which actually succeeded —
+    // is counted: no double-increment for the file that raced away.
+    assert_eq!(
+        remove_attempts.len(),
+        2,
+        "cleanup must attempt BOTH eligible files (continue past the failed removal): {remove_attempts:?}"
+    );
     assert_eq!(deleted, 1, "only the successful removal is counted");
+
+    // The first-attempted file failed removal, so it still exists; the
+    // second-attempted file was really removed. Asserting via attempt ORDER (not
+    // a fixed name) keeps this independent of `read_dir` ordering.
+    let failed = &remove_attempts[0];
+    let removed = &remove_attempts[1];
     assert!(
-        remove_attempts.iter().any(|p| p.ends_with("raced.json")),
-        "the failing file's removal must actually be attempted: {remove_attempts:?}"
+        failed.exists(),
+        "the file whose removal returned Err must remain: {}",
+        failed.display()
     );
     assert!(
-        remove_attempts.iter().any(|p| p.ends_with("survivor.json")),
-        "cleanup must continue to the survivor after the failed removal: {remove_attempts:?}"
+        !removed.exists(),
+        "the file removed after the failed one must be gone: {}",
+        removed.display()
     );
-    // `survivor` was really deleted; the raced file is left as our remover never
-    // removed it (it returned `Err`).
-    assert!(!survivor.exists(), "the survivor is removed for real");
-    assert!(
-        raced.exists(),
-        "the raced file was not removed (remover returned Err)"
+    // Sanity: exactly one of the two eligible files survives.
+    assert_eq!(
+        [a.exists(), b.exists()].iter().filter(|&&e| e).count(),
+        1,
+        "exactly one of the two eligible files must survive"
     );
 }

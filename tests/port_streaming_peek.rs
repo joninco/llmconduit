@@ -198,11 +198,17 @@ fn streaming_body(uri: &str) -> serde_json::Value {
 /// Harness (no scheduler protocol): advance the paused clock PAST the 15s
 /// keep-alive interval FIRST, so its `Sleep` is already expired, then drain
 /// frames. Every frame is now wanted — the engine prologue, then the ping the
-/// expired timer produces the moment the inner stream is idle — so we just read
-/// until the `:` comment. The `KEEPALIVE_FRAME_BUDGET` cap is purely a mutation
-/// tripwire: deleting `.keep_alive(...)` removes the `KeepAliveStream`, no ping
-/// is ever produced, and the drain hits the cap and `panic!`s fast (a clean
-/// deterministic failure, not a hang on the permanently-pending upstream).
+/// expired timer produces the moment the inner stream is idle — so we read until
+/// the `:` comment.
+///
+/// Each read is wrapped in a paused-time `tokio::time::timeout`, so an ABSENT
+/// ping cannot hang the test: deleting `.keep_alive(...)` removes the
+/// `KeepAliveStream`, the body then stays pending on the permanently-pending
+/// upstream, and the timeout's own `Sleep` auto-advances to its deadline and
+/// fires `Elapsed` — a clean, deterministic failure naming the route, NOT a
+/// hang. (An unbounded `body.next().await` would never resolve, since the frame
+/// budget only counts completed reads.) The frame budget additionally guards
+/// against a stream that keeps emitting non-ping frames.
 async fn assert_idle_stream_emits_keepalive_ping(route: &IngressRoute) {
     let app = llmconduit::build_app_from_gateway(gateway_with_upstream(PendingUpstream));
 
@@ -233,15 +239,24 @@ async fn assert_idle_stream_emits_keepalive_ping(route: &IngressRoute) {
     // yields the `:` ping.
     tokio::time::advance(Duration::from_secs(16)).await;
 
-    // Drain frames until the keep-alive comment. Prologue frames (a handful, per
-    // route) arrive first and are skipped; the ping is GUARANTEED to follow on a
-    // correctly-wired stream (the timer already fired), so this read terminates.
-    // The cap only bites when keep-alive is removed (no ping ever) — turning the
-    // permanently-pending upstream's hang into a fast, explicit failure.
+    // Each read is bounded by a paused-time timeout so an absent ping fails fast
+    // instead of hanging. The timeout is generous relative to the keep-alive
+    // interval; under paused time it only elapses if no frame is forthcoming.
+    const READ_TIMEOUT: Duration = Duration::from_secs(60);
+    // Defense against a stream that keeps emitting non-ping frames: the prologue
+    // is a handful of frames, so the ping must arrive well within this budget.
     const KEEPALIVE_FRAME_BUDGET: usize = 64;
     let mut saw_keepalive = false;
     for _ in 0..KEEPALIVE_FRAME_BUDGET {
-        match body.next().await {
+        let read = tokio::time::timeout(READ_TIMEOUT, body.next()).await;
+        let frame = read.unwrap_or_else(|_| {
+            panic!(
+                "{}: idle SSE body produced NO keep-alive ping before the read timed out — \
+                 `.keep_alive(...)` appears removed from {} (deterministic timeout, not a hang)",
+                route.name, route.builder
+            )
+        });
+        match frame {
             Some(Ok(bytes)) => {
                 if bytes.starts_with(b":") {
                     saw_keepalive = true;
