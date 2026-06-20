@@ -141,16 +141,14 @@ dispatcher, per-session LRU+TTL `ImageCache`, gating. Tests: `tests/gateway.rs` 
 > **Sequencing:** T1 → (T2, T9); T7 → T8; T5 ↔ T6 coordinate; T10, T11 independent. T1 first (it
 > builds the typed resolver T2/T9 consume).
 
-## STATUS (T3 APPROVED — orchestrator resume session `thermo-followups-resume`)
+## STATUS (T4 APPROVED — orchestrator resume session `thermo-followups-resume`)
 
-**DONE (Codex-xhigh APPROVED + committed):** T1, T2, T7, T8, T9, T6, T5, T3 (8 of 11).
-**REMAINING (in dependency order):** T4 → T10 → T11. Serial (`--agents 1`); T4/T10 are
-mutually independent. Each remaining task gets its OWN fresh agent (clean context per task).
-  - **T4** (split `vision.rs` 1,364 lines → `vision/{cache,strip,client}.rs` + `redaction.rs`; move
-    image-agent suite to `tests/image_agent.rs`): pure structural move.
+**DONE (Codex-xhigh APPROVED + committed):** T1, T2, T7, T8, T9, T6, T5, T3, T4 (9 of 11).
+**REMAINING (in dependency order):** T10 → T11. Serial (`--agents 1`); T10/T11 independent. Each
+remaining task gets its OWN fresh agent (clean context per task).
   - **T10** (AppError failover policy + G1 retry logging): independent.
   - **T11** (streaming/logging test-quality + catalog-parser dedup, depends on T1): independent.
-**Review log:** `/tmp/thermo-followup-review.md` holds 8 verdicts (T1×2, T2×3, T7×2, T8×1, T9×4, T6×2, T5×2, T3×4).
+**Review log:** `/tmp/thermo-followup-review.md` holds 9 verdicts (T1×2, T2×3, T7×2, T8×1, T9×4, T6×2, T5×2, T3×4, T4×2).
 **Per-task loop** = implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → append verdict to `/tmp/thermo-followup-review.md` → update this plan. STOP when all 11
 APPROVED (see `.ralph/GOAL.md`).
@@ -222,10 +220,16 @@ gateway image-agent 39/39 + all suites green throughout.
 **Files:** `src/engine.rs`, `src/tool_delta_gate.rs` (new), `src/lib.rs`.
 
 ### Task 11.4 — Split vision.rs + image-agent test suite
-**Priority:** MEDIUM · **Spec:** `.ralph/specs/T4-vision-module-split.md`
-Split `src/vision.rs` (1,364 lines) into `vision/{cache,strip,client}.rs` + `src/redaction.rs`;
-move the image-agent suite + `MockVisionClient` to `tests/image_agent.rs`. Pure structural move.
-**Files:** `src/vision.rs` (+ new files), `src/redaction.rs`, `tests/gateway.rs`, `tests/image_agent.rs`.
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/T4-vision-module-split.md` · **Commits:** `1994993` + `b52659c`
+**Status:** ✅ Codex-xhigh APPROVED (R2). `src/vision.rs` (1,364) → `src/vision/{mod 53, cache 309,
+strip 566, client 291}.rs` + new top-level `src/redaction.rs` (287, `pub(crate)`, re-exported from
+`vision/mod.rs` so `crate::vision::redact_*` still resolves). Image-agent suite (47 tests) +
+`MockVisionClient` → new `tests/image_agent.rs` (2,277); `tests/gateway.rs` −2,364; shared helpers →
+`tests/common/mod.rs`. 34 `vision::*` call sites resolve, no public API change. R1 found 1× MEDIUM (the
+moved `test_gateway_with_vision` had ADDED a `set_finalization_policies` call absent from the pre-T4
+original — a non-pure-move behavior change); fixed in `b52659c` by plain removal (root-caused: both mocks
+default finalization to EMPTY, so parity restored). Other moved-helper changes confirmed behavior-neutral.
+**Files:** `src/vision/{mod,cache,strip,client}.rs`, `src/redaction.rs` (new), `src/lib.rs`, `tests/gateway.rs`, `tests/image_agent.rs` (new), `tests/common/mod.rs`.
 
 ### Task 11.5 — Bytes-specialized SSE guard (cap before copy)
 **Priority:** HIGH · **Spec:** `.ralph/specs/T5-sse-guard-bytes.md` · **Commits:** `b8db7f0` + `f223927`
