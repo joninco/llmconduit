@@ -18,6 +18,25 @@ pub(crate) mod tool_delta_gate;
 pub mod upstream;
 pub mod vision;
 
+/// Build provenance, embedded at compile time by `build.rs`: git short commit,
+/// working-tree dirty flag, and UTC build timestamp. Surfaced in `--version`
+/// (see [`VERSION`]) and the startup log so a running process is traceable to
+/// the exact source commit it was built from.
+pub const GIT_HASH: &str = env!("LLMCONDUIT_GIT_HASH");
+/// `"true"` if the working tree had uncommitted changes at build time.
+pub const GIT_DIRTY: &str = env!("LLMCONDUIT_GIT_DIRTY");
+/// UTC build timestamp (`YYYY-MM-DDTHH:MM:SSZ`), or `unknown`.
+pub const BUILD_TIME: &str = env!("LLMCONDUIT_BUILD_TIME");
+/// `--version` string: `"<semver> (<short-hash>, <build-time>)"`.
+pub const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("LLMCONDUIT_GIT_HASH"),
+    ", ",
+    env!("LLMCONDUIT_BUILD_TIME"),
+    ")"
+);
+
 use crate::config::Config;
 use crate::engine::Gateway;
 use crate::http::RouterOptions;

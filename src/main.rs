@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 app_options,
             );
             let listener = TcpListener::bind(bind_addr).await?;
-            tracing::info!("llmconduit listening on {bind_addr}");
+            log_listening(bind_addr);
             if app_options.with_debug_ui {
                 tracing::info!("debug UI available at http://{bind_addr}/debug");
             }
@@ -74,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_debug_log_cleanup(&config);
             let (app, _gateway) = build_app_with_gateway_and_options(config, None, app_options);
             let listener = TcpListener::bind(bind_addr).await?;
-            tracing::info!("llmconduit listening on {bind_addr}");
+            log_listening(bind_addr);
             if app_options.with_debug_ui {
                 tracing::info!("debug UI available at http://{bind_addr}/debug");
             }
@@ -83,6 +83,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     }
+}
+
+/// Log the startup banner with embedded build provenance (version, commit,
+/// dirty flag, UTC build time) so a running process is traceable to its source.
+fn log_listening(bind_addr: impl std::fmt::Display) {
+    tracing::info!(
+        "llmconduit {} commit={} dirty={} built={} listening on {bind_addr}",
+        env!("CARGO_PKG_VERSION"),
+        llmconduit::GIT_HASH,
+        llmconduit::GIT_DIRTY,
+        llmconduit::BUILD_TIME,
+    );
 }
 
 /// Spawn opt-in age-based cleanup of debug/request-log dump files for each

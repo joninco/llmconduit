@@ -15,7 +15,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "llmconduit",
-    version,
+    version = crate::VERSION,
     about = "LLM API gateway for translating, normalizing, and extending model traffic"
 )]
 pub struct Cli {
