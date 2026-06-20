@@ -237,11 +237,15 @@ synthetic emission unchanged.
 **Blocks:** 11.8.
 
 ### Task 11.8 — Extract ReasoningEgressState from responses_to_anthropic
-**Priority:** MEDIUM · **Spec:** `.ralph/specs/T8-reasoning-egress-state.md`
-Extract `reasoning_buffer`/`reasoning_signature`/`content_started`/`has_tool_calls` + flush logic
-into a `ReasoningEgressState` typed state machine; split the 2,020-line converter into focused
-modules. Pure structural extraction.
-**Files:** `src/adapters/responses_to_anthropic.rs` (+ new files), tests.
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/T8-reasoning-egress-state.md` · **Commit:** `702f4fd`
+**Status:** Codex-xhigh APPROVED (R1). Pure structural extraction (no behavior change). `ReasoningEgressState`
+(reasoning.rs, 96 lines) owns `reasoning_buffer`/`reasoning_signature`/`content_started`/`has_tool_calls` +
+the promote/hold/late-drop decision matrix (`should_promote`, `is_late_reasoning`, `note_content_started`,
+`note_tool_calls`, `push_reasoning`, `push_signature`, `take_buffer`, `take_signature`, `has_buffered`); the
+converter holds one + delegates. Block emission stays on the converter. Module split:
+`responses_to_anthropic/{mod.rs(826), collector.rs(226), reasoning.rs(96), tests.rs(991)}` — all under 1k.
+`AnthropicStreamCollector` re-exported. G8 behavior preserved; `finalize()` + progressive usage unchanged.
+**Files:** `src/adapters/responses_to_anthropic/{mod,reasoning,collector,tests}.rs`.
 **Depends on:** 11.7.
 
 ### Task 11.9 — Move G3 budgeting behind route/provider resolution + single request builder
