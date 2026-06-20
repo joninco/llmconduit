@@ -4770,6 +4770,124 @@ async fn d3_cancel_during_send_finalizes_cancelled_not_failed() {
 }
 
 #[tokio::test]
+async fn d6_kill_during_full_channel_send_unblocks_and_tears_down() {
+    // D6 R1: a dashboard KILL while the engine is BLOCKED inside `send_event`'s
+    // `tx.send().await` — the client is CONNECTED but NOT draining, so the 128-slot
+    // SSE channel is FULL — must unblock the send via the abort token, finalize the
+    // flow Cancelled, tear the upstream stream down, and leak no AbortHub entry.
+    // Before composing the token into `send_event`, the send only resolved on
+    // capacity OR a fully-closed receiver, so this kill was MISSED: the task parked
+    // here forever and the AbortHub entry stayed live until the client drained.
+    // This is the SEND counterpart to `d3_cancel_during_send_*` (which hangs up) and
+    // to `d6_kill_midchunk_*` (whose kill lands while parked in `next_upstream_chunk`,
+    // NOT mid-send).
+    use std::sync::atomic::Ordering;
+
+    let flood = 300; // » the 128-slot channel, so the engine blocks on send.
+    let upstream = FloodThenParkUpstream::new(flood);
+    let yielded = Arc::clone(&upstream.yielded);
+    let stream_dropped = upstream.stream_dropped.notified();
+    let gateway = test_gateway_with_flow_store_upstream(Arc::new(upstream.clone()));
+    let api_call_id = d3_open_flow(&gateway);
+
+    let request = base_request(vec![user_message("flood")]);
+    // Hold the stream but NEVER poll it before the kill, so nothing drains the channel
+    // and the engine is forced to block INSIDE `tx.send().await`.
+    let mut stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+
+    // On the current-thread test runtime the spawned `run_turn` only runs while we
+    // await. Yield until the upstream's yield-count goes quiescent: that is EXACTLY
+    // when the engine is blocked on a full channel (it cannot pull the next chunk
+    // until a send completes, and no send can complete while we never drain).
+    let mut last = usize::MAX;
+    let mut stable = 0;
+    let mut guard = 0;
+    while stable < 200 {
+        tokio::task::yield_now().await;
+        let now = yielded.load(Ordering::SeqCst);
+        if now == last {
+            stable += 1;
+        } else {
+            stable = 0;
+            last = now;
+        }
+        guard += 1;
+        assert!(guard < 1_000_000, "engine never went quiescent (mid-send)");
+    }
+    assert!(
+        last > 0 && last < flood,
+        "engine blocked on a full channel mid-flood (yielded {last} of {flood}), \
+         i.e. parked inside tx.send — not drained, not still at 0"
+    );
+
+    // The kill token is registered while the flow is live, and the CLIENT is still
+    // connected (we still hold `stream`, never dropped it) — so this proves the kill
+    // composes with, and does NOT depend on, the `tx.closed()` hang-up path.
+    assert_eq!(
+        gateway.abort_hub().live_len(),
+        1,
+        "live flow registered exactly one kill token"
+    );
+
+    // SERVER-SIDE kill while the engine is parked inside `tx.send().await`.
+    assert!(
+        gateway.abort(&api_call_id),
+        "abort found the live token → true"
+    );
+
+    // Draining now lets the queued events flush; the engine's blocked send unblocked
+    // via the token (→ cancelled()), `run_turn` returned, and the stream ENDS with a
+    // terminal `response.failed` — collecting the remainder must not hang. (Without the
+    // fix the send would still be parked here and this drain would time out.)
+    let mut saw_failed = false;
+    let drain = async {
+        while let Some(event) = stream.next().await {
+            if event.event == "response.failed" {
+                saw_failed = true;
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+        .await
+        .expect("killed mid-send stream unblocked + terminated (did not hang)");
+    assert!(
+        saw_failed,
+        "killed stream ended with a terminal response.failed, not a half-open hang"
+    );
+
+    // The upstream stream was actually dropped — the engine tore down upstream work on
+    // the kill (no orphan task), proving the blocked send did not strand upstream.
+    tokio::time::timeout(std::time::Duration::from_secs(5), stream_dropped)
+        .await
+        .expect("upstream stream dropped on mid-send kill (upstream work torn down)");
+
+    let record = d3_await_terminal(&gateway, &api_call_id).await;
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Cancelled,
+        "a kill DURING a full-channel tx.send finalizes Cancelled, not Failed"
+    );
+    assert_eq!(
+        record.terminal_reason.as_deref(),
+        Some("client_disconnected"),
+        "carries the cancellation terminal reason, not an internal-error string"
+    );
+    assert_eq!(
+        record.claim.load(Ordering::SeqCst),
+        llmconduit::dashboard_flow::CLAIM_FINALIZED,
+    );
+    assert_eq!(
+        gateway.abort_hub().live_len(),
+        0,
+        "no AbortHub entry leaks after the killed-mid-send flow finalized"
+    );
+}
+
+#[tokio::test]
 async fn d3_extractor_failure_l0_guard_finalizes_no_orphan() {
     // A malformed JSON body is rejected by the axum `Json` extractor BEFORE the
     // request reaches the engine, so the record is never ClaimedL1. The L0

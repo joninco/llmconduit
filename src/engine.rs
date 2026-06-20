@@ -849,9 +849,30 @@ impl Gateway {
     /// (The `raw_output` write below is a genuine local IO fault and stays
     /// `internal`.) The old per-call `failure_message` argument is gone because a
     /// closed receiver is no longer a generic internal error needing a detail.
-    async fn send_event(&self, tx: &mpsc::Sender<SseEvent>, event: SseEvent) -> AppResult<()> {
+    ///
+    /// D6 (R1): the SEND itself is CANCELLABLE. A full-but-OPEN 128-slot channel
+    /// (client connected but not draining) parks `tx.send().await` on capacity —
+    /// `send` only resolves on capacity OR a fully-closed receiver, so without
+    /// composing the kill token a dashboard `abort()` was MISSED: the task blocked
+    /// here forever, upstream work was never torn down, and the AbortHub entry
+    /// stayed live until the client finally drained/disconnected. Racing the send
+    /// against `abort_token.cancelled()` makes BOTH a closed channel (hang-up, the
+    /// D3 path above) AND the kill token (dashboard kill) cancel the send; the kill
+    /// branch surfaces `cancelled()` (499), so `run_turn` returns Cancelled at the
+    /// spawn terminal-match → upstream dropped, the finalizing guard removes the
+    /// AbortHub entry. `biased` checks the (rare) kill before the send each poll.
+    async fn send_event(
+        &self,
+        tx: &mpsc::Sender<SseEvent>,
+        event: SseEvent,
+        abort_token: &tokio_util::sync::CancellationToken,
+    ) -> AppResult<()> {
         let raw_event = event.clone();
-        tx.send(event).await.map_err(|_| AppError::cancelled())?;
+        tokio::select! {
+            biased;
+            _ = abort_token.cancelled() => return Err(AppError::cancelled()),
+            result = tx.send(event) => result.map_err(|_| AppError::cancelled())?,
+        }
         if let Some(raw_output) = &self.raw_output {
             raw_output
                 .write_sse_event(&raw_event)
@@ -869,6 +890,7 @@ impl Gateway {
         response_id: &str,
         tx: &mpsc::Sender<SseEvent>,
         emission: DeltaEmission,
+        abort_token: &tokio_util::sync::CancellationToken,
     ) -> AppResult<()> {
         let DeltaEmission {
             call_id,
@@ -885,8 +907,12 @@ impl Gateway {
                 delta: delta.clone(),
             }
         });
-        self.send_event(tx, function_call_args_delta_event(call_id, name, delta))
-            .await
+        self.send_event(
+            tx,
+            function_call_args_delta_event(call_id, name, delta),
+            abort_token,
+        )
+        .await
     }
 
     /// Drive a [`ToolDeltaGate`] decision to the wire, in order. `None` emits
@@ -899,11 +925,12 @@ impl Gateway {
         response_id: &str,
         tx: &mpsc::Sender<SseEvent>,
         decision: DeltaDecision,
+        abort_token: &tokio_util::sync::CancellationToken,
     ) -> AppResult<()> {
         match decision {
             DeltaDecision::None => {}
             DeltaDecision::One(emission) => {
-                self.emit_function_call_delta(response_id, tx, emission)
+                self.emit_function_call_delta(response_id, tx, emission, abort_token)
                     .await?;
             }
             DeltaDecision::Flush {
@@ -924,6 +951,7 @@ impl Gateway {
                             name,
                             delta,
                         },
+                        abort_token,
                     )
                     .await?;
                 }
@@ -936,6 +964,7 @@ impl Gateway {
                             name,
                             delta,
                         },
+                        abort_token,
                     )
                     .await?;
                 }
@@ -1202,7 +1231,21 @@ impl Gateway {
                     .emit_with(response_id.as_str(), || MonitorEventKind::Failed {
                         message: err.to_string(),
                     });
-                let _ = gateway.send_event(&tx, failure_event(err)).await;
+                // The terminal `response.failed` is the client's ONLY signal that the
+                // turn failed/was killed, so it must DELIVER, not cancel: pass a fresh
+                // never-cancelled token. (The flow's own token is already flipped on a
+                // kill — composing it here would suppress the terminal event.) Teardown
+                // is already done by this point — `run_turn` returned (upstream dropped)
+                // and `guard.finalize` above removed the AbortHub entry — so this last
+                // best-effort send blocks on nothing but client backpressure, and the
+                // `tx.is_closed()` early-return above already covers a hung-up client.
+                let _ = gateway
+                    .send_event(
+                        &tx,
+                        failure_event(err),
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
             }
         });
         Ok(ReceiverStream::new(rx))
@@ -1711,8 +1754,9 @@ impl Gateway {
                     });
             }
         }
-        self.send_event(&tx, created_event(&response_id)).await?;
-        self.send_event(&tx, in_progress_event(&response_id))
+        self.send_event(&tx, created_event(&response_id), &abort_token)
+            .await?;
+        self.send_event(&tx, in_progress_event(&response_id), &abort_token)
             .await?;
 
         let mut public_history = request.input.clone();
@@ -1988,6 +2032,7 @@ impl Gateway {
                             self.send_event(
                                 &tx,
                                 output_item_added_event(item, target.output_index),
+                                &abort_token,
                             )
                             .await?;
                         }
@@ -2001,6 +2046,7 @@ impl Gateway {
                             self.send_event(
                                 &tx,
                                 output_text_delta_event(target.item_id, target.output_index, delta),
+                                &abort_token,
                             )
                             .await?;
                         }
@@ -2016,6 +2062,7 @@ impl Gateway {
                             self.send_event(
                                 &tx,
                                 output_item_added_event(item, target.output_index),
+                                &abort_token,
                             )
                             .await?;
                         }
@@ -2033,6 +2080,7 @@ impl Gateway {
                                     target.output_index,
                                     delta,
                                 ),
+                                &abort_token,
                             )
                             .await?;
                         }
@@ -2045,6 +2093,7 @@ impl Gateway {
                                     target.output_index,
                                     signature,
                                 ),
+                                &abort_token,
                             )
                             .await?;
                         }
@@ -2064,7 +2113,7 @@ impl Gateway {
                                         "upstream streamed too many tool-call argument bytes before a tool name",
                                     )
                                 })?;
-                            self.drive_delta_decision(&response_id, &tx, decision)
+                            self.drive_delta_decision(&response_id, &tx, decision, &abort_token)
                                 .await?;
                         }
                         StreamEmission::ContentPartAdded => {
@@ -2072,6 +2121,7 @@ impl Gateway {
                             self.send_event(
                                 &tx,
                                 content_part_added_event(target.item_id, target.output_index),
+                                &abort_token,
                             )
                             .await?;
                         }
@@ -2080,6 +2130,7 @@ impl Gateway {
                             self.send_event(
                                 &tx,
                                 content_part_done_event(target.item_id, target.output_index, text),
+                                &abort_token,
                             )
                             .await?;
                         }
@@ -2091,6 +2142,7 @@ impl Gateway {
                                     target.item_id,
                                     target.output_index,
                                 ),
+                                &abort_token,
                             )
                             .await?;
                         }
@@ -2103,6 +2155,7 @@ impl Gateway {
                                     target.output_index,
                                     text,
                                 ),
+                                &abort_token,
                             )
                             .await?;
                         }
@@ -2112,7 +2165,8 @@ impl Gateway {
                                     delta: delta.clone(),
                                 }
                             });
-                            self.send_event(&tx, refusal_delta_event(delta)).await?;
+                            self.send_event(&tx, refusal_delta_event(delta), &abort_token)
+                                .await?;
                         }
                     }
                 }
@@ -2141,12 +2195,13 @@ impl Gateway {
                     continue;
                 };
                 let decision = tool_delta_gate.flush_pending_client_tool(call_id);
-                self.drive_delta_decision(&response_id, &tx, decision)
+                self.drive_delta_decision(&response_id, &tx, decision, &abort_token)
                     .await?;
             }
             self.emit_completed_public_items(
                 &response_id,
                 &tx,
+                &abort_token,
                 &finalized,
                 &mut public_history,
                 &mut response_output,
@@ -2298,9 +2353,11 @@ impl Gateway {
             }
         });
         if is_incomplete {
-            self.send_event(&tx, incomplete_event(resource)).await?;
+            self.send_event(&tx, incomplete_event(resource), &abort_token)
+                .await?;
         } else {
-            self.send_event(&tx, completed_event(resource)).await?;
+            self.send_event(&tx, completed_event(resource), &abort_token)
+                .await?;
         }
         self.monitor.emit(response_id, MonitorEventKind::Completed);
         Ok(())
@@ -2481,10 +2538,15 @@ impl Gateway {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn emit_completed_public_items(
         &self,
         response_id: &str,
         tx: &mpsc::Sender<SseEvent>,
+        // D6: the flow's kill token, composed with `tx.closed()` inside `send_event`
+        // so a dashboard kill cancels these terminal-item sends even under full-channel
+        // backpressure (no poll/select site here — the SEND is the only block point).
+        abort_token: &tokio_util::sync::CancellationToken,
         finalized: &FinalizedAssistantTurn,
         public_history: &mut Vec<ResponseItem>,
         response_output: &mut Vec<ResponseItem>,
@@ -2514,6 +2576,7 @@ impl Gateway {
                         target.output_index,
                         reasoning_text,
                     ),
+                    abort_token,
                 )
                 .await?;
             }
@@ -2523,8 +2586,12 @@ impl Gateway {
                     summary: summarize_response_item(&reasoning),
                     payload_preview: preview_json(&reasoning),
                 });
-            self.send_event(tx, output_item_done_event(reasoning, target.output_index))
-                .await?;
+            self.send_event(
+                tx,
+                output_item_done_event(reasoning, target.output_index),
+                abort_token,
+            )
+            .await?;
         }
         if let Some(message) = finalized.message_item.clone() {
             let target = event_state.target_for_item(&message);
@@ -2547,6 +2614,7 @@ impl Gateway {
                             target.output_index,
                             full_text.clone(),
                         ),
+                        abort_token,
                     )
                     .await?;
                     if finalized.content_part_emitted {
@@ -2557,6 +2625,7 @@ impl Gateway {
                                 target.output_index,
                                 full_text,
                             ),
+                            abort_token,
                         )
                         .await?;
                     }
@@ -2570,12 +2639,20 @@ impl Gateway {
                     summary: summarize_response_item(&message),
                     payload_preview: preview_json(&message),
                 });
-            self.send_event(tx, output_item_done_event(message, target.output_index))
-                .await?;
+            self.send_event(
+                tx,
+                output_item_done_event(message, target.output_index),
+                abort_token,
+            )
+            .await?;
         }
         if !finalized.refusal_text.is_empty() {
-            self.send_event(tx, refusal_done_event(finalized.refusal_text.clone()))
-                .await?;
+            self.send_event(
+                tx,
+                refusal_done_event(finalized.refusal_text.clone()),
+                abort_token,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -2645,6 +2722,7 @@ impl Gateway {
                             name.clone(),
                             arguments.clone(),
                         ),
+                        abort_token,
                     )
                     .await?;
                 }
@@ -2665,6 +2743,7 @@ impl Gateway {
                 self.send_event(
                     tx,
                     output_item_done_event(tool_call.public_item.clone(), target.output_index),
+                    abort_token,
                 )
                 .await?;
             }
@@ -2746,6 +2825,7 @@ impl Gateway {
         self.send_event(
             tx,
             output_item_added_event(partial, partial_target.output_index),
+            abort_token,
         )
         .await?;
 
@@ -2797,6 +2877,7 @@ impl Gateway {
         self.send_event(
             tx,
             output_item_done_event(completed, completed_target.output_index),
+            abort_token,
         )
         .await?;
 
@@ -2832,6 +2913,7 @@ impl Gateway {
                     "results": result_items,
                 }),
             },
+            abort_token,
         )
         .await?;
         self.monitor
