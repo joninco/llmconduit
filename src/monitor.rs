@@ -297,6 +297,20 @@ impl MonitorHub {
         self.enabled
     }
 
+    /// The monitor's current event sequence — the transcript domain's per-domain
+    /// cursor (D5). The D5 5 s coordinated snapshot reads this so a cut records which
+    /// monitor sequence it was consistent with (AGENTS.md: per-domain `{domain, seq}`
+    /// cursors, never a single global watermark). `0` on a disabled hub.
+    pub fn last_sequence(&self) -> u64 {
+        if !self.enabled {
+            return 0;
+        }
+        self.state
+            .lock()
+            .expect("monitor state lock poisoned")
+            .last_sequence
+    }
+
     pub fn emit(&self, response_id: impl Into<String>, kind: MonitorEventKind) {
         self.emit_with(response_id, || kind);
     }

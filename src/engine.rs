@@ -93,6 +93,14 @@ pub struct Gateway {
     /// branch on the debug flag; the TASK that refreshes it is gated. Cloning the
     /// Gateway shares the inner `Arc`, keeping the derived `Clone`.
     provider_health: ProviderHealthPublisher,
+    /// D5 aggregated-metrics layer: per-window rings + histograms + the coordinated
+    /// body-free snapshot ring. `MetricsLayer::disabled()` when `--with-debug-ui` is
+    /// off (every op a no-op, zero lock), built `new()` + attached via
+    /// `with_metrics` in the `with_debug_ui` DI branch — mirroring how the FlowStore/
+    /// monitor are gated. The engine records into it at the D3 TERMINAL finalize seam
+    /// (NOT the middleware); the 5 s snapshot task reads it under the fixed
+    /// FlowStore→Metrics lock order.
+    metrics: crate::metrics::MetricsLayer,
     /// Throttle state for the "requested model not served → fell back to the
     /// default catalog model" WARN. Every request resolves the model TWICE (the
     /// HTTP layer to label the response, then the engine to drive the upstream
@@ -584,7 +592,66 @@ impl Gateway {
             dashboard_auth: None,
             upstream_model_catalog: Arc::new(Mutex::new(None)),
             provider_health: ProviderHealthPublisher::default(),
+            // D5: disabled by default (zero overhead); the DI root attaches an
+            // enabled layer via `with_metrics` in the `--with-debug-ui` branch.
+            metrics: crate::metrics::MetricsLayer::disabled(),
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Attach the D5 enabled [`MetricsLayer`](crate::metrics::MetricsLayer) (built in
+    /// the `--with-debug-ui` DI branch). Consuming builder so it threads through the
+    /// `Gateway::new(...)` → `Arc::new` construction WITHOUT widening the constructor
+    /// signature (every test that builds a bare `Gateway` keeps the default
+    /// `disabled()` layer — zero overhead). Mirrors `with_dashboard_auth`.
+    pub fn with_metrics(mut self, metrics: crate::metrics::MetricsLayer) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// Access the D5 metrics layer. `is_enabled()` is `false` when the debug UI is
+    /// off, in which case every metrics op is a no-op (zero lock, zero work).
+    pub fn metrics(&self) -> &crate::metrics::MetricsLayer {
+        &self.metrics
+    }
+
+    /// D5: record a TERMINAL response into the metrics rings at the engine's D3
+    /// terminal finalize seam — co-located with `guard.finalize(...)` so it fires at
+    /// the SAME single CAS-guarded choke point (exactly once per flow, NOT from the
+    /// middleware, NOT per chunk). Sources the served model + endpoint + upstream
+    /// from the just-finalized FlowStore record (D1/D2 are the authoritative
+    /// attribution: `model_served`, `uri`, `upstream_target`), and the latency from
+    /// the guard's monotonic `elapsed`. No-op when the metrics layer is disabled OR
+    /// no `api_call_id`/record exists (the bare/non-instrumented paths), so it is
+    /// zero-overhead off the dashboard path. The record read is one extra brief lock
+    /// on the dashboard-only path; the metrics layer early-returns before any lock
+    /// when disabled.
+    fn record_terminal_metrics(
+        &self,
+        api_call_id: &str,
+        status: crate::dashboard_flow::FlowStatus,
+        elapsed_ms: u128,
+    ) {
+        if !self.metrics.is_enabled() {
+            return;
+        }
+        // The finalized record carries the authoritative served-model / endpoint /
+        // upstream attribution (set by D1 `open` + D2 `set_*` + D3 `finalize`) and
+        // the flow's final cumulative usage (D3 `record_usage` upserts).
+        let Some(record) = self.flow_store().detail(api_call_id) else {
+            return;
+        };
+        let served_model = record.model_served.as_deref();
+        let upstream = record.upstream_target.as_deref();
+        self.metrics
+            .record_response(status, served_model, &record.uri, upstream, elapsed_ms);
+        // Record the flow's FINAL cumulative token usage ONCE (not per chunk), into
+        // the SAME bucket as the response (same terminal status), so the window's
+        // token sum is the true throughput. The D3 incremental upserts kept the
+        // record's `usage` current; we read the terminal total here.
+        if let Some(usage) = record.usage {
+            self.metrics
+                .record_usage(status, served_model, &record.uri, upstream, usage);
         }
     }
 
@@ -899,6 +966,14 @@ impl Gateway {
                     crate::dashboard_flow::FlowStatus::Failed,
                     Some(err.to_string()),
                 );
+                // D5: record the terminal into the metrics rings at the SAME seam as
+                // the finalize (co-located so a pre-spawn failure is counted exactly
+                // once, with the guard's monotonic latency). No-op when metrics off.
+                self.record_terminal_metrics(
+                    guard.api_call_id(),
+                    crate::dashboard_flow::FlowStatus::Failed,
+                    guard.elapsed().as_millis(),
+                );
             }
             err
         };
@@ -1029,20 +1104,29 @@ impl Gateway {
             // guard, finalizing `Cancelled`. The CAS makes the explicit finalize win
             // and the drop then no-op (idempotent).
             if let Some(guard) = &telemetry_guard {
-                match &result {
-                    Ok(()) => guard.finalize(
+                // Resolve the terminal status ONCE so the same value drives both the
+                // FlowStore finalize and the D5 metrics record (co-located at this
+                // single CAS-guarded choke point → recorded exactly once).
+                let (status, reason) = match &result {
+                    Ok(()) => (
                         crate::dashboard_flow::FlowStatus::Completed,
-                        Some("response.completed".to_string()),
+                        "response.completed".to_string(),
                     ),
-                    Err(err) if err.is_cancelled() => guard.finalize(
+                    Err(err) if err.is_cancelled() => (
                         crate::dashboard_flow::FlowStatus::Cancelled,
-                        Some("client_disconnected".to_string()),
+                        "client_disconnected".to_string(),
                     ),
-                    Err(err) => guard.finalize(
-                        crate::dashboard_flow::FlowStatus::Failed,
-                        Some(err.to_string()),
-                    ),
-                }
+                    Err(err) => (crate::dashboard_flow::FlowStatus::Failed, err.to_string()),
+                };
+                guard.finalize(status, Some(reason));
+                // D5: record the terminal into the metrics rings (sources served
+                // model + endpoint + upstream from the just-finalized record + the
+                // guard's monotonic latency). No-op when the metrics layer is off.
+                gateway.record_terminal_metrics(
+                    guard.api_call_id(),
+                    status,
+                    guard.elapsed().as_millis(),
+                );
             }
             if let Err(err) = &result {
                 if tx.is_closed() {
@@ -1776,8 +1860,11 @@ impl Gateway {
                         }
                         // D3: emit the usage event to the monitor hub. The `/debug/ws`
                         // + dashboard surfaces store it on the record + replay it in
-                        // `snapshot()`. D5: the `MetricsLayer.record_usage` ring hook
-                        // attaches HERE once D5 exists (it does not yet).
+                        // `snapshot()`. D5: the `MetricsLayer` token sum is recorded
+                        // ONCE at the TERMINAL seam (`record_terminal_metrics`, from
+                        // the record's final cumulative `usage`), NOT per chunk — so
+                        // the per-window token sum is the true throughput without
+                        // over-counting cumulative chunks here.
                         self.monitor
                             .emit_with(response_id.as_str(), || MonitorEventKind::Usage {
                                 prompt: total.prompt,

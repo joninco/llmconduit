@@ -9,6 +9,7 @@ pub mod engine;
 pub mod error;
 pub mod http;
 pub mod log_rotation;
+pub mod metrics;
 pub mod models;
 pub mod monitor;
 pub(crate) mod proxy_headers;
@@ -107,6 +108,15 @@ pub fn build_app_with_gateway_and_options(
         crate::dashboard_flow::DashboardFlowStore::new()
     } else {
         crate::dashboard_flow::DashboardFlowStore::disabled()
+    };
+    // D5 MetricsLayer: enabled only when the debug UI is on (same zero-overhead
+    // `disabled()` split). Attached to the Gateway via `with_metrics`; the 5 s
+    // coordinated snapshot task is spawned below (on a live runtime) under the same
+    // gate, so production runs no ring/histogram/snapshot work.
+    let metrics = if options.with_debug_ui {
+        crate::metrics::MetricsLayer::new()
+    } else {
+        crate::metrics::MetricsLayer::disabled()
     };
     // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
     // (G7); routes alone are enough to switch the gateway into the routing
@@ -264,6 +274,13 @@ pub fn build_app_with_gateway_and_options(
         (None, false)
     };
 
+    // D5: capture cheap `Clone` handles BEFORE the originals move into `Gateway::new`
+    // so the 5 s coordinated snapshot task can own them (each is an `Arc`-backed
+    // handle; `disabled()` ones no-op). The snapshot task reads the FlowStore THEN
+    // the MetricsLayer (the fixed lock order) + one topology `Arc` + the monitor seq.
+    let snapshot_flow_store = flow_store.clone();
+    let snapshot_metrics = metrics.clone();
+    let snapshot_monitor = monitor.clone();
     let gateway = Arc::new(
         Gateway::new(
             config,
@@ -276,7 +293,8 @@ pub fn build_app_with_gateway_and_options(
             raw_output,
             flow_store,
         )
-        .with_dashboard_auth(dashboard_auth),
+        .with_dashboard_auth(dashboard_auth)
+        .with_metrics(metrics),
     );
     // D4: spawn the topology-health publication task ONLY when the debug UI is on,
     // so production keeps the zero-overhead path (no 1 s tick). Guard on a live
@@ -284,6 +302,16 @@ pub fn build_app_with_gateway_and_options(
     // panic in `tokio::spawn` (the `main.rs` server path always has one).
     if options.with_debug_ui && tokio::runtime::Handle::try_current().is_ok() {
         gateway.spawn_provider_health_publisher();
+        // D5: spawn the 5 s coordinated body-free snapshot task (same gate + live-
+        // runtime guard). It takes the single FlowStore→Metrics critical section,
+        // captures one topology `Arc` (D4's publisher), and pushes a body-free cut
+        // onto the bounded ring every 5 s.
+        crate::metrics::spawn_snapshot_task(
+            snapshot_metrics,
+            snapshot_flow_store,
+            gateway.provider_health_publisher(),
+            snapshot_monitor,
+        );
     }
     let router_options = RouterOptions {
         with_debug_ui: options.with_debug_ui,

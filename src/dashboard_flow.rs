@@ -251,6 +251,12 @@ struct DashboardFlowState {
     order: VecDeque<String>,
     link_index: HashMap<String, String>,
     live_summary_bytes: usize,
+    /// Monotonic mutation sequence — the FlowStore's per-domain cursor (D5). Bumped
+    /// on every structural mutation (`insert`/`update`/`remove`) so a consumer can
+    /// detect a change without a global watermark across the sibling stores
+    /// (AGENTS.md: per-domain `{domain, seq}` cursors). The D5 5 s snapshot reads it
+    /// at the cut instant; D7/D13 frames carry it.
+    seq: u64,
 }
 
 /// Authoritative store of per-flow records + the capture seam. Mirrors the
@@ -287,6 +293,18 @@ impl DashboardFlowStore {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// The FlowStore's per-domain mutation cursor (D5): a monotonic counter bumped
+    /// on every structural mutation. `0` when disabled. The D5 5 s coordinated
+    /// snapshot reads this at the cut instant (under the FlowStore lock, FIRST in the
+    /// fixed lock order) so the cut's `flow_seq` matches the `snapshot_summaries()`
+    /// it captured in the same critical section.
+    pub fn flow_seq(&self) -> u64 {
+        if !self.enabled {
+            return 0;
+        }
+        self.lock().seq
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, DashboardFlowState> {
@@ -592,6 +610,30 @@ impl DashboardFlowStore {
             .collect()
     }
 
+    /// Body-free snapshot summaries PLUS the per-domain `seq` captured under the
+    /// SAME lock acquisition (D5). This is the accessor the 5 s coordinated snapshot
+    /// task uses so the cut's `flow_seq` provably matches the summaries it carries —
+    /// a separate `snapshot_summaries()` + `flow_seq()` pair could TEAR (a concurrent
+    /// mutation between the two lock acquisitions would bump `seq` after the
+    /// summaries were read). Pruning happens once, before BOTH are read, so the
+    /// returned seq already reflects any prune the read performed. Empty + `0` when
+    /// disabled.
+    pub fn snapshot_summaries_with_seq(&self) -> (Vec<SnapshotFlowSummary>, u64) {
+        if !self.enabled {
+            return (Vec::new(), 0);
+        }
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
+        let summaries = state
+            .order
+            .iter()
+            .rev()
+            .filter_map(|id| state.by_id.get(id))
+            .map(|record| SnapshotFlowSummary::from_record(record))
+            .collect();
+        (summaries, state.seq)
+    }
+
     /// Test-only: prune at a caller-supplied clock so the TTL is deterministically
     /// observable without sleeping (D1 R1 #7).
     #[cfg(test)]
@@ -748,6 +790,7 @@ impl DashboardFlowState {
             .saturating_add(record.summary_bytes());
         self.order.push_back(api_call_id.clone());
         self.by_id.insert(api_call_id, record);
+        self.seq = self.seq.saturating_add(1);
     }
 
     /// Resolve any flow id — an `api_call_id` (direct `by_id` key) OR a
@@ -783,6 +826,7 @@ impl DashboardFlowState {
             .saturating_sub(before)
             .saturating_add(after);
         self.by_id.insert(api_call_id, Arc::new(next));
+        self.seq = self.seq.saturating_add(1);
     }
 
     /// Drop records whose age exceeds the TTL, keyed off `started_ms` vs a
@@ -871,6 +915,7 @@ impl DashboardFlowState {
         self.order.retain(|id| id != api_call_id);
         // Drop any dangling link-index entries that pointed at this id.
         self.link_index.retain(|_, owner| owner != api_call_id);
+        self.seq = self.seq.saturating_add(1);
     }
 }
 

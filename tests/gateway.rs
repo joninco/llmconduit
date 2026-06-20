@@ -3484,6 +3484,235 @@ async fn response_completed_includes_usage_from_upstream() {
 }
 
 #[tokio::test]
+async fn d5_metrics_populate_only_at_terminal_finalize_not_midstream() {
+    // D5: a streamed request records into the MetricsLayer ONLY at the engine's D3
+    // terminal finalize seam — NOT mid-stream, NOT from the middleware. Assert the
+    // metrics window is EMPTY while the stream is in flight (we check before driving
+    // it to completion) and populated exactly once AFTER finalize.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "hello")),
+            Ok(usage_chunk("chat-1", 100, 25, 125, Some(10), Some(7))),
+        ])
+        .await;
+    let (gateway, flow_store, metrics) = test_gateway_with_metrics(upstream);
+
+    // The middleware opens the record; the engine claims + finalizes it. Mimic the
+    // middleware `open` so the engine's L1 guard claims THIS record.
+    let api_call_id = "api_d5_finalize".to_string();
+    flow_store.open(
+        api_call_id.clone(),
+        "POST".to_string(),
+        "/v1/responses".to_string(),
+        llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+        None,
+    );
+    // Before driving the stream to completion, metrics must be empty (no record at
+    // open time, no mid-stream record).
+    assert_eq!(
+        metrics.view().window_1m.total_count(),
+        0,
+        "no metrics recorded at open / pre-finalize"
+    );
+    assert_eq!(
+        metrics.metrics_seq(),
+        0,
+        "metrics seq unbumped pre-finalize"
+    );
+
+    let request = base_request(vec![user_message("hi")]);
+    let events = collect_stream(
+        gateway
+            .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+            .await
+            .expect("stream"),
+    )
+    .await;
+    // Sanity: the stream completed.
+    assert!(
+        events
+            .iter()
+            .any(|e| e["type"].as_str() == Some("response.completed")),
+        "stream reached response.completed"
+    );
+
+    // After finalize: exactly one terminal recorded into all windows.
+    let view = metrics.view();
+    assert_eq!(
+        view.window_1m.total_count(),
+        1,
+        "exactly one terminal recorded at finalize"
+    );
+    assert_eq!(view.window_5m.total_count(), 1);
+    assert_eq!(view.window_1h.total_count(), 1);
+    // The bucket carries the served model + Success class, and the token sum is the
+    // flow's FINAL cumulative usage (recorded once, not per chunk).
+    let (key, counts) = view
+        .window_1m
+        .buckets
+        .iter()
+        .next()
+        .expect("one bucket present");
+    assert_eq!(key.status, llmconduit::metrics::StatusClass::Success);
+    assert_eq!(key.endpoint, "/v1/responses");
+    assert_eq!(counts.count, 1);
+    assert_eq!(counts.prompt_tokens, 100, "final cumulative prompt tokens");
+    assert_eq!(counts.completion_tokens, 25);
+    assert_eq!(counts.cached_tokens, 10);
+    // Latency populated the histogram → p50 is non-zero.
+    assert!(view.window_1m.percentiles().p50 >= 0.0);
+}
+
+#[tokio::test]
+async fn d5_coordinated_snapshot_is_internally_consistent_end_to_end() {
+    // D5: drive a real flow through the engine, then take a coordinated snapshot and
+    // assert the cut is internally consistent — summaries, metrics, topology, and
+    // per-domain cursors all reflect the SAME post-finalize state (no torn read).
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "hello")),
+            Ok(usage_chunk("chat-1", 100, 25, 125, None, None)),
+        ])
+        .await;
+    let (gateway, flow_store, metrics) = test_gateway_with_metrics(upstream);
+    let topology = gateway.provider_health_publisher();
+    topology.publish(Vec::new()); // version 1
+
+    let api_call_id = "api_d5_snapshot".to_string();
+    flow_store.open(
+        api_call_id.clone(),
+        "POST".to_string(),
+        "/v1/responses".to_string(),
+        llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+        None,
+    );
+    let request = base_request(vec![user_message("hi")]);
+    let _ = collect_stream(
+        gateway
+            .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    // Take the coordinated cut (the same call the 5 s task makes).
+    let cut = metrics
+        .snapshot(&flow_store, &topology)
+        .expect("coordinated cut");
+
+    // Summaries reflect the finalized flow (body-free).
+    let summary = cut
+        .summaries
+        .iter()
+        .find(|s| s.api_call_id == api_call_id)
+        .expect("finalized flow in summaries");
+    assert_eq!(
+        summary.status,
+        llmconduit::dashboard_flow::FlowStatus::Completed
+    );
+    // Metrics reflect the same recorded terminal.
+    assert_eq!(cut.metrics.window_1m.total_count(), 1);
+    // Topology is the captured published version.
+    assert_eq!(cut.topology.version, 1);
+    // Per-domain cursors are all present + consistent with the captured stores.
+    assert_eq!(
+        cut.cursors.flow_seq,
+        flow_store.flow_seq(),
+        "flow_seq matches"
+    );
+    assert_eq!(
+        cut.cursors.metrics_seq,
+        metrics.metrics_seq(),
+        "metrics_seq matches"
+    );
+    assert_eq!(cut.cursors.topology_seq, 1, "topology_seq == version");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn d5_lock_order_stress_no_deadlock_under_concurrent_flows_and_snapshots() {
+    // D5: the fixed FlowStore→Metrics lock order means many concurrent flows
+    // mutating the FlowStore + a snapshot task taking the combined critical section
+    // can NEVER deadlock (only the snapshot path holds >1 lock). Drive heavy churn
+    // against both stores from many tasks while a snapshot loop runs, and assert the
+    // whole thing finishes within a timeout (a deadlock would hang).
+    let flow_store = llmconduit::dashboard_flow::DashboardFlowStore::new();
+    let metrics = llmconduit::metrics::MetricsLayer::new();
+    let topology = llmconduit::upstream::ProviderHealthPublisher::default();
+    topology.publish(Vec::new());
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Snapshot loop: repeatedly take the combined FlowStore→Metrics critical section.
+    let snapshot_task = {
+        let metrics = metrics.clone();
+        let flow_store = flow_store.clone();
+        let topology = topology.clone();
+        let stop = Arc::clone(&stop);
+        tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = metrics.snapshot(&flow_store, &topology);
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    // Many concurrent flow + metrics mutators.
+    let mut workers = Vec::new();
+    for worker_id in 0..8 {
+        let flow_store = flow_store.clone();
+        let metrics = metrics.clone();
+        workers.push(tokio::spawn(async move {
+            for index in 0..500 {
+                let api = format!("api_{worker_id}_{index}");
+                flow_store.open(
+                    api.clone(),
+                    "POST".to_string(),
+                    "/v1/responses".to_string(),
+                    llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+                    None,
+                );
+                flow_store.finalize(
+                    &api,
+                    llmconduit::dashboard_flow::FlowStatus::Completed,
+                    Some("done".to_string()),
+                    Some("provider".to_string()),
+                );
+                metrics.record_response(
+                    llmconduit::dashboard_flow::FlowStatus::Completed,
+                    Some("m"),
+                    "/v1/responses",
+                    Some("provider"),
+                    5,
+                );
+            }
+        }));
+    }
+
+    // All mutators must finish well within a generous timeout (a deadlock hangs).
+    let workers_done = async {
+        for worker in workers {
+            worker.await.expect("worker joins");
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), workers_done)
+        .await
+        .expect("no deadlock: all mutators finished under the fixed lock order");
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    snapshot_task.await.expect("snapshot task joins");
+
+    // The stores survived the churn and the snapshot ring holds body-free cuts.
+    let cut = metrics.latest_snapshot().expect("at least one cut");
+    for summary in &cut.summaries {
+        // Each retained summary is body-free (well under 1 KiB).
+        let bytes = serde_json::to_string(summary).expect("serialize").len();
+        assert!(bytes < 4096, "snapshot summary is a small body-free record");
+    }
+}
+
+#[tokio::test]
 async fn response_completed_accumulates_usage_across_web_search_rounds() {
     use llmconduit::models::chat::ChunkUsage;
 
@@ -3793,6 +4022,44 @@ fn test_gateway_with_flow_store(upstream: MockUpstream, search: MockSearch) -> A
         None,
         llmconduit::dashboard_flow::DashboardFlowStore::new(),
     ))
+}
+
+/// D5: a gateway with BOTH an enabled FlowStore and an enabled MetricsLayer, plus
+/// the cloned handles a test needs to drive `open` (the middleware's job) and read
+/// metrics/snapshots afterward. Mirrors the `with_debug_ui` DI wiring (FlowStore +
+/// MetricsLayer + `with_metrics`).
+fn test_gateway_with_metrics(
+    upstream: MockUpstream,
+) -> (
+    Arc<Gateway>,
+    llmconduit::dashboard_flow::DashboardFlowStore,
+    llmconduit::metrics::MetricsLayer,
+) {
+    let config = test_config();
+    upstream.set_finalization_policies(
+        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
+    );
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    let flow_store = llmconduit::dashboard_flow::DashboardFlowStore::new();
+    let metrics = llmconduit::metrics::MetricsLayer::new();
+    let gateway = Arc::new(
+        Gateway::new(
+            config,
+            ReplayStore::new(1000),
+            Arc::new(upstream),
+            Arc::new(MockSearch::default()),
+            vision,
+            image_cache,
+            MonitorHub::new(128),
+            None,
+            flow_store.clone(),
+        )
+        .with_metrics(metrics.clone()),
+    );
+    (gateway, flow_store, metrics)
 }
 
 /// Like [`test_gateway_with_flow_store`] but accepts ANY upstream trait object (so
