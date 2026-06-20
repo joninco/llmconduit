@@ -12,6 +12,8 @@ use crate::error::AppResult;
 use crate::models::anthropic::AnthropicRequest;
 use crate::models::chat::ChatCompletionRequest;
 use crate::models::responses::ResponsesRequest;
+use crate::proxy_headers::header_name_eq;
+use crate::proxy_headers::is_hop_by_hop_header;
 use crate::upstream::collect_models_response;
 use axum::Json;
 use axum::Router;
@@ -934,25 +936,6 @@ fn should_proxy_response_header(name: &HeaderName) -> bool {
     !is_hop_by_hop_header(name) && !header_name_eq(name, "content-length")
 }
 
-fn is_hop_by_hop_header(name: &HeaderName) -> bool {
-    [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    ]
-    .iter()
-    .any(|header| header_name_eq(name, header))
-}
-
-fn header_name_eq(name: &HeaderName, other: &str) -> bool {
-    name.as_str().eq_ignore_ascii_case(other)
-}
-
 fn stream_responses_response(stream: ReceiverStream<crate::engine::SseEvent>) -> Response {
     let mapped = stream.map(|event| {
         Ok::<_, Infallible>(
@@ -1321,4 +1304,46 @@ fn model_id_from_value(model: &Value) -> Option<String> {
         .and_then(|map| map.get("id"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_proxy_response_header;
+    use axum::http::HeaderName;
+
+    /// The full RFC 7230 §6.1 hop-by-hop set; must match the canonical list and
+    /// the request-direction parity test in `upstream.rs`.
+    const HOP_BY_HOP: [&str; 8] = [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+
+    #[test]
+    fn response_direction_strips_full_hop_by_hop_set() {
+        for header in HOP_BY_HOP {
+            let name = HeaderName::from_bytes(header.as_bytes()).unwrap();
+            assert!(
+                !should_proxy_response_header(&name),
+                "response proxy must strip hop-by-hop header {header}",
+            );
+        }
+    }
+
+    #[test]
+    fn response_direction_strips_content_length() {
+        let name = HeaderName::from_static("content-length");
+        assert!(!should_proxy_response_header(&name));
+    }
+
+    #[test]
+    fn response_direction_passes_representative_passthrough_header() {
+        let name = HeaderName::from_static("content-type");
+        assert!(should_proxy_response_header(&name));
+    }
 }

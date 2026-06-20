@@ -8,6 +8,7 @@ pub mod http;
 pub mod log_rotation;
 pub mod models;
 pub mod monitor;
+pub(crate) mod proxy_headers;
 pub mod raw;
 pub(crate) mod redaction;
 pub mod replay;

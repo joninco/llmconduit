@@ -4,6 +4,8 @@ use crate::error::AppResult;
 use crate::error::FailoverDisposition;
 use crate::models::chat::ChatCompletionChunk;
 use crate::models::chat::ChatCompletionRequest;
+use crate::proxy_headers::header_name_eq;
+use crate::proxy_headers::is_hop_by_hop_header;
 use crate::sse_guard::bounded_sse_byte_stream;
 use crate::sse_guard::default_max_sse_frame_bytes;
 use async_trait::async_trait;
@@ -2360,25 +2362,6 @@ fn should_proxy_request_header(name: &HeaderName) -> bool {
         && !header_name_eq(name, "content-length")
 }
 
-fn is_hop_by_hop_header(name: &HeaderName) -> bool {
-    [
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-    ]
-    .iter()
-    .any(|header| header_name_eq(name, header))
-}
-
-fn header_name_eq(name: &HeaderName, other: &str) -> bool {
-    name.as_str().eq_ignore_ascii_case(other)
-}
-
 /// Small fixed reserve subtracted from the context window when recomputing the
 /// completion budget for an exact-token overflow error.
 const CONTEXT_RETRY_MARGIN: i64 = 100;
@@ -2962,10 +2945,53 @@ mod tests {
     use super::UpstreamRequestLogger;
     use super::extract_supported_model_catalog;
     use super::sanitize_chat_request;
+    use super::should_proxy_request_header;
     use crate::models::chat::ChatCompletionRequest;
     use crate::models::chat::ChatMessage;
+    use http::HeaderName;
     use serde_json::Value;
     use std::collections::BTreeMap;
+
+    /// The full RFC 7230 §6.1 hop-by-hop set; must match the canonical list and
+    /// the response-direction parity test in `http.rs`.
+    const HOP_BY_HOP: [&str; 8] = [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+
+    #[test]
+    fn request_direction_strips_full_hop_by_hop_set() {
+        for header in HOP_BY_HOP {
+            let name = HeaderName::from_bytes(header.as_bytes()).unwrap();
+            assert!(
+                !should_proxy_request_header(&name),
+                "request proxy must strip hop-by-hop header {header}",
+            );
+        }
+    }
+
+    #[test]
+    fn request_direction_strips_authorization_host_content_length() {
+        for header in ["authorization", "host", "content-length"] {
+            let name = HeaderName::from_bytes(header.as_bytes()).unwrap();
+            assert!(
+                !should_proxy_request_header(&name),
+                "request proxy must strip {header}",
+            );
+        }
+    }
+
+    #[test]
+    fn request_direction_passes_representative_passthrough_header() {
+        let name = HeaderName::from_static("content-type");
+        assert!(should_proxy_request_header(&name));
+    }
 
     #[test]
     fn endpoint_url_preserves_v1_without_trailing_slash() {
