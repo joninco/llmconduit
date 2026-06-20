@@ -141,9 +141,30 @@ dispatcher, per-session LRU+TTL `ImageCache`, gating. Tests: `tests/gateway.rs` 
 > **Sequencing:** T1 → (T2, T9); T7 → T8; T5 ↔ T6 coordinate; T10, T11 independent. T1 first (it
 > builds the typed resolver T2/T9 consume).
 
+## STATUS (as of commit cba9aff — handover point)
+
+**DONE (Codex-xhigh APPROVED + committed):** T1, T2, T7, T8, T9 (5 of 11).
+**REMAINING (in dependency order):** T6 → T5 (T5 lands in T6's new module); T3; T4; T10; T11.
+  - **T6** (extract SSE guard to `src/sse_guard.rs`, `SseFrameGuard` → `pub(crate)`, move white-box
+    tests in, shrink `tests/port_streaming.rs`): STARTED then REVERTED — the guard-code extraction
+    was mechanical but the test relocation (11 inline guard tests in `upstream.rs::mod tests` at
+    lines ~4122-4381 + 19 white-box fns in `tests/port_streaming.rs`) is the delicate part. WIP was
+    discarded to keep the tree at the clean T8 commit; restart fresh.
+  - **T5** (Bytes-specialize the guard: scan borrowed bytes, retain ≤3-byte carry, no full-chunk
+    copy): do AFTER T6 so it lands in `src/sse_guard.rs`.
+  - **T3** (extract `ToolDeltaGate` from `run_turn`): independent.
+  - **T4** (split `vision.rs` 1,364 lines → `vision/{cache,strip,client}.rs` + `redaction.rs`; move
+    image-agent suite to `tests/image_agent.rs`): pure structural move.
+  - **T10** (AppError failover policy + G1 retry logging): independent.
+  - **T11** (streaming/logging test-quality + catalog-parser dedup, depends on T1): independent.
+**Review log:** `/tmp/thermo-followup-review.md` holds 5 verdicts (T1×2, T2×3, T7×2, T8×1, T9×4).
+**Next session:** start at T6. Per-task loop = implement → fmt/test/clippy → commit → Codex-xhigh
+review → append verdict to `/tmp/thermo-followup-review.md` → update this plan. STOP when all 11
+APPROVED (see `.ralph/GOAL.md`).
+
 ### Task 11.1 — Leaf-side profile resolution (template_family + upstream_chat_kwargs)
 **Priority:** HIGH · **Spec:** `.ralph/specs/T1-leaf-profile-resolution.md` · **Commit:** `cdb293d`
-**Status:** implemented; Codex-xhigh R1 found 4 findings — F1 (HIGH, case-sensitive policy
+**Status:** ✅ Codex-xhigh APPROVED (R2) + live-verified on :5022. implemented; Codex-xhigh R1 found 4 findings — F1 (HIGH, case-sensitive policy
 lookup) + F2 (MEDIUM, max-token alias shadowing) + F4 (LOW, wrapper visibility doc) fixed in a
 follow-up commit; F3 (MEDIUM, single-resolver dedup) split to T2 (see below).
 **Final design:** `template_family` + `upstream_chat_kwargs` profile resolution moved from the
