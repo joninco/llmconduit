@@ -1701,10 +1701,12 @@ impl Gateway {
                 if matches!(tool_call.kind, ToolKind::ImageAnalysis) {
                     continue;
                 }
-                let Some(call_id) = tool_call.internal_call.id.clone() else {
+                // Borrow the id (no clone): the gate takes `&str` and mints the
+                // single owned id it needs for the `Flush` decision.
+                let Some(call_id) = tool_call.internal_call.id.as_deref() else {
                     continue;
                 };
-                let decision = tool_delta_gate.flush_pending_client_tool(&call_id);
+                let decision = tool_delta_gate.flush_pending_client_tool(call_id);
                 self.drive_delta_decision(&response_id, &tx, decision)
                     .await?;
             }
