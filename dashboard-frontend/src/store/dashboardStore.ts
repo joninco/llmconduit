@@ -131,6 +131,23 @@ export interface DashboardState {
     metrics: MetricsResponse | null;
     topology: TopologyResponse | null;
   }) => void;
+  /**
+   * ATOMICALLY install a fresh snapshot AS the live store AND flip to `'live'` (D11 R6) — the
+   * staged-reconnect twin of `restoreLiveBaseline`. When `live()` resumes from a seek that staged a
+   * RECONNECT snapshot, the store still holds the FROZEN cut under `connection==='seeking'`; this
+   * replaces every row/cursor with the snapshot, clears the seek freeze, AND sets `connection='live'`
+   * in ONE `set`, so the socket's subsequent shadow-buffer replay never runs live data into the store
+   * while `connection` is still `'seeking'` (the window D10 must never observe). `applySnapshot`
+   * alone leaves `connection` unchanged (it is also the INITIAL-snapshot path, where the flip to live
+   * is a separate step), so the staged-resume path needs this combined action. Crosses a boundary
+   * (frozen cut → live snapshot store), so the monotonic epoch advances (finding 1).
+   */
+  restoreLiveSnapshot: (snap: {
+    cursors: SeqCursors;
+    flows: FlowSummary[];
+    metrics: MetricsResponse | null;
+    topology: TopologyResponse | null;
+  }) => void;
   upsertFlow: (flow: FlowSummary) => void;
   /** Patch from a `flow_status` WS payload (keyed by `api_call_id`). */
   patchFlowStatus: (p: FlowStatusPayload) => void;
@@ -278,6 +295,36 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
         // A fresh snapshot re-establishes the authoritative LIVE cut — clear any seek freeze.
         seekAtMs: null,
         seekMonitorSeq: null,
+        flows,
+        flowOrder,
+        metrics: snap.metrics,
+        topologyNodes: snap.topology?.nodes ?? [],
+        topologyEdges: snap.topology?.edges ?? [],
+        priceTable: snap.topology?.price_table ?? {},
+      };
+    }),
+
+  restoreLiveSnapshot: (snap) =>
+    set((s) => {
+      const flows = new Map<string, FlowSummary>();
+      const flowOrder: string[] = [];
+      for (const f of snap.flows) {
+        flows.set(f.api_call_id, f);
+        flowOrder.push(f.api_call_id);
+      }
+      return {
+        // Flip to LIVE in the SAME atomic update as installing the snapshot rows/cursors (D11 R6):
+        // the socket replays shadow-buffered frames AFTER this returns, so deferring the flip to a
+        // trailing `setConnection('live')` would expose `connection==='seeking'` with the snapshot's
+        // live rows/cursors/metrics applied — the invariant D10 relies on (never 'seeking' with live
+        // data). The same window `restoreLiveBaseline` closes for the baseline-restore resume path.
+        connection: 'live',
+        // Crosses a boundary (frozen cut → live snapshot store); bump the monotonic epoch (finding 1).
+        connEpoch: s.connEpoch + 1,
+        // The frozen cut is fully gone — clear the seek freeze so elapsed ticks + the monitor unbounds.
+        seekAtMs: null,
+        seekMonitorSeq: null,
+        cursors: snap.cursors,
         flows,
         flowOrder,
         metrics: snap.metrics,

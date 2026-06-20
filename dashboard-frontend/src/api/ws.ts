@@ -323,8 +323,10 @@ export class DashboardSocket {
    * ATOMICALLY with its store restore BEFORE any frame replays (D11 R3 — never replay live data
    * while `connection==='seeking'`):
    *  - a RECONNECT during the seek STAGED a fresh snapshot (finding 6): apply it FIRST — it is the
-   *    authoritative current cut + cursors (and supersedes the now-stale captured baseline). It
-   *    flips to live inside `commitSnapshot`, before draining early frames;
+   *    authoritative current cut + cursors (and supersedes the now-stale captured baseline).
+   *    `commitSnapshot` installs it AND flips to live ATOMICALLY (`restoreLiveSnapshot`, D11 R6),
+   *    before draining early frames — so the staged-resume path never exposes `seeking` with live
+   *    snapshot data, mirroring the baseline-restore path's atomic flip;
    *  - otherwise RESTORE the live baseline captured at `seek()` (the up-to-date pre-seek live state).
    *    `restoreLiveBaseline` flips `connection='live'` in the SAME atomic update as the restore.
    * Then replay buffered live frames in arrival order (dedup still applies) on top of the live store.
@@ -413,9 +415,19 @@ export class DashboardSocket {
     this.commitSnapshot(snap);
   }
 
-  /** Applies a snapshot to the store + cursors and drains any early-arrived frames. */
+  /**
+   * Installs a snapshot AS the live store + cursors and drains any early-arrived frames. The
+   * store install and the flip to `connection='live'` happen in ONE atomic update
+   * (`restoreLiveSnapshot`) — never `applySnapshot` then a separate `setConnection('live')` (D11
+   * R6). That ordering matters on the STAGED-reconnect resume path (`live()`), where the store
+   * still holds the FROZEN cut under `connection==='seeking'`: a non-atomic install would expose
+   * `seeking` WITH the snapshot's live rows/cursors/metrics before the flip — the window D10 must
+   * never observe. The combined action also covers the initial/reconnect-while-live path (already
+   * non-`seeking`), where the atomic flip is simply a strict improvement. The shadow-buffer replay
+   * below therefore always runs on a store that is already `'live'`.
+   */
   private commitSnapshot(snap: SnapshotFrame): void {
-    this.store.getState().applySnapshot({
+    this.store.getState().restoreLiveSnapshot({
       cursors: snap.cursors,
       flows: snap.flows,
       metrics: snap.metrics,
@@ -428,7 +440,6 @@ export class DashboardSocket {
       monitor: snap.cursors.monitor_seq,
     };
     this.snapshotApplied = true;
-    this.store.getState().setConnection('live');
 
     // Drain any pre-snapshot frames that arrived early.
     const early = this.shadowBuffer;

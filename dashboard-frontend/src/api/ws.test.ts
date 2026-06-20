@@ -23,6 +23,17 @@ function snapshot(): SnapshotFrame {
   };
 }
 
+/** A fully-valid MetricsResponse (passes `isMetricsResponse`) for staged-snapshot tests. */
+const METRIC_WINDOW = {
+  reqs_per_sec: 4.2, active_streams: 1, error_pct: 0,
+  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5,
+};
+const METRICS_SNAP = {
+  metrics_seq: 5, reqs_per_sec: 4.2, active_streams: 1, error_pct: 0,
+  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5,
+  windows: { m1: METRIC_WINDOW, m5: METRIC_WINDOW, h1: METRIC_WINDOW },
+};
+
 /** A controllable fake socket so tests can drive open/message/close/error. */
 class FakeSocket implements WsLike {
   onopen: ((ev: unknown) => void) | null = null;
@@ -650,6 +661,80 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     expect(st.flows.has('api_live')).toBe(true);
     expect(st.flows.has('api_buffered')).toBe(true);
     expect(st.flows.has('api_frozen')).toBe(false);
+  });
+
+  it('live() with a STAGED reconnect snapshot flips to live ATOMICALLY with the snapshot install — never `seeking` with the staged live rows/metrics, then buffered frames replay on top (R6)', () => {
+    // A live row + advanced cursor exist before seeking.
+    const liveFlow: DashboardFrame = {
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'flow_status', api_call_id: 'api_live', status: 'open', usage: null, started_ms: 1000 }],
+    };
+    expect(socket.applyFrame(liveFlow)).toBe(true);
+
+    // Drag-start: pause, then land the FROZEN cut ('seeking') via the real Scrubber path.
+    socket.seek();
+    dashboardStore.getState().applySeekCut({
+      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500 }],
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      atMs: 500, monitorSeq: 0, metrics: null, topology: null,
+    });
+    expect(dashboardStore.getState().connection).toBe('seeking');
+
+    // A RECONNECT delivers a fresh snapshot mid-seek: it STAGES (pendingSnapshot), NOT applied over
+    // the frozen cut. It carries the authoritative live rows (`api_snap`) + cursors + metrics.
+    const reconnectSnap: SnapshotFrame = {
+      type: 'snapshot',
+      cursors: { flow_seq: 5, metrics_seq: 5, topology_seq: 5, monitor_seq: 5 },
+      flows: [{ api_call_id: 'api_snap', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 3000 }],
+      metrics: METRICS_SNAP,
+      topology: null,
+    };
+    socket.handleParsed(reconnectSnap);
+    // Staged, not applied: frozen cut intact, still seeking, no snapshot rows/metrics yet.
+    expect(dashboardStore.getState().connection).toBe('seeking');
+    expect(dashboardStore.getState().flows.has('api_snap')).toBe(false);
+    expect(dashboardStore.getState().metrics).toBeNull();
+
+    // A live frame ALSO arrives mid-seek and shadow-buffers (replayed on resume, on top of the
+    // staged snapshot). Its seq must be > the staged snapshot's cursor so it is not deduped.
+    const bufferedFlow: DashboardFrame = {
+      domain: 'flow', seq: 6,
+      batch: [{ type: 'flow_status', api_call_id: 'api_buffered', status: 'open', usage: null, started_ms: 4000 }],
+    };
+    socket.handleParsed(bufferedFlow);
+    expect(socket.shadowBufferLength()).toBe(1);
+
+    // Invariant checker on EVERY store transition for the duration of live(): if `connection` is ever
+    // observed `'seeking'` while the STAGED snapshot's live data (rows OR metrics) is present, the flip
+    // was NOT atomic with the snapshot install — the exact non-atomic window D10 must never see. The
+    // frozen-only cut state ('seeking' with `api_frozen`, no snapshot/buffered data) is legitimate.
+    const violations: string[] = [];
+    const unsub = dashboardStore.subscribe((s) => {
+      if (s.connection === 'seeking') {
+        if (s.flows.has('api_snap')) violations.push('seeking with staged snapshot row (api_snap)');
+        if (s.flows.has('api_buffered')) violations.push('seeking with replayed buffered row (api_buffered)');
+        if (s.metrics !== null) violations.push('seeking with staged snapshot metrics');
+      }
+    });
+
+    // Explicit resume: install the staged snapshot AS the live store (atomic flip to live), THEN
+    // replay the shadow-buffered frame on top.
+    socket.live();
+    unsub();
+
+    // No transition during resume showed staged/replayed live data under `connection==='seeking'`.
+    expect(violations).toEqual([]);
+    // End state: live, snapshot rows/cursors/metrics installed, buffered frame replayed, frozen gone.
+    const st = dashboardStore.getState();
+    expect(st.connection).toBe('live');
+    expect(st.flows.has('api_snap')).toBe(true);    // staged snapshot row
+    expect(st.flows.has('api_buffered')).toBe(true); // replayed buffered frame on top
+    expect(st.flows.has('api_frozen')).toBe(false);  // frozen cut discarded
+    expect(st.metrics?.reqs_per_sec).toBe(4.2);      // staged snapshot metrics installed
+    expect(st.cursors.flow_seq).toBe(6);             // snapshot cursor 5 → replayed frame 6
+    expect(socket.getCursors().flow).toBe(6);
+    expect(st.seekAtMs).toBeNull();
+    expect(socket.shadowBufferLength()).toBe(0);
   });
 
   it('a RECONNECT snapshot arriving during seek does NOT clobber the frozen cut or flip to live (finding 6)', () => {
