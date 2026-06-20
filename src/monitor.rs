@@ -335,7 +335,7 @@ impl MonitorHub {
 }
 
 /// Redact image `data:`/signed URLs from a single outgoing `/debug/ws` message
-/// (round-6 #1), via the shared [`crate::vision::redact_image_uris`] utility, so
+/// (round-6 #1), via the shared [`crate::redaction::redact_image_uris`] utility, so
 /// the whole monitor/debug class is covered at one boundary. Covers every
 /// text-bearing field: segment text, timeline summary/preview, model id, and
 /// error strings. (`DebugEventImage` already carries no raw bytes.)
@@ -347,7 +347,7 @@ impl MonitorHub {
 /// PAYLOAD previews at their source — model output rarely emits raw image URLs.
 fn redact_ws_message_image_uris(message: &mut DebugWsMessage) {
     let redact = |text: &mut String| {
-        let redacted = crate::vision::redact_image_uris(text);
+        let redacted = crate::redaction::redact_image_uris(text);
         if redacted != *text {
             *text = redacted;
         }

@@ -44,6 +44,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// One queued upstream turn: the ordered chunk results a single
@@ -61,6 +62,11 @@ pub struct MockUpstream {
     supported_models: Arc<Mutex<Vec<String>>>,
     supported_model_queries: Arc<Mutex<usize>>,
     context_limits: Arc<Mutex<Vec<(String, i64)>>>,
+    /// When `Some`, the full pre-first-chunk candidate backend model set this
+    /// upstream reports for G4 native-vision gating (round-2 #1) — used to
+    /// simulate a failover chain (primary + fallbacks). `None` falls back to the
+    /// single-candidate `context_limits` plan used by G3 budgeting tests.
+    candidate_models: Arc<std::sync::Mutex<Option<Vec<String>>>>,
     /// Per-model finalization policies (effort/family/kwargs), built from the
     /// test config by the gateway harness so the mock's leaf-mirror applies the
     /// SAME profile kwargs the production leaf would (T1). Empty by default.
@@ -106,6 +112,19 @@ impl MockUpstream {
     {
         *self.context_limits.lock().await =
             limits.into_iter().map(|(id, n)| (id.into(), n)).collect();
+    }
+
+    /// Set the candidate backend model set reported to G4 native-vision gating
+    /// (round-2 #1), simulating a failover chain's primary + fallback models.
+    /// When set, this drives `backend_candidate_plan` instead of the
+    /// single-candidate `context_limits` projection.
+    pub fn set_candidate_models<I, S>(&self, models: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        *self.candidate_models.lock().expect("candidate models lock") =
+            Some(models.into_iter().map(Into::into).collect());
     }
 }
 
@@ -163,14 +182,32 @@ impl UpstreamClient for MockUpstream {
             .collect())
     }
 
-    // T9: override `backend_candidate_plan` so the candidate carries the
-    // context limit from `set_context_limits` (the default trait impl returns
-    // `None`, which would make G3 budgeting no-op). Single-provider mock: the
-    // one candidate is `requested_model` with its configured limit (if any).
+    // `backend_candidate_plan` is the single source of truth the engine projects
+    // `candidate_backend_models` from. Two modes:
+    // - G4 native-vision gating (`set_candidate_models`): the explicit failover
+    //   chain (primary + fallbacks), each with no context limit.
+    // - G3 budgeting (`set_context_limits`): a single `requested_model` candidate
+    //   carrying its configured context limit (the trait default returns `None`,
+    //   which would make budgeting a no-op).
     async fn backend_candidate_plan(
         &self,
         requested_model: &str,
     ) -> llmconduit::upstream::BackendCandidatePlan {
+        if let Some(models) = self
+            .candidate_models
+            .lock()
+            .expect("candidate models lock")
+            .clone()
+        {
+            let candidates = models
+                .into_iter()
+                .map(|model| llmconduit::upstream::BackendCandidate {
+                    model,
+                    context_limit: None,
+                })
+                .collect();
+            return llmconduit::upstream::BackendCandidatePlan { candidates };
+        }
         let limits = self.context_limits.lock().await.clone();
         let context_limit = limits
             .iter()
@@ -250,6 +287,128 @@ pub fn test_gateway_with_config(
         None,
     ))
 }
+
+// ---------------------------------------------------------------------------
+// G4 image-agent fixtures: a recording mock vision backend plus the gateway /
+// config / request builders the `tests/image_agent.rs` suite shares.
+// ---------------------------------------------------------------------------
+
+/// G4 mock vision backend. Records each `VisionRequest` it receives and replays
+/// queued outcomes (or a default description), so image-agent tests can assert
+/// what reached the vision model (image ids/urls/task) without a real backend.
+#[derive(Clone, Default)]
+pub struct MockVisionClient {
+    requests: Arc<Mutex<Vec<llmconduit::vision::VisionRequest>>>,
+    outcomes: Arc<
+        Mutex<VecDeque<Result<llmconduit::vision::VisionOutcome, llmconduit::error::AppError>>>,
+    >,
+    /// When set, `analyze` waits on this notify before returning, so a test can
+    /// drive cancellation/timeout deterministically.
+    block_until: Arc<Mutex<Option<Arc<Notify>>>>,
+}
+
+impl MockVisionClient {
+    pub async fn push_outcome(
+        &self,
+        outcome: Result<llmconduit::vision::VisionOutcome, llmconduit::error::AppError>,
+    ) {
+        self.outcomes.lock().await.push_back(outcome);
+    }
+
+    pub async fn requests(&self) -> Vec<llmconduit::vision::VisionRequest> {
+        self.requests.lock().await.clone()
+    }
+
+    pub async fn block_on(&self, notify: Arc<Notify>) {
+        *self.block_until.lock().await = Some(notify);
+    }
+}
+
+#[async_trait]
+impl llmconduit::vision::VisionClient for MockVisionClient {
+    async fn analyze(
+        &self,
+        request: &llmconduit::vision::VisionRequest,
+    ) -> Result<llmconduit::vision::VisionOutcome, llmconduit::error::AppError> {
+        self.requests.lock().await.push(request.clone());
+        let blocker = self.block_until.lock().await.clone();
+        if let Some(notify) = blocker {
+            notify.notified().await;
+        }
+        match self.outcomes.lock().await.pop_front() {
+            Some(outcome) => outcome,
+            None => Ok(llmconduit::vision::VisionOutcome {
+                text: format!("Vision description for {:?}", request.image_ids),
+            }),
+        }
+    }
+}
+
+/// Build a gateway with an explicit `MockVisionClient` and config for G4
+/// image-agent tests. The shared `ImageCache` is derived from the config so
+/// cache sizing/TTL match production wiring.
+pub fn test_gateway_with_vision(
+    upstream: MockUpstream,
+    vision: MockVisionClient,
+    config: Config,
+) -> Arc<Gateway> {
+    // Build the leaf finalization policies from the test config so the mock's
+    // leaf-mirror applies the same profile/family/effort kwargs the production
+    // leaf would (T1 moved profile resolution from the engine to the leaf).
+    upstream.set_finalization_policies(
+        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
+    );
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(vision);
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    Arc::new(Gateway::new(
+        config,
+        ReplayStore::new(1000),
+        Arc::new(upstream),
+        Arc::new(MockSearch::default()),
+        vision,
+        image_cache,
+        MonitorHub::new(128),
+        None,
+    ))
+}
+
+/// Config with the image agent enabled and a (mock-backed) vision endpoint, so
+/// gating activates for a text backend with images in the latest user turn.
+pub fn image_agent_config() -> Config {
+    let mut config = test_config();
+    config.brave_api_key = None; // isolate the image agent from web_search gating
+    config.image_agent_enabled = true;
+    config.vision_url = Some(
+        "http://127.0.0.1:9000/v1/chat/completions"
+            .parse()
+            .expect("url"),
+    );
+    config.vision_model = Some("vision-model".to_string());
+    config
+}
+
+/// A user message carrying a single `input_image` (a data URL), the shape the
+/// canonical pipeline produces for an uploaded image.
+pub fn user_message_with_image(text: &str, data_url: &str) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: text.to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: Some(data_url.to_string()),
+                file_id: None,
+                detail: None,
+            },
+        ],
+        phase: None,
+    }
+}
+
+pub const TEST_IMAGE_DATA_URL: &str =
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA=";
 
 pub fn test_config() -> Config {
     Config {
@@ -523,4 +682,18 @@ pub fn parse_chat_sse_events(body: &str) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// Serialize raw chunk JSON values into an OpenAI chat-completions SSE body
+/// (`data: {...}` frames terminated by `data: [DONE]`), the wire shape a wiremock
+/// upstream returns. Inverse of [`parse_chat_sse_events`].
+pub fn chat_completion_sse_body(chunks: &[Value]) -> String {
+    let mut body = String::new();
+    for chunk in chunks {
+        body.push_str("data: ");
+        body.push_str(&serde_json::to_string(chunk).expect("serialize chat chunk"));
+        body.push_str("\n\n");
+    }
+    body.push_str("data: [DONE]\n\n");
+    body
 }

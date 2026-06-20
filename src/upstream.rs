@@ -466,7 +466,7 @@ impl UpstreamRequestLogger {
         let mut payload = serde_json::to_vec(request).map_err(std::io::Error::other)?;
         if bytes_contain_image_uri(&payload) {
             let mut value = serde_json::to_value(request).map_err(std::io::Error::other)?;
-            crate::vision::redact_image_uris_in_value(&mut value);
+            crate::redaction::redact_image_uris_in_value(&mut value);
             payload = serde_json::to_vec(&value).map_err(std::io::Error::other)?;
         }
         payload.push(b'\n');
@@ -2941,7 +2941,7 @@ fn truncate_for_error(s: &str, max: usize) -> String {
 /// (AGENTS.md redact rule). Redaction runs BEFORE truncation so a split image
 /// URI cannot survive at the truncation boundary.
 fn redact_and_truncate_error_body(body: &str, max: usize) -> String {
-    truncate_for_error(&crate::vision::redact_image_uris(body), max)
+    truncate_for_error(&crate::redaction::redact_image_uris(body), max)
 }
 
 fn stringify_json_value(value: Value) -> Value {

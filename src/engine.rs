@@ -2522,7 +2522,7 @@ impl Gateway {
                     // though `ReqwestVisionClient` already redacts at the source,
                     // so any `VisionClient` impl is covered. The error message is
                     // already redacted inside the client.
-                    Ok(Ok(outcome)) => crate::vision::redact_vision_text(&outcome.text),
+                    Ok(Ok(outcome)) => crate::redaction::redact_vision_text(&outcome.text),
                     Ok(Err(err)) => format!("[Vision analysis failed: {err}]"),
                     Err(_) => "[Vision analysis timed out before returning a result.]".to_string(),
                 },
@@ -2610,7 +2610,7 @@ where
             // content (G4 round-4 #4 — the weaker bespoke redactor missed
             // remote/signed URLs and uppercase DATA:).
             collect_data_image_cards(&value, "$", &mut images);
-            crate::vision::redact_image_uris_in_value(&mut value);
+            crate::redaction::redact_image_uris_in_value(&mut value);
             serde_json::to_string_pretty(&value)
         }
         Err(err) => Err(err),
