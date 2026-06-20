@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act, cleanup, render } from '@testing-library/react';
 import { useMetricStream } from './useMetricStream';
-import { dashboardStore } from './dashboardStore';
+import { dashboardStore, type LiveBaseline } from './dashboardStore';
 import type { MetricsResponse } from '../api/types';
 
 function metrics(seq: number, reqs: number): MetricsResponse {
@@ -57,5 +57,50 @@ describe('useMetricStream', () => {
     // A LATER stale seed (seq 1 again, different value) must NOT re-fold out of order.
     rerender(<Probe folded={folded} seed={metrics(1, 999)} />);
     expect(folded).toEqual([11, 22]);
+  });
+
+  it('does NOT fold the FROZEN seek cut, and resume continues cleanly from live ticks (D11 R5)', () => {
+    const folded: number[] = [];
+    render(<Probe folded={folded} />);
+
+    // Two LIVE ticks fold normally.
+    act(() => {
+      dashboardStore.getState().setMetrics(metrics(1, 10));
+      dashboardStore.getState().setMetrics(metrics(2, 20));
+    });
+    expect(folded).toEqual([10, 20]);
+
+    // SEEK: capture the live baseline, then atomically install the frozen historical cut (its own
+    // metrics_seq + reqs/s) AND flip connection='seeking'. The frozen sample (99) must be SKIPPED —
+    // it is historical, not a live tick, so it must not enter the live history/hill ring.
+    let baseline!: LiveBaseline;
+    act(() => {
+      baseline = dashboardStore.getState().captureLiveBaseline();
+      dashboardStore.getState().applySeekCut({
+        rows: [],
+        cursors: { flow_seq: 0, metrics_seq: 77, topology_seq: 0, monitor_seq: 5 },
+        atMs: Date.now(),
+        monitorSeq: 5,
+        metrics: metrics(77, 99), // FROZEN historical metrics (distinct seq + value)
+        topology: null,
+      });
+    });
+    expect(dashboardStore.getState().connection).toBe('seeking');
+    expect(folded).toEqual([10, 20]); // frozen cut NOT folded
+
+    // Even a second frozen metrics mutation while seeking (e.g. another snapshot) is skipped.
+    act(() => dashboardStore.getState().setMetrics(metrics(88, 999)));
+    expect(folded).toEqual([10, 20]);
+
+    // RESUME: restore the captured live baseline (metrics_seq 2) atomically with connection='live'.
+    // The seq dedup drops it (already folded — we never advanced past it while skipping the cut), so
+    // NO duplicate baseline point lands in the live ring.
+    act(() => dashboardStore.getState().restoreLiveBaseline(baseline));
+    expect(dashboardStore.getState().connection).toBe('live');
+    expect(folded).toEqual([10, 20]);
+
+    // The next LIVE tick continues the history cleanly (no seek pollution, no gap).
+    act(() => dashboardStore.getState().setMetrics(metrics(3, 30)));
+    expect(folded).toEqual([10, 20, 30]);
   });
 });

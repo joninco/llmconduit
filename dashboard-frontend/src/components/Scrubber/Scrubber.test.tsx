@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { Scrubber } from './Scrubber';
-import { dashboardStore } from '../../store/dashboardStore';
+import { dashboardStore, type LiveBaseline } from '../../store/dashboardStore';
 import { getConnection } from '../../api/connection';
 import type { MetricsResponse, MetricWindow } from '../../api/types';
 import { renderWithQuery, resetWorld } from '../testHarness';
@@ -180,6 +180,41 @@ describe('Scrubber — seek + LIVE', () => {
     });
     // 40 moves + the down → ONE coalesced fetch this frame (NOT ~41).
     expect(snapSpy.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+
+  it('a seek does NOT add a point to the live hill, and live resume continues from live ticks (D11 R5)', () => {
+    const { socket } = getConnection();
+    const { getByTestId } = renderWithQuery(<Scrubber socket={socket} />);
+    seedHill([1, 4, 2, 6, 3]); // 5 live ticks (seq 1..5)
+    const hill = () => getByTestId('scrubber-hill').querySelector('path')!.getAttribute('d')!;
+    const beforeSeek = hill();
+
+    // SEEK: capture baseline, then atomically install the FROZEN historical cut + connection=seeking.
+    // The frozen metrics (a distinct seq + reqs/s) must NOT fold into the live hill ring.
+    let baseline!: LiveBaseline;
+    act(() => {
+      baseline = dashboardStore.getState().captureLiveBaseline();
+      dashboardStore.getState().applySeekCut({
+        rows: [],
+        cursors: { flow_seq: 0, metrics_seq: 99, topology_seq: 0, monitor_seq: 7 },
+        atMs: Date.now(),
+        monitorSeq: 7,
+        metrics: metrics(99, 50), // frozen reqs/s = 50 (would spike the hill if folded)
+        topology: null,
+      });
+    });
+    expect(dashboardStore.getState().connection).toBe('seeking');
+    // The hill path is UNCHANGED — the frozen seek cut added no point to the live ring.
+    expect(hill()).toBe(beforeSeek);
+
+    // RESUME: restore the live baseline (seq 5) atomically with connection=live → deduped, no point.
+    act(() => dashboardStore.getState().restoreLiveBaseline(baseline));
+    expect(dashboardStore.getState().connection).toBe('live');
+    expect(hill()).toBe(beforeSeek);
+
+    // A NEW live tick (seq 6) continues the hill cleanly — now the path grows.
+    act(() => dashboardStore.getState().setMetrics(metrics(6, 9)));
+    expect(hill()).not.toBe(beforeSeek);
   });
 
   it('the LIVE toggle resumes the socket (replays buffered frames)', () => {

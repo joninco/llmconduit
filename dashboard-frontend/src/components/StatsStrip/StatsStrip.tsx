@@ -7,12 +7,17 @@
  * Data flow:
  *  - The live store `metrics` (a `MetricsResponse`) is the authoritative latest sample — the
  *    socket writes it from `metric_tick` frames (and the initial snapshot). We fold EVERY distinct
- *    sample (deduped by `metrics_seq`) into a per-window ring via `useMetricStream`, which
+ *    LIVE sample (deduped by `metrics_seq`) into a per-window ring via `useMetricStream`, which
  *    subscribes to the store directly so no sample is lost to React's render batching.
  *  - The `/metrics` TanStack query seeds the strip before the first WS tick AND is the production
  *    REST source; `metric` frames invalidate `queryKeys.metrics` (connection.ts) so it refetches.
  *    It primes the same ring (deduped by `metrics_seq`), so seed + live share one history.
  *  - Sparklines are uPlot via `Sparkline` (StrictMode-safe dispose; reduced-motion static).
+ *  - Seek (D11 R5): the sparkline/delta history is LIVE-only (`useMetricStream` skips the frozen
+ *    seek cut), so the trends never absorb historical data. The chip CURRENT VALUE, however, must
+ *    reflect the seeked moment like the rest of the dashboard — so while `seeking` we read the
+ *    chips' `cur` from the FROZEN store `metrics` (the snapshot cut `applySeekCut` installed) for
+ *    the selected window, leaving the sparkline + delta on the (unpolluted) live history ring.
  *
  * Always rendered at the top of `App.tsx` (above the Scrubber).
  */
@@ -41,6 +46,11 @@ import { deriveChips, deltaGlyph, type ChipDescriptor } from './chips';
 export function StatsStrip() {
   const [window, setWindow] = useState<WindowKey>('m1');
   const connection = useDashboard((s) => s.connection);
+  const seeking = connection === 'seeking';
+  // The FROZEN store metrics while seeking — the snapshot cut `applySeekCut` installed. Read as the
+  // chip CURRENT VALUE (per window) so the strip reads as-of the seeked moment, while the sparkline
+  // history stays the LIVE ring (the seek cut is never folded into it — D11 R5).
+  const seekMetrics = useDashboard((s) => (s.connection === 'seeking' ? s.metrics : null));
   const { client } = getConnection();
 
   // The `/metrics` REST read: seeds the strip pre-WS and is the production data source. `metric`
@@ -63,8 +73,13 @@ export function StatsStrip() {
   // invisible to React); `window` switches the source window — so the memo below recomputes.
   void version;
   const history = historyRef.current;
-  const cur = latest(history, window);
-  const prev = previous(history, window);
+  // While seeking, the chip CURRENT value is the FROZEN snapshot window (as-of the seeked moment),
+  // NOT the live ring's latest — but the sparkline (`seriesFor` below) stays the live history. The
+  // delta is FLAT while seeking (`prev = null`): a point-in-time snapshot is not a live trend, so a
+  // direction arrow would be misleading. Live → the ring's latest/previous drive value + delta.
+  const liveCur = latest(history, window);
+  const cur = seeking ? (seekMetrics?.windows[window] ?? liveCur) : liveCur;
+  const prev = seeking ? null : previous(history, window);
   const chips = useMemo(() => deriveChips(cur, prev), [cur, prev]);
 
   return (

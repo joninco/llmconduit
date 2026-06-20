@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act, cleanup, fireEvent, within } from '@testing-library/react';
 import { StatsStrip } from './StatsStrip';
-import { dashboardStore } from '../../store/dashboardStore';
+import { dashboardStore, type LiveBaseline } from '../../store/dashboardStore';
 import type { MetricsResponse, MetricWindow } from '../../api/types';
 import { renderWithQuery, resetWorld } from '../testHarness';
 import { CHIP_METRICS } from './chips';
@@ -77,6 +77,46 @@ describe('StatsStrip — chips', () => {
     pushMetrics(metrics(1, {}, { m1: { reqs_per_sec: 4 } }));
     pushMetrics(metrics(2, {}, { m1: { reqs_per_sec: 6 } }));
     expect(within(getByTestId('chip-reqs_per_sec')).getByTestId('chip-delta').textContent).toBe('▲');
+  });
+});
+
+describe('StatsStrip — seek isolation (D11 R5)', () => {
+  it('reads the FROZEN snapshot value while seeking, flat delta, then returns to live on resume', () => {
+    const { getByTestId } = renderWithQuery(<StatsStrip />);
+    const value = () => within(getByTestId('chip-reqs_per_sec')).getByTestId('chip-value').textContent;
+    const delta = () => within(getByTestId('chip-reqs_per_sec')).getByTestId('chip-delta').textContent;
+    // Two LIVE ticks build the live history; chip reads the latest live (2) with an UP delta.
+    pushMetrics(metrics(1, {}, { m1: { reqs_per_sec: 1 } }));
+    pushMetrics(metrics(2, {}, { m1: { reqs_per_sec: 2 } }));
+    expect(value()).toBe('2.0');
+    expect(delta()).toBe('▲');
+
+    // SEEK: install a FROZEN cut (reqs/s = 42) atomically with connection='seeking'.
+    let baseline!: LiveBaseline;
+    act(() => {
+      baseline = dashboardStore.getState().captureLiveBaseline();
+      dashboardStore.getState().applySeekCut({
+        rows: [],
+        cursors: { flow_seq: 0, metrics_seq: 50, topology_seq: 0, monitor_seq: 3 },
+        atMs: Date.now(),
+        monitorSeq: 3,
+        metrics: metrics(50, {}, { m1: { reqs_per_sec: 42 } }),
+        topology: null,
+      });
+    });
+    // Chip CURRENT value now reads the FROZEN snapshot (42) — as-of the seeked moment — with a FLAT
+    // delta (a point-in-time snapshot is not a live trend; the frozen cut never folded into history).
+    expect(value()).toBe('42.0');
+    expect(delta()).toBe('·');
+
+    // RESUME: restore baseline (live seq 2) atomically with connection='live' → chip back on live.
+    act(() => dashboardStore.getState().restoreLiveBaseline(baseline));
+    expect(value()).toBe('2.0');
+
+    // A NEW live tick continues the live history cleanly — the frozen 42 left no trace.
+    pushMetrics(metrics(3, {}, { m1: { reqs_per_sec: 3 } }));
+    expect(value()).toBe('3.0');
+    expect(delta()).toBe('▲'); // 3 > 2 (the prior LIVE sample, not the frozen 42)
   });
 });
 
