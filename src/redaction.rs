@@ -189,6 +189,99 @@ pub(crate) fn capture_capped_redacted(raw: &[u8], body_cap: usize, scalar_cap: u
     format!("[redacted: unparseable body {} bytes]", raw.len()).into_bytes()
 }
 
+/// Capped + redacting capture of a `Serialize` value WITHOUT a full O(body)
+/// intermediate `Vec` (D2 R1 #1). The previous leaf path did `serde_json::to_vec`
+/// (up to a 256 MiB allocation for a huge prompt) and only THEN capped — defeating
+/// the O(CAP) guarantee. Here the value is serialized via `serde_json::to_writer`
+/// into a [`BoundedSerializeWriter`] hard-bounded at `2 × body_cap`: serialization
+/// STOPS (errors) the instant it would exceed the bound, so peak heap stays
+/// O(`body_cap`), never O(body). The bounded raw bytes are then run through the
+/// EXISTING capped + redacting JSON pass ([`capture_capped_redacted`]):
+/// - WITHIN the bound: a normal redacted, capped preview (secrets stripped). The
+///   `2×` headroom means a body whose serialized form is up to `2 × body_cap` still
+///   yields a full `body_cap` redacted preview even though redaction can EXPAND a
+///   string (`data:` runs → `<redacted uri>`).
+/// - OVER the bound: the writer truncates the bytes mid-JSON, so the strict
+///   streaming parser bails and the body routes to the fixed
+///   `[redacted: unparseable body …]` marker — NO raw/secret bytes survive, exactly
+///   like the non-UTF8/malformed fallback. (A multi-MiB body is observability-only;
+///   recording a bounded marker instead of its preview is the safe, O(CAP) choice.)
+///
+/// All secret-redaction guarantees of [`capture_capped_redacted`] hold unchanged
+/// (sensitive keys → `[redacted]`, image/data URIs stripped incl. `\uXXXX` forms).
+pub(crate) fn capture_capped_redacted_value<T: serde::Serialize>(
+    value: &T,
+    body_cap: usize,
+    scalar_cap: usize,
+) -> Vec<u8> {
+    // Serialize directly into a writer bounded at 2×body_cap (never a full Vec). The
+    // `2×` headroom lets a within-bound body survive redaction's possible expansion
+    // and still produce a full body_cap preview; past the bound the writer truncates.
+    let serialize_bound = body_cap.saturating_mul(2);
+    let mut writer = BoundedSerializeWriter::new(serialize_bound);
+    // `to_writer` returns Err the moment the writer reports it is full; in BOTH the
+    // Ok and the bounded-overflow case the (≤ 2×body_cap) accumulated bytes are run
+    // through the strict capped+redacting pass below. On overflow the bytes are a
+    // mid-JSON truncation → the strict parser bails → fixed marker (no secret leak).
+    let _ = serde_json::to_writer(&mut writer, value);
+    capture_capped_redacted(writer.as_bytes(), body_cap, scalar_cap)
+}
+
+/// A `std::io::Write` sink that accumulates serialized bytes only until it reaches
+/// `bound`; once full it returns a write error so `serde_json::to_writer` STOPS
+/// (D2 R1 #1) — no full O(body) buffer is ever built. Pre-reserves only
+/// `min(bound, 64 KiB)` so a tiny body does not eagerly allocate the whole bound.
+struct BoundedSerializeWriter {
+    buf: Vec<u8>,
+    bound: usize,
+    full: bool,
+}
+
+impl BoundedSerializeWriter {
+    fn new(bound: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(bound.min(64 * 1024)),
+            bound,
+            full: false,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl std::io::Write for BoundedSerializeWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.full {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "capture serialize bound exceeded",
+            ));
+        }
+        let remaining = self.bound - self.buf.len();
+        if bytes.len() <= remaining {
+            self.buf.extend_from_slice(bytes);
+            if self.buf.len() == self.bound {
+                self.full = true;
+            }
+            Ok(bytes.len())
+        } else {
+            // Keep the bounded prefix (a mid-JSON truncation) and stop serialization.
+            self.buf.extend_from_slice(&bytes[..remaining]);
+            self.full = true;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "capture serialize bound exceeded",
+            ))
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Redact captured headers. The NAME is capped to `scalar_cap` (D1 R2 #4 — a
 /// pathologically long header name must not be retained unbounded). For a sensitive
 /// name the VALUE becomes `"[redacted]"`. For every other header the value is run

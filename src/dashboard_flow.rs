@@ -682,6 +682,17 @@ pub fn capture_body(raw: &[u8]) -> CapturedBody {
     CapturedBody(Arc::from(bytes.into_boxed_slice()))
 }
 
+/// Capture a `Serialize` value (the typed on-wire request) into a [`CapturedBody`]
+/// WITHOUT a full O(body) `serde_json::to_vec` (D2 R1 #1). Serializes directly into
+/// a writer bounded at `2 × BODY_CAP` and redacts the bounded bytes via the shared
+/// O(CAP) primitive — peak heap is O(`BODY_CAP`), never O(body). Same `CapturedBody`
+/// guarantees as [`capture_body`] (provably redacted + capped); the leaf uses THIS
+/// so a 256 MiB request body is never serialized in full just to be capped.
+pub fn capture_body_from_value<T: serde::Serialize>(value: &T) -> CapturedBody {
+    let bytes = crate::redaction::capture_capped_redacted_value(value, BODY_CAP, SCALAR_CAP);
+    CapturedBody(Arc::from(bytes.into_boxed_slice()))
+}
+
 /// Redact + cap request headers → a [`CapturedHeaders`] (sensitive names →
 /// `"[redacted]"`; every other value image-URI-stripped then capped to
 /// [`SCALAR_CAP]`; names capped too). The ONLY constructor of `CapturedHeaders`, so
@@ -1216,6 +1227,86 @@ mod tests {
             peak_live <= ceiling,
             "malformed-body fallback held peak-live {peak_live} bytes (> {ceiling}); must be O(CAP)"
         );
+    }
+
+    #[test]
+    fn capture_body_from_value_peak_allocation_is_bounded_for_10mib_prompt() {
+        // D2 R1 #1 — THE crux: serializing a typed request whose prompt is 10 MiB
+        // must keep PEAK LIVE heap O(CAP), NOT O(body). The old leaf did
+        // `serde_json::to_vec` (a full ~10 MiB+ allocation, up to 256 MiB for a max
+        // body) THEN capped — defeating the guarantee. The Serialize-direct writer is
+        // bounded at 2×BODY_CAP, so peak stays well under O(body). Build the input
+        // OUTSIDE the armed region so only the capture's own allocations count.
+        use serde::Serialize;
+        #[derive(Serialize)]
+        struct Req {
+            model: String,
+            prompt: String,
+        }
+        const TEN_MIB: usize = 10 * 1024 * 1024;
+        let req = Req {
+            model: "served-model".to_string(),
+            prompt: "x".repeat(TEN_MIB),
+        };
+        // Headroom: the bounded serialize writer holds ≤ 2×BODY_CAP, plus the capped
+        // redacting pass's own ≤ BODY_CAP + SCALAR_CAP, plus slack. Crucially this is
+        // a CONSTANT independent of the 10 MiB body, proving O(CAP) not O(body).
+        let ceiling = 2 * BODY_CAP + BODY_CAP + SCALAR_CAP + 64 * 1024;
+        let (captured, peak_live) =
+            crate::test_alloc_probe::peak_live_alloc_during(|| capture_body_from_value(&req));
+        assert!(captured.as_bytes().len() <= BODY_CAP);
+        assert!(
+            peak_live <= ceiling,
+            "capture_body_from_value held peak-live {peak_live} bytes (> {ceiling}) for a \
+             {TEN_MIB}-byte prompt — it must serialize into the bounded writer, NOT to_vec the \
+             whole body"
+        );
+    }
+
+    #[test]
+    fn capture_body_from_value_redacts_secrets_and_round_trips_small_request() {
+        // A within-bound typed request: secrets redacted, image URIs stripped, and
+        // the on-wire field names preserved (valid JSON out). Serialize-direct path
+        // must keep every redaction guarantee of the bytes path.
+        let value = serde_json::json!({
+            "model": "m",
+            "api_key": "sk-VALUELEAK",
+            "messages": [
+                { "role": "user", "content": "see data:image/png;base64,IMGLEAK ok" }
+            ]
+        });
+        let captured = capture_body_from_value(&value);
+        let text = String::from_utf8_lossy(captured.as_bytes());
+        assert!(!text.contains("VALUELEAK"), "api_key value redacted");
+        assert!(!text.contains("IMGLEAK"), "data: payload redacted");
+        assert!(text.contains("[redacted]"));
+        assert!(text.contains("<redacted uri>"));
+        let parsed: serde_json::Value =
+            serde_json::from_slice(captured.as_bytes()).expect("captured value body is valid JSON");
+        assert_eq!(parsed["model"], serde_json::json!("m"));
+    }
+
+    #[test]
+    fn capture_body_from_value_overflow_routes_to_fixed_marker_no_leak() {
+        // A request whose serialized form exceeds 2×BODY_CAP truncates mid-JSON in the
+        // bounded writer → the strict parser bails → fixed marker. No raw/secret bytes
+        // survive. Embed a secret PAST the 2×BODY_CAP bound to prove nothing leaks.
+        let pad = "p".repeat(2 * BODY_CAP + 4096);
+        let value = serde_json::json!({
+            "filler": pad,
+            "api_key": "sk-TAILLEAK",
+        });
+        let captured = capture_body_from_value(&value);
+        let text = String::from_utf8_lossy(captured.as_bytes());
+        assert!(
+            text.starts_with("[redacted: unparseable body"),
+            "overflowing body → fixed marker: {text}"
+        );
+        assert!(
+            !text.contains("TAILLEAK"),
+            "no secret survives the overflow path"
+        );
+        assert!(captured.as_bytes().len() <= BODY_CAP);
     }
 
     #[test]

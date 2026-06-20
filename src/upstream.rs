@@ -661,9 +661,12 @@ impl ReqwestUpstreamClient {
 
     /// D2 capture: store the on-wire upstream body for `response_id` through the
     /// capped, redacting serializer. No-op when the store is `disabled()` or no
-    /// `response_id` is threaded (tests / non-engine paths). The transient
-    /// `serde_json::to_vec` materializes the same bytes reqwest's `.json(request)`
-    /// would; only the capped `Arc<[u8]>` (at most `BODY_CAP`) is retained.
+    /// `response_id` is threaded (tests / non-engine paths). Serializes the typed
+    /// request DIRECTLY into a writer bounded at `2 × BODY_CAP` (D2 R1 #1 — never a
+    /// full `serde_json::to_vec`, which for a multi-MiB prompt would allocate up to
+    /// 256 MiB before capping); only the capped `Arc<[u8]>` (≤ `BODY_CAP`) is
+    /// retained. A request whose serialized form overflows the bound is recorded as
+    /// the fixed `[redacted: unparseable body]` marker (observability-only).
     fn capture_upstream_body(&self, response_id: Option<&str>, request: &ChatCompletionRequest) {
         if !self.flow_store.is_enabled() {
             return;
@@ -671,10 +674,7 @@ impl ReqwestUpstreamClient {
         let Some(response_id) = response_id else {
             return;
         };
-        let Ok(on_wire) = serde_json::to_vec(request) else {
-            return;
-        };
-        let captured = crate::dashboard_flow::capture_body(&on_wire);
+        let captured = crate::dashboard_flow::capture_body_from_value(request);
         self.flow_store
             .set_upstream(response_id, None, None, Some(captured));
     }
@@ -4745,6 +4745,22 @@ mod tests {
             value.get("tool_choice").is_none(),
             "auto tool_choice with no tools was sanitized away → capture is POST-sanitize, not pre-leaf: {value}"
         );
+        // FULL equality (R1 #3): the captured body must equal wiremock's COMPLETE
+        // received body — not just the spot-checked fields. This body carries no
+        // secrets/URIs, so the capped+redacting serializer is a structural identity;
+        // any divergence (a dropped/added/reordered field, a redaction that fired on
+        // benign content) fails here.
+        let received = server
+            .received_requests()
+            .await
+            .expect("wiremock recorded requests");
+        assert_eq!(received.len(), 1, "exactly one upstream POST");
+        let on_wire: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("received body is JSON");
+        assert_eq!(
+            value, on_wire,
+            "captured upstream_body must equal the FULL on-wire body byte-for-byte (structural)"
+        );
         // The same record joins by response_id too.
         assert!(store.detail(&response_id).is_some());
     }
@@ -4808,6 +4824,32 @@ mod tests {
             value["max_tokens"],
             json!(63652),
             "captured body is the SHRUNK retry body (202752-100-139000), not the 64000 first attempt: {value}"
+        );
+        // FULL equality on the shrink-retry path (R1 #3): wiremock saw TWO POSTs —
+        // the oversized first attempt and the shrunk retry. The captured body must
+        // equal the SECOND (retry) body byte-for-byte AND differ from the first,
+        // proving capture follows the bytes that ACTUALLY went on the wire.
+        let received = server
+            .received_requests()
+            .await
+            .expect("wiremock recorded requests");
+        assert_eq!(received.len(), 2, "first attempt + one shrink retry");
+        let first: serde_json::Value =
+            serde_json::from_slice(&received[0].body).expect("first body is JSON");
+        let retry: serde_json::Value =
+            serde_json::from_slice(&received[1].body).expect("retry body is JSON");
+        assert_eq!(
+            value, retry,
+            "captured body must equal the FULL retry (second) on-wire body (structural)"
+        );
+        assert_ne!(
+            value, first,
+            "captured body must DIFFER from the first oversized attempt (it is the retry, not attempt 1)"
+        );
+        assert_eq!(
+            first["max_tokens"],
+            json!(64000),
+            "first attempt carried the oversized budget"
         );
     }
 
