@@ -167,9 +167,11 @@ pub(crate) fn is_sensitive_payload_key(key: &str) -> bool {
 /// copied in full. Never retains a slice of `raw`. Callers wrap the result in an
 /// `Arc<[u8]>` as needed (the dashboard FlowStore does).
 pub(crate) fn capture_capped_redacted(raw: &[u8], body_cap: usize, scalar_cap: usize) -> Vec<u8> {
-    // Common path: a single streaming pass over the bytes into a hard-capped
-    // writer that pre-reserves only `min(raw.len(), body_cap)` and stops at the
-    // cap. No `serde_json::Value` is ever built.
+    // Common path: a single streaming pass over the bytes into a hard-capped writer
+    // that pre-reserves only `min(raw.len(), body_cap)` and stops at the cap. No
+    // `serde_json::Value` is ever built. A too-deep SUBTREE is replaced inline with
+    // a placeholder and skipped (the parser still succeeds), so shallow `api_key`s
+    // are redacted and the shallow preview survives WITHOUT reaching the fallback.
     let mut writer = CappedWriter::new(raw.len(), body_cap);
     if let Ok(text) = std::str::from_utf8(raw) {
         let mut parser = JsonRedactor::new(text, scalar_cap);
@@ -178,24 +180,21 @@ pub(crate) fn capture_capped_redacted(raw: &[u8], body_cap: usize, scalar_cap: u
             return writer.into_vec();
         }
     }
-    // Fallback (RARE — malformed / non-JSON / non-UTF8 / too-deep): redact image
-    // URIs over a `body_cap`-bounded lossy prefix ONLY. This is still O(CAP) — it
-    // never parses a `serde_json::Value` (which would be O(body)). The lossy
-    // conversion already yields valid UTF-8, so the post-redaction truncate handles
-    // the char boundary; bound the slice taken from `raw` first to stay O(CAP).
-    let prefix = &raw[..raw.len().min(body_cap)];
-    let lossy = String::from_utf8_lossy(prefix);
-    let redacted = redact_image_uris(&lossy);
-    let mut bytes = redacted.into_bytes();
-    truncate_bytes_to_cap(&mut bytes, body_cap);
-    bytes
+    // Fallback (RARE — genuinely NON-JSON or NON-UTF8): the streaming redactor could
+    // not structurally parse the body, so we CANNOT prove which spans are secrets
+    // (an `api_key` / `\u`-escaped URI could sit anywhere). Retaining a lossy prefix
+    // and only image-URI-redacting it would LEAK those (D1 R2 #1a). Instead store a
+    // bounded FIXED marker that contains NONE of the original bytes — guaranteeing
+    // no secret survives — while still recording that a body existed and its size.
+    format!("[redacted: unparseable body {} bytes]", raw.len()).into_bytes()
 }
 
-/// Redact header VALUES whose normalized name is sensitive (via
-/// [`is_sensitive_payload_key`]) to `"[redacted]"`; for every other header, cap the
-/// value to `scalar_cap` bytes (char boundary) AND run [`redact_image_uris`] over
-/// it (a signed/`data:` URI can appear in ANY header value — D1 R1 #2). The header
-/// NAME is preserved (not a secret).
+/// Redact captured headers. The NAME is capped to `scalar_cap` (D1 R2 #4 — a
+/// pathologically long header name must not be retained unbounded). For a sensitive
+/// name the VALUE becomes `"[redacted]"`. For every other header the value is run
+/// through [`redact_image_uris`] FIRST, THEN capped to `scalar_cap` — redaction can
+/// EXPAND a value (many `data:` runs → `<redacted uri>`), so capping post-redaction
+/// is what actually bounds the retained bytes (D1 R2 #4).
 pub(crate) fn redact_headers_capped(
     headers: &axum::http::HeaderMap,
     scalar_cap: usize,
@@ -203,14 +202,15 @@ pub(crate) fn redact_headers_capped(
     headers
         .iter()
         .map(|(name, value)| {
-            let name = name.as_str().to_string();
+            let name = cap_str_on_char_boundary(name.as_str(), scalar_cap).to_string();
             if is_sensitive_payload_key(&name) {
                 return (name, "[redacted]".to_string());
             }
             let raw = value.to_str().unwrap_or("<non-utf8>");
-            let capped = cap_str_on_char_boundary(raw, scalar_cap);
-            // Strip data:/signed image URIs from the (capped) value.
-            (name, redact_image_uris(capped))
+            // Redact image/data URIs FIRST (it can grow the string), THEN cap.
+            let redacted = redact_image_uris(raw);
+            let capped = cap_str_on_char_boundary(&redacted, scalar_cap).to_string();
+            (name, capped)
         })
         .collect()
 }
@@ -227,17 +227,6 @@ fn cap_str_on_char_boundary(text: &str, cap: usize) -> &str {
         end -= 1;
     }
     &text[..end]
-}
-
-/// Truncate an owned byte buffer to `cap` on a UTF-8 char boundary in place.
-fn truncate_bytes_to_cap(bytes: &mut Vec<u8>, cap: usize) {
-    if bytes.len() > cap {
-        let mut end = cap;
-        while end > 0 && (bytes[end] & 0xC0) == 0x80 {
-            end -= 1;
-        }
-        bytes.truncate(end);
-    }
 }
 
 /// A `Vec<u8>` that accepts writes only until it reaches its cap; once full it
@@ -296,9 +285,12 @@ struct JsonRedactor<'a> {
     scalar_cap: usize,
 }
 
-/// Recursion-depth limit — bounds the call stack on adversarial nesting; deeper
-/// input falls back to the best-effort path.
-const MAX_JSON_DEPTH: usize = 128;
+/// Recursion-depth limit — bounds the call stack on adversarial nesting. At this
+/// depth a subtree is replaced with a `"[truncated: too deep]"` placeholder and
+/// skipped (siblings continue). Kept well below `serde_json`'s own default parse
+/// recursion limit (128) so the redacted OUTPUT (≤ this many nested levels) always
+/// re-parses cleanly downstream.
+const MAX_JSON_DEPTH: usize = 64;
 
 impl<'a> JsonRedactor<'a> {
     fn new(text: &'a str, scalar_cap: usize) -> Self {
@@ -330,24 +322,31 @@ impl<'a> JsonRedactor<'a> {
 
     /// Redact one JSON value at the cursor into `out`. When `sensitive` is set the
     /// value belongs to a sensitive key, so it is replaced wholesale with
-    /// `"[redacted]"` and parse-skipped. Returns `false` on malformed input or when
-    /// the depth limit is exceeded.
+    /// `"[redacted]"` and parse-skipped. At the depth limit, the value is replaced
+    /// with a `"[truncated: too deep]"` placeholder and PARSE-SKIPPED (D1 R2 #1b),
+    /// then redaction CONTINUES on shallower siblings — so a deeply nested body no
+    /// longer discards the whole (shallow) preview to the lossy fallback, and any
+    /// shallow/top-level `api_key` still gets redacted. Returns `false` only on
+    /// genuinely malformed input.
     fn redact_value(&mut self, out: &mut CappedWriter, depth: usize, sensitive: bool) -> bool {
-        if depth > MAX_JSON_DEPTH {
+        self.skip_ws();
+        if self.peek().is_none() {
             return false;
         }
-        self.skip_ws();
-        let Some(byte) = self.peek() else {
-            return false;
-        };
         if sensitive {
             out.write(b"\"[redacted]\"");
-            return self.skip_value(depth);
+            return self.skip_value();
         }
-        match byte {
-            b'{' => self.redact_object(out, depth),
-            b'[' => self.redact_array(out, depth),
-            b'"' => self.redact_string(out),
+        if depth > MAX_JSON_DEPTH {
+            // Too deep to recurse safely: emit a placeholder and skip this subtree
+            // iteratively (stack-safe), then let the caller continue with siblings.
+            out.write(b"\"[truncated: too deep]\"");
+            return self.skip_value();
+        }
+        match self.peek() {
+            Some(b'{') => self.redact_object(out, depth),
+            Some(b'[') => self.redact_array(out, depth),
+            Some(b'"') => self.redact_string(out),
             _ => self.copy_scalar(out),
         }
     }
@@ -478,68 +477,17 @@ impl<'a> JsonRedactor<'a> {
     }
 
     /// Parse-skip a JSON value WITHOUT emitting it (a sensitive value whose
-    /// redaction marker was already written). Returns `false` on malformed input or
-    /// depth overflow.
-    fn skip_value(&mut self, depth: usize) -> bool {
-        if depth > MAX_JSON_DEPTH {
-            return false;
-        }
+    /// redaction marker was already written, or a too-deep subtree). ITERATIVE
+    /// bracket-counting so an arbitrarily deep value is skipped with O(1) stack
+    /// (D1 R2 #1b — the recursive version could overflow on adversarial nesting and
+    /// could not be used to skip past the depth limit). Returns `false` only on
+    /// genuinely malformed input.
+    fn skip_value(&mut self) -> bool {
         self.skip_ws();
+        // A scalar / string value: consume it directly, no nesting.
         match self.peek() {
-            Some(b'{') => {
-                self.pos += 1;
-                self.skip_ws();
-                if self.peek() == Some(b'}') {
-                    self.pos += 1;
-                    return true;
-                }
-                loop {
-                    self.skip_ws();
-                    if self.scan_string_raw().is_none() {
-                        return false;
-                    }
-                    self.skip_ws();
-                    if self.peek() != Some(b':') {
-                        return false;
-                    }
-                    self.pos += 1;
-                    if !self.skip_value(depth + 1) {
-                        return false;
-                    }
-                    self.skip_ws();
-                    match self.peek() {
-                        Some(b',') => self.pos += 1,
-                        Some(b'}') => {
-                            self.pos += 1;
-                            return true;
-                        }
-                        _ => return false,
-                    }
-                }
-            }
-            Some(b'[') => {
-                self.pos += 1;
-                self.skip_ws();
-                if self.peek() == Some(b']') {
-                    self.pos += 1;
-                    return true;
-                }
-                loop {
-                    if !self.skip_value(depth + 1) {
-                        return false;
-                    }
-                    self.skip_ws();
-                    match self.peek() {
-                        Some(b',') => self.pos += 1,
-                        Some(b']') => {
-                            self.pos += 1;
-                            return true;
-                        }
-                        _ => return false,
-                    }
-                }
-            }
-            Some(b'"') => self.scan_string_raw().is_some(),
+            Some(b'"') => return self.scan_string_raw().is_some(),
+            Some(b'{') | Some(b'[') => {}
             Some(_) => {
                 let start = self.pos;
                 while self.pos < self.bytes.len() {
@@ -548,10 +496,36 @@ impl<'a> JsonRedactor<'a> {
                         _ => self.pos += 1,
                     }
                 }
-                self.pos != start
+                return self.pos != start;
             }
-            None => false,
+            None => return false,
         }
+        // A container: walk forward counting brackets, treating string tokens
+        // opaquely (so a `{`/`[`/`"` INSIDE a string never perturbs the depth).
+        let mut depth: usize = 0;
+        while self.pos < self.bytes.len() {
+            match self.bytes[self.pos] {
+                b'"' => {
+                    if self.scan_string_raw().is_none() {
+                        return false;
+                    }
+                }
+                b'{' | b'[' => {
+                    depth += 1;
+                    self.pos += 1;
+                }
+                b'}' | b']' => {
+                    depth -= 1;
+                    self.pos += 1;
+                    if depth == 0 {
+                        return true;
+                    }
+                }
+                _ => self.pos += 1,
+            }
+        }
+        // Ran off the end without closing every container → malformed.
+        false
     }
 
     /// Scan a JSON string token INCLUDING the surrounding quotes, honoring `\"`/`\\`
@@ -743,13 +717,58 @@ mod tests {
     }
 
     #[test]
-    fn capture_fallback_redacts_non_json_without_value() {
-        // Malformed/non-JSON input → image URIs still stripped over a bounded prefix.
-        let raw = b"not json data:image/png;base64,RAWLEAK trailing";
+    fn capture_fallback_stores_fixed_marker_no_raw_bytes() {
+        // D1 R2 #1a: a genuinely non-JSON / non-UTF8 body cannot be structurally
+        // parsed, so we cannot prove which spans are secrets — retaining a lossy
+        // prefix would LEAK an `api_key`/URI. The fallback stores a FIXED marker
+        // containing NONE of the original bytes.
+        let raw = b"not json api_key=SECRETKEY data:image/png;base64,RAWLEAK trailing";
         let out = capture_capped_redacted(raw, 128 * 1024, 4 * 1024);
         let text = String::from_utf8_lossy(&out);
-        assert!(!text.contains("RAWLEAK"), "non-json image uri redacted");
-        assert!(text.contains("<redacted uri>"));
+        assert!(
+            !text.contains("SECRETKEY"),
+            "no api_key survives the fallback"
+        );
+        assert!(
+            !text.contains("RAWLEAK"),
+            "no raw bytes survive the fallback"
+        );
+        assert!(!text.contains("not json"), "no original text retained");
+        assert!(
+            text.starts_with("[redacted: unparseable body"),
+            "fixed redacted marker stored: {text}"
+        );
+
+        // Non-UTF8 bytes also hit the fixed marker (no panic, no raw bytes).
+        let non_utf8 = [0xFF, 0xFE, b'a', b'p', b'i', 0x80];
+        let out2 = capture_capped_redacted(&non_utf8, 128 * 1024, 4 * 1024);
+        assert!(
+            String::from_utf8_lossy(&out2).starts_with("[redacted: unparseable body"),
+            "non-utf8 body → fixed marker"
+        );
+    }
+
+    #[test]
+    fn capture_too_deep_subtree_truncates_but_keeps_shallow_redaction() {
+        // D1 R2 #1b: a VALID but too-deep JSON body must NOT discard the whole body
+        // to the fallback. The deep subtree becomes a placeholder; a TOP-LEVEL
+        // `api_key` is still redacted and the shallow preview survives.
+        let deep = "[".repeat(300) + &"]".repeat(300);
+        let body = format!(r#"{{"api_key":"DEEPLEAK","nested":{deep},"model":"m"}}"#);
+        let out = capture_capped_redacted(body.as_bytes(), 128 * 1024, 4 * 1024);
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("DEEPLEAK"),
+            "top-level api_key still redacted"
+        );
+        assert!(text.contains("[redacted]"), "api_key marker present");
+        assert!(
+            text.contains("[truncated: too deep]"),
+            "deep subtree truncated"
+        );
+        assert!(text.contains("\"model\":\"m\""), "shallow siblings survive");
+        // The result is still valid JSON.
+        let _: serde_json::Value = serde_json::from_slice(&out).expect("valid json out");
     }
 
     #[test]

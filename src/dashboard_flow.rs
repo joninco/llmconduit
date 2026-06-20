@@ -97,6 +97,33 @@ pub struct FlowUsage {
 #[derive(Debug, Clone)]
 pub struct ApiCallId(pub String);
 
+/// A body that has ALREADY been through the capped + redacting capture primitive.
+/// The ONLY way to mint one is [`capture_body`] (D1 R2 #2), so a caller (D2/D3)
+/// cannot hand the store an unredacted/over-cap `Arc<[u8]>` — the type makes the
+/// bypass impossible. Holds an `Arc<[u8]>` ≤ `BODY_CAP` with secrets redacted.
+#[derive(Debug, Clone)]
+pub struct CapturedBody(Arc<[u8]>);
+
+impl CapturedBody {
+    /// The redacted, capped bytes (cheap `Arc` clone).
+    fn into_arc(self) -> Arc<[u8]> {
+        self.0
+    }
+
+    /// Test-only view of the redacted bytes (the field is private so production
+    /// callers cannot read raw body bytes back out of the newtype).
+    #[cfg(test)]
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Headers that have ALREADY been through the capping + redacting header primitive.
+/// The ONLY way to mint one is [`redact_headers`] (D1 R2 #2), so the store can never
+/// be handed raw, secret-bearing header pairs.
+#[derive(Debug, Clone)]
+pub struct CapturedHeaders(Vec<(String, String)>);
+
 /// The authoritative live record for one inference flow. NOT `Serialize`: it holds
 /// an `Arc<AtomicU8>` (the D3 claim) and an `Instant`, and carries the raw capped
 /// body `Arc<[u8]>`s; the dashboard surface serializes the body-free
@@ -268,16 +295,17 @@ impl DashboardFlowStore {
             .expect("dashboard flow state lock poisoned")
     }
 
-    /// Open a new flow record keyed by `api_call_id`. No-op when disabled. The
-    /// caller passes ALREADY-redacted headers and an ALREADY-capped inbound body
-    /// (`capture_body`); every other dynamic scalar is capped here before storage.
+    /// Open a new flow record keyed by `api_call_id`. No-op when disabled. The body
+    /// and headers are [`CapturedBody`]/[`CapturedHeaders`] — minted ONLY by the
+    /// capture primitives, so they are provably redacted + capped (D1 R2 #2); every
+    /// other dynamic scalar is `cap_scalar`-bounded here before storage.
     pub fn open(
         &self,
         api_call_id: String,
         method: String,
         uri: String,
-        headers_redacted: Vec<(String, String)>,
-        inbound_body: Option<Arc<[u8]>>,
+        headers: CapturedHeaders,
+        inbound_body: Option<CapturedBody>,
     ) {
         if !self.enabled {
             return;
@@ -289,8 +317,8 @@ impl DashboardFlowStore {
             response_id: None,
             method: cap_scalar(method),
             uri: cap_scalar(uri),
-            headers: headers_redacted,
-            inbound_body,
+            headers: headers.0,
+            inbound_body: inbound_body.map(CapturedBody::into_arc),
             normalized: None,
             upstream_body: None,
             model_requested: None,
@@ -339,19 +367,22 @@ impl DashboardFlowStore {
         state.enforce_caps(self.summary_quota_bytes);
     }
 
-    /// Attach the upstream target + served model identity + upstream body (D2).
+    /// Attach the upstream target + served model identity + upstream body (D2). The
+    /// body is a [`CapturedBody`] (provably redacted + capped); scalars are
+    /// `cap_scalar`-bounded.
     pub fn set_upstream(
         &self,
         api_call_id: &str,
         upstream_target: Option<String>,
         model_served: Option<String>,
-        upstream_body: Option<Arc<[u8]>>,
+        upstream_body: Option<CapturedBody>,
     ) {
         if !self.enabled {
             return;
         }
         let upstream_target = upstream_target.map(cap_scalar);
         let model_served = model_served.map(cap_scalar);
+        let upstream_body = upstream_body.map(CapturedBody::into_arc);
         let mut state = self.lock();
         state.prune_expired(now_ms());
         state.update(api_call_id, |record| {
@@ -368,17 +399,19 @@ impl DashboardFlowStore {
         state.enforce_caps(self.summary_quota_bytes);
     }
 
-    /// Attach the canonical/normalized body + requested model (D2).
+    /// Attach the canonical/normalized body + requested model (D2). The body is a
+    /// [`CapturedBody`] (provably redacted + capped); the model is `cap_scalar`-bounded.
     pub fn set_normalized(
         &self,
         api_call_id: &str,
         model_requested: Option<String>,
-        normalized: Option<Arc<[u8]>>,
+        normalized: Option<CapturedBody>,
     ) {
         if !self.enabled {
             return;
         }
         let model_requested = model_requested.map(cap_scalar);
+        let normalized = normalized.map(CapturedBody::into_arc);
         let mut state = self.lock();
         state.prune_expired(now_ms());
         state.update(api_call_id, |record| {
@@ -564,17 +597,21 @@ impl DashboardFlowState {
         self.enforce_summary_quota(quota_bytes);
     }
 
-    /// Walk records oldest-first dropping their bodies until the running
-    /// summary-byte total is back under quota. Only bodies are shed; the record
-    /// (and its body-free summary) stays.
+    /// Bring the running summary-byte total back under quota. Phase 1: walk records
+    /// oldest-first dropping their BODIES (the record survives as a body-free
+    /// summary). Phase 2 (D1 R2 #3): if shedding every body is still not enough —
+    /// because scalar/header-only records dominate the total — evict OLDEST WHOLE
+    /// records until under quota, so the quota is a HARD bound the store cannot
+    /// exceed regardless of body presence.
     fn enforce_summary_quota(&mut self, quota_bytes: usize) {
         if self.live_summary_bytes <= quota_bytes {
             return;
         }
+        // Phase 1: shed bodies oldest-first.
         let ids: Vec<String> = self.order.iter().cloned().collect();
         for id in ids {
             if self.live_summary_bytes <= quota_bytes {
-                break;
+                return;
             }
             let Some(existing) = self.by_id.get(&id) else {
                 continue;
@@ -589,6 +626,14 @@ impl DashboardFlowState {
             next.upstream_body = None;
             self.by_id.insert(id, Arc::new(next));
             self.live_summary_bytes = self.live_summary_bytes.saturating_sub(freed);
+        }
+        // Phase 2: bodies are all gone but still over quota → evict whole records
+        // oldest-first. (`remove` keeps `order`/`link_index`/byte-total consistent.)
+        while self.live_summary_bytes > quota_bytes {
+            let Some(oldest) = self.order.front().cloned() else {
+                break;
+            };
+            self.remove(&oldest);
         }
     }
 
@@ -609,18 +654,22 @@ impl DashboardFlowState {
     }
 }
 
-/// Capped + redacting capture of a request/response body → owned `Arc<[u8]>` of at
-/// most [`BODY_CAP`] bytes with secrets redacted inline (delegates to the shared
-/// O(CAP) primitive in [`crate::redaction`]). Never retains a slice of `raw`.
-pub fn capture_body(raw: &[u8]) -> Arc<[u8]> {
+/// Capped + redacting capture of a request/response body → a [`CapturedBody`]
+/// (`Arc<[u8]>` ≤ [`BODY_CAP`], secrets redacted inline) via the shared O(CAP)
+/// primitive in [`crate::redaction`]. This is the ONLY constructor of
+/// `CapturedBody`, so every body that reaches a store mutator is provably sanitized
+/// (D1 R2 #2). Never retains a slice of `raw`.
+pub fn capture_body(raw: &[u8]) -> CapturedBody {
     let bytes = crate::redaction::capture_capped_redacted(raw, BODY_CAP, SCALAR_CAP);
-    Arc::from(bytes.into_boxed_slice())
+    CapturedBody(Arc::from(bytes.into_boxed_slice()))
 }
 
-/// Redact header VALUES (sensitive names → `"[redacted]"`; all others capped to
-/// [`SCALAR_CAP`] AND image-URI-stripped). Delegates to the shared primitive.
-pub fn redact_headers(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
-    crate::redaction::redact_headers_capped(headers, SCALAR_CAP)
+/// Redact + cap request headers → a [`CapturedHeaders`] (sensitive names →
+/// `"[redacted]"`; every other value image-URI-stripped then capped to
+/// [`SCALAR_CAP]`; names capped too). The ONLY constructor of `CapturedHeaders`, so
+/// the store can never be handed raw header pairs (D1 R2 #2).
+pub fn redact_headers(headers: &axum::http::HeaderMap) -> CapturedHeaders {
+    CapturedHeaders(crate::redaction::redact_headers_capped(headers, SCALAR_CAP))
 }
 
 /// Cap a single retained scalar string to [`SCALAR_CAP`] bytes on a UTF-8 char
@@ -651,8 +700,15 @@ mod tests {
     use axum::http::HeaderName;
     use axum::http::HeaderValue;
 
-    fn arc(bytes: &[u8]) -> Arc<[u8]> {
-        Arc::from(bytes.to_vec().into_boxed_slice())
+    /// Mint a `CapturedBody` from raw bytes via the real capture primitive (the only
+    /// way to build one — that is the point of the newtype).
+    fn cap(bytes: &[u8]) -> CapturedBody {
+        capture_body(bytes)
+    }
+
+    /// An empty `CapturedHeaders` (minted via the real redactor).
+    fn no_headers() -> CapturedHeaders {
+        redact_headers(&HeaderMap::new())
     }
 
     fn open_simple(store: &DashboardFlowStore, api: &str) {
@@ -660,7 +716,7 @@ mod tests {
             api.to_string(),
             "POST".to_string(),
             "/v1/responses".to_string(),
-            Vec::new(),
+            no_headers(),
             None,
         );
     }
@@ -673,8 +729,8 @@ mod tests {
             "api_1".to_string(),
             "POST".to_string(),
             "/v1/responses".to_string(),
-            Vec::new(),
-            Some(arc(b"{}")),
+            no_headers(),
+            Some(cap(b"{}")),
         );
         store.link("resp_1".to_string(), "api_1".to_string());
         store.record_usage("api_1", FlowUsage::default());
@@ -687,12 +743,17 @@ mod tests {
     #[test]
     fn open_then_list_and_detail_round_trip() {
         let store = DashboardFlowStore::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("content-type"),
+            HeaderValue::from_static("application/json"),
+        );
         store.open(
             "api_1".to_string(),
             "POST".to_string(),
             "/v1/responses".to_string(),
-            vec![("content-type".to_string(), "application/json".to_string())],
-            Some(arc(b"{\"model\":\"m\"}")),
+            redact_headers(&headers),
+            Some(cap(b"{\"model\":\"m\"}")),
         );
         let records = store.list();
         assert_eq!(records.len(), 1);
@@ -831,7 +892,7 @@ mod tests {
         let store = DashboardFlowStore::new();
         open_simple(&store, "api_1");
         let before = store.detail("api_1").expect("record").claim.clone();
-        store.set_normalized("api_1", Some("model".to_string()), Some(arc(b"{}")));
+        store.set_normalized("api_1", Some("model".to_string()), Some(cap(b"{}")));
         let after = store.detail("api_1").expect("record").claim.clone();
         assert!(
             Arc::ptr_eq(&before, &after),
@@ -864,8 +925,8 @@ mod tests {
                 format!("api_{i}"),
                 "POST".to_string(),
                 "/v1/responses".to_string(),
-                Vec::new(),
-                Some(capture_body(&json)),
+                no_headers(),
+                Some(cap(&json)),
             );
         }
         assert_eq!(store.list().len(), 3, "records survive body eviction");
@@ -885,31 +946,35 @@ mod tests {
         // SCALAR_CAP AND counted in `live_summary_bytes`, so their bytes can trip
         // the quota and evict an older body. A small quota makes the scalar bytes —
         // not bodies — the decisive contribution.
+        // Quota 16 KiB: api_0's ~10 KiB body fits; api_1's ~12 KiB of CAPPED scalars
+        // (3 x SCALAR_CAP) fit on their own; but api_0.body + api_1.scalars exceeds
+        // the quota, so the counted scalars force api_0's BODY to be shed while api_1
+        // (under-quota by itself) survives.
         let store = DashboardFlowStore {
             enabled: true,
             state: Arc::new(Mutex::new(DashboardFlowState::default())),
-            // Tiny quota: one small body fits; the next record's capped scalars
-            // (~3 x SCALAR_CAP) push the total over and evict the oldest body.
-            summary_quota_bytes: 6 * 1024,
+            summary_quota_bytes: 16 * 1024,
         };
-        // api_0: a small (~SCALAR_CAP) body, no large scalars.
+        // api_0: a ~10 KiB body (JSON array of many short strings; none individually
+        // capped, so the captured body is genuinely large), no large scalars.
+        let array_body = format!("{{\"a\":[{}]}}", vec!["\"xx\""; 2000].join(","));
         store.open(
             "api_0".to_string(),
             "POST".to_string(),
             "/v1/responses".to_string(),
-            Vec::new(),
-            Some(capture_body(br#"{"x":"small"}"#)),
+            no_headers(),
+            Some(cap(array_body.as_bytes())),
         );
         assert!(
             store.detail("api_0").unwrap().inbound_body.is_some(),
             "api_0 body retained under quota initially"
         );
-        // api_1: oversized scalars (each capped to SCALAR_CAP, all counted).
+        // api_1: oversized scalars (each capped to SCALAR_CAP, all counted), no body.
         store.open(
             "api_1".to_string(),
             "POST".to_string(),
             "/".to_string() + &"u".repeat(64 * 1024),
-            Vec::new(),
+            no_headers(),
             None,
         );
         store.set_upstream(
@@ -918,7 +983,9 @@ mod tests {
             Some("m".repeat(64 * 1024)),
             None,
         );
-        let record = store.detail("api_1").expect("record");
+        let record = store
+            .detail("api_1")
+            .expect("api_1 survives (under quota alone)");
         assert!(record.uri.len() <= SCALAR_CAP, "uri capped");
         assert!(
             record.upstream_target.as_ref().unwrap().len() <= SCALAR_CAP,
@@ -928,12 +995,62 @@ mod tests {
             record.model_served.as_ref().unwrap().len() <= SCALAR_CAP,
             "model_served capped"
         );
-        // The capped-but-counted scalars exceeded the quota → oldest body shed.
-        let oldest = store.detail("api_0").expect("record present");
+        // The capped-but-counted scalars pushed total over quota → api_0 body shed.
+        let oldest = store.detail("api_0").expect("api_0 record still present");
         assert!(
             oldest.inbound_body.is_none(),
             "oldest body evicted once scalars counted toward quota"
         );
+    }
+
+    #[test]
+    fn whole_records_evicted_when_body_eviction_insufficient() {
+        // D1 R2 #3: when bodies are all gone (or absent) but the total still exceeds
+        // quota — scalar/header-only records dominate — evict OLDEST WHOLE records
+        // until under quota, so the quota is a HARD bound.
+        let store = DashboardFlowStore {
+            enabled: true,
+            state: Arc::new(Mutex::new(DashboardFlowState::default())),
+            // ~10 capped-scalar records fit; many more must force whole-record eviction.
+            summary_quota_bytes: 64 * 1024,
+        };
+        let mut headers = HeaderMap::new();
+        // A ~4 KiB header value (capped to SCALAR_CAP) so each record is header-heavy
+        // with NO body to shed.
+        headers.insert(
+            HeaderName::from_static("x-big"),
+            HeaderValue::from_str(&"h".repeat(8 * 1024)).unwrap(),
+        );
+        let captured_headers = redact_headers(&headers);
+        for i in 0..40 {
+            store.open(
+                format!("api_{i}"),
+                "POST".to_string(),
+                "/v1/responses".to_string(),
+                captured_headers.clone(),
+                None, // no body → body eviction cannot help
+            );
+        }
+        // The store stayed under quota by evicting oldest WHOLE records.
+        let live = store.list();
+        let total: usize = live
+            .iter()
+            .map(|r| {
+                r.headers
+                    .iter()
+                    .map(|(n, v)| n.len() + v.len())
+                    .sum::<usize>()
+                    + r.uri.len()
+            })
+            .sum();
+        assert!(
+            total <= 64 * 1024,
+            "store exceeded quota ({total} > 64 KiB) — whole-record eviction failed"
+        );
+        // Newest survive, oldest are gone.
+        assert!(store.detail("api_39").is_some(), "newest record retained");
+        assert!(store.detail("api_0").is_none(), "oldest record evicted");
+        assert!(live.len() < 40, "some records were evicted");
     }
 
     #[test]
@@ -976,42 +1093,46 @@ mod tests {
 
     #[test]
     fn capture_body_peak_allocation_is_bounded_for_10mib_body() {
-        // THE crux acceptance criterion: serializing a 10 MiB body keeps PEAK heap
-        // use O(CAP), not O(body). Build the input OUTSIDE the armed region so only
-        // `capture_body`'s own allocations count.
+        // THE crux acceptance criterion: serializing a 10 MiB body keeps PEAK LIVE
+        // heap use O(CAP), not O(body) (D1 R2 #5 — peak-live also catches a path
+        // doing many small unfreed allocations). Build the input OUTSIDE the armed
+        // region so only `capture_body`'s own allocations count.
         const TEN_MIB: usize = 10 * 1024 * 1024;
         let big = "x".repeat(TEN_MIB);
         let json = format!("{{\"text\":\"{big}\"}}");
         let raw = json.into_bytes();
         let ceiling = BODY_CAP + SCALAR_CAP + 64 * 1024;
-        let (captured, peak) =
-            crate::test_alloc_probe::peak_alloc_during(ceiling, || capture_body(&raw));
-        assert!(captured.len() <= BODY_CAP);
-        assert_eq!(
-            peak, 0,
-            "capture_body made a single allocation >= {ceiling} bytes (peak={peak}) for a \
-             {TEN_MIB}-byte body — it must stream, not materialize the whole body"
+        let (captured, peak_live) =
+            crate::test_alloc_probe::peak_live_alloc_during(|| capture_body(&raw));
+        assert!(captured.as_bytes().len() <= BODY_CAP);
+        assert!(
+            peak_live <= ceiling,
+            "capture_body held peak-live {peak_live} bytes (> {ceiling}) for a {TEN_MIB}-byte \
+             body — it must stream, not materialize the whole body"
         );
     }
 
     #[test]
     fn capture_body_peak_bounded_for_10mib_single_key() {
-        // D1 R1 #4a: a single 10 MiB OBJECT KEY must also stay O(CAP).
+        // D1 R1 #4a: a single 10 MiB OBJECT KEY must also stay O(CAP) (peak-live).
         const TEN_MIB: usize = 10 * 1024 * 1024;
         let big_key = "k".repeat(TEN_MIB);
         let json = format!("{{\"{big_key}\":\"v\"}}");
         let raw = json.into_bytes();
         let ceiling = BODY_CAP + SCALAR_CAP + 64 * 1024;
-        let (captured, peak) =
-            crate::test_alloc_probe::peak_alloc_during(ceiling, || capture_body(&raw));
-        assert!(captured.len() <= BODY_CAP);
-        assert_eq!(peak, 0, "huge key must not allocate O(body) (peak={peak})");
+        let (captured, peak_live) =
+            crate::test_alloc_probe::peak_live_alloc_during(|| capture_body(&raw));
+        assert!(captured.as_bytes().len() <= BODY_CAP);
+        assert!(
+            peak_live <= ceiling,
+            "huge key held peak-live {peak_live} bytes (> {ceiling}); must be O(CAP)"
+        );
     }
 
     #[test]
     fn capture_body_peak_bounded_for_malformed_body() {
-        // D1 R1 #4b: the fallback must NOT materialize a serde_json::Value — a
-        // malformed 10 MiB body must stay O(CAP).
+        // D1 R1 #4b + R2 #1a: the fallback must NOT materialize the body (no Value,
+        // no retained lossy prefix) — a malformed 10 MiB body must stay O(CAP).
         const TEN_MIB: usize = 10 * 1024 * 1024;
         // Valid UTF-8 but NOT valid JSON (unterminated object) → fallback path.
         let mut raw = Vec::with_capacity(TEN_MIB + 16);
@@ -1019,12 +1140,12 @@ mod tests {
         raw.extend(std::iter::repeat_n(b'z', TEN_MIB));
         // no closing quote/brace
         let ceiling = BODY_CAP + SCALAR_CAP + 64 * 1024;
-        let (captured, peak) =
-            crate::test_alloc_probe::peak_alloc_during(ceiling, || capture_body(&raw));
-        assert!(captured.len() <= BODY_CAP);
-        assert_eq!(
-            peak, 0,
-            "malformed-body fallback must be O(CAP), not parse a Value (peak={peak})"
+        let (captured, peak_live) =
+            crate::test_alloc_probe::peak_live_alloc_during(|| capture_body(&raw));
+        assert!(captured.as_bytes().len() <= BODY_CAP);
+        assert!(
+            peak_live <= ceiling,
+            "malformed-body fallback held peak-live {peak_live} bytes (> {ceiling}); must be O(CAP)"
         );
     }
 
@@ -1032,7 +1153,7 @@ mod tests {
     fn capture_body_redacts_sensitive_keys_inline() {
         let json = br#"{"model":"m","api_key":"sk-SECRETLEAK","nested":{"authorization":"Bearer TOKENLEAK"},"keep":"visible"}"#;
         let captured = capture_body(json);
-        let text = String::from_utf8_lossy(&captured);
+        let text = String::from_utf8_lossy(captured.as_bytes());
         assert!(!text.contains("SECRETLEAK"), "api_key value redacted");
         assert!(!text.contains("TOKENLEAK"), "nested authorization redacted");
         assert!(text.contains("[redacted]"));
@@ -1044,7 +1165,7 @@ mod tests {
         let json =
             br#"{"content":"see data:image/png;base64,IMGLEAK and https://signed.x/i?sig=SIGLEAK"}"#;
         let captured = capture_body(json);
-        let text = String::from_utf8_lossy(&captured);
+        let text = String::from_utf8_lossy(captured.as_bytes());
         assert!(!text.contains("IMGLEAK"), "data: payload redacted");
         assert!(!text.contains("SIGLEAK"), "signed-url token redacted");
         assert!(text.contains("<redacted uri>"));
@@ -1077,7 +1198,7 @@ mod tests {
         );
 
         let captured = capture_body(json.as_bytes());
-        let text = String::from_utf8_lossy(&captured);
+        let text = String::from_utf8_lossy(captured.as_bytes());
         assert!(
             !text.contains("UNILEAK"),
             "unicode-escaped data: payload redacted: {text}"
@@ -1094,7 +1215,7 @@ mod tests {
         let json = br#"{"a":1,"b":[true,false,null],"c":{"d":"e"}}"#;
         let captured = capture_body(json);
         let value: serde_json::Value =
-            serde_json::from_slice(&captured).expect("captured body is valid JSON");
+            serde_json::from_slice(captured.as_bytes()).expect("captured body is valid JSON");
         assert_eq!(value["a"], serde_json::json!(1));
         assert_eq!(value["b"], serde_json::json!([true, false, null]));
         assert_eq!(value["c"]["d"], serde_json::json!("e"));
@@ -1193,8 +1314,8 @@ mod tests {
             "api_1".to_string(),
             "POST".to_string(),
             "/v1/responses".to_string(),
-            Vec::new(),
-            Some(capture_body(b"{\"model\":\"m\"}")),
+            no_headers(),
+            Some(cap(b"{\"model\":\"m\"}")),
         );
         let summaries = store.snapshot_summaries();
         assert_eq!(summaries.len(), 1);
@@ -1204,6 +1325,30 @@ mod tests {
         assert!(
             !json.contains("\"model\":\"m\""),
             "no body content in summary"
+        );
+    }
+
+    #[test]
+    fn malformed_body_with_api_key_leaks_nothing_into_the_store() {
+        // D1 R2 #1a end-to-end: a MALFORMED (non-JSON) inbound body carrying an
+        // `api_key` must not persist ANY of the secret in the stored record.
+        let store = DashboardFlowStore::new();
+        let malformed = b"oops not json api_key=PLAINTEXTLEAK data:image/png;base64,IMGLEAK";
+        store.open(
+            "api_1".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            no_headers(),
+            Some(cap(malformed)),
+        );
+        let record = store.detail("api_1").expect("record");
+        let body = record.inbound_body.as_ref().expect("inbound stored");
+        let text = String::from_utf8_lossy(body);
+        assert!(!text.contains("PLAINTEXTLEAK"), "no api_key persisted");
+        assert!(!text.contains("IMGLEAK"), "no raw image bytes persisted");
+        assert!(
+            text.starts_with("[redacted: unparseable body"),
+            "fixed marker stored for a malformed body: {text}"
         );
     }
 }
