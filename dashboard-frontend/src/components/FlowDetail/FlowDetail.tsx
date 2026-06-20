@@ -36,20 +36,29 @@ import { cn } from '../../lib/cn';
 type Tab = 'headers' | 'timeline' | 'error';
 
 export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose: () => void }) {
-  const { detail, liveFlow, status, seeking, mutationsEnabled, kill, killState } = useFlowDetail(apiCallId);
+  const { detail, frozenDetail, liveFlow, status, seeking, seekMonitorSeq, seekAtMs, mutationsEnabled, kill, killState } =
+    useFlowDetail(apiCallId);
   const monitor = useDashboard((s) => s.monitor);
+  const monitorSeqs = useDashboard((s) => s.monitorSeqs);
   const priceTable = useDashboard((s) => s.priceTable);
   const [tab, setTab] = useState<Tab>('headers');
 
-  // The flow's response_id (engine id) joins the monitor ring to this flow.
-  const responseId = liveFlow?.response_id ?? detail?.response_id ?? null;
-  const join = useMemo(() => joinMonitor(monitor, responseId), [monitor, responseId]);
+  // The flow's response_id (engine id) joins the monitor ring to this flow. While seeking we read
+  // it from the FROZEN row (not the live REST detail, which is withheld from non-body surfaces).
+  const responseId = liveFlow?.response_id ?? frozenDetail?.response_id ?? null;
+  // SEEK BOUND (finding 1): bound the join to the frozen `monitor_seq` so post-cut segments/events/
+  // status never leak into the deltas/timeline/error. Live ⇒ no bound (the whole ring is current).
+  const join = useMemo(
+    () => joinMonitor(monitor, responseId, { seqs: monitorSeqs, maxSeq: seekMonitorSeq }),
+    [monitor, monitorSeqs, responseId, seekMonitorSeq],
+  );
 
-  // Deltas shown in the sub-panel = the REST replay (base, so a reloaded/completed flow keeps its
-  // streamed output) MERGED with the live monitor segments (appended) — finding 5.
+  // Deltas shown in the sub-panel = the REST replay (base) MERGED with the live monitor segments
+  // (appended) — finding 5. While seeking, the live REST replay (`detail.deltas`) is post-cut and
+  // withheld; the cut-bounded monitor join alone supplies the frozen stream (finding 1).
   const segments = useMemo(
-    () => mergeDeltas(normalizeRestDeltas(detail?.deltas), join.segments),
-    [detail?.deltas, join.segments],
+    () => mergeDeltas(normalizeRestDeltas(frozenDetail?.deltas), join.segments),
+    [frozenDetail?.deltas, join.segments],
   );
 
   // Structural diffs between the captured layers (path → kind).
@@ -67,12 +76,11 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   // summary (live status/usage wins; roll-up cost + detail fields fill gaps) lets `flowCost` apply
   // its own roll-up-first precedence, so a live row LACKING cost no longer hides `detail.cost`.
   //
-  // SEEK coherence (finding 3): while seeking, `liveFlow` IS the frozen snapshot row and `detail`
-  // is LIVE `/flows/:id` (post-seek) — so cost must derive EXCLUSIVELY from the frozen summary,
-  // never the live REST roll-up. We drop `detail` from the merge while seeking; the frozen row's
-  // own `cost`/`usage` stand alone.
+  // SEEK coherence (finding 1/3): while seeking, `liveFlow` IS the frozen snapshot row and the live
+  // REST detail is withheld (`frozenDetail` is null) — so cost derives EXCLUSIVELY from the frozen
+  // summary, never the live REST roll-up.
   const cost = useMemo(() => {
-    const summary = seeking ? null : detail;
+    const summary = frozenDetail;
     if (!liveFlow && !summary) return null;
     const merged: FlowSummary = {
       ...(summary ?? {}),
@@ -90,16 +98,17 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
       model_requested: liveFlow?.model_requested ?? summary?.model_requested ?? null,
     };
     return flowCost(merged, priceTable);
-  }, [liveFlow, detail, apiCallId, status, priceTable, seeking]);
+  }, [liveFlow, frozenDetail, apiCallId, status, priceTable]);
 
   return (
     <section className="flex min-h-0 w-[46%] min-w-[420px] flex-col border-l border-line bg-panel" data-testid="flow-detail" aria-label="flow detail">
       <DetailHeader
         apiCallId={apiCallId}
         flow={liveFlow}
-        detail={detail}
+        detail={frozenDetail}
         cost={cost}
         seeking={seeking}
+        seekAtMs={seekAtMs}
         isActive={isActive}
         mutationsEnabled={mutationsEnabled}
         killState={killState}
@@ -145,9 +154,11 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         <TabButton id="error" active={tab} onClick={setTab}>Error</TabButton>
       </div>
       <div className="max-h-44 min-h-[3rem] shrink-0 overflow-auto" role="tabpanel" data-testid={`tabpanel-${tab}`}>
-        {tab === 'headers' && <HeadersTab headers={detail?.inbound_headers} />}
+        {/* Headers + Error read the FROZEN detail (null while seeking) so no live/post-cut metadata
+            leaks; Timeline reads the cut-bounded monitor join (finding 1). */}
+        {tab === 'headers' && <HeadersTab headers={frozenDetail?.inbound_headers} />}
         {tab === 'timeline' && <Timeline events={join.events} />}
-        {tab === 'error' && <ErrorTab detail={detail} liveFlow={liveFlow} joinError={join.error} />}
+        {tab === 'error' && <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} />}
       </div>
 
       {/* deltas sub-panel */}
@@ -172,6 +183,7 @@ function DetailHeader({
   detail,
   cost,
   seeking,
+  seekAtMs,
   isActive,
   mutationsEnabled,
   killState,
@@ -183,6 +195,7 @@ function DetailHeader({
   detail: FlowDetailDto | null;
   cost: number | null;
   seeking: boolean;
+  seekAtMs: number | null;
   isActive: boolean;
   mutationsEnabled: boolean;
   killState: KillState;
@@ -194,12 +207,13 @@ function DetailHeader({
   const modelServed = flow?.model_served ?? detail?.model_served;
   const upstream = flow?.upstream_target ?? detail?.upstream_target ?? '—';
   // Elapsed: live = `elapsedMs` (which ticks an OPEN flow against `now`). SEEK coherence
-  // (finding 3): a frozen cut must NOT read wall-clock `Date.now()` — that would leak time
-  // elapsed AFTER the seeked instant. While seeking we pass the frozen `started_ms` as `now`, so
-  // an open flow reads 0 (no live ticking) and a finished flow still derives `finished-started`
-  // from the frozen row. We also prefer the frozen row's roll-up over the live REST `detail`.
+  // (finding 6): a frozen cut must NOT read wall-clock `Date.now()` — that would leak time elapsed
+  // AFTER the seeked instant. We pass the frozen cut `at_ms` as `now`, so an OPEN historical flow
+  // reads its elapsed AS OF the cut (`at_ms - started_ms`), consistent with the table (which uses
+  // the same `at_ms`); a finished flow still derives `finished-started` from the frozen row. `detail`
+  // here is already the FROZEN detail (null while seeking), so non-body surfaces never read live.
   const elapsed = flow
-    ? elapsedMs(flow, seeking ? flow.started_ms : Date.now())
+    ? elapsedMs(flow, seeking ? seekAtMs ?? flow.started_ms : Date.now())
     : (seeking ? null : detail?.elapsed_ms ?? null);
 
   return (

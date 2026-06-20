@@ -55,6 +55,18 @@ describe('JsonPane — highlight.js JSON + per-path diff tints', () => {
     expect((code.querySelector('.json-line[data-path="$.tools[0].name"]') as HTMLElement)?.dataset.diff).toBe('added');
   });
 
+  it('renders BOTH a composite added-removed tint on the middle pane (finding 5)', () => {
+    // A field introduced by A→B and dropped by B→C: pane B (side `both`) gets the composite kind
+    // and renders a gradient carrying BOTH signals, not just the add.
+    const diff = new Map([['$.b_only', 'added-removed' as const]]);
+    const { getByTestId } = render(<JsonPane label="B" value={{ b_only: 1 }} diff={diff} side="both" />);
+    const code = getByTestId('jsonpane-code-B');
+    const line = code.querySelector('.json-line[data-path="$.b_only"]') as HTMLElement;
+    expect(line?.dataset.diff).toBe('added-removed');
+    // A gradient (both halves) — not a single solid colour — encodes the dual classification.
+    expect(line?.style.backgroundImage).toContain('gradient');
+  });
+
   it('shows the evicted placeholder (not undefined) when the body is absent', () => {
     const { getByTestId, queryByTestId } = render(<JsonPane label="C" value={undefined} emptyLabel="body evicted" />);
     expect(getByTestId('jsonpane-empty-C').textContent).toBe('body evicted');

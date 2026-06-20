@@ -34,4 +34,21 @@ describe('joinMonitor — filters the ring to one response_id', () => {
     expect(j.error).toBe('boom');
     expect(j.status).toBe('failed');
   });
+
+  it('bounds the join to a seek cut: excludes messages past maxSeq (finding 1)', () => {
+    const ringSeek: DebugWsMessage[] = [
+      segment('resp_001', 'output', 'in-cut-1'),
+      segment('resp_001', 'output', 'in-cut-2'),
+      segment('resp_001', 'output', 'post-cut'),
+    ];
+    // Lockstep arrival seqs: first two at the cut (seq 2), the third after (seq 3).
+    const seqs = [2, 2, 3];
+    const j = joinMonitor(ringSeek, 'resp_001', { seqs, maxSeq: 2 });
+    expect(j.segments.map((s) => s.text)).toEqual(['in-cut-1', 'in-cut-2']);
+  });
+
+  it('applies no bound when maxSeq is null (LIVE — whole ring is current)', () => {
+    const j = joinMonitor(ring, 'resp_001', { seqs: [1, 1, 1, 1, 1], maxSeq: null });
+    expect(j.segments.map((s) => s.text)).toEqual(['Hello', ', world']);
+  });
 });

@@ -56,10 +56,13 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     const { getByTestId, getByRole } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
     await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
 
-    // Stream a timeline event + segments (output + a tool call) for resp_001.
+    // Stream a timeline event + segments (output + a tool call) for resp_001. The segments arrive
+    // AFTER the mock REST replay's coverage (its deltas sit near the flow start), so the live
+    // continuation is appended past the replay cursor (deltas merge by temporal cursor — finding 3).
+    const afterReplay = Date.now() + 60_000;
     pushMonitor({ type: 'event_append', response_id: 'resp_001', event: { timestamp_ms: 1, kind: 'response.created', summary: 'created', images: [] } });
-    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 2, kind: 'output', text: 'Hello world' } });
-    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 3, kind: 'tool', text: JSON.stringify({ name: 'search' }) } });
+    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: afterReplay, kind: 'output', text: 'Hello world' } });
+    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: afterReplay + 1, kind: 'tool', text: JSON.stringify({ name: 'search' }) } });
 
     // Deltas sub-panel shows the output text + an expandable tool card.
     expect(getByTestId('deltas-panel').textContent).toContain('Hello world');
@@ -233,32 +236,114 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     expect(dashboardStore.getState().flows.get('api_open_hist')?.status).toBe('open');
   });
 
-  it('derives cost + elapsed from the FROZEN snapshot while seeking — no Date.now / live cost (finding 3)', async () => {
+  it('derives cost + elapsed from the FROZEN cut while seeking — no Date.now / live cost (findings 1+6)', async () => {
     // The frozen snapshot row is OPEN with a server roll-up cost; the LIVE /flows/:id detail
     // carries a DIFFERENT (post-seek) cost and a long elapsed. While seeking, the header must show
-    // the frozen row's cost and an elapsed that does NOT tick against wall-clock Date.now().
+    // the frozen row's cost and an elapsed derived from the cut `at_ms`, not wall-clock Date.now().
+    const started = 1_700_000_000_000;
     seedFlows([makeFlow({
       api_call_id: 'api_frozen', response_id: 'resp_frozen', status: 'open',
-      started_ms: 1_700_000_000_000, cost: 0.1234,
+      started_ms: started, cost: 0.1234,
     })]);
     const liveDetail: FlowDetailDto = {
       flow_seq: 1, api_call_id: 'api_frozen', response_id: 'resp_frozen', status: 'open',
-      deltas: [], started_ms: 1_700_000_000_000,
+      deltas: [], started_ms: started,
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
       cost: 0.9999, elapsed_ms: 999_000, // live values that must NOT bleed into the frozen view
     };
     const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_frozen" onClose={noop} />);
     act(() => queryClient.setQueryData(['flows', 'api_frozen'], liveDetail));
-    act(() => dashboardStore.getState().setConnection('seeking'));
+    // Enter seek with a KNOWN cut 5s after the flow started → deterministic frozen elapsed.
+    act(() => dashboardStore.getState().enterSeek(started + 5_000));
     await waitFor(() => expect(document.querySelector('[data-testid="seek-badge"]')).toBeTruthy());
 
     const text = getByTestId('flow-detail').textContent ?? '';
     // Frozen roll-up cost shown; the live REST cost is NOT used.
     expect(text).toContain('$0.1234');
     expect(text).not.toContain('$1.00'); // 0.9999 would round to $1.00
-    // Elapsed for the OPEN frozen flow reads 0ms (frozen started==now), never a live-ticked value
-    // from Date.now() and never the live detail's 999000ms (→ 16m39s).
-    expect(text).toContain('0ms');
+    // Elapsed for the OPEN frozen flow = at_ms - started_ms = 5000ms → 5.0s. NOT the live detail's
+    // 999000ms (→ 16m39s) and NOT a wall-clock Date.now() tick.
+    expect(text).toContain('5.0s');
     expect(text).not.toContain('16m');
+  });
+
+  it('while seeking, an in-cut flow does NOT leak live REST deltas/headers; only the cut-bounded monitor stream shows (finding 1)', async () => {
+    // The frozen cut is at monitor_seq=2. A live /flows/:id replay (post-cut) carries deltas + an
+    // auth header that MUST NOT render while seeking. A monitor segment stamped at seq=2 is in the
+    // cut (shows); one stamped at seq=3 is POST-cut (hidden).
+    const started = 1_700_000_000_000;
+    seedFlows([makeFlow({ api_call_id: 'api_cut', response_id: 'resp_cut', status: 'open', started_ms: started })]);
+    // Cursor reflects the live monitor_seq the cut will freeze at.
+    act(() => dashboardStore.getState().setCursor('monitor_seq', 2));
+    // Two monitor segments: one AT the cut (seq 2, shown), one AFTER (seq 3, hidden).
+    act(() => dashboardStore.getState().pushMonitor({ type: 'segment_append', response_id: 'resp_cut', segment: { timestamp_ms: 10, kind: 'output', text: 'IN-CUT' } }, 2));
+    act(() => dashboardStore.getState().pushMonitor({ type: 'segment_append', response_id: 'resp_cut', segment: { timestamp_ms: 20, kind: 'output', text: 'POST-CUT' } }, 3));
+    const liveDetail: FlowDetailDto = {
+      flow_seq: 1, api_call_id: 'api_cut', response_id: 'resp_cut', status: 'open',
+      started_ms: started, inbound_headers: { authorization: 'Bearer LEAK' },
+      inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
+      deltas: [{ sequence: 1, kind: 'response.output_text.delta', payload: { text: 'REST-LEAK' }, ts_ms: 5 }],
+    };
+    const { getByTestId, getByRole, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_cut" onClose={noop} />);
+    act(() => queryClient.setQueryData(['flows', 'api_cut'], liveDetail));
+    act(() => dashboardStore.getState().enterSeek(started + 1_000));
+    await waitFor(() => expect(document.querySelector('[data-testid="seek-badge"]')).toBeTruthy());
+
+    // Deltas: the in-cut monitor segment shows; the post-cut segment and the REST replay do NOT.
+    const deltas = getByTestId('deltas-panel').textContent ?? '';
+    expect(deltas).toContain('IN-CUT');
+    expect(deltas).not.toContain('POST-CUT');
+    expect(deltas).not.toContain('REST-LEAK');
+    // Headers: the live REST auth header is withheld while seeking (frozen cut has no headers).
+    fireEvent.click(getByRole('tab', { name: 'Headers' }));
+    expect(getByTestId('headers-empty')).toBeTruthy();
+  });
+
+  it('while seeking, an OUT-of-cut selection fetches no detail and shows evicted panes (finding 1)', async () => {
+    // A selection NOT present in the frozen snapshot rows must not fetch /flows/:id at all. The
+    // mock answers api_001's detail; selecting it while seeking with an EMPTY cut must still show
+    // the evicted placeholders (no live body), proving the detail query was gated off.
+    act(() => dashboardStore.getState().enterSeek(1_700_000_000_000));
+    const { queryClient } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    // Even after a tick, no detail data lands (the query is disabled out-of-cut while seeking).
+    await act(async () => { await Promise.resolve(); });
+    expect(queryClient.getQueryData(['flows', 'api_001'])).toBeUndefined();
+    const empties = document.querySelectorAll('[data-testid^="jsonpane-empty-"]');
+    expect(empties.length).toBe(3);
+  });
+
+  it('a kill in-flight when seek begins does NOT roll back into the frozen store (finding 2)', async () => {
+    // Dispatch a kill that will FAIL (403, no CSRF) so `onError` fires. BEFORE it resolves, enter
+    // seek and swap in a frozen snapshot cut. The optimistic rollback must be SKIPPED (the live
+    // epoch changed) — otherwise it would re-insert the killed flow's prior 'open' row into the
+    // frozen cut, leaking live data past the seek boundary.
+    const started = 1_700_000_000_000;
+    resetWorld({ mock: true });
+    authStore.getState().setMutationsEnabled(true);
+    authStore.getState().setCsrfToken('mock-csrf-token');
+    seedFlows([makeFlow({ api_call_id: 'api_001', response_id: 'resp_001', status: 'open', started_ms: started })]);
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('kill-button')).toBeTruthy());
+    // Clear the CSRF AFTER the connection seeded it (getConnection re-seeds on build), so the kill
+    // omits X-CSRF-Token → the mock answers 403 → the mutation's onError path runs.
+    act(() => authStore.getState().setCsrfToken(null));
+    document.cookie = 'llmconduit_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+
+    // Fire the kill (optimistic flip to cancelled in onMutate), THEN immediately enter seek + swap
+    // the store to a frozen snapshot cut while the 403 is still in flight.
+    fireEvent.click(getByTestId('kill-button'));
+    expect(dashboardStore.getState().flows.get('api_001')?.status).toBe('cancelled');
+    const frozenRow = makeFlow({ api_call_id: 'api_snap', status: 'completed', started_ms: started });
+    act(() => dashboardStore.getState().applySnapshot({ cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 }, flows: [frozenRow], metrics: null, topology: null }));
+    act(() => dashboardStore.getState().enterSeek(started + 1_000));
+
+    // Let the 403 resolve. The epoch guard skips the rollback: the frozen cut keeps ONLY api_snap;
+    // the killed flow's prior 'open' row is NOT re-inserted.
+    await waitFor(() => expect(getByTestId('kill-forbidden')).toBeTruthy());
+    expect(dashboardStore.getState().flows.has('api_snap')).toBe(true);
+    expect(dashboardStore.getState().flows.has('api_001')).toBe(false);
+    // Still frozen + only the snapshot row present.
+    expect(dashboardStore.getState().connection).toBe('seeking');
+    expect(dashboardStore.getState().flows.size).toBe(1);
   });
 });

@@ -31,13 +31,14 @@ describe('diffLayers — structural per-path classification', () => {
     expect(d.get('$.b')).toBe('unchanged');
   });
 
-  it('flags a type change (scalar→object) at the path without walking replaced children', () => {
+  it('flags a scalar→object change at the path AND classifies the new container side (finding 4)', () => {
     const left = { tool: 'name' };
     const right = { tool: { name: 'x' } };
     const d = diffLayers(left, right);
     expect(d.get('$.tool')).toBe('changed');
-    // The whole subtree was replaced; children are not separately tinted.
-    expect(d.get('$.tool.name')).toBeUndefined();
+    // The container side that REPLACED the scalar renders its own lines, so they are classified
+    // `added` (the scalar side has no descendants) — otherwise they'd stay untinted (finding 4).
+    expect(d.get('$.tool.name')).toBe('added');
   });
 
   it('treats array element changes positionally', () => {
@@ -124,38 +125,43 @@ describe('diffLayers — structural per-path classification', () => {
     expect(d.get('$.x.a')).toBe('added');
   });
 
-  it('still treats a scalar↔object swap as a single changed (no phantom child paths)', () => {
-    // Regression guard for the existing contract: a SCALAR on one side has no descendants, so the
-    // container-type-change branch must not fire — it stays a lone `changed`.
-    const d = diffLayers({ tool: 'name' }, { tool: { name: 'x' } });
+  it('classifies the container side of a scalar↔object swap (object→scalar removes descendants)', () => {
+    // The reverse direction: an OBJECT on the left replaced by a SCALAR on the right. The node is
+    // `changed` and the OLD (left/object) descendants are `removed`; the scalar side adds nothing.
+    const d = diffLayers({ tool: { name: 'x' } }, { tool: 'name' });
     expect(d.get('$.tool')).toBe('changed');
-    expect(d.get('$.tool.name')).toBeUndefined();
+    expect(d.get('$.tool.name')).toBe('removed');
   });
 });
 
-describe('combineMiddleDiff — pane B shows A→B added/changed AND B→C removed (finding 4)', () => {
-  it('surfaces a B-only field that C drops as removed in the middle map', () => {
-    // 3 layers: A → B adds `b_only`; B → C drops it. Pane B (the middle) must show `b_only`
-    // as removed (it leaves on the way to C), while still showing what A→B introduced.
+describe('combineMiddleDiff — pane B shows A→B added/changed AND B→C removed (findings 4+5)', () => {
+  it('preserves BOTH classifications: a B-only field C drops is `added-removed` (finding 5)', () => {
+    // 3 layers: A → B adds `b_only`; B → C drops it. The B→C removal must NOT be discarded just
+    // because A→B already classified it `added`: the composite `added-removed` keeps both, so pane
+    // B renders both the "new in B" and the "dropped toward C" signals.
     const a = { keep: 1 };
     const b = { keep: 1, b_only: 2 }; // A→B added b_only
     const c = { keep: 1 }; // B→C removed b_only
-    const ab = diffLayers(a, b);
-    const bc = diffLayers(b, c);
-    const mid = combineMiddleDiff(ab, bc);
-    // A→B classified b_only as added; B→C drops it. The added (what B introduced) wins so the
-    // primary "new in B" story is kept, but the field is still classified (not unchanged).
-    expect(mid.get('$.b_only')).toBe('added');
+    const mid = combineMiddleDiff(diffLayers(a, b), diffLayers(b, c));
+    expect(mid.get('$.b_only')).toBe('added-removed');
     // A field present in B and C alike (unchanged A→B, unchanged B→C) stays unclassified-as-change.
     expect(mid.get('$.keep')).toBe('unchanged');
   });
 
-  it('marks a field UNCHANGED A→B but dropped B→C as removed in pane B', () => {
+  it('preserves a CHANGED-then-dropped field as `changed-removed` (finding 5)', () => {
+    const a = { v: 1 };
+    const b = { v: 2 }; // A→B changed v
+    const c = {}; // B→C removed v
+    const mid = combineMiddleDiff(diffLayers(a, b), diffLayers(b, c));
+    expect(mid.get('$.v')).toBe('changed-removed');
+  });
+
+  it('marks a field UNCHANGED A→B but dropped B→C as a lone removed in pane B', () => {
     const a = { keep: 1, drops: 'x' };
     const b = { keep: 1, drops: 'x' }; // unchanged A→B
     const c = { keep: 1 }; // B→C removes `drops`
     const mid = combineMiddleDiff(diffLayers(a, b), diffLayers(b, c));
-    // `drops` was not added/changed by A→B, so the B→C removal surfaces in pane B.
+    // `drops` was not added/changed by A→B, so the B→C removal surfaces as a plain removed.
     expect(mid.get('$.drops')).toBe('removed');
   });
 });

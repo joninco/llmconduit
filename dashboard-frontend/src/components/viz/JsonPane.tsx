@@ -39,16 +39,30 @@ function ensureJsonLanguage(): void {
 export type DiffSide = 'left' | 'right' | 'both';
 
 /**
- * Background tint for a path's `DiffKind`, from the design tokens (palette `diff*`). A `left`
- * pane only surfaces `removed` (a field dropped by the next layer); a `right` pane surfaces
- * `added`/`changed`; the `both` middle pane surfaces all three. `unchanged` and the irrelevant
- * side get no tint.
+ * Background tint (a CSS `background` value — solid color OR gradient) for a path's `DiffKind`,
+ * from the design tokens (palette `diff*`). A `left` pane only surfaces `removed` (a field dropped
+ * by the next layer); a `right` pane surfaces `added`/`changed`; the `both` middle pane surfaces
+ * all three PLUS the composite kinds. `unchanged` and the irrelevant side get no tint.
+ *
+ * COMPOSITE (pane B only, finding 5): `added-removed` / `changed-removed` mean the path was
+ * introduced/changed by A→B AND dropped toward C. On the `both` pane they render a split gradient
+ * (the A→B add/changed tint over the B→C remove tint) so BOTH directions are visible at once. On a
+ * `left`/`right` pane (which never receives composites from `combineMiddleDiff`) they degrade to the
+ * side-relevant half.
  */
 function tintFor(kind: DiffKind | undefined, side: DiffSide): string | undefined {
   if (!kind) return undefined;
   if (kind === 'changed') return colors.diffContextBg; // changed tints on every side
   if (kind === 'added') return side === 'left' ? undefined : colors.diffAddBg;
   if (kind === 'removed') return side === 'right' ? undefined : colors.diffRemoveBg;
+  // Composite: the field is both introduced/changed in B and removed toward C.
+  if (kind === 'added-removed' || kind === 'changed-removed') {
+    const introduced = kind === 'added-removed' ? colors.diffAddBg : colors.diffContextBg;
+    if (side === 'left') return colors.diffRemoveBg; // left sees only the removal
+    if (side === 'right') return introduced; // right sees only the A→B side
+    // The middle (`both`) pane shows BOTH: top half the introduced tint, bottom half the removal.
+    return `linear-gradient(${introduced} 0 50%, ${colors.diffRemoveBg} 50% 100%)`;
+  }
   return undefined;
 }
 
@@ -96,7 +110,8 @@ export function JsonPane({
         const kind = diff?.get(line.path);
         const tint = tintFor(kind, side);
         if (tint && kind) {
-          div.style.backgroundColor = tint;
+          // `background` (not `backgroundColor`) so a composite kind's gradient applies (finding 5).
+          div.style.background = tint;
           div.dataset.diff = kind;
         }
         try {

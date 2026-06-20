@@ -26,6 +26,18 @@ export interface DashboardState {
   /** Last applied per-domain seq (mirrors the socket's dedup cursors for display). */
   cursors: SeqCursors;
 
+  /**
+   * The FROZEN time-travel cut, captured when seek begins; null while LIVE.
+   *  - `seekAtMs`: the wall-clock instant the cut was taken (the snapshot `at_ms`). Elapsed for an
+   *    OPEN flow derives from THIS, never `Date.now()`, so the frozen view does not tick forward
+   *    past the seeked instant (finding 6 / seek coherence).
+   *  - `seekMonitorSeq`: the `monitor_seq` cursor at the cut. The inspector's monitor join is
+   *    bounded to it so NO segment/event/status that arrived after the cut leaks into the frozen
+   *    deltas/timeline (finding 1).
+   */
+  seekAtMs: number | null;
+  seekMonitorSeq: number | null;
+
   /** Flow rows keyed by `api_call_id` (insertion order preserved via `flowOrder`). */
   flows: Map<string, FlowSummary>;
   flowOrder: string[];
@@ -38,9 +50,17 @@ export interface DashboardState {
 
   /** Recent monitor (debug) messages, capped ring for the theater/inspector. */
   monitor: DebugWsMessage[];
+  /**
+   * Per-message arrival `monitor_seq`, sliced in LOCKSTEP with `monitor` (same length/order). A
+   * monitor frame's seq stamps every message it carried, so the inspector can EXCLUDE post-cut
+   * messages while seeking by dropping any whose stamp is `> seekMonitorSeq` (finding 1).
+   */
+  monitorSeqs: number[];
 
   // -- mutations (called by the socket) --
   setConnection: (s: ConnectionState) => void;
+  /** Enter the frozen seek cut: marks `seeking` and captures `at_ms` + the `monitor_seq` cut. */
+  enterSeek: (atMs: number) => void;
   setCursor: (domain: keyof SeqCursors, seq: number) => void;
   applySnapshot: (snap: {
     cursors: SeqCursors;
@@ -55,7 +75,8 @@ export interface DashboardState {
   patchUsage: (apiCallId: string, usage: Usage) => void;
   setMetrics: (m: MetricsResponse) => void;
   setTopology: (nodes: ProviderHealth[], edges: TopologyEdge[]) => void;
-  pushMonitor: (msg: DebugWsMessage) => void;
+  /** Append a monitor message, stamped with the `monitor_seq` of the frame that delivered it. */
+  pushMonitor: (msg: DebugWsMessage, seq?: number) => void;
   reset: () => void;
 }
 
@@ -71,6 +92,8 @@ const emptyCursors = (): SeqCursors => ({
 export const dashboardStore = createStore<DashboardState>((set) => ({
   connection: 'idle',
   cursors: emptyCursors(),
+  seekAtMs: null,
+  seekMonitorSeq: null,
   flows: new Map(),
   flowOrder: [],
   metrics: null,
@@ -78,8 +101,23 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
   topologyEdges: [],
   priceTable: {},
   monitor: [],
+  monitorSeqs: [],
 
-  setConnection: (connection) => set({ connection }),
+  // Leaving 'seeking' (any non-seek state — typically 'live') DROPS the frozen cut so elapsed
+  // resumes ticking and the monitor join unbounds. Entering 'seeking' directly via setConnection
+  // (e.g. a test) captures the cut from the current cursor/clock; `enterSeek` is the explicit path.
+  setConnection: (connection) =>
+    set((s) => {
+      if (connection === 'seeking') {
+        return s.connection === 'seeking'
+          ? { connection }
+          : { connection, seekAtMs: Date.now(), seekMonitorSeq: s.cursors.monitor_seq };
+      }
+      return { connection, seekAtMs: null, seekMonitorSeq: null };
+    }),
+
+  enterSeek: (atMs) =>
+    set((s) => ({ connection: 'seeking', seekAtMs: atMs, seekMonitorSeq: s.cursors.monitor_seq })),
 
   setCursor: (domain, seq) =>
     set((s) => ({ cursors: { ...s.cursors, [domain]: seq } })),
@@ -94,6 +132,9 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
       }
       return {
         cursors: snap.cursors,
+        // A fresh snapshot re-establishes the authoritative LIVE cut — clear any seek freeze.
+        seekAtMs: null,
+        seekMonitorSeq: null,
         flows,
         flowOrder,
         metrics: snap.metrics,
@@ -154,18 +195,22 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
 
   setTopology: (topologyNodes, topologyEdges) => set({ topologyNodes, topologyEdges }),
 
-  pushMonitor: (msg) =>
+  pushMonitor: (msg, seq = 0) =>
     set((s) => {
-      const monitor = s.monitor.length >= MONITOR_RING_CAP
-        ? [...s.monitor.slice(s.monitor.length - MONITOR_RING_CAP + 1), msg]
-        : [...s.monitor, msg];
-      return { monitor };
+      // `monitor` + `monitorSeqs` are sliced together so index i always pairs message↔arrival seq.
+      const atCap = s.monitor.length >= MONITOR_RING_CAP;
+      const drop = atCap ? s.monitor.length - MONITOR_RING_CAP + 1 : 0;
+      const monitor = atCap ? [...s.monitor.slice(drop), msg] : [...s.monitor, msg];
+      const monitorSeqs = atCap ? [...s.monitorSeqs.slice(drop), seq] : [...s.monitorSeqs, seq];
+      return { monitor, monitorSeqs };
     }),
 
   reset: () =>
     set({
       connection: 'idle',
       cursors: emptyCursors(),
+      seekAtMs: null,
+      seekMonitorSeq: null,
       flows: new Map(),
       flowOrder: [],
       metrics: null,
@@ -173,6 +218,7 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
       topologyEdges: [],
       priceTable: {},
       monitor: [],
+      monitorSeqs: [],
     }),
 }));
 

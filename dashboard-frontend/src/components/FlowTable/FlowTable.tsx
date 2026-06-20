@@ -55,6 +55,10 @@ export function FlowTable({
   const [filters, setFilters] = useState<FlowFilters>(EMPTY_FILTERS);
   const { rows, total, models, upstreams } = useFlowRows(filters);
   const priceTable = useDashboard((s) => s.priceTable);
+  // SEEK coherence (finding 6): while seeking, an OPEN row's elapsed must derive from the FROZEN
+  // cut `at_ms` (the snapshot instant) rather than wall-clock `Date.now()`, which would tick the
+  // frozen view forward. `seekAtMs` is null while LIVE → rows fall back to `Date.now()` per render.
+  const seekAtMs = useDashboard((s) => s.seekAtMs);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const virtualizer = useVirtualizer({
@@ -97,6 +101,7 @@ export function FlowTable({
                 <FlowRow
                   flow={flow}
                   priceTable={priceTable}
+                  nowMs={seekAtMs ?? Date.now()}
                   selected={flow.api_call_id === selectedId}
                   onSelect={onSelect}
                 />
@@ -139,11 +144,14 @@ function HeaderRow() {
 function FlowRow({
   flow,
   priceTable,
+  nowMs,
   selected,
   onSelect,
 }: {
   flow: FlowSummary;
   priceTable: Record<string, ModelPrice>;
+  /** Reference instant for an OPEN row's elapsed: the frozen cut `at_ms` while seeking, else now. */
+  nowMs: number;
   selected: boolean;
   onSelect: (id: string) => void;
 }) {
@@ -194,7 +202,7 @@ function FlowRow({
         {fmtTokens(tokensIn)}<span className="text-line"> / </span>{fmtTokens(tokensOut)}
       </span>
       <span className="text-right tabular-nums text-meta">{fmtCost(cost)}</span>
-      <span className="text-right tabular-nums text-text-muted">{fmtElapsed(elapsedMs(flow, Date.now()))}</span>
+      <span className="text-right tabular-nums text-text-muted">{fmtElapsed(elapsedMs(flow, nowMs))}</span>
     </button>
   );
 }

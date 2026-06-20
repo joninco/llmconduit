@@ -15,8 +15,21 @@
  * segment) — a reorder is a change, matching how a reader reasons about `messages[0]`.
  */
 
-/** How a path in the RIGHT layer relates to the same path in the LEFT layer. */
-export type DiffKind = 'added' | 'removed' | 'changed' | 'unchanged';
+/**
+ * How a path in the RIGHT layer relates to the same path in the LEFT layer.
+ *
+ * The COMPOSITE kinds are produced only by `combineMiddleDiff` for pane B, where a path can carry
+ * TWO directional classifications at once (finding 5): introduced/changed by A→B AND dropped on the
+ * way to C. `added-removed` = added in B, removed toward C; `changed-removed` = changed in B,
+ * removed toward C. They let pane B render BOTH indicators rather than discarding the B→C removal.
+ */
+export type DiffKind =
+  | 'added'
+  | 'removed'
+  | 'changed'
+  | 'unchanged'
+  | 'added-removed'
+  | 'changed-removed';
 
 /**
  * A flat path→kind map for one layer comparison. Keys are canonical JSON paths
@@ -114,20 +127,20 @@ function walk(path: string, left: unknown, right: unknown, leftHas: boolean, rig
     }
     return;
   }
-  // CONTAINER TYPE CHANGE (object↔array): both sides are containers but of different types, so
-  // there is no positional/key correspondence to recurse into. The node itself is `changed`, and
-  // because each side's children render their own lines, mark EVERY old descendant `removed` (left
-  // pane) and EVERY new descendant `added` (right pane) — otherwise the swapped subtree's lines
-  // stay unclassified (finding 3). `markSubtree` overwrites the node tint last so it stays `changed`.
-  if (isContainer(left) && isContainer(right)) {
-    markSubtree(path, left, 'removed', out);
-    markSubtree(path, right, 'added', out);
+  // TYPE CHANGE where AT LEAST ONE side is a container (object↔array, OR scalar↔container): there
+  // is no positional/key correspondence to recurse, so the node itself is `changed`. Because each
+  // side's children render their OWN lines, mark EVERY descendant of the container side(s): the old
+  // container's descendants `removed` (left pane) and the new container's descendants `added` (right
+  // pane). A scalar side has no descendants, so a scalar↔container swap classifies only the lone
+  // container side's interior (findings 3+4). `markSubtree` writes the node tint last → stays
+  // `changed`. (`markSubtree` on a scalar is a no-op beyond the node, so scalar↔scalar never enters.)
+  if (isContainer(left) || isContainer(right)) {
+    if (isContainer(left)) markSubtree(path, left, 'removed', out);
+    if (isContainer(right)) markSubtree(path, right, 'added', out);
     out.set(path, 'changed');
     return;
   }
-  // At least one side is a scalar (scalar↔scalar or scalar↔container): a single tint at this path.
-  // A scalar has no descendants, so a scalar↔container swap is just `changed` here (the lone
-  // container side's interior is intentionally not separately tinted — the whole value was replaced).
+  // Both sides are scalars (scalar↔scalar): a single tint at this path, no descendants.
   out.set(path, leafEqual(left, right) ? 'unchanged' : 'changed');
 }
 
@@ -207,19 +220,23 @@ export function diffLayers(left: unknown, right: unknown): DiffMap {
 /**
  * Tints for the MIDDLE pane (B), which sits between two comparisons: it is the RIGHT side of
  * A→B (so its `added`/`changed` paths show how the gateway built B from A) AND the LEFT side of
- * B→C (so a field B carries that C drops must show as `removed`). This overlays the two maps:
- * an A→B `added`/`changed` classification wins (that is the primary "what B introduced" story);
- * otherwise a B→C `removed` surfaces a field dropped on the way to C. Rendered with side `both`
- * (JsonPane) so all three kinds tint. Without this, pane B never shows B→C removals (finding 4).
+ * B→C (so a field B carries that C drops must show as `removed`). This overlays the two maps so
+ * pane B (side `both`, JsonPane) tints BOTH directions. Without this, pane B never shows B→C
+ * removals (finding 4).
+ *
+ * A path classified by BOTH comparisons keeps BOTH (finding 5): an A→B `added`+B→C `removed`
+ * becomes the composite `added-removed` (introduced in B, then dropped toward C) and `changed`+
+ * `removed` becomes `changed-removed`, so the B→C removal is no longer DISCARDED when A→B already
+ * flagged the path. A B→C removal on a path A→B left unchanged stays a plain `removed`.
  */
 export function combineMiddleDiff(ab: DiffMap, bc: DiffMap): DiffMap {
   const out = new Map<string, DiffKind>(ab);
   for (const [path, kind] of bc) {
     if (kind !== 'removed') continue;
     const abKind = out.get(path);
-    // Keep an A→B added/changed tint; only fill a removed where A→B did not already flag it.
-    if (abKind === 'added' || abKind === 'changed') continue;
-    out.set(path, 'removed');
+    if (abKind === 'added') out.set(path, 'added-removed');
+    else if (abKind === 'changed') out.set(path, 'changed-removed');
+    else out.set(path, 'removed'); // A→B did not flag it → a lone B→C removal
   }
   return out;
 }

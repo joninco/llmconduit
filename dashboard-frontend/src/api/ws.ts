@@ -422,8 +422,9 @@ export class DashboardSocket {
     switch (payload.type) {
       case 'monitor':
         // The monitor arm NESTS an itself-tagged DebugWsMessage under `message`
-        // (see types WIRE CONTRACT — it is NOT flattened).
-        store.pushMonitor(payload.message);
+        // (see types WIRE CONTRACT — it is NOT flattened). Stamp it with the frame's
+        // already-advanced monitor seq so the inspector can bound the join to a seek cut.
+        store.pushMonitor(payload.message, this.lastSeq.monitor);
         return;
       case 'usage':
         store.patchUsage(payload.api_call_id, {

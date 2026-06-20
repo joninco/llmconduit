@@ -28,8 +28,17 @@ const EMPTY: MonitorJoin = { segments: [], events: [], request: null, status: nu
  * (the ring is append-order = arrival order = chronological). Returns a stable empty result when
  * `responseId` is null (a flow not yet linked to an engine response) so callers can render an
  * empty deltas/timeline rather than the whole ring.
+ *
+ * SEEK BOUND (finding 1): pass `opts.seqs` (the store's per-message `monitorSeqs`, sliced in
+ * lockstep with `monitor`) + `opts.maxSeq` (the frozen `monitor_seq` cut). Any message whose
+ * arrival seq is `> maxSeq` — i.e. it streamed AFTER the seeked instant — is excluded, so a
+ * historical cut's deltas/timeline/status never leak post-cut frames. Omitted ⇒ no bound (LIVE).
  */
-export function joinMonitor(monitor: DebugWsMessage[], responseId: string | null | undefined): MonitorJoin {
+export function joinMonitor(
+  monitor: DebugWsMessage[],
+  responseId: string | null | undefined,
+  opts?: { seqs?: number[]; maxSeq?: number | null },
+): MonitorJoin {
   if (!responseId) return EMPTY;
   const segments: DebugSegment[] = [];
   const events: DebugTimelineEvent[] = [];
@@ -37,7 +46,12 @@ export function joinMonitor(monitor: DebugWsMessage[], responseId: string | null
   let status: DebugRequestStatus | null = null;
   let error: string | null = null;
 
-  for (const msg of monitor) {
+  const seqs = opts?.seqs;
+  const maxSeq = opts?.maxSeq ?? null;
+  for (let i = 0; i < monitor.length; i += 1) {
+    const msg = monitor[i]!;
+    // Drop anything past the frozen cut (only when a bound + its lockstep seq are provided).
+    if (maxSeq !== null && seqs && (seqs[i] ?? 0) > maxSeq) continue;
     switch (msg.type) {
       case 'request_upsert':
         if (msg.request.response_id === responseId) {

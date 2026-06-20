@@ -18,7 +18,6 @@ import type { FlowSummary } from '../../api/types';
 import { useDashboard } from '../../store/hooks';
 import { getConnection, queryKeys } from '../../api/connection';
 import type { FlowFilters } from './filterTypes';
-import { isFailover } from './flowModel';
 
 export interface FlowRowsResult {
   /** Filtered rows, newest-on-top (the array the virtualizer renders). */
@@ -133,6 +132,3 @@ export function useFlowRows(filters: FlowFilters): FlowRowsResult {
 
   return { rows, total: merged.length, models, upstreams };
 }
-
-/** Re-export so the table can tag failover rows without re-importing the model module. */
-export { isFailover };

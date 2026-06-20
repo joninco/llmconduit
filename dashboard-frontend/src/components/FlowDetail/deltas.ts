@@ -66,34 +66,32 @@ export function normalizeRestDeltas(deltas: FlowDelta[] | undefined): DebugSegme
 /**
  * Merges the REST replay (base) with the live monitor segments (appended). The replay anchors the
  * stream for a reloaded/completed flow; live segments continue it. The two sources OVERLAP at the
- * seam: the live ring retains the recent history the replay already holds, so the END of `rest`
- * and the START of `live` repeat the same segments. We remove that overlap by finding the LONGEST
- * suffix of `rest` that equals a prefix of `live` (by kind+text — timestamps may differ between
- * sources) and appending only the live tail past it. So REST `[A,B]` + live `[B,C]` joins to
- * `[A,B,C]` (the shared `B` is not duplicated), not `[A,B,B,C]` (finding 6). A prefix-only compare
- * missed a PARTIAL overlap like this — it only caught a live head that duplicated the replay HEAD.
- * Order is preserved: replay first, then the un-duplicated live remainder.
+ * seam: the live ring retains the recent history the replay already holds.
+ *
+ * We de-dup by each segment's TEMPORAL CURSOR (`timestamp_ms`), NOT by text (finding 3). Both
+ * sources stamp segments from the SAME engine clock (`monitor.rs`): the REST `ts_ms` and the live
+ * `timestamp_ms` are the segment's position in the one stream. So the replay COVERS the stream up
+ * to its last segment's timestamp, and a live segment belongs to the un-replayed tail iff its
+ * timestamp is strictly AFTER that coverage. This fixes both text-equality failures:
+ *   - a partial seam overlap is removed precisely (the live head at/under the cursor is dropped);
+ *   - legitimately-REPEATED identical segments (same kind+text, DISTINCT timestamps) are PRESERVED,
+ *     because identity is the cursor, not the text.
+ * When a side carries no usable cursor (all `timestamp_ms === 0` — e.g. a replay that omitted
+ * `ts_ms`), we cannot place the seam temporally, so we fall back to APPENDING the whole live run
+ * (no text-collapsing): over-keeping a duplicate is safer than silently dropping a real segment.
+ * Order is preserved: replay first, then the live tail past the cursor.
  */
 export function mergeDeltas(rest: DebugSegment[], live: DebugSegment[]): DebugSegment[] {
   if (rest.length === 0) return live;
   if (live.length === 0) return rest;
-  const sameSeg = (a: DebugSegment, b: DebugSegment) => a.kind === b.kind && a.text === b.text;
-  // Longest k such that rest's last k segments === live's first k segments. Start from the largest
-  // feasible overlap and shrink, so the seam joins cleanly even when live re-sends many segments.
-  const maxOverlap = Math.min(rest.length, live.length);
-  let overlap = 0;
-  for (let k = maxOverlap; k > 0; k -= 1) {
-    let matches = true;
-    for (let i = 0; i < k; i += 1) {
-      if (!sameSeg(rest[rest.length - k + i]!, live[i]!)) {
-        matches = false;
-        break;
-      }
-    }
-    if (matches) {
-      overlap = k;
-      break;
-    }
+  // The replay's coverage cursor = the max timestamp it carries. 0 ⇒ no usable cursor (see below).
+  const restCursor = rest.reduce((max, s) => Math.max(max, s.timestamp_ms), 0);
+  if (restCursor === 0) {
+    // No temporal cursor on the replay: we can't locate the seam, so append the live run verbatim.
+    return [...rest, ...live];
   }
-  return [...rest, ...live.slice(overlap)];
+  // Keep only the live segments AFTER the replay's coverage (the genuinely newer tail). A live
+  // segment at-or-before the cursor is already in the replay (the seam) and is dropped.
+  const tail = live.filter((s) => s.timestamp_ms > restCursor);
+  return [...rest, ...tail];
 }
