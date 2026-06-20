@@ -21,7 +21,7 @@ pub type AppResult<T> = Result<T, AppError>;
 /// `AGENTS.md`: context-overflow is a same-provider shrink-and-retry, not a
 /// failover trigger).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FailoverDisposition {
+pub(crate) enum FailoverDisposition {
     /// Provider-failure-shaped: failover may retry on the next provider.
     #[default]
     Failover,
@@ -75,7 +75,7 @@ impl AppError {
     /// upstream client uses this to mark a context-window overflow that survived
     /// its shrink-and-retry as `Terminal` so failover/routing surfaces it
     /// instead of retrying the same oversized prompt on another provider.
-    pub fn upstream_with_disposition(
+    pub(crate) fn upstream_with_disposition(
         message: impl Into<String>,
         disposition: FailoverDisposition,
     ) -> Self {
@@ -114,7 +114,7 @@ impl AppError {
     /// The failover disposition of the upstream attempt that produced this error.
     /// The failover loop matches on this to decide whether to retry the next
     /// provider (`Failover`) or surface the error terminally (`Terminal`).
-    pub fn failover_disposition(&self) -> FailoverDisposition {
+    pub(crate) fn failover_disposition(&self) -> FailoverDisposition {
         self.failover
     }
 }
