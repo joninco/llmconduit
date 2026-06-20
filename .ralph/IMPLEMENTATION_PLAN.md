@@ -5,7 +5,7 @@ G4 (image agent) + G7 (route config) + the descoped G3 keep-alive-peek. Specs: `
 (historical design inputs — see "Spec status" below). Review gate: `.ralph/REVIEW_PROTOCOL.md`.
 
 ## Executive summary
-**Status: core 7/7 ✅ + EXTENDED RUN COMPLETE ✅ (G3-peek, G7, G4 — owner-directed, all Codex-xhigh APPROVED). ALL 9 GAPS + P1 + G3-peek DONE, plus a post-run `reasoning_effort_map` rework (leaf-applied, reserved-key deleted), plus a per-gap thermo-nuclear code-quality review (10 gaps reviewed; bounded fixes in `07117b2`; 11 deferred follow-ups tracked as Topic 11 on branch `ralph/thermo-followups`).** Topic 11 is now COMPLETE (11/11 Codex-xhigh APPROVED). **Topic 12 added 2026-06-20** — a whole-codebase thermo-nuclear PROJECT review (16 parallel subsystem reviewers → Codex-xhigh adversarial verify) surfaced 11 VERIFIED findings (2 HIGH, 5 MEDIUM, 4 REVISED-LOW; 0 refuted) → **10 tasks (12.1–12.10, ⬜ PENDING)**; specs `.ralph/specs/U1..U10`, full report `/tmp/thermo-project-review.md`. Loop validated: build → cargo test/clippy/fmt → Codex-xhigh review → fix → re-review APPROVED.
+**Status: core 7/7 ✅ + EXTENDED RUN COMPLETE ✅ (G3-peek, G7, G4 — owner-directed, all Codex-xhigh APPROVED). ALL 9 GAPS + P1 + G3-peek DONE, plus a post-run `reasoning_effort_map` rework (leaf-applied, reserved-key deleted), plus a per-gap thermo-nuclear code-quality review (10 gaps reviewed; bounded fixes in `07117b2`; 11 deferred follow-ups tracked as Topic 11 on branch `ralph/thermo-followups`).** Topic 11 is now COMPLETE (11/11 Codex-xhigh APPROVED). **Topic 12 added 2026-06-20** — a whole-codebase thermo-nuclear PROJECT review (16 parallel subsystem reviewers → Codex-xhigh adversarial verify) surfaced 11 VERIFIED findings (2 HIGH, 5 MEDIUM, 4 REVISED-LOW; 0 refuted) → **10 tasks (12.1–12.10) — Topic 12 COMPLETE ✅ (10/10 Codex-xhigh APPROVED)**; specs `.ralph/specs/U1..U10`, full report `/tmp/thermo-project-review.md`. Loop validated: build → cargo test/clippy/fmt → Codex-xhigh review → fix → re-review APPROVED.
 
 ## Spec status
 `.ralph/specs/*.md` are **historical design inputs** written before implementation; their `OPEN QUESTION` /
@@ -330,10 +330,10 @@ coverage change). R1 (2 MEDIUM keepalive-hang + race-order, 1 LOW shadowed key) 
 > the missing `stop` arm); **12.9 bundles** both sides of the `tool_calls` wire-string contract. Obey
 > AGENTS.md "Hard rules in the engine"; do NOT re-raise the adjudicated invalid findings below.
 
-## STATUS (🔄 IN PROGRESS — 9/10)
+## STATUS (✅ COMPLETE — 10/10 — all Codex-xhigh APPROVED)
 
-**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`), 12.4 (`4cd2b44`), 12.5 (`adc5dd7`), 12.6 (`9a42909`), 12.7 (`56c34b2`), 12.8 (`854978b`), 12.9 (`89def6d`, Codex-xhigh APPROVED R1 — consumer delegates to `from_finish_reason`; producer test pins all 5 wire strings incl. load-bearing `tool_calls` rename).
-**TODO (sequenced):** 12.10 (LOW).
+**DONE:** 12.1 (`7d80dc6`), 12.2 (`f47357b`), 12.3 (`70ad24f`), 12.4 (`4cd2b44`), 12.5 (`adc5dd7`), 12.6 (`9a42909`), 12.7 (`56c34b2`), 12.8 (`854978b`), 12.9 (`89def6d`, Codex-xhigh APPROVED R1 — consumer delegates to `from_finish_reason`; producer test pins all 5 wire strings incl. load-bearing `tool_calls` rename), 12.10 (`1c0e076`, Codex-xhigh APPROVED R1 — `seen_names` removed, registry is sole case-insensitive dup-name authority; `web_search_placeholder_result` data-driven byte-identical refactor).
+**Topic 12 COMPLETE (10/10).**
 Per-task loop = read spec → implement → fmt/test/clippy → commit → Codex-xhigh review → fix/re-review ≤3
 rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 
@@ -410,7 +410,7 @@ rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 **Sequencing:** Depends on T7 (FINAL/APPROVED). No conflict with other Topic-12 tasks; no ordering constraint — independent.
 
 ### Task 12.10 — Chat-lowering dedup: single tool-name authority + data-driven web_search placeholder
-**Priority:** LOW · **Spec:** `.ralph/specs/U10-chat-lowering-dedup.md` · **Status:** ⬜ PENDING
+**Priority:** LOW · **Spec:** `.ralph/specs/U10-chat-lowering-dedup.md` · **Status:** ✅ DONE — commit `1c0e076`, Codex-xhigh APPROVED round 1. Removed `seen_names` map; `build_tool_registry` is sole case-insensitive duplicate-name authority. `web_search_placeholder_result` collapsed to one base template + joined fragment Vec (byte-identical). Rewrote `duplicate_tool_name_rejected` via `lower_request` + added case-insensitive test + byte-exact placeholder test. strip.rs doc comment updated. cargo test/clippy/fmt green.
 **Thermo finding:** Duplicate-tool-name rejection implemented twice with divergent keying — `lower_tools` raw case-sensitive `seen_names` HashMap (`src/adapters/responses_to_chat.rs:461`, checked `:578-585`) vs `build_tool_registry` lowercased (`:643-647`); and `web_search_placeholder_result` (`:741-780`) is a ~40-line nested match re-typing one base sentence ~6×.
 **Fix:** Delete the `seen_names` HashMap (`:461`) and its check (`:578-585`) so `build_tool_registry`'s stricter case-insensitive check is the single duplicate-name authority; move/rewrite `duplicate_tool_name_rejected` (`:1100`) to assert via `lower_request`/registry and add a case-insensitive (`echo`/`ECHO`) case. Collapse `web_search_placeholder_result` to one base template (action label `""`/`" open_page"`/`" find_in_page"`) plus a data-driven `Vec<String>` of present fragments (`Query:`/`URL:`/`Pattern:`) joined `". "` and appended with a leading space — keep the `query.or_else(first queries)` selection and append no trailing period. Both are byte-identical-on-the-wire pure refactors.
 **Files:** src/adapters/responses_to_chat.rs (lower_tools, build_tool_registry, web_search_placeholder_result + #[cfg(test)] module)
