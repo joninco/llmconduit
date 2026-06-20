@@ -43,6 +43,18 @@ describe('JsonPane — highlight.js JSON + per-path diff tints', () => {
     void colors; // token module imported to confirm tint derivation is wired
   });
 
+  it('tints EVERY line of an added nested subtree, not just its opening bracket (finding 3)', () => {
+    const left = { model: 'x' };
+    const right = { model: 'x', tools: [{ name: 'search' }] };
+    const diff = diffLayers(left, right);
+    const { getByTestId } = render(<JsonPane label="C" value={right} diff={diff} side="right" />);
+    const code = getByTestId('jsonpane-code-C');
+    // The container line AND each nested line under the new subtree carry an added tint.
+    expect((code.querySelector('.json-line[data-path="$.tools"]') as HTMLElement)?.dataset.diff).toBe('added');
+    expect((code.querySelector('.json-line[data-path="$.tools[0]"]') as HTMLElement)?.dataset.diff).toBe('added');
+    expect((code.querySelector('.json-line[data-path="$.tools[0].name"]') as HTMLElement)?.dataset.diff).toBe('added');
+  });
+
   it('shows the evicted placeholder (not undefined) when the body is absent', () => {
     const { getByTestId, queryByTestId } = render(<JsonPane label="C" value={undefined} emptyLabel="body evicted" />);
     expect(getByTestId('jsonpane-empty-C').textContent).toBe('body evicted');

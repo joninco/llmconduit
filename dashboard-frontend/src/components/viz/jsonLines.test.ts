@@ -27,4 +27,13 @@ describe('toJsonLines — path-tagged pretty-print', () => {
   it('returns NO lines for undefined (evicted body placeholder handled by caller)', () => {
     expect(toJsonLines(undefined)).toEqual([]);
   });
+
+  it('encodes a key containing a dot the SAME way the diff does (finding 6)', () => {
+    // The serializer shares `pathKey` with the diff, so a dotted key tags as `$["a.b"]` —
+    // matching the diff map key, so the tint for that line still lands.
+    const lines = toJsonLines({ 'a.b': 1 });
+    const paths = new Set(lines.map((l) => l.path));
+    expect(paths.has('$["a.b"]')).toBe(true);
+    expect(paths.has('$.a.b')).toBe(false);
+  });
 });

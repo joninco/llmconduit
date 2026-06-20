@@ -51,13 +51,38 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   const sync = useScrollSync(3);
   const isActive = status === 'open';
 
+  // Cost from the MERGED flow+detail data: prefer the server roll-up (detail.cost, else the live
+  // row's cost), and only fall back to usage×price when neither roll-up exists. Building a merged
+  // summary (live status/usage wins; roll-up cost + detail fields fill gaps) lets `flowCost` apply
+  // its own roll-up-first precedence, so a live row LACKING cost no longer hides `detail.cost`
+  // (finding 4).
+  const cost = useMemo(() => {
+    if (!liveFlow && !detail) return null;
+    const merged: FlowSummary = {
+      ...(detail ?? {}),
+      ...(liveFlow ?? {}),
+      api_call_id: apiCallId,
+      method: liveFlow?.method ?? 'POST',
+      uri: liveFlow?.uri ?? '',
+      status: status ?? liveFlow?.status ?? detail?.status ?? 'open',
+      started_ms: liveFlow?.started_ms ?? detail?.started_ms ?? 0,
+      // Roll-up precedence: server detail roll-up first, then the live row's own roll-up.
+      cost: detail?.cost ?? liveFlow?.cost ?? null,
+      // Freshest usage/model for the usage×price fallback: live row first, then detail.
+      usage: liveFlow?.usage ?? detail?.usage ?? null,
+      model_served: liveFlow?.model_served ?? detail?.model_served ?? null,
+      model_requested: liveFlow?.model_requested ?? detail?.model_requested ?? null,
+    };
+    return flowCost(merged, priceTable);
+  }, [liveFlow, detail, apiCallId, status, priceTable]);
+
   return (
     <section className="flex min-h-0 w-[46%] min-w-[420px] flex-col border-l border-line bg-panel" data-testid="flow-detail" aria-label="flow detail">
       <DetailHeader
         apiCallId={apiCallId}
         flow={liveFlow}
         detail={detail}
-        cost={liveFlow ? flowCost(liveFlow, priceTable) : detail?.cost ?? null}
+        cost={cost}
         seeking={seeking}
         isActive={isActive}
         mutationsEnabled={mutationsEnabled}

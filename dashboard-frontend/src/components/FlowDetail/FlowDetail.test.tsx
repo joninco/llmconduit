@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, waitFor, within } from '@testing-library/react
 import { FlowDetail } from './FlowDetail';
 import { dashboardStore } from '../../store/dashboardStore';
 import { authStore } from '../../store/authStore';
-import { mockKillLog } from '../../api/mock';
+import { mockKillLog, MOCK_KILL_UNAUTHORIZED_ID } from '../../api/mock';
 import { makeFlow, renderWithQuery, resetWorld, seedFlows } from '../testHarness';
 import type { DebugWsMessage, FlowDetail as FlowDetailDto } from '../../api/types';
 
@@ -97,6 +97,32 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     // Forbidden state surfaces and the optimistic flip is rolled back to open.
     await waitFor(() => expect(getByTestId('kill-forbidden')).toBeTruthy());
     expect(dashboardStore.getState().flows.get('api_001')?.status).toBe('open');
+  });
+
+  it('a 401 kill lets teardown win: the store stays CLEARED, the prior row is NOT re-inserted (finding 1)', async () => {
+    // Seed an OPEN flow whose kill route answers 401 (session raced expiry). A valid CSRF is
+    // present, so the request reaches the server and comes back 401 → centralized teardown clears
+    // the live store. The optimistic rollback must NOT re-insert the prior row afterwards.
+    seedFlows([makeFlow({ api_call_id: MOCK_KILL_UNAUTHORIZED_ID, status: 'open', started_ms: 1_700_000_000_000 })]);
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId={MOCK_KILL_UNAUTHORIZED_ID} onClose={noop} />);
+    await waitFor(() => expect(getByTestId('kill-button')).toBeTruthy());
+    expect(dashboardStore.getState().flows.get(MOCK_KILL_UNAUTHORIZED_ID)).toBeTruthy();
+
+    fireEvent.click(getByTestId('kill-button'));
+
+    // The 401 routed through teardown (stores reset); the rollback did not re-leak the row.
+    await waitFor(() => expect(dashboardStore.getState().flows.size).toBe(0));
+    expect(dashboardStore.getState().flows.get(MOCK_KILL_UNAUTHORIZED_ID)).toBeUndefined();
+  });
+
+  it('detail cost roll-up shows even when the live row carries no cost (finding 4)', async () => {
+    // api_001's live row (seeded in beforeEach) has NO cost/usage; the mock /flows/:id detail
+    // carries the server roll-up cost. The header must surface that roll-up, not "—".
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    // Wait for the detail query (with the roll-up cost) to resolve.
+    await waitFor(() => expect(getByTestId('jsonpane-code-A · inbound').querySelectorAll('.json-line').length).toBeGreaterThan(0));
+    // The seeded mock detail cost for api_001 is 0.0061 → formatted into the cost/elapsed cell.
+    await waitFor(() => expect(getByTestId('flow-detail').textContent).toContain('$0.0061'));
   });
 
   it('kill button is gated OFF (disabled, no POST) when mutations are disabled', async () => {

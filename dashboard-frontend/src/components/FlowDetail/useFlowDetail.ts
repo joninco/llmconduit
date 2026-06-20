@@ -69,12 +69,17 @@ export function useFlowDetail(apiCallId: string | null) {
       return { prev };
     },
     onError: (err: unknown, _id, ctx) => {
-      // Roll back the optimistic flip.
-      if (ctx?.prev) dashboardStore.getState().upsertFlow(ctx.prev);
       if (err instanceof UnauthorizedError) {
-        // The client already routed the 401 through teardown; reflect a generic error.
+        // A 401 already routed through centralized teardown (connection.ts), which CLEARED the
+        // live store. Rolling back here would re-insert the optimistic row's prior value into the
+        // now-cleared store — leaking session data past the auth boundary. So on 401 we do NOT
+        // roll back; teardown wins. Reflect a generic expired-session error.
         setKillState({ phase: 'error', message: 'session expired' });
-      } else if (isForbidden(err)) {
+        return;
+      }
+      // Non-auth failure (e.g. 403): the store was NOT torn down, so undo the optimistic flip.
+      if (ctx?.prev) dashboardStore.getState().upsertFlow(ctx.prev);
+      if (isForbidden(err)) {
         // 403 = mutations disabled / bad CSRF (D7). Distinct UI from a generic failure.
         setKillState({ phase: 'forbidden' });
       } else {

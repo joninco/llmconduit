@@ -25,12 +25,27 @@ export type DiffKind = 'added' | 'removed' | 'changed' | 'unchanged';
  */
 export type DiffMap = ReadonlyMap<string, DiffKind>;
 
-/** Root path token; every other path is built by appending `.key` or `[i]`. */
+/** Root path token; every other path is built by appending a key or `[i]` segment. */
 export const ROOT_PATH = '$';
 
-/** Appends an object-key segment to a path (`$` + `model` → `$.model`). */
+/**
+ * A key is "simple" when it contains none of the path metacharacters (`.`, `[`, `]`) and is
+ * non-empty. Simple keys append as the readable `.key` form; any other key (one carrying a dot
+ * or bracket, or empty) is bracket + JSON-string encoded as `["<json>"]` so it cannot collide
+ * with the nested-path syntax — `{"a.b":…}` and `{"a":{"b":…}}` get DISTINCT paths (finding 6).
+ */
+function isSimpleKey(key: string): boolean {
+  return key.length > 0 && !/[.[\]]/.test(key);
+}
+
+/**
+ * Appends an object-key segment to a path. Simple keys → `$.model`; keys containing a
+ * metacharacter (or empty) → bracket/JSON-string encoded `$["a.b"]` so dotted/bracketed keys
+ * stay unambiguous (finding 6). `jsonLines` imports this so serialization + diff classification
+ * key paths IDENTICALLY (no second encoder to drift).
+ */
 export function pathKey(base: string, key: string): string {
-  return `${base}.${key}`;
+  return isSimpleKey(key) ? `${base}.${key}` : `${base}[${JSON.stringify(key)}]`;
 }
 
 /** Appends an array-index segment to a path (`$.messages` + 0 → `$.messages[0]`). */
@@ -65,11 +80,14 @@ function leafEqual(a: unknown, b: unknown): boolean {
  */
 function walk(path: string, left: unknown, right: unknown, leftHas: boolean, rightHas: boolean, out: Map<string, DiffKind>): void {
   if (leftHas && !rightHas) {
-    out.set(path, 'removed');
+    // The WHOLE left subtree was dropped: mark this path AND every descendant `removed` so the
+    // left pane tints every line of the gone subtree, not just its opening brace (finding 3).
+    markSubtree(path, left, 'removed', out);
     return;
   }
   if (!leftHas && rightHas) {
-    out.set(path, 'added');
+    // The whole right subtree is new: mark this path + every descendant `added` (finding 3).
+    markSubtree(path, right, 'added', out);
     return;
   }
   // Present in both — compare shape then content.
@@ -98,6 +116,24 @@ function walk(path: string, left: unknown, right: unknown, leftHas: boolean, rig
   }
   // At least one side is a scalar, OR the container TYPES differ (object vs array vs scalar).
   out.set(path, leafEqual(left, right) ? 'unchanged' : 'changed');
+}
+
+/**
+ * Marks `path` and EVERY descendant path of `value` with `kind`. Used when a whole subtree is
+ * added or removed (present on only one side): the parent alone is not enough, because `JsonPane`
+ * tints per serialized LINE and the subtree's children each render their own line. Walking the
+ * value with the SAME path scheme (`pathKey`/`pathIndex`) as `jsonLines` guarantees every emitted
+ * line finds its tint (finding 3).
+ */
+function markSubtree(path: string, value: unknown, kind: DiffKind, out: Map<string, DiffKind>): void {
+  out.set(path, kind);
+  if (isPlainObject(value)) {
+    for (const key of Object.keys(value)) {
+      markSubtree(pathKey(path, key), value[key], kind, out);
+    }
+  } else if (Array.isArray(value)) {
+    value.forEach((el, i) => markSubtree(pathIndex(path, i), el, kind, out));
+  }
 }
 
 /**

@@ -36,13 +36,18 @@ function mergeRows(
   flows: Map<string, FlowSummary>,
   queryFlows: FlowSummary[],
 ): FlowSummary[] {
+  // Index the REST list by api_call_id so a live row can re-adopt the server-only roll-up
+  // fields the WS frame does not carry (finding 5).
+  const restById = new Map(queryFlows.map((f) => [f.api_call_id, f]));
   const seen = new Set<string>();
   const merged: FlowSummary[] = [];
-  // Live rows first, in store order (newest-prepended ⇒ already newest-first).
+  // Live rows first, in store order (newest-prepended ⇒ already newest-first). The live row's
+  // status/usage WIN, but `cost`/`terminal_reason` fall back to the REST roll-up when the live
+  // frame lacks them — so a live update never blanks the server's cost/terminal_reason.
   for (const id of order) {
     const f = flows.get(id);
     if (f) {
-      merged.push(f);
+      merged.push(mergeLiveWithRest(f, restById.get(id)));
       seen.add(id);
     }
   }
@@ -50,6 +55,23 @@ function mergeRows(
   const extras = queryFlows.filter((f) => !seen.has(f.api_call_id)).sort((a, b) => b.started_ms - a.started_ms);
   merged.push(...extras);
   return merged;
+}
+
+/**
+ * Live row wins on status/usage/timing (the socket is freshest), but RETAINS the REST roll-up
+ * fields (`cost`, `terminal_reason`) when the live row's are absent (null/undefined). The
+ * `flow_status` store patch defaults these to null until a frame carries them, so without this a
+ * live update would drop the server's cost/terminal_reason (finding 5). Returns the live row
+ * unchanged when there is no REST counterpart or nothing to backfill.
+ */
+function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): FlowSummary {
+  if (!rest) return live;
+  const cost = live.cost ?? rest.cost ?? null;
+  const terminalReason = live.terminal_reason ?? rest.terminal_reason ?? null;
+  if (cost === (live.cost ?? null) && terminalReason === (live.terminal_reason ?? null)) {
+    return live; // nothing to backfill — avoid a needless object churn
+  }
+  return { ...live, cost, terminal_reason: terminalReason };
 }
 
 function applyFilters(rows: FlowSummary[], f: FlowFilters): FlowSummary[] {
@@ -70,15 +92,17 @@ function distinct(rows: FlowSummary[], pick: (r: FlowSummary) => (string | null 
 export function useFlowRows(filters: FlowFilters): FlowRowsResult {
   const order = useDashboard((s) => s.flowOrder);
   const flows = useDashboard((s) => s.flows);
-  const { client, mock } = getConnection();
+  const { client } = getConnection();
 
-  // The REST list. WS `flow` frames invalidate `queryKeys.flows` (connection.ts), so this
-  // refetches when the server list changes. In tests without a server it simply stays empty.
+  // The REST list — the PRODUCTION data source for the table. It seeds rows the live store has
+  // not seen and carries the server-only roll-up fields (cost/terminal_reason). WS `flow` frames
+  // invalidate `queryKeys.flows` (connection.ts), so it refetches when the server list changes.
+  // Enabled for BOTH the real backend (where it is authoritative) and the mock (its `mockFetch`
+  // answers `/flows`). Component tests that drive the store directly seed `resetWorld()` with a
+  // real bootstrap and no live server, so the fetch simply fails/stays empty without churn.
   const query = useQuery({
     queryKey: queryKeys.flows,
     queryFn: () => client.flows(),
-    // Under the mock the live store is the primary driver; keep the REST poll quiet.
-    enabled: mock,
   });
   const queryData = query.data;
 

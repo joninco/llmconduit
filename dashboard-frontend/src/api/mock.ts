@@ -149,6 +149,12 @@ function json(body: unknown, status = 200): Response {
 /** Captures kill POSTs so tests can assert the CSRF header round-tripped. */
 export const mockKillLog: { id: string; csrf: string | null }[] = [];
 
+/**
+ * Reserved api_call_id whose kill route answers 401 (with a valid CSRF) — models a kill that
+ * races a session expiry. Lets the 401-teardown path be driven through the real client wiring.
+ */
+export const MOCK_KILL_UNAUTHORIZED_ID = 'api_session_expired';
+
 /** A `fetch`-compatible mock answering D13 REST + D7 auth. */
 export const mockFetch: typeof fetch = async (input, init): Promise<Response> => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
@@ -172,6 +178,9 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     const csrf = headerValue(init?.headers, 'X-CSRF-Token');
     mockKillLog.push({ id, csrf });
     if (!csrf) return json({ error: 'missing csrf' }, 403);
+    // Test affordance: the reserved id `api_session_expired` models a kill that races a
+    // session loss → 401, so the auth-teardown-vs-rollback contract can be exercised end to end.
+    if (id === MOCK_KILL_UNAUTHORIZED_ID) return json({ error: 'unauthorized' }, 401);
     if (!isSeededApiCallId(id)) return json({ error: 'unknown api_call_id' }, 404);
     return json({ api_call_id: id, killed: true });
   }
