@@ -304,28 +304,73 @@ upstream_model = "Kimi-K2.6"
 }
 
 /// Regression guard for G2: `template_family` still resolves through the profile
-/// chain after the G7 config changes. The most-specific matched profile wins
-/// over the global override; an unmatched model falls back to the global value.
+/// chain after the G7 config changes. Exercised through the PUBLIC upstream-leaf
+/// seam (`finalize_request_for_backend`) — the path production runs — since the
+/// per-request resolution lives at the leaf, not on `Config`. The per-model
+/// `template_family` policy wins over the global override; an unmatched model
+/// falls back to the global value. The profiled model carries a NON-family name
+/// so the per-model `kimi` override (not name sniffing) is what drives injection.
 #[test]
 fn template_family_still_resolves_through_profile_chain() {
     let config = config_from_yaml(
         r#"
 template_family: deepseek
 model_profiles:
-  "Kimi-Route":
+  "Router-X":
     template_family: kimi
 "#,
     );
-    // Profile match (case-insensitive) -> normalized profile family wins.
+    // Per-model `kimi` override -> Kimi `chat_template_kwargs` injected on the
+    // wire for `Router-X`, despite its non-Kimi name.
     assert_eq!(
-        config.resolve_template_family("kimi-route", "kimi-route"),
-        Some("kimi".to_string())
+        leaf_family_chat_template_kwargs(&config, "Router-X"),
+        serde_json::json!({"thinking": true, "preserve_thinking": true})
     );
-    // No profile match -> global override applies.
+    // No per-model policy -> global `deepseek` override applies (`enable_thinking`).
     assert_eq!(
-        config.resolve_template_family("other", "other"),
-        Some("deepseek".to_string())
+        leaf_family_chat_template_kwargs(&config, "plain-model"),
+        serde_json::json!({"enable_thinking": true})
     );
+}
+
+/// Resolve the family `chat_template_kwargs` the upstream LEAF injects for
+/// `backend_model`, via the PUBLIC seam: build the SAME finalization policies
+/// production builds (`BackendFinalizationPolicies::from_config`) and apply them
+/// through `finalize_request_for_backend` to an empty wire request. Returns the
+/// injected `chat_template_kwargs` object.
+fn leaf_family_chat_template_kwargs(config: &Config, backend_model: &str) -> serde_json::Value {
+    use llmconduit::models::chat::ChatCompletionRequest;
+    use llmconduit::upstream::BackendChatRequest;
+    use llmconduit::upstream::BackendFinalizationPolicies;
+    use llmconduit::upstream::finalize_request_for_backend;
+
+    let request = ChatCompletionRequest {
+        model: backend_model.to_string(),
+        messages: Vec::new(),
+        stream: true,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: false,
+        reasoning_effort: None,
+        response_format: None,
+        stream_options: None,
+        temperature: None,
+        top_p: None,
+        max_output_tokens: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stop: None,
+        extra_body: std::collections::BTreeMap::new(),
+    };
+    let policies = BackendFinalizationPolicies::from_config(config);
+    let mut backend = BackendChatRequest::new(request, None);
+    finalize_request_for_backend(&mut backend, &policies);
+    backend
+        .request
+        .extra_body
+        .get("chat_template_kwargs")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// `test_config` (no routes) still behaves as a non-routing gateway: this proves

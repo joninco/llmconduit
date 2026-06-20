@@ -830,23 +830,6 @@ impl Config {
             && self.fallback_upstreams.is_empty()
     }
 
-    pub fn resolve_upstream_chat_kwargs(&self, request_model: &str) -> JsonMap<String, JsonValue> {
-        let upstream_model = self.resolve_upstream_model(request_model);
-        self.resolve_upstream_chat_kwargs_for_resolved_model(request_model, &upstream_model)
-    }
-
-    pub fn resolve_upstream_chat_kwargs_for_resolved_model(
-        &self,
-        request_model: &str,
-        resolved_model: &str,
-    ) -> JsonMap<String, JsonValue> {
-        let mut kwargs = self.upstream_chat_kwargs.clone();
-        for profile in self.model_profiles_for_resolved_model(request_model, resolved_model) {
-            merge_json_maps(&mut kwargs, &profile.upstream_chat_kwargs);
-        }
-        kwargs
-    }
-
     /// Per-BACKEND-MODEL reasoning-effort policies, keyed by the resolved model
     /// id (profile name). Applied at the upstream LEAF — the single point that
     /// knows the FINAL provider model after routing/failover/exposed-alias remap
@@ -930,23 +913,6 @@ impl Config {
     /// (T1); the engine no longer pre-merges profile kwargs.
     pub fn global_upstream_chat_kwargs(&self) -> &JsonMap<String, JsonValue> {
         &self.upstream_chat_kwargs
-    }
-
-    /// Resolve an explicit backend chat-template family override for this
-    /// turn (G2). The most-specific matched model profile wins, then the
-    /// global `template_family`. Returns `None` when no override applies, in
-    /// which case the engine sniffs the resolved model id instead. Values are
-    /// already normalized to `kimi`/`deepseek` at construction time.
-    pub fn resolve_template_family(
-        &self,
-        request_model: &str,
-        resolved_model: &str,
-    ) -> Option<String> {
-        self.model_profiles_for_resolved_model(request_model, resolved_model)
-            .into_iter()
-            .rev()
-            .find_map(|profile| profile.template_family.clone())
-            .or_else(|| self.template_family.clone())
     }
 
     /// Direct, PROFILE-ONLY `native_vision` lookup for EXACTLY `model` (G4
@@ -1601,8 +1567,75 @@ mod tests {
     use super::load_persisted_config;
     use super::merge_json_maps;
     use super::write_persisted_config;
+    use crate::models::chat::ChatCompletionRequest;
+    use crate::upstream::BackendChatRequest;
+    use crate::upstream::BackendFinalizationPolicies;
+    use crate::upstream::finalize_request_for_backend;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::collections::BTreeMap as StdBTreeMap;
+
+    /// Minimal wire request for leaf-finalization tests. `backend_model` is the
+    /// FINAL provider model the leaf sees (after any routing/failover/alias
+    /// remap); the leaf resolves per-model policies against THIS id.
+    fn leaf_request(backend_model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: backend_model.to_string(),
+            messages: Vec::new(),
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: false,
+            reasoning_effort: None,
+            response_format: None,
+            stream_options: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            extra_body: StdBTreeMap::new(),
+        }
+    }
+
+    /// Resolve the FINAL `chat_template_kwargs`-bearing `extra_body` the upstream
+    /// LEAF produces for `backend_model`, exercising the REAL production path: the
+    /// policies are built via [`BackendFinalizationPolicies::from_config`] (the
+    /// single way production builds leaf policies, T1) and applied through the
+    /// public [`finalize_request_for_backend`] seam. The request carries an empty
+    /// `extra_body` and no `reasoning_effort`, so the resulting `extra_body` is
+    /// exactly the leaf's per-model `upstream_chat_kwargs` resolution: the
+    /// at-most-one per-model policy (`policy_for_model`, exact-then-canonical-
+    /// unique) layered over `global_upstream_chat_kwargs` (per-model wins on
+    /// conflict). Pick a `backend_model` that does NOT name-sniff to a family
+    /// (kimi/deepseek) so no family `chat_template_kwargs` are injected and the
+    /// returned map isolates kwargs precedence.
+    fn leaf_chat_kwargs(config: &Config, backend_model: &str) -> JsonMap<String, JsonValue> {
+        let policies = BackendFinalizationPolicies::from_config(config);
+        let mut backend = BackendChatRequest::new(leaf_request(backend_model), None);
+        finalize_request_for_backend(&mut backend, &policies);
+        backend.request.extra_body.into_iter().collect()
+    }
+
+    /// The family `chat_template_kwargs` the LEAF injects for `backend_model`,
+    /// exercising the REAL path: policies via `from_config`, applied through the
+    /// public `finalize_request_for_backend` seam. The resolved `template_family`
+    /// override (per-model policy else global) selects the family; the injected
+    /// `chat_template_kwargs` object is returned.
+    fn leaf_family_kwargs(config: &Config, backend_model: &str) -> JsonValue {
+        leaf_chat_kwargs(config, backend_model)
+            .get("chat_template_kwargs")
+            .cloned()
+            .unwrap_or(JsonValue::Null)
+    }
+
+    /// Whether the LEAF injected any `chat_template_kwargs` for `backend_model`
+    /// (i.e. a family was resolved). `false` means no per-model/global override
+    /// matched and the name did not sniff to a family.
+    fn leaf_request_has_family_kwargs(config: &Config, backend_model: &str) -> bool {
+        leaf_chat_kwargs(config, backend_model).contains_key("chat_template_kwargs")
+    }
 
     #[test]
     fn resolves_reasoning_effort_policy_from_profile_chain() {
@@ -2033,13 +2066,23 @@ model_profiles:
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
-            upstream_chat_kwargs: JsonMap::new(),
+            // Non-empty GLOBAL base: a global-only sibling key plus a nested key
+            // (`thinking`) that CONFLICTS with the per-model policy below, so the
+            // leaf precedence (per-model wins on conflict, global-only survives)
+            // is exercised, not just a per-model-over-empty-base lookup.
+            upstream_chat_kwargs: JsonMap::from_iter([(
+                "chat_template_kwargs".to_string(),
+                json!({
+                    "thinking": false,
+                    "global_only": true
+                }),
+            )]),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([(
-                "Kimi-K2.6".to_string(),
+                "Reasoner-A26".to_string(),
                 PersistedModelProfile {
                     extends: Vec::new(),
                     upstream_model: None,
@@ -2077,17 +2120,34 @@ model_profiles:
         })
         .expect("config");
 
+        // The LEAF layers the at-most-one per-model policy OVER the global base
+        // for the FINAL backend model (the profile name): the global-only key
+        // (`global_only`) survives, while the per-model value wins on the
+        // conflicting `thinking` key (per-model `true` beats global `false`).
         assert_eq!(
-            config.resolve_upstream_model("Kimi-K2.6"),
-            "Kimi-K2.6".to_string()
+            config.resolve_upstream_model("Reasoner-A26"),
+            "Reasoner-A26".to_string()
         );
         assert_eq!(
-            config.resolve_upstream_chat_kwargs("Kimi-K2.6"),
+            leaf_chat_kwargs(&config, "Reasoner-A26"),
             JsonMap::from_iter([(
                 "chat_template_kwargs".to_string(),
                 json!({
                     "thinking": true,
-                    "preserve_thinking": true
+                    "preserve_thinking": true,
+                    "global_only": true
+                }),
+            )])
+        );
+        // An unprofiled (non-family-sniffing) backend model gets ONLY the global
+        // base — no per-model policy is layered.
+        assert_eq!(
+            leaf_chat_kwargs(&config, "unprofiled-plain"),
+            JsonMap::from_iter([(
+                "chat_template_kwargs".to_string(),
+                json!({
+                    "thinking": false,
+                    "global_only": true
                 }),
             )])
         );
@@ -2104,26 +2164,41 @@ model_profiles:
 
     #[test]
     fn resolves_template_family_override_from_profile_and_global() {
+        // Profile key carries an explicit `template_family` but a name that does
+        // NOT sniff to any family, so the per-model override (not name sniffing)
+        // is what drives injection at the leaf.
         let config = Config::from_persisted(&PersistedConfig {
             template_family: Some("deepseek".to_string()),
             model_profiles: BTreeMap::from_iter([(
-                "Kimi-Route".to_string(),
+                "Router-X".to_string(),
                 profile_with_family("KIMI"),
             )]),
             ..PersistedConfig::default()
         })
         .expect("config");
 
-        // Profile match (case-insensitive on the profile key) -> normalized
-        // profile family wins over the global override.
+        // The LEAF builds per-model + global `template_family` policies via
+        // `from_config`. Per-model wins over global; the value is normalized.
         assert_eq!(
-            config.resolve_template_family("kimi-route", "kimi-route"),
-            Some("kimi".to_string())
+            config.template_family_policies(),
+            BTreeMap::from_iter([("Router-X".to_string(), "kimi".to_string())])
         );
-        // No profile match -> the global override applies.
         assert_eq!(
-            config.resolve_template_family("other", "other"),
+            config.global_template_family(),
             Some("deepseek".to_string())
+        );
+
+        // Proven on the wire through the public leaf seam: the per-model `kimi`
+        // override forces Kimi injection (`thinking: true`) for `Router-X`
+        // despite its non-Kimi name; an unmatched model falls back to the global
+        // `deepseek` override (`enable_thinking: true`).
+        assert_eq!(
+            leaf_family_kwargs(&config, "Router-X"),
+            json!({"thinking": true, "preserve_thinking": true})
+        );
+        assert_eq!(
+            leaf_family_kwargs(&config, "plain-model"),
+            json!({"enable_thinking": true})
         );
     }
 
@@ -2137,7 +2212,11 @@ model_profiles:
         })
         .expect("config");
         assert_eq!(config.template_family, None);
-        assert_eq!(config.resolve_template_family("m", "m"), None);
+        // The leaf sees neither a per-model policy nor a global override, so no
+        // family is forced for an unrecognized backend model.
+        assert!(config.template_family_policies().is_empty());
+        assert_eq!(config.global_template_family(), None);
+        assert!(!leaf_request_has_family_kwargs(&config, "m"));
 
         // A recognized value is canonicalized to lowercase.
         let config = Config::from_persisted(&PersistedConfig {
@@ -2146,6 +2225,7 @@ model_profiles:
         })
         .expect("config");
         assert_eq!(config.template_family, Some("kimi".to_string()));
+        assert_eq!(config.global_template_family(), Some("kimi".to_string()));
     }
 
     #[test]
@@ -2215,9 +2295,12 @@ model_profiles:
         })
         .expect("config");
 
+        // The LEAF's `policy_for_model` matches the profile keyed `MiMo-V2.5`
+        // against the FINAL backend model `mimo-v2.5` via canonical key (case-
+        // insensitive), surfacing that profile's `upstream_chat_kwargs`.
         assert_eq!(config.resolve_upstream_model("mimo-v2.5"), "mimo-v2.5");
         assert_eq!(
-            config.resolve_upstream_chat_kwargs("mimo-v2.5"),
+            leaf_chat_kwargs(&config, "mimo-v2.5"),
             JsonMap::from_iter([
                 ("separate_reasoning".to_string(), JsonValue::Bool(true)),
                 (
@@ -2287,8 +2370,11 @@ model_profiles:
             config.resolve_upstream_model("client-default-model"),
             "xiaomi/mimo-v2.5-pro"
         );
+        // The engine remaps the request model to the configured upstream model,
+        // and the LEAF resolves kwargs against that FINAL backend id — the
+        // profile keyed on the remap target supplies the kwargs.
         assert_eq!(
-            config.resolve_upstream_chat_kwargs("client-default-model"),
+            leaf_chat_kwargs(&config, "xiaomi/mimo-v2.5-pro"),
             JsonMap::from_iter([(
                 "reasoning".to_string(),
                 json!({
@@ -2305,7 +2391,12 @@ model_profiles:
     }
 
     #[test]
-    fn request_model_profile_overrides_upstream_model_profile_kwargs() {
+    fn leaf_resolves_only_final_model_profile_not_request_alias() {
+        // The OLD config merge layered the request-alias profile over the
+        // backend profile and produced `{enabled:true, effort:high}` — a merge
+        // the gateway NEVER runs. The REAL leaf keys kwargs by the FINAL backend
+        // model ONLY (at-most-one per-model policy over the global base), so the
+        // request-alias profile's kwargs do NOT bleed into the backend request.
         let config = Config::from_persisted(&PersistedConfig {
             bind_addr: "127.0.0.1:4010".to_string(),
             upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
@@ -2376,16 +2467,32 @@ model_profiles:
         })
         .expect("config");
 
+        // FINAL backend model is the remap target: only ITS profile's kwargs
+        // apply. The request-alias `client-default-model` profile (`effort:high`)
+        // is NOT layered, so the leaf keeps `effort: medium`.
         assert_eq!(
-            config.resolve_upstream_chat_kwargs("client-default-model"),
+            leaf_chat_kwargs(&config, "xiaomi/mimo-v2.5-pro"),
             JsonMap::from_iter([(
                 "reasoning".to_string(),
                 json!({
                     "enabled": true,
+                    "effort": "medium"
+                }),
+            )])
+        );
+        // The request-alias profile contributes ZERO kwargs at the leaf when it
+        // is not the final backend model.
+        assert_eq!(
+            leaf_chat_kwargs(&config, "client-default-model"),
+            JsonMap::from_iter([(
+                "reasoning".to_string(),
+                json!({
                     "effort": "high"
                 }),
             )])
         );
+        // The system-prompt-prefix path is UNCHANGED (still engine-side,
+        // multi-profile): the request-model profile prefix still applies.
         assert_eq!(
             config
                 .resolve_system_prompt_prefix("client-default-model")
@@ -2462,8 +2569,12 @@ model_profiles:
         .expect("config");
 
         assert_eq!(config.resolve_upstream_model("mimo-v2.5"), "lower-profile");
+        // The LEAF's `policy_for_model` prefers the EXACT-id profile over the
+        // case-insensitive (canonical-key) sibling: for FINAL backend `mimo-v2.5`
+        // the lowercase profile (`false`) wins over `MiMo-V2.5` (`true`), even
+        // though both share a canonical key.
         assert_eq!(
-            config.resolve_upstream_chat_kwargs("mimo-v2.5"),
+            leaf_chat_kwargs(&config, "mimo-v2.5"),
             JsonMap::from_iter([("stream_reasoning".to_string(), JsonValue::Bool(false))])
         );
         assert_eq!(
@@ -2602,8 +2713,11 @@ model_profiles:
             config.resolve_system_prompt_prefix("GLM-5.1").as_deref(),
             Some("Reasoning prefix.\n\nModel prefix.")
         );
+        // The per-model `upstream_chat_kwargs` are extends-merged at construction
+        // (template order: reasoning -> streaming -> profile). The LEAF surfaces
+        // that already-merged map for the FINAL backend model unchanged.
         assert_eq!(
-            config.resolve_upstream_chat_kwargs("GLM-5.1"),
+            leaf_chat_kwargs(&config, "GLM-5.1"),
             JsonMap::from_iter([
                 (
                     "reasoning".to_string(),
@@ -2640,7 +2754,7 @@ model_profile_templates:
       thinking: true
 
 model_profiles:
-  DeepSeek-V4-Pro:
+  Reasoner-D4:
     extends:
       - reasoning
     stream_reasoning: true
@@ -2656,8 +2770,11 @@ model_profiles:
         .expect("yaml");
         let config = Config::from_persisted(&persisted).expect("config");
 
+        // The profile-root shorthand keys and the explicit `upstream_chat_kwargs`
+        // wrapper are extends-merged into ONE per-model map at construction. The
+        // LEAF surfaces that map for the FINAL backend model unchanged.
         assert_eq!(
-            config.resolve_upstream_chat_kwargs("DeepSeek-V4-Pro"),
+            leaf_chat_kwargs(&config, "Reasoner-D4"),
             JsonMap::from_iter([
                 ("separate_reasoning".to_string(), JsonValue::Bool(true)),
                 ("stream_reasoning".to_string(), JsonValue::Bool(true)),
@@ -2847,10 +2964,10 @@ model_profiles:
             config.resolve_upstream_model("anthropic/Kimi-K2.6"),
             "anthropic/Kimi-K2.6"
         );
-        assert_eq!(
-            config.resolve_upstream_chat_kwargs("anthropic/Kimi-K2.6"),
-            JsonMap::new()
-        );
+        // With no profile and no global base, the LEAF resolves NO per-model
+        // `upstream_chat_kwargs` for an unprofiled (non-family-sniffing) backend
+        // model — the request passes through with an empty `extra_body`.
+        assert_eq!(leaf_chat_kwargs(&config, "vendor/plain-v1"), JsonMap::new());
     }
 
     #[test]
