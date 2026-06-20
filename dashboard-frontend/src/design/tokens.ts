@@ -1,49 +1,20 @@
 /**
- * Centralized design tokens — the SINGLE source of truth for the dark-ops palette,
- * typography, spacing, and motion. Tailwind's theme (tailwind.config.ts) and the
- * runtime CSS variables (applyTokensToRoot) both derive from this file. Do NOT
- * hardcode hex colors anywhere else in the app.
+ * Centralized design tokens for the dark-ops UI — typography, spacing, motion, and the
+ * palette/CSS-var derivation. The raw hex/font LITERALS live ONLY in ./palette.ts (a
+ * DOM-free module shared with tailwind.config.ts under the Node tsconfig) — finding 8.
+ * This module re-exports them as `colors`/`fonts`, derives the CSS vars, and owns the
+ * DOM-touching helpers (`applyTokensToRoot`, `prefersReducedMotion`). No palette literals
+ * are duplicated anywhere: index.css references the vars; Tailwind references the vars.
  *
  * Spec: D9 §"Design system tokens".
  */
+import { PALETTE, FONTS, TAILWIND_COLOR_VARS } from './palette';
 
-export const colors = {
-  /** App background. */
-  bg: '#0d0f12',
-  /** Primary panel surface. */
-  panel: '#16191e',
-  /** Raised / nested panel surface. */
-  panelRaised: '#1e2329',
-  /** Hairline borders + grid lines. */
-  line: '#2a313a',
-
-  /** Provider status — healthy / serving. */
-  statusHealthy: '#58d68d',
-  /** Provider status — cooling / degraded. */
-  statusCooling: '#f6c453',
-  /** Provider status — down / error. */
-  statusDown: '#ff6b6b',
-
-  /** Primary accent (links, active, focus). */
-  accent: '#6bb6ff',
-  /** Meta / secondary accent (reasoning, cached, annotations). */
-  meta: '#c58bd1',
-
-  /** Foreground text. */
-  text: '#e6e9ef',
-  /** Muted / secondary text. */
-  textMuted: '#8b93a1',
-
-  /** Diff tints — additive (green-ish) and removed (red-ish) washes. */
-  diffAddBg: 'rgba(88, 214, 141, 0.14)',
-  diffAddText: '#9be8b8',
-  diffRemoveBg: 'rgba(255, 107, 107, 0.14)',
-  diffRemoveText: '#ff9d9d',
-  diffContextBg: 'rgba(107, 182, 255, 0.07)',
-} as const;
+/** The palette token object (re-exported from the DOM-free single source). */
+export const colors = PALETTE;
 
 /**
- * Maps a provider health status string (the wire `ProviderStatus`) to its token color.
+ * Maps a provider health string (the wire `ProviderStatus`) to its token color.
  * Centralized so every view colors status identically.
  */
 export const STATUS_COLOR: Record<string, string> = {
@@ -56,12 +27,7 @@ export const STATUS_COLOR: Record<string, string> = {
   unknown: colors.textMuted,
 };
 
-export const fonts = {
-  /** System sans for the UI chrome. */
-  ui: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-  /** Monospace for payloads / JSON / code. */
-  mono: 'ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace',
-} as const;
+export const fonts = FONTS;
 
 /** 4px spacing grid. Index = multiples of the base unit. */
 export const SPACING_UNIT = 4;
@@ -96,25 +62,43 @@ export function prefersReducedMotion(): boolean {
 }
 
 /**
- * Flattens the token tree into CSS custom properties and applies them to a root
- * element (default: documentElement). index.css references these vars so Tailwind
- * utilities and raw CSS stay in sync with this file.
+ * THE mapping of CSS custom-property name → value, derived from the palette single source
+ * (./palette.ts). `applyTokensToRoot` writes these vars at boot; Tailwind references them
+ * via `var(--color-*)`; index.css carries no palette literals. Imperative viz (d3/uPlot/
+ * canvas) that cannot use CSS vars reads the raw values from `colors` (same literals).
+ */
+export const cssVarMap: Record<string, string> = {
+  '--color-bg': colors.bg,
+  '--color-panel': colors.panel,
+  '--color-panel-raised': colors.panelRaised,
+  '--color-line': colors.line,
+  '--color-status-healthy': colors.statusHealthy,
+  '--color-status-cooling': colors.statusCooling,
+  '--color-status-down': colors.statusDown,
+  '--color-accent': colors.accent,
+  '--color-meta': colors.meta,
+  '--color-text': colors.text,
+  '--color-text-muted': colors.textMuted,
+  '--font-ui': fonts.ui,
+  '--font-mono': fonts.mono,
+};
+
+/**
+ * Tailwind color theme (Tailwind color KEY → `var(--color-*)`), re-exported from the
+ * DOM-free palette module so tailwind.config.ts can import it under the Node tsconfig.
+ */
+export const tailwindColorVars = TAILWIND_COLOR_VARS;
+
+/**
+ * Writes every token CSS custom property onto a root element (default: documentElement)
+ * BEFORE first paint. Called once in main.tsx before `render()`, so Tailwind's
+ * `var(--color-*)` utilities resolve on the first frame. index.css holds only a single
+ * `html{background}` anti-FOUC literal as a pre-JS fallback.
  */
 export function applyTokensToRoot(root: HTMLElement = document.documentElement): void {
-  const set = (k: string, v: string) => root.style.setProperty(k, v);
-  set('--color-bg', colors.bg);
-  set('--color-panel', colors.panel);
-  set('--color-panel-raised', colors.panelRaised);
-  set('--color-line', colors.line);
-  set('--color-status-healthy', colors.statusHealthy);
-  set('--color-status-cooling', colors.statusCooling);
-  set('--color-status-down', colors.statusDown);
-  set('--color-accent', colors.accent);
-  set('--color-meta', colors.meta);
-  set('--color-text', colors.text);
-  set('--color-text-muted', colors.textMuted);
-  set('--font-ui', fonts.ui);
-  set('--font-mono', fonts.mono);
+  for (const [name, value] of Object.entries(cssVarMap)) {
+    root.style.setProperty(name, value);
+  }
 }
 
 export const tokens = {

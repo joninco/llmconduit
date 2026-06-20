@@ -5,26 +5,39 @@
  *  - snapshot-then-live: the first server message is a full `SnapshotFrame`; everything
  *    after is a batched `DashboardFrame`.
  *  - decode the batched envelope `DashboardFrame { domain, seq, batch }`.
+ *  - **validate before applying** (finding 6): the WHOLE frame (envelope + every payload
+ *    arm) is validated against the runtime guards BEFORE any cursor or store mutation, so
+ *    a malformed frame is dropped wholesale WITHOUT advancing the cursor (stays replayable).
  *  - **per-domain whole-frame dedup**: a frame with `seq <= last_seq[domain]` is dropped
  *    WHOLESALE (the entire batch); `seq > last_seq[domain]` is processed and advances the
- *    cursor. Because the Monitor frame carries ONE envelope per `DebugUpdate` (its `batch`
- *    = all sibling `DebugWsMessage`s under one `sequence`), no sibling is ever dropped.
- *  - feed the zustand dashboard store.
+ *    cursor. The Monitor frame carries ONE envelope per `DebugUpdate` (its `batch` = all
+ *    sibling `DebugWsMessage`s under one `sequence`), so no sibling is ever dropped.
+ *  - feed the zustand dashboard store; notify `onFrameApplied(domain)` AFTER an accepted
+ *    frame so the composition root can drive TanStack Query invalidation (finding 10).
+ *  - auth failure handling (finding 3): a rejected WS upgrade surfaces as an error or an
+ *    ABNORMAL close (not a clean 1000) — both bounce to login via `onUnauthorized`.
+ *  - reconnect safety (finding 4): each opened socket carries a generation id; every
+ *    callback is guarded by an identity check so a late `close`/`error` from an OLD socket
+ *    cannot clobber a freshly reconnected one (StrictMode mount→unmount→remount).
  *  - D11 time-travel: `seek()` pauses applying live frames and shadow-buffers them;
  *    `live()` resumes by replaying the buffered frames in order.
  *
  * Transport-agnostic: a `WebSocketFactory` is injected so the mock + tests supply a
- * fake socket. The dedup/apply logic is the unit under test.
+ * fake socket. The validate/dedup/apply logic is the unit under test.
  */
 import type {
   DashboardFrame,
   DashboardPayload,
   Domain,
   SnapshotFrame,
-  WsServerMessage,
 } from './types';
-import { assertNever } from './types';
+import { assertNever, isDashboardFrame, isSnapshotFrame, monitorMessage } from './types';
 import { dashboardStore } from '../store/dashboardStore';
+
+/** Clean WS close code (RFC 6455 §7.4.1). Anything else after open == abnormal. */
+const WS_NORMAL_CLOSE = 1000;
+/** Our convention for an explicit auth/expiry close from the server. */
+const WS_AUTH_CLOSE = 4401;
 
 /** Minimal structural subset of `WebSocket` we depend on (eases mocking). */
 export interface WsLike {
@@ -41,8 +54,10 @@ export type WebSocketFactory = (url: string) => WsLike;
 export interface DashboardSocketOptions {
   url?: string;
   factory?: WebSocketFactory;
-  /** Called on a WS-level 401/close-with-auth so the shell bounces to login. */
+  /** Called on a WS auth failure (upgrade reject / abnormal close / error) → bounce to login. */
   onUnauthorized?: () => void;
+  /** Fired AFTER an accepted (post-dedup) frame so the caller can invalidate REST queries. */
+  onFrameApplied?: (domain: Domain) => void;
   /** Store the socket feeds. Defaults to the singleton dashboard store. */
   store?: typeof dashboardStore;
 }
@@ -53,9 +68,15 @@ export class DashboardSocket {
   private readonly url: string;
   private readonly factory: WebSocketFactory;
   private readonly onUnauthorized: (() => void) | undefined;
+  private readonly onFrameApplied: ((domain: Domain) => void) | undefined;
   private readonly store: typeof dashboardStore;
 
   private ws: WsLike | null = null;
+  /** Monotonic id of the CURRENT socket; stale-callback guard compares against it. */
+  private generation = 0;
+  /** Whether the current socket reached a clean/auth close (so error after that is ignored). */
+  private closedCleanly = false;
+
   /** Per-domain dedup cursors. */
   private lastSeq: LastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0 };
   /** Whether the initial snapshot has been applied (gates live frames). */
@@ -69,6 +90,7 @@ export class DashboardSocket {
     this.url = opts.url ?? defaultWsUrl();
     this.factory = opts.factory ?? ((u: string) => new WebSocket(u) as unknown as WsLike);
     this.onUnauthorized = opts.onUnauthorized;
+    this.onFrameApplied = opts.onFrameApplied;
     this.store = opts.store ?? dashboardStore;
   }
 
@@ -77,34 +99,83 @@ export class DashboardSocket {
     if (this.ws) return;
     this.store.getState().setConnection('connecting');
     const ws = this.factory(this.url);
+    // This socket's identity. Every callback below checks `this.ws === ws` (and the
+    // generation) so a late event from a REPLACED socket is ignored (finding 4).
+    const gen = ++this.generation;
     this.ws = ws;
+    this.closedCleanly = false;
+
+    const isCurrent = () => this.ws === ws && this.generation === gen;
+
     ws.onopen = () => {
-      // Live state begins after the snapshot is applied; mark 'live' on first snapshot.
+      if (!isCurrent()) return;
+      // Live state begins after the snapshot is applied; marked 'live' there.
     };
-    ws.onmessage = (ev) => this.handleRaw(ev.data);
+    ws.onmessage = (ev) => {
+      if (!isCurrent()) return;
+      this.handleRaw(ev.data);
+    };
     ws.onclose = (ev) => {
-      // 4401 is our convention for an auth/expiry close (cookie exp passed, bad origin).
-      if (ev?.code === 4401) {
-        this.onUnauthorized?.();
-        this.store.getState().setConnection('error');
-      } else {
-        this.store.getState().setConnection('closed');
-      }
+      // A close from a stale socket must NOT touch current state (finding 4).
+      if (!isCurrent()) return;
+      const code = ev?.code;
+      this.detach(ws);
       this.ws = null;
+      this.closedCleanly = true;
+      if (code === WS_AUTH_CLOSE) {
+        // Explicit auth/expiry close → bounce to login.
+        this.store.getState().setConnection('error');
+        this.onUnauthorized?.();
+      } else if (code === undefined || code === WS_NORMAL_CLOSE) {
+        // Clean close (our own disconnect, or server 1000).
+        this.store.getState().setConnection('closed');
+      } else {
+        // ABNORMAL close (e.g. 1006) — an upgrade reject / dropped session surfaces here,
+        // NOT as a clean 4401. Treat as an auth failure and bounce to login (finding 3).
+        this.store.getState().setConnection('error');
+        this.onUnauthorized?.();
+      }
     };
     ws.onerror = () => {
+      if (!isCurrent()) return;
+      // A handshake/upgrade failure fires `error` (often with no usable close frame).
+      // Treat it as an auth failure → bounce to login (finding 3). Guard against a
+      // duplicate bounce if a close already handled it.
+      if (this.closedCleanly) return;
+      this.detach(ws);
+      this.ws = null;
+      this.closedCleanly = true;
       this.store.getState().setConnection('error');
+      this.onUnauthorized?.();
     };
   }
 
   /** Closes the socket and resets dedup/snapshot/buffer state. */
   disconnect(): void {
-    this.ws?.close();
-    this.ws = null;
+    const ws = this.ws;
+    if (ws) {
+      this.detach(ws);
+      this.ws = null;
+      // Bump generation so any in-flight callback for `ws` is treated as stale.
+      this.generation++;
+      try {
+        ws.close(WS_NORMAL_CLOSE);
+      } catch {
+        // ignore — already closing/closed
+      }
+    }
     this.snapshotApplied = false;
     this.paused = false;
     this.shadowBuffer = [];
     this.lastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0 };
+  }
+
+  /** Detaches all handlers from a socket so it can never call back into the instance. */
+  private detach(ws: WsLike): void {
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onclose = null;
+    ws.onerror = null;
   }
 
   /** Current per-domain dedup cursors (for tests / display). */
@@ -146,32 +217,40 @@ export class DashboardSocket {
 
   /** Decodes a raw WS payload (string or already-parsed object) and routes it. */
   private handleRaw(data: unknown): void {
-    let msg: WsServerMessage;
+    let parsed: unknown;
     try {
-      msg = typeof data === 'string' ? (JSON.parse(data) as WsServerMessage) : (data as WsServerMessage);
+      parsed = typeof data === 'string' ? JSON.parse(data) : data;
     } catch {
-      // Malformed frame: ignore (defensive — a bad frame must not crash the pipe).
+      // Malformed JSON: ignore (a bad frame must not crash the pipe or advance a cursor).
       return;
     }
-    this.handleMessage(msg);
+    this.handleParsed(parsed);
   }
 
-  /** Public for tests: route a decoded server message (snapshot or batched frame). */
-  handleMessage(msg: WsServerMessage): void {
-    if (isSnapshot(msg)) {
-      this.applySnapshotMessage(msg);
+  /**
+   * Public for tests: route an UNTRUSTED decoded value. Snapshots and frames are validated
+   * before anything mutates. Anything that fails validation is dropped silently.
+   */
+  handleParsed(parsed: unknown): void {
+    if (isSnapshotFrame(parsed)) {
+      this.applySnapshotMessage(parsed);
       return;
     }
+    if (!isDashboardFrame(parsed)) {
+      // Not a valid frame → drop. No cursor moves, no store mutation (finding 6).
+      return;
+    }
+    const frame: DashboardFrame = parsed;
     // A live frame before the snapshot is buffered until the snapshot lands.
     if (!this.snapshotApplied) {
-      this.shadowBuffer.push(msg);
+      this.shadowBuffer.push(frame);
       return;
     }
     if (this.paused) {
-      this.shadowBuffer.push(msg);
+      this.shadowBuffer.push(frame);
       return;
     }
-    this.applyFrame(msg);
+    this.applyFrame(frame);
   }
 
   private applySnapshotMessage(snap: SnapshotFrame): void {
@@ -200,22 +279,32 @@ export class DashboardSocket {
   }
 
   /**
-   * Applies one batched frame with per-domain whole-frame dedup. Returns true if the
-   * frame was applied, false if it was dropped as stale.
+   * Applies one batched frame. Order of operations (finding 6):
+   *   1. VALIDATE the whole frame (envelope + every payload). Invalid → drop, NO mutation.
+   *   2. Dedup: `seq <= cursor` → drop the whole batch, cursor unchanged.
+   *   3. Advance the cursor, apply every payload, then notify `onFrameApplied`.
+   * Returns true if the frame was applied, false if dropped (stale or invalid).
    */
-  applyFrame(frame: DashboardFrame): boolean {
-    const cursor = this.lastSeq[frame.domain];
-    // Whole-frame dedup: a stale or duplicate seq drops the ENTIRE batch.
-    if (frame.seq <= cursor) {
+  applyFrame(frame: unknown): boolean {
+    // (1) Validate BEFORE touching any cursor/store. A partially-valid frame is rejected
+    // wholesale so it never half-applies and stays replayable on a later valid resend.
+    if (!isDashboardFrame(frame)) {
       return false;
     }
-    this.lastSeq[frame.domain] = frame.seq;
+    const valid: DashboardFrame = frame;
+    const cursor = this.lastSeq[valid.domain];
+    // (2) Whole-frame dedup: a stale or duplicate seq drops the ENTIRE batch.
+    if (valid.seq <= cursor) {
+      return false;
+    }
+    // (3) Accept: advance cursor, apply every payload (no sibling dropped), then notify.
+    this.lastSeq[valid.domain] = valid.seq;
     const store = this.store.getState();
-    store.setCursor(domainToCursorKey(frame.domain), frame.seq);
-    // Every payload in the batch is applied — no sibling dropped.
-    for (const payload of frame.batch) {
+    store.setCursor(domainToCursorKey(valid.domain), valid.seq);
+    for (const payload of valid.batch) {
       this.applyPayload(payload);
     }
+    this.onFrameApplied?.(valid.domain);
     return true;
   }
 
@@ -224,7 +313,8 @@ export class DashboardSocket {
     const store = this.store.getState();
     switch (payload.type) {
       case 'monitor':
-        store.pushMonitor(payload.message);
+        // Flattened wire form: extract the DebugWsMessage half (see types WIRE CONTRACT).
+        store.pushMonitor(monitorMessage(payload));
         return;
       case 'usage':
         store.patchUsage(payload.response_id, {
@@ -272,10 +362,6 @@ export class DashboardSocket {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-function isSnapshot(msg: WsServerMessage): msg is SnapshotFrame {
-  return (msg as SnapshotFrame).type === 'snapshot';
-}
 
 function domainToCursorKey(domain: Domain): 'flow_seq' | 'metrics_seq' | 'topology_seq' | 'monitor_seq' {
   switch (domain) {

@@ -108,7 +108,20 @@ export function buildMonitorFrame(seq = 6, responseId = 'resp_001'): DashboardFr
   return {
     domain: 'monitor',
     seq,
-    batch: siblings.map((message): DashboardPayload => ({ type: 'monitor', message })),
+    // FLATTENED wire form: DebugWsMessage fields inline alongside `type:'monitor'`
+    // (see types.ts WIRE CONTRACT) — no nested `message` wrapper.
+    batch: siblings.map((m): DashboardPayload => ({ type: 'monitor', ...m })),
+  };
+}
+
+/** A standalone `usage` frame (flow domain) — exercises the `usage` payload arm (finding 9). */
+export function buildUsageFrame(seq: number, responseId = 'resp_001'): DashboardFrame {
+  return {
+    domain: 'flow',
+    seq,
+    batch: [
+      { type: 'usage', response_id: responseId, prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 16 },
+    ],
   };
 }
 
@@ -248,10 +261,13 @@ export class MockWebSocket implements WsLike {
   private start(): void {
     this.onopen?.({});
     this.deliver(buildSnapshot());
-    // Stagger live frames.
+    // Stagger live frames. flow_status THEN a standalone usage frame (finding 9: the
+    // `usage` payload arm must be exercised on the live path), both flow-domain so their
+    // seqs stay monotonic.
     let t = 50;
     const live: WsServerMessage[] = [
       this.flowFrame(),
+      buildUsageFrame(++this.seq.flow),
       this.metricsFrame(),
       this.topologyFrame(),
       buildMonitorFrame(++this.seq.monitor),

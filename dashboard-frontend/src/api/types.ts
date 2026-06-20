@@ -60,12 +60,39 @@ export interface DebugWsMessage {
 
 // ---------------------------------------------------------------------------
 // DashboardPayload — the discriminated union (D7). Discriminant: `type`.
+//
+// WIRE CONTRACT (frozen target for D7 — the Rust side MUST match this):
+//   The Rust `DashboardPayload` enum is serialized INTERNALLY TAGGED via
+//   `#[serde(tag = "type", rename_all = "snake_case")]`. With internal tagging serde
+//   FLATTENS a newtype variant's inner struct fields alongside the tag, so
+//   `Monitor(DebugWsMessage)` serializes as:
+//       { "type": "monitor", "kind": "...", "response_id": "...", "sequence": N,
+//         "payload": <any>, "ts_ms": N }
+//   i.e. the `DebugWsMessage` fields are INLINE next to `type` — there is NO nested
+//   `{ "message": {...} }` wrapper. `MonitorPayload` below therefore extends
+//   `DebugWsMessage` (flattened), and the decoder reads the message fields off the
+//   payload object directly. The other arms are plain internally-tagged structs.
+//   The golden fixture in `ws.fixtures.ts` is the exact byte-for-byte target D7 emits.
 // ---------------------------------------------------------------------------
 
-export interface MonitorPayload {
+/**
+ * The Monitor arm: one per `DebugWsMessage` in the originating `DebugUpdate` batch.
+ * FLATTENED — the `DebugWsMessage` fields sit inline alongside the `type` discriminant
+ * (see the WIRE CONTRACT note above). `monitorMessage()` extracts the message half.
+ */
+export interface MonitorPayload extends DebugWsMessage {
   type: 'monitor';
-  /** One `DebugWsMessage` per message in the originating `DebugUpdate` batch. */
-  message: DebugWsMessage;
+}
+
+/** Extracts the `DebugWsMessage` carried (flattened) inside a `MonitorPayload`. */
+export function monitorMessage(p: MonitorPayload): DebugWsMessage {
+  return {
+    kind: p.kind,
+    response_id: p.response_id,
+    sequence: p.sequence,
+    payload: p.payload,
+    ts_ms: p.ts_ms,
+  };
 }
 
 export interface UsagePayload {
@@ -325,6 +352,83 @@ export interface DashboardBootstrap {
   authenticated: boolean;
   csrf_token: string | null;
   mutations_enabled: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime validation (the WS pipe must NOT trust the wire — D9 finding 6).
+// A frame is validated WHOLLY (envelope + every payload arm) BEFORE the socket
+// touches any cursor or store, so a malformed frame drops without partial apply.
+// ---------------------------------------------------------------------------
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+function isNum(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+function isStr(v: unknown): v is string {
+  return typeof v === 'string';
+}
+
+const DOMAINS: readonly Domain[] = ['flow', 'metrics', 'topology', 'monitor'];
+export function isDomain(v: unknown): v is Domain {
+  return isStr(v) && (DOMAINS as readonly string[]).includes(v);
+}
+
+function isUsageOrNull(v: unknown): v is Usage | null {
+  if (v === null) return true;
+  return isObj(v) && isNum(v.prompt) && isNum(v.completion) && isNum(v.total) && isNum(v.cached) && isNum(v.reasoning);
+}
+
+function isMetricWindow(v: unknown): v is MetricWindow {
+  return (
+    isObj(v) && isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
+    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min)
+  );
+}
+
+/** Validates a single decoded payload against its `type` arm. */
+export function isDashboardPayload(v: unknown): v is DashboardPayload {
+  if (!isObj(v) || !isStr(v.type)) return false;
+  switch (v.type) {
+    case 'monitor':
+      // Flattened DebugWsMessage: `kind` is the only required field.
+      return isStr(v.kind);
+    case 'usage':
+      return isStr(v.response_id) && isNum(v.prompt) && isNum(v.completion) && isNum(v.total) && isNum(v.cached) && isNum(v.reasoning);
+    case 'metric_tick':
+      return (
+        isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
+        isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
+        isObj(v.windows) && isMetricWindow(v.windows.m1) && isMetricWindow(v.windows.m5) && isMetricWindow(v.windows.h1)
+      );
+    case 'flow_status':
+      return isStr(v.response_id) && isStr(v.status) && isStr(v.served_model) && isStr(v.upstream_target) && isUsageOrNull(v.usage) && isNum(v.elapsed_ms);
+    case 'topology_update':
+      return Array.isArray(v.nodes) && Array.isArray(v.edges) && v.nodes.every(isProviderHealth) && v.edges.every(isTopologyEdge);
+    default:
+      return false;
+  }
+}
+
+function isProviderHealth(v: unknown): v is ProviderHealth {
+  return isObj(v) && isStr(v.id) && isStr(v.name) && isStr(v.status) && isNum(v.in_flight) && isNum(v.error_streak) && isNum(v.tokens_per_sec);
+}
+function isTopologyEdge(v: unknown): v is TopologyEdge {
+  return isObj(v) && isStr(v.from) && isStr(v.to) && isNum(v.throughput) && isNum(v.tokens_per_sec) && isNum(v.cost_per_sec);
+}
+
+/** Validates the whole batched envelope: domain + seq + EVERY payload in the batch. */
+export function isDashboardFrame(v: unknown): v is DashboardFrame {
+  return (
+    isObj(v) && isDomain(v.domain) && isNum(v.seq) &&
+    Array.isArray(v.batch) && v.batch.every(isDashboardPayload)
+  );
+}
+
+/** Validates a snapshot envelope (loose on nested cursor presence). */
+export function isSnapshotFrame(v: unknown): v is SnapshotFrame {
+  return isObj(v) && v.type === 'snapshot' && isObj(v.cursors) && Array.isArray(v.flows);
 }
 
 // ---------------------------------------------------------------------------

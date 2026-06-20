@@ -11,12 +11,19 @@
  */
 import { useLayoutEffect, useRef, type RefObject, type DependencyList } from 'react';
 
-/** A setup returns its teardown. Returning `void` means "nothing to clean up". */
-export type VizCleanup = (() => void) | void;
+/**
+ * A viz teardown — REQUIRED (finding 7). Every `setup` MUST return its cleanup
+ * (stop the d3 simulation, dispose the uPlot, remove the SVG). Making this mandatory at
+ * the type level forces each D10-D12 viz to declare teardown, so a StrictMode double
+ * mount→unmount→remount can never leak a running simulation or duplicate a node.
+ */
+export type VizCleanup = () => void;
 
 /**
  * @param container ref to the DOM node the viz mounts into.
- * @param setup imperative init; receives the (non-null) container element, returns cleanup.
+ * @param setup imperative init; receives the (non-null) container element, returns its
+ *   REQUIRED cleanup. If a viz genuinely has nothing to tear down it must still return a
+ *   no-op `() => {}` — this is intentional friction so teardown is never silently skipped.
  * @param deps re-run dependencies (like useEffect). Defaults to `[]` (mount-only).
  */
 export function useImperativeViz<E extends HTMLElement>(
@@ -32,10 +39,9 @@ export function useImperativeViz<E extends HTMLElement>(
     const el = container.current;
     if (!el) return;
     const cleanup = setupRef.current(el);
-    return () => {
-      // FULL teardown on every unmount/re-run — StrictMode safety.
-      if (typeof cleanup === 'function') cleanup();
-    };
+    // FULL teardown on every unmount/re-run — StrictMode safety. cleanup is required,
+    // so this always runs the viz's own disposal.
+    return cleanup;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);
 }

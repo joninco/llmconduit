@@ -3,6 +3,8 @@ import { StrictMode } from 'react';
 import { render, cleanup } from '@testing-library/react';
 import { DemoViz } from './DemoViz';
 import { demoVizCounters, resetDemoVizCounters } from './demoVizState';
+import { ForceDemoViz } from './ForceDemoViz';
+import { forceDemoState, resetForceDemoState } from './forceDemoState';
 
 describe('useImperativeViz — StrictMode-safe cleanup', () => {
   beforeEach(() => {
@@ -46,5 +48,35 @@ describe('useImperativeViz — StrictMode-safe cleanup', () => {
     expect(svgs).toHaveLength(1);
     second.unmount();
     expect(demoVizCounters.cleanups).toBe(demoVizCounters.setups);
+  });
+});
+
+describe('useImperativeViz — a REAL d3-force simulation is stopped on teardown (finding 7)', () => {
+  beforeEach(() => {
+    resetForceDemoState();
+    cleanup();
+  });
+
+  it('StrictMode double-invoke stops the live simulation and clears its tick handler', () => {
+    const { unmount } = render(
+      <StrictMode>
+        <ForceDemoViz />
+      </StrictMode>,
+    );
+    // A real forceSimulation was created and is tracked.
+    expect(forceDemoState.simulation).not.toBeNull();
+    // StrictMode double-invokes: setup ran twice, and the discarded first mount was torn
+    // down (cleanup >= 1). Every torn-down simulation was stopped with its tick cleared.
+    expect(forceDemoState.setups).toBeGreaterThanOrEqual(2);
+    expect(forceDemoState.cleanups).toBeGreaterThanOrEqual(1);
+    expect(forceDemoState.allTickHandlersCleared).toBe(true);
+    expect(forceDemoState.stoppedCleanly).toBe(forceDemoState.cleanups);
+
+    unmount();
+    // After unmount the LIVE simulation is also torn down: fully balanced (no leak), and
+    // its tick handler is now cleared so the alpha-decay timer can never re-fire it.
+    expect(forceDemoState.cleanups).toBe(forceDemoState.setups);
+    expect(forceDemoState.allTickHandlersCleared).toBe(true);
+    expect(forceDemoState.simulation?.on('tick')).toBeUndefined();
   });
 });
