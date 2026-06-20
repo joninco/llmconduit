@@ -199,6 +199,49 @@ describe('SnapshotController — rAF coalescing (no fetch storm)', () => {
     expect(delivered).toEqual([]);
   });
 
+  it('cancel() frees the in-flight slot so a subsequent seek starts a NEW fetch immediately (R2 finding 2)', async () => {
+    const { raf, cancelRaf, flush } = manualRaf();
+    const resolvers: Array<{ bucket: number; resolve: () => void }> = [];
+    const fetchSnapshot = vi.fn(
+      (atMs: number) =>
+        new Promise<SnapshotResponse>((res) => {
+          resolvers.push({ bucket: atMs, resolve: () => res(snap(atMs)) });
+        }),
+    );
+    const delivered: number[] = [];
+    const c = new SnapshotController({ fetchSnapshot, onSnapshot: (r) => delivered.push(r.at_ms), raf, cancelRaf });
+
+    // Start a seek fetch and hold it in flight (a HUNG/slow backend — it never resolves).
+    c.requestAt(4000);
+    flush();
+    await Promise.resolve();
+    expect(resolvers).toHaveLength(1);
+    expect(resolvers[0]!.bucket).toBe(4000);
+
+    // User hits LIVE → cancel(). The old fetch is still outstanding (never settled).
+    c.cancel();
+
+    // A SUBSEQUENT seek to a NEW bucket must start a NEW fetch right away — not be blocked forever by
+    // the still-hung first request (the bug: `inFlight` stayed set until the old fetch settled).
+    c.requestAt(8000);
+    flush();
+    await Promise.resolve();
+    expect(c.fetchCount()).toBe(2);
+    expect(resolvers).toHaveLength(2);
+    expect(resolvers[1]!.bucket).toBe(8000);
+
+    // The NEW fetch delivers normally.
+    resolvers[1]!.resolve();
+    await Promise.resolve(); await Promise.resolve();
+    expect(delivered).toEqual([8000]);
+
+    // The aborted FIRST request's late response, arriving after cancel, is ignored (no extra deliver,
+    // and it does not clobber the slot the new fetch owns).
+    resolvers[0]!.resolve();
+    await Promise.resolve(); await Promise.resolve();
+    expect(delivered).toEqual([8000]); // unchanged — the orphaned 4000 response was dropped
+  });
+
   it('a stale in-flight fetch does NOT overwrite a newer CACHED seek (finding 3)', async () => {
     const { raf, cancelRaf, flush } = manualRaf();
     const resolvers: Array<{ bucket: number; resolve: () => void }> = [];

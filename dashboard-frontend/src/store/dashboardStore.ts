@@ -21,6 +21,26 @@ import type {
 
 export type ConnectionState = 'idle' | 'connecting' | 'live' | 'seeking' | 'closed' | 'error';
 
+/**
+ * An immutable capture of the LIVE mutable slices, taken the instant a seek pauses the feed (D11
+ * R2 finding 1). `applySeekCut` overwrites those slices with the FROZEN historical cut, so on LIVE
+ * resume the store no longer reflects the live rows/cursors/monitor that existed at the pause. The
+ * socket captures this baseline on `seek()` and `restoreLiveBaseline`s it on `live()` (when no
+ * reconnect snapshot re-baselined the store), so resuming reflects the up-to-date live state before
+ * the shadow-buffered frames replay — the frozen cut is gone, nothing stays rewound.
+ */
+export interface LiveBaseline {
+  cursors: SeqCursors;
+  flows: Map<string, FlowSummary>;
+  flowOrder: string[];
+  metrics: MetricsResponse | null;
+  topologyNodes: ProviderHealth[];
+  topologyEdges: TopologyEdge[];
+  priceTable: TopologyResponse['price_table'];
+  monitor: DebugWsMessage[];
+  monitorSeqs: number[];
+}
+
 export interface DashboardState {
   connection: ConnectionState;
   /**
@@ -87,6 +107,20 @@ export interface DashboardState {
     topology: TopologyResponse | null;
   }) => void;
   setCursor: (domain: keyof SeqCursors, seq: number) => void;
+  /**
+   * Capture the current LIVE mutable slices (D11 R2 finding 1). The socket calls this on `seek()`
+   * BEFORE any `applySeekCut` overwrites the store with the frozen cut, so `live()` can restore the
+   * up-to-date live rows/cursors/monitor instead of resuming on the frozen historical cut. Returns a
+   * defensively-copied snapshot (the live Maps/arrays keep mutating after capture).
+   */
+  captureLiveBaseline: () => LiveBaseline;
+  /**
+   * ATOMICALLY reinstall a previously-captured live baseline (D11 R2 finding 1). One `set` restores
+   * the live rows/cursors/monitor and clears any seek freeze (`seekAtMs`/`seekMonitorSeq`) so the
+   * frozen cut is fully gone; the socket then replays shadow-buffered frames on top. Crosses a
+   * boundary (frozen cut → live store), so the monotonic epoch advances (finding 1).
+   */
+  restoreLiveBaseline: (baseline: LiveBaseline) => void;
   applySnapshot: (snap: {
     cursors: SeqCursors;
     flows: FlowSummary[];
@@ -114,7 +148,7 @@ const emptyCursors = (): SeqCursors => ({
   monitor_seq: 0,
 });
 
-export const dashboardStore = createStore<DashboardState>((set) => ({
+export const dashboardStore = createStore<DashboardState>((set, get) => ({
   connection: 'idle',
   connEpoch: 0,
   cursors: emptyCursors(),
@@ -183,6 +217,41 @@ export const dashboardStore = createStore<DashboardState>((set) => ({
 
   setCursor: (domain, seq) =>
     set((s) => ({ cursors: { ...s.cursors, [domain]: seq } })),
+
+  // Read-only capture — defensively COPY the mutable Maps/arrays so the returned baseline is frozen
+  // against later live mutation (a captured `Map`/array shared by reference would keep ticking).
+  captureLiveBaseline: () => {
+    const s = get();
+    return {
+      cursors: { ...s.cursors },
+      flows: new Map(s.flows),
+      flowOrder: [...s.flowOrder],
+      metrics: s.metrics,
+      topologyNodes: [...s.topologyNodes],
+      topologyEdges: [...s.topologyEdges],
+      priceTable: { ...s.priceTable },
+      monitor: [...s.monitor],
+      monitorSeqs: [...s.monitorSeqs],
+    };
+  },
+
+  restoreLiveBaseline: (baseline) =>
+    set((s) => ({
+      // Crosses a boundary (frozen cut → live store); bump the monotonic epoch (finding 1).
+      connEpoch: s.connEpoch + 1,
+      // The frozen cut is fully gone — clear the seek freeze so elapsed ticks + the monitor unbounds.
+      seekAtMs: null,
+      seekMonitorSeq: null,
+      cursors: { ...baseline.cursors },
+      flows: new Map(baseline.flows),
+      flowOrder: [...baseline.flowOrder],
+      metrics: baseline.metrics,
+      topologyNodes: [...baseline.topologyNodes],
+      topologyEdges: [...baseline.topologyEdges],
+      priceTable: { ...baseline.priceTable },
+      monitor: [...baseline.monitor],
+      monitorSeqs: [...baseline.monitorSeqs],
+    })),
 
   applySnapshot: (snap) =>
     set((s) => {

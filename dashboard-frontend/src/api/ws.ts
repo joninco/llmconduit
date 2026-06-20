@@ -35,7 +35,7 @@ import type {
   SnapshotFrame,
 } from './types';
 import { assertNever, isDashboardFrame, isSnapshotFrame } from './types';
-import { dashboardStore } from '../store/dashboardStore';
+import { dashboardStore, type LiveBaseline } from '../store/dashboardStore';
 
 /** Clean WS close code (RFC 6455 §7.4.1). Anything else after open == abnormal. */
 const WS_NORMAL_CLOSE = 1000;
@@ -116,6 +116,15 @@ export class DashboardSocket {
    * cut or flip the connection to `live`. `live()` applies it on explicit resume.
    */
   private pendingSnapshot: SnapshotFrame | null = null;
+  /**
+   * The LIVE store state captured the instant `seek()` paused the feed (D11 R2 finding 1). The
+   * Scrubber's `applySeekCut` overwrites the store with the frozen historical cut, so on `live()`
+   * (when no reconnect snapshot re-baselined the store) this is restored FIRST — re-establishing the
+   * up-to-date live rows/cursors/monitor — before the shadow-buffered frames replay. Without it,
+   * resuming would replay onto the frozen cut, leaving rows/cursors that existed between the cut and
+   * the pause missing or rewound while `connection==='live'`.
+   */
+  private liveBaseline: LiveBaseline | null = null;
 
   constructor(opts: DashboardSocketOptions = {}) {
     this.url = opts.url ?? defaultWsUrl();
@@ -207,6 +216,7 @@ export class DashboardSocket {
     this.paused = false;
     this.shadowBuffer = [];
     this.pendingSnapshot = null;
+    this.liveBaseline = null;
     this.reconnectAttempts = 0;
     this.lastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0 };
   }
@@ -285,20 +295,37 @@ export class DashboardSocket {
    * the cut's `monitor_seq` is the true boundary.
    */
   seek(): void {
+    // First seek of a drag (not-paused → paused): capture the LIVE baseline BEFORE any
+    // `applySeekCut` overwrites the store with the frozen cut, so `live()` can restore the
+    // up-to-date live rows/cursors/monitor (finding 1). Re-entrant `seek()` calls during the same
+    // drag must NOT recapture — by then the store may already hold the frozen cut.
+    if (!this.paused) {
+      this.liveBaseline = this.store.getState().captureLiveBaseline();
+    }
     this.paused = true;
   }
 
   /**
-   * Resume LIVE. If a reconnect happened during the seek, a fresh snapshot was STAGED
-   * (finding 6): apply it FIRST (it re-establishes the authoritative cut + cursors), then
-   * replay any buffered live frames in arrival order (dedup still applies).
+   * Resume LIVE. The store currently holds the FROZEN seek cut (`applySeekCut`), so before replaying
+   * the shadow buffer we MUST re-establish the live store, else buffered frames would replay onto the
+   * frozen cut and the rows/cursors between the cut and the pause would stay missing/rewound while
+   * `connection==='live'` (finding 1). Two re-baseline paths:
+   *  - a RECONNECT during the seek STAGED a fresh snapshot (finding 6): apply it FIRST — it is the
+   *    authoritative current cut + cursors (and supersedes the now-stale captured baseline);
+   *  - otherwise RESTORE the live baseline captured at `seek()` (the up-to-date pre-seek live state).
+   * Then replay buffered live frames in arrival order (dedup still applies) on top of the live store.
    */
   live(): void {
     this.paused = false;
     const staged = this.pendingSnapshot;
     this.pendingSnapshot = null;
+    const baseline = this.liveBaseline;
+    this.liveBaseline = null;
     if (staged) {
       this.commitSnapshot(staged); // resets store + cursors, drains early frames, marks live
+    } else if (baseline) {
+      // Re-establish the up-to-date live store so buffered frames don't replay onto the frozen cut.
+      this.store.getState().restoreLiveBaseline(baseline);
     }
     const buffered = this.shadowBuffer;
     this.shadowBuffer = [];

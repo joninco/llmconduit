@@ -65,6 +65,14 @@ export class SnapshotController {
   private frame: number | null = null;
   /** Bucket currently being fetched (one in flight at a time). */
   private inFlight: number | null = null;
+  /**
+   * Monotonic cancellation generation (D11 R2 finding 2). Each started fetch captures the current
+   * value; `cancel()` bumps it. A resolving fetch whose captured generation is stale (a `cancel()`
+   * intervened) drops its response AND skips `settle` — so it can NOT clear the in-flight slot a
+   * newer cycle now owns. `cancel()` frees `inFlight` immediately (not when the abandoned request
+   * settles), so a subsequent seek can start a NEW fetch right away even if the old one hangs.
+   */
+  private generation = 0;
   /** Observable fetch count (the storm guard the test asserts). */
   private fetches = 0;
 
@@ -139,8 +147,17 @@ export class SnapshotController {
   private startFetch(bucket: number): void {
     this.inFlight = bucket;
     this.fetches += 1;
+    // Tag this fetch with the current generation; a `cancel()` bumps it and orphans this request.
+    const gen = this.generation;
     this.fetchSnapshot(bucket)
       .then((resp) => {
+        // (R2 finding 2) A canceled request is fully orphaned: it must NOT deliver and must NOT
+        // `settle` (which would clear the in-flight slot a newer cycle now owns). It is still cached
+        // (a future drag back can reuse it) but otherwise dropped.
+        if (gen !== this.generation) {
+          this.touch(bucket, resp);
+          return;
+        }
         this.touch(bucket, resp);
         // (finding 3) Deliver only if this bucket is STILL the latest requested; a newer drag (or a
         // newer cached delivery) that moved `pendingBucket` wins, and this stale response is dropped.
@@ -148,6 +165,8 @@ export class SnapshotController {
         this.settle(bucket);
       })
       .catch((err) => {
+        // Orphaned (canceled) rejection: swallow without touching the in-flight slot.
+        if (gen !== this.generation) return;
         this.onError(err);
         this.settle(bucket);
       });
@@ -183,16 +202,23 @@ export class SnapshotController {
   }
 
   /**
-   * Cancel any scheduled frame and clear the pending target (called on resume/unmount). Clearing
-   * `pendingBucket` also DISARMS any still-in-flight fetch: its `deliverIfLatest` will see no
-   * matching latest target and drop the response — so a LIVE resume during an in-flight seek can't
-   * be clobbered by a late cut landing after the user already went live.
+   * Cancel any scheduled frame and clear the pending target (called on resume/unmount). Bumping the
+   * generation ORPHANS any still-in-flight fetch (its late response is dropped, not delivered) — so a
+   * LIVE resume during an in-flight seek can't be clobbered by a late cut landing after the user
+   * already went live. Critically, the in-flight slot is freed HERE (R2 finding 2), not when the
+   * abandoned request eventually settles: a subsequent seek can therefore start a NEW fetch
+   * immediately even if the canceled request hangs (otherwise `runPending` would refuse forever while
+   * `inFlight !== null`). Clearing `pendingBucket` additionally disarms delivery of any in-flight
+   * fetch that somehow shares the generation.
    */
   cancel(): void {
     if (this.frame !== null) {
       this.cancelRaf(this.frame);
       this.frame = null;
     }
+    // Invalidate the in-flight fetch's generation and free the slot so the next seek isn't blocked.
+    this.generation += 1;
+    this.inFlight = null;
     this.pendingBucket = null;
   }
 }
