@@ -5,7 +5,7 @@ G4 (image agent) + G7 (route config) + the descoped G3 keep-alive-peek. Specs: `
 (historical design inputs — see "Spec status" below). Review gate: `.ralph/REVIEW_PROTOCOL.md`.
 
 ## Executive summary
-**Status: core 7/7 ✅ + EXTENDED RUN COMPLETE ✅ (G3-peek, G7, G4 — owner-directed, all Codex-xhigh APPROVED). ALL 9 GAPS + P1 + G3-peek DONE, plus a post-run `reasoning_effort_map` rework (leaf-applied, reserved-key deleted), plus a per-gap thermo-nuclear code-quality review (10 gaps reviewed; bounded fixes in `07117b2`; 11 deferred follow-ups tracked as Topic 11 on branch `ralph/thermo-followups`).** Topic 11 is now COMPLETE (11/11 Codex-xhigh APPROVED). **Topic 12 added 2026-06-20** — a whole-codebase thermo-nuclear PROJECT review (16 parallel subsystem reviewers → Codex-xhigh adversarial verify) surfaced 11 VERIFIED findings (2 HIGH, 5 MEDIUM, 4 REVISED-LOW; 0 refuted) → **10 tasks (12.1–12.10) — Topic 12 COMPLETE ✅ (10/10 Codex-xhigh APPROVED)**; specs `.ralph/specs/U1..U10`, full report `/tmp/thermo-project-review.md`. Loop validated: build → cargo test/clippy/fmt → Codex-xhigh review → fix → re-review APPROVED.
+**Status: core 7/7 ✅ + EXTENDED RUN COMPLETE ✅ (G3-peek, G7, G4 — owner-directed, all Codex-xhigh APPROVED). ALL 9 GAPS + P1 + G3-peek DONE, plus a post-run `reasoning_effort_map` rework (leaf-applied, reserved-key deleted), plus a per-gap thermo-nuclear code-quality review (10 gaps reviewed; bounded fixes in `07117b2`; 11 deferred follow-ups tracked as Topic 11 on branch `ralph/thermo-followups`).** Topic 11 is now COMPLETE (11/11 Codex-xhigh APPROVED). **Topic 12 added 2026-06-20** — a whole-codebase thermo-nuclear PROJECT review (16 parallel subsystem reviewers → Codex-xhigh adversarial verify) surfaced 11 VERIFIED findings (2 HIGH, 5 MEDIUM, 4 REVISED-LOW; 0 refuted) → **10 tasks (12.1–12.10) — Topic 12 COMPLETE ✅ (10/10 Codex-xhigh APPROVED)**; specs `.ralph/specs/U1..U10`, full report `/tmp/thermo-project-review.md`. Loop validated: build → cargo test/clippy/fmt → Codex-xhigh review → fix → re-review APPROVED. **Topic 13 added 2026-06-20** — the **Argus realtime dashboard** (from `DASHBOARD_PLAN.md` rev 8, Codex-xhigh APPROVED after 7 adversarial rounds). 13 tasks (13.1–13.13): Rust instrumentation seams (D1–D7: FlowStore/middleware, BackendChatRequest identity + leaf on-wire capture, L0/L1 telemetry-guard CAS + cumulative usage, provider_health + topology, MetricsLayer + body-free snapshots, AbortHub/kill, auth+CSP+batched-WS-envelope), build embed (D8), React+TS+Vite scaffold (D9), four views (D10 inspector, D11 stats+scrubber, D12 topology+sankey+theater), REST routes + price config (D13 capstone). Specs `.ralph/specs/D1..D13`. Branch `worktree-dashboard` (based on `ralph/thermo-followups` @ `24c97f4`). **Sequencing:** frontend (D9) develops against mocks in parallel with the Rust seams; 13.3‖13.4 and 13.10‖13.11‖13.12 run parallel. See Topic 13 parallelism cheat-sheet.
 
 ## Spec status
 `.ralph/specs/*.md` are **historical design inputs** written before implementation; their `OPEN QUESTION` /
@@ -423,3 +423,154 @@ rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
   the toggle is added.
 - **G5 `.jsonl` exclusion:** explicit G5 spec acceptance criterion ("Only `*.json` / `*.ndjson` are
   eligible; other extensions are skipped"). By design.
+
+---
+
+## Topic 13 — Argus: realtime LLM-proxy dashboard
+
+> **Source:** `/ralph-guide-update` on 2026-06-20, from `DASHBOARD_PLAN.md` (rev 8, Codex-xhigh
+> APPROVED after 7 adversarial review rounds). A flagship web dashboard for the gateway: 6 views
+> (transformation inspector, upstream topology map, token-flow Sankey, live stream theater, stats strip,
+> time-travel scrubber). Frontend = React+TS+Vite embedded via `include_dir!` (opt-in
+> `LLMCONDUIT_BUILD_DASHBOARD`); Rust adds authoritative `DashboardFlowStore` + `MetricsLayer` + new
+> instrumentation seams, reusing `MonitorHub` only for transcript/delta broadcast.
+> Specs: `.ralph/specs/D1..D13`. Branch: `worktree-dashboard` (based on `ralph/thermo-followups` @
+> `24c97f4`). Review gate: `.ralph/REVIEW_PROTOCOL.md` (Codex-xhigh) per task; DoD = executable test
+> green · `cargo test` · `cargo clippy --all-targets` · `cargo fmt` · Codex-xhigh APPROVED · commit.
+> Frontend tasks add `tsc --noEmit` + `eslint` clean. Security-sensitive tasks (D7, D6) get extra
+> scrutiny on constant-time/Origin/cookie-attrs/expiry.
+
+> **Sequencing + parallelism (acyclic; D13 is the capstone).** Cycle-breaking notes: D6 does NOT
+> depend on D7 or D13 (it compiles against a mock `MutationPolicy`); D7 APPLIES the mutation policy to
+> the kill route (D7 depends on D6's `Gateway::abort`, not vice-versa); D13 merely REGISTERS D6's
+> route after D6 ships. D7 splits into D7a (auth+CSP+login foundation, dep D1 only — parallel-start)
+> and D7b (WS envelope+frame wiring, deps D3/D4/D5).
+> - **Phase A — parallel start (light deps):** 13.1 (D1 store+middleware), 13.8 (D8 build embed),
+>   13.9 (D9 mock scaffold — dependency-free), and 13.7a (D7 env-secrets + login/cookie + /debug+CSP
+>   protection — depends on D1's route hooks only) can ALL begin together; 13.7a slots in as soon as
+>   13.1's route-gating skeleton is available (the lone inter-dep in Phase A).
+> - **After 13.1:** 13.2 (D2 leaf capture).
+> - **After 13.2:** 13.3 (D3 telemetry guard + usage) AND 13.4 (D4 provider health) run **in parallel**
+>   (both depend only on 13.1/13.2, not each other).
+> - **After 13.3 AND 13.4:** 13.5 (D5 metrics+snapshots — needs D3 record_usage AND D4 topology capture;
+>   ring/histogram can scaffold during 13.3) AND 13.6 (D6 kill — depends on 13.3 only). 13.7b (WS
+>   envelope wiring — needs D3/D4/D5) follows 13.5.
+> - **After 13.1–13.8 (all Rust seams + embed):** 13.13 (D13 REST routes) — the capstone; it REGISTERS
+>   13.6's kill route behind 13.7's policy but does NOT make 13.6 depend on 13.13.
+> - **After 13.9 + its data deps:** 13.10, 13.11, 13.12 (the four views) run **in parallel** (each
+>   consumes different endpoints; no inter-view deps). 13.10 needs 13.1/13.2/13.3/13.13; 13.11 needs
+>   13.5/13.13; 13.12 needs 13.4/13.5/13.13.
+> - **Independent throughout:** 13.8 is never blocked. 13.9 mocks unblock view dev before Rust is live
+>   — do not let the frontend wait on the backend.
+> - **Critical path:** 13.1 → 13.2 → {13.3 ‖ 13.4} → 13.5 → 13.7b → 13.13 → {13.10 ‖ 13.11 ‖ 13.12}.
+>   13.8/13.9/13.7a ride alongside from Phase A; 13.6 on the 13.3→13.5 branch (parallel with 13.5).
+
+### Task 13.1 — DashboardFlowStore + stateful middleware + api_call_id link (D1)
+**Priority:** HIGH · **Spec:** `.ralph/specs/D1-dashboard-flow-store-and-middleware.md` · **Status:** ⬜ PENDING
+**Summary:** New `src/dashboard_flow.rs` — authoritative per-flow store (`Arc<FlowRecord>` COW, records+LRU under one `Mutex`, cap 512 / 30 min, the `claim: Arc<AtomicU8>` field for D3). Convert `log_api_call` (http.rs:89) to `from_fn_with_state(Arc<Gateway>)` (it's stateless `from_fn` today); capture the inbound body via a **capped + redacting streaming serializer** (128 KiB bodies / 4 KiB scalars, redacts secrets/image URIs) — never retain the 256 MiB `Bytes` slice. Whitelist only `/v1/responses`,`/v1/messages`,`/v1/chat/completions` (skip `/v1/completions`, `/dashboard*`, `/debug*`, `/health`, `/`, `/v1/models`). Stash `api_call_id` (http.rs:90) in extensions before http.rs:145; `stream_responses(request)` becomes a wrapper over internal `stream_responses_with_api_call_id(request, api_call_id)` (public signature preserved — no test churn). `link(response_id, api_call_id)` fires once on `RequestStarted`; `response_id` stays `resp_{uuid}` (API contract).
+**Files:** new `src/dashboard_flow.rs`, `src/http.rs`, `src/engine.rs`, `src/lib.rs`
+**Acceptance:** store shape + single-lock; capped serializer peak ≤ CAP for a 10 MiB body; whitelist test (no record for `/v1/completions`,`/health`,…); `api_call_id` extension + wrapper preserve public API; `link` exactly once per flow; live summary-byte quota evicts oldest bodies; zero-cost `disabled()` path; `cargo test`/clippy/fmt green; Codex-xhigh APPROVED.
+**Sequencing:** FOUNDATIONAL — first Rust seam; blocks 13.2/13.3/13.5/13.6/13.7/13.13. **Parallel start** with 13.8 (build) and 13.9 (frontend scaffold/mock).
+
+### Task 13.2 — BackendChatRequest identity (response_id + serving token) + leaf on-wire body capture (D2)
+**Priority:** HIGH · **Spec:** `.ralph/specs/D2-backend-request-identity-and-leaf-capture.md` · **Status:** ⬜ PENDING
+**Summary:** Add `response_id: Option<String>` + `serving: Option<Arc<ServingToken{route,provider}>>` to `BackendChatRequest` (upstream.rs:1914, both `Debug`/`Clone`-safe — NO `Arc<dyn Fn>`). ENGINE allocates a fresh `Arc<ServingToken>` per `stream_responses` (kills the cross-flow race) and sets both at `BackendChatRequest::new` (engine.rs:1486); production rebuilds (failover upstream.rs:813, routing upstream.rs:1110) clone the `Arc`s forward; `upstream.rs:3105` is a TEST helper (excluded). Leaf `ReqwestUpstreamClient` gets a `flow_store` handle; **`response_id: Option<&str>` passed explicitly to `logged_send_chat_request`** (callers upstream.rs:628/658 pass `backend.response_id.as_deref()`) so it can `set_upstream(id, &request)` AFTER `sanitize_chat_request` (upstream.rs:620) and on the shrink-retry path (upstream.rs:658). `RoutingUpstreamClient` sets `route`; `mark_provider_success` (upstream.rs:982) sets `provider`; bare leaf (lib.rs:195) sets synthetic `"primary"`.
+**Files:** `src/upstream.rs`, `src/engine.rs`, `src/lib.rs`
+**Acceptance:** captured `upstream_body` == POST-`sanitize` body (NOT pre-leaf) and == retry body; concurrent-flow test shows distinct `{route,provider}` (no overwrite); bare path tags `"primary"`; `Debug`/`Clone` compile; 3 production sites identified (1486/813/1110), `3105` excluded; `cargo test`/clippy/fmt green; Codex-xhigh APPROVED.
+**Sequencing:** Depends on 13.1 (store + `set_upstream`). **After 13.1.** Unblocks 13.3 + 13.4 (both run parallel after this).
+
+### Task 13.3 — TelemetryGuard (L0/L1 CAS) + cumulative-aware usage emission (D3)
+**Priority:** HIGH · **Spec:** `.ralph/specs/D3-telemetry-guard-and-usage.md` · **Status:** ⬜ PENDING
+**Summary:** `OpenL0→ClaimedL1→Finalized` CAS state machine in the record's `claim` field. L0 middleware RAII `Drop` finalizes only if `OpenL0` (catches extractor/conversion failures → no orphan). L1 engine guard `compare_exchange(OpenL0→ClaimedL1)` then finalizes on every exit (pre-spawn engine.rs:809/:1383, spawned :817, Completed/Failed) with status + serving provider (from 13.2) + `Instant`-based monotonic latency; RAII drop fallback. `/v1/completions` opens no record (13.1 whitelist). **Cumulative usage:** `turn_base = snapshot()` at turn start; on each usage chunk (engine.rs:1513 region) upsert `turn_base + chunk.usage` (turn-local cumulative, NO double-count); single `accumulated_usage.add` after the loop (engine.rs:1676) advances `turn_base`; midstream cancel keeps last upserted total; no usage chunk → `None`. Add `MonitorEventKind::Usage` (monitor.rs:15) emitted at engine.rs:1805, `DebugWsMessage::Usage` (monitor.rs:98) + `apply_event` + `snapshot()` replay + no-op redact arm (monitor.rs:295); usage also written to store/`MetricsLayer`.
+**Files:** `src/engine.rs`, `src/monitor.rs`, `src/http.rs`
+**Acceptance:** CAS race-free (extractor-failure leaves `OpenL0` → L0 Drop finalizes; no orphan); pre-spawn/midstream-cancel finalize with last cumulative usage (not zero); cumulative-no-double-count test; `MonitorEventKind::Usage` reaches snapshot+subscribe; `Send` across the spawn (midstream test compiles); `cargo test`/clippy/fmt green; Codex-xhigh APPROVED.
+**Sequencing:** Depends on 13.1 + 13.2. **Runs in PARALLEL with 13.4** (both depend only on 13.1/13.2). Unblocks 13.5 + 13.6.
+
+### Task 13.4 — provider_health accessor + topology publication (D4)
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/D4-provider-health-and-topology.md` · **Status:** ⬜ PENDING
+**Summary:** Non-async default `UpstreamClient::provider_health() -> Vec<ProviderHealth>` (upstream.rs:85, mirrors `supported_model_catalog` :115; dyn-safe with `Arc<dyn UpstreamClient>`). `Arc<ProviderMetrics>` per provider (keeps derived `Clone` on `RoutingUpstreamClient` upstream.rs:340 / `FailoverUpstreamClient` :212): cumulative `served_count`/`failover_count` + `consecutive_failures` (reset at `mark_provider_success` :877). `Arc<CatalogMeta{fetched_ms,size}` swapped under the existing `AsyncMutex<catalog>` in `refresh_catalog` (no torn pair). Serializable `ProviderHealth` DTO (epoch-ms) with `Down` = `Cooling` + `consecutive_failures >= 3`. `Gateway::upstream_health()`. **Publication:** immutable versioned `Arc<ProviderHealthSnapshot>` on a coalesced 1 s tick + cooldown-deadline wake (NOT per `served_count`; idle cooling→Healthy flips with no traffic).
+**Files:** `src/upstream.rs`, `src/engine.rs`, `src/lib.rs`
+**Acceptance:** `provider_health` dyn-safe; `Clone` still compiles; no torn catalog pair; `consecutive_failures` resets on success; idle cooling→Healthy via deadline-wake (mock clock); routing override sets `route`; `cargo test`/clippy/fmt green; Codex-xhigh APPROVED.
+**Sequencing:** Depends on 13.2 (serving token). **Runs in PARALLEL with 13.3.** Unblocks 13.5 (topology in snapshot) + 13.12 (topology view).
+
+### Task 13.5 — MetricsLayer (ring buffers + histograms) + coordinated body-free snapshots (D5)
+**Priority:** HIGH · **Spec:** `.ralph/specs/D5-metrics-and-snapshots.md` · **Status:** ⬜ PENDING
+**Summary:** New `src/metrics.rs` — per-window rings (1m/5m/1h @1s), `{status,model,endpoint,upstream}` buckets, 30-bucket latency histogram, p50/p95/p99 interpolation, token sums. `record_response` from D3 terminal finalize (NOT middleware). **5 s coordinated snapshots:** snapshot task holds FlowStore mutex THEN `MetricsLayer` mutex (fixed order, single critical section) + captures ONE `Arc<ProviderHealthSnapshot>` (13.4) → true atomic cut across all three stores; no deadlock (only snapshot task holds >1 lock). **Body-free** `SnapshotFlowSummary` (no `Arc<[u8]>`, no live ref) — kills the 135 GiB worst case (720×512×<1KiB ≈ ≤400 MiB summaries, bounded by a snapshot-summary quota). `SnapshotRing` 720 bodies-free cuts; `DashboardSnapshot` carries per-domain cursors `{flow_seq,metrics_seq,topology_seq,monitor_seq}`; `snapshot_at(ts)` nearest ≤5 s. `record_usage` from D3. Per-store seq (no global). Zero-cost `disabled()` + criterion bench (disabled path + seq contention).
+**Files:** new `src/metrics.rs`, `src/dashboard_flow.rs` (snapshot_summaries), `src/lib.rs`, D3 call sites
+**Acceptance:** p-quantile unit tests; `/snapshot?at` internally consistent (no torn reads); peak snapshot-ring memory ≤ ~400 MiB under churn (NOT 135 GiB); body-free (no `Arc<[u8]>` on snapshots); per-domain cursors; lock-order stress (no deadlock); zero-cost disabled-path + seq bench; `cargo test`/clippy/fmt/bench green; Codex-xhigh APPROVED.
+**Sequencing:** Depends on 13.1 + 13.3 **and 13.4** (topology `Arc<ProviderHealthSnapshot>` captured in the 5 s cut; D5 starts after BOTH 13.3 and 13.4). Unblocks 13.11 (stats+scrubber) + 13.13 + 13.7b. Ring/histogram scaffolding can begin during 13.3.
+
+### Task 13.6 — AbortHub + kill route (D6)
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/D6-abort-hub-and-kill.md` · **Status:** ⬜ PENDING
+**Summary:** `AbortHub { handles: Mutex<HashMap<api_call_id, CancellationToken>> }` on `Gateway`, keyed by `api_call_id` (= flow `:id`). D3 L1 guard registers on `ClaimedL1`, removes on finalize (no leak; bounded by in-flight count). Engine checks `token.is_cancelled()` alongside every existing `tx.is_closed()` (compose, don't replace) → `AppError::cancelled()` (499), no duplicated tokens. `POST /dashboard/api/flows/:id/kill` → `cancel()` (200; 404 unknown/finished). Replay DEFERRED.
+**Files:** `src/engine.rs`, `src/http.rs`, `src/lib.rs`
+**Acceptance:** no entry leaks after Completed; kill → 499 cleanly mid-chunk (no dup tokens); 404 for unknown/finished; every `tx.is_closed()` point composed (grep-verified); `cargo test`/clippy/fmt green; Codex-xhigh APPROVED.
+**Sequencing:** Depends on 13.3 (L1 guard lifecycle) ONLY. Does NOT depend on 13.7 or 13.13 (compiles/tests against a mock `MutationPolicy`; 13.7 supplies the real policy consumer-side, 13.13 registers the route) — this BREAKS the prior 13.6↔13.7 and 13.6↔13.13 cycles. Parallel with 13.5 (both follow 13.3+13.4). Kill is the ONLY mutation this phase.
+
+### Task 13.7 — Dashboard auth + CSP + batched WS envelope (+ protect /debug) (D7)
+**Priority:** HIGH (security) · **Spec:** `.ralph/specs/D7-dashboard-auth-and-ws.md` · **Status:** ⬜ PENDING
+**Summary:** Env-only secrets (`LLMCONDUIT_DASHBOARD_TOKEN`, `_SESSION_KEY`, `_PUBLIC_ORIGIN` — never a `Debug+Clone` config struct). `POST /dashboard/login`: constant-time compare (`subtle::ConstantTimeEq`), HMAC-SHA256 signed `HttpOnly; SameSite=Strict; Secure;-when-PUBLIC_ORIGIN; Path=/; Max-Age=3600` cookie; `/dashboard` serves a login shell when unauthed. **Non-loopback REQUIRES** token + validated `https://` `PUBLIC_ORIGIN` (startup refuses both `/dashboard` + `/debug` to register otherwise; explicit `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1` override). `/dashboard/api/*` + `/dashboard/ws` + `/debug` + `/debug/ws` require the cookie; WS validates cookie + Origin + closes at cookie `exp` (mock clock). Kill needs `LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS=1` + double-submit CSRF `X-CSRF-Token`. CSP: `/dashboard` strict; `/debug` externalizes its inline script (or sha256-hash); `/debug/ws` bare contract UNCHANGED. **Batched WS envelope** (dashboard only): `DashboardFrame{domain,seq,batch:Vec<DashboardPayload>}` — ONE per `DebugUpdate` (seq=`DebugUpdate.sequence`, batch=its messages) so per-domain whole-frame dedup (`seq <= last_seq[domain]`) drops NO sibling `DebugWsMessage`.
+**Files:** new `src/dashboard_auth.rs`, `src/dashboard_ws.rs`, `src/http.rs`, `src/main.rs`, `src/monitor.rs`, `src/debug_ui.rs`
+**Acceptance:** non-loopback refusal; login constant-time + cookie attrs; all routes (incl `/debug*`) authed; WS cookie+Origin+expiry; kill mutation+CSRF (403 otherwise); CSP externalizes `/debug` inline script; batched-envelope sibling-frame test (all `DebugWsMessage` in a `DebugUpdate` arrive); `/debug/ws` unchanged; `cargo test`/clippy/fmt green; Codex-xhigh APPROVED (security-scrutiny).
+**Sequencing:** TWO stages. **13.7a** (env-secrets + login/cookie + /debug+CSP protection, dep 13.1 only) is **parallel-start** with 13.1/13.8/13.9. **13.7b** (WS batched-envelope + frame wiring) after 13.3/13.4/13.5. 13.7 APPLIES the mutation+CSRF policy to 13.6's kill route (so 13.7 depends on 13.6's `Gateway::abort`, NOT vice-versa — no cycle) and supplies the `MutationPolicy` 13.6/13.13 consume. Independent design from 13.13.
+
+### Task 13.8 — build.rs stub + include_dir! embedding + node-less-host safety (D8)
+**Priority:** HIGH (gates frontend) · **Spec:** `.ralph/specs/D8-dashboard-build-embed.md` · **Status:** ⬜ PENDING
+**Summary:** `build.rs` ALWAYS ensures `$OUT_DIR/dashboard_dist/` with a stub `index.html`; on `LLMCONDUIT_BUILD_DASHBOARD=1` clears it + runs `npm ci && npm run build` (outDir = `$OUT_DIR/dashboard_dist`) — fails loudly if npm missing; when off, clears/rewrites the stub (no stale assets). `src/dashboard_ui.rs`:
+```rust
+use include_dir::{include_dir, Dir};
+static DASHBOARD_DIST: Dir<'static> = include_dir!("$OUT_DIR/dashboard_dist");
+```
+(`static Dir` binding is required — bare `include_dir!(concat!(env!(...)))` does NOT compile). Add `include_dir` crate. Serve `/dashboard` shell + `/dashboard/assets/*`, gated by `--with-debug-ui` (http.rs:75).
+**Files:** `build.rs`, `Cargo.toml`, new `src/dashboard_ui.rs`, `src/http.rs`
+**Acceptance:** `cargo build` succeeds node-less (stub always present); `LLMCONDUIT_BUILD_DASHBOARD=1` builds real dist; prior assets don't linger when flag off; routes gated by `--with-debug-ui`; `cargo test`/clippy/fmt green; Codex-xhigh APPROVED.
+**Sequencing:** FULLY INDEPENDENT — **parallel-start** from Phase A. Unblocks 13.9 (frontend produces the `dist/` it embeds).
+
+### Task 13.9 — Frontend scaffold (React+TS+Vite) + data plumbing + design system (D9)
+**Priority:** HIGH · **Spec:** `.ralph/specs/D9-frontend-scaffold.md` · **Status:** ⬜ PENDING
+**Summary:** `dashboard-frontend/` — React 18 + TS + Vite → `dist/` (embedded by 13.8). TanStack Query (REST + WS invalidation) + zustand (live WS state) + `@tanstack/react-virtual` + `highlight.js` + `uPlot` + `d3-force` + `d3-sankey` + tailwind/shadcn (`framer-motion` DEFERRED). `DashboardSocket` decodes the batched `DashboardFrame` (13.7) with per-domain whole-frame dedup; REST client typed against 13.13 shapes (kill includes `X-CSRF-Token`); in-browser mock for view dev pre-Rust. `useSyncExternalStore` bridge; hash router. **React-18 viz correctness:** all imperative viz in `useLayoutEffect` + cleanup, StrictMode-idempotent. Dark-ops design tokens (§3.3 palette; `tabular-nums`; `prefers-reduced-motion` cuts particles).
+**Files:** new `dashboard-frontend/`
+**Acceptance:** builds to `dist/`; `npm run dev` serves all 4 routes against the mock; socket dedups per-domain (sibling-frame test); kill includes CSRF; StrictMode double-invoke leaks no sim/dup SVG; tokens centralized; `tsc --noEmit` + `eslint` clean; Codex-xhigh APPROVED.
+**Sequencing:** Depends on 13.8 (embed path) for *embedded production builds ONLY*; the **mock-scaffold is dependency-free and parallel-start** from Phase A (builds against the in-browser mock), fully parallel with all Rust seams (13.1-13.7,13.13). Unblocks 13.10/13.11/13.12.
+
+### Task 13.10 — Transformation inspector view (FlowTable + 3-pane + deltas) (D10)
+**Priority:** HIGH · **Spec:** `.ralph/specs/D10-transformation-inspector-view.md` · **Status:** ⬜ PENDING
+**Summary:** The flagship. Virtualized `FlowTable` (newest-on-top; cols: time, short id, client, endpoint, req→served model, upstream, status chip, tok in/out, cost, elapsed; filters; failover tags). `FlowDetail`: 3 scroll-synced `JsonPane`s — inbound / normalized / upstream on-wire body (13.2) — with a structural diff overlay tinting added/changed/removed between layers. Tabs Headers/Timeline/Error. Deltas sub-panel (output bright, reasoning dim, tool cards) from monitor `segment_append`. Time-travel seek renders snapshot summaries; body panel reads live ("evicted" if gone). Kill button (CSRF, optimistic).
+**Files:** `dashboard-frontend/src/views/FlowsView.tsx`, `components/FlowTable/`, `components/FlowDetail/`, `components/viz/JsonPane.tsx`
+**Acceptance:** 10k mock rows smooth; 3-pane scroll-sync + diff tints (known fixture); deltas live; tabs populate; seek renders summary + "evicted"; kill optimistic + 403 handled; `tsc`/`eslint` clean + StrictMode-safe; Codex-xhigh APPROVED.
+**Sequencing:** Depends on 13.9, 13.1, 13.2, 13.3, 13.13. **Parallel with 13.11 + 13.12** once deps land.
+
+### Task 13.11 — Stats strip + time-travel scrubber views (D11)
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/D11-stats-strip-and-scrubber-views.md` · **Status:** ⬜ PENDING
+**Summary:** Always-on `StatsStrip` (req/s, active streams, error%, p50/p95/p99, tokens/s, $/min; uPlot sparklines; 1m/5m/1h selector) driven by `MetricTick` + `GET /metrics`. `Scrubber` timeline (reqs/s hill) → `seek` pauses live WS, fetches `GET /snapshot?at=` rAF-throttled + LRU-cached, broadcasts the frozen cut; LIVE toggle resumes. Hover tooltip.
+**Files:** `dashboard-frontend/src/components/StatsStrip/`, `components/Scrubber/`
+**Acceptance:** chips `tabular-nums` + sparklines from `MetricTick`; seek pauses/fetches/resumes with rAF+LRU (no storm); hill + tooltip; StrictMode-safe uPlot (dispose); `prefers-reduced-motion` honored; `tsc`/`eslint` clean; Codex-xhigh APPROVED.
+**Sequencing:** Depends on 13.9, 13.5, 13.7, 13.13. **Parallel with 13.10 + 13.12.**
+
+### Task 13.12 — Topology + token-flow Sankey + live stream theater views (D12)
+**Priority:** MEDIUM · **Spec:** `.ralph/specs/D12-topology-sankey-theater-views.md` · **Status:** ⬜ PENDING
+**Summary:** `TopologyView` — radial d3-force hub-and-spoke, health-colored nodes (13.4), animated edges, click→filter FlowTable, cooldown tooltip; `TopologyUpdate`-driven. `TokenSankeyView` — 3-col d3-sankey client→gateway→model, band height = tokens/30s, cost-colored (13.13 price table), click→filter. `TheaterView` — fullscreen rivers of output/reasoning/tool deltas, per-river tok/s + cursor, multi-grid 1/2/3-6, linger-then-fade (`framer-motion` only if CSS-motion insufficient). All StrictMode-safe; `prefers-reduced-motion` cuts particles.
+**Files:** `dashboard-frontend/src/views/{TopologyView,SankeyView,TheaterView}.tsx`, `components/viz/{RadialTopology,TokenSankey,River}.tsx`
+**Acceptance:** topology health-color + particles + click-filter + cooldown tooltip; sankey d3-sankey 3-col + cost-color + click-filter; theater rivers + grid + cursor + fullscreen; all StrictMode-safe with cleanup; seek renders frozen state; `tsc`/`eslint` clean; Codex-xhigh APPROVED.
+**Sequencing:** Depends on 13.9, 13.4, 13.5, 13.3, 13.13. **Parallel with 13.10 + 13.11.**
+
+### Task 13.13 — Dashboard REST routes + price-table config (D13) — CAPSTONE
+**Priority:** HIGH · **Spec:** `.ralph/specs/D13-dashboard-rest-routes-and-price-config.md` · **Status:** ⬜ PENDING
+**Summary:** Register (in the `--with-debug-ui` block, http.rs:75, behind D7 auth): `GET /dashboard` (shell, 13.8), `/dashboard/api/flows` (`{flows,total,flow_seq}`), `/dashboard/api/flows/:id` (3 bodies + deltas + usage), `/dashboard/api/metrics` (`{metrics_seq,…,windows}`), `/dashboard/api/topology` (`{topology_seq,nodes,edges}` + price table), `/dashboard/api/catalog`, `/dashboard/api/snapshot?at=` (`{cursors:{flow_seq,metrics_seq,topology_seq,monitor_seq},summaries,metrics,topology}` body-free), `POST /dashboard/api/flows/:id/kill` (13.6, mutation+CSRF gated). `:id`=`api_call_id`. Price table: `Config.price_table: HashMap<String,ModelPrice>` (YAML `price_table:` + `LLMCONDUIT_PRICE_TABLE_JSON` env); `Gateway::price_for(model)`; flow `cost` + `cost_per_min`/`cost_per_sec`. Per-domain seq only (no singular `seq`). Replay NOT registered.
+**Files:** `src/http.rs`, new `src/dashboard_api.rs`, `src/config.rs`, `src/lib.rs`
+**Acceptance:** all routes registered only when `--with-debug-ui`; off → none; flows/detail/metrics/topology/snapshot return per-domain seq + correct shapes; kill honors mutation+CSRF (403 otherwise); price table YAML+env loads + drives cost; `no-store` + auth enforced; end-to-end (stream → flow → 3-pane inspector → usage → topology → stats → time-travel → kill) works against the real backend; `cargo test`/clippy/fmt green; Codex-xhigh APPROVED.
+**Sequencing:** CAPSTONE — after 13.1-13.8 (all Rust seams + embed). **REGISTERS** 13.6's kill route behind 13.7's policy but does NOT make 13.6 depend on 13.13 (13.6 already shipped against a mock policy). The contract surface the views (13.10-13.12) consume; with 13.9 mocks they needn't wait on it.
+
+## Topic 13 — parallelism cheat-sheet
+```
+Phase A (parallel; 13.7a after 13.1 skeleton):  13.1(D1) ‖ 13.8(D8) ‖ 13.7a(D7 auth+CSP) ‖ 13.9(D9 mock scaffold)
+After 13.1:        13.2(D2)
+After 13.2:        13.3(D3) ‖ 13.4(D4)            (parallel pair — both dep 13.1/13.2 only)
+After 13.3 & 13.4: 13.5(D5) ‖ 13.6(D6)           (13.5 dep D3+D4; 13.6 dep D3 only)
+After 13.5:        13.7b(D7 WS envelope wiring — dep D3/D4/D5)
+After 13.1..13.8:  13.13(D13 capstone — registers 13.6 kill behind 13.7 policy)
+After 13.9 + deps: 13.10(D10) ‖ 13.11(D11) ‖ 13.12(D12)   (parallel views)
+Acyclic: 13.6 ↛ 13.7/13.13 (mock MutationPolicy); 13.7 → 13.6 (consumes abort); 13.13 → 13.6 (registers route)
+Independent: 13.8 never blocked; 13.9 mock scaffold dependency-free (only embedded build dep 13.8)
+Critical path: 13.1 → 13.2 → {13.3 ‖ 13.4} → 13.5 → 13.7b → 13.13 → {13.10 ‖ 13.11 ‖ 13.12}
+```

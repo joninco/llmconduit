@@ -24,9 +24,23 @@ Run locally:
 ./target/release/llmconduit configure     # interactive YAML config
 ./target/release/llmconduit start         # serve
 ./target/release/llmconduit start --raw   # also write delta text to stdout
-./target/release/llmconduit start --with-debug-ui   # exposes /debug + /debug/ws
+./target/release/llmconduit start --with-debug-ui   # exposes /debug + /debug/ws (and, when built, /dashboard)
 ./target/release/llmconduit analyze-log   # prefix-stability diff of upstream JSONL
 ```
+
+Dashboard (Topic 13 — optional, opt-in embed):
+
+```bash
+LLMCONDUIT_BUILD_DASHBOARD=1 cargo build --release   # build the React SPA + embed via include_dir
+cd dashboard-frontend && npm install && npm run dev  # frontend dev against an in-browser mock
+cargo build --release                                 # node-less host: embeds a stub, still compiles
+```
+`/dashboard` + `/dashboard/api/*` + `/dashboard/ws` are registered only when `--with-debug-ui` is on.
+Dashboard auth (env-only, never a persisted `Config` field): `LLMCONDUIT_DASHBOARD_TOKEN`,
+`LLMCONDUIT_DASHBOARD_SESSION_KEY`, `LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN` (must be `https://` on
+non-loopback — startup refuses to register `/dashboard` + `/debug` otherwise;
+`LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1` overrides). Kill requires `LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS=1`
++ a CSRF token. See `.ralph/specs/D7-dashboard-auth-and-ws.md`.
 
 ## Code layout
 
@@ -43,6 +57,12 @@ Run locally:
 | `src/search.rs` | Brave Search client, `SearchClient` trait |
 | `src/monitor.rs` | Debug-UI broadcast hub |
 | `src/debug_ui.rs` | `/debug` HTML + WS handler |
+| `src/dashboard_flow.rs` | (T13) DashboardFlowStore — authoritative per-flow records + capture seams |
+| `src/metrics.rs` | (T13) MetricsLayer — ring buffers, histograms, 5 s body-free snapshots |
+| `src/dashboard_api.rs` | (T13) `/dashboard/api/*` REST handlers |
+| `src/dashboard_auth.rs` / `src/dashboard_ws.rs` | (T13) dashboard session-cookie auth + batched WS envelope |
+| `src/dashboard_ui.rs` | (T13) `include_dir!`-embedded SPA shell + static assets |
+| `dashboard-frontend/` | (T13) React + TS + Vite SPA (Vite build → `dist`, embedded when `LLMCONDUIT_BUILD_DASHBOARD=1`) |
 | `src/raw.rs` | `--raw` stdout delta writer |
 | `src/request_log.rs` | `analyze-log` impl |
 | `src/error.rs` | `AppError` (client vs internal message split) |
@@ -118,6 +138,10 @@ Profiles are considered against the resolved catalog model, the configured upstr
 - Don't lower the hard ceilings listed above.
 - Don't leak server-side Brave search internals into Chat Completions output. Chat hides `web_search_call`; Anthropic gets `server_tool_use` + `web_search_tool_result` from `response.web_search_results`.
 - Don't add CI/CD or new top-level files without checking with the user first.
+- Don't store the dashboard auth TOKEN/SESSION_KEY in the persisted `Config` struct (it's `#[derive(Debug, Clone)]` — secrets would leak) — read them env-only in the dashboard auth layer.
+- Don't retain `Bytes` slices of the 256 MiB middleware body buffer in the dashboard FlowStore — copy via the capped/redacting streaming serializer (a slice keeps the whole backing allocation alive).
+- Don't put dashboard snapshot bodies on historical snapshots — snapshots hold body-free `SnapshotFlowSummary` only (body retention on snapshots recreates a 135 GiB worst case).
+- Don't drive a single global `seq` watermark across monitor/flow/metrics/topology — use per-domain `{domain, seq}` cursors (a global watermark discards valid lower-numbered sibling frames).
 
 ## Quick gotchas
 
@@ -132,3 +156,6 @@ Profiles are considered against the resolved catalog model, the configured upstr
 - `UpstreamModelCatalog` caches `/v1/models` for 300s (`engine.rs:56`). Tests that depend on catalog changes need to construct a fresh `Gateway`.
 - `RoutingUpstreamClient` also caches the union model catalog for 300s (`upstream.rs:32`). Tests that change provider catalogs need a fresh router/client or must account for the cache.
 - `RawOutput` writes every SSE event whose name ends with `.delta` and has a string `delta`, including reasoning/refusal/tool-argument deltas; raw mode suppresses tracing output to keep stdout clean.
+- Dashboard (T13): `/v1/completions` is a raw passthrough and is NOT instrumented by the FlowStore on purpose (it bypasses the engine); the FlowStore whitelist is `/v1/responses`,`/v1/messages`,`/v1/chat/completions` only.
+- `LLMCONDUIT_BUILD_DASHBOARD` is a BUILD-time env var (build.rs runs `npm run build` + embeds via `include_dir!`); without it `cargo build` still succeeds on a node-less host (a stub shell is embedded). Runtime gating is the existing `--with-debug-ui`.
+- The dashboard WS envelope is BATCHED `DashboardFrame{domain,seq,batch:Vec<payload>}` (one per `DebugUpdate`, seq = `DebugUpdate.sequence`) — `/debug/ws` keeps the BARE `DebugWsMessage` contract untouched. Don't add per-frame seq to `DebugWsMessage`.
