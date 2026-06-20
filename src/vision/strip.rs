@@ -151,7 +151,8 @@ impl ImageCache {
 /// We drop every existing `analyzeImage` (case-insensitive) BOTH as a top-level
 /// Function/Custom tool AND as a NAMESPACED child — a surviving namespaced
 /// `analyzeImage` would lower to a chat tool of the same name and collide with
-/// the appended canonical tool (`lower_tools` rejects duplicate names). A
+/// the appended canonical tool (`build_tool_registry` rejects duplicate names,
+/// case-insensitively). A
 /// namespace left empty after removal is dropped entirely. Finally append
 /// exactly one canonical spec.
 fn inject_analyze_image_tool(tools: &mut Vec<ToolSpec>) {

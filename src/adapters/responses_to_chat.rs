@@ -458,7 +458,6 @@ fn validate_request(request: &ResponsesRequest) -> AppResult<()> {
 
 fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
     let mut tools = Vec::new();
-    let mut seen_names = HashMap::new();
     for spec in specs {
         let lowered_tools = match spec {
             ToolSpec::Function {
@@ -574,15 +573,10 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
             }],
             ToolSpec::ImageGeneration { .. } => Vec::new(),
         };
-        for tool in lowered_tools {
-            let name = tool.function.name.clone();
-            if seen_names.insert(name.clone(), ()).is_some() {
-                return Err(AppError::bad_request(format!(
-                    "duplicate tool name is not supported: {name}"
-                )));
-            }
-            tools.push(tool);
-        }
+        // Duplicate-tool-name rejection lives solely in `build_tool_registry`
+        // (case-insensitive), which `lower_request` always calls on the same
+        // tool slice. `lower_tools` only builds and sorts the chat tools.
+        tools.extend(lowered_tools);
     }
     tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
     Ok(tools)
@@ -741,42 +735,46 @@ fn web_search_arguments(action: &Option<crate::models::responses::WebSearchActio
 fn web_search_placeholder_result(
     action: &Option<crate::models::responses::WebSearchAction>,
 ) -> String {
-    match action {
-        Some(crate::models::responses::WebSearchAction::Search { query, queries }) => {
-            let query = query
-                .clone()
-                .or_else(|| queries.as_ref().and_then(|queries| queries.first().cloned()));
-            match query {
-                Some(query) => format!(
-                    "Previous web_search completed in an earlier turn, but the original tool result is unavailable because replay state was missing. Query: {query}"
-                ),
-                None => "Previous web_search completed in an earlier turn, but the original tool result is unavailable because replay state was missing.".to_string(),
+    use crate::models::responses::WebSearchAction;
+
+    // One base sentence, differing only by an optional action label, plus the
+    // optional fields present for this action, in field order.
+    let (action_label, fragments): (&str, Vec<String>) = match action {
+        Some(WebSearchAction::Search { query, queries }) => {
+            let query = query.clone().or_else(|| {
+                queries
+                    .as_ref()
+                    .and_then(|queries| queries.first().cloned())
+            });
+            (
+                "",
+                query.into_iter().map(|q| format!("Query: {q}")).collect(),
+            )
+        }
+        Some(WebSearchAction::OpenPage { url }) => (
+            " open_page",
+            url.iter().map(|u| format!("URL: {u}")).collect(),
+        ),
+        Some(WebSearchAction::FindInPage { url, pattern }) => {
+            let mut fragments = Vec::new();
+            if let Some(url) = url {
+                fragments.push(format!("URL: {url}"));
             }
-        }
-        Some(crate::models::responses::WebSearchAction::OpenPage { url }) => match url {
-            Some(url) => format!(
-                "Previous web_search open_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing. URL: {url}"
-            ),
-            None => "Previous web_search open_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing.".to_string(),
-        },
-        Some(crate::models::responses::WebSearchAction::FindInPage { url, pattern }) => {
-            match (url, pattern) {
-                (Some(url), Some(pattern)) => format!(
-                    "Previous web_search find_in_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing. URL: {url}. Pattern: {pattern}"
-                ),
-                (Some(url), None) => format!(
-                    "Previous web_search find_in_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing. URL: {url}"
-                ),
-                (None, Some(pattern)) => format!(
-                    "Previous web_search find_in_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing. Pattern: {pattern}"
-                ),
-                (None, None) => "Previous web_search find_in_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing.".to_string(),
+            if let Some(pattern) = pattern {
+                fragments.push(format!("Pattern: {pattern}"));
             }
+            (" find_in_page", fragments)
         }
-        Some(crate::models::responses::WebSearchAction::Other) | None => {
-            "Previous web_search completed in an earlier turn, but the original tool result is unavailable because replay state was missing.".to_string()
-        }
+        Some(WebSearchAction::Other) | None => ("", Vec::new()),
+    };
+
+    let mut result = format!(
+        "Previous web_search{action_label} completed in an earlier turn, but the original tool result is unavailable because replay state was missing."
+    );
+    if !fragments.is_empty() {
+        result.push_str(&format!(" {}", fragments.join(". ")));
     }
+    result
 }
 
 fn reasoning_item_text(
@@ -1098,7 +1096,10 @@ mod tests {
 
     #[test]
     fn duplicate_tool_name_rejected() {
-        let tools = vec![
+        // Rejection is the registry's sole responsibility, reached end-to-end
+        // via `lower_request`. Exact-case duplicate.
+        let mut req = base_test_request();
+        req.tools = vec![
             ToolSpec::Function {
                 name: "echo".to_string(),
                 description: "a".to_string(),
@@ -1112,7 +1113,39 @@ mod tests {
                 parameters: json!({}),
             },
         ];
-        assert!(lower_tools(&tools).is_err());
+        let err = lower_request(&req, vec![]).expect_err("duplicate name must be rejected");
+        assert!(
+            err.to_string()
+                .contains("duplicate tool name is not supported: "),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_tool_name_rejected_case_insensitive() {
+        // The surviving (registry) check folds case: `echo` vs `ECHO` collide,
+        // which the removed case-sensitive `lower_tools` map never caught.
+        let mut req = base_test_request();
+        req.tools = vec![
+            ToolSpec::Function {
+                name: "echo".to_string(),
+                description: "a".to_string(),
+                strict: false,
+                parameters: json!({}),
+            },
+            ToolSpec::Function {
+                name: "ECHO".to_string(),
+                description: "b".to_string(),
+                strict: false,
+                parameters: json!({}),
+            },
+        ];
+        let err = lower_request(&req, vec![]).expect_err("case-insensitive duplicate must reject");
+        assert!(
+            err.to_string()
+                .contains("duplicate tool name is not supported: "),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1220,6 +1253,84 @@ mod tests {
                 .contains("replay state was missing")
         );
         assert!(web_search_placeholder_result(&None).contains("replay state was missing"));
+    }
+
+    #[test]
+    fn web_search_placeholder_result_byte_exact() {
+        // Full-string equality guards against wording/spacing/punctuation drift.
+        const BASE: &str = "Previous web_search completed in an earlier turn, but the original tool result is unavailable because replay state was missing.";
+
+        // Search: with `query`, with only `queries`, with neither.
+        assert_eq!(
+            web_search_placeholder_result(&Some(WebSearchAction::Search {
+                query: Some("cats".to_string()),
+                queries: Some(vec!["ignored".to_string()]),
+            })),
+            format!("{BASE} Query: cats")
+        );
+        assert_eq!(
+            web_search_placeholder_result(&Some(WebSearchAction::Search {
+                query: None,
+                queries: Some(vec!["dogs".to_string(), "second".to_string()]),
+            })),
+            format!("{BASE} Query: dogs")
+        );
+        assert_eq!(
+            web_search_placeholder_result(&Some(WebSearchAction::Search {
+                query: None,
+                queries: None,
+            })),
+            BASE
+        );
+
+        // OpenPage: with/without url.
+        assert_eq!(
+            web_search_placeholder_result(&Some(WebSearchAction::OpenPage {
+                url: Some("http://x.com".to_string()),
+            })),
+            "Previous web_search open_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing. URL: http://x.com"
+        );
+        assert_eq!(
+            web_search_placeholder_result(&Some(WebSearchAction::OpenPage { url: None })),
+            "Previous web_search open_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing."
+        );
+
+        // FindInPage: url+pattern, url-only, pattern-only, neither.
+        assert_eq!(
+            web_search_placeholder_result(&Some(WebSearchAction::FindInPage {
+                url: Some("http://x.com".to_string()),
+                pattern: Some("foo".to_string()),
+            })),
+            "Previous web_search find_in_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing. URL: http://x.com. Pattern: foo"
+        );
+        assert_eq!(
+            web_search_placeholder_result(&Some(WebSearchAction::FindInPage {
+                url: Some("http://x.com".to_string()),
+                pattern: None,
+            })),
+            "Previous web_search find_in_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing. URL: http://x.com"
+        );
+        assert_eq!(
+            web_search_placeholder_result(&Some(WebSearchAction::FindInPage {
+                url: None,
+                pattern: Some("foo".to_string()),
+            })),
+            "Previous web_search find_in_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing. Pattern: foo"
+        );
+        assert_eq!(
+            web_search_placeholder_result(&Some(WebSearchAction::FindInPage {
+                url: None,
+                pattern: None,
+            })),
+            "Previous web_search find_in_page completed in an earlier turn, but the original tool result is unavailable because replay state was missing."
+        );
+
+        // Other and None: bare base.
+        assert_eq!(
+            web_search_placeholder_result(&Some(WebSearchAction::Other)),
+            BASE
+        );
+        assert_eq!(web_search_placeholder_result(&None), BASE);
     }
 
     #[test]
