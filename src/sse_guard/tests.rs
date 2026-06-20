@@ -12,6 +12,131 @@ fn frame(data: &str) -> String {
     format!("data: {data}\n\n")
 }
 
+// --------------------------------------------------------------------------
+// Reject-path allocation probe (T5 R2).
+//
+// `SseFrameGuard::peak_owned_carry_bytes` only maxes `self.carry.len()` AFTER a
+// SUCCESSFUL scan, so it is structurally BLIND to a temporary chunk-sized buffer
+// that a regressed scanner would allocate and drop on the cap-EXCEEDED (`Err`)
+// path before control returns — exactly the old `buf = carry ++ chunk` (and the
+// old adapter `Bytes::copy_from_slice`). A counter threaded through the carry
+// choke-point cannot see that local either. So the genuine reject-path guard is
+// an allocator that observes EVERY heap allocation by SIZE, regardless of which
+// API made it (`copy_from_slice`, `Vec::with_capacity` + `extend_from_slice`,
+// `BytesMut`, …), and records the largest one made on the arming thread while a
+// guarded region is active.
+//
+// Inert by construction outside the probe: the global allocator does one
+// thread-local `Cell` read per `alloc` and returns immediately unless THIS thread
+// has armed it, so the rest of the suite (and every release build — the whole
+// module is `#[cfg(test)]`) pays nothing. Arming is THREAD-LOCAL, so other tests
+// running in parallel (incl. ones that allocate 16 MiB of their own) are never
+// observed; only allocations on the arming thread between `arm`/`disarm` count.
+// --------------------------------------------------------------------------
+mod alloc_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Whether THIS thread is currently inside an `armed(..)` region.
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        /// Only allocations `>= THRESHOLD` bytes are recorded — filters out the
+        /// incidental small allocations (error-string formatting, `Vec` growth,
+        /// the <=3-byte carry) so the probe fires ONLY on a chunk-sized copy.
+        static THRESHOLD: Cell<usize> = const { Cell::new(usize::MAX) };
+        /// High-water mark of the largest single recorded allocation, in bytes.
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+        /// Re-entrancy guard so any allocation made *inside* the hook (none today)
+        /// cannot recurse into recording.
+        static IN_HOOK: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// A passthrough `System` allocator that, only while the CURRENT thread is
+    /// armed, records the largest single allocation `>= threshold`.
+    struct ProbeAlloc;
+
+    // SAFETY: every method forwards verbatim to `System`; the recording side does
+    // not allocate and is re-entrancy-guarded, so it cannot perturb allocation.
+    unsafe impl GlobalAlloc for ProbeAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            record(layout.size());
+            ptr
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc_zeroed(layout) };
+            record(layout.size());
+            ptr
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let np = unsafe { System.realloc(ptr, layout, new_size) };
+            record(new_size);
+            np
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    /// Record `size` against this thread's peak iff armed and at/over threshold.
+    /// During teardown a thread-local may be destroyed, so `try_with` degrades to
+    /// a no-op rather than panicking.
+    fn record(size: usize) {
+        let armed = ARMED.try_with(|c| c.get()).unwrap_or(false);
+        if !armed {
+            return;
+        }
+        let reentrant = IN_HOOK.with(|c| {
+            let was = c.get();
+            c.set(true);
+            was
+        });
+        if !reentrant {
+            let threshold = THRESHOLD.with(|c| c.get());
+            if size >= threshold {
+                PEAK.with(|c| c.set(c.get().max(size)));
+            }
+            IN_HOOK.with(|c| c.set(false));
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: ProbeAlloc = ProbeAlloc;
+
+    /// Run `body` with the allocation probe armed on the current thread, recording
+    /// any single allocation `>= threshold`, and return the largest such recorded
+    /// allocation in bytes (0 if none). Allocations made BEFORE the call (e.g. the
+    /// hostile input chunk) are not counted — only what `body` allocates is.
+    pub(super) fn peak_alloc_during<R>(threshold: usize, body: impl FnOnce() -> R) -> (R, usize) {
+        PEAK.with(|c| c.set(0));
+        THRESHOLD.with(|c| c.set(threshold));
+        ARMED.with(|c| c.set(true));
+        let out = body();
+        ARMED.with(|c| c.set(false));
+        let peak = PEAK.with(|c| c.get());
+        (out, peak)
+    }
+
+    /// `async` sibling of [`peak_alloc_during`]: arm across an `.await`-driven
+    /// section. Sound under the default current-thread `#[tokio::test]` runtime,
+    /// where polling happens inline on the arming thread.
+    pub(super) async fn peak_alloc_during_async<F, R>(threshold: usize, fut: F) -> (R, usize)
+    where
+        F: std::future::Future<Output = R>,
+    {
+        PEAK.with(|c| c.set(0));
+        THRESHOLD.with(|c| c.set(threshold));
+        ARMED.with(|c| c.set(true));
+        let out = fut.await;
+        ARMED.with(|c| c.set(false));
+        let peak = PEAK.with(|c| c.get());
+        (out, peak)
+    }
+}
+
 // --- Boundary-detection internals (white-box: pokes module-private items) ---
 
 #[test]
@@ -308,6 +433,111 @@ fn oversized_chunk_is_rejected_without_owning_a_full_copy() {
          (carry is <=3 bytes)",
         guard.peak_owned_carry_bytes()
     );
+}
+
+/// THE REJECT-PATH ALLOCATION GUARD (T5 R2). `peak_owned_carry_bytes` (asserted
+/// above) only observes the *persisted* carry after a successful scan, so it is
+/// blind to a temporary chunk-sized buffer a regressed scanner would allocate and
+/// drop on the cap-exceeded `Err` path. Here we wrap the same 16 MiB-chunk
+/// rejection in an allocation probe that records the largest single heap
+/// allocation made WHILE rejecting, and assert it stays far below the chunk —
+/// proving no full-copy buffer is ever materialized on the reject path, by ANY
+/// allocation API.
+///
+/// Sensitivity: the pre-T5 scanner did
+/// `Vec::with_capacity(carry.len()+chunk.len()); buf.extend_from_slice(&carry);
+/// buf.extend_from_slice(chunk)` BEFORE the cap check, and the pre-T5 adapter did
+/// `Bytes::copy_from_slice(bytes.as_ref())`. Either reintroduced here would make a
+/// single ~16 MiB allocation on this thread inside the probed region, blowing past
+/// the 64 KiB threshold and FAILING this assert — even though it is freed before
+/// `accept` returns and `peak_owned_carry_bytes` never sees it.
+#[test]
+fn oversized_chunk_reject_path_makes_no_chunk_sized_allocation() {
+    let cap = 1024 * 1024; // 1 MiB.
+    let mut guard = SseFrameGuard::new(cap);
+
+    // Build the hostile chunk BEFORE arming so the INPUT allocation is not counted
+    // — we measure only what the guard allocates while scanning/rejecting it. A
+    // borrowed-scan guard allocates at most the <=3-byte carry (well under 64 KiB).
+    let hostile = vec![b'x'; 16 * 1024 * 1024];
+    let threshold = 64 * 1024; // >> the <=3-byte carry, << the 16 MiB chunk.
+
+    let (result, peak) = alloc_probe::peak_alloc_during(threshold, || guard.accept(&hostile));
+    let err = result.expect_err("a 16 MiB unterminated frame must be rejected at the cap");
+    assert!(err.to_string().contains("exceeded"), "got: {err}");
+    assert_eq!(
+        peak, 0,
+        "rejecting a 16 MiB chunk made a single allocation of {peak} bytes (>= {threshold}); \
+         the guard must cap the BORROWED bytes and never copy the chunk (T5)"
+    );
+
+    // Same guarantee end-to-end through the real adapter (drives `accept` on the
+    // reject path AND the `Bytes::copy_from_slice`-free forward), not just the
+    // guard in isolation. The probe is armed across the `.await` that polls the
+    // `async_stream` on this (current-thread) runtime.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("current-thread runtime");
+    rt.block_on(async {
+        use futures::StreamExt;
+        let hostile = vec![b'x'; 16 * 1024 * 1024];
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(Bytes::from(hostile))];
+        let mut stream = Box::pin(super::bounded_sse_byte_stream(
+            futures::stream::iter(chunks),
+            cap,
+        ));
+        let (item, peak) =
+            alloc_probe::peak_alloc_during_async(threshold, async { stream.next().await }).await;
+        let err = item
+            .expect("the adapter yields the rejection item")
+            .expect_err("the 16 MiB chunk must surface as a transport error");
+        assert!(err.to_string().contains("exceeded"), "got: {err}");
+        assert_eq!(
+            peak, 0,
+            "the adapter made a single allocation of {peak} bytes (>= {threshold}) rejecting a \
+             16 MiB chunk; neither the adapter (no `copy_from_slice`) nor the scanner (no \
+             `buf = carry ++ chunk`) may copy the chunk"
+        );
+    });
+}
+
+/// THE ADAPTER SAME-ALLOCATION GUARD (T5 R2). The other half of the finding: prove
+/// `bounded_sse_byte_stream` forwards the SAME ref-counted `Bytes` allocation it
+/// received — i.e. it no longer `Bytes::copy_from_slice`s each chunk before the
+/// guard sees it. A normal, sub-cap, well-formed frame is fed in and the forwarded
+/// item is asserted to share the input's backing pointer. A reintroduced
+/// `copy_from_slice` would forward a DISTINCT allocation, so `as_ptr()` would
+/// differ and this test would fail.
+#[tokio::test]
+async fn bounded_stream_forwards_same_allocation_without_copying() {
+    use futures::StreamExt;
+
+    // A normal, well-formed, sub-cap frame. `Bytes::from(Vec)` owns a unique heap
+    // allocation, so its `as_ptr()` is a stable identity for that buffer.
+    let input = Bytes::from(b"data: hello world\n\n".to_vec());
+    let input_ptr = input.as_ptr();
+    let input_bytes = input.clone(); // keep a handle for an equality cross-check.
+
+    let chunks: Vec<Result<Bytes, reqwest::Error>> = vec![Ok(input)];
+    let mut stream = Box::pin(super::bounded_sse_byte_stream(
+        futures::stream::iter(chunks),
+        1024 * 1024,
+    ));
+
+    let forwarded = stream
+        .next()
+        .await
+        .expect("the adapter forwards the sub-cap frame")
+        .expect("a well-formed sub-cap frame is not rejected");
+
+    // SAME allocation: identical backing pointer (no `copy_from_slice`).
+    assert_eq!(
+        forwarded.as_ptr(),
+        input_ptr,
+        "the adapter must forward the SAME `Bytes` allocation it received, not a copy"
+    );
+    // Belt-and-braces: contents are of course unchanged too.
+    assert_eq!(forwarded, input_bytes);
 }
 
 /// Many large but UNDER-cap, well-formed chunks are all accepted, and the guard's

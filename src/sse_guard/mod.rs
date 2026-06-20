@@ -147,11 +147,7 @@ impl SseFrameGuard {
     }
 
     fn scan(&mut self, chunk: &[u8], at_eof: bool) -> Result<(), AppError> {
-        let ScanState {
-            since_boundary,
-            carry,
-            in_eol_run,
-        } = scan_frames_since_boundary(
+        let result = scan_frames_since_boundary(
             ScanState {
                 since_boundary: self.since_boundary,
                 carry: std::mem::take(&mut self.carry),
@@ -160,8 +156,23 @@ impl SseFrameGuard {
             chunk,
             self.max_frame_bytes,
             at_eof,
-        )
-        .map_err(|observed| {
+        );
+        // Snapshot the owned-buffer high-water mark BEFORE branching on the result,
+        // so the seam observes every owned `Vec` the scanner materialized (via the
+        // `JoinedBuf::collect_from` choke-point) on the cap-EXCEEDED path too — not
+        // only after a successful scan. The scan borrows the chunk, so the only
+        // buffer it ever owns is the deferred <=3-byte carry; a test asserts this
+        // stays tiny regardless of how large a chunk we just scanned.
+        #[cfg(test)]
+        {
+            self.peak_owned_carry_bytes =
+                self.peak_owned_carry_bytes.max(take_scanner_owned_peak());
+        }
+        let ScanState {
+            since_boundary,
+            carry,
+            in_eol_run,
+        } = result.map_err(|observed| {
             AppError::upstream(format!(
                 "upstream SSE frame exceeded {} bytes before an event boundary \
                          (saw {observed}); rejecting to bound memory (G6)",
@@ -171,13 +182,6 @@ impl SseFrameGuard {
         self.since_boundary = since_boundary;
         self.carry = carry;
         self.in_eol_run = in_eol_run;
-        // The scan borrowed the chunk; the only buffer the guard now owns is the
-        // deferred carry. Record its high-water mark so a test can prove it stays
-        // bounded (<=3 bytes) regardless of how large a chunk we just scanned.
-        #[cfg(test)]
-        {
-            self.peak_owned_carry_bytes = self.peak_owned_carry_bytes.max(self.carry.len());
-        }
         Ok(())
     }
 }
@@ -377,6 +381,56 @@ impl ByteSource for JoinedBuf<'_> {
             self.tail.get(i - self.head.len()).copied()
         }
     }
+
+    /// The production scanner's ONE owned-buffer exit: every `Vec` the scanner
+    /// materializes from the carry+chunk view goes through here (the carry it
+    /// defers on each return path). Routing it through a single choke-point lets
+    /// the guard observe the owned-byte high-water mark on EVERY path — the
+    /// would-be-reject path included — not only after a successful scan. The
+    /// default impl already copies just the requested suffix (the <=3-byte carry);
+    /// we only add the `#[cfg(test)]` bookkeeping. Zero release cost.
+    fn collect_from(&self, from: usize) -> Vec<u8> {
+        let out = {
+            let n = self.len();
+            let mut v = Vec::with_capacity(n.saturating_sub(from));
+            let mut i = from;
+            while i < n {
+                v.push(self.byte(i).expect("index within len() is always present"));
+                i += 1;
+            }
+            v
+        };
+        #[cfg(test)]
+        record_owned_buffer_bytes(out.len());
+        out
+    }
+}
+
+// High-water mark of bytes the production scanner has materialized (via
+// [`JoinedBuf::collect_from`]) on the CURRENT thread since the last reset. The
+// guard snapshots it after EVERY `scan` — on the success AND error paths — so the
+// owned-byte seam observes the reject path too, not just a persisted carry.
+// Thread-local so parallel tests do not contend; `#[cfg(test)]`-only.
+#[cfg(test)]
+thread_local! {
+    static SCANNER_OWNED_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Bump the thread-local owned-buffer high-water mark. Called from the scanner's
+/// single owned-buffer choke-point.
+#[cfg(test)]
+fn record_owned_buffer_bytes(len: usize) {
+    SCANNER_OWNED_PEAK.with(|c| c.set(c.get().max(len)));
+}
+
+/// Read-and-reset the thread-local owned-buffer high-water mark.
+#[cfg(test)]
+fn take_scanner_owned_peak() -> usize {
+    SCANNER_OWNED_PEAK.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    })
 }
 
 fn eol_token_at(buf: &(impl ByteSource + ?Sized), i: usize, at_eof: bool) -> EolToken {
