@@ -7,9 +7,13 @@ use std::time::UNIX_EPOCH;
 use tokio::sync::broadcast;
 
 const DEBUG_PROTOCOL_VERSION: u32 = 1;
-const DEBUG_HISTORY_RETENTION_MS: u128 = 30 * 60 * 1000;
+/// 30-minute history TTL. Also reused as the dashboard FlowStore per-record TTL
+/// (D1) so the two stores share one retention value rather than inventing a
+/// second.
+pub(crate) const DEBUG_HISTORY_RETENTION_MS: u128 = 30 * 60 * 1000;
 const REQUEST_TEXT_CHAR_LIMIT: usize = 128 * 1024;
-const REQUEST_EVENT_LIMIT: usize = 512;
+/// 512-record cap. Also reused as the dashboard FlowStore record cap (D1).
+pub(crate) const REQUEST_EVENT_LIMIT: usize = 512;
 
 #[derive(Debug, Clone, Serialize)]
 pub enum MonitorEventKind {

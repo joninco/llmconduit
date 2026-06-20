@@ -73,6 +73,10 @@ pub struct Gateway {
     image_cache: Arc<ImageCache>,
     monitor: MonitorHub,
     raw_output: Option<RawOutput>,
+    /// D1 dashboard FlowStore: authoritative per-flow records + capture seam.
+    /// `DashboardFlowStore::disabled()` when `--with-debug-ui` is off, so every
+    /// store op is a no-op and the production hot path is unchanged.
+    flow_store: crate::dashboard_flow::DashboardFlowStore,
     upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
     /// Throttle state for the "requested model not served → fell back to the
     /// default catalog model" WARN. Every request resolves the model TWICE (the
@@ -532,6 +536,7 @@ impl Gateway {
         image_cache: Arc<ImageCache>,
         monitor: MonitorHub,
         raw_output: Option<RawOutput>,
+        flow_store: crate::dashboard_flow::DashboardFlowStore,
     ) -> Self {
         Self {
             config,
@@ -542,9 +547,16 @@ impl Gateway {
             image_cache,
             monitor,
             raw_output,
+            flow_store,
             upstream_model_catalog: Arc::new(Mutex::new(None)),
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Access the dashboard FlowStore (D1). `is_enabled()` is `false` when the
+    /// debug UI is off, in which case every store op is a no-op.
+    pub fn flow_store(&self) -> &crate::dashboard_flow::DashboardFlowStore {
+        &self.flow_store
     }
 
     pub fn config(&self) -> &Config {
@@ -702,9 +714,23 @@ impl Gateway {
         Ok(())
     }
 
+    /// Public entry point: stream a canonical Responses request. Thin wrapper that
+    /// delegates to [`stream_responses_with_api_call_id`](Self::stream_responses_with_api_call_id)
+    /// with no `api_call_id`, so existing callers (tests, non-instrumented paths)
+    /// keep this exact signature. The HTTP handlers pass the `api_call_id` from the
+    /// request extension via the `_with_api_call_id` variant so the engine can
+    /// `flow_store.link(response_id, api_call_id)` (D1).
     pub async fn stream_responses(
         self: Arc<Self>,
         request: ResponsesRequest,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
+        self.stream_responses_with_api_call_id(request, None).await
+    }
+
+    pub async fn stream_responses_with_api_call_id(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        api_call_id: Option<String>,
     ) -> AppResult<ReceiverStream<SseEvent>> {
         let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
         let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
@@ -814,6 +840,15 @@ impl Gateway {
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
         let response_id = format!("resp_{}", Uuid::new_v4().simple());
+        // D1: bind this flow's `response_id` to the inbound `api_call_id` exactly
+        // once, so the dashboard can join the engine-side response stream back to
+        // the captured HTTP flow record. No-op when the FlowStore is disabled or no
+        // `api_call_id` was threaded (e.g. the public `stream_responses` wrapper).
+        // `response_id` stays the `resp_{uuid}` API contract — never collapsed to
+        // the `api_call_id`.
+        if let Some(api_call_id) = api_call_id {
+            self.flow_store().link(response_id.clone(), api_call_id);
+        }
         tokio::spawn(async move {
             let result = gateway
                 .run_turn(

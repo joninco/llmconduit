@@ -82,18 +82,36 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
 
     router
         .fallback(api_not_found)
-        .layer(middleware::from_fn(log_api_call))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&gateway),
+            log_api_call,
+        ))
         .with_state(gateway)
 }
 
-async fn log_api_call(request: Request, next: Next) -> Response {
+/// Paths whose inbound bodies the dashboard FlowStore captures (D1). ONLY the
+/// three canonical inference entry points are whitelisted: `/v1/completions` is a
+/// raw upstream passthrough that bypasses the engine (so it is never instrumented),
+/// and `/dashboard*`/`/debug*`/`/health`/`/`/`/v1/models` carry no inference flow.
+fn is_flow_capture_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/responses" | "/v1/messages" | "/v1/chat/completions"
+    )
+}
+
+async fn log_api_call(
+    State(gateway): State<Arc<Gateway>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let api_call_id = format!("api_{}", Uuid::new_v4().simple());
     let method = request.method().clone();
     let uri = request.uri().clone();
     let headers = request.headers().clone();
     let started_at = Instant::now();
 
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let body_bytes = match to_bytes(body, API_LOG_BODY_LIMIT_BYTES).await {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -139,6 +157,30 @@ async fn log_api_call(request: Request, next: Next) -> Response {
             path = %uri.path(),
             body_payload = %payload_for_log(&body_bytes),
             "inbound API request payload"
+        );
+    }
+
+    // D1: thread the `api_call_id` to the inference handlers + engine via a request
+    // extension for EVERY request (cheap), so `stream_responses_with_api_call_id`
+    // can link `response_id → api_call_id`. The capture work below is gated on the
+    // FlowStore being enabled AND a whitelisted inference path, so the disabled
+    // production path does no extra work beyond this one extension insert.
+    parts
+        .extensions
+        .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
+    if gateway.flow_store().is_enabled() && is_flow_capture_path(uri.path()) {
+        // Capture the inbound body + headers through the capped/redacting streaming
+        // serializer (never retain a `Bytes` slice of the 256 MiB buffer), then open
+        // the flow record. Secrets (auth headers, `api_key`, image URIs) are redacted
+        // INLINE by the serializer/header redactor — no secret persists even here.
+        let inbound_body = Some(crate::dashboard_flow::capture_body(&body_bytes));
+        let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
+        gateway.flow_store().open(
+            api_call_id.clone(),
+            method.to_string(),
+            uri.path().to_string(),
+            headers_redacted,
+            inbound_body,
         );
     }
 
@@ -260,7 +302,7 @@ fn redact_payload_secrets(value: &mut Value) {
     }
 }
 
-fn is_sensitive_payload_key(key: &str) -> bool {
+pub(crate) fn is_sensitive_payload_key(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
     matches!(
         normalized.as_str(),
@@ -709,12 +751,15 @@ fn json_type(value: &Value) -> &'static str {
 
 async fn post_responses(
     State(gateway): State<Arc<Gateway>>,
+    api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     Json(request): Json<ResponsesRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let served = gateway.resolve_request_model(&request.model).await.0;
     let wants_stream = request.stream;
-    let stream = gateway.stream_responses(request).await?;
+    let stream = gateway
+        .stream_responses_with_api_call_id(request, api_call_id.map(|extension| extension.0.0))
+        .await?;
     let response = if wants_stream {
         stream_responses_response(stream)
     } else {
@@ -725,9 +770,11 @@ async fn post_responses(
 
 async fn post_messages(
     State(gateway): State<Arc<Gateway>>,
+    api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     Json(request): Json<AnthropicRequest>,
 ) -> Response {
-    match handle_post_messages(gateway, request).await {
+    let api_call_id = api_call_id.map(|extension| extension.0.0);
+    match handle_post_messages(gateway, request, api_call_id).await {
         Ok(response) => response,
         Err(err) => anthropic_error_response(err),
     }
@@ -735,6 +782,7 @@ async fn post_messages(
 
 async fn post_chat_completions(
     State(gateway): State<Arc<Gateway>>,
+    api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
     Json(request): Json<ChatCompletionRequest>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
@@ -750,7 +798,12 @@ async fn post_chat_completions(
     // receives server-side chain-of-thought from ANY model (G2, Finding 1).
     let suppress_reasoning = gateway.chat_reasoning_suppressed(&request);
     let responses_request = chat_completions::convert_request(request)?;
-    let stream = gateway.stream_responses(responses_request).await?;
+    let stream = gateway
+        .stream_responses_with_api_call_id(
+            responses_request,
+            api_call_id.map(|extension| extension.0.0),
+        )
+        .await?;
 
     let response = if wants_stream {
         stream_chat_completions_response(model.clone(), include_usage, suppress_reasoning, stream)
@@ -775,12 +828,15 @@ async fn post_completions(
 async fn handle_post_messages(
     gateway: Arc<Gateway>,
     request: AnthropicRequest,
+    api_call_id: Option<String>,
 ) -> AppResult<Response> {
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
     let wants_stream = request.stream;
     let responses_request = anthropic_to_responses::convert_request(request)?;
-    let stream = gateway.stream_responses(responses_request).await?;
+    let stream = gateway
+        .stream_responses_with_api_call_id(responses_request, api_call_id)
+        .await?;
 
     let response = if wants_stream {
         stream_anthropic_response(model.clone(), stream)?

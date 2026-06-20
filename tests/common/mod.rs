@@ -286,6 +286,7 @@ pub fn test_gateway_with_config(
         image_cache,
         MonitorHub::new(128),
         None,
+        llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
     ))
 }
 
@@ -406,6 +407,7 @@ pub fn test_gateway_with_vision(
         image_cache,
         MonitorHub::new(128),
         None,
+        llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
     ))
 }
 

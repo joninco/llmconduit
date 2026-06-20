@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod cli;
 pub mod config;
+pub mod dashboard_flow;
 pub mod debug_ui;
 pub mod engine;
 pub mod error;
@@ -15,6 +16,11 @@ pub mod replay;
 pub mod request_log;
 pub mod search;
 pub(crate) mod sse_guard;
+/// Crate-internal, test-only peak-allocation probe (the crate's single
+/// `#[global_allocator]`), shared by the `sse_guard` reject-path and
+/// `dashboard_flow::capture_body` heap-bound tests.
+#[cfg(test)]
+pub(crate) mod test_alloc_probe;
 pub(crate) mod tool_delta_gate;
 pub mod upstream;
 pub mod vision;
@@ -92,6 +98,13 @@ pub fn build_app_with_gateway_and_options(
         MonitorHub::new(512)
     } else {
         MonitorHub::disabled()
+    };
+    // D1 dashboard FlowStore: enabled only when the debug UI is on, mirroring the
+    // monitor's zero-overhead `disabled()` split.
+    let flow_store = if options.with_debug_ui {
+        crate::dashboard_flow::DashboardFlowStore::new()
+    } else {
+        crate::dashboard_flow::DashboardFlowStore::disabled()
     };
     // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
     // (G7); routes alone are enough to switch the gateway into the routing
@@ -238,6 +251,7 @@ pub fn build_app_with_gateway_and_options(
         image_cache,
         monitor,
         raw_output,
+        flow_store,
     ));
     let app = build_router(Arc::clone(&gateway), options.into());
     (app, gateway)

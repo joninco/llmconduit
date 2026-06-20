@@ -90,6 +90,7 @@ fn gateway_with_upstream<U: UpstreamClient + 'static>(upstream: U) -> Arc<Gatewa
         image_cache,
         MonitorHub::disabled(),
         None,
+        llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
     ))
 }
 

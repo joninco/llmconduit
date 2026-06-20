@@ -3070,6 +3070,175 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
     assert_eq!(tool_msgs.len(), 3);
 }
 
+// ---------------------------------------------------------------------------
+// D1 — DashboardFlowStore middleware integration (whitelist + api_call_id link).
+// ---------------------------------------------------------------------------
+
+/// Build a gateway whose dashboard FlowStore is ENABLED (debug UI on), so the
+/// `log_api_call` middleware captures whitelisted inference flows. Mirrors
+/// `test_gateway_with_config_and_raw_output` but with a live `DashboardFlowStore`.
+fn test_gateway_with_flow_store(upstream: MockUpstream, search: MockSearch) -> Arc<Gateway> {
+    let config = test_config();
+    upstream.set_finalization_policies(
+        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
+    );
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    Arc::new(Gateway::new(
+        config,
+        ReplayStore::new(1000),
+        Arc::new(upstream),
+        Arc::new(search),
+        vision,
+        image_cache,
+        MonitorHub::new(128),
+        None,
+        llmconduit::dashboard_flow::DashboardFlowStore::new(),
+    ))
+}
+
+#[tokio::test]
+async fn flow_store_opens_record_for_whitelisted_inference_path() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
+        .await;
+    let gateway = test_gateway_with_flow_store(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(Arc::clone(&gateway));
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer SECRETTOKEN")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+
+    // A flow record was opened for this whitelisted path.
+    let records = gateway.flow_store().list();
+    assert_eq!(records.len(), 1, "one flow record opened");
+    let record = &records[0];
+    // The api_call_id extension was minted + threaded (non-empty `api_` id).
+    assert!(
+        record.api_call_id.starts_with("api_"),
+        "api_call_id minted: {}",
+        record.api_call_id
+    );
+    assert_eq!(record.method, "POST");
+    assert_eq!(record.uri, "/v1/chat/completions");
+    // The engine linked response_id → api_call_id exactly once (response_id set).
+    assert!(
+        record
+            .response_id
+            .as_ref()
+            .is_some_and(|id| id.starts_with("resp_")),
+        "response_id linked: {:?}",
+        record.response_id
+    );
+    // Secret-bearing header value was redacted inline by the capture seam.
+    let header_dump = format!("{:?}", record.headers);
+    assert!(
+        !header_dump.contains("SECRETTOKEN"),
+        "authorization header value redacted in capture"
+    );
+    // detail joins by either id.
+    assert!(gateway.flow_store().detail(&record.api_call_id).is_some());
+    assert!(
+        gateway
+            .flow_store()
+            .detail(record.response_id.as_deref().expect("response_id"))
+            .is_some(),
+        "detail joins by response_id"
+    );
+}
+
+#[tokio::test]
+async fn flow_store_skips_non_whitelisted_paths() {
+    // The FlowStore is enabled; the middleware's whitelist must skip these paths
+    // BEFORE any upstream call, so whether the upstream proxy succeeds is
+    // irrelevant — the assertion is purely "no record opened". (`/v1/completions`
+    // is a raw passthrough that bypasses the engine and is intentionally never
+    // instrumented; `/v1/models`, `/health`, `/dashboard/*` carry no flow.)
+    let gateway = test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(Arc::clone(&gateway));
+
+    for (method_name, uri, body) in [
+        (
+            "POST",
+            "/v1/completions",
+            Some("{\"model\":\"glm-5.1\",\"prompt\":\"hi\"}"),
+        ),
+        ("GET", "/v1/models", None),
+        ("GET", "/health", None),
+        ("GET", "/dashboard/anything", None),
+    ] {
+        let mut builder = Request::builder().method(method_name).uri(uri);
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let request = builder
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .expect("request");
+        let _ = app.clone().oneshot(request).await.expect("response");
+    }
+
+    assert!(
+        gateway.flow_store().list().is_empty(),
+        "no flow record opened for /v1/completions, /v1/models, /health, or /dashboard/*"
+    );
+}
+
+#[tokio::test]
+async fn flow_store_disabled_path_opens_nothing() {
+    // With the default (disabled) FlowStore, the middleware does zero capture work
+    // and the public `stream_responses` signature still drives the request.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    assert!(
+        !gateway.flow_store().is_enabled(),
+        "default test gateway has a disabled FlowStore"
+    );
+    let app = llmconduit::build_app_from_gateway(Arc::clone(&gateway));
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    assert!(
+        gateway.flow_store().list().is_empty(),
+        "disabled FlowStore opens nothing"
+    );
+}
+
 fn test_gateway(upstream: MockUpstream, search: MockSearch) -> Arc<Gateway> {
     test_gateway_with_config(upstream, search, test_config())
 }
@@ -3119,6 +3288,7 @@ fn test_gateway_with_config_and_raw_output(
         image_cache,
         MonitorHub::new(128),
         raw_output,
+        llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
     ))
 }
 
@@ -5864,6 +6034,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
         image_cache,
         MonitorHub::new(128),
         None,
+        llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
     ));
 
     let request = base_request(vec![user_message("count")]);
