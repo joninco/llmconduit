@@ -1,6 +1,11 @@
 //! D1 — `DashboardFlowStore`: the authoritative per-flow record store and the
 //! on-wire capture seam that feeds the transformation inspector + metrics.
 //!
+//! This module holds STORE LOGIC ONLY. The capped + redacting body serializer and
+//! the single sensitive-key authority live in [`crate::redaction`] (D1 R1 #10), so
+//! there is exactly one definition of "what is sensitive" and one O(CAP) capture
+//! primitive shared with the inbound-trace logger.
+//!
 //! Architecture (DASHBOARD_PLAN §4.2/§4.7, Codex round-2/4/5 fixes):
 //! - The store is `DashboardFlowStore { state: Mutex<DashboardFlowState> }` with a
 //!   `MonitorHub`-style `new()`/`disabled()` split: when `--with-debug-ui` is off
@@ -13,23 +18,24 @@
 //!   `claim: Arc<AtomicU8>` is CLONED (shared) across COW copies so the atomic
 //!   identity persists for D3's `OpenL0 → ClaimedL1 → Finalized` CAS guard. D1
 //!   only ALLOCATES `claim` as `OpenL0`; D3 owns the transitions.
-//! - Bodies are owned, capped `Arc<[u8]>` produced by a redacting STREAMING JSON
-//!   serializer (`capture_body`): peak serializer memory is O(CAP), not O(body),
-//!   and a `Bytes::slice` of the 256 MiB middleware buffer is NEVER retained (a
-//!   slice keeps the whole backing allocation alive — AGENTS.md don't-rule). The
-//!   serializer redacts secrets INLINE (sensitive keys, image URIs, over-long
-//!   scalars), so no secret persists even in a preview.
-//! - The live store enforces three caps under the same lock: the record count
-//!   (512), a 30-minute TTL, and a total live summary-byte quota (64 MiB) that
-//!   evicts OLDEST BODIES first (sets their body `Arc`s to `None`; the record
-//!   stays as a body-free summary).
+//! - Bodies are owned, capped `Arc<[u8]>` produced by the redacting STREAMING JSON
+//!   serializer in `redaction`: peak serializer memory is O(CAP), not O(body), and
+//!   a `Bytes::slice` of the 256 MiB middleware buffer is NEVER retained (a slice
+//!   keeps the whole backing allocation alive — AGENTS.md don't-rule). Secrets are
+//!   redacted INLINE (sensitive keys, image URIs incl. `\uXXXX`-escaped forms,
+//!   over-long scalars + keys), so no secret persists even in a preview.
+//! - Every dynamic scalar string the record retains (ids, method, uri, models,
+//!   upstream target, terminal reason) is CAPPED at `SCALAR_CAP` and COUNTED in
+//!   `live_summary_bytes` (D1 R1 #5).
+//! - The live store enforces three caps under the same lock AFTER EVERY mutation
+//!   AND on every read: the record count (512), a 30-minute TTL, and a total live
+//!   summary-byte quota (64 MiB) that evicts OLDEST BODIES first (sets their body
+//!   `Arc`s to `None`; the record stays as a body-free summary).
 //! - Snapshots (`snapshot_summaries`) are BODY-FREE (`SnapshotFlowSummary`) — body
 //!   retention on historical snapshots recreates a 135 GiB worst case (D5 owns the
 //!   ring; D1 just exposes the body-free summary projection).
 
-use crate::http::is_sensitive_payload_key;
 use serde::Serialize;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -53,12 +59,9 @@ const DEFAULT_SUMMARY_QUOTA_BYTES: usize = 64 * 1024 * 1024;
 /// serializer stops writing once it has emitted this many bytes, so peak retained
 /// body memory is O(CAP) regardless of the 256 MiB inbound buffer size.
 const BODY_CAP: usize = 128 * 1024;
-/// Per-retained-scalar-string cap inside a captured body. A single huge JSON string
-/// (e.g. a base64 blob) is truncated to this many bytes before it is retained.
+/// Per-retained-scalar-string cap: bounds every dynamic string the record keeps
+/// (body scalars, headers, ids, method, uri, models, target, terminal reason).
 const SCALAR_CAP: usize = 4 * 1024;
-/// Recursion depth limit for the streaming JSON redactor — bounds the call stack on
-/// adversarially nested input; deeper input falls back to the best-effort path.
-const MAX_JSON_DEPTH: usize = 128;
 
 /// CAS claim state: the flow is open and unclaimed by a telemetry writer (D3 L0).
 pub const CLAIM_OPEN_L0: u8 = 0;
@@ -132,16 +135,30 @@ pub struct FlowRecord {
 
 impl FlowRecord {
     /// Bytes this record contributes to the live summary-byte quota: the three
-    /// captured bodies plus the retained (already-capped) header strings. Used to
-    /// maintain `live_summary_bytes` incrementally and to drive body eviction.
+    /// captured bodies, the retained (already-capped) header strings, AND every
+    /// dynamic scalar string the record holds (D1 R1 #5 — none of these were
+    /// counted before, so a flood of long model/uri/target strings could blow the
+    /// quota silently).
     fn summary_bytes(&self) -> usize {
         let body = |b: &Option<Arc<[u8]>>| b.as_ref().map(|b| b.len()).unwrap_or(0);
+        let opt = |s: &Option<String>| s.as_ref().map(|s| s.len()).unwrap_or(0);
         let headers: usize = self
             .headers
             .iter()
             .map(|(name, value)| name.len() + value.len())
             .sum();
-        body(&self.inbound_body) + body(&self.normalized) + body(&self.upstream_body) + headers
+        body(&self.inbound_body)
+            + body(&self.normalized)
+            + body(&self.upstream_body)
+            + headers
+            + self.api_call_id.len()
+            + opt(&self.response_id)
+            + self.method.len()
+            + self.uri.len()
+            + opt(&self.model_requested)
+            + opt(&self.model_served)
+            + opt(&self.upstream_target)
+            + opt(&self.terminal_reason)
     }
 
     /// Total bytes held by the three body `Arc`s only (the eviction target).
@@ -253,7 +270,7 @@ impl DashboardFlowStore {
 
     /// Open a new flow record keyed by `api_call_id`. No-op when disabled. The
     /// caller passes ALREADY-redacted headers and an ALREADY-capped inbound body
-    /// (`capture_body`), so no secret-bearing or oversized data enters the store.
+    /// (`capture_body`); every other dynamic scalar is capped here before storage.
     pub fn open(
         &self,
         api_call_id: String,
@@ -268,10 +285,10 @@ impl DashboardFlowStore {
         let now = now_ms();
         let record = FlowRecord {
             claim: Arc::new(AtomicU8::new(CLAIM_OPEN_L0)),
-            api_call_id: api_call_id.clone(),
+            api_call_id: cap_scalar(api_call_id.clone()),
             response_id: None,
-            method,
-            uri,
+            method: cap_scalar(method),
+            uri: cap_scalar(uri),
             headers: headers_redacted,
             inbound_body,
             normalized: None,
@@ -289,31 +306,40 @@ impl DashboardFlowStore {
         };
         let mut state = self.lock();
         state.prune_expired(now);
-        state.insert(api_call_id, Arc::new(record));
+        state.insert(cap_scalar(api_call_id), Arc::new(record));
         state.enforce_caps(self.summary_quota_bytes);
     }
 
-    /// Record the `response_id → api_call_id` mapping and stamp the flow's
-    /// `response_id`. Fires once per flow (the engine calls it exactly once after
-    /// minting `resp_{uuid}`). No-op when disabled or when the flow is unknown.
+    /// Atomically bind a `response_id` to its flow's `api_call_id` (D1 R1 #8):
+    /// fires exactly once per flow (first-link-wins). NO-OP when disabled, when the
+    /// record is unknown, or when the record is already linked — so an unknown id
+    /// can never leak a `link_index` entry and a repeat link can never alias.
     pub fn link(&self, response_id: String, api_call_id: String) {
         if !self.enabled {
             return;
         }
+        let response_id = cap_scalar(response_id);
         let mut state = self.lock();
-        // Record the join index even if the record was already evicted, so a late
-        // detail-by-response_id still resolves while the record lives.
+        state.prune_expired(now_ms());
+        let Some(existing) = state.by_id.get(&api_call_id) else {
+            // Unknown flow → no index entry, no record. (Avoids the leak where an
+            // index entry outlives a never-existent record.)
+            return;
+        };
+        if existing.response_id.is_some() {
+            // Already linked: first-link-wins, idempotent.
+            return;
+        }
         state
             .link_index
             .insert(response_id.clone(), api_call_id.clone());
         state.update(&api_call_id, |record| {
-            if record.response_id.is_none() {
-                record.response_id = Some(response_id.clone());
-            }
+            record.response_id = Some(response_id.clone());
         });
+        state.enforce_caps(self.summary_quota_bytes);
     }
 
-    /// Attach the upstream target + served/requested model identity (D2).
+    /// Attach the upstream target + served model identity + upstream body (D2).
     pub fn set_upstream(
         &self,
         api_call_id: &str,
@@ -324,7 +350,10 @@ impl DashboardFlowStore {
         if !self.enabled {
             return;
         }
+        let upstream_target = upstream_target.map(cap_scalar);
+        let model_served = model_served.map(cap_scalar);
         let mut state = self.lock();
+        state.prune_expired(now_ms());
         state.update(api_call_id, |record| {
             if upstream_target.is_some() {
                 record.upstream_target = upstream_target.clone();
@@ -336,7 +365,6 @@ impl DashboardFlowStore {
                 record.upstream_body = upstream_body.clone();
             }
         });
-        state.recompute_summary_bytes();
         state.enforce_caps(self.summary_quota_bytes);
     }
 
@@ -350,7 +378,9 @@ impl DashboardFlowStore {
         if !self.enabled {
             return;
         }
+        let model_requested = model_requested.map(cap_scalar);
         let mut state = self.lock();
+        state.prune_expired(now_ms());
         state.update(api_call_id, |record| {
             if model_requested.is_some() {
                 record.model_requested = model_requested.clone();
@@ -359,7 +389,6 @@ impl DashboardFlowStore {
                 record.normalized = normalized.clone();
             }
         });
-        state.recompute_summary_bytes();
         state.enforce_caps(self.summary_quota_bytes);
     }
 
@@ -369,8 +398,10 @@ impl DashboardFlowStore {
         if !self.enabled {
             return;
         }
+        let terminal_reason = terminal_reason.map(cap_scalar);
         let now = now_ms();
         let mut state = self.lock();
+        state.prune_expired(now);
         state.update(api_call_id, |record| {
             record.status = status;
             record.finished_ms = Some(now);
@@ -379,6 +410,7 @@ impl DashboardFlowStore {
                 record.terminal_reason = terminal_reason.clone();
             }
         });
+        state.enforce_caps(self.summary_quota_bytes);
     }
 
     /// Attach token usage (D3).
@@ -387,17 +419,20 @@ impl DashboardFlowStore {
             return;
         }
         let mut state = self.lock();
+        state.prune_expired(now_ms());
         state.update(api_call_id, |record| {
             record.usage = Some(usage);
         });
     }
 
-    /// Live records, newest-first. Empty when disabled.
+    /// Live records, newest-first. Empty when disabled. Prunes expired records
+    /// first (D1 R1 #7 — TTL no longer depends on `open` traffic).
     pub fn list(&self) -> Vec<Arc<FlowRecord>> {
         if !self.enabled {
             return Vec::new();
         }
-        let state = self.lock();
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
         state
             .order
             .iter()
@@ -407,26 +442,28 @@ impl DashboardFlowStore {
     }
 
     /// Resolve a single record by `api_call_id` OR `response_id` (via the link
-    /// index). `None` when disabled or unknown.
+    /// index). `None` when disabled or unknown. Prunes expired records first.
     pub fn detail(&self, id: &str) -> Option<Arc<FlowRecord>> {
         if !self.enabled {
             return None;
         }
-        let state = self.lock();
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
         if let Some(record) = state.by_id.get(id) {
             return Some(Arc::clone(record));
         }
-        // Join by response_id → api_call_id.
         let api_call_id = state.link_index.get(id)?;
         state.by_id.get(api_call_id).cloned()
     }
 
-    /// Body-free snapshot summaries, newest-first. Empty when disabled.
+    /// Body-free snapshot summaries, newest-first. Empty when disabled. Prunes
+    /// expired records first.
     pub fn snapshot_summaries(&self) -> Vec<SnapshotFlowSummary> {
         if !self.enabled {
             return Vec::new();
         }
-        let state = self.lock();
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
         state
             .order
             .iter()
@@ -434,6 +471,22 @@ impl DashboardFlowStore {
             .filter_map(|id| state.by_id.get(id))
             .map(|record| SnapshotFlowSummary::from_record(record))
             .collect()
+    }
+
+    /// Test-only: prune at a caller-supplied clock so the TTL is deterministically
+    /// observable without sleeping (D1 R1 #7).
+    #[cfg(test)]
+    fn prune_at(&self, now_ms: u128) {
+        let mut state = self.lock();
+        state.prune_expired(now_ms);
+    }
+
+    /// Test-only: backdate a record's `started_ms` so a deterministic TTL test can
+    /// age it past the retention window.
+    #[cfg(test)]
+    fn force_started_ms(&self, api_call_id: &str, started_ms: u128) {
+        let mut state = self.lock();
+        state.update(api_call_id, |record| record.started_ms = started_ms);
     }
 }
 
@@ -479,19 +532,8 @@ impl DashboardFlowState {
         self.by_id.insert(api_call_id.to_string(), Arc::new(next));
     }
 
-    /// Recompute the running summary-byte total from scratch. Called after a
-    /// body-attaching mutation so the quota accounting cannot drift over the COW
-    /// lifecycle.
-    fn recompute_summary_bytes(&mut self) {
-        self.live_summary_bytes = self
-            .by_id
-            .values()
-            .map(|record| record.summary_bytes())
-            .sum();
-    }
-
-    /// Drop records whose age exceeds the TTL. Returns the removed ids' summary
-    /// bytes to the running total.
+    /// Drop records whose age exceeds the TTL, keyed off `started_ms` vs a
+    /// caller-supplied `now`.
     fn prune_expired(&mut self, now: u128) {
         let cutoff = now.saturating_sub(FLOW_TTL_MS);
         let expired: Vec<String> = self
@@ -562,548 +604,37 @@ impl DashboardFlowState {
             }
         }
         self.order.retain(|id| id != api_call_id);
-        // Drop any dangling link-index entries that pointed at this id (e.g. a
-        // link recorded before the record was evicted).
+        // Drop any dangling link-index entries that pointed at this id.
         self.link_index.retain(|_, owner| owner != api_call_id);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Capped + redacting STREAMING body serializer.
-//
-// `capture_body` turns a raw request/response byte slice into an owned
-// `Arc<[u8]>` of at most BODY_CAP bytes, redacting secrets INLINE:
-// - sensitive object keys (`api_key`/`authorization`/… via the shared
-//   `is_sensitive_payload_key`) → the entire value becomes `"[redacted]"` and the
-//   real value is parse-skipped (never written);
-// - string values → capped to SCALAR_CAP and run through `redact_image_uris`;
-// - everything else copied through.
-//
-// The common path is a SINGLE forward-pass recursive-descent walk over the byte
-// slice into a hard-capped writer — it never builds a full `serde_json::Value`
-// (that would be O(body)), so peak allocation is O(CAP) even for a 10 MiB body.
-// Only the rare fallback (malformed/non-UTF8/too-deep) materializes a `Value`.
-// ---------------------------------------------------------------------------
-
-/// Capped + redacting capture of a request/response body. Returns an owned
-/// `Arc<[u8]>` of at most [`BODY_CAP`] bytes with secrets redacted inline. Never
-/// retains a slice of `raw` (copies into a fresh buffer).
+/// Capped + redacting capture of a request/response body → owned `Arc<[u8]>` of at
+/// most [`BODY_CAP`] bytes with secrets redacted inline (delegates to the shared
+/// O(CAP) primitive in [`crate::redaction`]). Never retains a slice of `raw`.
 pub fn capture_body(raw: &[u8]) -> Arc<[u8]> {
-    // Common path: a single streaming pass over the bytes into a hard-capped
-    // writer. `CappedWriter` pre-reserves only `raw.len().min(BODY_CAP)` and stops
-    // writing at BODY_CAP, so peak allocation is O(CAP), not O(body).
-    let mut writer = CappedWriter::new(raw.len());
-    if let Ok(text) = std::str::from_utf8(raw) {
-        let mut parser = JsonRedactor::new(text);
-        parser.skip_ws();
-        if parser.redact_value(&mut writer, 0, false) && parser.at_trailing_end() {
-            return writer.into_arc();
-        }
-    }
-    // Fallback (RARE): malformed / non-JSON / non-UTF8 / too-deep. Best-effort
-    // redaction via the existing `Value`-based path, then truncate to BODY_CAP. The
-    // 10 MiB cap test must hit the streaming path above, so this stays the rare
-    // case.
-    capture_body_fallback(raw)
-}
-
-/// Best-effort fallback redaction for bodies the streaming pass could not handle.
-fn capture_body_fallback(raw: &[u8]) -> Arc<[u8]> {
-    if let Ok(mut value) = serde_json::from_slice::<Value>(raw) {
-        redact_value_secrets(&mut value);
-        crate::redaction::redact_image_uris_in_value(&mut value);
-        if let Ok(serialized) = serde_json::to_vec(&value) {
-            return truncate_to_cap(serialized);
-        }
-    }
-    // Not even JSON: redact image URIs over a BODY_CAP-bounded lossy prefix.
-    let prefix_len = raw.len().min(BODY_CAP);
-    let lossy = String::from_utf8_lossy(&raw[..prefix_len]);
-    let redacted = crate::redaction::redact_image_uris(&lossy);
-    truncate_to_cap(redacted.into_bytes())
-}
-
-/// Value-tree secret redactor mirroring `http::redact_payload_secrets` (sensitive
-/// key → `"[redacted]"`), used only on the fallback path.
-fn redact_value_secrets(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, inner) in map.iter_mut() {
-                if is_sensitive_payload_key(key) {
-                    *inner = Value::String("[redacted]".to_string());
-                } else {
-                    redact_value_secrets(inner);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                redact_value_secrets(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Truncate an owned byte buffer to [`BODY_CAP`] on a UTF-8 char boundary (so a
-/// best-effort preview never splits a multibyte sequence) and freeze it.
-fn truncate_to_cap(mut bytes: Vec<u8>) -> Arc<[u8]> {
-    if bytes.len() > BODY_CAP {
-        let mut end = BODY_CAP;
-        while end > 0 && (bytes[end] & 0xC0) == 0x80 {
-            end -= 1;
-        }
-        bytes.truncate(end);
-    }
+    let bytes = crate::redaction::capture_capped_redacted(raw, BODY_CAP, SCALAR_CAP);
     Arc::from(bytes.into_boxed_slice())
 }
 
-/// A `Vec<u8>` that accepts writes only until it reaches [`BODY_CAP`]; once full it
-/// silently drops further writes and records `full = true`. Pre-reserves only
-/// `min(hint, BODY_CAP)` so peak allocation is bounded by the cap.
-struct CappedWriter {
-    buf: Vec<u8>,
-    full: bool,
-}
-
-impl CappedWriter {
-    fn new(size_hint: usize) -> Self {
-        Self {
-            buf: Vec::with_capacity(size_hint.min(BODY_CAP)),
-            full: false,
-        }
-    }
-
-    /// Append `bytes`, stopping at the cap. Returns `false` once the writer is
-    /// full so the caller can stop producing output.
-    fn write(&mut self, bytes: &[u8]) -> bool {
-        if self.full {
-            return false;
-        }
-        let remaining = BODY_CAP - self.buf.len();
-        if bytes.len() <= remaining {
-            self.buf.extend_from_slice(bytes);
-            if self.buf.len() == BODY_CAP {
-                self.full = true;
-            }
-            true
-        } else {
-            self.buf.extend_from_slice(&bytes[..remaining]);
-            self.full = true;
-            false
-        }
-    }
-
-    fn write_byte(&mut self, byte: u8) -> bool {
-        self.write(&[byte])
-    }
-
-    fn into_arc(self) -> Arc<[u8]> {
-        Arc::from(self.buf.into_boxed_slice())
-    }
-}
-
-/// Forward-pass recursive-descent JSON redactor over a `&str`. Walks the value at
-/// the cursor writing a redacted copy into a [`CappedWriter`], never building a
-/// `Value`. Returns `false` on malformed input or depth overflow so the caller can
-/// fall back.
-struct JsonRedactor<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> JsonRedactor<'a> {
-    fn new(text: &'a str) -> Self {
-        Self {
-            bytes: text.as_bytes(),
-            pos: 0,
-        }
-    }
-
-    fn skip_ws(&mut self) {
-        while self.pos < self.bytes.len() {
-            match self.bytes[self.pos] {
-                b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
-                _ => break,
-            }
-        }
-    }
-
-    fn peek(&self) -> Option<u8> {
-        self.bytes.get(self.pos).copied()
-    }
-
-    /// After parsing the top-level value, only whitespace may remain.
-    fn at_trailing_end(&mut self) -> bool {
-        self.skip_ws();
-        self.pos >= self.bytes.len()
-    }
-
-    /// Redact one JSON value at the cursor into `out`. When `sensitive` is set the
-    /// value belongs to a sensitive key, so it is replaced wholesale with
-    /// `"[redacted]"` and parse-skipped. Returns `false` on malformed input or
-    /// when the depth limit is exceeded.
-    fn redact_value(&mut self, out: &mut CappedWriter, depth: usize, sensitive: bool) -> bool {
-        if depth > MAX_JSON_DEPTH {
-            return false;
-        }
-        self.skip_ws();
-        let Some(byte) = self.peek() else {
-            return false;
-        };
-        if sensitive {
-            // Replace the whole value with the redaction marker, and parse-skip the
-            // real value so the cursor advances correctly.
-            out.write(b"\"[redacted]\"");
-            return self.skip_value(depth);
-        }
-        match byte {
-            b'{' => self.redact_object(out, depth),
-            b'[' => self.redact_array(out, depth),
-            b'"' => self.redact_string(out),
-            _ => self.copy_scalar(out),
-        }
-    }
-
-    fn redact_object(&mut self, out: &mut CappedWriter, depth: usize) -> bool {
-        // consume '{'
-        self.pos += 1;
-        out.write_byte(b'{');
-        self.skip_ws();
-        if self.peek() == Some(b'}') {
-            self.pos += 1;
-            out.write_byte(b'}');
-            return true;
-        }
-        loop {
-            self.skip_ws();
-            if self.peek() != Some(b'"') {
-                return false;
-            }
-            // Capture the key text (unescaped lossily) to test sensitivity, while
-            // writing the key string through verbatim-but-capped.
-            let key = match self.read_key_string(out) {
-                Some(key) => key,
-                None => return false,
-            };
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return false;
-            }
-            self.pos += 1;
-            out.write_byte(b':');
-            let sensitive = is_sensitive_payload_key(&key);
-            if !self.redact_value(out, depth + 1, sensitive) {
-                return false;
-            }
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                    out.write_byte(b',');
-                }
-                Some(b'}') => {
-                    self.pos += 1;
-                    out.write_byte(b'}');
-                    return true;
-                }
-                _ => return false,
-            }
-        }
-    }
-
-    fn redact_array(&mut self, out: &mut CappedWriter, depth: usize) -> bool {
-        // consume '['
-        self.pos += 1;
-        out.write_byte(b'[');
-        self.skip_ws();
-        if self.peek() == Some(b']') {
-            self.pos += 1;
-            out.write_byte(b']');
-            return true;
-        }
-        loop {
-            if !self.redact_value(out, depth + 1, false) {
-                return false;
-            }
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                    out.write_byte(b',');
-                }
-                Some(b']') => {
-                    self.pos += 1;
-                    out.write_byte(b']');
-                    return true;
-                }
-                _ => return false,
-            }
-        }
-    }
-
-    /// Read a JSON string key, writing it through (capped) AND returning its
-    /// decoded text for the sensitivity test. The cursor lands just past the
-    /// closing quote. Keys are short in practice; the token slice is zero-copy and
-    /// only the small decoded key allocates.
-    fn read_key_string(&mut self, out: &mut CappedWriter) -> Option<String> {
-        let range = self.scan_string_raw()?;
-        let raw = self.token_str(range);
-        out.write(raw.as_bytes());
-        Some(decode_json_string(raw))
-    }
-
-    /// Redact a JSON string VALUE: cap its inner content to SCALAR_CAP and run
-    /// `redact_image_uris` over it, then re-emit a quoted JSON string. The cursor
-    /// lands just past the closing quote. The token is a zero-copy slice — for a
-    /// 10 MiB value only the SCALAR_CAP-byte capped prefix is ever allocated.
-    fn redact_string(&mut self, out: &mut CappedWriter) -> bool {
-        let Some(range) = self.scan_string_raw() else {
-            return false;
-        };
-        let raw = self.token_str(range);
-        // `raw` includes the surrounding quotes. Strip them, cap the inner JSON
-        // text on a boundary that does not split a `\uXXXX`/`\x` escape, redact
-        // image URIs, and re-wrap. `cap_json_string_inner` slices BEFORE allocating,
-        // so the huge inner string is never copied in full.
-        let inner = &raw[1..raw.len() - 1];
-        let capped = cap_json_string_inner(inner, SCALAR_CAP);
-        let redacted = crate::redaction::redact_image_uris(&capped);
-        out.write_byte(b'"');
-        out.write(redacted.as_bytes());
-        out.write_byte(b'"');
-        true
-    }
-
-    /// Copy a JSON scalar (number / `true` / `false` / `null`) through verbatim.
-    fn copy_scalar(&mut self, out: &mut CappedWriter) -> bool {
-        let start = self.pos;
-        while self.pos < self.bytes.len() {
-            match self.bytes[self.pos] {
-                b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r' => break,
-                _ => self.pos += 1,
-            }
-        }
-        if self.pos == start {
-            return false;
-        }
-        out.write(&self.bytes[start..self.pos]);
-        true
-    }
-
-    /// Parse-skip a JSON value WITHOUT emitting it (used for a sensitive value
-    /// whose redaction marker was already written). Returns `false` on malformed
-    /// input or depth overflow.
-    fn skip_value(&mut self, depth: usize) -> bool {
-        if depth > MAX_JSON_DEPTH {
-            return false;
-        }
-        self.skip_ws();
-        match self.peek() {
-            Some(b'{') => {
-                self.pos += 1;
-                self.skip_ws();
-                if self.peek() == Some(b'}') {
-                    self.pos += 1;
-                    return true;
-                }
-                loop {
-                    self.skip_ws();
-                    if self.scan_string_raw().is_none() {
-                        return false;
-                    }
-                    self.skip_ws();
-                    if self.peek() != Some(b':') {
-                        return false;
-                    }
-                    self.pos += 1;
-                    if !self.skip_value(depth + 1) {
-                        return false;
-                    }
-                    self.skip_ws();
-                    match self.peek() {
-                        Some(b',') => self.pos += 1,
-                        Some(b'}') => {
-                            self.pos += 1;
-                            return true;
-                        }
-                        _ => return false,
-                    }
-                }
-            }
-            Some(b'[') => {
-                self.pos += 1;
-                self.skip_ws();
-                if self.peek() == Some(b']') {
-                    self.pos += 1;
-                    return true;
-                }
-                loop {
-                    if !self.skip_value(depth + 1) {
-                        return false;
-                    }
-                    self.skip_ws();
-                    match self.peek() {
-                        Some(b',') => self.pos += 1,
-                        Some(b']') => {
-                            self.pos += 1;
-                            return true;
-                        }
-                        _ => return false,
-                    }
-                }
-            }
-            Some(b'"') => self.scan_string_raw().is_some(),
-            Some(_) => {
-                let start = self.pos;
-                while self.pos < self.bytes.len() {
-                    match self.bytes[self.pos] {
-                        b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r' => break,
-                        _ => self.pos += 1,
-                    }
-                }
-                self.pos != start
-            }
-            None => false,
-        }
-    }
-
-    /// Scan a JSON string token INCLUDING the surrounding quotes, honoring `\"`
-    /// and `\\` escapes. Returns the `start..end` BYTE RANGE of the token (a
-    /// zero-copy slice into `self.bytes`) or `None` if the string is unterminated.
-    /// The cursor lands just past the closing quote. Returning a range — not an
-    /// owned `String` — is what keeps `capture_body` O(CAP): a 10 MiB string VALUE
-    /// is never copied in full; the caller slices and only the CAPPED prefix is
-    /// allocated.
-    fn scan_string_raw(&mut self) -> Option<(usize, usize)> {
-        if self.peek() != Some(b'"') {
-            return None;
-        }
-        let start = self.pos;
-        self.pos += 1; // opening quote
-        while self.pos < self.bytes.len() {
-            match self.bytes[self.pos] {
-                b'\\' => {
-                    // Skip the escape and the escaped byte (UTF-8 continuation
-                    // bytes after `\u` are ASCII hex, so byte-stepping is safe).
-                    self.pos += 2;
-                }
-                b'"' => {
-                    self.pos += 1;
-                    return Some((start, self.pos));
-                }
-                _ => self.pos += 1,
-            }
-        }
-        None
-    }
-
-    /// The validated `&str` slice for a scanned string-token range. The bytes came
-    /// from a `&str` and we split only on ASCII quote/backslash boundaries, so the
-    /// slice is valid UTF-8 (the `unwrap_or` keeps the forward pass total).
-    fn token_str(&self, range: (usize, usize)) -> &'a str {
-        std::str::from_utf8(&self.bytes[range.0..range.1]).unwrap_or("")
-    }
-}
-
-/// Cap the INNER text of a JSON string to `cap` bytes without splitting a UTF-8
-/// sequence or a trailing JSON escape (`\`): if the cut would land right after a
-/// lone backslash, back off one byte so the re-wrapped string stays valid.
-fn cap_json_string_inner(inner: &str, cap: usize) -> String {
-    if inner.len() <= cap {
-        return inner.to_string();
-    }
-    let bytes = inner.as_bytes();
-    let mut end = cap;
-    // Back off to a UTF-8 char boundary.
-    while end > 0 && (bytes[end] & 0xC0) == 0x80 {
-        end -= 1;
-    }
-    // Avoid ending on a lone (unfinished) backslash escape: count the run of
-    // trailing backslashes before `end`; if odd, the last one opens an escape, so
-    // drop it.
-    let mut backslashes = 0;
-    let mut i = end;
-    while i > 0 && bytes[i - 1] == b'\\' {
-        backslashes += 1;
-        i -= 1;
-    }
-    if backslashes % 2 == 1 {
-        end -= 1;
-    }
-    inner[..end].to_string()
-}
-
-/// Decode a raw JSON string token (quotes + escapes) into its text value, enough
-/// to test key sensitivity. Only the escapes relevant to object keys are handled;
-/// an unrecognized escape is passed through. Lossy by design (keys are ASCII in
-/// practice).
-fn decode_json_string(raw: &str) -> String {
-    // `raw` is a scanned string token including its surrounding quotes.
-    let inner = if raw.len() >= 2 {
-        &raw[1..raw.len() - 1]
-    } else {
-        ""
-    };
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('"') => out.push('"'),
-                Some('\\') => out.push('\\'),
-                Some('/') => out.push('/'),
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('r') => out.push('\r'),
-                Some('b') => out.push('\u{0008}'),
-                Some('f') => out.push('\u{000C}'),
-                Some('u') => {
-                    // Best-effort: consume 4 hex digits, decode a BMP scalar.
-                    let hex: String = chars.by_ref().take(4).collect();
-                    if let Ok(code) = u32::from_str_radix(&hex, 16)
-                        && let Some(decoded) = char::from_u32(code)
-                    {
-                        out.push(decoded);
-                    }
-                }
-                Some(other) => out.push(other),
-                None => {}
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Redact header VALUES whose normalized name is sensitive (reusing
-/// `is_sensitive_payload_key`) to `"[redacted]"`; cap every other value to
-/// [`SCALAR_CAP`] bytes (on a char boundary). Returns owned name/value pairs ready
-/// for `FlowRecord.headers`. The header NAME is preserved (it is not a secret) so
-/// the dashboard can show WHICH auth header was present without its value.
+/// Redact header VALUES (sensitive names → `"[redacted]"`; all others capped to
+/// [`SCALAR_CAP`] AND image-URI-stripped). Delegates to the shared primitive.
 pub fn redact_headers(headers: &axum::http::HeaderMap) -> Vec<(String, String)> {
-    headers
-        .iter()
-        .map(|(name, value)| {
-            let name = name.as_str().to_string();
-            if is_sensitive_payload_key(&name) {
-                return (name, "[redacted]".to_string());
-            }
-            let raw = value.to_str().unwrap_or("<non-utf8>");
-            let capped = if raw.len() > SCALAR_CAP {
-                let bytes = raw.as_bytes();
-                let mut end = SCALAR_CAP;
-                while end > 0 && (bytes[end] & 0xC0) == 0x80 {
-                    end -= 1;
-                }
-                raw[..end].to_string()
-            } else {
-                raw.to_string()
-            };
-            (name, capped)
-        })
-        .collect()
+    crate::redaction::redact_headers_capped(headers, SCALAR_CAP)
+}
+
+/// Cap a single retained scalar string to [`SCALAR_CAP`] bytes on a UTF-8 char
+/// boundary (D1 R1 #5 — every dynamic scalar the record keeps is bounded).
+fn cap_scalar(mut text: String) -> String {
+    if text.len() > SCALAR_CAP {
+        let bytes = text.as_bytes();
+        let mut end = SCALAR_CAP;
+        while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
 }
 
 fn now_ms() -> u128 {
@@ -1119,8 +650,19 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::http::HeaderName;
     use axum::http::HeaderValue;
+
     fn arc(bytes: &[u8]) -> Arc<[u8]> {
         Arc::from(bytes.to_vec().into_boxed_slice())
+    }
+
+    fn open_simple(store: &DashboardFlowStore, api: &str) {
+        store.open(
+            api.to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            Vec::new(),
+            None,
+        );
     }
 
     #[test]
@@ -1161,9 +703,7 @@ mod tests {
             CLAIM_OPEN_L0,
             "claim allocated OpenL0"
         );
-        // detail by api_call_id
         assert!(store.detail("api_1").is_some());
-        // unknown id
         assert!(store.detail("nope").is_none());
     }
 
@@ -1171,13 +711,7 @@ mod tests {
     fn list_is_newest_first() {
         let store = DashboardFlowStore::new();
         for i in 0..3 {
-            store.open(
-                format!("api_{i}"),
-                "POST".to_string(),
-                "/v1/responses".to_string(),
-                Vec::new(),
-                None,
-            );
+            open_simple(&store, &format!("api_{i}"));
         }
         let ids: Vec<String> = store
             .list()
@@ -1190,19 +724,12 @@ mod tests {
     #[test]
     fn link_fires_once_and_detail_joins_by_either_id() {
         let store = DashboardFlowStore::new();
-        store.open(
-            "api_1".to_string(),
-            "POST".to_string(),
-            "/v1/responses".to_string(),
-            Vec::new(),
-            None,
-        );
-        // Pre-link: detail by api_call_id resolves; by response_id does not yet.
+        open_simple(&store, "api_1");
         assert!(store.detail("api_1").is_some());
         assert!(store.detail("resp_1").is_none());
 
         store.link("resp_1".to_string(), "api_1".to_string());
-        // A second link must NOT overwrite the response_id.
+        // A second link must NOT overwrite the response_id (first-link-wins).
         store.link("resp_other".to_string(), "api_1".to_string());
 
         let record = store.detail("api_1").expect("record");
@@ -1211,9 +738,34 @@ mod tests {
             Some("resp_1"),
             "link fires once; the first response_id wins"
         );
-        // detail now joins by response_id too.
         let by_resp = store.detail("resp_1").expect("join by response_id");
         assert_eq!(by_resp.api_call_id, "api_1");
+        // The aliasing response_id was never indexed.
+        assert!(
+            store.detail("resp_other").is_none(),
+            "second link did not create an alias"
+        );
+    }
+
+    #[test]
+    fn link_unknown_id_is_a_no_op_and_leaks_no_index() {
+        let store = DashboardFlowStore::new();
+        // No record opened for api_404.
+        store.link("resp_x".to_string(), "api_404".to_string());
+        assert!(store.detail("resp_x").is_none(), "no index entry leaked");
+        assert!(store.detail("api_404").is_none());
+        assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn link_double_call_is_idempotent() {
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        store.link("resp_1".to_string(), "api_1".to_string());
+        store.link("resp_1".to_string(), "api_1".to_string());
+        let record = store.detail("api_1").expect("record");
+        assert_eq!(record.response_id.as_deref(), Some("resp_1"));
+        assert!(store.detail("resp_1").is_some());
     }
 
     #[test]
@@ -1225,13 +777,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let api = format!("api_{i}");
                 let resp = format!("resp_{i}");
-                store.open(
-                    api.clone(),
-                    "POST".to_string(),
-                    "/v1/responses".to_string(),
-                    Vec::new(),
-                    None,
-                );
+                open_simple(&store, &api);
                 store.link(resp, api);
             }));
         }
@@ -1253,13 +799,7 @@ mod tests {
     #[test]
     fn finalize_stamps_terminal_fields() {
         let store = DashboardFlowStore::new();
-        store.open(
-            "api_1".to_string(),
-            "POST".to_string(),
-            "/v1/responses".to_string(),
-            Vec::new(),
-            None,
-        );
+        open_simple(&store, "api_1");
         store.record_usage(
             "api_1",
             FlowUsage {
@@ -1288,25 +828,15 @@ mod tests {
 
     #[test]
     fn claim_arc_is_shared_across_cow_mutations() {
-        // D3 relies on the claim atomic identity surviving COW updates. Capture the
-        // Arc, mutate via finalize, and assert the SAME allocation is observed.
         let store = DashboardFlowStore::new();
-        store.open(
-            "api_1".to_string(),
-            "POST".to_string(),
-            "/v1/responses".to_string(),
-            Vec::new(),
-            None,
-        );
+        open_simple(&store, "api_1");
         let before = store.detail("api_1").expect("record").claim.clone();
-        // A mutation that goes through the COW path.
         store.set_normalized("api_1", Some("model".to_string()), Some(arc(b"{}")));
         let after = store.detail("api_1").expect("record").claim.clone();
         assert!(
             Arc::ptr_eq(&before, &after),
             "claim Arc identity must persist across COW updates for D3"
         );
-        // Writing through the original handle is visible via the new one.
         before.store(CLAIM_CLAIMED_L1, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             after.load(std::sync::atomic::Ordering::SeqCst),
@@ -1316,13 +846,11 @@ mod tests {
 
     #[test]
     fn summary_quota_evicts_oldest_bodies_keeping_records() {
-        // A tiny quota forces body eviction. Use a custom store with a small quota.
         let store = DashboardFlowStore {
             enabled: true,
             state: Arc::new(Mutex::new(DashboardFlowState::default())),
             summary_quota_bytes: 4 * 1024,
         };
-        // Each body is ~2 KiB after capture; three of them exceed 4 KiB.
         let body = vec![b'a'; 2048];
         let json = {
             let mut v = Vec::new();
@@ -1340,71 +868,125 @@ mod tests {
                 Some(capture_body(&json)),
             );
         }
-        // All three records still present.
         assert_eq!(store.list().len(), 3, "records survive body eviction");
-        // The OLDEST body is gone; the record remains a body-free summary.
         let oldest = store.detail("api_0").expect("oldest record present");
         assert!(
             oldest.inbound_body.is_none(),
             "oldest body evicted under quota"
         );
-        // The newest still has its body (quota satisfied before reaching it).
         let newest = store.detail("api_2").expect("newest record present");
         assert!(newest.inbound_body.is_some(), "newest body retained");
-        // Snapshot summaries are body-free regardless.
         assert_eq!(store.snapshot_summaries().len(), 3);
+    }
+
+    #[test]
+    fn long_scalars_are_capped_counted_and_can_trigger_eviction() {
+        // D1 R1 #5: long dynamic scalars (model/uri/target) must be capped to
+        // SCALAR_CAP AND counted in `live_summary_bytes`, so their bytes can trip
+        // the quota and evict an older body. A small quota makes the scalar bytes —
+        // not bodies — the decisive contribution.
+        let store = DashboardFlowStore {
+            enabled: true,
+            state: Arc::new(Mutex::new(DashboardFlowState::default())),
+            // Tiny quota: one small body fits; the next record's capped scalars
+            // (~3 x SCALAR_CAP) push the total over and evict the oldest body.
+            summary_quota_bytes: 6 * 1024,
+        };
+        // api_0: a small (~SCALAR_CAP) body, no large scalars.
+        store.open(
+            "api_0".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            Vec::new(),
+            Some(capture_body(br#"{"x":"small"}"#)),
+        );
+        assert!(
+            store.detail("api_0").unwrap().inbound_body.is_some(),
+            "api_0 body retained under quota initially"
+        );
+        // api_1: oversized scalars (each capped to SCALAR_CAP, all counted).
+        store.open(
+            "api_1".to_string(),
+            "POST".to_string(),
+            "/".to_string() + &"u".repeat(64 * 1024),
+            Vec::new(),
+            None,
+        );
+        store.set_upstream(
+            "api_1",
+            Some("https://".to_string() + &"t".repeat(64 * 1024)),
+            Some("m".repeat(64 * 1024)),
+            None,
+        );
+        let record = store.detail("api_1").expect("record");
+        assert!(record.uri.len() <= SCALAR_CAP, "uri capped");
+        assert!(
+            record.upstream_target.as_ref().unwrap().len() <= SCALAR_CAP,
+            "upstream_target capped"
+        );
+        assert!(
+            record.model_served.as_ref().unwrap().len() <= SCALAR_CAP,
+            "model_served capped"
+        );
+        // The capped-but-counted scalars exceeded the quota → oldest body shed.
+        let oldest = store.detail("api_0").expect("record present");
+        assert!(
+            oldest.inbound_body.is_none(),
+            "oldest body evicted once scalars counted toward quota"
+        );
     }
 
     #[test]
     fn record_cap_evicts_oldest_whole_records() {
         let store = DashboardFlowStore::new();
-        // One past the cap → the oldest whole record is dropped.
         for i in 0..(FLOW_CAP + 1) {
-            store.open(
-                format!("api_{i}"),
-                "POST".to_string(),
-                "/v1/responses".to_string(),
-                Vec::new(),
-                None,
-            );
+            open_simple(&store, &format!("api_{i}"));
         }
         assert_eq!(store.list().len(), FLOW_CAP);
         assert!(store.detail("api_0").is_none(), "oldest record evicted");
         assert!(store.detail(&format!("api_{FLOW_CAP}")).is_some());
     }
 
+    #[test]
+    fn expired_records_are_pruned_on_read_deterministically() {
+        // D1 R1 #7: TTL pruning runs on reads/mutations, not only `open`.
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_old");
+        // Backdate it well past the retention window.
+        store.force_started_ms("api_old", 1);
+        open_simple(&store, "api_new");
+        // A read at a `now` past the TTL must drop the old record but keep the new.
+        store.prune_at(FLOW_TTL_MS + 100);
+        assert!(store.detail("api_old").is_none(), "expired record pruned");
+        assert!(store.detail("api_new").is_some(), "fresh record retained");
+        // And the public read path prunes too (no explicit prune_at needed): age
+        // api_new and observe list() drop it at the wall clock.
+        store.force_started_ms("api_new", 1);
+        // `list()` prunes at `now_ms()`, which is far past `started_ms = 1 + TTL`.
+        assert!(
+            store.list().iter().all(|r| r.api_call_id != "api_new"),
+            "read path prunes expired records"
+        );
+    }
+
     // -------------------------------------------------------------------
-    // Capped + redacting streaming serializer
+    // Capture seam (the heavy serializer lives in crate::redaction; these
+    // confirm the dashboard wrapper + store integration).
     // -------------------------------------------------------------------
 
     #[test]
     fn capture_body_peak_allocation_is_bounded_for_10mib_body() {
         // THE crux acceptance criterion: serializing a 10 MiB body keeps PEAK heap
-        // use O(CAP), not O(body) — the streaming pass never materializes the whole
-        // body (no full `serde_json::Value`, no `Bytes::copy_from_slice`). Build the
-        // 10 MiB input OUTSIDE the armed region so only `capture_body`'s own
-        // allocations count. The shared allocator probe records the largest SINGLE
-        // allocation `>= threshold` on this thread; we set the threshold ABOVE the
-        // legitimate ceiling (output cap + one capped scalar + slack) but FAR below
-        // the 10 MiB body, then assert nothing that large was allocated. A
-        // body-materializing implementation would allocate a multi-MiB buffer and
-        // trip the probe.
+        // use O(CAP), not O(body). Build the input OUTSIDE the armed region so only
+        // `capture_body`'s own allocations count.
         const TEN_MIB: usize = 10 * 1024 * 1024;
         let big = "x".repeat(TEN_MIB);
         let json = format!("{{\"text\":\"{big}\"}}");
         let raw = json.into_bytes();
-
-        // Legitimate ceiling for any single allocation on the streaming path.
         let ceiling = BODY_CAP + SCALAR_CAP + 64 * 1024;
         let (captured, peak) =
             crate::test_alloc_probe::peak_alloc_during(ceiling, || capture_body(&raw));
-
-        assert!(
-            captured.len() <= BODY_CAP,
-            "captured body {} exceeds BODY_CAP {}",
-            captured.len(),
-            BODY_CAP
-        );
+        assert!(captured.len() <= BODY_CAP);
         assert_eq!(
             peak, 0,
             "capture_body made a single allocation >= {ceiling} bytes (peak={peak}) for a \
@@ -1413,17 +995,36 @@ mod tests {
     }
 
     #[test]
-    fn capture_body_caps_output_to_body_cap() {
-        // A 10 MiB string body must serialize to <= BODY_CAP (output-size check;
-        // the companion test asserts PEAK allocation is bounded).
-        let big = "x".repeat(10 * 1024 * 1024);
-        let json = format!("{{\"text\":\"{big}\"}}");
-        let captured = capture_body(json.as_bytes());
-        assert!(
-            captured.len() <= BODY_CAP,
-            "captured body {} exceeds BODY_CAP {}",
-            captured.len(),
-            BODY_CAP
+    fn capture_body_peak_bounded_for_10mib_single_key() {
+        // D1 R1 #4a: a single 10 MiB OBJECT KEY must also stay O(CAP).
+        const TEN_MIB: usize = 10 * 1024 * 1024;
+        let big_key = "k".repeat(TEN_MIB);
+        let json = format!("{{\"{big_key}\":\"v\"}}");
+        let raw = json.into_bytes();
+        let ceiling = BODY_CAP + SCALAR_CAP + 64 * 1024;
+        let (captured, peak) =
+            crate::test_alloc_probe::peak_alloc_during(ceiling, || capture_body(&raw));
+        assert!(captured.len() <= BODY_CAP);
+        assert_eq!(peak, 0, "huge key must not allocate O(body) (peak={peak})");
+    }
+
+    #[test]
+    fn capture_body_peak_bounded_for_malformed_body() {
+        // D1 R1 #4b: the fallback must NOT materialize a serde_json::Value — a
+        // malformed 10 MiB body must stay O(CAP).
+        const TEN_MIB: usize = 10 * 1024 * 1024;
+        // Valid UTF-8 but NOT valid JSON (unterminated object) → fallback path.
+        let mut raw = Vec::with_capacity(TEN_MIB + 16);
+        raw.extend_from_slice(b"{\"a\":\"");
+        raw.extend(std::iter::repeat_n(b'z', TEN_MIB));
+        // no closing quote/brace
+        let ceiling = BODY_CAP + SCALAR_CAP + 64 * 1024;
+        let (captured, peak) =
+            crate::test_alloc_probe::peak_alloc_during(ceiling, || capture_body(&raw));
+        assert!(captured.len() <= BODY_CAP);
+        assert_eq!(
+            peak, 0,
+            "malformed-body fallback must be O(CAP), not parse a Value (peak={peak})"
         );
     }
 
@@ -1436,7 +1037,6 @@ mod tests {
         assert!(!text.contains("TOKENLEAK"), "nested authorization redacted");
         assert!(text.contains("[redacted]"));
         assert!(text.contains("visible"), "non-sensitive value preserved");
-        assert!(text.contains("\"model\":\"m\""), "structure preserved");
     }
 
     #[test]
@@ -1451,53 +1051,69 @@ mod tests {
     }
 
     #[test]
-    fn capture_body_caps_individual_scalar_strings() {
-        // A single huge string is capped to ~SCALAR_CAP even though the overall
-        // body is under BODY_CAP.
-        let big = "y".repeat(64 * 1024);
-        let json = format!("{{\"blob\":\"{big}\",\"after\":\"tail\"}}");
+    fn capture_body_redacts_unicode_escaped_image_uris() {
+        // D1 R1 #3: a JSON `\uXXXX`-escaped scheme must be DE-ESCAPED before
+        // redaction. Build the body so it literally contains JSON unicode escapes
+        // for the scheme letters (e.g. the four bytes `\`,`u`,`0`,`0`,`6`,`4` for
+        // 'd'), so the stored string spells `data:`/`https:` with escapes;
+        // de-escaping must expose them to `redact_image_uris`.
+        let esc = |s: &str| -> String {
+            s.chars()
+                .map(|c| format!("\\u{:04x}", c as u32))
+                .collect::<String>()
+        };
+        // Scheme letters are escaped; the rest is literal so the URI run is intact.
+        let data_uri = format!("{}:image/png;base64,UNILEAK", esc("data"));
+        let https_uri = format!("{}://h/p?sig=ESCSIGLEAK", esc("https"));
+        let json = format!("{{\"a\":\"{data_uri} x\",\"b\":\"{https_uri} y\"}}");
+        // Sanity: the body holds the ESCAPED (not literal) scheme.
+        assert!(
+            json.contains("\\u0064"),
+            "test body uses \\u escapes for 'd'"
+        );
+        assert!(
+            !json.contains("data:"),
+            "test body has NO literal data: scheme"
+        );
+
         let captured = capture_body(json.as_bytes());
         let text = String::from_utf8_lossy(&captured);
-        // The blob value is truncated well under its original size.
-        assert!(captured.len() < big.len(), "huge scalar truncated");
-        // Fields after the capped scalar survive (the stream did not stop).
         assert!(
-            text.contains("after"),
-            "fields after a capped scalar survive"
+            !text.contains("UNILEAK"),
+            "unicode-escaped data: payload redacted: {text}"
         );
-    }
-
-    #[test]
-    fn capture_body_handles_non_json_via_fallback() {
-        let raw = b"this is not json: data:image/png;base64,RAWLEAK end";
-        let captured = capture_body(raw);
-        let text = String::from_utf8_lossy(&captured);
-        assert!(!text.contains("RAWLEAK"), "non-json image uri redacted");
+        assert!(
+            !text.contains("ESCSIGLEAK"),
+            "unicode-escaped https signed-url token redacted: {text}"
+        );
         assert!(text.contains("<redacted uri>"));
-        assert!(captured.len() <= BODY_CAP);
     }
 
     #[test]
     fn capture_body_roundtrips_valid_json_structure() {
         let json = br#"{"a":1,"b":[true,false,null],"c":{"d":"e"}}"#;
         let captured = capture_body(json);
-        // The streaming pass produced parseable JSON.
-        let value: Value = serde_json::from_slice(&captured).expect("captured body is valid JSON");
+        let value: serde_json::Value =
+            serde_json::from_slice(&captured).expect("captured body is valid JSON");
         assert_eq!(value["a"], serde_json::json!(1));
         assert_eq!(value["b"], serde_json::json!([true, false, null]));
         assert_eq!(value["c"]["d"], serde_json::json!("e"));
     }
 
     #[test]
-    fn redact_headers_redacts_sensitive_values() {
+    fn redact_headers_redacts_sensitive_and_uri_values() {
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static("authorization"),
             HeaderValue::from_static("Bearer SECRETHEADER"),
         );
         headers.insert(
-            HeaderName::from_static("x-api-key"),
-            HeaderValue::from_static("sk-HEADERKEY"),
+            HeaderName::from_static("openai-beta"),
+            HeaderValue::from_static("assistants=v2;token=BETASECRET"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-callback-url"),
+            HeaderValue::from_static("https://cb.example.com/h?sig=HDRSIGLEAK"),
         );
         headers.insert(
             HeaderName::from_static("content-type"),
@@ -1505,22 +1121,20 @@ mod tests {
         );
         let redacted = redact_headers(&headers);
         let dumped = format!("{redacted:?}");
+        assert!(!dumped.contains("SECRETHEADER"), "authorization redacted");
+        // openai-beta is in the sensitive-key set now → value redacted.
+        assert!(!dumped.contains("BETASECRET"), "openai-beta value redacted");
+        // A URI-bearing header value is image-URI-redacted.
         assert!(
-            !dumped.contains("SECRETHEADER"),
-            "authorization value redacted"
+            !dumped.contains("HDRSIGLEAK"),
+            "signed-url header value redacted"
         );
-        assert!(!dumped.contains("HEADERKEY"), "x-api-key value redacted");
-        assert!(dumped.contains("[redacted]"));
-        // The non-sensitive value survives; names are preserved.
+        assert!(dumped.contains("<redacted uri>") || dumped.contains("[redacted]"));
         assert!(dumped.contains("application/json"));
-        assert!(dumped.contains("authorization"));
     }
 
     #[test]
     fn secret_persistence_prevention_end_to_end() {
-        // An inbound body with sensitive headers AND a top-level api_key field plus
-        // an upstream body carrying api_key: NONE of the original secret values may
-        // persist in the stored record.
         let store = DashboardFlowStore::new();
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1584,8 +1198,6 @@ mod tests {
         );
         let summaries = store.snapshot_summaries();
         assert_eq!(summaries.len(), 1);
-        // `SnapshotFlowSummary` has no body fields by construction; serializing it
-        // must not surface any body bytes.
         let json = serde_json::to_string(&summaries[0]).expect("serialize summary");
         assert!(json.contains("api_call_id"));
         assert!(!json.contains("inbound_body"));

@@ -3167,11 +3167,13 @@ async fn flow_store_opens_record_for_whitelisted_inference_path() {
 
 #[tokio::test]
 async fn flow_store_skips_non_whitelisted_paths() {
-    // The FlowStore is enabled; the middleware's whitelist must skip these paths
+    // The FlowStore is enabled; the middleware's whitelist must skip these requests
     // BEFORE any upstream call, so whether the upstream proxy succeeds is
     // irrelevant — the assertion is purely "no record opened". (`/v1/completions`
     // is a raw passthrough that bypasses the engine and is intentionally never
-    // instrumented; `/v1/models`, `/health`, `/dashboard/*` carry no flow.)
+    // instrumented; `/v1/models`, `/health`, `/dashboard/*` carry no flow.) D1 R1
+    // #1: HEAD/OPTIONS probes on the whitelisted `/v1/messages` path must ALSO open
+    // no record — the gate requires METHOD==POST, not just an allowed path.
     let gateway = test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default());
     let app = llmconduit::build_app_from_gateway(Arc::clone(&gateway));
 
@@ -3184,6 +3186,9 @@ async fn flow_store_skips_non_whitelisted_paths() {
         ("GET", "/v1/models", None),
         ("GET", "/health", None),
         ("GET", "/dashboard/anything", None),
+        // Non-POST methods on a WHITELISTED path must not open a record.
+        ("HEAD", "/v1/messages", None),
+        ("OPTIONS", "/v1/messages", None),
     ] {
         let mut builder = Request::builder().method(method_name).uri(uri);
         if body.is_some() {
@@ -3197,7 +3202,7 @@ async fn flow_store_skips_non_whitelisted_paths() {
 
     assert!(
         gateway.flow_store().list().is_empty(),
-        "no flow record opened for /v1/completions, /v1/models, /health, or /dashboard/*"
+        "no flow record opened for non-POST probes or non-whitelisted paths"
     );
 }
 

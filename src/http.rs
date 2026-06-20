@@ -89,15 +89,18 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         .with_state(gateway)
 }
 
-/// Paths whose inbound bodies the dashboard FlowStore captures (D1). ONLY the
-/// three canonical inference entry points are whitelisted: `/v1/completions` is a
-/// raw upstream passthrough that bypasses the engine (so it is never instrumented),
-/// and `/dashboard*`/`/debug*`/`/health`/`/`/`/v1/models` carry no inference flow.
-fn is_flow_capture_path(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1/responses" | "/v1/messages" | "/v1/chat/completions"
-    )
+/// Whether a request is an instrumented inference flow (D1, incl. R1 #1): the
+/// METHOD must be `POST` AND the path one of the three canonical inference entry
+/// points. The method check matters because `/v1/messages` also serves HEAD/OPTIONS
+/// probes — those (and any non-POST) must NOT open an orphan flow record.
+/// `/v1/completions` is a raw upstream passthrough that bypasses the engine (never
+/// instrumented); `/dashboard*`/`/debug*`/`/health`/`/`/`/v1/models` carry no flow.
+fn is_flow_capture_request(method: &axum::http::Method, path: &str) -> bool {
+    method == axum::http::Method::POST
+        && matches!(
+            path,
+            "/v1/responses" | "/v1/messages" | "/v1/chat/completions"
+        )
 }
 
 async fn log_api_call(
@@ -160,19 +163,18 @@ async fn log_api_call(
         );
     }
 
-    // D1: thread the `api_call_id` to the inference handlers + engine via a request
-    // extension for EVERY request (cheap), so `stream_responses_with_api_call_id`
-    // can link `response_id → api_call_id`. The capture work below is gated on the
-    // FlowStore being enabled AND a whitelisted inference path, so the disabled
-    // production path does no extra work beyond this one extension insert.
-    parts
-        .extensions
-        .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
-    if gateway.flow_store().is_enabled() && is_flow_capture_path(uri.path()) {
-        // Capture the inbound body + headers through the capped/redacting streaming
-        // serializer (never retain a `Bytes` slice of the 256 MiB buffer), then open
-        // the flow record. Secrets (auth headers, `api_key`, image URIs) are redacted
-        // INLINE by the serializer/header redactor — no secret persists even here.
+    // D1 (incl. R1 #1/#6): only when the FlowStore is ENABLED AND this is an
+    // instrumented inference flow (POST + whitelisted path) do we (a) stash the
+    // `api_call_id` extension the engine reads to link `response_id → api_call_id`,
+    // and (b) capture the inbound body + headers and open the record. Gating BOTH on
+    // the same condition keeps the disabled production path zero-cost (no clone, no
+    // extension insert) and prevents HEAD/OPTIONS probes or non-whitelisted paths
+    // from opening an orphan record. Secrets (auth headers, `api_key`, image URIs)
+    // are redacted INLINE by the serializer/header redactor — none persist here.
+    if gateway.flow_store().is_enabled() && is_flow_capture_request(&method, uri.path()) {
+        parts
+            .extensions
+            .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
         let inbound_body = Some(crate::dashboard_flow::capture_body(&body_bytes));
         let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
         gateway.flow_store().open(
@@ -283,10 +285,12 @@ fn payload_for_log(body: &Bytes) -> String {
 }
 
 fn redact_payload_secrets(value: &mut Value) {
+    // Single sensitive-key authority lives in `crate::redaction` (D1 R1 #10); this
+    // logging surface routes through it so the secret-key set has one definition.
     match value {
         Value::Object(map) => {
             for (key, value) in map {
-                if is_sensitive_payload_key(key) {
+                if crate::redaction::is_sensitive_payload_key(key) {
                     *value = Value::String("[redacted]".to_string());
                 } else {
                     redact_payload_secrets(value);
@@ -300,24 +304,6 @@ fn redact_payload_secrets(value: &mut Value) {
         }
         _ => {}
     }
-}
-
-pub(crate) fn is_sensitive_payload_key(key: &str) -> bool {
-    let normalized = key.to_ascii_lowercase().replace(['-', '_'], "");
-    matches!(
-        normalized.as_str(),
-        "apikey"
-            | "xapikey"
-            | "authorization"
-            | "password"
-            | "passwd"
-            | "secret"
-            | "clientsecret"
-            | "accesstoken"
-            | "refreshtoken"
-            | "authtoken"
-            | "bearertoken"
-    )
 }
 
 fn summarize_json_api_body(path: &str, value: &Value) -> String {

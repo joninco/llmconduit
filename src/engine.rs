@@ -840,15 +840,6 @@ impl Gateway {
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
         let response_id = format!("resp_{}", Uuid::new_v4().simple());
-        // D1: bind this flow's `response_id` to the inbound `api_call_id` exactly
-        // once, so the dashboard can join the engine-side response stream back to
-        // the captured HTTP flow record. No-op when the FlowStore is disabled or no
-        // `api_call_id` was threaded (e.g. the public `stream_responses` wrapper).
-        // `response_id` stays the `resp_{uuid}` API contract — never collapsed to
-        // the `api_call_id`.
-        if let Some(api_call_id) = api_call_id {
-            self.flow_store().link(response_id.clone(), api_call_id);
-        }
         tokio::spawn(async move {
             let result = gateway
                 .run_turn(
@@ -861,6 +852,9 @@ impl Gateway {
                     lowered.reasoning_effort,
                     resolved_model,
                     vision_session,
+                    // D1 (R1 #9): the engine binds `response_id → api_call_id` at
+                    // the RequestStarted emission seam inside `run_turn`, not here.
+                    api_call_id,
                     tx.clone(),
                 )
                 .await;
@@ -1088,8 +1082,21 @@ impl Gateway {
         // images against, and the signal to suppress `analyzeImage` streamed
         // deltas from the client.
         vision_session: Option<String>,
+        // D1 (R1 #9): the inbound `api_call_id` for this flow (when the request was
+        // captured by the dashboard FlowStore), so `link(response_id, api_call_id)`
+        // fires at the RequestStarted seam below.
+        api_call_id: Option<String>,
         tx: mpsc::Sender<SseEvent>,
     ) -> AppResult<()> {
+        // D1 (R1 #9): bind this flow's `response_id` to its inbound `api_call_id`
+        // exactly ONCE, at the RequestStarted emission seam (not pre-spawn). No-op
+        // when the FlowStore is disabled or no `api_call_id` was threaded (the
+        // public `stream_responses` wrapper). `response_id` stays the `resp_{uuid}`
+        // API contract — never collapsed to the `api_call_id`.
+        if let Some(api_call_id) = &api_call_id {
+            self.flow_store()
+                .link(response_id.clone(), api_call_id.clone());
+        }
         self.monitor.emit_with(response_id.as_str(), || {
             MonitorEventKind::RequestStarted {
                 model: request.model.clone(),
