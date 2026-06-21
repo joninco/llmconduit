@@ -10,7 +10,7 @@ module.exports = {
   parser: '@typescript-eslint/parser',
   parserOptions: { ecmaVersion: 2022, sourceType: 'module' },
   plugins: ['@typescript-eslint', 'react-refresh'],
-  ignorePatterns: ['dist', 'node_modules', 'vite.config.ts', 'tailwind.config.ts', '.eslintrc.cjs', 'postcss.config.js'],
+  ignorePatterns: ['dist', 'node_modules', 'vite.config.ts', 'tailwind.config.ts', '.eslintrc.cjs', 'postcss.config.js', 'e2e', 'playwright.config.ts'],
   rules: {
     // The discriminated-union contract MUST stay exhaustive and `any`-free.
     '@typescript-eslint/no-explicit-any': 'error',

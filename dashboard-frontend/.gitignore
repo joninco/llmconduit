@@ -4,3 +4,9 @@ dist/
 .DS_Store
 coverage/
 *.tsbuildinfo
+
+# Playwright (baselines under e2e/*-snapshots/ ARE committed)
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/

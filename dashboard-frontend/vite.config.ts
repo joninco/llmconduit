@@ -2,6 +2,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { fileURLToPath, URL } from 'node:url';
+import { configDefaults } from 'vitest/config';
 
 // The Rust host (D8) embeds `dist/` via include_dir! and serves the SPA at `/dashboard`
 // with static assets under `/dashboard/assets/*`. `base: '/dashboard/'` makes the built
@@ -31,5 +32,7 @@ export default defineConfig({
     environment: 'jsdom',
     setupFiles: ['./vitest.setup.ts'],
     css: false,
+    // Playwright owns e2e/*.spec.ts; keep Vitest's default glob from grabbing them.
+    exclude: [...configDefaults.exclude, 'e2e/**'],
   },
 });
