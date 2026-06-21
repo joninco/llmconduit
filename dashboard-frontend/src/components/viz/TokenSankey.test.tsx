@@ -5,20 +5,20 @@ import { TokenSankey } from './TokenSankey';
 import { tokenSankeyCounters, resetTokenSankeyCounters } from './tokenSankeyState';
 import type { SankeyModel } from './sankeyModel';
 
-/** A fixture model with two cost-distinct lanes (gpt expensive, cheap cheap). */
+/** A fixture model with two cost-distinct (upstream, model) lanes (gpt expensive, cheap cheap). */
 function fixture(): SankeyModel {
   return {
     nodes: [
       { id: 'client', label: 'client', col: 0 },
       { id: 'gateway', label: 'gateway', col: 1 },
-      { id: 'model:gpt-4o', label: 'gpt-4o', col: 2, model: 'gpt-4o' },
-      { id: 'model:cheap', label: 'cheap', col: 2, model: 'cheap' },
+      { id: 'served:vllm-a|gpt-4o', label: 'gpt-4o @vllm-a', col: 2, model: 'gpt-4o', upstream: 'vllm-a' },
+      { id: 'served:vllm-b|cheap', label: 'cheap @vllm-b', col: 2, model: 'cheap', upstream: 'vllm-b' },
     ],
     links: [
-      { source: 'client', target: 'gateway', value: 2000, cost: 0.04, model: 'gpt-4o' },
-      { source: 'gateway', target: 'model:gpt-4o', value: 2000, cost: 0.04, model: 'gpt-4o' },
-      { source: 'client', target: 'gateway', value: 2000, cost: 0.001, model: 'cheap' },
-      { source: 'gateway', target: 'model:cheap', value: 2000, cost: 0.001, model: 'cheap' },
+      { source: 'client', target: 'gateway', value: 2000, cost: 0.04, model: 'gpt-4o', upstream: 'vllm-a' },
+      { source: 'gateway', target: 'served:vllm-a|gpt-4o', value: 2000, cost: 0.04, model: 'gpt-4o', upstream: 'vllm-a' },
+      { source: 'client', target: 'gateway', value: 2000, cost: 0.001, model: 'cheap', upstream: 'vllm-b' },
+      { source: 'gateway', target: 'served:vllm-b|cheap', value: 2000, cost: 0.001, model: 'cheap', upstream: 'vllm-b' },
     ],
     costPerMin: 0.08,
     totalTokens: 4000,
@@ -40,7 +40,7 @@ describe('TokenSankey — 3-column d3-sankey layout', () => {
     const xOf = (id: string) => Number(container.querySelector(`[data-node-id="${id}"]`)?.getAttribute('x'));
     const client = xOf('client');
     const gateway = xOf('gateway');
-    const gpt = xOf('model:gpt-4o');
+    const gpt = xOf('served:vllm-a|gpt-4o');
     // Strict left→right ordering: client < gateway < model column.
     expect(client).toBeLessThan(gateway);
     expect(gateway).toBeLessThan(gpt);
@@ -69,19 +69,19 @@ describe('TokenSankey — 3-column d3-sankey layout', () => {
   });
 });
 
-describe('TokenSankey — click → filter wiring', () => {
-  it('clicking a model band calls onSelectModel with that model', () => {
+describe('TokenSankey — click → filter wiring (both facets — finding 9)', () => {
+  it('clicking a lane band calls onSelectModel with its (model, upstream) pair', () => {
     const onSelect = vi.fn();
     const { container } = render(<TokenSankey model={fixture()} width={600} height={400} onSelectModel={onSelect} />);
     fireEvent.click(container.querySelector('[data-testid="sankey-band"][data-model="gpt-4o"]')!);
-    expect(onSelect).toHaveBeenCalledWith('gpt-4o');
+    expect(onSelect).toHaveBeenCalledWith('gpt-4o', 'vllm-a');
   });
 
-  it('clicking a model node also filters to that model', () => {
+  it('clicking a lane node also filters to that (model, upstream) pair', () => {
     const onSelect = vi.fn();
     const { container } = render(<TokenSankey model={fixture()} width={600} height={400} onSelectModel={onSelect} />);
-    fireEvent.click(container.querySelector('[data-node-id="model:cheap"]')!);
-    expect(onSelect).toHaveBeenCalledWith('cheap');
+    fireEvent.click(container.querySelector('[data-node-id="served:vllm-b|cheap"]')!);
+    expect(onSelect).toHaveBeenCalledWith('cheap', 'vllm-b');
   });
 });
 

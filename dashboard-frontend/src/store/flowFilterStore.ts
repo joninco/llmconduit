@@ -13,25 +13,20 @@
  * slices' selectors.
  */
 import { createStore } from 'zustand/vanilla';
-import type { FlowStatus } from '../api/types';
 import { EMPTY_FILTERS, type FlowFilters } from '../components/FlowTable/filterTypes';
 
 export interface FlowFilterState {
   filters: FlowFilters;
-  /** Replace the whole filter set (the FlowTable's FilterBar onChange). */
+  /** Replace the whole filter set (the FlowTable's FilterBar onChange; it owns chip toggles). */
   setFilters: (next: FlowFilters) => void;
   /**
-   * Toggle a single facet to a value: setting the SAME value again clears it (mirrors the
-   * FilterBar chip toggle). Topology/Sankey use the `set*` helpers below, which are thin
-   * wrappers over this so a second click on the same node/band un-filters.
+   * Cross-link from a topology node: SET the upstream filter to that target (finding 10). A
+   * cross-link is "click here → SEE those flows", so it deterministically SETS the facet — it does
+   * NOT toggle off on a repeat (chip-toggle semantics live in the FilterBar, the only chip writer).
    */
-  toggle: <K extends keyof FlowFilters>(key: K, value: NonNullable<FlowFilters[K]>) => void;
-  /** Cross-link from a topology node: filter to that upstream target (toggles off on repeat). */
   setUpstream: (upstream: string) => void;
-  /** Cross-link from a sankey band: filter to that model (requested OR served — toggles off). */
+  /** Cross-link from a sankey band: SET the model filter to that model (deterministic — finding 10). */
   setModel: (model: string) => void;
-  /** Cross-link convenience: filter to a status (toggles off on repeat). */
-  setStatus: (status: FlowStatus) => void;
   /** Clear every facet. */
   clear: () => void;
 }
@@ -39,18 +34,10 @@ export interface FlowFilterState {
 export const flowFilterStore = createStore<FlowFilterState>((set) => ({
   filters: EMPTY_FILTERS,
   setFilters: (filters) => set({ filters }),
-  toggle: (key, value) =>
-    set((s) => ({
-      // Re-selecting the active value clears the facet (chip-toggle semantics), so a second
-      // click on the same node/band/chip removes the filter rather than re-applying it.
-      filters: { ...s.filters, [key]: s.filters[key] === value ? null : value },
-    })),
-  setUpstream: (upstream) =>
-    set((s) => ({ filters: { ...s.filters, upstream: s.filters.upstream === upstream ? null : upstream } })),
-  setModel: (model) =>
-    set((s) => ({ filters: { ...s.filters, model: s.filters.model === model ? null : model } })),
-  setStatus: (status) =>
-    set((s) => ({ filters: { ...s.filters, status: s.filters.status === status ? null : status } })),
+  // Cross-link setters are DETERMINISTIC (finding 10): a click SETS the facet so the table always
+  // lands filtered to what was clicked. (The FilterBar owns the toggle-off-on-repeat chip behavior.)
+  setUpstream: (upstream) => set((s) => ({ filters: { ...s.filters, upstream } })),
+  setModel: (model) => set((s) => ({ filters: { ...s.filters, model } })),
   clear: () => set({ filters: EMPTY_FILTERS }),
 }));
 

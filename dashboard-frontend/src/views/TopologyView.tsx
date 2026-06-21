@@ -10,32 +10,45 @@
  * renders the historical state with NO extra wiring here — we just consume the store. We surface a
  * small "historical" affordance while seeking so the frozen state is not mistaken for live.
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { RadialTopology, type TopoHover } from '../components/viz/RadialTopology';
 import { useDashboard } from '../store/hooks';
+import { useTopologyQuery } from '../store/useTopologyQuery';
 import { flowFilterStore } from '../store/flowFilterStore';
 import { navigate } from '../router/useHashRoute';
 import { Panel } from '../components/ui/Panel';
 import { CooldownTooltip } from '../components/viz/CooldownTooltip';
 
 export function TopologyView() {
+  // Seed nodes/edges/prices from `/topology` (LIVE-only; never overwrites a seek cut) — finding 5.
+  useTopologyQuery();
   const nodes = useDashboard((s) => s.topologyNodes);
   const edges = useDashboard((s) => s.topologyEdges);
   const seeking = useDashboard((s) => s.connection === 'seeking');
+  const seekAtMs = useDashboard((s) => s.seekAtMs);
+  // p99 is not on the per-provider D4 DTO — source the overall metrics-window p99 (the FROZEN cut
+  // while seeking) for the tooltip (finding 6).
+  const p99 = useDashboard((s) => s.metrics?.p99 ?? null);
   const [hover, setHover] = useState<TopoHover | null>(null);
-  // Pin the live tick so a cooldown countdown in the tooltip refreshes once a second.
-  const [, force] = useState(0);
-  const tickRef = useRef(force);
-  tickRef.current = force;
+  // The cooldown countdown clock: live it ticks once a second (refreshing the tooltip); while
+  // SEEKING it is FROZEN to `seekAtMs` so the historical view does not advance into the future
+  // (finding 1) — and the live timer is disabled so a frozen tooltip never re-renders forward.
+  const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
-    if (!hover) return;
-    const id = window.setInterval(() => tickRef.current((n) => n + 1), 1000);
+    if (!hover || seeking) return; // no live tick while seeking — the clock is frozen below.
+    setNowMs(Date.now());
+    const id = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => window.clearInterval(id);
-  }, [hover]);
+  }, [hover, seeking]);
+  // While seeking the countdown is measured against the frozen cut instant, never the wall clock.
+  const clock = seeking ? (seekAtMs ?? nowMs) : nowMs;
+  // Re-resolve the hovered provider's CURRENT health by id on each render (finding 7): a streaming
+  // health update reflects in an open tooltip, and if the provider was removed the tooltip closes.
+  const hoverHealth = hover ? nodes.find((n) => n.id === hover.id) ?? null : null;
 
   function onSelectUpstream(id: string): void {
     // Filter the FlowTable to this upstream target, then jump to the flows view so the cross-link
-    // lands on the already-filtered table. The store toggle clears it on a repeat click.
+    // lands on the already-filtered table. The setter SETS the facet deterministically (finding 10).
     flowFilterStore.getState().setUpstream(id);
     navigate('flows');
   }
@@ -61,7 +74,9 @@ export function TopologyView() {
           <RadialTopology nodes={nodes} edges={edges} onSelectUpstream={onSelectUpstream} onHover={setHover} />
         )}
       </Panel>
-      {hover && <CooldownTooltip hover={hover} />}
+      {hover && hoverHealth && (
+        <CooldownTooltip health={hoverHealth} x={hover.x} y={hover.y} nowMs={clock} p99={p99} />
+      )}
     </div>
   );
 }

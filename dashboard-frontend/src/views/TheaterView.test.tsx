@@ -130,6 +130,57 @@ function pushMonitorBare(msgs: DebugWsMessage[]): void {
   dashboardStore.getState().setConnection('live');
 }
 
+describe('TheaterView — terminated rivers linger-then-fade-then-remove (finding 4)', () => {
+  it('keeps a completed river during the linger, fades it, then removes it', () => {
+    vi.useFakeTimers();
+    try {
+      const { getByTestId, queryByTestId } = render(<TheaterView />);
+      // A running river is present.
+      act(() => {
+        dashboardStore.getState().pushMonitor(upsert('r1', 'gpt-4o', 'running'), 1);
+        dashboardStore.getState().pushMonitor(seg('r1', 'output', 'hi', 1000), 1);
+        dashboardStore.getState().setConnection('live');
+      });
+      expect(getByTestId('river')).not.toBeNull();
+
+      // Flip it terminal — it must NOT vanish immediately (it lingers).
+      act(() => {
+        dashboardStore.getState().pushMonitor({ type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: 2000, error: null }, 1);
+      });
+      expect(getByTestId('river').getAttribute('data-status')).toBe('completed');
+      expect(getByTestId('river').getAttribute('data-exiting')).toBeNull();
+
+      // After the linger (4s) it enters the fade phase (data-exiting), still rendered.
+      act(() => { vi.advanceTimersByTime(4_000); });
+      expect(getByTestId('river').getAttribute('data-exiting')).toBe('true');
+
+      // After the fade (0.4s) it is removed from the grid entirely.
+      act(() => { vi.advanceTimersByTime(400); });
+      expect(queryByTestId('river')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears its linger timers on unmount (no leaked timer fires post-unmount — StrictMode-safe)', () => {
+    vi.useFakeTimers();
+    try {
+      const { unmount } = render(<TheaterView />);
+      act(() => {
+        dashboardStore.getState().pushMonitor(upsert('r1', 'm', 'completed'), 1);
+        dashboardStore.getState().pushMonitor(seg('r1', 'output', 'done', 1000), 1);
+        dashboardStore.getState().setConnection('live');
+      });
+      unmount();
+      // Advancing past linger+fade after unmount must not throw (timers were cleared, no setState
+      // on an unmounted tree).
+      expect(() => act(() => { vi.advanceTimersByTime(10_000); })).not.toThrow();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('TheaterView — SEEK shows historical summaries, NOT a live river', () => {
   function frozenFlow(over: Partial<FlowSummary>): FlowSummary {
     return {

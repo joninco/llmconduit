@@ -79,6 +79,16 @@ pre,
 .river-tile {
   animation: river-enter 0.45s ease-out both;
 }
+/* Theater — a terminated river lingers, then fades out before removal (finding 4). The `exiting`
+   class swaps the entrance for the fade; under prefers-reduced-motion the global clamp collapses
+   this to ~instant, so the tile still leaves cleanly without a visible animation. */
+@keyframes river-exit {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(6px); }
+}
+.river-tile-exiting {
+  animation: river-exit 0.4s ease-in both;
+}
 /* Theater — the blinking output cursor while a stream is running. */
 @keyframes river-cursor-blink {
   0%, 49% { opacity: 1; }

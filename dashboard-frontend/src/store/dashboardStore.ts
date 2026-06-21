@@ -155,6 +155,12 @@ export interface DashboardState {
   patchUsage: (apiCallId: string, usage: Usage) => void;
   setMetrics: (m: MetricsResponse) => void;
   setTopology: (nodes: ProviderHealth[], edges: TopologyEdge[]) => void;
+  /**
+   * Seed the topology nodes/edges AND the price table from the `/topology` REST read (D13, finding
+   * 5). The WS `topology_update` frames carry ONLY nodes/edges (no price table), so the REST seed is
+   * the price table's source; the caller gates this to LIVE so it never overwrites a frozen seek cut.
+   */
+  seedTopology: (topology: TopologyResponse) => void;
   /** Append a monitor message, stamped with the `monitor_seq` of the frame that delivered it. */
   pushMonitor: (msg: DebugWsMessage, seq?: number) => void;
   reset: () => void;
@@ -384,6 +390,11 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
   setMetrics: (metrics) => set({ metrics }),
 
   setTopology: (topologyNodes, topologyEdges) => set({ topologyNodes, topologyEdges }),
+
+  // Seed nodes/edges + price table from `/topology` (finding 5). The caller seeds only while LIVE,
+  // so this never overwrites the frozen seek cut `applySeekCut` installed.
+  seedTopology: (topology) =>
+    set({ topologyNodes: topology.nodes, topologyEdges: topology.edges, priceTable: topology.price_table }),
 
   pushMonitor: (msg, seq = 0) =>
     set((s) => {

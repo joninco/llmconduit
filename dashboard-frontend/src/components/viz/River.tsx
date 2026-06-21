@@ -18,7 +18,7 @@ const STATUS_DOT: Record<RiverData['status'], string> = {
   failed: 'bg-status-down',
 };
 
-export function River({ river }: { river: RiverData }) {
+export function River({ river, exiting = false }: { river: RiverData; exiting?: boolean }) {
   // Reasoning is collapsed by default (it is the dim secondary channel); the toggle reveals it.
   const [showReasoning, setShowReasoning] = useState(false);
   const running = river.status === 'running';
@@ -28,8 +28,13 @@ export function River({ river }: { river: RiverData }) {
       data-testid="river"
       data-river-id={river.id}
       data-status={river.status}
-      // `river-tile` carries the CSS linger-then-fade entrance (reduced-motion → no animation).
-      className="river-tile flex min-h-0 min-w-0 flex-col overflow-hidden rounded-md border border-line bg-panel"
+      data-exiting={exiting || undefined}
+      // `river-tile` carries the CSS entrance; `river-tile-exiting` swaps it for the linger-then-fade
+      // exit while a terminated tile is being removed (finding 4; reduced-motion → ~instant).
+      className={cn(
+        'river-tile flex min-h-0 min-w-0 flex-col overflow-hidden rounded-md border border-line bg-panel',
+        exiting && 'river-tile-exiting',
+      )}
     >
       <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
         <span className={cn('h-2 w-2 shrink-0 rounded-full', STATUS_DOT[river.status])} aria-hidden />

@@ -50,9 +50,13 @@ interface TopoNode extends SimulationNodeDatum {
 }
 type TopoLink = SimulationLinkDatum<TopoNode>;
 
-/** What `onHover` reports: the provider datum + its screen position (null = pointer left). */
+/**
+ * What `onHover` reports: the provider's ID + its screen position (null = pointer left). The view
+ * re-resolves the CURRENT `ProviderHealth` by this id on each render (finding 7), so an open tooltip
+ * reflects streaming health updates instead of freezing the value captured at mouseenter time.
+ */
 export interface TopoHover {
-  health: ProviderHealth;
+  id: string;
   /** Center of the node in the SVG's client coordinate space. */
   x: number;
   y: number;
@@ -78,6 +82,19 @@ const NODE_R = 14;
 /** Throughput → stroke width (px), clamped so a hot edge can't dominate. */
 function edgeWidth(throughput: number): number {
   return Math.max(1.5, Math.min(7, 1.5 + throughput * 0.9));
+}
+
+/**
+ * A stable key for the graph IDENTITY — the node SET + edge SET, independent of health/throughput
+ * (finding 7). Health/throughput changes recolor in place via `renderGraph` (no physics restart);
+ * only an identity change (a provider or edge added/removed) re-runs `setup` to rebuild the sim, so
+ * a freshly-discovered provider gets a node and a removed one stops lingering. Sorted so order is
+ * irrelevant.
+ */
+function graphIdentity(providers: ProviderHealth[], edges: TopologyEdge[]): string {
+  const nodeIds = providers.map((p) => p.id).sort().join(',');
+  const edgeIds = edges.map((e) => `${e.from}->${e.to}`).sort().join(',');
+  return `${nodeIds}|${edgeIds}`;
 }
 
 /** Build the node/link graph from the topology payload (synthetic client + gateway hub added). */
@@ -128,6 +145,9 @@ export function RadialTopology({
   // nodes/edges in place (no physics restart) — the topology twin of Sparkline's `setData`.
   const renderRef = useRef<(() => void) | null>(null);
   const reduced = prefersReducedMotion();
+  // The graph IDENTITY (node/edge SET). Health/throughput changes do NOT change it (they recolor in
+  // place); an added/removed provider or edge DOES, re-running setup to rebuild the sim (finding 7).
+  const identity = graphIdentity(nodes, edges);
 
   // Recreate ONLY on a shape change (size/motion). Data changes flow through `dataRef` +
   // `renderGraph` below (no physics restart). d3 owns the <svg>; cleanup removes it + stops sim.
@@ -173,13 +193,14 @@ export function RadialTopology({
         .force('radial', forceRadial<TopoNode>((n) => (n.kind === 'provider' ? ringR : 0), cx, cy).strength((n) => (n.kind === 'provider' ? 0.85 : 0)));
 
       // Spy on stop() so the StrictMode test can assert it was actually called (deleting the
-      // cleanup's stop() would drop the count and fail) — the d3 teardown contract.
+      // cleanup's stop() would drop the count and fail) — the d3 teardown contract. We do NOT store
+      // the sim in a module-global (finding 8): a global handle would outlive the unmount, retaining
+      // the stopped graph. The cleanup owns the only reference and tears it down.
       const realStop = sim.stop.bind(sim);
       sim.stop = () => {
         radialTopologyState.stopCalls += 1;
         return realStop();
       };
-      radialTopologyState.simulation = sim as unknown as Simulation<SimulationNodeDatum, undefined>;
 
       // Render the SVG from the current node/link positions + the latest health data. Called on
       // each tick (layout settling) and whenever a live TopologyUpdate lands (recolor only).
@@ -265,9 +286,11 @@ export function RadialTopology({
           if (node.kind === 'provider' && health) {
             g.style.cursor = 'pointer';
             g.addEventListener('click', () => selectRef.current(node.id));
+            // Report the provider ID (not the health datum) so the view re-resolves CURRENT health
+            // by id on each render — an open tooltip then reflects streaming updates (finding 7).
             g.addEventListener('mouseenter', () => {
               const rect = svg.getBoundingClientRect();
-              hoverRef.current?.({ health, x: rect.left + (node.x ?? 0), y: rect.top + (node.y ?? 0) });
+              hoverRef.current?.({ id: node.id, x: rect.left + (node.x ?? 0), y: rect.top + (node.y ?? 0) });
             });
             g.addEventListener('mouseleave', () => hoverRef.current?.(null));
           }
@@ -289,15 +312,19 @@ export function RadialTopology({
       return () => {
         radialTopologyState.cleanups += 1;
         renderRef.current = null;
-        // REQUIRED teardown (findings 7+8): stop the physics timer + drop the tick handler so no
-        // animation frame survives the unmount, then remove the d3-owned SVG (StrictMode-safe).
+        // REQUIRED teardown: stop the physics timer + drop the tick handler so no animation frame
+        // survives the unmount, then remove the d3-owned SVG (StrictMode-safe). The sim has no
+        // surviving reference outside this closure (finding 8), so it is fully released here.
         sim.stop();
         sim.on('tick', null);
         if (sim.on('tick') != null) radialTopologyState.allTickHandlersCleared = false;
         svg.remove();
       };
     },
-    [width, height, reduced],
+    // `identity` re-runs setup when the node/edge SET changes (a provider/edge added/removed —
+    // finding 7); size/motion changes also rebuild. Health/throughput-only changes flow through
+    // `renderGraph` below (recolor, no physics restart).
+    [width, height, reduced, identity],
   );
 
   // Live recolor: a streaming TopologyUpdate (same node set, changed health/throughput) re-renders

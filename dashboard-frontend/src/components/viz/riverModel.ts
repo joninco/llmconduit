@@ -9,7 +9,7 @@
  * the standard "≈ tokens" heuristic the theater meter shows; the authoritative token totals live
  * on the flow rows. A river with a completed/failed status stops accumulating tok/s (frozen final).
  */
-import type { DebugWsMessage, DebugRequestStatus } from '../../api/types';
+import { assertNever, type DebugWsMessage, type DebugRequestStatus } from '../../api/types';
 
 export interface River {
   /** The stream id (`response_id`). */
@@ -97,9 +97,16 @@ export function buildRivers(monitor: DebugWsMessage[]): River[] {
         }
         break;
       }
-      // `hello`/`event_append`/`snapshot_done` do not shape a river's body.
-      default:
+      // These arms carry no river body — intentionally ignored, but enumerated so a NEW protocol
+      // arm (added to the `DebugWsMessage` union) is a COMPILE error here, not a silent drop
+      // (finding 11). `hello` is the handshake; `event_append` feeds the inspector timeline (not the
+      // theater); `snapshot_done` marks end-of-replay.
+      case 'hello':
+      case 'event_append':
+      case 'snapshot_done':
         break;
+      default:
+        assertNever(msg);
     }
   }
 

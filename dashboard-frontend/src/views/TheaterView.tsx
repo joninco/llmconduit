@@ -13,7 +13,8 @@
  */
 import { useMemo, useState } from 'react';
 import { River } from '../components/viz/River';
-import { buildRivers, gridColumns } from '../components/viz/riverModel';
+import { gridColumns } from '../components/viz/riverModel';
+import { useLingeringRivers } from '../components/viz/useLingeringRivers';
 import { useDashboard } from '../store/hooks';
 import type { FlowSummary } from '../api/types';
 import { cn } from '../lib/cn';
@@ -27,7 +28,9 @@ export function TheaterView() {
 function LiveTheater() {
   const monitor = useDashboard((s) => s.monitor);
   const [fullscreen, setFullscreen] = useState(false);
-  const rivers = useMemo(() => buildRivers(monitor), [monitor]);
+  // Terminated tiles linger-then-fade-then-remove (finding 4) rather than persisting until the
+  // monitor evicts them; the hook owns the StrictMode-safe timers.
+  const rivers = useLingeringRivers(monitor);
   const cols = gridColumns(rivers.length);
 
   return (
@@ -64,7 +67,7 @@ function LiveTheater() {
           data-cols={cols}
         >
           {rivers.map((river) => (
-            <River key={river.id} river={river} />
+            <River key={river.id} river={river} exiting={river.exiting} />
           ))}
         </div>
       )}

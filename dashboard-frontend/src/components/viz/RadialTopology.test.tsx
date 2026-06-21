@@ -64,16 +64,49 @@ describe('RadialTopology — click → filter wiring', () => {
 });
 
 describe('RadialTopology — cooldown tooltip hover reporting', () => {
-  it('mouseenter on a node reports its health datum + screen position via onHover', () => {
+  it('mouseenter on a node reports its provider ID + screen position via onHover (finding 7)', () => {
     const onHover = vi.fn();
     const { container } = render(<RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} onHover={onHover} />);
     fireEvent.mouseEnter(container.querySelector('[data-node-id="vllm-b"]')!);
     expect(onHover).toHaveBeenCalledTimes(1);
     const arg = onHover.mock.calls[0]![0];
-    expect(arg.health.id).toBe('vllm-b');
-    expect(arg.health.cooling_until_ms).toBeGreaterThan(Date.now());
+    // Reports the ID (not the health datum) so the view re-resolves CURRENT health by id.
+    expect(arg.id).toBe('vllm-b');
+    expect(typeof arg.x).toBe('number');
+    expect(typeof arg.y).toBe('number');
     fireEvent.mouseLeave(container.querySelector('[data-node-id="vllm-b"]')!);
     expect(onHover).toHaveBeenLastCalledWith(null);
+  });
+});
+
+describe('RadialTopology — live node-set changes rebuild the graph (finding 7)', () => {
+  it('adding a provider renders a new node; removing one drops it', () => {
+    const { container, rerender } = render(
+      <RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} />,
+    );
+    expect(container.querySelectorAll('[data-testid="topo-node"]').length).toBe(3);
+    // Add a fourth provider → identity changes → the sim rebuilds with a node for it.
+    const more = [...NODES, provider({ id: 'groq', name: 'groq', status: 'healthy' })];
+    rerender(<RadialTopology nodes={more} edges={EDGES} onSelectUpstream={() => {}} />);
+    expect(container.querySelectorAll('[data-testid="topo-node"]').length).toBe(4);
+    expect(container.querySelector('[data-node-id="groq"]')).not.toBeNull();
+    // Remove down to one → the dropped providers no longer linger.
+    rerender(<RadialTopology nodes={[NODES[0]!]} edges={EDGES} onSelectUpstream={() => {}} />);
+    expect(container.querySelectorAll('[data-testid="topo-node"]').length).toBe(1);
+    expect(container.querySelector('[data-node-id="openai"]')).toBeNull();
+  });
+
+  it('a health-only change (same node set) recolors WITHOUT a full sim rebuild', () => {
+    resetRadialTopologyState();
+    const { container, rerender } = render(
+      <RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} />,
+    );
+    const setupsAfterMount = radialTopologyState.setups;
+    // Flip vllm-a healthy → down (same ids/edges → identity unchanged → recolor only, no new setup).
+    const recolored = [provider({ id: 'vllm-a', name: 'vllm-a', status: 'down' }), NODES[1]!, NODES[2]!];
+    rerender(<RadialTopology nodes={recolored} edges={EDGES} onSelectUpstream={() => {}} />);
+    expect(radialTopologyState.setups).toBe(setupsAfterMount); // no rebuild
+    expect(container.querySelector('[data-node-id="vllm-a"] circle')?.getAttribute('fill')).toBe(colors.statusDown);
   });
 });
 

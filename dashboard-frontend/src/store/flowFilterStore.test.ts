@@ -11,18 +11,21 @@ describe('flowFilterStore — the shared FlowTable filter (D12 cross-link)', () 
     expect(flowFilterStore.getState().filters).toEqual(EMPTY_FILTERS);
   });
 
-  it('setUpstream filters to a target and toggles it off on a repeat', () => {
+  it('setUpstream SETS the target deterministically (a click filters; no toggle-off) — finding 10', () => {
     flowFilterStore.getState().setUpstream('vllm-a');
     expect(flowFilterStore.getState().filters.upstream).toBe('vllm-a');
-    // Re-selecting the same upstream clears it (chip-toggle semantics).
+    // A cross-link is "click → SEE those flows": a repeat re-SETS the same value, never clears it.
     flowFilterStore.getState().setUpstream('vllm-a');
-    expect(flowFilterStore.getState().filters.upstream).toBeNull();
+    expect(flowFilterStore.getState().filters.upstream).toBe('vllm-a');
+    // A different target replaces it.
+    flowFilterStore.getState().setUpstream('vllm-b');
+    expect(flowFilterStore.getState().filters.upstream).toBe('vllm-b');
   });
 
-  it('setModel / setStatus set their facets independently', () => {
+  it('setModel / setUpstream set their facets independently', () => {
     flowFilterStore.getState().setModel('gpt-4o');
-    flowFilterStore.getState().setStatus('failed');
-    expect(flowFilterStore.getState().filters).toEqual({ status: 'failed', model: 'gpt-4o', upstream: null });
+    flowFilterStore.getState().setUpstream('vllm-a');
+    expect(flowFilterStore.getState().filters).toEqual({ status: null, model: 'gpt-4o', upstream: 'vllm-a' });
   });
 
   it('setFilters replaces the whole set; clear resets', () => {

@@ -1,9 +1,9 @@
 /**
- * TokenSankey (D12) — the cost story. A 3-column d3-sankey: client → gateway → served-model. Band
- * height ∝ tokens over the rolling window (`sankeyModel`, default 30 s); each band is colored on a
- * cool→hot cost RAMP (from the D13 `/topology` price table) so the expensive lanes read hot. The
- * total windowed cost is projected to `$`/min in the header. Clicking a model band (or its node)
- * cross-links to the FlowTable filtered to that model.
+ * TokenSankey (D12) — the cost story. A 3-column d3-sankey: client → gateway → (upstream, served-
+ * model). Band height ∝ tokens over the rolling window (`sankeyModel`, default 30 s); each band is
+ * colored on a cool→hot cost RAMP (from the D13 `/topology` price table) so the expensive lanes
+ * read hot. Clicking a lane band (or its node) cross-links to the FlowTable filtered ATOMICALLY to
+ * that band's `(upstream, model)` pair (finding 9) — the view owns the `$`/min readout.
  *
  * Lifecycle (§3.3 + `useImperativeViz`): d3 OWNS the <svg> (created in the imperative setup,
  * removed in cleanup), React owns the mount lifecycle. d3-sankey is a pure LAYOUT — no physics
@@ -21,15 +21,15 @@ import { tokenSankeyCounters } from './tokenSankeyState';
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
 /** The extra properties carried on d3-sankey nodes/links (beyond the layout-computed geometry). */
-interface SNode { id: string; label: string; col: 0 | 1 | 2; model?: string }
-interface SLink { cost: number; model?: string }
+interface SNode { id: string; label: string; col: 0 | 1 | 2; model?: string; upstream?: string | null }
+interface SLink { cost: number; model?: string; upstream?: string | null }
 
 export interface TokenSankeyProps {
   model: SankeyModel;
   width?: number;
   height?: number;
-  /** Click a model band/node → cross-link to the FlowTable filtered to that model. */
-  onSelectModel: (model: string) => void;
+  /** Click a lane band/node → cross-link filtered to that band's (upstream, model) pair (finding 9). */
+  onSelectModel: (model: string, upstream: string | null) => void;
 }
 
 const DEFAULT_W = 720;
@@ -82,6 +82,7 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
           value: l.value,
           cost: l.cost,
           model: l.model,
+          upstream: l.upstream,
         }));
         const layout = sankey<SNode, SLink>()
           .nodeId((n) => n.id)
@@ -107,6 +108,7 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
           path.setAttribute('stroke-width', String(Math.max(1, link.width ?? 1)));
           path.setAttribute('data-testid', 'sankey-band');
           if (sl.model) path.setAttribute('data-model', sl.model);
+          if (sl.upstream) path.setAttribute('data-upstream', sl.upstream);
           // Pulsing dash (CSS) along the band; gracefully static under reduced motion (the class
           // only animates when motion is allowed — see index.css).
           path.setAttribute('stroke-dasharray', '10 14');
@@ -114,7 +116,8 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
           if (sl.model) {
             path.style.cursor = 'pointer';
             const model = sl.model;
-            path.addEventListener('click', () => selectRef.current(model));
+            const upstream = sl.upstream ?? null;
+            path.addEventListener('click', () => selectRef.current(model, upstream));
           }
           linkLayer.appendChild(path);
         }
@@ -134,10 +137,13 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
           rect.setAttribute('rx', '2');
           rect.setAttribute('data-testid', sn.col === 2 ? 'sankey-model-node' : 'sankey-node');
           rect.setAttribute('data-node-id', sn.id);
+          if (sn.model) rect.setAttribute('data-model', sn.model);
+          if (sn.upstream) rect.setAttribute('data-upstream', sn.upstream);
           if (sn.model) {
             rect.style.cursor = 'pointer';
             const model = sn.model;
-            rect.addEventListener('click', () => selectRef.current(model));
+            const upstream = sn.upstream ?? null;
+            rect.addEventListener('click', () => selectRef.current(model, upstream));
           }
           nodeLayer.appendChild(rect);
 
