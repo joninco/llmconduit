@@ -846,12 +846,19 @@ impl MetricsLayer {
     /// the tile never updates. Capturing both under one lock guarantees the cursor is
     /// exactly the watermark of the view returned. `(MetricsView::default(), 0)` when
     /// disabled.
+    ///
+    /// Time-inside-the-lock (D7b R3 HIGH): `now_epoch_s()` is sampled AFTER the lock is
+    /// acquired, so the view's aggregation window, the `metrics_seq`, and the bucketed
+    /// data are mutually consistent. Sampling `now` BEFORE the lock leaves a window in
+    /// which a mutation in the next second enters `metrics_seq` (and its tokens land in
+    /// the current-epoch bucket) yet is EXCLUDED from a view aggregated against the older
+    /// `now` — pairing a newer seq with a view that omits that very sample.
     pub fn view_with_seq(&self) -> (MetricsView, u64) {
         if !self.enabled {
             return (MetricsView::default(), 0);
         }
-        let now = now_epoch_s();
         let state = self.lock();
+        let now = now_epoch_s();
         (state.view(now), state.metrics_seq)
     }
 
@@ -1834,6 +1841,88 @@ mod tests {
             0,
             "every cut's taken_at_ms is >= the topology version's publish-time AND the \
              monitor cursor it captured (independent fields sampled before the stamp)"
+        );
+    }
+
+    /// D7b R3 HIGH: `view_with_seq` must sample the time INSIDE the lock so the view's
+    /// window, the `metrics_seq`, and the bucketed data are mutually consistent. Each
+    /// `record_response` bumps `metrics_seq` by 1 AND adds exactly 1 to the count in the
+    /// current second's slot of every ring; the 1 h ring spans 3600 s, so within this
+    /// sub-second test EVERY recorded sample falls inside the 1 h window — making the 1 h
+    /// `total_count == metrics_seq` an exact invariant for a consistent atomic read.
+    ///
+    /// If the time were sampled BEFORE the lock (the bug), a writer landing a sample at
+    /// the next second between the reader's time-read and its lock-acquire would bump
+    /// `metrics_seq` AND drop the count into a slot whose `epoch_s > now` — which
+    /// `aggregate(now)` EXCLUDES from every window. The reader would then observe
+    /// `metrics_seq = N` while the 1 h window held only `N - 1` counts. Hammer a writer
+    /// across a second boundary while the reader takes `view_with_seq()` and assert no
+    /// such sample-in-seq-but-excluded-from-view is ever observed.
+    #[test]
+    fn view_with_seq_time_and_seq_are_consistent_under_contention() {
+        let metrics = MetricsLayer::new();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let violations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Writers: record terminal responses as fast as possible so the reader straddles
+        // a 1 s boundary mid-read. Only `record_response` (never `record_usage`) is used
+        // so every seq-bump corresponds to exactly one counted sample.
+        let mut writers = Vec::new();
+        for _ in 0..4 {
+            let metrics = metrics.clone();
+            let stop = Arc::clone(&stop);
+            writers.push(std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    metrics.record_response(
+                        FlowStatus::Completed,
+                        Some("m"),
+                        "/v1/responses",
+                        Some("p"),
+                        5,
+                    );
+                }
+            }));
+        }
+
+        let reader_thread = {
+            let metrics = metrics.clone();
+            let stop = Arc::clone(&stop);
+            let violations = Arc::clone(&violations);
+            let reads_seen = Arc::clone(&reads_seen);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let (view, seq) = metrics.view_with_seq();
+                    reads_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // The 1 h window includes every sample of this short test, so its
+                    // count must EXACTLY equal the seq — never lag it (which is the bug:
+                    // a seq-bumping sample excluded from the time-bucketed view).
+                    if view.window_1h.total_count() != seq {
+                        violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        // Run long enough to straddle at least one wall-clock second boundary, where the
+        // sample-newer-than-`now` exclusion would manifest under the pre-lock-time bug.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for writer in writers {
+            writer.join().expect("writer thread joins");
+        }
+        reader_thread.join().expect("reader thread joins");
+
+        assert!(
+            reads_seen.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the reader took at least one view_with_seq while writers raced it"
+        );
+        assert_eq!(
+            violations.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "every (view, seq) is consistent: the 1 h window's count equals the seq, so \
+             no sample is included in the seq yet excluded from the time-bucketed view"
         );
     }
 
