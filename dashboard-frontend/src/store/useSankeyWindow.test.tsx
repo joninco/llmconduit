@@ -163,6 +163,35 @@ describe('useSankeyWindow — timestamped deltas, not cumulative totals (finding
     expect(result.current.deltasRef.current.map((d) => d.total)).toEqual([500, 150]);
   });
 
+  it('a flow seen with usage but NO model yet baselines silently; when the model later resolves, ONLY the growth folds (lifetime never restamped) — D12 R5 HIGH', () => {
+    const ref = { now: 1000 };
+    // A live flow arrives already carrying a big cumulative usage but with its model attribution STILL
+    // ABSENT (model_served/model_requested both null — D2 has not attached it yet).
+    act(() => {
+      dashboardStore.getState().upsertFlow(
+        flow({ api_call_id: 'a', model_served: null, model_requested: null, usage: usage({ prompt: 1_000_000, total: 1_000_000 }) }),
+      );
+    });
+    const { result } = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
+    // No model → NO delta is emitted (the band has no model to attribute), but the 1M baseline WAS
+    // recorded. The bug was skipping the flow entirely, leaving the baseline unset.
+    expect(result.current.deltasRef.current).toEqual([]);
+
+    // The model resolves and usage GROWS to 1_000_250 in the same frame (D2 attaches model_served).
+    ref.now = 2000;
+    act(() => {
+      dashboardStore.getState().upsertFlow(
+        flow({ api_call_id: 'a', model_served: 'gpt-4o', usage: usage({ prompt: 1_000_250, total: 1_000_250 }) }),
+      );
+    });
+    // ONLY the +250 growth past the seeded baseline folds — the 1M lifetime is NEVER restamped as a
+    // fresh now()-stamped band now that the model is known.
+    const deltas = result.current.deltasRef.current;
+    expect(deltas.map((d) => d.total)).toEqual([250]);
+    expect(deltas[0]!.model).toBe('gpt-4o');
+    expect(deltas[0]!.ts).toBe(2000);
+  });
+
   it('resets baselines + ring on a teardown (reset → idle); the fresh snapshot SEEDS (no stale diff), then post-snapshot growth folds', () => {
     const ref = { now: 1000 };
     act(() => {

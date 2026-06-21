@@ -33,6 +33,32 @@ describe('buildRivers — folds the monitor ring into per-stream rivers', () => 
     expect(river?.tools).toEqual(['search(q)']);
   });
 
+  it('coalesces ADJACENT tool-argument fragments into ONE card (streamed args of a single call) — D12 R5 MED', () => {
+    const monitor: DebugWsMessage[] = [
+      upsert('r1', 'gpt-4o'),
+      // One tool call whose arguments stream as three fragments.
+      seg('r1', 'tool', 'search({"q":"weath', 1300),
+      seg('r1', 'tool', 'er in ', 1310),
+      seg('r1', 'tool', 'Paris"})', 1320),
+    ];
+    const [river] = buildRivers(monitor);
+    expect(river?.tools).toEqual(['search({"q":"weather in Paris"})']);
+  });
+
+  it('a non-tool segment between tool runs SPLITS them into separate cards (distinct tool calls)', () => {
+    const monitor: DebugWsMessage[] = [
+      upsert('r1', 'gpt-4o'),
+      seg('r1', 'tool', 'search(', 1300),
+      seg('r1', 'tool', 'a)', 1310),
+      // An output (or reasoning) segment marks the boundary between two distinct tool calls.
+      seg('r1', 'output', 'thinking', 1320),
+      seg('r1', 'tool', 'lookup(', 1330),
+      seg('r1', 'tool', 'b)', 1340),
+    ];
+    const [river] = buildRivers(monitor);
+    expect(river?.tools).toEqual(['search(a)', 'lookup(b)']);
+  });
+
   it('derives tokens/sec from the segment timestamp window (≈ chars/4 over elapsed)', () => {
     const monitor: DebugWsMessage[] = [
       upsert('r1', 'm'),

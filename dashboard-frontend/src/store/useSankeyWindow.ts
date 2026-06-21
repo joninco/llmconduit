@@ -191,14 +191,21 @@ function fold(eng: FoldEngine): void {
   for (const f of s.flows.values()) {
     const u = f.usage;
     if (!u) continue;
+    // The MODEL gates EMITTING a delta, NOT recording the baseline. A flow can be seeded (or its
+    // usage observed) BEFORE its model attribution resolves; if we skipped such a flow entirely, its
+    // baseline would stay unset, and when the model later arrives the diff would be against 0 — so the
+    // flow's ENTIRE lifetime cumulative would fold as a fresh `now()`-stamped band (D12 R5 HIGH). We
+    // therefore ALWAYS baseline current cumulative below (model known or not); only LIVE growth that
+    // ALSO has a model emits a delta. A flow seeded without a model thus records its baseline, and
+    // when the model later resolves only the GROWTH past that baseline folds — never the lifetime.
     const model = f.model_served ?? f.model_requested;
-    if (!model) continue;
     // On a SEED frame: silently re-baseline to the snapshot's cumulative total and emit no delta.
     // Otherwise diff against the prior cumulative snapshot; a brand-new flow's first LIVE observation
     // IS its delta (prev = 0s). A non-increasing total (no growth) records nothing — so a historical
     // cumulative total already captured in the baseline (after a remount/seek-resume) emits NOTHING,
-    // never a fresh `now()`-stamped band.
-    if (!seed) {
+    // never a fresh `now()`-stamped band. Growth with no model yet is NOT emitted but DOES advance the
+    // baseline below, so it is not re-counted as a fresh delta once the model resolves.
+    if (!seed && model) {
       const prev = baselines.get(f.api_call_id);
       const dTotal = u.total - (prev?.total ?? 0);
       if (dTotal > 0) {
@@ -214,8 +221,9 @@ function fold(eng: FoldEngine): void {
         folded = true;
       }
     }
-    // Always advance the baseline to the latest cumulative (even on a non-positive diff, e.g. a
-    // corrected/reset total, or a SEED frame) so the NEXT diff is against the current truth.
+    // Always advance the baseline to the latest cumulative — on a SEED frame, a non-positive diff
+    // (a corrected/reset total), AND a model-less observation — so the NEXT diff is against the
+    // current truth and a later model resolution folds only growth, never the lifetime (D12 R5 HIGH).
     baselines.set(f.api_call_id, { prompt: u.prompt, cached: u.cached, completion: u.completion, total: u.total });
   }
 

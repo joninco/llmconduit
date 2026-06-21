@@ -20,7 +20,14 @@ export interface River {
   output: string;
   /** Concatenated `reasoning` deltas (dim, collapsible). */
   reasoning: string;
-  /** Tool-call segment texts, in order (rendered as cards). */
+  /**
+   * Tool-call texts, in order (one card each). ADJACENT `tool` segments are COALESCED into a single
+   * entry — a streamed tool call arrives as many `segment_append` fragments of its arguments, and
+   * stamping each fragment as its own card would shred one call into dozens of cards. We accumulate
+   * consecutive tool fragments into the current card (the same delta-coalescing D10 applies to text)
+   * and only START a new card when a non-tool segment (output/reasoning) interleaves, marking the
+   * boundary between distinct tool calls.
+   */
   tools: string[];
   /** First/last segment timestamps (ms) seen for this river — the tok/s window. */
   firstMs: number | null;
@@ -55,6 +62,10 @@ function approxTokensFor(text: string): number {
 export function buildRivers(monitor: DebugWsMessage[]): River[] {
   const rivers = new Map<string, River>();
   const order: string[] = [];
+  // Per-river: was the LAST segment folded a `tool`? Adjacent tool fragments coalesce into the
+  // current `tools` card; a non-tool segment clears this so the NEXT tool segment opens a fresh card
+  // (a distinct tool call). Kept local to the fold (transient), not on the public `River` type.
+  const lastWasTool = new Map<string, boolean>();
 
   const ensure = (id: string): River => {
     let r = rivers.get(id);
@@ -88,11 +99,20 @@ export function buildRivers(monitor: DebugWsMessage[]): River[] {
         if (msg.segment.kind === 'output') {
           r.output += msg.segment.text;
           r.approxTokens += approxTokensFor(msg.segment.text);
+          lastWasTool.set(r.id, false); // a non-tool segment ends the current tool card's run.
         } else if (msg.segment.kind === 'reasoning') {
           r.reasoning += msg.segment.text;
           r.approxTokens += approxTokensFor(msg.segment.text);
+          lastWasTool.set(r.id, false); // a non-tool segment ends the current tool card's run.
         } else {
-          r.tools.push(msg.segment.text);
+          // Coalesce consecutive tool fragments into ONE card (the streamed arguments of a single
+          // call); a fresh card only opens when the previous segment was NOT a tool (D12 R5 MED).
+          if (lastWasTool.get(r.id)) {
+            r.tools[r.tools.length - 1] += msg.segment.text;
+          } else {
+            r.tools.push(msg.segment.text);
+          }
+          lastWasTool.set(r.id, true);
         }
         break;
       }
