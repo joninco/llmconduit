@@ -1,38 +1,45 @@
 /**
- * `useSankeyWindow` — the LIVE rolling-window accumulator for the token Sankey (D12, finding 2).
- * Subscribes to the dashboard store DIRECTLY (like `useMetricStream`) and folds every distinct
- * usage GROWTH per flow into a TIMESTAMPED delta, returning a ref-held ring pruned to the window.
+ * The token-Sankey rolling-window accumulator (D12, finding 2), split into an APP-LIFETIME fold
+ * engine + a thin read hook (D12 R3).
  *
- * Why deltas (not cumulative totals): a `FlowSummary.usage` is the flow's LIFETIME cumulative
- * count. The band must be tokens/30 s, so we cannot sum cumulative totals of every flow that
- * overlaps the window — a single long-running flow would report its entire lifetime as the 30 s
- * rate. Instead we record the INCREMENT each flow grew by, stamped with the wall-clock instant we
- * observed it, and the model sums only the increments inside `[now - windowMs, now]`. A flow that
- * streamed a million tokens an hour ago but is idle now contributes nothing to the current band.
+ * THE FOLD IS APP-LIFETIME, NOT MOUNT-SCOPED (D12 R3 — the fix for "usage that grew while away from
+ * the Sankey is folded at REMOUNT time and stamped at the remount instant"): folding lives in a
+ * MODULE-level store subscription started ONCE at app bootstrap (`startSankeyFold`, called from the
+ * composition root), so it runs from app start regardless of which view is mounted. Each usage
+ * increment is stamped with the wall-clock instant it ACTUALLY arrives, never `Date.now()` at a
+ * remount. The `SankeyView` only READS the already-maintained windowed ring via `useSankeyWindow`;
+ * mounting/unmounting it no longer changes WHEN deltas are recorded. Growth that happens while the
+ * Sankey is unmounted is folded at its real arrival time and correctly ages out of the 30 s window.
  *
- * Why a direct store subscription (not `useDashboard` + an effect): React batches synchronous store
+ * Why deltas (not cumulative totals): a `FlowSummary.usage` is the flow's LIFETIME cumulative count.
+ * The band must be tokens/30 s, so we cannot sum cumulative totals of every flow that overlaps the
+ * window — a single long-running flow would report its entire lifetime as the 30 s rate. Instead we
+ * record the INCREMENT each flow grew by, stamped with the wall-clock instant we observed it, and the
+ * model sums only the increments inside `[now - windowMs, now]`. A flow that streamed a million
+ * tokens an hour ago but is idle now contributes nothing to the current band.
+ *
+ * Why a direct store subscription (not a selector + an effect): React batches synchronous store
  * updates into ONE commit, so a `useSyncExternalStore` selector only exposes the LATEST `flows` —
- * intermediate usage bumps landing in the same tick would be lost. Subscribing to the vanilla store
- * directly runs the fold on every change, so no increment is dropped.
+ * intermediate usage bumps landing in the same tick would be lost. The module fold runs on every
+ * vanilla-store change, so no increment is dropped.
  *
  * STABLE SINGLETON COLLECTOR (finding 3 — the fix for "route entry / seek resume restamps every
- * cumulative total as fresh traffic"): the baselines + delta ring live at MODULE scope, NOT in a
- * per-mount ref, so they SURVIVE a SankeyView remount (route navigation) and a seek round-trip
- * (`live → seeking → live`). A flow already at cumulative total T keeps baseline T, so its first
- * observation after a remount/resume diffs to 0 and emits NOTHING — its lifetime total is never
- * re-stamped at `Date.now()` as a fresh 30 s band. Only TRUE incremental growth folds, with its
- * real arrival time. The baselines + ring are cleared ONLY on a genuine TEARDOWN edge — the
- * connection entering `'idle'`/`'closed'` (a `reset()` / fresh session), where cumulative continuity
- * is actually broken and a reused `api_call_id` may restart at a lower total. That clear is driven
- * by a module-level store subscription (below), so it fires even when no `SankeyView` is mounted at
- * the instant of teardown (e.g. a reset between route mounts).
+ * cumulative total as fresh traffic"): the baselines + delta ring live at MODULE scope, so a flow
+ * already at cumulative total T keeps baseline T; its next observation after a remount/seek-resume
+ * diffs to 0 and emits NOTHING — its lifetime total is never re-stamped as a fresh 30 s band. Only
+ * TRUE incremental growth folds, with its real arrival time. The baselines + ring are cleared ONLY
+ * on a genuine TEARDOWN edge — the connection entering `'idle'`/`'closed'`, OR the monotonic
+ * `connEpoch` advancing (a `reset()` / fresh snapshot, where cumulative continuity is broken and a
+ * reused `api_call_id` may restart at a lower total). Because the fold engine is app-lifetime, that
+ * clear fires even when no `SankeyView` is mounted at the instant of teardown.
  */
 import { useEffect, useRef, useState } from 'react';
 import { dashboardStore } from './dashboardStore';
+import type { FlowSummary } from '../api/types';
 import type { SankeyUsageDelta } from '../components/viz/sankeyModel';
 
 export interface SankeyWindow {
-  /** Bumps once per folded increment so the component re-renders to read the (ref-held) ring. */
+  /** Bumps once per fold-engine ring change so the component re-renders to read the (ref-held) ring. */
   version: number;
   /** The current windowed deltas (ref-held — read after a `version` bump). */
   deltasRef: React.MutableRefObject<SankeyUsageDelta[]>;
@@ -46,17 +53,9 @@ interface Cumulative {
   total: number;
 }
 
-/**
- * The MODULE-level collector — one per app, surviving component remounts (route navigation) and
- * seek round-trips so a flow's cumulative baseline is never re-stamped as fresh traffic. Cleared
- * only on a genuine teardown edge (see the module subscription below).
- */
-interface Collector {
-  baselines: Map<string, Cumulative>;
-  deltas: SankeyUsageDelta[];
-}
-
-const collector: Collector = { baselines: new Map(), deltas: [] };
+export const DEFAULT_WINDOW_MS = 30_000;
+/** Hard cap on retained deltas (defensive — pruning by time is the primary bound). */
+const MAX_DELTAS = 5_000;
 
 /** Connection states that signal a genuine session teardown (cumulative continuity broken). */
 function isTeardown(connection: string): boolean {
@@ -64,95 +63,208 @@ function isTeardown(connection: string): boolean {
 }
 
 /**
- * Clear the collector on a TEARDOWN EDGE, driven by a module-level store subscription so it fires
- * regardless of whether a `SankeyView` is mounted at that instant (a `reset()` may land between
- * route mounts). A teardown is an edge INTO `'idle'`/`'closed'` (was-not-teardown → is-teardown);
- * a seek round-trip never enters those states, so it does NOT clear (the baselines are preserved and
- * an unchanged cumulative total diffs to 0 on resume — no restamp). Subscribing at module scope is
- * a deliberate app-lifetime global (mirrors the singleton collector); it is never torn down.
+ * The APP-LIFETIME fold engine: owns the per-flow baselines + the windowed delta ring, folds usage
+ * growth as store frames arrive (stamping each delta at its REAL arrival time), and notifies readers
+ * when the ring changes. One instance per app, installed once by `startSankeyFold`.
  */
-let prevConnection = dashboardStore.getState().connection as string;
-dashboardStore.subscribe(() => {
-  const connection = dashboardStore.getState().connection as string;
-  if (isTeardown(connection) && !isTeardown(prevConnection)) {
-    collector.baselines = new Map();
-    collector.deltas = [];
-  }
-  prevConnection = connection;
-});
+interface FoldEngine {
+  baselines: Map<string, Cumulative>;
+  /** The windowed ring, appended in arrival-time order so pruning is incremental from the front. */
+  deltas: SankeyUsageDelta[];
+  /** Last `flows` Map reference folded — an UNCHANGED reference means no flow grew (skip the scan). */
+  lastFlows: Map<string, FlowSummary> | null;
+  /** Last connection state, to detect the EDGE into a teardown state (clears baselines + ring). */
+  lastConnection: string;
+  retentionMs: number;
+  now: () => number;
+  /** Reader callbacks (the hook) fired after every ring change. */
+  listeners: Set<() => void>;
+  /** Tears down the store subscription (test-only; the production engine is never torn down). */
+  unsubscribe: (() => void) | null;
+}
 
-const DEFAULT_WINDOW_MS = 30_000;
-/** Hard cap on retained deltas (defensive — pruning by time is the primary bound). */
-const MAX_DELTAS = 5_000;
+let engine: FoldEngine | null = null;
+
+/** Notify readers (the hook) that the ring changed so they re-render to read it. */
+function emit(eng: FoldEngine): void {
+  for (const l of eng.listeners) l();
+}
 
 /**
- * @param windowMs the rolling window; entries older than `now - windowMs` are pruned on each fold.
+ * Drop ring entries older than the retention window. The ring is in arrival-time ORDER, so every
+ * expired entry is a contiguous PREFIX — drop them from the front (O(dropped), not O(n)), then defend
+ * with the hard cap. Returns whether anything was dropped (callers decide whether to notify). Used by
+ * both the fold path AND the read path, so a ring read between store frames (e.g. a SankeyView
+ * remount after a long idle) is still time-accurate without waiting for the next fold.
+ */
+function pruneRing(eng: FoldEngine, nowMs: number): boolean {
+  const cutoff = nowMs - eng.retentionMs;
+  let dropped = 0;
+  while (dropped < eng.deltas.length && eng.deltas[dropped]!.ts < cutoff) dropped++;
+  if (dropped > 0) eng.deltas = eng.deltas.slice(dropped);
+  if (eng.deltas.length > MAX_DELTAS) {
+    eng.deltas = eng.deltas.slice(eng.deltas.length - MAX_DELTAS);
+    return true;
+  }
+  return dropped > 0;
+}
+
+/**
+ * Fold the store's CURRENT `flows` into timestamped deltas. Runs on every store change (and once
+ * eagerly at install). Cheap when nothing relevant changed:
+ *  - SKIPS the per-flow scan entirely when the `flows` Map reference is UNCHANGED (MED fix: avoid an
+ *    O(flows + deltas) cost on every unrelated monitor/metrics frame — those never replace `flows`,
+ *    and `upsertFlow`/`patchUsage`/`patchFlowStatus` each install a NEW Map, so an identical
+ *    reference proves no flow grew). Time-pruning when the clock advances WITHOUT a flow change is
+ *    handled lazily by `pruneRing` on the read path (+ the view's per-second recompute tick).
+ *  - SKIPS folding while `seeking` (the store holds the FROZEN cut, not live increments — D11 R5).
+ *  - CLEARS baselines + ring on the EDGE into a teardown state (`idle`/`closed`) — a genuine session
+ *    teardown where cumulative continuity is broken and a reused `api_call_id` may restart at a lower
+ *    total. A `live → seeking → live` round-trip never enters those states, so it does NOT clear (the
+ *    baselines survive and an unchanged cumulative total diffs to 0 on resume — no restamp). Driven
+ *    here (app-lifetime subscription) so it fires even with no SankeyView mounted (a `reset()` may
+ *    land between route mounts).
+ */
+function fold(eng: FoldEngine): void {
+  const s = dashboardStore.getState();
+
+  const teardownEdge = isTeardown(s.connection) && !isTeardown(eng.lastConnection);
+  eng.lastConnection = s.connection;
+  if (teardownEdge) {
+    const had = eng.deltas.length > 0 || eng.baselines.size > 0;
+    eng.baselines = new Map();
+    eng.deltas = [];
+    // Re-baseline against the post-teardown flows on the next change (force the scan past the MED
+    // reference check). The flows after a `reset()` are empty, but a fresh snapshot may land them in
+    // the SAME teardown state (`idle`) before the flip to `live` — folding resumes on the next frame.
+    eng.lastFlows = null;
+    if (had) emit(eng);
+  }
+
+  // While SEEKING the store holds the FROZEN cut (not live increments) — never fold it (D11 R5).
+  if (s.connection === 'seeking') return;
+
+  // MED fix: skip the whole scan when `flows` did not change reference (no flow grew this frame).
+  if (s.flows === eng.lastFlows) return;
+  eng.lastFlows = s.flows;
+
+  const ts = eng.now();
+  const baselines = eng.baselines;
+  let folded = false;
+  for (const f of s.flows.values()) {
+    const u = f.usage;
+    if (!u) continue;
+    const model = f.model_served ?? f.model_requested;
+    if (!model) continue;
+    const prev = baselines.get(f.api_call_id);
+    // Diff against the prior cumulative snapshot; a brand-new flow's first observation IS its delta
+    // (prev = 0s). A non-increasing total (no growth) records nothing — so a historical cumulative
+    // total already captured in the baseline (after a remount/seek-resume) emits NOTHING, never a
+    // fresh `now()`-stamped band.
+    const dTotal = u.total - (prev?.total ?? 0);
+    if (dTotal > 0) {
+      eng.deltas.push({
+        ts,
+        upstream: f.upstream_target ?? null,
+        model,
+        prompt: Math.max(0, u.prompt - (prev?.prompt ?? 0)),
+        cached: Math.max(0, u.cached - (prev?.cached ?? 0)),
+        completion: Math.max(0, u.completion - (prev?.completion ?? 0)),
+        total: dTotal,
+      });
+      folded = true;
+    }
+    // Always advance the baseline to the latest cumulative (even on a non-positive diff, e.g. a
+    // corrected/reset total) so the NEXT diff is against the current truth.
+    baselines.set(f.api_call_id, { prompt: u.prompt, cached: u.cached, completion: u.completion, total: u.total });
+  }
+
+  const pruned = pruneRing(eng, ts);
+  if (folded || pruned) emit(eng);
+}
+
+/**
+ * Install the app-lifetime fold engine (idempotent). Call ONCE from the composition root at bootstrap
+ * so folding runs from app start regardless of which view is mounted. Subsequent calls are no-ops
+ * (the first install wins) so a defensive call from the hook never replaces the running engine or
+ * its accumulated state.
+ *
+ * @param windowMs the rolling-window retention; entries older than `now - windowMs` are pruned.
  * @param now injectable clock (tests); defaults to `Date.now`.
  */
+export function startSankeyFold(windowMs = DEFAULT_WINDOW_MS, now: () => number = Date.now): void {
+  if (engine) return;
+  const eng: FoldEngine = {
+    baselines: new Map(),
+    deltas: [],
+    lastFlows: null,
+    lastConnection: dashboardStore.getState().connection as string,
+    retentionMs: windowMs,
+    now,
+    listeners: new Set(),
+    unsubscribe: null,
+  };
+  engine = eng;
+  // Fold the current state immediately, then on EVERY store change (no increment lost to batching).
+  fold(eng);
+  eng.unsubscribe = dashboardStore.subscribe(() => fold(eng));
+}
+
+const EMPTY: SankeyUsageDelta[] = [];
+
+/**
+ * Read the live windowed ring, time-pruned to NOW first. Pruning on read (not only on fold) keeps the
+ * ring accurate when it is read BETWEEN store frames — e.g. a SankeyView remount after a long idle,
+ * where deltas aged past the window since the last fold but no frame has arrived to prune them. The
+ * engine's own clock bounds the window so the read agrees with the fold path.
+ */
+function readSankeyDeltas(): SankeyUsageDelta[] {
+  if (!engine) return EMPTY;
+  pruneRing(engine, engine.now());
+  return engine.deltas;
+}
+
+/**
+ * Tear down + forget the fold engine (TEST ONLY). Production never calls this — the engine is an
+ * app-lifetime global. Tests use it to restart the engine with an injected clock between cases.
+ */
+export function __resetSankeyFold(): void {
+  if (engine?.unsubscribe) engine.unsubscribe();
+  engine = null;
+}
+
+/**
+ * READ the app-lifetime windowed delta ring for the Sankey. This hook NO LONGER folds — folding is
+ * the app-lifetime engine's job (`startSankeyFold`, installed at bootstrap). The hook ensures the
+ * engine is running (idempotent safety net), subscribes for ring-change notifications, and returns
+ * the ref-held ring + a `version` that bumps on each change so the consumer re-renders to read it.
+ *
+ * @param windowMs the rolling window; forwarded to the engine's retention on first install only.
+ * @param now injectable clock (tests); forwarded to the engine on first install only.
+ */
 export function useSankeyWindow(windowMs = DEFAULT_WINDOW_MS, now: () => number = Date.now): SankeyWindow {
-  const deltasRef = useRef<SankeyUsageDelta[]>(collector.deltas);
+  // Defensive: in production the composition root has already started the engine; this no-ops then.
+  // It only installs if some entry path mounted the view without bootstrapping (keeps the view robust).
+  startSankeyFold(windowMs, now);
+
+  const deltasRef = useRef<SankeyUsageDelta[]>(readSankeyDeltas());
   const [version, setVersion] = useState(0);
 
-  // Fold the store's current `flows` into timestamped deltas using the MODULE collector. SKIP while
-  // `seeking` (the store holds the FROZEN cut, not live increments — D11 R5). Teardown clearing is
-  // handled by the module subscription above, NOT here, so a remount/seek-resume preserves the
-  // baselines and an unchanged cumulative total diffs to 0 (no restamp at Date.now()).
-  const consume = useRef(() => {
-    const s = dashboardStore.getState();
-    // Keep the public ref pointed at the (possibly just-cleared) singleton ring before any early
-    // return, so a teardown that emptied the ring is reflected even when there is nothing to fold.
-    if (deltasRef.current !== collector.deltas) {
-      deltasRef.current = collector.deltas;
-      setVersion((n) => n + 1);
-    }
-    if (s.connection === 'seeking') return;
-
-    const ts = now();
-    const baselines = collector.baselines;
-    let folded = false;
-    for (const f of s.flows.values()) {
-      const u = f.usage;
-      if (!u) continue;
-      const model = f.model_served ?? f.model_requested;
-      if (!model) continue;
-      const prev = baselines.get(f.api_call_id);
-      // Diff against the prior cumulative snapshot; a brand-new flow's first observation IS its
-      // delta (prev = 0s). A non-increasing total (no growth) records nothing — so a historical
-      // cumulative total already captured in the baseline (after a remount/seek-resume) emits
-      // NOTHING, never a fresh Date.now()-stamped band.
-      const dTotal = u.total - (prev?.total ?? 0);
-      if (dTotal > 0) {
-        collector.deltas.push({
-          ts,
-          upstream: f.upstream_target ?? null,
-          model,
-          prompt: Math.max(0, u.prompt - (prev?.prompt ?? 0)),
-          cached: Math.max(0, u.cached - (prev?.cached ?? 0)),
-          completion: Math.max(0, u.completion - (prev?.completion ?? 0)),
-          total: dTotal,
-        });
-        folded = true;
-      }
-      // Always advance the baseline to the latest cumulative (even on a non-positive diff, e.g. a
-      // corrected/reset total) so the NEXT diff is against the current truth.
-      baselines.set(f.api_call_id, { prompt: u.prompt, cached: u.cached, completion: u.completion, total: u.total });
-    }
-
-    // Prune by time (primary bound) + a hard cap (defensive against a pathological burst).
-    const cutoff = ts - windowMs;
-    let pruned = collector.deltas.filter((d) => d.ts >= cutoff);
-    if (pruned.length > MAX_DELTAS) pruned = pruned.slice(pruned.length - MAX_DELTAS);
-    const changed = folded || pruned.length !== collector.deltas.length;
-    collector.deltas = pruned;
-    deltasRef.current = collector.deltas;
-    if (changed) setVersion((n) => n + 1);
-  }).current;
-
-  // Fold the current state immediately, then on EVERY store change (no increment lost to batching).
   useEffect(() => {
-    consume();
-    return dashboardStore.subscribe(consume);
-  }, [consume]);
+    // Re-read (time-pruned) + re-render once on mount — the engine may have folded (or deltas may
+    // have aged out) while this view was unmounted — then on every subsequent ring change.
+    const sync = () => {
+      deltasRef.current = readSankeyDeltas();
+      setVersion((n) => n + 1);
+    };
+    sync();
+    if (!engine) return;
+    const eng = engine;
+    eng.listeners.add(sync);
+    return () => {
+      eng.listeners.delete(sync);
+    };
+  }, []);
 
   return { version, deltasRef };
 }

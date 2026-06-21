@@ -15,6 +15,7 @@ import { mockFetch, mockWsFactory } from './mock';
 import { isMockEnabled, readBootstrap } from '../config/env';
 import { authStore } from '../store/authStore';
 import { dashboardStore } from '../store/dashboardStore';
+import { startSankeyFold, __resetSankeyFold } from '../store/useSankeyWindow';
 import type { Domain } from './types';
 
 /** Stable query keys; the WS invalidation + the views both reference these. */
@@ -89,6 +90,13 @@ export function getConnection(): Connection {
     probeAuth: () => client.probeAuth(),
   });
 
+  // Start the APP-LIFETIME Sankey fold engine from the composition root (D12 R3): it subscribes to
+  // the store directly and folds each flow's usage GROWTH into a timestamped delta as frames arrive,
+  // stamping every delta at its REAL arrival time regardless of which view is mounted. The SankeyView
+  // only READS the maintained ring — so usage that grew while the Sankey was unmounted is recorded at
+  // its real arrival time and correctly ages out of the 30 s window, never lumped in at remount.
+  startSankeyFold();
+
   singleton = { client, socket, queryClient, mock };
   return singleton;
 }
@@ -127,8 +135,11 @@ function invalidateForDomain(queryClient: QueryClient, domain: Domain): void {
   }
 }
 
-/** Test/HMR reset of the singleton. */
+/** Test/HMR reset of the singleton (also stops the app-lifetime Sankey fold engine it started). */
 export function resetConnection(): void {
   singleton?.socket.disconnect();
   singleton = null;
+  // Pair the engine teardown with the singleton reset so a fresh `getConnection()` re-starts it
+  // (HMR) and tests don't leak a running fold subscription / accumulated ring across cases.
+  __resetSankeyFold();
 }

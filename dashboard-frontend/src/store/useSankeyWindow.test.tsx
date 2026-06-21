@@ -5,7 +5,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, cleanup } from '@testing-library/react';
-import { useSankeyWindow } from './useSankeyWindow';
+import { useSankeyWindow, startSankeyFold, __resetSankeyFold } from './useSankeyWindow';
 import { dashboardStore } from './dashboardStore';
 import type { FlowSummary, Usage } from '../api/types';
 
@@ -25,12 +25,18 @@ function clockAt(ref: { now: number }): () => number {
 }
 
 beforeEach(() => {
+  // Drop the app-lifetime fold engine so each case re-installs it with its own injected clock and a
+  // fresh ring/baselines (the engine is module-global and survives across tests otherwise).
+  __resetSankeyFold();
   dashboardStore.getState().reset();
   // Start LIVE so the accumulator folds (it skips while seeking).
   dashboardStore.getState().setConnection('live');
   cleanup();
 });
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  __resetSankeyFold();
+});
 
 describe('useSankeyWindow — timestamped deltas, not cumulative totals (finding 2)', () => {
   it("a flow's first observation contributes its cumulative as ONE delta; a repeat with no growth adds nothing", () => {
@@ -157,7 +163,7 @@ describe('useSankeyWindow — timestamped deltas, not cumulative totals (finding
     expect(result.current.deltasRef.current.map((d) => d.total)).toEqual([500, 150]);
   });
 
-  it('resets baselines + ring on a connEpoch change (fresh session never diffs a stale total)', () => {
+  it('resets baselines + ring on a teardown (reset → idle) so a fresh session never diffs a stale total', () => {
     const ref = { now: 1000 };
     act(() => {
       dashboardStore.getState().upsertFlow(flow({ api_call_id: 'a', usage: usage({ prompt: 100, total: 100 }) }));
@@ -165,9 +171,9 @@ describe('useSankeyWindow — timestamped deltas, not cumulative totals (finding
     const { result } = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
     expect(result.current.deltasRef.current).toHaveLength(1);
 
-    // A teardown/reset crosses a boundary (epoch bump). A subsequent fresh snapshot with the SAME
-    // api_call_id at a LOWER cumulative must be treated as a new flow (delta = its full total), not
-    // a negative diff against the pre-reset baseline.
+    // `reset()` enters the `idle` teardown state (continuity broken). A subsequent fresh snapshot with
+    // the SAME api_call_id at a LOWER cumulative must be treated as a new flow (delta = its full
+    // total), not a negative diff against the pre-reset baseline.
     act(() => {
       dashboardStore.getState().reset();
       dashboardStore.getState().applySnapshot({
@@ -179,5 +185,71 @@ describe('useSankeyWindow — timestamped deltas, not cumulative totals (finding
     });
     const totals = result.current.deltasRef.current.map((d) => d.total);
     expect(totals).toEqual([30]);
+  });
+});
+
+describe('useSankeyWindow — APP-LIFETIME fold, not mount-scoped (D12 R3)', () => {
+  it('folds usage growth that happens WHILE NO SankeyView is mounted, stamped at its REAL arrival time', () => {
+    const ref = { now: 1000 };
+    // The app-lifetime engine starts at bootstrap — NOT on SankeyView mount. Start it with no view.
+    startSankeyFold(30_000, clockAt(ref));
+    act(() => {
+      dashboardStore.getState().upsertFlow(flow({ api_call_id: 'a', usage: usage({ prompt: 100, total: 100 }) }));
+    });
+
+    // Usage GROWS while the Sankey is unmounted; the delta must be stamped NOW (ts=5000), the real
+    // arrival instant — not deferred to a later remount.
+    ref.now = 5000;
+    act(() => {
+      dashboardStore.getState().patchUsage('a', usage({ prompt: 400, total: 400 }));
+    });
+
+    // Mount the view only AFTER the growth already happened. It READS the maintained ring; it must NOT
+    // restamp the +300 increment at the mount instant.
+    ref.now = 9000;
+    const { result } = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
+    const deltas = result.current.deltasRef.current;
+    expect(deltas.map((d) => d.total)).toEqual([100, 300]);
+    // The growth delta carries its REAL arrival time (5000), not the 9000 remount instant.
+    expect(deltas[1]!.ts).toBe(5000);
+  });
+
+  it('growth that happened while unmounted is AGED OUT by the 30s window at remount (real arrival time, not restamped)', () => {
+    const ref = { now: 1000 };
+    startSankeyFold(30_000, clockAt(ref));
+    act(() => {
+      dashboardStore.getState().upsertFlow(flow({ api_call_id: 'a', usage: usage({ prompt: 100, total: 100 }) }));
+    });
+    // A burst of growth lands at ts=2000 while no view is mounted.
+    ref.now = 2000;
+    act(() => {
+      dashboardStore.getState().patchUsage('a', usage({ prompt: 900, total: 900 }));
+    });
+
+    // 40s pass with the Sankey still unmounted; both deltas (ts=1000, ts=2000) are now older than 30s.
+    ref.now = 2000 + 40_000;
+    const { result } = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
+    // Read-time pruning ages them out by their REAL timestamps — NOT lumped into the window at the
+    // remount instant (which is exactly the mount-scoped bug this fix removes).
+    expect(result.current.deltasRef.current).toEqual([]);
+  });
+
+  it('a later mounted reader sees deltas the engine folded before any reader subscribed', () => {
+    const ref = { now: 1000 };
+    startSankeyFold(30_000, clockAt(ref));
+    // Two distinct growth events arrive (still no reader): the engine folds both at their arrival times.
+    act(() => {
+      dashboardStore.getState().upsertFlow(flow({ api_call_id: 'a', usage: usage({ prompt: 50, total: 50 }) }));
+    });
+    ref.now = 3000;
+    act(() => {
+      dashboardStore.getState().patchUsage('a', usage({ prompt: 50, completion: 70, total: 120 }));
+    });
+
+    ref.now = 4000;
+    const { result } = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
+    const deltas = result.current.deltasRef.current;
+    expect(deltas.map((d) => d.total)).toEqual([50, 70]);
+    expect(deltas.map((d) => d.ts)).toEqual([1000, 3000]);
   });
 });
