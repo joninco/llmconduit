@@ -1852,6 +1852,40 @@ fn authed_router(
     (router, auth)
 }
 
+/// Like [`authed_router`] but ALSO returns the `Arc<Gateway>` so a D7b test can drive a
+/// real flow (advancing the monitor sequence + the FlowStore independently) and then read
+/// `debug_snapshot().last_sequence` / `flow_store().flow_seq()` to assert the live
+/// `/dashboard/ws` snapshot sources its flow-domain dedup cursor from the MONITOR
+/// sequence (D7b R4 finding 1), not the FlowStore `flow_seq`. The SAME `Arc<Gateway>` is
+/// shared with the router, so a flow driven through the returned handle is visible to the
+/// socket the router serves.
+fn authed_router_with_gateway(
+    bind: std::net::SocketAddr,
+    env: &llmconduit::dashboard_auth::DashboardEnv,
+) -> (
+    axum::Router,
+    Arc<llmconduit::dashboard_auth::DashboardAuth>,
+    Arc<Gateway>,
+) {
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(bind, env)
+        .expect("auth builds")
+        .auth;
+    let gateway = Arc::new(
+        test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default())
+            .as_ref()
+            .clone()
+            .with_dashboard_auth(Some(Arc::clone(&auth))),
+    );
+    let router = llmconduit::http::build_router(
+        Arc::clone(&gateway),
+        llmconduit::http::RouterOptions {
+            with_debug_ui: true,
+            register_protected_routes: true,
+        },
+    );
+    (router, auth, gateway)
+}
+
 fn assert_security_headers(headers: &axum::http::HeaderMap) {
     assert_eq!(
         headers
@@ -2517,6 +2551,59 @@ async fn dashboard_ws_sends_initial_snapshot_frame() {
     assert!(value["cursors"]["metrics_seq"].is_u64());
 
     drop(stream);
+    server.abort();
+}
+
+/// D7b R4 finding 1 (end-to-end): the live `/dashboard/ws` snapshot sources its
+/// flow-domain dedup cursor from the MONITOR's `last_sequence` (captured atomically with
+/// the transcript), NOT the FlowStore `flow_seq`. Drive a real flow so the monitor
+/// sequence advances (the engine emits RequestUpsert/segments/status/usage), then connect
+/// and assert the snapshot's `cursors.flow_seq` equals `debug_snapshot().last_sequence`.
+/// The flow-domain live frames are stamped with this same monitor clock, so a flow frame
+/// with `seq > last_sequence` applies and one already reflected is deduped — the whole
+/// point of the fix (a delayed monitor update can no longer inherit a newer FlowStore
+/// `record_seq` and dedup-drop the final flow frame).
+#[tokio::test]
+async fn dashboard_ws_snapshot_flow_cursor_is_monitor_last_sequence() {
+    let (app, auth, gateway) =
+        authed_router_with_gateway("0.0.0.0:4000".parse().unwrap(), &authed_env());
+
+    // Drive one real flow through the engine so the monitor sequence advances well past 0
+    // (each engine emit bumps `last_sequence`) and a flow record is opened + finalized.
+    let api_call_id = d3_open_flow(&gateway);
+    let request = base_request(vec![user_message("hi")]);
+    let stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+    let _events = collect_stream(stream).await;
+    let _record = d3_await_terminal(&gateway, &api_call_id).await;
+
+    // Read the monitor sequence the snapshot must source its flow cursor from. The flow
+    // had real activity, so this is strictly > 0.
+    let monitor_last_seq = gateway.debug_snapshot().last_sequence;
+    assert!(
+        monitor_last_seq > 0,
+        "the driven flow advanced the monitor sequence past 0"
+    );
+
+    let (cookie, _exp) = auth.issue_session();
+    let (mut socket, server) = ws_connect(app, &cookie, "https://dash.example.com").await;
+    let (opcode, payload) = ws_read_frame(&mut socket).await;
+    assert_eq!(opcode, 0x1, "the first dashboard frame is a text message");
+    let value: serde_json::Value = serde_json::from_slice(&payload).expect("snapshot is JSON");
+    assert_eq!(value["type"], serde_json::json!("snapshot"));
+
+    // The crux: the snapshot's flow-domain dedup baseline is the MONITOR's last_sequence
+    // (the monitor clock the live flow frames are stamped with) — NOT the FlowStore seq.
+    assert_eq!(
+        value["cursors"]["flow_seq"].as_u64(),
+        Some(monitor_last_seq),
+        "the snapshot flow cursor MUST be the monitor's last_sequence (D7b R4 finding 1)"
+    );
+
+    drop(socket);
     server.abort();
 }
 

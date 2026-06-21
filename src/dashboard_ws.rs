@@ -371,24 +371,28 @@ pub struct TopologyEdge {
 /// `flow_store`). So a `DebugUpdate` still becomes ONE Monitor frame containing all
 /// its siblings, PLUS any additive flow-domain enrichment frame.
 ///
-/// ## Event-time flow seq + per-record coalescing (D7b R1 finding 3, hardened R3)
-/// The flow frame is stamped with the FlowStore mutation `seq` read ATOMICALLY with
-/// the record (`detail_with_seq`), coalesced to the MAX across the resolved records
-/// — never a separately-read send-time `flow_seq()`. A queued/replayed older update
-/// would otherwise pick up a newer global cursor (bumped by unrelated flows in the
-/// gap) and dedup-drop a genuinely newer flow frame on the client.
+/// ## Monitor-sequence flow seq — NOT the FlowStore `record_seq` (D7b R4 finding 1)
+/// The flow enrichment frame is stamped with the ORIGINATING `update.sequence` — the
+/// monitor's MONOTONIC, event-ordered broadcast cursor — NOT the FlowStore
+/// `record_seq` read at socket-drain time. The `record_seq` is the WRONG clock for
+/// these monitor-derived live frames: it is read when the update is DRAINED off the
+/// broadcast channel, which RACES the async engine mutation, so a delayed/older
+/// monitor update can read a `record_seq` already bumped by a LATER mutation —
+/// inheriting a final seq and dedup-dropping the genuinely final flow frame. Because
+/// the monitor broadcast is strictly ordered, an OLDER update carries a SMALLER
+/// `update.sequence` than a NEWER one, so the flow frame seqs are monotonic with the
+/// event order: no leapfrog, no dropped final frame. The flow frame and the monitor
+/// frame for one update therefore share `update.sequence` (in their own domains).
 ///
-/// R3 (event-time capture, no same-record leapfrog): the `{record COW snapshot,
-/// record_seq}` pair for a record is read EXACTLY ONCE — AFTER the message walk —
-/// and BOTH that record's `usage` and `flow_status` enrichment payloads are built
-/// from that ONE snapshot. So two payloads for one record never carry data from two
-/// different mutation snapshots while sharing a seq, and an OLDER event in the batch
-/// can never inherit a LATER same-record mutation seq read at a different instant.
-/// Multiple events for the SAME record (a `Usage` AND a `RequestStatus`, or repeats)
-/// COALESCE onto that single snapshot, carrying the record's LATEST state at its
-/// current `record_seq`. The monitor token values still ride the per-record `usage`
-/// payload (the record's cumulative `usage` is set on a separate seam), keeping the
-/// enrichment additive over what the monitor reported.
+/// ## Per-record coalescing + alias MERGE (D7b R3/R4 finding 2)
+/// Each `response_id` resolves to its FlowStore [`FlowRecord`] (recovering the
+/// authoritative `api_call_id`). Multiple `response_id`s can ALIAS to ONE record
+/// (one `api_call_id`); their intents are MERGED by `api_call_id` (latest `Usage`
+/// wins, latest `RequestStatus` wins) so the SECOND alias's usage/status is NEVER
+/// discarded — both fold onto ONE flow frame built from a SINGLE record snapshot
+/// (carrying that record's LATEST `usage`/status/timing). The monitor token values
+/// still ride the per-record `usage` payload, keeping the enrichment additive over
+/// what the monitor reported.
 ///
 /// Returns the frames in batch order: the flow enrichment frame (when any) followed
 /// by the single monitor frame (always, when the update has any messages).
@@ -443,27 +447,18 @@ pub fn frames_for_update(
         }
     }
 
-    // Resolve each intent to its record ONCE (R3: one atomic `{record, seq}` read per
-    // response_id) and build that record's payloads from the single snapshot. Coalesce
-    // by the RESOLVED record identity so two response_ids mapping to one record do not
-    // double-emit or stamp two seqs — the second occurrence folds onto the first.
+    // Resolve each intent's `response_id` to its FlowStore record, then MERGE intents
+    // that ALIAS to the SAME record (one `api_call_id`) so two `response_id`s mapping to
+    // one record do NOT discard the second's usage/status (D7b R4 finding 2): the latest
+    // `Usage` + latest `RequestStatus` across all aliases fold onto ONE merged entry, and
+    // the frame is built from a SINGLE record snapshot (the first resolved per record).
+    let merged = merge_intents_by_record(&intents, flow_store);
     let mut flow_batch: Vec<DashboardPayload> = Vec::new();
-    let mut flow_seq: Option<u64> = None;
-    let mut seen_records: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for intent in &intents {
-        let Some((record, seq)) = flow_store.detail_with_seq(&intent.response_id) else {
-            continue;
-        };
-        // Coalesce by the authoritative record key: a record already enriched (via an
-        // earlier response_id that resolved to it) is not emitted twice.
-        if !seen_records.insert(record.api_call_id.clone()) {
-            continue;
-        }
-        flow_seq = Some(flow_seq.map_or(seq, |cur| cur.max(seq)));
-        if let Some(tokens) = intent.usage {
+    for merged in &merged {
+        if let Some(tokens) = merged.usage {
             flow_batch.push(DashboardPayload::Usage {
-                api_call_id: record.api_call_id.clone(),
-                response_id: Some(intent.response_id.clone()),
+                api_call_id: merged.record.api_call_id.clone(),
+                response_id: Some(merged.response_id.clone()),
                 prompt: tokens.prompt,
                 completion: tokens.completion,
                 total: tokens.total,
@@ -471,19 +466,21 @@ pub fn frames_for_update(
                 reasoning: tokens.reasoning,
             });
         }
-        if let Some(completed_at_ms) = intent.status_completed_at_ms {
-            flow_batch.push(flow_status_payload(&record, completed_at_ms));
+        if let Some(completed_at_ms) = merged.status_completed_at_ms {
+            flow_batch.push(flow_status_payload(&merged.record, completed_at_ms));
         }
     }
 
     let mut frames = Vec::new();
-    if let Some(seq) = flow_seq {
-        // Stamp with the event-time FlowStore seq (finding 3), not a send-time
-        // global `flow_seq()`. Per-domain dedup is the client's job; the server
-        // just stamps the correct `{domain, seq}`.
+    if !flow_batch.is_empty() {
+        // Stamp with the ORIGINATING monitor `update.sequence` (D7b R4 finding 1) — the
+        // strictly-ordered broadcast cursor — NOT a FlowStore `record_seq` read at drain
+        // time (which races the async engine mutation and can inherit a LATER mutation's
+        // seq, dedup-dropping the final frame). Per-domain dedup is the client's job; the
+        // server just stamps the correct `{domain, seq}`.
         frames.push(DashboardFrame {
             domain: Domain::Flow,
-            seq,
+            seq: update.sequence,
             batch: flow_batch,
         });
     }
@@ -509,9 +506,9 @@ struct UsageTokens {
 }
 
 /// A pending flow-domain enrichment for ONE `response_id`, accumulated across the
-/// messages of a single `DebugUpdate` BEFORE the record is read (R3). Both arms
-/// COALESCE onto the same intent so the record is resolved exactly once and its
-/// `usage` + `flow_status` payloads share one `{record, seq}` snapshot.
+/// messages of a single `DebugUpdate` BEFORE the record is resolved. Both arms
+/// COALESCE onto the same intent so repeated messages for one `response_id` fold
+/// together; aliasing `response_id`s are then merged by `api_call_id` downstream.
 #[derive(Debug, Clone)]
 struct FlowEnrichIntent {
     response_id: String,
@@ -539,6 +536,66 @@ fn intent_for<'a>(
         intents.len() - 1
     });
     &mut intents[pos]
+}
+
+/// One flow-domain enrichment after per-`response_id` intents have been RESOLVED and
+/// MERGED by the authoritative `api_call_id` (D7b R4 finding 2). All `response_id`s
+/// that alias to the same record fold into ONE of these, carrying the latest `Usage`
+/// and the latest `RequestStatus` stamp seen across the aliases, so neither alias's
+/// payload is lost and the frame is built from the ONE retained `record` snapshot.
+struct MergedRecordIntent {
+    /// The single FlowStore record snapshot all aliases resolved to (the first
+    /// resolution per `api_call_id`). The `usage`/`flow_status` payloads are built
+    /// from THIS one snapshot, so they never mix two reads of the record.
+    record: Arc<FlowRecord>,
+    /// The first-seen `response_id` for this record — carried as the `usage` payload's
+    /// optional secondary correlation (the authoritative key is `record.api_call_id`).
+    response_id: String,
+    /// Latest monitor `Usage` token counts across all aliasing `response_id`s.
+    usage: Option<UsageTokens>,
+    /// Latest monitor `RequestStatus` completion stamp across all aliases (the inner
+    /// `Option` is the message's own `completed_at_ms`, which may be `None`).
+    status_completed_at_ms: Option<Option<u128>>,
+}
+
+/// Resolve each per-`response_id` [`FlowEnrichIntent`] to its FlowStore record and MERGE
+/// the intents that alias to the SAME record (one `api_call_id`) into one
+/// [`MergedRecordIntent`] each (D7b R4 finding 2). Two `response_id`s for one record no
+/// longer DISCARD the second alias's usage/status — the latest `Usage` + latest
+/// `RequestStatus` across the aliases fold onto the single merged entry, and the entry
+/// retains the FIRST record snapshot so each record's frame is built from ONE snapshot.
+/// First-seen `api_call_id` order is preserved. An intent whose `response_id` no longer
+/// resolves (record pruned/evicted, or store disabled) is skipped, exactly as before —
+/// the message still rode the monitor batch, so no transcript data is lost.
+fn merge_intents_by_record(
+    intents: &[FlowEnrichIntent],
+    flow_store: &DashboardFlowStore,
+) -> Vec<MergedRecordIntent> {
+    let mut merged: Vec<MergedRecordIntent> = Vec::new();
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for intent in intents {
+        let Some(record) = flow_store.detail(&intent.response_id) else {
+            continue;
+        };
+        let slot = *index.entry(record.api_call_id.clone()).or_insert_with(|| {
+            merged.push(MergedRecordIntent {
+                record: Arc::clone(&record),
+                response_id: intent.response_id.clone(),
+                usage: None,
+                status_completed_at_ms: None,
+            });
+            merged.len() - 1
+        });
+        let entry = &mut merged[slot];
+        // Latest non-empty wins across aliases (intents are in first-seen message order).
+        if intent.usage.is_some() {
+            entry.usage = intent.usage;
+        }
+        if intent.status_completed_at_ms.is_some() {
+            entry.status_completed_at_ms = intent.status_completed_at_ms;
+        }
+    }
+    merged
 }
 
 /// Build a flow-domain `FlowStatus` payload from the authoritative FlowStore
@@ -715,8 +772,11 @@ fn topology_snapshot(snapshot: &ProviderHealthSnapshot) -> TopologySnapshot {
 /// MUST send FIRST (D7b R1 finding 1) — before any live [`DashboardFrame`]. The SPA
 /// buffers every frame until this lands, so it seeds the whole baseline atomically:
 /// the four per-domain cursors, the body-free flow rows, and the metrics/topology
-/// cuts. The cursors come from the SAME reads that built `flows`/`metrics`/
-/// `topology` so the client's dedup baseline matches the seeded rows.
+/// cuts. The metrics/topology cursors come from the SAME reads that built those bodies;
+/// the `flow_seq` cursor is the MONITOR's atomically-captured `last_sequence` (D7b R4
+/// finding 1) — live flow frames are stamped with the monitor `update.sequence`, so the
+/// flow + monitor domains dedup against the SAME monotonic clock (the flow `flows` body
+/// still comes from the FlowStore).
 fn snapshot_message(
     flows: Vec<crate::dashboard_flow::SnapshotFlowSummary>,
     flow_seq: u64,
@@ -807,32 +867,46 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // 0: the snapshot body carries NO transcript, so the retained-transcript replay
     // below (seq = `last_sequence`) is ACCEPTED, seeding the inspector history.
     //
-    // (finding 2) Each domain's body + its dedup cursor are captured ATOMICALLY (one
-    // lock hold per store), so the snapshot never pairs an older body with a newer
+    // (D7b R2 finding 2) Each domain's body + its dedup cursor are captured ATOMICALLY
+    // (one lock hold per store), so the snapshot never pairs an older body with a newer
     // cursor — which would permanently dedup-drop that mutation's own live frame:
     //  - metrics:  `view_with_seq()`         (view + metrics_seq under one metrics lock)
-    //  - flows:    `snapshot_summaries_with_seq()` (summaries + flow_seq under one lock)
+    //  - flows:    `snapshot_summaries_with_seq()` (the body-free flow SUMMARIES under
+    //              one FlowStore lock — its FlowStore `seq` is NOT the WS flow cursor).
     //  - topology: ONE `latest()` read       (the `version` lives INSIDE the snapshot)
+    //
+    // (D7b R4 finding 1) The flow-domain DEDUP cursor is the MONITOR's `last_sequence`
+    // captured ATOMICALLY with the transcript inside `debug_snapshot()` — NOT the
+    // FlowStore `record_seq`/`flow_seq`. Live flow enrichment frames are stamped with the
+    // originating monitor `update.sequence` (strictly ordered), so a live flow frame with
+    // `seq > last_sequence` applies and one already reflected (`seq <= last_sequence`) is
+    // deduped. This keeps the flow + monitor domains on the SAME monitor clock, so a
+    // delayed monitor update can never inherit a newer FlowStore mutation seq and
+    // dedup-drop the final flow frame. The flow SUMMARIES still come from the FlowStore.
     let (metrics_view, metrics_seq) = gateway.metrics().view_with_seq();
     let mut last_metrics_seq = metrics_seq;
     let metrics = Some(metrics_snapshot(&metrics_view, metrics_seq));
     let topo = gateway.provider_health_publisher().latest();
     let mut last_topology_version = topo.version;
     let topology = Some(topology_snapshot(&topo));
-    let (flow_summaries, flow_seq) = flow_store.snapshot_summaries_with_seq();
+    // Body-free flow summaries from the FlowStore; the FlowStore `seq` is discarded — the
+    // flow-domain WS dedup cursor is the monitor's `last_sequence` (finding 1), captured
+    // atomically with the transcript below.
+    let (flow_summaries, _flow_store_seq) = flow_store.snapshot_summaries_with_seq();
     let initial = snapshot_message(
         flow_summaries,
-        flow_seq,
+        // Flow dedup baseline = the monitor's atomically-captured sequence (finding 1).
+        snapshot.last_sequence,
         metrics,
         topology,
         // monitor baseline 0 — the transcript rides the replay frame below.
         0,
     );
-    // Replay the retained monitor transcript as ONE batched monitor frame (its
-    // messages share `snapshot.last_sequence`). Enrichment flow frames it emits are
-    // stamped at event-time seqs ≤ the snapshot's `flow_seq`, so the client dedups
-    // them (the snapshot already carries those flows) — only the monitor-domain
-    // transcript frame advances the (snapshot-0) monitor cursor.
+    // Replay the retained monitor transcript as ONE batched monitor frame (its messages
+    // share `snapshot.last_sequence`). The flow enrichment frames it emits are stamped at
+    // `update.sequence == snapshot.last_sequence` == the flow dedup baseline, so the
+    // client dedups them (the snapshot already carries those flows) — only the
+    // monitor-domain transcript frame advances the (snapshot-0) monitor cursor.
     let snapshot_update = DebugUpdate {
         sequence: snapshot.last_sequence,
         messages: snapshot.messages.clone(),
@@ -1384,16 +1458,17 @@ mod tests {
         assert_eq!(*wire_status, serde_json::json!("cancelled"));
     }
 
-    /// D7b R1 finding 3: the flow frame is stamped with the FlowStore seq AS OF THE
-    /// EVENT (read atomically with the record via `detail_with_seq`), NEVER a
-    /// send-time global `flow_seq()`. So a LATER-processed update whose record was
-    /// resolved earlier cannot carry a cursor that leapfrogs — and, crucially, an
-    /// out-of-order replay does not stamp an OLD event with a NEWER cursor that would
-    /// dedup-drop the genuinely newer flow frame on the client.
+    /// D7b R4 finding 1: the flow enrichment frame is stamped with the ORIGINATING
+    /// monitor `update.sequence` — NOT the FlowStore `record_seq` read at socket-drain
+    /// time. The `record_seq` is the wrong clock: it is read when the update is drained,
+    /// which RACES the async engine mutation, so a delayed update could read a seq already
+    /// bumped by a later mutation. Here MANY unrelated flows (and the record itself)
+    /// mutate the store AFTER the update's monitor sequence is fixed, advancing the
+    /// FlowStore `record_seq`/`flow_seq` far past the update's sequence — yet the frame is
+    /// stamped with `update.sequence`, provably independent of the FlowStore counters.
     #[test]
-    fn flow_frame_seq_is_event_time_not_send_time_global() {
+    fn flow_frame_seq_is_originating_monitor_sequence_not_record_seq() {
         let store = DashboardFlowStore::new();
-        // Flow A opened + linked, then finalized → its record's seq is some value Sa.
         store.open(
             "api_a".to_string(),
             "POST".to_string(),
@@ -1402,29 +1477,8 @@ mod tests {
             Some(capture_body(b"{}")),
         );
         store.link("resp_a".to_string(), "api_a".to_string());
-        // Capture the FlowStore seq at which flow A's record is current.
-        let (_record_a, seq_a) = store.detail_with_seq("resp_a").expect("flow A resolves");
 
-        // Now MANY unrelated flows mutate the store, bumping the GLOBAL flow_seq far
-        // past `seq_a` (this models the gap between A's event and its update being
-        // processed off the broadcast channel).
-        for i in 0..10 {
-            let id = format!("api_other_{i}");
-            store.open(
-                id.clone(),
-                "POST".to_string(),
-                "/v1/responses".to_string(),
-                redact_headers(&HeaderMap::new()),
-                Some(capture_body(b"{}")),
-            );
-        }
-        let global_now = store.flow_seq();
-        assert!(
-            global_now > seq_a,
-            "the global cursor advanced past flow A's event seq"
-        );
-
-        // Build the frame for flow A's (now older) status update.
+        // The update's monitor sequence is fixed (the strictly-ordered broadcast cursor).
         let update = DebugUpdate {
             sequence: 3,
             messages: vec![DebugWsMessage::RequestStatus {
@@ -1434,39 +1488,73 @@ mod tests {
                 error: None,
             }],
         };
+
+        // Now the record itself AND many unrelated flows mutate AFTER the monitor sequence
+        // was fixed, driving BOTH the record's own `record_seq` and the global `flow_seq`
+        // far past `update.sequence` (modelling the drain-race: a delayed update read at
+        // this instant would have inherited a much newer FlowStore seq). Several
+        // `record_usage` upserts on `api_a` climb its OWN per-record watermark; the
+        // unrelated opens climb the global cursor.
+        for i in 0..6 {
+            store.record_usage(
+                "api_a",
+                FlowUsage {
+                    prompt: i,
+                    completion: i,
+                    total: 2 * i,
+                    cached: 0,
+                    reasoning: 0,
+                },
+            );
+            store.open(
+                format!("api_other_{i}"),
+                "POST".to_string(),
+                "/v1/responses".to_string(),
+                redact_headers(&HeaderMap::new()),
+                Some(capture_body(b"{}")),
+            );
+        }
+        store.finalize(
+            "api_a",
+            FlowStatus::Completed,
+            Some("done".to_string()),
+            None,
+        );
+        let (_rec, record_seq_now) = store.detail_with_seq("resp_a").expect("flow A resolves");
+        assert!(
+            record_seq_now > update.sequence,
+            "the record's own FlowStore record_seq ({record_seq_now}) advanced past the \
+             update's monitor sequence ({}) — the drain-race the fix neutralizes",
+            update.sequence
+        );
+        assert!(
+            store.flow_seq() > update.sequence,
+            "the global FlowStore cursor also advanced past the update's monitor sequence"
+        );
+
         let frames = frames_for_update(&update, &store);
         let flow = frames
             .iter()
             .find(|f| f.domain == Domain::Flow)
             .expect("flow frame");
-        // The frame's seq is the record's CURRENT event-time seq (read in this build),
-        // NOT a value leapfrogged by the unrelated flows beyond what the record needs.
-        // Re-read the record's seq now to assert exact equality.
-        let (_again, seq_a_now) = store.detail_with_seq("resp_a").expect("flow A resolves");
+        // The crux: the frame carries the ORIGINATING monitor sequence (3), NOT the
+        // drain-time FlowStore `record_seq` (which leapfrogged to `record_seq_now`).
         assert_eq!(
-            flow.seq, seq_a_now,
-            "flow frame seq == flow A's event-time record seq, not the global send-time cursor"
+            flow.seq, update.sequence,
+            "flow frame seq == the originating monitor update.sequence, not the FlowStore record_seq"
         );
-        // It is NOT stamped with the (larger) send-time global flow_seq() — that is
-        // the exact bug: a separate send-time read would over-advance the cursor.
-        assert!(
-            flow.seq <= global_now,
-            "event-time seq never exceeds the global cursor"
+        assert_ne!(
+            flow.seq, record_seq_now,
+            "the frame did NOT inherit the (newer) drain-time FlowStore record_seq"
         );
     }
 
-    /// D7b R3 HIGH: multiple events for the SAME record within one `DebugUpdate`
-    /// (a `Usage` AND a `RequestStatus`) COALESCE onto ONE flow frame whose payloads
-    /// are built from a SINGLE `{record, seq}` snapshot — so an OLDER event in the
-    /// batch can never inherit a LATER same-record mutation seq read at a different
-    /// instant, and the two payloads never carry data from two different snapshots
-    /// while sharing one seq. The frame's seq is the record's CURRENT (latest-mutation)
-    /// `record_seq`, captured once after the message walk. Drive two distinct mutations
-    /// on the record (open+link, then record_usage) so its `record_seq` has advanced,
-    /// then build a frame from an update carrying both a Usage and a RequestStatus for
-    /// that record.
+    /// D7b R4: multiple events for the SAME record within one `DebugUpdate` (a `Usage`
+    /// AND a `RequestStatus`) COALESCE onto ONE flow frame built from a SINGLE record
+    /// snapshot, stamped with the update's monitor sequence. Both enrichment payloads
+    /// ride that one frame keyed by the authoritative `api_call_id`.
     #[test]
-    fn same_record_events_coalesce_to_one_frame_at_current_record_seq() {
+    fn same_record_events_coalesce_to_one_frame_at_update_sequence() {
         let store = DashboardFlowStore::new();
         store.open(
             "api_a".to_string(),
@@ -1476,19 +1564,6 @@ mod tests {
             Some(capture_body(b"{}")),
         );
         store.link("resp_a".to_string(), "api_a".to_string());
-        // A SECOND mutation on the same record advances its record_seq past the open.
-        store.record_usage(
-            "api_a",
-            FlowUsage {
-                prompt: 10,
-                completion: 5,
-                total: 15,
-                cached: 0,
-                reasoning: 0,
-            },
-        );
-        // The record's CURRENT event-time seq — the value the coalesced frame must carry.
-        let (_rec, record_seq_now) = store.detail_with_seq("resp_a").expect("flow A resolves");
 
         // One update carrying BOTH a Usage and a RequestStatus for the SAME record.
         let update = DebugUpdate {
@@ -1520,11 +1595,10 @@ mod tests {
             "same-record events coalesce to ONE frame"
         );
         let flow = flow_frames[0];
-        // Its seq is the record's CURRENT record_seq — NOT leapfrogged, NOT a per-event
-        // re-read that could differ between the Usage and the RequestStatus.
+        // Its seq is the update's monitor sequence — one frame, one seq, both payloads.
         assert_eq!(
-            flow.seq, record_seq_now,
-            "frame seq is the record's current event-time record_seq"
+            flow.seq, update.sequence,
+            "frame seq is the originating monitor update.sequence"
         );
         // Both the usage AND the flow_status enrichment ride that single frame, keyed by
         // the authoritative api_call_id — derived from the one snapshot, sharing one seq.
@@ -1547,14 +1621,87 @@ mod tests {
         );
     }
 
-    /// D7b R3 HIGH (the leapfrog/drop regression): an OLDER queued event for a record
-    /// does NOT inherit a NEWER mutation's seq, and does NOT cause the newer/final frame
-    /// to be dropped. Build the OLDER event's flow frame FIRST (it is stamped at the
-    /// record's seq AT THAT TIME), THEN mutate the record again and build the FINAL
-    /// event's frame: the final frame must carry a STRICTLY GREATER seq, so the client's
-    /// per-domain dedup (`seq <= last_seq` drops) ACCEPTS it rather than dropping it.
+    /// D7b R4 finding 2: when TWO DISTINCT alias ids resolve to ONE record (same
+    /// `api_call_id`), the second alias's payload is MERGED, NOT discarded. One message
+    /// keys off the `api_call_id` itself (`detail` resolves it directly) carrying the
+    /// `Usage`; the other keys off the LINKED `response_id` carrying the `RequestStatus`
+    /// — both resolve to the one record. The merged frame MUST carry BOTH payloads (no
+    /// payload lost), built from a SINGLE record snapshot (one frame). This is the exact
+    /// regression: the old code read the record twice and dropped the second alias's
+    /// payload when its `api_call_id` was already seen.
     #[test]
-    fn older_queued_event_does_not_inherit_newer_seq_or_drop_final_frame() {
+    fn two_aliases_to_one_record_merge_both_payloads_into_one_frame() {
+        let store = DashboardFlowStore::new();
+        store.open(
+            "api_a".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            redact_headers(&HeaderMap::new()),
+            Some(capture_body(b"{}")),
+        );
+        // `resp_1` links to `api_a`. Now BOTH `"api_a"` (the id itself) and `"resp_1"`
+        // (the linked response_id) resolve to the SAME record — two DISTINCT alias ids.
+        store.link("resp_1".to_string(), "api_a".to_string());
+
+        let update = DebugUpdate {
+            sequence: 7,
+            messages: vec![
+                // Alias #1: keyed by the api_call_id itself — carries the Usage.
+                DebugWsMessage::Usage {
+                    response_id: "api_a".to_string(),
+                    prompt: 1,
+                    completion: 2,
+                    total: 3,
+                    cached: 0,
+                    reasoning: 0,
+                },
+                // Alias #2: keyed by the linked response_id — carries the RequestStatus.
+                DebugWsMessage::RequestStatus {
+                    response_id: "resp_1".to_string(),
+                    status: DebugRequestStatus::Completed,
+                    completed_at_ms: Some(42),
+                    error: None,
+                },
+            ],
+        };
+        let frames = frames_for_update(&update, &store);
+        let flow_frames: Vec<&DashboardFrame> =
+            frames.iter().filter(|f| f.domain == Domain::Flow).collect();
+        assert_eq!(
+            flow_frames.len(),
+            1,
+            "two aliases to one record → exactly ONE flow frame"
+        );
+        let flow = flow_frames[0];
+        assert_eq!(flow.seq, 7, "stamped with the monitor update.sequence");
+        // BOTH payloads present — the second alias was MERGED, not discarded.
+        assert!(
+            flow.batch
+                .iter()
+                .any(|p| matches!(p, DashboardPayload::Usage { api_call_id, .. } if api_call_id == "api_a")),
+            "the usage payload (alias #1) survives the merge"
+        );
+        assert!(
+            flow.batch
+                .iter()
+                .any(|p| matches!(p, DashboardPayload::FlowStatus { api_call_id, .. } if api_call_id == "api_a")),
+            "the status payload (alias #2) survives the merge — not discarded as a dup record"
+        );
+        assert_eq!(
+            flow.batch.len(),
+            2,
+            "exactly the two merged payloads (usage + flow_status), one record snapshot"
+        );
+    }
+
+    /// D7b R4 finding 1 (the drain-race / leapfrog regression): an OLDER monitor update
+    /// (smaller `sequence`) processed AFTER a later same-record mutation does NOT inherit
+    /// a newer seq, so the FINAL update's frame (larger `sequence`) is strictly newer and
+    /// the client's per-domain dedup (`seq <= last_seq` drops) ACCEPTS it. Because the
+    /// monitor broadcast is strictly ordered, the older update's `sequence` is fixed BELOW
+    /// the newer one regardless of when each is drained or how the FlowStore mutated.
+    #[test]
+    fn older_update_does_not_inherit_newer_seq_or_drop_final_frame() {
         let store = DashboardFlowStore::new();
         store.open(
             "api_a".to_string(),
@@ -1565,7 +1712,7 @@ mod tests {
         );
         store.link("resp_a".to_string(), "api_a".to_string());
 
-        // The OLDER event is built/stamped NOW, at the record's current seq.
+        // The OLDER monitor update (sequence 1).
         let older_update = DebugUpdate {
             sequence: 1,
             messages: vec![DebugWsMessage::Usage {
@@ -1577,21 +1724,24 @@ mod tests {
                 reasoning: 0,
             }],
         };
-        let older_frames = frames_for_update(&older_update, &store);
-        let older_seq = older_frames
-            .iter()
-            .find(|f| f.domain == Domain::Flow)
-            .expect("older flow frame")
-            .seq;
-
-        // The record mutates AGAIN (a newer, genuinely-later flow event) — advancing its
-        // own record_seq strictly past the older-event stamp.
+        // The record mutates AGAIN (a genuinely-later flow event) — driving its FlowStore
+        // record_seq strictly past the older update's monitor sequence. Under the OLD
+        // (record_seq) scheme, draining the older update NOW would inherit this newer seq
+        // and dedup-drop the final frame. Under monitor-sequence stamping it cannot.
         store.finalize(
             "api_a",
             FlowStatus::Completed,
             Some("done".to_string()),
             None,
         );
+        // Drain the OLDER update only NOW (after the later mutation) — the drain-race.
+        let older_seq = frames_for_update(&older_update, &store)
+            .iter()
+            .find(|f| f.domain == Domain::Flow)
+            .expect("older flow frame")
+            .seq;
+
+        // The FINAL monitor update (sequence 2 — strictly after the older one).
         let final_update = DebugUpdate {
             sequence: 2,
             messages: vec![DebugWsMessage::RequestStatus {
@@ -1601,20 +1751,27 @@ mod tests {
                 error: None,
             }],
         };
-        let final_frames = frames_for_update(&final_update, &store);
-        let final_seq = final_frames
+        let final_seq = frames_for_update(&final_update, &store)
             .iter()
             .find(|f| f.domain == Domain::Flow)
             .expect("final flow frame")
             .seq;
 
-        // The crux: the older event did NOT inherit the newer mutation's seq (it was
-        // stamped at the record's THEN-current seq), so the final frame is STRICTLY
+        // The crux: the older update carried its OWN smaller monitor sequence (1), not the
+        // newer mutation's leapfrogged FlowStore seq, so the final frame (2) is strictly
         // newer and the client's `seq <= last_seq` dedup ACCEPTS it (no drop).
+        assert_eq!(
+            older_seq, 1,
+            "older frame stamped with its own monitor sequence"
+        );
+        assert_eq!(
+            final_seq, 2,
+            "final frame stamped with its own monitor sequence"
+        );
         assert!(
             final_seq > older_seq,
             "the newer/final flow frame's seq ({final_seq}) is strictly greater than the \
-             older queued event's seq ({older_seq}) — so it is not dedup-dropped"
+             older update's seq ({older_seq}) — so it is not dedup-dropped"
         );
     }
 
