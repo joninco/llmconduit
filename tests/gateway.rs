@@ -5378,6 +5378,49 @@ async fn d13_api_requires_session_when_token_configured() {
 }
 
 #[tokio::test]
+async fn d13_extractor_rejection_carries_no_store_and_security_headers() {
+    // D13 R1 MED: `no-store` + the dashboard security headers are ROUTE-LEVEL response
+    // middleware on the whole `/dashboard/api` router, so EVEN an axum EXTRACTOR
+    // rejection — an invalid `at`/`page` query parsed to a bare `400` BEFORE any
+    // handler runs — carries them. Without the route-level layer the bare 400 escaped
+    // the per-handler `json_no_store` stamping. Dev-open (loopback) so no cookie needed.
+    let app = llmconduit::build_app_with_options(
+        test_config(),
+        llmconduit::AppOptions {
+            with_debug_ui: true,
+        },
+    );
+    // `?at=` wants a u64; a non-numeric value rejects in the `Query<SnapshotQuery>`
+    // extractor. `?page=` wants a usize; a non-numeric value rejects in
+    // `Query<FlowsQuery>`. Both are extractor failures, not handler responses.
+    for uri in [
+        "/dashboard/api/snapshot?at=not-a-number",
+        "/dashboard/api/flows?page=not-a-number",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "{uri} ⇒ extractor-rejection 400"
+        );
+        // The whole dashboard security header set, including no-store, is present.
+        assert_security_headers(response.headers());
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .and_then(|v| v.to_str().ok()),
+            Some("default-src 'none'; frame-ancestors 'none'"),
+            "{uri} extractor-rejection 400 carries the locked-down CSP"
+        );
+    }
+}
+
+#[tokio::test]
 async fn d13_metrics_shape_carries_seq_and_windows() {
     // `/metrics` matches the frozen `MetricsResponse`: a `metrics_seq` cursor, the
     // eight headline tile fields, and the three windows m1/m5/h1 each with the
@@ -5872,12 +5915,35 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
         detail["upstream_body"]["model"],
         serde_json::json!("glm-5.1")
     );
-    // `normalized` is an OPTIONAL field (the contract marks it absent-when-unset);
-    // D2 does not populate a separate canonical body, so it is absent here — the
-    // handler surfaces `record.normalized` faithfully (present only when captured).
+    // (D13 R1 HIGH) The MIDDLE pane: the engine captures the NORMALIZED canonical
+    // body (the internal `ResponsesRequest` after the inbound→canonical adapter, just
+    // before lowering) via `set_normalized`, so `normalized` is NON-absent, parses as
+    // a JSON object, and DIFFERS from the raw inbound chat body — the inbound is the
+    // `/v1/chat/completions` shape (`messages`), the normalized is the canonical
+    // Responses shape (`input`/`instructions`), so the 3-pane inspector shows a real
+    // inbound → normalized → upstream transformation.
     assert!(
-        detail.get("normalized").is_none() || detail["normalized"].is_object(),
-        "normalized is surfaced faithfully (absent when D2 did not capture it)"
+        detail["normalized"].is_object(),
+        "normalized canonical body captured by the engine (3-pane MIDDLE pane), got {:?}",
+        detail["normalized"]
+    );
+    assert_ne!(
+        detail["normalized"], detail["inbound_body"],
+        "normalized canonical body DIFFERS from the raw inbound body"
+    );
+    // The canonical Responses body carries `input` (the inbound chat `messages`
+    // adapted), proving it is the internal protocol, not a passthrough of the inbound.
+    assert!(
+        detail["normalized"].get("input").is_some(),
+        "normalized is the canonical Responses request (has `input`), got {:?}",
+        detail["normalized"]
+    );
+    // (D13 R1 HIGH) `model_requested` — the ORIGINAL request model captured before
+    // resolution — is surfaced on the detail (here it equals the served `glm-5.1`).
+    assert_eq!(
+        detail["model_requested"],
+        serde_json::json!("glm-5.1"),
+        "model_requested captured (pre-resolution request model)"
     );
     let usage = &detail["usage"];
     assert_eq!(
@@ -5944,6 +6010,64 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
     // The snapshot still reshapes metrics + topology into their REST bodies.
     assert!(snapshot["metrics"]["metrics_seq"].is_u64());
     assert!(snapshot["topology"]["price_table"].is_object());
+}
+
+#[tokio::test]
+async fn d13_historical_snapshot_active_streams_is_frozen_to_the_cut() {
+    // D13 R1 HIGH: a historical `/snapshot?at=` reports the `active_streams` of the
+    // FROZEN cut (the open flows AT THAT INSTANT), NOT the live FlowStore count now.
+    // Open a flow, take a coordinated cut (1 open stream), THEN finalize the flow
+    // (0 open now). The cut-time `?at=` must still read 1; the live `/metrics` reads 0.
+    let (app, gateway) = llmconduit::build_app_with_gateway_and_options(
+        test_config(),
+        None,
+        llmconduit::AppOptions {
+            with_debug_ui: true,
+        },
+    );
+    gateway.provider_health_publisher().publish(Vec::new());
+
+    // Open a flow and leave it OPEN (a live stream).
+    let api_call_id = "api_frozen_active".to_string();
+    gateway.flow_store().open(
+        api_call_id.clone(),
+        "POST".to_string(),
+        "/v1/responses".to_string(),
+        llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+        None,
+    );
+
+    // Coordinated cut while the flow is open ⇒ the cut's summaries carry 1 open flow.
+    let cut = gateway
+        .metrics()
+        .snapshot(gateway.flow_store(), &gateway.provider_health_publisher())
+        .expect("snapshot taken");
+    let at = cut.taken_at_ms;
+
+    // Now finalize the flow ⇒ the LIVE open count drops to 0, but the cut is frozen.
+    gateway.flow_store().finalize(
+        &api_call_id,
+        llmconduit::dashboard_flow::FlowStatus::Completed,
+        Some("response.completed".to_string()),
+        None,
+    );
+
+    // The historical `?at=` reflects the FROZEN cut: 1 active stream.
+    let snapshot = d13_json(d13_get(&app, &format!("/dashboard/api/snapshot?at={at}")).await).await;
+    assert_eq!(
+        snapshot["metrics"]["active_streams"],
+        serde_json::json!(1),
+        "historical snapshot active_streams is the FROZEN cut's open count (1), not now"
+    );
+
+    // The LIVE `/metrics` reflects NOW: the flow finalized, so 0 active streams.
+    let metrics = d13_json(d13_get(&app, "/dashboard/api/metrics").await).await;
+    assert_eq!(
+        metrics["active_streams"],
+        serde_json::json!(0),
+        "live metrics active_streams reflects the finalized flow (0), proving the \
+         snapshot's 1 came from the cut, not the live store"
+    );
 }
 
 #[tokio::test]

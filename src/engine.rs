@@ -1038,6 +1038,12 @@ impl Gateway {
             .as_ref()
             .map(|guard| guard.abort_token())
             .unwrap_or_default();
+        // D2 (D13 R1 HIGH): the ORIGINAL request model, captured BEFORE resolution so
+        // the flow record's `model_requested` reflects what the CLIENT asked for (an
+        // alias / ad-hoc route / profile name), distinct from the resolved/served
+        // model the leaf records as `model_served`. Stamped onto the record via
+        // `set_normalized` below alongside the normalized canonical body.
+        let model_requested = request.model.clone();
         let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
         let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
 
@@ -1104,6 +1110,24 @@ impl Gateway {
                     tail_request.tools.is_empty(),
                 );
             }
+        }
+        // D2 (D13 R1 HIGH): capture the NORMALIZED canonical body — the
+        // `ResponsesRequest` the engine operates on AFTER the inbound→canonical
+        // adapter, system-prompt prefixing, image-agent strip, and tool stripping,
+        // i.e. the settled internal Responses protocol, just BEFORE lowering to the
+        // upstream chat payload. This feeds the 3-pane inspector's MIDDLE pane
+        // (inbound → NORMALIZED → upstream). Keyed by `api_call_id` (the store key),
+        // captured via the O(CAP) redacting mint so a multi-MiB prompt is never
+        // serialized in full. No-op when the store is disabled or no `api_call_id`
+        // was threaded (the public wrapper / non-instrumented paths). Done after the
+        // pre-spawn `?` paths above could have early-returned, but BEFORE lowering so
+        // it reflects exactly what the engine hands to `lower_request_with_image_agent`.
+        if self.flow_store().is_enabled()
+            && let Some(api_call_id) = api_call_id.as_deref()
+        {
+            let normalized = crate::dashboard_flow::capture_body_from_value(&request);
+            self.flow_store()
+                .set_normalized(api_call_id, Some(model_requested), Some(normalized));
         }
         // Lower the canonical request to the upstream chat payload BEFORE
         // budgeting. The `?` surfaces any lowering/validation error (invalid

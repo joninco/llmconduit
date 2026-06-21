@@ -104,6 +104,39 @@ pub struct ModelPrice {
     pub cached_per_1k: f64,
 }
 
+impl ModelPrice {
+    /// Whether ALL three rates are finite (no NaN/±∞). The frozen `ModelPrice`
+    /// contract (and the frontend `isModelPrice` guard) requires finite rates;
+    /// `serde_json` serializes NaN/±∞ as `null`, which would silently corrupt the
+    /// `/dashboard/api/topology` price table on the wire. Config load uses this to
+    /// REJECT a malformed entry so the in-memory table only ever holds finite prices
+    /// (D13 R1 MED).
+    fn is_finite(&self) -> bool {
+        self.input_per_1k.is_finite()
+            && self.output_per_1k.is_finite()
+            && self.cached_per_1k.is_finite()
+    }
+}
+
+/// Drop any price-table entry carrying a non-finite rate (NaN/±∞), logging the key
+/// so a misconfiguration is visible. YAML and the `LLMCONDUIT_PRICE_TABLE_JSON` env
+/// override both feed through here, so the in-memory `price_table` only ever holds
+/// finite `ModelPrice`s and the topology price serialization is always finite (D13
+/// R1 MED — `serde_json` would otherwise emit `null` for a NaN/Inf rate, violating
+/// the frozen finite-number contract the frontend `isModelPrice` guard rejects).
+fn retain_finite_prices(table: &mut HashMap<String, ModelPrice>) {
+    table.retain(|model, price| {
+        let finite = price.is_finite();
+        if !finite {
+            tracing::warn!(
+                model = %model,
+                "dropping price_table entry with non-finite rate (NaN/Inf)"
+            );
+        }
+        finite
+    });
+}
+
 #[derive(Debug, Clone)]
 pub struct UpstreamConfig {
     pub name: String,
@@ -827,7 +860,14 @@ impl Config {
             // cache evict every image immediately and silently disable the agent.
             image_cache_max_size: config.image_cache_max_size.max(1),
             image_cache_ttl_secs: config.image_cache_ttl_secs,
-            price_table: config.price_table.clone(),
+            price_table: {
+                // D13 R1 MED: reject any YAML price entry with a non-finite rate so
+                // the resolved table only holds finite prices (the topology price
+                // serialization is then always finite).
+                let mut table = config.price_table.clone();
+                retain_finite_prices(&mut table);
+                table
+            },
         })
     }
 
@@ -1589,8 +1629,11 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     // value is ignored so a typo cannot wipe a configured table silently.
     if let Ok(value) = env::var("LLMCONDUIT_PRICE_TABLE_JSON")
         && !value.trim().is_empty()
-        && let Ok(parsed) = serde_json::from_str::<HashMap<String, ModelPrice>>(&value)
+        && let Ok(mut parsed) = serde_json::from_str::<HashMap<String, ModelPrice>>(&value)
     {
+        // D13 R1 MED: drop any non-finite (NaN/Inf) env-supplied price so the table
+        // serializes finite numbers only (the frozen `ModelPrice` contract).
+        retain_finite_prices(&mut parsed);
         config.price_table = parsed;
     }
 }
@@ -1626,6 +1669,7 @@ mod tests {
     use super::default_config_path;
     use super::load_persisted_config;
     use super::merge_json_maps;
+    use super::retain_finite_prices;
     use super::write_persisted_config;
     use crate::models::chat::ChatCompletionRequest;
     use crate::upstream::BackendChatRequest;
@@ -3276,5 +3320,72 @@ model_profiles:
         unsafe {
             std::env::remove_var("LLMCONDUIT_PRICE_TABLE_JSON");
         }
+    }
+
+    /// D13 R1 MED: a price entry carrying a NON-finite rate (NaN / ±∞) is REJECTED at
+    /// config load so the in-memory table only ever holds finite prices — `serde_json`
+    /// serializes NaN/Inf as `null`, which would silently corrupt the
+    /// `/dashboard/api/topology` price table and violate the frozen finite-number
+    /// `ModelPrice` contract. Both the YAML load and the env override drop the bad
+    /// entry; a sibling finite entry survives.
+    #[test]
+    fn price_table_rejects_non_finite_rates_on_load() {
+        // YAML `.inf` parses to an infinite f64; the entry must be dropped, the finite
+        // sibling kept.
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            "price_table:\n  good:\n    input_per_1k: 2.0\n    output_per_1k: 6.0\n  bad-inf:\n    \
+             input_per_1k: .inf\n    output_per_1k: 1.0\n",
+        )
+        .expect("yaml parses");
+        let config = Config::from_persisted(&persisted).expect("config");
+        assert!(
+            config.price_for("good").is_some(),
+            "a finite YAML price survives the finite filter"
+        );
+        assert!(
+            config.price_for("bad-inf").is_none(),
+            "a non-finite (∞) YAML price entry is dropped at load"
+        );
+
+        // The env-override path applies the SAME `retain_finite_prices` filter before
+        // installing the parsed table, so a NaN/±∞ in any of the three rate fields is
+        // dropped while finite siblings survive. (`serde_json` rejects bare
+        // `NaN`/overflow literals at parse time, so the filter is exercised directly on
+        // a parsed table — the exact post-parse value the env path feeds it.)
+        let mut table = HashMap::new();
+        table.insert(
+            "finite".to_string(),
+            ModelPrice {
+                input_per_1k: 1.0,
+                output_per_1k: 2.0,
+                cached_per_1k: 0.0,
+            },
+        );
+        table.insert(
+            "nan-input".to_string(),
+            ModelPrice {
+                input_per_1k: f64::NAN,
+                output_per_1k: 2.0,
+                cached_per_1k: 0.0,
+            },
+        );
+        table.insert(
+            "inf-cached".to_string(),
+            ModelPrice {
+                input_per_1k: 1.0,
+                output_per_1k: 2.0,
+                cached_per_1k: f64::INFINITY,
+            },
+        );
+        retain_finite_prices(&mut table);
+        assert!(table.contains_key("finite"), "a finite price survives");
+        assert!(
+            !table.contains_key("nan-input"),
+            "a NaN rate in any field drops the entry"
+        );
+        assert!(
+            !table.contains_key("inf-cached"),
+            "an ∞ rate in any field drops the entry"
+        );
     }
 }

@@ -529,6 +529,18 @@ fn active_stream_count(gateway: &Gateway) -> u64 {
         .count() as u64
 }
 
+/// Count the OPEN flows in a FROZEN snapshot cut's body-free summaries — the
+/// `active_streams` value for a historical `/snapshot?at=` (D13 R1 HIGH). Reading the
+/// live FlowStore for a time-travel cut would report NOW's open count, not the cut's;
+/// the summaries are the cut's own consistent flow projection, so counting their open
+/// status keeps the whole snapshot frozen to one instant.
+fn cut_active_stream_count(summaries: &[crate::dashboard_flow::SnapshotFlowSummary]) -> u64 {
+    summaries
+        .iter()
+        .filter(|summary| summary.status == FlowStatus::Open)
+        .count() as u64
+}
+
 // ---------------------------------------------------------------------------
 // Delta replay (MonitorHub snapshot, filtered by response_id)
 // ---------------------------------------------------------------------------
@@ -810,9 +822,13 @@ pub async fn dashboard_snapshot(
         .map(|summary| FlowRow::from_summary(summary, gateway.as_ref()))
         .collect();
     // Reshape the cut's body-free metrics view into the REST `/metrics` shape, with
-    // the cut's own `metrics_seq` cursor. `active_streams` reflects NOW (the cut is
-    // body-free + does not retain a live open-flow count); it is a live gauge.
-    let active = active_stream_count(gateway.as_ref());
+    // the cut's own `metrics_seq` cursor. `active_streams` is derived from the FROZEN
+    // cut's open summaries (D13 R1 HIGH) — NOT the live FlowStore — so a historical
+    // `?at=` reflects how many streams were open AT THAT CUT, not now. The cut's
+    // `summaries` are the same body-free flow projections captured in the snapshot's
+    // single critical section, so counting `status == Open` among them is consistent
+    // with the rest of the frozen cut.
+    let active = cut_active_stream_count(&cut.summaries);
     let metrics = Some(metrics_body(
         &cut.metrics,
         cut.cursors.metrics_seq,

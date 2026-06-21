@@ -138,14 +138,17 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
 /// this sub-router so the middleware/handlers/extractors can read it
 /// (`/debug/ws` reads it via `gateway.dashboard_auth()` instead).
 fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
-    // Routes requiring a valid session (401 when missing/expired/invalid). The
-    // D13 `/dashboard/api/*` REST surface joins this group so every read AND the
-    // kill mutation is 401'd for an unauthenticated caller BEFORE any handler work
-    // (the kill's CSRF/mutation gate runs only for an authenticated request). The
-    // handlers themselves stamp `no-store` + the dashboard security headers.
-    let session_gated = Router::new()
-        .route("/debug", get(debug_index))
-        .route("/debug/app.js", get(debug_app_js))
+    // D13 `/dashboard/api/*` REST surface. `no-store` + the dashboard security
+    // headers are applied as ROUTE-LEVEL response middleware on the WHOLE api router
+    // (D13 R1 MED), so EVERY response carries them — including an axum EXTRACTOR
+    // rejection (an invalid `page`/`limit`/`at` query → a bare `400` produced before
+    // any handler runs), which previously escaped the per-handler stamping. The
+    // handlers' own `json_no_store` re-stamp is idempotent (same static header
+    // values), so double-application is harmless. `require_session` is layered
+    // OUTSIDE the response map (added last → outermost) so it 401's an unauthed
+    // caller BEFORE any handler/extractor work AND its 401 also flows back through
+    // the `no_store` map.
+    let api_routes = Router::new()
         .route("/dashboard/api/flows", get(dashboard_flows))
         .route("/dashboard/api/flows/{id}", get(dashboard_flow_detail))
         .route("/dashboard/api/flows/{id}/kill", post(dashboard_flow_kill))
@@ -153,6 +156,21 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
         .route("/dashboard/api/snapshot", get(dashboard_snapshot))
+        .route_layer(middleware::map_response(dashboard_api_no_store));
+
+    // The `/debug` HTML/JS endpoints share the same session gate but stamp their own
+    // headers in-handler (they serve HTML, not the JSON `no-store` set), so they are
+    // NOT under the api router's `no_store` response map.
+    let debug_routes = Router::new()
+        .route("/debug", get(debug_index))
+        .route("/debug/app.js", get(debug_app_js));
+
+    // Both groups require a valid session (401 when missing/expired/invalid): every
+    // dashboard read AND the kill mutation is 401'd for an unauthenticated caller
+    // BEFORE any handler work (the kill's CSRF/mutation gate runs only for an
+    // authenticated request).
+    let session_gated = api_routes
+        .merge(debug_routes)
         .route_layer(middleware::from_fn(require_session));
 
     // Routes that read the auth context but manage their own access decision,
@@ -175,6 +193,16 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .merge(open)
         // Scope the auth context to ONLY the protected routes (not `/v1/*`).
         .layer(Extension(auth))
+}
+
+/// Route-level response middleware (D13 R1 MED): stamp `no-store` + the dashboard
+/// security header set on EVERY `/dashboard/api/*` response, including an axum
+/// extractor-rejection `400` produced before any handler runs (an invalid
+/// `page`/`limit`/`at` query). Delegates to the single header authority
+/// [`crate::dashboard_auth::no_store`]; the handlers' own `json_no_store` re-stamps
+/// the same static values, so applying this on top is idempotent.
+async fn dashboard_api_no_store(response: Response) -> Response {
+    crate::dashboard_auth::no_store(response)
 }
 
 /// D6 — the outcome of a `POST /dashboard/api/flows/:id/kill` attempt, decoupled from
