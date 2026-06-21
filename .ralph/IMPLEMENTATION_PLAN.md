@@ -428,6 +428,18 @@ rounds → record verdict + mark task done here. STOP when all 10 APPROVED.
 
 ## Topic 13 — Argus: realtime LLM-proxy dashboard
 
+> **✅ STATUS: COMPLETE — 13/13 Codex-xhigh APPROVED (branch `worktree-dashboard`).** Orchestrated run:
+> Opus orchestrator + isolated Opus implementer/fix subagents; per-task Codex-xhigh gate per
+> `.ralph/REVIEW_PROTOCOL.md`, fix→re-review until APPROVED (49 review rounds total; backend serial on
+> shared files, frontend parallel track). Per-task final approvals: D1 `66d95ff` (R5) · D2 `8d8568c` (R2) ·
+> D3 `678a844` (R2) · D4 `15d9f50` (R1) · D5 `fcee5ca` (R5) · D6 `8f10078` (R2) · D7a `93b01e6` (R5) +
+> D7b `b0c04e9` (R5) · D8 `72638c3` (R2) · D9 `5d9573` (R5) · D10 (R6) · D11 (R7) · D12 (R7) ·
+> D13 `4ab8dc2` (R2, capstone). Full per-round verdict log: `/tmp/dashboard-topic13-review.md`;
+> orchestration state: `.ralph/orchestrate.dashboard-topic13.state.md`. Final integration GREEN:
+> cargo fmt + clippy --all-targets + cargo test + frontend tsc/eslint/vitest(318)/vite-build +
+> `LLMCONDUIT_BUILD_DASHBOARD=1` real-embed release build. The per-task `Status:` lines below keep their
+> spec text; this banner is the authoritative completion record.
+
 > **Source:** `/ralph-guide-update` on 2026-06-20, from `DASHBOARD_PLAN.md` (rev 8, Codex-xhigh
 > APPROVED after 7 adversarial review rounds). A flagship web dashboard for the gateway: 6 views
 > (transformation inspector, upstream topology map, token-flow Sankey, live stream theater, stats strip,
