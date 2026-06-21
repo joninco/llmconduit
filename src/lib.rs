@@ -1,6 +1,7 @@
 pub mod adapters;
 pub mod cli;
 pub mod config;
+pub mod dashboard_api;
 pub mod dashboard_auth;
 pub mod dashboard_flow;
 pub mod dashboard_ui;

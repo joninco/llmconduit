@@ -4,6 +4,7 @@ use serde::Serialize;
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -75,6 +76,32 @@ pub struct Config {
     pub image_cache_max_size: usize,
     /// Per-session image-cache TTL (seconds).
     pub image_cache_ttl_secs: u64,
+    /// Per-model price table (T13/D13), keyed by SERVED model id. Drives the
+    /// dashboard's flow `cost` roll-up + the Sankey cost coloring + the
+    /// `cost_per_min`/`cost_per_sec` rates. Loaded from the YAML `price_table:`
+    /// map and overridable wholesale by `LLMCONDUIT_PRICE_TABLE_JSON`. Empty by
+    /// default — an absent model simply has no price (cost stays `None`/0), which
+    /// is contract-valid (the frontend only requires finite rates when present).
+    pub price_table: HashMap<String, ModelPrice>,
+}
+
+/// One model's billing rates (T13/D13), per 1k tokens. Field names mirror the
+/// FROZEN frontend `ModelPrice` contract (`dashboard-frontend/src/api/types.ts`)
+/// byte-for-byte so the `/dashboard/api/topology` `price_table` validates. All
+/// three rates are finite (the frontend `isModelPrice` guard rejects NaN/Inf);
+/// `cached_per_1k` defaults to `0.0` when a config entry omits it. This is the
+/// SINGLE `ModelPrice` definition for the crate — the dashboard WS topology
+/// snapshot re-exports it so REST + WS agree on the wire shape.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ModelPrice {
+    /// USD per 1k PROMPT (input) tokens.
+    pub input_per_1k: f64,
+    /// USD per 1k COMPLETION (output) tokens.
+    pub output_per_1k: f64,
+    /// USD per 1k CACHED (cache-read) prompt tokens. Defaults to `0.0` when the
+    /// config entry omits it (a provider with no cache discount).
+    #[serde(default)]
+    pub cached_per_1k: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -508,6 +535,12 @@ pub struct PersistedConfig {
     /// Per-session image-cache TTL (seconds).
     #[serde(default = "default_image_cache_ttl_secs")]
     pub image_cache_ttl_secs: u64,
+    /// Per-model price table (T13/D13), keyed by served model id. A YAML map of
+    /// `model: { input_per_1k, output_per_1k, cached_per_1k? }`. Wholesale-
+    /// overridable by `LLMCONDUIT_PRICE_TABLE_JSON` (mirrors the
+    /// `upstream_chat_kwargs` env-JSON pattern). Empty by default.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub price_table: HashMap<String, ModelPrice>,
 }
 
 fn default_bind_addr() -> String {
@@ -609,6 +642,7 @@ impl Default for PersistedConfig {
             vision_model: None,
             image_cache_max_size: default_image_cache_max_size(),
             image_cache_ttl_secs: default_image_cache_ttl_secs(),
+            price_table: HashMap::new(),
         }
     }
 }
@@ -793,6 +827,7 @@ impl Config {
             // cache evict every image immediately and silently disable the agent.
             image_cache_max_size: config.image_cache_max_size.max(1),
             image_cache_ttl_secs: config.image_cache_ttl_secs,
+            price_table: config.price_table.clone(),
         })
     }
 
@@ -801,6 +836,20 @@ impl Config {
             .and_then(|profile| profile.upstream_model.clone())
             .or_else(|| self.upstream_model.clone())
             .unwrap_or_else(|| request_model.to_string())
+    }
+
+    /// The configured [`ModelPrice`] for `model` (T13/D13). Exact key match first,
+    /// then an ASCII-case-insensitive fallback (mirrors `model_profile`'s lookup),
+    /// so a price keyed `GLM-4.6` still matches a served `glm-4.6`. `None` when no
+    /// price is configured for the model — the dashboard then reports no `cost`
+    /// for that flow (contract: `cost` is `Option`), never a fabricated zero.
+    pub fn price_for(&self, model: &str) -> Option<ModelPrice> {
+        self.price_table.get(model).copied().or_else(|| {
+            self.price_table
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(model))
+                .map(|(_, price)| *price)
+        })
     }
 
     /// Whether `model` matches an ad-hoc `model_routes` entry by exact name
@@ -1534,6 +1583,16 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.image_cache_ttl_secs = parsed;
     }
+    // T13/D13: the per-model price table can be supplied wholesale as a JSON map
+    // via the environment (mirrors `LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON`). The
+    // env value REPLACES the YAML `price_table:` map when it parses; a malformed
+    // value is ignored so a typo cannot wipe a configured table silently.
+    if let Ok(value) = env::var("LLMCONDUIT_PRICE_TABLE_JSON")
+        && !value.trim().is_empty()
+        && let Ok(parsed) = serde_json::from_str::<HashMap<String, ModelPrice>>(&value)
+    {
+        config.price_table = parsed;
+    }
 }
 
 pub fn merge_json_maps(
@@ -1557,6 +1616,7 @@ mod tests {
     use super::Config;
     use super::JsonMap;
     use super::JsonValue;
+    use super::ModelPrice;
     use super::OrderedModelRoutes;
     use super::PersistedConfig;
     use super::PersistedFallbackUpstream;
@@ -1574,6 +1634,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::collections::BTreeMap as StdBTreeMap;
+    use std::collections::HashMap;
 
     /// Minimal wire request for leaf-finalization tests. `backend_model` is the
     /// FINAL provider model the leaf sees (after any routing/failover/alias
@@ -2050,6 +2111,7 @@ model_profiles:
             image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
+            price_table: std::collections::HashMap::new(),
         };
         write_persisted_config(&path, &config).expect("write config");
         let loaded = load_persisted_config(&path).expect("load config");
@@ -2117,6 +2179,7 @@ model_profiles:
             image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
+            price_table: std::collections::HashMap::new(),
         })
         .expect("config");
 
@@ -2292,6 +2355,7 @@ model_profiles:
             image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
+            price_table: std::collections::HashMap::new(),
         })
         .expect("config");
 
@@ -2363,6 +2427,7 @@ model_profiles:
             image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
+            price_table: std::collections::HashMap::new(),
         })
         .expect("config");
 
@@ -2464,6 +2529,7 @@ model_profiles:
             image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
+            price_table: std::collections::HashMap::new(),
         })
         .expect("config");
 
@@ -2565,6 +2631,7 @@ model_profiles:
             image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
+            price_table: std::collections::HashMap::new(),
         })
         .expect("config");
 
@@ -2957,6 +3024,7 @@ model_profiles:
             image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
+            price_table: std::collections::HashMap::new(),
         })
         .expect("config");
 
@@ -3014,6 +3082,7 @@ model_profiles:
             image_cache_ttl_secs: 300,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
+            price_table: std::collections::HashMap::new(),
         })
         .expect("config");
 
@@ -3102,5 +3171,110 @@ model_profiles:
             !dirs.contains(&PathBuf::from("/tmp/llmconduit-inactive-global")),
             "routing mode must exclude the inactive global fallback log dir"
         );
+    }
+
+    // -- D13 price table -------------------------------------------------------
+
+    /// The YAML `price_table:` map deserializes into `Config.price_table` and
+    /// `price_for` resolves an exact key. A missing `cached_per_1k` defaults to
+    /// `0.0` (a provider with no cache discount), so a two-field entry is valid.
+    #[test]
+    fn price_table_loads_from_yaml_and_price_for_resolves() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            "price_table:\n  glm-5.1:\n    input_per_1k: 2.0\n    output_per_1k: 6.0\n    \
+             cached_per_1k: 0.5\n  cheap-model:\n    input_per_1k: 0.1\n    output_per_1k: 0.2\n",
+        )
+        .expect("yaml parses");
+        let config = Config::from_persisted(&persisted).expect("config");
+
+        let glm = config.price_for("glm-5.1").expect("glm priced");
+        assert_eq!(glm.input_per_1k, 2.0);
+        assert_eq!(glm.output_per_1k, 6.0);
+        assert_eq!(glm.cached_per_1k, 0.5);
+        // The two-field entry defaults cached to 0.0.
+        let cheap = config.price_for("cheap-model").expect("cheap priced");
+        assert_eq!(cheap.cached_per_1k, 0.0);
+        // An unknown model has no price (cost will report null, never a fake zero).
+        assert!(config.price_for("unknown-model").is_none());
+    }
+
+    /// `price_for` falls back to an ASCII-case-insensitive match so a price keyed
+    /// `GLM-5.1` still resolves a served `glm-5.1` (mirrors `model_profile`).
+    #[test]
+    fn price_for_is_case_insensitive() {
+        let mut table = HashMap::new();
+        table.insert(
+            "GLM-5.1".to_string(),
+            ModelPrice {
+                input_per_1k: 1.0,
+                output_per_1k: 2.0,
+                cached_per_1k: 0.0,
+            },
+        );
+        let persisted = PersistedConfig {
+            price_table: table,
+            ..Default::default()
+        };
+        let config = Config::from_persisted(&persisted).expect("config");
+        assert!(
+            config.price_for("glm-5.1").is_some(),
+            "a differently-cased served model still resolves its configured price"
+        );
+    }
+
+    /// `LLMCONDUIT_PRICE_TABLE_JSON` REPLACES the YAML price table wholesale (the
+    /// env-JSON override pattern), and a malformed value is ignored (a typo cannot
+    /// silently wipe a configured table).
+    #[test]
+    fn apply_env_overrides_price_table_json() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var(
+                "LLMCONDUIT_PRICE_TABLE_JSON",
+                r#"{"env-model":{"input_per_1k":3.0,"output_per_1k":9.0,"cached_per_1k":1.0}}"#,
+            );
+        }
+        let mut config = PersistedConfig::default();
+        // Seed a YAML table the env override must REPLACE.
+        config.price_table.insert(
+            "yaml-model".to_string(),
+            ModelPrice {
+                input_per_1k: 1.0,
+                output_per_1k: 1.0,
+                cached_per_1k: 0.0,
+            },
+        );
+        apply_env_overrides(&mut config);
+        assert!(
+            config.price_table.contains_key("env-model"),
+            "the env JSON installs its model"
+        );
+        assert!(
+            !config.price_table.contains_key("yaml-model"),
+            "the env JSON REPLACES (not merges) the YAML table"
+        );
+
+        // A malformed value is ignored (the seeded table survives).
+        unsafe {
+            std::env::set_var("LLMCONDUIT_PRICE_TABLE_JSON", "{not valid json");
+        }
+        let mut config2 = PersistedConfig::default();
+        config2.price_table.insert(
+            "kept".to_string(),
+            ModelPrice {
+                input_per_1k: 1.0,
+                output_per_1k: 1.0,
+                cached_per_1k: 0.0,
+            },
+        );
+        apply_env_overrides(&mut config2);
+        assert!(
+            config2.price_table.contains_key("kept"),
+            "a malformed env JSON is ignored, leaving the configured table intact"
+        );
+
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_PRICE_TABLE_JSON");
+        }
     }
 }

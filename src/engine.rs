@@ -729,6 +729,22 @@ impl Gateway {
         &self.config
     }
 
+    /// D13: the configured [`ModelPrice`](crate::config::ModelPrice) for `model`,
+    /// keyed by the SERVED model id (exact, then case-insensitive). `None` when no
+    /// price is configured — the dashboard then reports no `cost` for that flow.
+    /// A thin pass-through to [`Config::price_for`] so the dashboard REST handlers
+    /// + the flow-cost roll-up resolve prices without reaching into `config()`.
+    pub fn price_for(&self, model: &str) -> Option<crate::config::ModelPrice> {
+        self.config.price_for(model)
+    }
+
+    /// D13: the whole per-model price table (`/dashboard/api/topology` returns it,
+    /// the Sankey colors edges from it). A borrow of the `Config`-owned map; empty
+    /// when none is configured (contract-valid — an empty `price_table` validates).
+    pub fn price_table(&self) -> &std::collections::HashMap<String, crate::config::ModelPrice> {
+        &self.config.price_table
+    }
+
     pub fn upstream_client(&self) -> Arc<dyn UpstreamClient> {
         Arc::clone(&self.upstream)
     }

@@ -4,6 +4,12 @@ use crate::adapters::chat_completions::ChatCompletionCollector;
 use crate::adapters::chat_completions::ChatCompletionStreamConverter;
 use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
+use crate::dashboard_api::dashboard_catalog;
+use crate::dashboard_api::dashboard_flow_detail;
+use crate::dashboard_api::dashboard_flows;
+use crate::dashboard_api::dashboard_metrics;
+use crate::dashboard_api::dashboard_snapshot;
+use crate::dashboard_api::dashboard_topology;
 use crate::dashboard_auth::DashboardAuth;
 use crate::dashboard_auth::MutationDenied;
 use crate::dashboard_auth::MutationPolicy;
@@ -132,10 +138,21 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
 /// this sub-router so the middleware/handlers/extractors can read it
 /// (`/debug/ws` reads it via `gateway.dashboard_auth()` instead).
 fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
-    // Routes requiring a valid session (401 when missing/expired/invalid).
+    // Routes requiring a valid session (401 when missing/expired/invalid). The
+    // D13 `/dashboard/api/*` REST surface joins this group so every read AND the
+    // kill mutation is 401'd for an unauthenticated caller BEFORE any handler work
+    // (the kill's CSRF/mutation gate runs only for an authenticated request). The
+    // handlers themselves stamp `no-store` + the dashboard security headers.
     let session_gated = Router::new()
         .route("/debug", get(debug_index))
         .route("/debug/app.js", get(debug_app_js))
+        .route("/dashboard/api/flows", get(dashboard_flows))
+        .route("/dashboard/api/flows/{id}", get(dashboard_flow_detail))
+        .route("/dashboard/api/flows/{id}/kill", post(dashboard_flow_kill))
+        .route("/dashboard/api/metrics", get(dashboard_metrics))
+        .route("/dashboard/api/topology", get(dashboard_topology))
+        .route("/dashboard/api/catalog", get(dashboard_catalog))
+        .route("/dashboard/api/snapshot", get(dashboard_snapshot))
         .route_layer(middleware::from_fn(require_session));
 
     // Routes that read the auth context but manage their own access decision,
@@ -220,9 +237,13 @@ pub async fn dashboard_flow_kill(
 ) -> Response {
     let response = match flow_kill_outcome(auth.as_ref(), &headers, gateway.as_ref(), &api_call_id)
     {
-        FlowKillOutcome::Killed => {
-            (StatusCode::OK, Json(serde_json::json!({"killed": true}))).into_response()
-        }
+        // The 200 body MUST match the frozen `KillResponse {api_call_id, killed}`
+        // (dashboard-frontend/src/api/types.ts) — the SPA decodes both fields.
+        FlowKillOutcome::Killed => (
+            StatusCode::OK,
+            Json(serde_json::json!({"api_call_id": api_call_id, "killed": true})),
+        )
+            .into_response(),
         FlowKillOutcome::NotFound => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "no live flow for that id"})),

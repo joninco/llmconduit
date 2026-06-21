@@ -357,6 +357,7 @@ mod integration {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            price_table: std::collections::HashMap::new(),
         }
     }
 

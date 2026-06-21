@@ -168,15 +168,14 @@ pub struct TopologySnapshot {
     pub price_table: std::collections::BTreeMap<String, ModelPrice>,
 }
 
-/// One model's price row (`/api/topology` `price_table` value). All three rates
-/// are finite (the frontend `isModelPrice` guard rejects NaN/Inf). Populated by
-/// D13's price config; absent entries simply do not appear.
-#[derive(Debug, Clone, Copy, Serialize)]
-pub struct ModelPrice {
-    pub input_per_1k: f64,
-    pub output_per_1k: f64,
-    pub cached_per_1k: f64,
-}
+/// One model's price row (`/api/topology` `price_table` value). The crate's
+/// SINGLE `ModelPrice` definition lives in [`crate::config`] — it is BOTH the
+/// config-loaded type AND the wire type, so REST `/dashboard/api/topology` and
+/// this WS topology snapshot serialize the SAME shape — re-exported here so the
+/// `TopologySnapshot` field type reads naturally and D13 can populate it from the
+/// same `Config::price_table` source. All three rates are finite (the frontend
+/// `isModelPrice` guard rejects NaN/Inf).
+pub use crate::config::ModelPrice;
 
 /// The INITIAL WS message: a `type:"snapshot"` envelope the SPA waits for BEFORE
 /// it renders. The frontend (`dashboard-frontend/src/api/ws.ts`) BUFFERS every
@@ -321,7 +320,10 @@ pub struct TopologyNode {
 }
 
 impl TopologyNode {
-    fn from_health(health: &crate::upstream::ProviderHealth) -> Self {
+    /// Project a D4 [`ProviderHealth`](crate::upstream::ProviderHealth) into a
+    /// topology node (`catalog_size` flattened `None → 0`). `pub(crate)` so D13's
+    /// REST `/topology` builds the SAME node shape as the WS topology frame.
+    pub(crate) fn from_health(health: &crate::upstream::ProviderHealth) -> Self {
         Self {
             id: health.id.clone(),
             name: health.name.clone(),

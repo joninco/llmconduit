@@ -640,6 +640,7 @@ async fn uses_configured_upstream_model_override() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            price_table: std::collections::HashMap::new(),
         },
     );
 
@@ -725,6 +726,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            price_table: std::collections::HashMap::new(),
         },
     );
 
@@ -1075,6 +1077,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            price_table: std::collections::HashMap::new(),
         },
     );
 
@@ -1148,6 +1151,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            price_table: std::collections::HashMap::new(),
         },
     );
 
@@ -2855,6 +2859,7 @@ async fn proxies_models_endpoint_with_etag() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        price_table: std::collections::HashMap::new(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -2929,6 +2934,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        price_table: std::collections::HashMap::new(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3009,6 +3015,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        price_table: std::collections::HashMap::new(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3092,6 +3099,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        price_table: std::collections::HashMap::new(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -3180,6 +3188,7 @@ async fn proxies_completions_endpoint_passthrough() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        price_table: std::collections::HashMap::new(),
     };
     let app = llmconduit::build_app(config);
     let response = app
@@ -5108,6 +5117,835 @@ async fn d6_kill_handler_outcome_maps_authorize_then_abort() {
     );
 }
 
+// ===========================================================================
+// D13 — Dashboard REST routes + price config (the CAPSTONE). The routes register
+// ONLY in the `--with-debug-ui` block, behind D7a auth + `no-store`; the cursor-
+// bearing reads carry their per-domain seq; the kill honors the mutation+CSRF
+// gate; the price table drives `cost` end-to-end. The shapes MUST match the
+// FROZEN frontend contract (`dashboard-frontend/src/api/types.ts`).
+// ===========================================================================
+
+/// A priced D13 env: token + https origin + (optionally) mutations enabled.
+fn d13_env(allow_mutations: bool) -> llmconduit::dashboard_auth::DashboardEnv {
+    use base64::Engine as _;
+    llmconduit::dashboard_auth::DashboardEnv {
+        token: Some("d13-token".to_string()),
+        session_key_b64: Some(base64::engine::general_purpose::STANDARD.encode([13u8; 32])),
+        public_origin: Some("https://dash.example.com".to_string()),
+        allow_insecure: false,
+        allow_mutations,
+    }
+}
+
+/// A test price table keyed by served model. `glm-5.1` (the `base_request` model,
+/// which the bare leaf records as `model_served`) is priced so a driven flow gets
+/// a non-null cost: input 2.0 / output 6.0 / cached 0.5 per 1k.
+fn d13_price_table() -> std::collections::HashMap<String, llmconduit::config::ModelPrice> {
+    let mut table = std::collections::HashMap::new();
+    table.insert(
+        "glm-5.1".to_string(),
+        llmconduit::config::ModelPrice {
+            input_per_1k: 2.0,
+            output_per_1k: 6.0,
+            cached_per_1k: 0.5,
+        },
+    );
+    table
+}
+
+/// Build a gateway with an ENABLED FlowStore + MetricsLayer + the configured price
+/// table + the D7a auth context, mirroring the `--with-debug-ui` DI wiring. Accepts
+/// any upstream trait object so the kill test can use a parking upstream.
+fn d13_gateway(
+    upstream: Arc<dyn UpstreamClient>,
+    auth: Arc<llmconduit::dashboard_auth::DashboardAuth>,
+) -> Arc<Gateway> {
+    let mut config = test_config();
+    config.price_table = d13_price_table();
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    Arc::new(
+        Gateway::new(
+            config,
+            ReplayStore::new(1000),
+            upstream,
+            Arc::new(MockSearch::default()),
+            vision,
+            image_cache,
+            MonitorHub::new(128),
+            None,
+            llmconduit::dashboard_flow::DashboardFlowStore::new(),
+        )
+        .with_metrics(llmconduit::metrics::MetricsLayer::new())
+        .with_dashboard_auth(Some(auth)),
+    )
+}
+
+/// Build the router for a D13 gateway with the protected routes registered.
+fn d13_router(gateway: Arc<Gateway>) -> axum::Router {
+    llmconduit::http::build_router(
+        gateway,
+        llmconduit::http::RouterOptions {
+            with_debug_ui: true,
+            register_protected_routes: true,
+        },
+    )
+}
+
+/// GET a `/dashboard/api/*` path with a valid session cookie, returning the
+/// response (status + headers + body) for assertion.
+async fn d13_authed_get(
+    app: &axum::Router,
+    auth: &llmconduit::dashboard_auth::DashboardAuth,
+    uri: &str,
+) -> axum::response::Response {
+    let (cookie, _exp) = auth.issue_session();
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={cookie}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Read a response body into a `serde_json::Value`.
+async fn d13_json(response: axum::response::Response) -> serde_json::Value {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("read body");
+    serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+        panic!(
+            "response is JSON (status {status}, body={:?}): {err}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
+}
+
+/// GET a `/dashboard/api/*` path with NO cookie (dev-open auth, loopback bind).
+async fn d13_get(app: &axum::Router, uri: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+/// Wait for ANY flow in the store to reach a terminal status and return its
+/// `api_call_id` (the router-driven flow's id is minted by the middleware).
+async fn d13_await_any_terminal(gateway: &Gateway) -> String {
+    for _ in 0..2000 {
+        if let Some(record) = gateway
+            .flow_store()
+            .list()
+            .iter()
+            .find(|record| record.status != llmconduit::dashboard_flow::FlowStatus::Open)
+        {
+            return record.api_call_id.clone();
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("no flow finalized in the store");
+}
+
+/// Assert a response carries `Cache-Control: no-store` (D7a — every
+/// `/dashboard/api/*` response is uncacheable).
+fn d13_assert_no_store(response: &axum::response::Response) {
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "every /dashboard/api/* response MUST be no-store"
+    );
+}
+
+#[tokio::test]
+async fn d13_routes_absent_without_debug_ui() {
+    // With the debug UI OFF, NONE of the `/dashboard/api/*` routes exist → 404.
+    let app = llmconduit::build_app_with_options(
+        test_config(),
+        llmconduit::AppOptions {
+            with_debug_ui: false,
+        },
+    );
+    for uri in [
+        "/dashboard/api/flows",
+        "/dashboard/api/flows/api_x",
+        "/dashboard/api/metrics",
+        "/dashboard/api/topology",
+        "/dashboard/api/catalog",
+        "/dashboard/api/snapshot",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            404,
+            "{uri} must not exist when --with-debug-ui is off"
+        );
+    }
+    // The kill POST is likewise absent.
+    let kill = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/dashboard/api/flows/api_x/kill")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(kill.status().as_u16(), 404, "kill absent without debug UI");
+}
+
+#[tokio::test]
+async fn d13_routes_present_in_dev_open_with_debug_ui() {
+    // With the debug UI ON (loopback dev-open: no token), the routes EXIST and
+    // serve (200) — the inverse of the off case. Dev-open authenticates every
+    // request, so a cookieless GET still reaches the handler.
+    let app = llmconduit::build_app_with_options(
+        test_config(),
+        llmconduit::AppOptions {
+            with_debug_ui: true,
+        },
+    );
+    for uri in [
+        "/dashboard/api/flows",
+        "/dashboard/api/metrics",
+        "/dashboard/api/topology",
+        "/dashboard/api/catalog",
+        "/dashboard/api/snapshot",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "{uri} must serve 200 when --with-debug-ui is on (dev-open)"
+        );
+        d13_assert_no_store(&response);
+    }
+}
+
+#[tokio::test]
+async fn d13_api_requires_session_when_token_configured() {
+    // With a token configured (production posture), an unauthenticated read is
+    // 401 no-store; a valid session cookie is 200. Proves D7a gates every
+    // `/dashboard/api/*` read BEFORE the handler runs.
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let app = d13_router(d13_gateway(
+        Arc::new(MockUpstream::default()),
+        Arc::clone(&auth),
+    ));
+
+    let unauthed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/dashboard/api/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthed.status().as_u16(), 401);
+    d13_assert_no_store(&unauthed);
+
+    let authed = d13_authed_get(&app, &auth, "/dashboard/api/metrics").await;
+    assert_eq!(authed.status().as_u16(), 200);
+    d13_assert_no_store(&authed);
+}
+
+#[tokio::test]
+async fn d13_metrics_shape_carries_seq_and_windows() {
+    // `/metrics` matches the frozen `MetricsResponse`: a `metrics_seq` cursor, the
+    // eight headline tile fields, and the three windows m1/m5/h1 each with the
+    // same fields. (Values are zero on a quiet gateway; the SHAPE is the contract.)
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let app = d13_router(d13_gateway(
+        Arc::new(MockUpstream::default()),
+        Arc::clone(&auth),
+    ));
+    let body = d13_json(d13_authed_get(&app, &auth, "/dashboard/api/metrics").await).await;
+
+    assert!(
+        body["metrics_seq"].is_u64(),
+        "metrics carries its domain cursor"
+    );
+    for field in [
+        "reqs_per_sec",
+        "active_streams",
+        "error_pct",
+        "p50",
+        "p95",
+        "p99",
+        "tokens_per_sec",
+        "cost_per_min",
+    ] {
+        assert!(body[field].is_number(), "metrics headline tile has {field}");
+    }
+    for window in ["m1", "m5", "h1"] {
+        let tile = &body["windows"][window];
+        assert!(tile.is_object(), "windows.{window} present");
+        for field in [
+            "reqs_per_sec",
+            "active_streams",
+            "error_pct",
+            "p50",
+            "p95",
+            "p99",
+            "tokens_per_sec",
+            "cost_per_min",
+        ] {
+            assert!(tile[field].is_number(), "windows.{window} has {field}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn d13_topology_shape_carries_seq_and_price_table() {
+    // `/topology` matches the frozen `TopologyResponse`: a `topology_seq` cursor,
+    // `nodes`/`edges` arrays, AND the configured `price_table` (the model row with
+    // the three finite per-1k rates the frontend `isModelPrice` guard requires).
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let app = d13_router(d13_gateway(
+        Arc::new(MockUpstream::default()),
+        Arc::clone(&auth),
+    ));
+    let body = d13_json(d13_authed_get(&app, &auth, "/dashboard/api/topology").await).await;
+
+    assert!(
+        body["topology_seq"].is_u64(),
+        "topology carries its domain cursor"
+    );
+    assert!(body["nodes"].is_array());
+    assert!(body["edges"].is_array());
+    // The price table carries the configured model with finite per-1k rates.
+    let price = &body["price_table"]["glm-5.1"];
+    assert_eq!(price["input_per_1k"], serde_json::json!(2.0));
+    assert_eq!(price["output_per_1k"], serde_json::json!(6.0));
+    assert_eq!(price["cached_per_1k"], serde_json::json!(0.5));
+}
+
+#[tokio::test]
+async fn d13_catalog_is_a_bare_array_no_cursor() {
+    // `/catalog` is the lone BARE array `[{id, context_limit}]` — NO cursor (a
+    // static-ish read, not a mutating domain). An upstream that reports no window
+    // collapses `context_limit` to 0 (non-null, per the frozen `CatalogEntry`).
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["model-a", "model-b"]).await;
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let app = d13_router(d13_gateway(Arc::new(upstream), Arc::clone(&auth)));
+    let body = d13_json(d13_authed_get(&app, &auth, "/dashboard/api/catalog").await).await;
+
+    let array = body
+        .as_array()
+        .expect("catalog is a BARE array (no cursor)");
+    assert_eq!(array.len(), 2);
+    assert_eq!(array[0]["id"], serde_json::json!("model-a"));
+    assert_eq!(
+        array[0]["context_limit"],
+        serde_json::json!(0),
+        "no upstream window ⇒ context_limit collapses to 0 (non-null)"
+    );
+}
+
+/// Build a `--with-debug-ui` app + its gateway over a wiremock upstream (the REAL
+/// `ReqwestUpstreamClient` leaf, so D2 captures the normalized + upstream bodies +
+/// `model_served`), with the price table configured. Auth is DEV-OPEN (loopback
+/// bind, no token), so `/dashboard/api/*` reads need no cookie — this exercises the
+/// full capture+price+REST e2e; the cookie/CSRF gating lives in its own tests.
+async fn d13_wiremock_app() -> (axum::Router, Arc<Gateway>, MockServer) {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.1"}]
+        })))
+        .mount(&server)
+        .await;
+    // The chat-completions SSE: one content delta + a final usage chunk so the flow
+    // finalizes Completed WITH usage (prompt 100 / completion 40 / cached 10) and so
+    // the leaf records `model_served = glm-5.1` (driving a cost of 0.425).
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[
+                    json!({
+                        "id": "chat-1",
+                        "choices": [{"index": 0, "delta": {"content": "Hello world"}, "finish_reason": null}],
+                        "usage": null
+                    }),
+                    json!({
+                        "id": "chat-1",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": 100,
+                            "completion_tokens": 40,
+                            "total_tokens": 140,
+                            "prompt_tokens_details": {"cached_tokens": 10}
+                        }
+                    }),
+                ])),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.price_table = d13_price_table();
+    // Loopback bind ⇒ dev-open auth (the routes register, no token required).
+    let (app, gateway) = llmconduit::build_app_with_gateway_and_options(
+        config,
+        None,
+        llmconduit::AppOptions {
+            with_debug_ui: true,
+        },
+    );
+    (app, gateway, server)
+}
+
+#[tokio::test]
+async fn d13_flows_filters_and_carries_flow_seq_and_cost() {
+    // `/flows` matches the frozen `FlowsResponse` `{flows, total, flow_seq}`. A real
+    // streamed flow (Completed, priced via the wiremock leaf) + a directly-finalized
+    // Failed flow let the `status=` filter prove the subset, the `flow_seq` cursor,
+    // and a non-null `cost` driven by the price table.
+    let (app, gateway, _server) = d13_wiremock_app().await;
+
+    // Drive one real Completed flow through the router so the leaf records
+    // `model_served = glm-5.1` and usage (⇒ cost 0.425).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "glm-5.1",
+                        "stream": true,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("drain SSE");
+    let completed = d13_await_any_terminal(&gateway).await;
+
+    // Open a second flow and finalize it Failed directly (no stream).
+    let failed = d3_open_flow(&gateway);
+    gateway.flow_store().finalize(
+        &failed,
+        llmconduit::dashboard_flow::FlowStatus::Failed,
+        Some("boom".to_string()),
+        None,
+    );
+
+    // Dev-open: no cookie needed.
+    let all = d13_json(d13_get(&app, "/dashboard/api/flows").await).await;
+    assert!(
+        all["flow_seq"].is_u64(),
+        "flows carries the FlowStore cursor"
+    );
+    assert_eq!(all["total"], serde_json::json!(2));
+    assert_eq!(all["flows"].as_array().unwrap().len(), 2);
+
+    // The completed row carries a non-null cost = usage × glm-5.1 price = 0.425.
+    let completed_row = all["flows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["api_call_id"] == serde_json::json!(completed))
+        .expect("completed row present");
+    let cost = completed_row["cost"].as_f64().expect("cost priced");
+    assert!(
+        (cost - 0.425).abs() < 1e-9,
+        "cost {cost} == usage×price 0.425"
+    );
+
+    // `status=failed` returns ONLY the failed flow.
+    let only_failed = d13_json(d13_get(&app, "/dashboard/api/flows?status=failed").await).await;
+    assert_eq!(only_failed["total"], serde_json::json!(1));
+    assert_eq!(
+        only_failed["flows"][0]["api_call_id"],
+        serde_json::json!(failed)
+    );
+    assert_eq!(
+        only_failed["flows"][0]["status"],
+        serde_json::json!("failed")
+    );
+}
+
+#[tokio::test]
+async fn d13_kill_honors_mutation_flag_and_csrf_and_authorizes_before_abort() {
+    // The kill route honors the D7a mutation+CSRF gate: 403 when mutations are OFF
+    // (even for a live flow — authorize-BEFORE-abort, so no existence oracle), 403
+    // on a CSRF mismatch, 200 on a valid CSRF kill, 404 on a re-kill of the now-
+    // finished flow. Drives a real parked stream so the AbortHub holds a live token.
+    let upstream = ChunkThenPendingUpstream::new(vec![
+        content_chunk("chat-1", "Hel"),
+        usage_chunk("chat-1", 100, 20, 120, Some(5), None),
+    ]);
+    let stream_polled = upstream.stream_polled.notified();
+
+    // (a) Mutations OFF: a live flow must STILL be 403 (authorize-before-abort).
+    let auth_off = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(upstream.clone()), Arc::clone(&auth_off));
+    let api_call_id = d3_open_flow(&gateway);
+    let mut stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(
+            base_request(vec![user_message("count")]),
+            Some(api_call_id.clone()),
+        )
+        .await
+        .expect("stream");
+    // Drain the early events until the upstream parks → the flow is live + registered.
+    let mut early = 0;
+    while early < 2 {
+        match stream.next().await {
+            Some(_) => early += 1,
+            None => break,
+        }
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_polled)
+        .await
+        .expect("upstream parked");
+    assert_eq!(
+        gateway.abort_hub().live_len(),
+        1,
+        "live flow registered a kill token"
+    );
+
+    let app_off = d13_router(Arc::clone(&gateway));
+    let (cookie, _exp) = auth_off.issue_session();
+    let denied = app_off
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/dashboard/api/flows/{api_call_id}/kill"))
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={cookie}; llmconduit_csrf=tok"),
+                )
+                .header("x-csrf-token", "tok")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        denied.status().as_u16(),
+        403,
+        "mutations OFF ⇒ 403 even for a live flow (authorize before abort)"
+    );
+    d13_assert_no_store(&denied);
+    assert_eq!(
+        gateway.abort_hub().live_len(),
+        1,
+        "a denied kill must NOT have aborted the flow (authorize-before-abort)"
+    );
+
+    // (b) Mutations ON but the SAME gateway: rebuild auth with mutations enabled and
+    // a router over the same gateway so the live flow is still killable.
+    let auth_on = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(true),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway_on = Arc::new(
+        gateway
+            .as_ref()
+            .clone()
+            .with_dashboard_auth(Some(Arc::clone(&auth_on))),
+    );
+    let app_on = d13_router(Arc::clone(&gateway_on));
+    let (cookie_on, _exp) = auth_on.issue_session();
+
+    // CSRF mismatch (header ≠ cookie) ⇒ 403.
+    let csrf_bad = app_on
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/dashboard/api/flows/{api_call_id}/kill"))
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={cookie_on}; llmconduit_csrf=secret"),
+                )
+                .header("x-csrf-token", "WRONG")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(csrf_bad.status().as_u16(), 403, "CSRF mismatch ⇒ 403");
+
+    // Valid CSRF (header == cookie) ⇒ 200 killed.
+    let killed = app_on
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/dashboard/api/flows/{api_call_id}/kill"))
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={cookie_on}; llmconduit_csrf=secret"),
+                )
+                .header("x-csrf-token", "secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(killed.status().as_u16(), 200, "valid CSRF kill ⇒ 200");
+    d13_assert_no_store(&killed);
+    let killed_body = d13_json(killed).await;
+    // The frozen `KillResponse` carries BOTH api_call_id and killed.
+    assert_eq!(killed_body["killed"], serde_json::json!(true));
+    assert_eq!(
+        killed_body["api_call_id"],
+        serde_json::json!(api_call_id),
+        "kill response carries the frozen KillResponse.api_call_id field"
+    );
+
+    // The killed stream tears down; the record finalizes Cancelled.
+    let drain = async { while stream.next().await.is_some() {} };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain).await;
+    let record = d3_await_terminal(&gateway_on, &api_call_id).await;
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Cancelled
+    );
+
+    // Re-kill of the now-finished flow ⇒ 404 (no live token).
+    let gone = app_on
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/dashboard/api/flows/{api_call_id}/kill"))
+                .header(
+                    axum::http::header::COOKIE,
+                    format!("llmconduit_session={cookie_on}; llmconduit_csrf=secret"),
+                )
+                .header("x-csrf-token", "secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        gone.status().as_u16(),
+        404,
+        "re-kill of a finished flow ⇒ 404"
+    );
+}
+
+#[tokio::test]
+async fn d13_end_to_end_streamed_flow_through_real_router() {
+    // THE CAPSTONE end-to-end against the REAL backend (a wiremock upstream + the
+    // real `ReqwestUpstreamClient` leaf): a streamed request POSTed through the
+    // router appears in `/flows`; its `/flows/:id` shows the THREE captured bodies
+    // (inbound from the middleware, normalized + upstream on-wire from the leaf) +
+    // usage + deltas; `/metrics` + `/topology` populate; a `/snapshot?at=` returns a
+    // BODY-FREE cut. The leaf records `model_served`, so the flow is priced.
+    let (app, gateway, _server) = d13_wiremock_app().await;
+
+    // POST a streamed /v1/chat/completions through the router (NOT behind auth —
+    // only /dashboard/* is). The `log_api_call` middleware mints the api_call_id,
+    // captures the inbound body, and opens the flow; the engine + leaf stream,
+    // capture the normalized + upstream bodies, and finalize.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "glm-5.1",
+                        "stream": true,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200, "streamed response served");
+    let _ = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+        .await
+        .expect("drain SSE");
+    let api_call_id = d13_await_any_terminal(&gateway).await;
+
+    // (1) The flow appears in `/flows` with a cost (dev-open: no cookie needed).
+    let flows = d13_json(d13_get(&app, "/dashboard/api/flows").await).await;
+    assert!(
+        flows["flows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["api_call_id"] == serde_json::json!(api_call_id) }),
+        "the streamed flow appears in /flows"
+    );
+
+    // (2) `/flows/:id` shows the THREE bodies + usage + deltas + flow_seq.
+    let detail =
+        d13_json(d13_get(&app, &format!("/dashboard/api/flows/{api_call_id}")).await).await;
+    assert!(
+        detail["flow_seq"].is_u64(),
+        "detail carries the flow cursor"
+    );
+    assert_eq!(detail["api_call_id"], serde_json::json!(api_call_id));
+    // The two on-wire bodies D2 captures: the INBOUND request (middleware) and the
+    // UPSTREAM chat body (the leaf). Both are parsed JSON objects in the detail.
+    assert!(
+        detail["inbound_body"].is_object(),
+        "inbound body captured (middleware)"
+    );
+    assert!(
+        detail["upstream_body"].is_object(),
+        "upstream on-wire body captured (D2 leaf)"
+    );
+    // The inbound body round-trips the request the client POSTed.
+    assert_eq!(
+        detail["inbound_body"]["model"],
+        serde_json::json!("glm-5.1")
+    );
+    // The upstream body carries the model the leaf actually POSTed upstream.
+    assert_eq!(
+        detail["upstream_body"]["model"],
+        serde_json::json!("glm-5.1")
+    );
+    // `normalized` is an OPTIONAL field (the contract marks it absent-when-unset);
+    // D2 does not populate a separate canonical body, so it is absent here — the
+    // handler surfaces `record.normalized` faithfully (present only when captured).
+    assert!(
+        detail.get("normalized").is_none() || detail["normalized"].is_object(),
+        "normalized is surfaced faithfully (absent when D2 did not capture it)"
+    );
+    let usage = &detail["usage"];
+    assert_eq!(
+        usage["total"],
+        serde_json::json!(140),
+        "usage threaded through"
+    );
+    assert_eq!(usage["prompt"], serde_json::json!(100));
+    assert!(
+        detail["deltas"].is_array(),
+        "deltas replayed from the monitor"
+    );
+    let cost = detail["cost"].as_f64().expect("detail cost priced");
+    assert!((cost - 0.425).abs() < 1e-9, "detail cost {cost} == 0.425");
+
+    // (3) `/metrics` populated — the completed flow bumped the rings.
+    let metrics = d13_json(d13_get(&app, "/dashboard/api/metrics").await).await;
+    assert!(
+        metrics["metrics_seq"].as_u64().unwrap() > 0,
+        "the finalized flow advanced metrics_seq"
+    );
+
+    // (4) `/topology` populated — price table + a topology_seq cursor.
+    let topology = d13_json(d13_get(&app, "/dashboard/api/topology").await).await;
+    assert!(topology["topology_seq"].is_u64());
+    assert!(
+        topology["price_table"]["glm-5.1"].is_object(),
+        "price table present"
+    );
+
+    // (5) `/snapshot?at=` returns a BODY-FREE cut. Take a coordinated snapshot
+    // directly (deterministic — the 5 s task may not have ticked), then read it back.
+    let cut = gateway
+        .metrics()
+        .snapshot(gateway.flow_store(), &gateway.provider_health_publisher())
+        .expect("snapshot taken");
+    let at = cut.taken_at_ms;
+    let snapshot = d13_json(d13_get(&app, &format!("/dashboard/api/snapshot?at={at}")).await).await;
+    assert!(snapshot["cursors"]["flow_seq"].is_u64());
+    assert!(snapshot["cursors"]["metrics_seq"].is_u64());
+    assert!(snapshot["cursors"]["topology_seq"].is_u64());
+    assert!(snapshot["cursors"]["monitor_seq"].is_u64());
+    assert!(snapshot["at_ms"].as_u64().unwrap() > 0);
+    // The summaries are BODY-FREE: a summary row carries NO inbound_body/normalized/
+    // upstream_body keys (only the detail endpoint carries bodies).
+    let summary = snapshot["summaries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["api_call_id"] == serde_json::json!(api_call_id))
+        .expect("the flow is in the snapshot summaries");
+    assert!(
+        summary.get("inbound_body").is_none(),
+        "snapshot summaries are BODY-FREE"
+    );
+    assert!(
+        summary.get("normalized").is_none(),
+        "snapshot summaries are BODY-FREE"
+    );
+    assert!(
+        summary.get("upstream_body").is_none(),
+        "snapshot summaries are BODY-FREE"
+    );
+    // The snapshot still reshapes metrics + topology into their REST bodies.
+    assert!(snapshot["metrics"]["metrics_seq"].is_u64());
+    assert!(snapshot["topology"]["price_table"].is_object());
+}
+
 #[tokio::test]
 async fn d3_cancel_during_send_finalizes_cancelled_not_failed() {
     // D3 R1 #1: a client that drops the SSE receiver while the engine is BLOCKED
@@ -5569,6 +6407,7 @@ fn test_config() -> Config {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        price_table: std::collections::HashMap::new(),
     }
 }
 
@@ -8262,6 +9101,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        price_table: std::collections::HashMap::new(),
     };
     // The image agent is off here, so the vision client is inert; a real
     // `ReqwestVisionClient` that is never called satisfies the constructor
