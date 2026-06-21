@@ -163,7 +163,7 @@ describe('useSankeyWindow — timestamped deltas, not cumulative totals (finding
     expect(result.current.deltasRef.current.map((d) => d.total)).toEqual([500, 150]);
   });
 
-  it('resets baselines + ring on a teardown (reset → idle) so a fresh session never diffs a stale total', () => {
+  it('resets baselines + ring on a teardown (reset → idle); the fresh snapshot SEEDS (no stale diff), then post-snapshot growth folds', () => {
     const ref = { now: 1000 };
     act(() => {
       dashboardStore.getState().upsertFlow(flow({ api_call_id: 'a', usage: usage({ prompt: 100, total: 100 }) }));
@@ -171,9 +171,10 @@ describe('useSankeyWindow — timestamped deltas, not cumulative totals (finding
     const { result } = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
     expect(result.current.deltasRef.current).toHaveLength(1);
 
-    // `reset()` enters the `idle` teardown state (continuity broken). A subsequent fresh snapshot with
-    // the SAME api_call_id at a LOWER cumulative must be treated as a new flow (delta = its full
-    // total), not a negative diff against the pre-reset baseline.
+    // `reset()` enters the `idle` teardown state (continuity broken). The subsequent fresh snapshot
+    // (epoch advances) SEEDS silently (D12 R4): its lifetime total (30) is NOT folded into the window
+    // as a fresh band, and the reused `api_call_id` at a LOWER total is never a negative diff against
+    // the pre-reset baseline — the seed re-baselines 'a' to 30 with no delta.
     act(() => {
       dashboardStore.getState().reset();
       dashboardStore.getState().applySnapshot({
@@ -183,8 +184,14 @@ describe('useSankeyWindow — timestamped deltas, not cumulative totals (finding
       });
       dashboardStore.getState().setConnection('live');
     });
-    const totals = result.current.deltasRef.current.map((d) => d.total);
-    expect(totals).toEqual([30]);
+    // The snapshot's lifetime total was seeded, not folded → the live window is empty.
+    expect(result.current.deltasRef.current.map((d) => d.total)).toEqual([]);
+
+    // Only GROWTH after the snapshot folds: 'a' streams 30 → 80, a +50 increment against the seed.
+    act(() => {
+      dashboardStore.getState().patchUsage('a', usage({ prompt: 80, total: 80 }));
+    });
+    expect(result.current.deltasRef.current.map((d) => d.total)).toEqual([50]);
   });
 });
 
@@ -251,5 +258,97 @@ describe('useSankeyWindow — APP-LIFETIME fold, not mount-scoped (D12 R3)', () 
     const deltas = result.current.deltasRef.current;
     expect(deltas.map((d) => d.total)).toEqual([50, 70]);
     expect(deltas.map((d) => d.ts)).toEqual([1000, 3000]);
+  });
+});
+
+describe('useSankeyWindow — the INITIAL snapshot SEEDS, never folds lifetime totals (D12 R4)', () => {
+  it("an initial snapshot's old completed flow (huge lifetime usage, finished_ms 30 min ago) does NOT appear in the current 30s window", () => {
+    // The wall clock is NOW; the snapshot carries a flow that finished 30 minutes ago having streamed
+    // a million LIFETIME tokens. Folding its lifetime total at arrival time would inflate the live 30s
+    // band by that million — exactly the D12 R4 bug.
+    const now = 1_700_000_000_000;
+    const ref = { now };
+    const thirtyMinAgo = now - 30 * 60_000;
+
+    // PRODUCTION ORDER: the app-lifetime engine installs on the EMPTY pre-connect store...
+    startSankeyFold(30_000, clockAt(ref));
+
+    // ...then the INITIAL snapshot lands via `applySnapshot` (epoch advances → this frame SEEDS).
+    act(() => {
+      dashboardStore.getState().applySnapshot({
+        cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+        flows: [
+          flow({
+            api_call_id: 'old', status: 'completed', model_served: 'gpt-4o', upstream_target: 'vllm-a',
+            started_ms: thirtyMinAgo - 5_000, finished_ms: thirtyMinAgo,
+            usage: usage({ prompt: 600_000, completion: 400_000, total: 1_000_000 }),
+          }),
+        ],
+        metrics: null, topology: null,
+      });
+      // The initial snapshot flips the store live (the real bootstrap flips via the live() path).
+      dashboardStore.getState().setConnection('live');
+    });
+
+    // The 1M lifetime total was SEEDED silently — the current 30s Sankey window is EMPTY, not 1M.
+    const { result } = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
+    expect(result.current.deltasRef.current).toEqual([]);
+  });
+
+  it('only usage GROWTH that occurs AFTER the snapshot folds into the window (the seeded baseline holds)', () => {
+    const now = 1_700_000_000_000;
+    const ref = { now };
+
+    startSankeyFold(30_000, clockAt(ref));
+    act(() => {
+      dashboardStore.getState().applySnapshot({
+        cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+        flows: [
+          // A still-running flow already at 1M lifetime tokens at snapshot time.
+          flow({
+            api_call_id: 'live', status: 'open', model_served: 'gpt-4o', upstream_target: 'vllm-a',
+            started_ms: now - 10_000, finished_ms: null,
+            usage: usage({ prompt: 600_000, completion: 400_000, total: 1_000_000 }),
+          }),
+        ],
+        metrics: null, topology: null,
+      });
+      dashboardStore.getState().setConnection('live');
+    });
+
+    const { result } = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
+    // Seeded → window empty despite the 1M lifetime total.
+    expect(result.current.deltasRef.current.map((d) => d.total)).toEqual([]);
+
+    // The flow streams 1_000_000 → 1_000_300 AFTER the snapshot — only the +300 GROWTH folds, stamped
+    // at its real arrival time, never the 1M lifetime baseline.
+    ref.now = now + 2_000;
+    act(() => {
+      dashboardStore.getState().patchUsage('live', usage({ prompt: 600_100, completion: 400_200, total: 1_000_300 }));
+    });
+    const deltas = result.current.deltasRef.current;
+    expect(deltas.map((d) => d.total)).toEqual([300]);
+    expect(deltas[0]!.ts).toBe(now + 2_000);
+    expect(deltas[0]!.completion).toBe(200);
+    expect(deltas[0]!.prompt).toBe(100);
+  });
+
+  it('a reconnect snapshot (restoreLiveSnapshot) likewise seeds — retained flows do not re-flood the window', () => {
+    const ref = { now: 1_700_000_000_000 };
+    startSankeyFold(30_000, clockAt(ref));
+
+    // A reconnect after a drop replaces the store with a fresh snapshot carrying retained flows at
+    // their LIFETIME totals (`restoreLiveSnapshot` flips live + bumps the epoch in one atomic update).
+    act(() => {
+      dashboardStore.getState().restoreLiveSnapshot({
+        cursors: { flow_seq: 7, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+        flows: [flow({ api_call_id: 'r', usage: usage({ prompt: 750_000, total: 750_000 }) })],
+        metrics: null, topology: null,
+      });
+    });
+
+    const { result } = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
+    // The retained flow's 750k lifetime total is seeded, not folded → window empty.
+    expect(result.current.deltasRef.current.map((d) => d.total)).toEqual([]);
   });
 });

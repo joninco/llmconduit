@@ -28,10 +28,25 @@
  * already at cumulative total T keeps baseline T; its next observation after a remount/seek-resume
  * diffs to 0 and emits NOTHING — its lifetime total is never re-stamped as a fresh 30 s band. Only
  * TRUE incremental growth folds, with its real arrival time. The baselines + ring are cleared ONLY
- * on a genuine TEARDOWN edge — the connection entering `'idle'`/`'closed'`, OR the monotonic
- * `connEpoch` advancing (a `reset()` / fresh snapshot, where cumulative continuity is broken and a
- * reused `api_call_id` may restart at a lower total). Because the fold engine is app-lifetime, that
- * clear fires even when no `SankeyView` is mounted at the instant of teardown.
+ * on a genuine TEARDOWN edge — the connection entering `'idle'`/`'closed'`, where cumulative
+ * continuity is broken and a reused `api_call_id` may restart at a lower total. Because the fold
+ * engine is app-lifetime, that clear fires even when no `SankeyView` is mounted at the instant of
+ * teardown.
+ *
+ * SNAPSHOT-SEED, NOT LIVE-GROWTH (D12 R4 — the fix for "the INITIAL snapshot stamps every retained
+ * flow's LIFETIME cumulative as a fresh delta at arrival time, so a 30-min-old completed flow's
+ * lifetime tokens inflate the current 30 s window"): a `FlowSummary.usage` in a snapshot is the
+ * flow's LIFETIME total, NOT growth that just happened. Folding the first observation of every
+ * snapshot flow as a `now()`-stamped delta (diff against an empty baseline) would dump hours of
+ * historical tokens into the live rolling window. So whenever the store crosses a SNAPSHOT/RESET
+ * boundary — signalled by the monotonic `connEpoch` advancing (`applySnapshot` = the initial &
+ * reconnect snapshots, `restoreLiveSnapshot`/`restoreLiveBaseline` = seek resume, `reset()` =
+ * teardown) — the NEXT fold runs in SEED mode: it SILENTLY stamps each flow's baseline to its
+ * CURRENT cumulative usage and emits NOTHING. Only usage GROWTH observed on LATER frames (same
+ * epoch, no boundary crossed) folds as timestamped deltas. This subsumes finding 3's no-restamp
+ * guarantee for the seek-resume path (the resumed flows seed silently instead of diffing to 0) and
+ * fixes the initial-snapshot inflation: a completed flow that streamed a million tokens before the
+ * snapshot seeds at that total and contributes to the window only if it grows AFTER the snapshot.
  */
 import { useEffect, useRef, useState } from 'react';
 import { dashboardStore } from './dashboardStore';
@@ -75,6 +90,12 @@ interface FoldEngine {
   lastFlows: Map<string, FlowSummary> | null;
   /** Last connection state, to detect the EDGE into a teardown state (clears baselines + ring). */
   lastConnection: string;
+  /**
+   * Last `connEpoch` folded, to detect a SNAPSHOT/RESET boundary (D12 R4). When it advances the next
+   * fold SEEDS baselines silently (a snapshot's flows carry LIFETIME totals, not just-arrived growth)
+   * so historical lifetime tokens never fold into the live rolling window as a fresh delta.
+   */
+  lastEpoch: number;
   retentionMs: number;
   now: () => number;
   /** Reader callbacks (the hook) fired after every ring change. */
@@ -111,19 +132,26 @@ function pruneRing(eng: FoldEngine, nowMs: number): boolean {
 
 /**
  * Fold the store's CURRENT `flows` into timestamped deltas. Runs on every store change (and once
- * eagerly at install). Cheap when nothing relevant changed:
+ * eagerly at install — on the empty pre-connect store). Cheap when nothing relevant changed:
  *  - SKIPS the per-flow scan entirely when the `flows` Map reference is UNCHANGED (MED fix: avoid an
  *    O(flows + deltas) cost on every unrelated monitor/metrics frame — those never replace `flows`,
  *    and `upsertFlow`/`patchUsage`/`patchFlowStatus` each install a NEW Map, so an identical
  *    reference proves no flow grew). Time-pruning when the clock advances WITHOUT a flow change is
- *    handled lazily by `pruneRing` on the read path (+ the view's per-second recompute tick).
- *  - SKIPS folding while `seeking` (the store holds the FROZEN cut, not live increments — D11 R5).
+ *    handled lazily by `pruneRing` on the read path (+ the view's per-second recompute tick). A SEED
+ *    frame overrides this skip — the baselines must be re-stamped to the snapshot's totals.
+ *  - SKIPS folding (and seeding) while `seeking` (the store holds the FROZEN cut, not live increments
+ *    — D11 R5). The epoch is not advanced by entering seek, so the resume frame still seeds.
+ *  - SEEDS baselines silently (emitting NO deltas) whenever the monotonic `connEpoch` advances — a
+ *    SNAPSHOT/RESET boundary (`applySnapshot`/`restoreLiveSnapshot`/`restoreLiveBaseline`/`reset`). A
+ *    snapshot's `usage` is LIFETIME cumulative, not just-arrived growth, so seeding prevents
+ *    historical totals from folding into the live window as a fresh band (D12 R4). Only same-epoch
+ *    growth on later frames folds as timestamped deltas.
  *  - CLEARS baselines + ring on the EDGE into a teardown state (`idle`/`closed`) — a genuine session
  *    teardown where cumulative continuity is broken and a reused `api_call_id` may restart at a lower
  *    total. A `live → seeking → live` round-trip never enters those states, so it does NOT clear (the
- *    baselines survive and an unchanged cumulative total diffs to 0 on resume — no restamp). Driven
- *    here (app-lifetime subscription) so it fires even with no SankeyView mounted (a `reset()` may
- *    land between route mounts).
+ *    resumed flows seed silently on the epoch-advancing resume frame — no restamp). Driven here
+ *    (app-lifetime subscription) so it fires even with no SankeyView mounted (a `reset()` may land
+ *    between route mounts).
  */
 function fold(eng: FoldEngine): void {
   const s = dashboardStore.getState();
@@ -141,11 +169,20 @@ function fold(eng: FoldEngine): void {
     if (had) emit(eng);
   }
 
-  // While SEEKING the store holds the FROZEN cut (not live increments) — never fold it (D11 R5).
+  // While SEEKING the store holds the FROZEN cut (not live increments) — never fold OR seed it. The
+  // epoch is NOT advanced here, so the resume frame (which DOES advance the epoch) still seeds. (D11
+  // R5 — the frozen cut never enters the live ring or baselines.)
   if (s.connection === 'seeking') return;
 
-  // MED fix: skip the whole scan when `flows` did not change reference (no flow grew this frame).
-  if (s.flows === eng.lastFlows) return;
+  // D12 R4: a SNAPSHOT/RESET boundary (monotonic `connEpoch` advanced) means the upcoming `flows`
+  // carry LIFETIME cumulative usage, not just-arrived growth. Run this fold in SEED mode: silently
+  // stamp baselines and emit NOTHING, so historical totals never fold into the live rolling window as
+  // a fresh `now()`-stamped delta. Subsequent same-epoch frames fold true growth normally.
+  const seed = s.connEpoch !== eng.lastEpoch;
+  eng.lastEpoch = s.connEpoch;
+  // Force the per-flow scan when seeding even if the `flows` reference happens to be unchanged (the
+  // baselines MUST be re-stamped to the snapshot's totals); otherwise apply the MED reference-skip.
+  if (!seed && s.flows === eng.lastFlows) return;
   eng.lastFlows = s.flows;
 
   const ts = eng.now();
@@ -156,26 +193,29 @@ function fold(eng: FoldEngine): void {
     if (!u) continue;
     const model = f.model_served ?? f.model_requested;
     if (!model) continue;
-    const prev = baselines.get(f.api_call_id);
-    // Diff against the prior cumulative snapshot; a brand-new flow's first observation IS its delta
-    // (prev = 0s). A non-increasing total (no growth) records nothing — so a historical cumulative
-    // total already captured in the baseline (after a remount/seek-resume) emits NOTHING, never a
-    // fresh `now()`-stamped band.
-    const dTotal = u.total - (prev?.total ?? 0);
-    if (dTotal > 0) {
-      eng.deltas.push({
-        ts,
-        upstream: f.upstream_target ?? null,
-        model,
-        prompt: Math.max(0, u.prompt - (prev?.prompt ?? 0)),
-        cached: Math.max(0, u.cached - (prev?.cached ?? 0)),
-        completion: Math.max(0, u.completion - (prev?.completion ?? 0)),
-        total: dTotal,
-      });
-      folded = true;
+    // On a SEED frame: silently re-baseline to the snapshot's cumulative total and emit no delta.
+    // Otherwise diff against the prior cumulative snapshot; a brand-new flow's first LIVE observation
+    // IS its delta (prev = 0s). A non-increasing total (no growth) records nothing — so a historical
+    // cumulative total already captured in the baseline (after a remount/seek-resume) emits NOTHING,
+    // never a fresh `now()`-stamped band.
+    if (!seed) {
+      const prev = baselines.get(f.api_call_id);
+      const dTotal = u.total - (prev?.total ?? 0);
+      if (dTotal > 0) {
+        eng.deltas.push({
+          ts,
+          upstream: f.upstream_target ?? null,
+          model,
+          prompt: Math.max(0, u.prompt - (prev?.prompt ?? 0)),
+          cached: Math.max(0, u.cached - (prev?.cached ?? 0)),
+          completion: Math.max(0, u.completion - (prev?.completion ?? 0)),
+          total: dTotal,
+        });
+        folded = true;
+      }
     }
     // Always advance the baseline to the latest cumulative (even on a non-positive diff, e.g. a
-    // corrected/reset total) so the NEXT diff is against the current truth.
+    // corrected/reset total, or a SEED frame) so the NEXT diff is against the current truth.
     baselines.set(f.api_call_id, { prompt: u.prompt, cached: u.cached, completion: u.completion, total: u.total });
   }
 
@@ -199,6 +239,7 @@ export function startSankeyFold(windowMs = DEFAULT_WINDOW_MS, now: () => number 
     deltas: [],
     lastFlows: null,
     lastConnection: dashboardStore.getState().connection as string,
+    lastEpoch: dashboardStore.getState().connEpoch,
     retentionMs: windowMs,
     now,
     listeners: new Set(),
@@ -206,6 +247,9 @@ export function startSankeyFold(windowMs = DEFAULT_WINDOW_MS, now: () => number 
   };
   engine = eng;
   // Fold the current state immediately, then on EVERY store change (no increment lost to batching).
+  // The composition root installs this on an EMPTY store before the socket connects, so the eager
+  // fold sees no flows; the initial snapshot lands LATER via `applySnapshot` (epoch advances → that
+  // frame SEEDS, never folding lifetime totals into the window — D12 R4).
   fold(eng);
   eng.unsubscribe = dashboardStore.subscribe(() => fold(eng));
 }
