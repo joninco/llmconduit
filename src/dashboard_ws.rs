@@ -55,7 +55,6 @@ use crate::dashboard_flow::FlowUsage;
 use crate::engine::Gateway;
 use crate::metrics::MetricsView;
 use crate::metrics::WindowReport;
-use crate::monitor::DebugRequestStatus;
 use crate::monitor::DebugUpdate;
 use crate::monitor::DebugWsMessage;
 use crate::upstream::ProviderHealthSnapshot;
@@ -114,6 +113,87 @@ pub struct DashboardFrame {
     pub domain: Domain,
     pub seq: u64,
     pub batch: Vec<DashboardPayload>,
+}
+
+/// The four per-domain cursors carried on the initial [`SnapshotMessage`] — the
+/// `{flow,metrics,topology,monitor}` sequences the SPA installs as its dedup
+/// baseline (`commitSnapshot` in `dashboard-frontend/src/api/ws.ts`). Serializes
+/// snake_case to the frozen `SeqCursors` contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SeqCursors {
+    pub flow_seq: u64,
+    pub metrics_seq: u64,
+    pub topology_seq: u64,
+    pub monitor_seq: u64,
+}
+
+/// The full `/api/metrics`-shaped snapshot body (the flat tile + the three
+/// windows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live
+/// [`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsSnapshot {
+    pub metrics_seq: u64,
+    pub reqs_per_sec: f64,
+    pub active_streams: u64,
+    pub error_pct: f64,
+    pub p50: f64,
+    pub p95: f64,
+    pub p99: f64,
+    pub tokens_per_sec: f64,
+    pub cost_per_min: f64,
+    pub windows: MetricWindows,
+}
+
+/// The full `/api/topology`-shaped snapshot body (nodes + edges + the price table)
+/// PLUS its `topology_seq` cursor. Mirrors the frontend `TopologyResponse`. The
+/// price table is empty until D13 wires the price config; an empty map satisfies
+/// the frontend `isPriceTable` guard (vacuously every value is a finite price).
+#[derive(Debug, Clone, Serialize)]
+pub struct TopologySnapshot {
+    pub topology_seq: u64,
+    pub nodes: Vec<TopologyNode>,
+    pub edges: Vec<TopologyEdge>,
+    pub price_table: std::collections::BTreeMap<String, ModelPrice>,
+}
+
+/// One model's price row (`/api/topology` `price_table` value). All three rates
+/// are finite (the frontend `isModelPrice` guard rejects NaN/Inf). Populated by
+/// D13's price config; absent entries simply do not appear.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ModelPrice {
+    pub input_per_1k: f64,
+    pub output_per_1k: f64,
+    pub cached_per_1k: f64,
+}
+
+/// The INITIAL WS message: a `type:"snapshot"` envelope the SPA waits for BEFORE
+/// it renders. The frontend (`dashboard-frontend/src/api/ws.ts`) BUFFERS every
+/// live [`DashboardFrame`] until this lands (`snapshotApplied`), so it MUST be the
+/// FIRST frame on a `/dashboard/ws` connection — else the dashboard never renders
+/// (D7b R1 finding 1). It seeds the store's cursors + flow rows + metrics/topology
+/// baseline in one atomic install (`restoreLiveSnapshot`); subsequent live frames
+/// build on it. Internally tagged `type:"snapshot"` to match the frozen
+/// `SnapshotFrame` discriminant.
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotMessage {
+    /// Discriminant — always `"snapshot"`; the SPA routes on it.
+    #[serde(rename = "type")]
+    pub kind: SnapshotTag,
+    pub cursors: SeqCursors,
+    pub flows: Vec<crate::dashboard_flow::SnapshotFlowSummary>,
+    /// Metrics baseline (or `null` when metrics are disabled).
+    pub metrics: Option<MetricsSnapshot>,
+    /// Topology baseline (or `null` when no providers are published yet).
+    pub topology: Option<TopologySnapshot>,
+}
+
+/// The literal `"snapshot"` tag for [`SnapshotMessage::kind`] (a unit enum so the
+/// value is fixed at the type level and serializes to exactly that string).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotTag {
+    Snapshot,
 }
 
 /// One dashboard payload. Internally `type`-tagged (snake_case) to match the
@@ -268,24 +348,47 @@ pub struct TopologyEdge {
 // ---------------------------------------------------------------------------
 
 /// Build the dashboard frames for ONE monitor [`DebugUpdate`]. The update's
-/// `sequence` is the Monitor domain cursor: a SINGLE monitor frame carries every
-/// non-flow message under that one `seq`, so whole-frame dedup never drops a
-/// sibling. `Usage`/`RequestStatus` messages are routed OUT to the flow domain
-/// (keyed by `api_call_id` recovered from `flow_store`), each as its own
-/// flow-domain frame stamped with the FlowStore's `flow_seq` at this instant.
+/// `sequence` is the Monitor domain cursor: a SINGLE monitor frame carries EVERY
+/// original [`DebugWsMessage`] sibling under that one `seq`, so whole-frame dedup
+/// drops a stale WHOLE update, never a live sibling.
 ///
-/// Returns the frames in batch order: any flow frames (usage/status) followed by
-/// the single monitor frame (when it has any messages). A `Usage`/`RequestStatus`
-/// whose `response_id` does not resolve in the FlowStore falls back into the
-/// monitor batch, so no message is ever dropped.
+/// ## Sibling-no-drop (D7b R1 finding 2): enrichment is ADDITIVE, not a move
+/// EVERY original message ALWAYS rides the monitor batch as a
+/// [`DashboardPayload::Monitor`] — `Usage`/`RequestStatus` are NOT removed from it.
+/// On top of that, a resolvable `Usage`/`RequestStatus` ALSO yields a flow-domain
+/// enrichment payload (`usage`/`flow_status` keyed by `api_call_id` recovered from
+/// `flow_store`). So a `DebugUpdate` still becomes ONE Monitor frame containing all
+/// its siblings, PLUS any additive flow-domain enrichment frame.
+///
+/// ## Event-time flow seq (D7b R1 finding 3)
+/// The flow frame is stamped with the FlowStore mutation `seq` read ATOMICALLY with
+/// the record (`detail_with_seq`), coalesced to the MAX across the resolved records
+/// — never a separately-read send-time `flow_seq()`. A queued/replayed older update
+/// would otherwise pick up a newer global cursor (bumped by unrelated flows in the
+/// gap) and dedup-drop a genuinely newer flow frame on the client.
+///
+/// Returns the frames in batch order: the flow enrichment frame (when any) followed
+/// by the single monitor frame (always, when the update has any messages).
 pub fn frames_for_update(
     update: &DebugUpdate,
     flow_store: &DashboardFlowStore,
 ) -> Vec<DashboardFrame> {
     let mut monitor_batch: Vec<DashboardPayload> = Vec::new();
     let mut flow_batch: Vec<DashboardPayload> = Vec::new();
+    // The flow frame's seq is the MAX event-time FlowStore seq across the records
+    // that produced the enrichment payloads (finding 3) — set only when a flow
+    // payload is actually emitted.
+    let mut flow_seq: Option<u64> = None;
+    let mut bump_flow_seq = |seq: u64| {
+        flow_seq = Some(flow_seq.map_or(seq, |cur| cur.max(seq)));
+    };
 
     for message in &update.messages {
+        // EVERY original message ALWAYS stays in the monitor batch (finding 2 —
+        // sibling-no-drop). The flow arms below are ADDITIVE enrichment.
+        monitor_batch.push(DashboardPayload::Monitor {
+            message: message.clone(),
+        });
         match message {
             DebugWsMessage::Usage {
                 response_id,
@@ -294,50 +397,42 @@ pub fn frames_for_update(
                 total,
                 cached,
                 reasoning,
-            } => match flow_store.detail(response_id) {
-                Some(record) => flow_batch.push(DashboardPayload::Usage {
-                    api_call_id: record.api_call_id.clone(),
-                    response_id: Some(response_id.clone()),
-                    prompt: *prompt,
-                    completion: *completion,
-                    total: *total,
-                    cached: *cached,
-                    reasoning: *reasoning,
-                }),
-                // Unresolved (store disabled / flow evicted): keep it in the
-                // monitor batch so the transcript usage frame is never dropped.
-                None => monitor_batch.push(DashboardPayload::Monitor {
-                    message: message.clone(),
-                }),
-            },
+            } => {
+                if let Some((record, seq)) = flow_store.detail_with_seq(response_id) {
+                    bump_flow_seq(seq);
+                    flow_batch.push(DashboardPayload::Usage {
+                        api_call_id: record.api_call_id.clone(),
+                        response_id: Some(response_id.clone()),
+                        prompt: *prompt,
+                        completion: *completion,
+                        total: *total,
+                        cached: *cached,
+                        reasoning: *reasoning,
+                    });
+                }
+            }
             DebugWsMessage::RequestStatus {
                 response_id,
-                status,
                 completed_at_ms,
-                error: _,
-            } => match flow_store.detail(response_id) {
-                Some(record) => {
-                    flow_batch.push(flow_status_payload(&record, *status, *completed_at_ms))
+                ..
+            } => {
+                if let Some((record, seq)) = flow_store.detail_with_seq(response_id) {
+                    bump_flow_seq(seq);
+                    flow_batch.push(flow_status_payload(&record, *completed_at_ms));
                 }
-                None => monitor_batch.push(DashboardPayload::Monitor {
-                    message: message.clone(),
-                }),
-            },
-            other => monitor_batch.push(DashboardPayload::Monitor {
-                message: other.clone(),
-            }),
+            }
+            _ => {}
         }
     }
 
     let mut frames = Vec::new();
-    if !flow_batch.is_empty() {
-        // The flow domain's cursor is the FlowStore mutation sequence at this
-        // instant (the status/usage transitions that produced these payloads
-        // already bumped it). Per-domain dedup is the client's job; the server
+    if let Some(seq) = flow_seq {
+        // Stamp with the event-time FlowStore seq (finding 3), not a send-time
+        // global `flow_seq()`. Per-domain dedup is the client's job; the server
         // just stamps the correct `{domain, seq}`.
         frames.push(DashboardFrame {
             domain: Domain::Flow,
-            seq: flow_store.flow_seq(),
+            seq,
             batch: flow_batch,
         });
     }
@@ -351,22 +446,18 @@ pub fn frames_for_update(
     frames
 }
 
-/// Build a flow-domain `FlowStatus` payload by joining the monitor status
-/// transition to the authoritative FlowStore [`FlowRecord`] (D1): the
-/// `api_call_id` (authoritative key), the served identity, cumulative usage, and
-/// timing come from the record; the live `status`/`completed_at_ms` come from the
-/// monitor message. The monitor's `DebugRequestStatus` maps to the FlowStore
-/// `FlowStatus`; an unmapped value defaults to the record's own status.
-fn flow_status_payload(
-    record: &FlowRecord,
-    monitor_status: DebugRequestStatus,
-    completed_at_ms: Option<u128>,
-) -> DashboardPayload {
-    let status = match monitor_status {
-        DebugRequestStatus::Running => FlowStatus::Open,
-        DebugRequestStatus::Completed => FlowStatus::Completed,
-        DebugRequestStatus::Failed => FlowStatus::Failed,
-    };
+/// Build a flow-domain `FlowStatus` payload from the authoritative FlowStore
+/// [`FlowRecord`] (D1): the `api_call_id` (authoritative key), the served identity,
+/// cumulative usage, timing, AND the lifecycle `status` all come from the record.
+///
+/// The status is taken from `record.status` (the FlowStore [`FlowStatus`], which
+/// HAS a `Cancelled` variant) rather than re-derived from the monitor message's
+/// `DebugRequestStatus` (which has only running/completed/failed) — D7b R1 finding
+/// 4: a client hang-up the FlowStore finalized `Cancelled` must serialize
+/// `cancelled`, not be flattened to `failed`. The monitor `completed_at_ms` is used
+/// ONLY as a fallback to derive `elapsed_ms` when the record has not finalized its
+/// own measured elapsed yet.
+fn flow_status_payload(record: &FlowRecord, completed_at_ms: Option<u128>) -> DashboardPayload {
     // Prefer the record's measured elapsed; fall back to a wall-clock delta from
     // the monitor's completion stamp (when the record has not finalized yet).
     let elapsed_ms = record
@@ -375,7 +466,7 @@ fn flow_status_payload(
     DashboardPayload::FlowStatus {
         api_call_id: record.api_call_id.clone(),
         response_id: record.response_id.clone(),
-        status,
+        status: record.status,
         model_requested: record.model_requested.clone(),
         model_served: record.model_served.clone(),
         upstream_target: record.upstream_target.clone(),
@@ -473,6 +564,85 @@ pub fn topology_frame(snapshot: &ProviderHealthSnapshot) -> DashboardFrame {
     }
 }
 
+/// Build the metrics half of the initial [`SnapshotMessage`] from a collapsed
+/// [`MetricsView`] (D5) + its `metrics_seq`. Same flat tile + three windows as a
+/// live [`DashboardPayload::MetricTick`], with the cursor attached.
+fn metrics_snapshot(view: &MetricsView, metrics_seq: u64) -> MetricsSnapshot {
+    let m1 = window_tile(&view.window_1m);
+    MetricsSnapshot {
+        metrics_seq,
+        reqs_per_sec: m1.reqs_per_sec,
+        active_streams: m1.active_streams,
+        error_pct: m1.error_pct,
+        p50: m1.p50,
+        p95: m1.p95,
+        p99: m1.p99,
+        tokens_per_sec: m1.tokens_per_sec,
+        cost_per_min: m1.cost_per_min,
+        windows: MetricWindows {
+            m1,
+            m5: window_tile(&view.window_5m),
+            h1: window_tile(&view.window_1h),
+        },
+    }
+}
+
+/// Build the topology half of the initial [`SnapshotMessage`] from a D4
+/// [`ProviderHealthSnapshot`]. Same nodes/edges as a live [`topology_frame`], with
+/// the `topology_seq` cursor attached and an (empty until D13) `price_table`.
+fn topology_snapshot(snapshot: &ProviderHealthSnapshot) -> TopologySnapshot {
+    let nodes: Vec<TopologyNode> = snapshot
+        .providers
+        .iter()
+        .map(TopologyNode::from_health)
+        .collect();
+    let edges: Vec<TopologyEdge> = snapshot
+        .providers
+        .iter()
+        .map(|provider| TopologyEdge {
+            from: "gateway".to_string(),
+            to: provider.id.clone(),
+            throughput: 0.0,
+            tokens_per_sec: 0.0,
+            cost_per_sec: 0.0,
+        })
+        .collect();
+    TopologySnapshot {
+        topology_seq: snapshot.version,
+        nodes,
+        edges,
+        // D13 wires the real price config; an empty table is contract-valid.
+        price_table: std::collections::BTreeMap::new(),
+    }
+}
+
+/// Build the INITIAL `type:"snapshot"` message a fresh `/dashboard/ws` connection
+/// MUST send FIRST (D7b R1 finding 1) — before any live [`DashboardFrame`]. The SPA
+/// buffers every frame until this lands, so it seeds the whole baseline atomically:
+/// the four per-domain cursors, the body-free flow rows, and the metrics/topology
+/// cuts. The cursors come from the SAME reads that built `flows`/`metrics`/
+/// `topology` so the client's dedup baseline matches the seeded rows.
+fn snapshot_message(
+    flows: Vec<crate::dashboard_flow::SnapshotFlowSummary>,
+    flow_seq: u64,
+    metrics: Option<MetricsSnapshot>,
+    topology: Option<TopologySnapshot>,
+    monitor_seq: u64,
+) -> SnapshotMessage {
+    SnapshotMessage {
+        kind: SnapshotTag::Snapshot,
+        cursors: SeqCursors {
+            flow_seq,
+            metrics_seq: metrics.as_ref().map_or(0, |m| m.metrics_seq),
+            topology_seq: topology.as_ref().map_or(0, |t| t.topology_seq),
+            monitor_seq,
+        },
+        flows,
+        metrics,
+        topology,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // /dashboard/ws handler
 // ---------------------------------------------------------------------------
@@ -510,11 +680,12 @@ pub async fn dashboard_ws(
         .into_response()
 }
 
-/// Drive one `/dashboard/ws` connection: replay the retained monitor snapshot as
-/// batched frames, then multiplex the live monitor broadcast, the periodic metric
-/// tick, and the topology poller — all racing the cookie-`exp` close timer so no
-/// frame is delivered past expiry. `session_exp == u64::MAX` (dev-open) yields an
-/// effectively-infinite timer.
+/// Drive one `/dashboard/ws` connection: send the INITIAL `type:"snapshot"` message
+/// FIRST (the SPA buffers every live frame until it lands — D7b R1 finding 1), then
+/// replay the retained monitor transcript as batched frames, then multiplex the live
+/// monitor broadcast, the periodic metric tick, and the topology poller — all racing
+/// the cookie-`exp` close timer so nothing is delivered past expiry.
+/// `session_exp == u64::MAX` (dev-open) yields an effectively-infinite timer.
 async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_exp: u64) {
     let flow_store = gateway.flow_store().clone();
     let mut monitor_rx = gateway.subscribe_monitor();
@@ -525,16 +696,43 @@ async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_
     let expiry = wait_for_session_expiry(session_exp);
     tokio::pin!(expiry);
 
-    // Replay the retained monitor snapshot as ONE batched monitor frame (its
-    // messages share `snapshot.last_sequence`), routing usage/status to the flow
-    // domain exactly like the live path. The snapshot is a point-in-time cut, so
-    // a single update with `sequence = snapshot.last_sequence` models it.
+    // -- (finding 1) The INITIAL snapshot message — the FIRST thing on the wire --
+    // The SPA gates ALL live frames behind `snapshotApplied`, so this MUST precede
+    // every `DashboardFrame`. It seeds the dedup cursors + flow rows + metrics/
+    // topology baseline atomically. The metrics/topology cursors here are the live
+    // watermarks the loop below resumes from, so the next periodic tick is the first
+    // NEW frame (no redundant baseline frame, no self-dedup). The monitor cursor is
+    // 0: the snapshot body carries NO transcript, so the retained-transcript replay
+    // below (seq = `last_sequence`) is ACCEPTED, seeding the inspector history.
+    let mut last_metrics_seq = gateway.metrics().metrics_seq();
+    let metrics = Some(metrics_snapshot(
+        &gateway.metrics().view(),
+        last_metrics_seq,
+    ));
+    let topo = gateway.provider_health_publisher().latest();
+    let mut last_topology_version = topo.version;
+    let topology = Some(topology_snapshot(&topo));
+    let initial = snapshot_message(
+        flow_store.snapshot_summaries(),
+        flow_store.flow_seq(),
+        metrics,
+        topology,
+        // monitor baseline 0 — the transcript rides the replay frame below.
+        0,
+    );
+    // Replay the retained monitor transcript as ONE batched monitor frame (its
+    // messages share `snapshot.last_sequence`). Enrichment flow frames it emits are
+    // stamped at event-time seqs ≤ the snapshot's `flow_seq`, so the client dedups
+    // them (the snapshot already carries those flows) — only the monitor-domain
+    // transcript frame advances the (snapshot-0) monitor cursor.
     let snapshot_update = DebugUpdate {
         sequence: snapshot.last_sequence,
         messages: snapshot.messages.clone(),
     };
     let snapshot_frames = frames_for_update(&snapshot_update, &flow_store);
-    match send_frames(&snapshot_frames, expiry.as_mut(), &mut socket).await {
+    // Send the snapshot FIRST, then the replay frames, racing expiry throughout
+    // (finding 1: snapshot strictly precedes every frame).
+    match send_initial(&initial, &snapshot_frames, expiry.as_mut(), &mut socket).await {
         SendOutcome::Completed => {}
         SendOutcome::Expired => {
             let _ = socket.send(Message::Close(None)).await;
@@ -543,39 +741,12 @@ async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_
         SendOutcome::Failed => return,
     }
 
-    // Send an initial metric + topology frame so a fresh client has a baseline
-    // before the first periodic tick.
-    let mut last_metrics_seq = gateway.metrics().metrics_seq();
-    let mut last_topology_version = {
-        let snapshot = gateway.provider_health_publisher().latest();
-        let frame = topology_frame(&snapshot);
-        let version = snapshot.version;
-        match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut socket).await {
-            SendOutcome::Completed => {}
-            SendOutcome::Expired => {
-                let _ = socket.send(Message::Close(None)).await;
-                return;
-            }
-            SendOutcome::Failed => return,
-        }
-        version
-    };
-    {
-        let frame = metric_tick_frame(&gateway.metrics().view(), last_metrics_seq);
-        match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut socket).await {
-            SendOutcome::Completed => {}
-            SendOutcome::Expired => {
-                let _ = socket.send(Message::Close(None)).await;
-                return;
-            }
-            SendOutcome::Failed => return,
-        }
-    }
-
     let mut metric_ticker = tokio::time::interval(METRIC_TICK_INTERVAL);
     metric_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // The first `interval` tick fires immediately; consume it so the baseline
-    // frame above is not duplicated on the very next loop.
+    // The first `interval` tick fires immediately; consume it so the loop's first
+    // metric frame is a genuinely NEW sample, not an instant re-send of the metrics
+    // baseline already carried by the initial snapshot (its `metrics_seq` seeds
+    // `last_metrics_seq`, so the loop emits only once the seq advances).
     metric_ticker.tick().await;
     let mut topology_ticker = tokio::time::interval(TOPOLOGY_POLL_INTERVAL);
     topology_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -644,17 +815,23 @@ async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_
     }
 }
 
-/// A sink for one dashboard frame. Abstracts the WS socket so the send/expiry
-/// race ([`send_frames`]) is unit-testable with a mock sink — an `axum`
-/// `WebSocket` can't be constructed off a real upgrade in a unit test.
+/// A sink for the dashboard wire messages. Abstracts the WS socket so the
+/// send/expiry race ([`send_frames`] / [`send_snapshot`]) is unit-testable with a
+/// mock sink — an `axum` `WebSocket` can't be constructed off a real upgrade in a
+/// unit test.
 trait FrameSink {
     /// Send one frame; `false` means the peer is gone (sending should stop).
     fn send_frame(&mut self, frame: &DashboardFrame) -> impl Future<Output = bool>;
+    /// Send the initial `type:"snapshot"` message; `false` means the peer is gone.
+    fn send_snapshot_message(&mut self, snap: &SnapshotMessage) -> impl Future<Output = bool>;
 }
 
 impl FrameSink for WebSocket {
     fn send_frame(&mut self, frame: &DashboardFrame) -> impl Future<Output = bool> {
         send_one(self, frame)
+    }
+    fn send_snapshot_message(&mut self, snap: &SnapshotMessage) -> impl Future<Output = bool> {
+        send_snapshot_one(self, snap)
     }
 }
 
@@ -690,11 +867,58 @@ async fn send_frames(
     SendOutcome::Completed
 }
 
+/// Send the initial snapshot message into `sink`, racing the armed `expiry` future
+/// so it is never delivered past the cookie `exp`. The snapshot MUST precede every
+/// `DashboardFrame` (finding 1); the same `biased` race as [`send_frames`] keeps an
+/// already-/near-expired cookie from emitting it.
+async fn send_snapshot(
+    snapshot: &SnapshotMessage,
+    mut expiry: std::pin::Pin<&mut (impl Future<Output = ()> + ?Sized)>,
+    sink: &mut impl FrameSink,
+) -> SendOutcome {
+    tokio::select! {
+        biased;
+        _ = expiry.as_mut() => SendOutcome::Expired,
+        sent = sink.send_snapshot_message(snapshot) => {
+            if sent { SendOutcome::Completed } else { SendOutcome::Failed }
+        }
+    }
+}
+
+/// The connection PREAMBLE in its mandated order (D7b R1 finding 1): the initial
+/// `type:"snapshot"` message FIRST, then the retained-transcript replay `frames`.
+/// The SPA buffers every frame until the snapshot lands, so the snapshot strictly
+/// precedes every frame here. Each step races `expiry`; a mid-preamble expiry/peer
+/// loss short-circuits with `Expired`/`Failed` (the caller closes the socket). This
+/// is its own unit so the snapshot-first ordering is testable with a recording sink
+/// (an `axum` `WebSocket` can't be built off a real upgrade).
+async fn send_initial(
+    snapshot: &SnapshotMessage,
+    frames: &[DashboardFrame],
+    mut expiry: std::pin::Pin<&mut (impl Future<Output = ()> + ?Sized)>,
+    sink: &mut impl FrameSink,
+) -> SendOutcome {
+    match send_snapshot(snapshot, expiry.as_mut(), sink).await {
+        SendOutcome::Completed => {}
+        other => return other,
+    }
+    send_frames(frames, expiry.as_mut(), sink).await
+}
+
 /// Serialize + send one frame as a WS text message. A serialization failure is
 /// treated as a no-op success (skip the frame) rather than tearing down the
 /// socket, mirroring `/debug/ws`.
 async fn send_one(socket: &mut WebSocket, frame: &DashboardFrame) -> bool {
     let Ok(payload) = serde_json::to_string(frame) else {
+        return true;
+    };
+    socket.send(Message::Text(payload.into())).await.is_ok()
+}
+
+/// Serialize + send the initial snapshot message as a WS text message. Like
+/// [`send_one`], a serialization failure is a no-op success rather than a teardown.
+async fn send_snapshot_one(socket: &mut WebSocket, snapshot: &SnapshotMessage) -> bool {
+    let Ok(payload) = serde_json::to_string(snapshot) else {
         return true;
     };
     socket.send(Message::Text(payload.into())).await.is_ok()
@@ -730,6 +954,7 @@ mod tests {
     use crate::dashboard_flow::redact_headers;
     use crate::monitor::DebugRequest;
     use crate::monitor::DebugRequestStats;
+    use crate::monitor::DebugRequestStatus;
     use crate::monitor::DebugSegment;
     use crate::monitor::DebugSegmentKind;
     use axum::http::HeaderMap;
@@ -789,10 +1014,11 @@ mod tests {
     }
 
     /// Without the FlowStore link, a monitor `Usage`/`RequestStatus` cannot be
-    /// keyed by `api_call_id`, so it FALLS BACK into the monitor batch rather than
-    /// being dropped (no transcript data lost).
+    /// enriched into a flow payload, so NO flow frame is emitted — but both messages
+    /// still ride the monitor batch (the monitor batch ALWAYS carries every original
+    /// sibling — finding 2), so no transcript data is lost.
     #[test]
-    fn unresolved_usage_status_fall_back_to_monitor_batch() {
+    fn unresolved_usage_status_stay_in_monitor_batch_no_flow_frame() {
         let store = DashboardFlowStore::disabled();
         let update = DebugUpdate {
             sequence: 9,
@@ -819,16 +1045,19 @@ mod tests {
         assert_eq!(
             frames[0].batch.len(),
             2,
-            "both fall back to monitor, none dropped"
+            "both stay in monitor, none dropped"
         );
     }
 
-    /// With a live FlowStore record (linked `response_id → api_call_id`), a
-    /// monitor `Usage` routes OUT to a flow-domain `usage` payload keyed by
-    /// `api_call_id`, and `RequestStatus` to a flow-domain `flow_status`. The
-    /// remaining messages stay in a monitor frame.
+    /// With a live FlowStore record (linked `response_id → api_call_id`), a monitor
+    /// `Usage`/`RequestStatus` yields an ADDITIVE flow-domain `usage`/`flow_status`
+    /// enrichment payload keyed by `api_call_id` — WITHOUT being removed from the
+    /// monitor batch (D7b R1 finding 2: the monitor frame still carries ALL THREE
+    /// original siblings, sibling-no-drop). The flow `status` is the record's
+    /// `FlowStatus` (here `Open` — the record was opened, never finalized), not the
+    /// monitor message's `Completed` (finding 4).
     #[test]
-    fn usage_and_status_route_to_flow_domain_keyed_by_api_call_id() {
+    fn usage_status_enrich_flow_domain_additively_without_dropping_monitor_siblings() {
         let store = DashboardFlowStore::new();
         store.open(
             "api_001".to_string(),
@@ -867,13 +1096,13 @@ mod tests {
             ],
         };
         let frames = frames_for_update(&update, &store);
-        // A flow frame (usage + status) and a monitor frame (the segment).
+        // An additive flow frame (usage + status) AND a monitor frame (ALL 3 originals).
         assert_eq!(frames.len(), 2);
         let flow = frames
             .iter()
             .find(|f| f.domain == Domain::Flow)
             .expect("flow frame");
-        assert_eq!(flow.batch.len(), 2, "usage + flow_status");
+        assert_eq!(flow.batch.len(), 2, "usage + flow_status enrichment");
         match &flow.batch[0] {
             DashboardPayload::Usage {
                 api_call_id,
@@ -899,7 +1128,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(api_call_id, "api_001");
-                assert_eq!(*status, FlowStatus::Completed);
+                // Record status (Open), NOT the monitor message's Completed (finding 4).
+                assert_eq!(*status, FlowStatus::Open);
             }
             other => panic!("expected flow_status payload, got {other:?}"),
         }
@@ -909,8 +1139,163 @@ mod tests {
             .expect("monitor frame");
         assert_eq!(
             monitor.batch.len(),
-            1,
-            "only the non-flow message stays in monitor"
+            3,
+            "sibling-no-drop: ALL three originals stay in the monitor batch"
+        );
+        // The enrichment is ADDITIVE — the usage + status messages are STILL present
+        // in the monitor batch, not moved out of it.
+        let monitor_kinds: Vec<&DebugWsMessage> = monitor
+            .batch
+            .iter()
+            .map(|p| match p {
+                DashboardPayload::Monitor { message } => message,
+                other => panic!("monitor batch must hold only Monitor payloads, got {other:?}"),
+            })
+            .collect();
+        assert!(
+            monitor_kinds
+                .iter()
+                .any(|m| matches!(m, DebugWsMessage::Usage { .. })),
+            "the Usage sibling is retained in the monitor batch"
+        );
+        assert!(
+            monitor_kinds
+                .iter()
+                .any(|m| matches!(m, DebugWsMessage::RequestStatus { .. })),
+            "the RequestStatus sibling is retained in the monitor batch"
+        );
+    }
+
+    /// D7b R1 finding 4: a flow the FlowStore finalized `Cancelled` (client hang-up)
+    /// serializes `status: "cancelled"`, NOT flattened to `failed`. The monitor
+    /// `RequestStatus` only carries `failed`/`completed`/`running`, so the payload
+    /// MUST take its status from the record's `FlowStatus` (which has `Cancelled`).
+    #[test]
+    fn cancelled_flow_serializes_cancelled_not_failed() {
+        let store = DashboardFlowStore::new();
+        store.open(
+            "api_cxl".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            redact_headers(&HeaderMap::new()),
+            Some(capture_body(b"{}")),
+        );
+        store.link("resp_cxl".to_string(), "api_cxl".to_string());
+        // The FlowStore finalizes the flow Cancelled (the D3 client-hangup terminal).
+        store.finalize(
+            "api_cxl",
+            FlowStatus::Cancelled,
+            Some("client-hangup".to_string()),
+            None,
+        );
+
+        let update = DebugUpdate {
+            sequence: 7,
+            messages: vec![DebugWsMessage::RequestStatus {
+                response_id: "resp_cxl".to_string(),
+                // The monitor's closest status is Failed — but the record says Cancelled.
+                status: DebugRequestStatus::Failed,
+                completed_at_ms: Some(20),
+                error: Some("client-hangup".to_string()),
+            }],
+        };
+        let frames = frames_for_update(&update, &store);
+        let flow = frames
+            .iter()
+            .find(|f| f.domain == Domain::Flow)
+            .expect("flow frame");
+        let status = flow
+            .batch
+            .iter()
+            .find_map(|p| match p {
+                DashboardPayload::FlowStatus { status, .. } => Some(*status),
+                _ => None,
+            })
+            .expect("flow_status payload");
+        assert_eq!(
+            status,
+            FlowStatus::Cancelled,
+            "record's Cancelled wins over the monitor's Failed"
+        );
+        // And it serializes to the snake_case wire string the frontend expects.
+        let value = serde_json::to_value(flow).expect("serialize");
+        let wire_status = &value["batch"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["type"] == "flow_status")
+            .unwrap()["status"];
+        assert_eq!(*wire_status, serde_json::json!("cancelled"));
+    }
+
+    /// D7b R1 finding 3: the flow frame is stamped with the FlowStore seq AS OF THE
+    /// EVENT (read atomically with the record via `detail_with_seq`), NEVER a
+    /// send-time global `flow_seq()`. So a LATER-processed update whose record was
+    /// resolved earlier cannot carry a cursor that leapfrogs — and, crucially, an
+    /// out-of-order replay does not stamp an OLD event with a NEWER cursor that would
+    /// dedup-drop the genuinely newer flow frame on the client.
+    #[test]
+    fn flow_frame_seq_is_event_time_not_send_time_global() {
+        let store = DashboardFlowStore::new();
+        // Flow A opened + linked, then finalized → its record's seq is some value Sa.
+        store.open(
+            "api_a".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            redact_headers(&HeaderMap::new()),
+            Some(capture_body(b"{}")),
+        );
+        store.link("resp_a".to_string(), "api_a".to_string());
+        // Capture the FlowStore seq at which flow A's record is current.
+        let (_record_a, seq_a) = store.detail_with_seq("resp_a").expect("flow A resolves");
+
+        // Now MANY unrelated flows mutate the store, bumping the GLOBAL flow_seq far
+        // past `seq_a` (this models the gap between A's event and its update being
+        // processed off the broadcast channel).
+        for i in 0..10 {
+            let id = format!("api_other_{i}");
+            store.open(
+                id.clone(),
+                "POST".to_string(),
+                "/v1/responses".to_string(),
+                redact_headers(&HeaderMap::new()),
+                Some(capture_body(b"{}")),
+            );
+        }
+        let global_now = store.flow_seq();
+        assert!(
+            global_now > seq_a,
+            "the global cursor advanced past flow A's event seq"
+        );
+
+        // Build the frame for flow A's (now older) status update.
+        let update = DebugUpdate {
+            sequence: 3,
+            messages: vec![DebugWsMessage::RequestStatus {
+                response_id: "resp_a".to_string(),
+                status: DebugRequestStatus::Completed,
+                completed_at_ms: Some(5),
+                error: None,
+            }],
+        };
+        let frames = frames_for_update(&update, &store);
+        let flow = frames
+            .iter()
+            .find(|f| f.domain == Domain::Flow)
+            .expect("flow frame");
+        // The frame's seq is the record's CURRENT event-time seq (read in this build),
+        // NOT a value leapfrogged by the unrelated flows beyond what the record needs.
+        // Re-read the record's seq now to assert exact equality.
+        let (_again, seq_a_now) = store.detail_with_seq("resp_a").expect("flow A resolves");
+        assert_eq!(
+            flow.seq, seq_a_now,
+            "flow frame seq == flow A's event-time record seq, not the global send-time cursor"
+        );
+        // It is NOT stamped with the (larger) send-time global flow_seq() — that is
+        // the exact bug: a separate send-time read would over-advance the cursor.
+        assert!(
+            flow.seq <= global_now,
+            "event-time seq never exceeds the global cursor"
         );
     }
 
@@ -1257,6 +1642,104 @@ mod tests {
         );
     }
 
+    // -- the initial snapshot message (finding 1) --------------------------
+
+    /// The serialized `SnapshotMessage` matches the frozen `SnapshotFrame` contract
+    /// the SPA's `isSnapshotFrame` guard requires (`dashboard-frontend/src/api/
+    /// types.ts`): `type:"snapshot"`, a `cursors` quad, a `flows` array of body-free
+    /// summaries, and `metrics`/`topology` either their full shape or `null`. A
+    /// mismatch here means the SPA drops the snapshot and never renders.
+    #[test]
+    fn snapshot_message_matches_frontend_snapshot_frame_shape() {
+        use crate::upstream::ProviderHealth;
+        use crate::upstream::ProviderStatus;
+        // A live store with one finalized flow → one body-free summary.
+        let store = DashboardFlowStore::new();
+        store.open(
+            "api_001".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            redact_headers(&HeaderMap::new()),
+            Some(capture_body(b"{}")),
+        );
+        store.finalize("api_001", FlowStatus::Completed, None, None);
+        let flows = store.snapshot_summaries();
+        let flow_seq = store.flow_seq();
+
+        let metrics = Some(metrics_snapshot(&MetricsView::default(), 7));
+        let snapshot = ProviderHealthSnapshot {
+            version: 3,
+            providers: vec![ProviderHealth {
+                id: "vllm-a".to_string(),
+                name: "vllm-a".to_string(),
+                route: None,
+                base_url: "http://localhost:8001".to_string(),
+                status: ProviderStatus::Healthy,
+                cooling_until_ms: None,
+                last_error: None,
+                served_count: 0,
+                failover_count: 0,
+                consecutive_failures: 0,
+                catalog_fetched_ms: None,
+                catalog_size: None,
+            }],
+        };
+        let topology = Some(topology_snapshot(&snapshot));
+        let msg = snapshot_message(flows, flow_seq, metrics, topology, 0);
+        let value = serde_json::to_value(&msg).expect("serialize");
+
+        // Discriminant the SPA routes on.
+        assert_eq!(value["type"], serde_json::json!("snapshot"));
+        // The four per-domain cursors (all present, the SPA installs them as dedup
+        // baselines). metrics_seq/topology_seq mirror the carried bodies; monitor 0.
+        let cursors = &value["cursors"];
+        assert_eq!(cursors["flow_seq"], serde_json::json!(flow_seq));
+        assert_eq!(cursors["metrics_seq"], serde_json::json!(7));
+        assert_eq!(cursors["topology_seq"], serde_json::json!(3));
+        assert_eq!(cursors["monitor_seq"], serde_json::json!(0));
+        // flows: an array of body-free summaries keyed by api_call_id (no body keys).
+        let flows = value["flows"].as_array().expect("flows is an array");
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0]["api_call_id"], serde_json::json!("api_001"));
+        assert_eq!(flows[0]["status"], serde_json::json!("completed"));
+        assert!(
+            flows[0].get("inbound_body").is_none(),
+            "summaries are body-free"
+        );
+        // metrics: the flat tile + metrics_seq + windows{m1,m5,h1}.
+        let m = &value["metrics"];
+        assert_eq!(m["metrics_seq"], serde_json::json!(7));
+        assert!(m["windows"]["m1"].is_object());
+        assert!(m["windows"]["m5"].is_object());
+        assert!(m["windows"]["h1"].is_object());
+        // topology: topology_seq + nodes + edges + a (possibly empty) price_table map.
+        let t = &value["topology"];
+        assert_eq!(t["topology_seq"], serde_json::json!(3));
+        assert!(t["nodes"].is_array());
+        assert!(t["edges"].is_array());
+        assert!(
+            t["price_table"].is_object(),
+            "price_table is an object map (empty until D13)"
+        );
+        // catalog_size on a snapshot node follows the same non-null-uint rule.
+        assert_eq!(t["nodes"][0]["catalog_size"], serde_json::json!(0));
+    }
+
+    /// When metrics/topology are absent (disabled / no providers), the snapshot
+    /// carries JSON `null` for them and zeroes their cursors — the SPA's
+    /// `isSnapshotFrame` accepts `metrics`/`topology` of `null`.
+    #[test]
+    fn snapshot_message_serializes_null_metrics_topology() {
+        let msg = snapshot_message(Vec::new(), 0, None, None, 0);
+        let value = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(value["type"], serde_json::json!("snapshot"));
+        assert!(value["metrics"].is_null(), "absent metrics → null");
+        assert!(value["topology"].is_null(), "absent topology → null");
+        assert_eq!(value["cursors"]["metrics_seq"], serde_json::json!(0));
+        assert_eq!(value["cursors"]["topology_seq"], serde_json::json!(0));
+        assert!(value["flows"].as_array().unwrap().is_empty());
+    }
+
     // -- expiry timer ------------------------------------------------------
 
     #[test]
@@ -1320,6 +1803,85 @@ mod tests {
             self.sent += 1;
             !matches!(self.fail_at, Some(at) if self.sent == at)
         }
+        async fn send_snapshot_message(&mut self, _snap: &SnapshotMessage) -> bool {
+            if self.per_send > Duration::ZERO {
+                tokio::time::sleep(self.per_send).await;
+            }
+            self.sent += 1;
+            !matches!(self.fail_at, Some(at) if self.sent == at)
+        }
+    }
+
+    /// A recording sink that logs the ORDER + kind of each wire message so a test
+    /// can assert the snapshot precedes every frame (finding 1). Each `send_*`
+    /// returns success; ordering, not backpressure, is the unit under test here.
+    #[derive(Default)]
+    struct RecordingSink {
+        log: Vec<WireKind>,
+    }
+    #[derive(Debug, PartialEq, Eq)]
+    enum WireKind {
+        Snapshot,
+        Frame(Domain),
+    }
+    impl FrameSink for RecordingSink {
+        async fn send_frame(&mut self, frame: &DashboardFrame) -> bool {
+            self.log.push(WireKind::Frame(frame.domain));
+            true
+        }
+        async fn send_snapshot_message(&mut self, _snap: &SnapshotMessage) -> bool {
+            self.log.push(WireKind::Snapshot);
+            true
+        }
+    }
+
+    fn sample_snapshot() -> SnapshotMessage {
+        snapshot_message(Vec::new(), 0, None, None, 0)
+    }
+
+    /// D7b R1 finding 1: the connection preamble sends the `type:"snapshot"` message
+    /// as the VERY FIRST wire message, BEFORE any `DashboardFrame`. The SPA buffers
+    /// frames until the snapshot lands, so this ordering is what makes the dashboard
+    /// render at all.
+    #[tokio::test(start_paused = true)]
+    async fn send_initial_emits_snapshot_before_any_frame() {
+        let expiry = wait_for_session_expiry(now_unix() + 3600);
+        tokio::pin!(expiry);
+        let mut sink = RecordingSink::default();
+        let frames = monitor_frames(3);
+        let outcome = send_initial(&sample_snapshot(), &frames, expiry.as_mut(), &mut sink).await;
+        assert_eq!(outcome, SendOutcome::Completed);
+        // FIRST message is the snapshot; the replay frames follow.
+        assert_eq!(
+            sink.log.first(),
+            Some(&WireKind::Snapshot),
+            "the snapshot must be the FIRST wire message"
+        );
+        assert_eq!(sink.log.len(), 4, "snapshot + 3 frames");
+        for entry in &sink.log[1..] {
+            assert!(
+                matches!(entry, WireKind::Frame(_)),
+                "everything after the snapshot is a frame"
+            );
+        }
+    }
+
+    /// The snapshot send is itself gated by the expiry race: an already-expired
+    /// cookie emits NOTHING (no snapshot, no frame) and yields `Expired`.
+    #[tokio::test(start_paused = true)]
+    async fn send_initial_with_expired_cookie_emits_nothing() {
+        let expiry = wait_for_session_expiry(now_unix().saturating_sub(10));
+        tokio::pin!(expiry);
+        let mut sink = RecordingSink::default();
+        let outcome = send_initial(
+            &sample_snapshot(),
+            &monitor_frames(3),
+            expiry.as_mut(),
+            &mut sink,
+        )
+        .await;
+        assert_eq!(outcome, SendOutcome::Expired);
+        assert!(sink.log.is_empty(), "no wire message after exp");
     }
 
     #[tokio::test(start_paused = true)]

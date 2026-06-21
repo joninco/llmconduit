@@ -756,6 +756,30 @@ impl DashboardFlowStore {
         state.by_id.get(api_call_id).cloned()
     }
 
+    /// Resolve a record AND the FlowStore mutation `seq` read in the SAME lock hold
+    /// — so the returned `seq` is exactly the cursor at which the returned record is
+    /// current (D7b R1 finding 3). The dashboard flow frame must be stamped with
+    /// THIS event-time seq, never a separately-read send-time `flow_seq()`: a
+    /// queued/replayed older monitor update would otherwise be stamped with a NEWER
+    /// global cursor (bumped by unrelated flows in the gap), advancing the client's
+    /// flow cursor past a genuinely newer frame so it gets whole-frame-deduped. By
+    /// coupling the seq to the record read, the stamp always matches the record
+    /// state delivered. `None` when disabled or unknown.
+    pub fn detail_with_seq(&self, id: &str) -> Option<(Arc<FlowRecord>, u64)> {
+        if !self.enabled {
+            return None;
+        }
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
+        let seq = state.seq;
+        if let Some(record) = state.by_id.get(id) {
+            return Some((Arc::clone(record), seq));
+        }
+        let api_call_id = state.link_index.get(id)?.clone();
+        let record = state.by_id.get(&api_call_id)?;
+        Some((Arc::clone(record), seq))
+    }
+
     /// Body-free snapshot summaries, newest-first. Empty when disabled. Prunes
     /// expired records first.
     pub fn snapshot_summaries(&self) -> Vec<SnapshotFlowSummary> {
