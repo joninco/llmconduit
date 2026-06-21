@@ -837,6 +837,24 @@ impl MetricsLayer {
         self.lock().view(now)
     }
 
+    /// Collapse the rings into a [`MetricsView`] **AND** read `metrics_seq` in ONE
+    /// lock hold (D7b R2 finding 2). The `/dashboard/ws` initial snapshot pairs the
+    /// metrics body with its dedup cursor: reading `view()` and `metrics_seq()` as
+    /// SEPARATE lock acquisitions leaves a window where a mutation between them seeds an
+    /// OLDER metrics body with a NEWER cursor — so the next live `metric_tick` (whose
+    /// seq advanced only to that same mutation) is whole-frame-deduped on the client and
+    /// the tile never updates. Capturing both under one lock guarantees the cursor is
+    /// exactly the watermark of the view returned. `(MetricsView::default(), 0)` when
+    /// disabled.
+    pub fn view_with_seq(&self) -> (MetricsView, u64) {
+        if !self.enabled {
+            return (MetricsView::default(), 0);
+        }
+        let now = now_epoch_s();
+        let state = self.lock();
+        (state.view(now), state.metrics_seq)
+    }
+
     /// **The 5 s coordinated snapshot.** Takes the FIXED lock order — FlowStore mutex
     /// FIRST, THEN this layer's metrics mutex nested under it — and captures ONE
     /// `Arc<ProviderHealthSnapshot>` from the D4 publisher, producing a true atomic cut

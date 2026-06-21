@@ -59,6 +59,7 @@ use crate::monitor::DebugUpdate;
 use crate::monitor::DebugWsMessage;
 use crate::upstream::ProviderHealthSnapshot;
 use axum::extract::State;
+use axum::extract::ws::CloseFrame;
 use axum::extract::ws::Message;
 use axum::extract::ws::WebSocket;
 use axum::extract::ws::WebSocketUpgrade;
@@ -66,6 +67,9 @@ use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use futures::SinkExt;
+use futures::StreamExt;
+use futures::stream::SplitSink;
 use serde::Serialize;
 use std::future::Future;
 use std::sync::Arc;
@@ -73,6 +77,13 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::broadcast;
+
+/// The explicit WS close code the dashboard SPA recognizes as a SESSION EXPIRY /
+/// auth failure (`dashboard-frontend/src/api/ws.ts` `WS_AUTH_CLOSE`): on `4401` the
+/// SPA bounces to login instead of treating the drop as a transient blip to probe +
+/// reconnect (D7b R2 finding 3). EVERY expiry close path sends this code so a genuinely
+/// expired session is never mistaken for a network blip and silently reconnected.
+const WS_AUTH_CLOSE_CODE: u16 = 4401;
 
 /// How often the Metrics domain emits a [`DashboardPayload::MetricTick`]. One per
 /// second mirrors the dashboard's live stats cadence; the frame is skipped when
@@ -686,10 +697,17 @@ pub async fn dashboard_ws(
 /// monitor broadcast, the periodic metric tick, and the topology poller — all racing
 /// the cookie-`exp` close timer so nothing is delivered past expiry.
 /// `session_exp == u64::MAX` (dev-open) yields an effectively-infinite timer.
-async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_exp: u64) {
+async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp: u64) {
     let flow_store = gateway.flow_store().clone();
     let mut monitor_rx = gateway.subscribe_monitor();
     let snapshot = gateway.debug_snapshot();
+
+    // Split the socket so the loop can READ inbound alongside writing (D7b R2 finding
+    // 4): without an inbound read, a browser-side close / peer disconnect is invisible
+    // and this task + its broadcast receiver linger until the cookie `exp` — wasting a
+    // receiver slot (broadcast lag pressure) and a task per dead connection. The read
+    // half surfaces the peer's `Close`/EOF so we tear down PROMPTLY.
+    let (mut sink, mut stream) = socket.split();
 
     // Arm the expiry timer BEFORE any send so a near-/already-expired cookie
     // closes the socket even mid-replay.
@@ -704,17 +722,23 @@ async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_
     // NEW frame (no redundant baseline frame, no self-dedup). The monitor cursor is
     // 0: the snapshot body carries NO transcript, so the retained-transcript replay
     // below (seq = `last_sequence`) is ACCEPTED, seeding the inspector history.
-    let mut last_metrics_seq = gateway.metrics().metrics_seq();
-    let metrics = Some(metrics_snapshot(
-        &gateway.metrics().view(),
-        last_metrics_seq,
-    ));
+    //
+    // (finding 2) Each domain's body + its dedup cursor are captured ATOMICALLY (one
+    // lock hold per store), so the snapshot never pairs an older body with a newer
+    // cursor — which would permanently dedup-drop that mutation's own live frame:
+    //  - metrics:  `view_with_seq()`         (view + metrics_seq under one metrics lock)
+    //  - flows:    `snapshot_summaries_with_seq()` (summaries + flow_seq under one lock)
+    //  - topology: ONE `latest()` read       (the `version` lives INSIDE the snapshot)
+    let (metrics_view, metrics_seq) = gateway.metrics().view_with_seq();
+    let mut last_metrics_seq = metrics_seq;
+    let metrics = Some(metrics_snapshot(&metrics_view, metrics_seq));
     let topo = gateway.provider_health_publisher().latest();
     let mut last_topology_version = topo.version;
     let topology = Some(topology_snapshot(&topo));
+    let (flow_summaries, flow_seq) = flow_store.snapshot_summaries_with_seq();
     let initial = snapshot_message(
-        flow_store.snapshot_summaries(),
-        flow_store.flow_seq(),
+        flow_summaries,
+        flow_seq,
         metrics,
         topology,
         // monitor baseline 0 — the transcript rides the replay frame below.
@@ -732,10 +756,10 @@ async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_
     let snapshot_frames = frames_for_update(&snapshot_update, &flow_store);
     // Send the snapshot FIRST, then the replay frames, racing expiry throughout
     // (finding 1: snapshot strictly precedes every frame).
-    match send_initial(&initial, &snapshot_frames, expiry.as_mut(), &mut socket).await {
+    match send_initial(&initial, &snapshot_frames, expiry.as_mut(), &mut sink).await {
         SendOutcome::Completed => {}
         SendOutcome::Expired => {
-            let _ = socket.send(Message::Close(None)).await;
+            send_auth_close(&mut sink).await;
             return;
         }
         SendOutcome::Failed => return,
@@ -755,10 +779,22 @@ async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_
     loop {
         tokio::select! {
             biased;
-            // Session expired mid-connection: close the socket.
+            // Session expired mid-connection: close the socket with the EXPLICIT 4401
+            // auth-close code (finding 3) so the SPA bounces to login, not reconnects.
             _ = &mut expiry => {
-                let _ = socket.send(Message::Close(None)).await;
+                send_auth_close(&mut sink).await;
                 return;
+            }
+            // (finding 4) Inbound from the peer: a `Close`, an EOF (`None`), or a read
+            // error means the browser/proxy hung up — tear down NOW rather than lingering
+            // until `exp`. We don't process inbound data frames (the dashboard socket is
+            // server→client only); any inbound `Text`/`Binary`/`Ping`/`Pong` is ignored
+            // and we keep serving (axum answers Pings at the protocol layer).
+            inbound = stream.next() => {
+                if inbound_is_terminal(&inbound) {
+                    return;
+                }
+                // Non-terminal inbound (data/ping/pong): ignore, keep serving.
             }
             received = monitor_rx.recv() => {
                 match received {
@@ -768,10 +804,10 @@ async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_
                     Ok(update) if update.sequence <= snapshot.last_sequence => {}
                     Ok(update) => {
                         let frames = frames_for_update(&update, &flow_store);
-                        match send_frames(&frames, expiry.as_mut(), &mut socket).await {
+                        match send_frames(&frames, expiry.as_mut(), &mut sink).await {
                             SendOutcome::Completed => {}
                             SendOutcome::Expired => {
-                                let _ = socket.send(Message::Close(None)).await;
+                                send_auth_close(&mut sink).await;
                                 return;
                             }
                             SendOutcome::Failed => return,
@@ -782,14 +818,15 @@ async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_
                 }
             }
             _ = metric_ticker.tick() => {
-                let seq = gateway.metrics().metrics_seq();
+                // Atomic view + seq (finding 2): pair the tile body with its own cursor.
+                let (view, seq) = gateway.metrics().view_with_seq();
                 if seq != last_metrics_seq {
                     last_metrics_seq = seq;
-                    let frame = metric_tick_frame(&gateway.metrics().view(), seq);
-                    match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut socket).await {
+                    let frame = metric_tick_frame(&view, seq);
+                    match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
                         SendOutcome::Completed => {}
                         SendOutcome::Expired => {
-                            let _ = socket.send(Message::Close(None)).await;
+                            send_auth_close(&mut sink).await;
                             return;
                         }
                         SendOutcome::Failed => return,
@@ -801,10 +838,10 @@ async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_
                 if snapshot.version != last_topology_version {
                     last_topology_version = snapshot.version;
                     let frame = topology_frame(&snapshot);
-                    match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut socket).await {
+                    match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
                         SendOutcome::Completed => {}
                         SendOutcome::Expired => {
-                            let _ = socket.send(Message::Close(None)).await;
+                            send_auth_close(&mut sink).await;
                             return;
                         }
                         SendOutcome::Failed => return,
@@ -813,6 +850,37 @@ async fn dashboard_socket(mut socket: WebSocket, gateway: Arc<Gateway>, session_
             }
         }
     }
+}
+
+/// The EXPLICIT `4401` auth/expiry close frame (D7b R2 finding 3). The dashboard SPA
+/// (`ws.ts` `WS_AUTH_CLOSE`) treats `4401` as a confirmed session expiry and bounces to
+/// login; an unclassified `Close(None)` (RFC `1005`/no code) is instead read as an
+/// abnormal blip and reconnected — so an expired session would silently reconnect into
+/// another rejection loop. Pure constructor so the code is unit-testable (the socket
+/// loop that sends it can't be built off a real upgrade in a unit test).
+fn auth_close_frame() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: WS_AUTH_CLOSE_CODE,
+        reason: "session expired".into(),
+    }))
+}
+
+/// Send the [`auth_close_frame`] on EVERY expiry path (finding 3). Best-effort: the
+/// peer may already be gone, and errors are ignored since we are tearing down anyway.
+async fn send_auth_close(sink: &mut SplitSink<WebSocket, Message>) {
+    let _ = sink.send(auth_close_frame()).await;
+}
+
+/// Classify an inbound WS poll (`stream.next()`) into "stop serving?" (D7b R2 finding
+/// 4). A peer `Close`, an EOF (`None` — stream ended), or a transport error all mean the
+/// browser/proxy hung up, so the socket must tear down PROMPTLY rather than linger until
+/// the cookie `exp` (wasting a broadcast-receiver slot + a task per dead connection).
+/// Any other inbound message (`Text`/`Binary`/`Ping`/`Pong`) is ignored — the dashboard
+/// socket is server→client only and axum answers Pings at the protocol layer — so we
+/// keep serving. Generic over the error type so it is unit-testable without an
+/// `axum::Error` (which can't be constructed off a real socket).
+fn inbound_is_terminal<E>(inbound: &Option<Result<Message, E>>) -> bool {
+    matches!(inbound, None | Some(Err(_)) | Some(Ok(Message::Close(_))))
 }
 
 /// A sink for the dashboard wire messages. Abstracts the WS socket so the
@@ -826,7 +894,7 @@ trait FrameSink {
     fn send_snapshot_message(&mut self, snap: &SnapshotMessage) -> impl Future<Output = bool>;
 }
 
-impl FrameSink for WebSocket {
+impl FrameSink for SplitSink<WebSocket, Message> {
     fn send_frame(&mut self, frame: &DashboardFrame) -> impl Future<Output = bool> {
         send_one(self, frame)
     }
@@ -907,21 +975,25 @@ async fn send_initial(
 
 /// Serialize + send one frame as a WS text message. A serialization failure is
 /// treated as a no-op success (skip the frame) rather than tearing down the
-/// socket, mirroring `/debug/ws`.
-async fn send_one(socket: &mut WebSocket, frame: &DashboardFrame) -> bool {
+/// socket, mirroring `/debug/ws`. Writes to the split sink half (the read half is
+/// raced separately for inbound-close detection — finding 4).
+async fn send_one(sink: &mut SplitSink<WebSocket, Message>, frame: &DashboardFrame) -> bool {
     let Ok(payload) = serde_json::to_string(frame) else {
         return true;
     };
-    socket.send(Message::Text(payload.into())).await.is_ok()
+    sink.send(Message::Text(payload.into())).await.is_ok()
 }
 
 /// Serialize + send the initial snapshot message as a WS text message. Like
 /// [`send_one`], a serialization failure is a no-op success rather than a teardown.
-async fn send_snapshot_one(socket: &mut WebSocket, snapshot: &SnapshotMessage) -> bool {
+async fn send_snapshot_one(
+    sink: &mut SplitSink<WebSocket, Message>,
+    snapshot: &SnapshotMessage,
+) -> bool {
     let Ok(payload) = serde_json::to_string(snapshot) else {
         return true;
     };
-    socket.send(Message::Text(payload.into())).await.is_ok()
+    sink.send(Message::Text(payload.into())).await.is_ok()
 }
 
 /// A far-future cap for the expiry timer (dev-open passes `u64::MAX`); keeps
@@ -1947,5 +2019,77 @@ mod tests {
         let outcome = send_frames(&monitor_frames(5), expiry.as_mut(), &mut sink).await;
         assert_eq!(outcome, SendOutcome::Failed);
         assert_eq!(sink.sent, 2);
+    }
+
+    // -- (finding 3) the 4401 auth/expiry close frame -----------------------
+
+    /// D7b R2 finding 3: EVERY expiry path closes with the EXPLICIT `4401` code the SPA
+    /// recognizes as a session expiry (`ws.ts` `WS_AUTH_CLOSE`), NEVER an unclassified
+    /// `Close(None)`. An unclassified close is read by the SPA as an abnormal blip and
+    /// reconnected; only `4401` bounces it to login.
+    #[test]
+    fn auth_close_frame_carries_4401_code() {
+        match auth_close_frame() {
+            Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, 4401, "the expiry close MUST be code 4401");
+                assert_eq!(frame.code, WS_AUTH_CLOSE_CODE);
+                assert!(!frame.reason.is_empty(), "a human-readable reason is set");
+            }
+            other => panic!("expected a Close(Some(_)) frame, got {other:?}"),
+        }
+    }
+
+    /// The 4401 close is NOT the unclassified `Close(None)` form (the exact bug: a
+    /// no-code close is treated by the SPA as a transient drop, not an auth failure).
+    #[test]
+    fn auth_close_frame_is_not_an_unclassified_close() {
+        assert_ne!(
+            auth_close_frame(),
+            Message::Close(None),
+            "an unclassified Close(None) would be read as a blip, not an expiry"
+        );
+    }
+
+    // -- (finding 4) inbound-close detection --------------------------------
+
+    /// D7b R2 finding 4: an inbound `Close`, an EOF (`None`), or a read error all mean
+    /// the peer hung up → the socket must tear down (the loop `return`s) rather than
+    /// linger until `exp`. (Generic helper so it is testable without an `axum::Error`.)
+    #[test]
+    fn inbound_terminal_on_close_eof_or_error() {
+        // Peer sent a Close frame.
+        assert!(inbound_is_terminal::<std::io::Error>(&Some(Ok(
+            Message::Close(None)
+        ))));
+        assert!(inbound_is_terminal::<std::io::Error>(&Some(Ok(
+            Message::Close(Some(CloseFrame {
+                code: 1000,
+                reason: "bye".into(),
+            }))
+        ))));
+        // Stream ended (EOF).
+        assert!(inbound_is_terminal::<std::io::Error>(&None));
+        // Transport error.
+        assert!(inbound_is_terminal(&Some(Err(std::io::Error::other(
+            "boom"
+        )))));
+    }
+
+    /// A non-terminal inbound message (data / ping / pong) is IGNORED — the dashboard
+    /// socket is server→client only, so we keep serving rather than tearing down.
+    #[test]
+    fn inbound_non_terminal_keeps_serving() {
+        assert!(!inbound_is_terminal::<std::io::Error>(&Some(Ok(
+            Message::Text("hi".into())
+        ))));
+        assert!(!inbound_is_terminal::<std::io::Error>(&Some(Ok(
+            Message::Binary(vec![1, 2, 3].into())
+        ))));
+        assert!(!inbound_is_terminal::<std::io::Error>(&Some(Ok(
+            Message::Ping(Vec::new().into())
+        ))));
+        assert!(!inbound_is_terminal::<std::io::Error>(&Some(Ok(
+            Message::Pong(Vec::new().into())
+        ))));
     }
 }

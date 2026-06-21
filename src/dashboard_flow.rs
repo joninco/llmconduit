@@ -259,6 +259,17 @@ pub struct FlowRecord {
     /// D3 telemetry-guard CAS cell (`CLAIM_OPEN_L0` at creation). Shared across COW
     /// copies — D1 only allocates it; D3 owns the transitions.
     pub claim: Arc<AtomicU8>,
+    /// The value of the FlowStore's monotonic mutation counter AT THIS RECORD'S LAST
+    /// MUTATION (D7b R2 finding 1). Drawn from the SAME global counter as
+    /// [`DashboardFlowState::seq`] (so it stays directly comparable to the snapshot's
+    /// `flow_seq` dedup baseline), but FROZEN at the record's own last mutation instead
+    /// of re-read at send time. [`DashboardFlowStore::detail_with_seq`] returns THIS, so
+    /// a delayed/replayed flow update is stamped with the record's own watermark — it
+    /// can no longer leapfrog past unrelated flows that mutated in the gap and so cannot
+    /// dedup-drop a genuinely newer flow frame on the client. `insert`/`update` set it to
+    /// the post-bump `seq`; this field is NOT counted in `summary_bytes` (a fixed-size
+    /// `u64`, not a heap scalar).
+    pub record_seq: u64,
     pub api_call_id: String,
     pub response_id: Option<String>,
     pub method: String,
@@ -474,6 +485,9 @@ impl DashboardFlowStore {
         let now = now_ms();
         let record = FlowRecord {
             claim: Arc::new(AtomicU8::new(CLAIM_OPEN_L0)),
+            // Placeholder — `insert` stamps the post-bump global `seq` so the record's
+            // watermark reflects THIS insert (D7b R2 finding 1).
+            record_seq: 0,
             api_call_id: cap_scalar(api_call_id.clone()),
             response_id: None,
             method: cap_scalar(method),
@@ -756,27 +770,32 @@ impl DashboardFlowStore {
         state.by_id.get(api_call_id).cloned()
     }
 
-    /// Resolve a record AND the FlowStore mutation `seq` read in the SAME lock hold
-    /// — so the returned `seq` is exactly the cursor at which the returned record is
-    /// current (D7b R1 finding 3). The dashboard flow frame must be stamped with
-    /// THIS event-time seq, never a separately-read send-time `flow_seq()`: a
-    /// queued/replayed older monitor update would otherwise be stamped with a NEWER
-    /// global cursor (bumped by unrelated flows in the gap), advancing the client's
-    /// flow cursor past a genuinely newer frame so it gets whole-frame-deduped. By
-    /// coupling the seq to the record read, the stamp always matches the record
-    /// state delivered. `None` when disabled or unknown.
+    /// Resolve a record AND **that record's own mutation watermark** (`record_seq`)
+    /// read in the SAME lock hold (D7b R1 finding 3, hardened by R2 finding 1). The
+    /// returned `seq` is the global counter value AS OF THE RECORD'S LAST MUTATION —
+    /// NOT the live global `state.seq` re-read at send time. The dashboard flow frame
+    /// is stamped with THIS, so a queued/replayed older monitor update cannot be
+    /// stamped with a NEWER global cursor (bumped by UNRELATED flows in the gap): the
+    /// earlier `state.seq` form leapfrogged exactly those unrelated mutations, advancing
+    /// the client's single flow cursor past a genuinely newer flow frame so it got
+    /// whole-frame-deduped. `record_seq` stays drawn from the same global counter (so it
+    /// is directly comparable to the snapshot's `flow_seq` dedup baseline) yet is frozen
+    /// at the record's own progress, so the stamp matches the record state delivered AND
+    /// only advances the cursor by THIS record's own mutations. `None` when disabled or
+    /// unknown.
     pub fn detail_with_seq(&self, id: &str) -> Option<(Arc<FlowRecord>, u64)> {
         if !self.enabled {
             return None;
         }
         let mut state = self.lock();
         state.prune_expired(now_ms());
-        let seq = state.seq;
         if let Some(record) = state.by_id.get(id) {
+            let seq = record.record_seq;
             return Some((Arc::clone(record), seq));
         }
         let api_call_id = state.link_index.get(id)?.clone();
         let record = state.by_id.get(&api_call_id)?;
+        let seq = record.record_seq;
         Some((Arc::clone(record), seq))
     }
 
@@ -795,6 +814,33 @@ impl DashboardFlowStore {
             .filter_map(|id| state.by_id.get(id))
             .map(|record| SnapshotFlowSummary::from_record(record))
             .collect()
+    }
+
+    /// Body-free snapshot summaries **AND** the FlowStore domain `seq`, captured in ONE
+    /// lock hold (D7b R2 finding 2). The `/dashboard/ws` initial snapshot MUST seed its
+    /// `flow_seq` dedup baseline from the SAME critical section that produced `flows`:
+    /// reading `snapshot_summaries()` and `flow_seq()` as SEPARATE lock acquisitions
+    /// leaves a window where a mutation between them seeds an OLDER body with a NEWER
+    /// cursor — so that mutation's own live flow frame (stamped at the older `record_seq`
+    /// ≤ the leaked newer baseline) is permanently whole-frame-deduped on the client and
+    /// the row never updates. Returning the pair atomically guarantees the cursor is
+    /// exactly the watermark of the summaries delivered, so every later live frame with a
+    /// strictly newer record_seq is accepted. Prunes expired records first (so the seq
+    /// already reflects any prune). `(Vec::new(), 0)` when disabled.
+    pub fn snapshot_summaries_with_seq(&self) -> (Vec<SnapshotFlowSummary>, u64) {
+        if !self.enabled {
+            return (Vec::new(), 0);
+        }
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
+        let summaries = state
+            .order
+            .iter()
+            .rev()
+            .filter_map(|id| state.by_id.get(id))
+            .map(|record| SnapshotFlowSummary::from_record(record))
+            .collect();
+        (summaries, state.seq)
     }
 
     /// Run `f` with the body-free summaries + the FlowStore `seq` while the FlowStore
@@ -1063,20 +1109,26 @@ impl Drop for TelemetryGuard {
 
 impl DashboardFlowState {
     /// Insert (or replace) a record, keeping `by_id` + `order` in lockstep and the
-    /// `live_summary_bytes` total correct.
-    fn insert(&mut self, api_call_id: String, record: Arc<FlowRecord>) {
+    /// `live_summary_bytes` total correct. Bumps the global `seq` and stamps the
+    /// record's own `record_seq` with the post-bump value (D7b R2 finding 1), so the
+    /// record carries the exact watermark of THIS mutation.
+    fn insert(&mut self, api_call_id: String, mut record: Arc<FlowRecord>) {
         if let Some(previous) = self.by_id.remove(&api_call_id) {
             self.live_summary_bytes = self
                 .live_summary_bytes
                 .saturating_sub(previous.summary_bytes());
             self.order.retain(|id| id != &api_call_id);
         }
+        self.seq = self.seq.saturating_add(1);
+        // Stamp the record's own watermark with the post-bump global seq. The Arc is
+        // freshly minted by `open` (refcount 1), so `make_mut` mutates in place without
+        // a clone.
+        Arc::make_mut(&mut record).record_seq = self.seq;
         self.live_summary_bytes = self
             .live_summary_bytes
             .saturating_add(record.summary_bytes());
         self.order.push_back(api_call_id.clone());
         self.by_id.insert(api_call_id, record);
-        self.seq = self.seq.saturating_add(1);
     }
 
     /// Resolve any flow id — an `api_call_id` (direct `by_id` key) OR a
@@ -1111,8 +1163,12 @@ impl DashboardFlowState {
             .live_summary_bytes
             .saturating_sub(before)
             .saturating_add(after);
-        self.by_id.insert(api_call_id, Arc::new(next));
+        // Bump the global seq and stamp THIS record's own watermark with the post-bump
+        // value (D7b R2 finding 1), so `detail_with_seq` returns the record's own
+        // mutation seq, not a later global value bumped by unrelated flows.
         self.seq = self.seq.saturating_add(1);
+        next.record_seq = self.seq;
+        self.by_id.insert(api_call_id, Arc::new(next));
     }
 
     /// Drop records whose age exceeds the TTL, keyed off `started_ms` vs a
@@ -1338,6 +1394,133 @@ mod tests {
         );
         assert!(store.detail("api_1").is_some());
         assert!(store.detail("nope").is_none());
+    }
+
+    /// D7b R2 finding 1: `detail_with_seq` returns the RESOLVED RECORD'S OWN mutation
+    /// watermark (`record_seq`), NOT the live global `state.seq`. After flow A is
+    /// finalized, MANY unrelated flows mutate the store and advance the global counter
+    /// far past A's last mutation — yet `detail_with_seq("api_a")` still returns A's own
+    /// (smaller) `record_seq`, so a delayed A frame cannot leapfrog those unrelated
+    /// mutations and dedup-drop a genuinely newer flow frame.
+    #[test]
+    fn detail_with_seq_returns_record_seq_not_global_seq() {
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_a");
+        store.link("resp_a".to_string(), "api_a".to_string());
+        store.finalize("api_a", FlowStatus::Completed, None, None);
+        // A's record watermark right after its last mutation.
+        let (_record_a, seq_a) = store.detail_with_seq("api_a").expect("flow A resolves");
+        // The record's own field matches the returned seq.
+        assert_eq!(
+            _record_a.record_seq, seq_a,
+            "returned seq IS the record's own record_seq"
+        );
+
+        // Many unrelated flows mutate, bumping the GLOBAL counter past A's watermark.
+        for i in 0..10 {
+            open_simple(&store, &format!("api_other_{i}"));
+        }
+        let global_now = store.flow_seq();
+        assert!(
+            global_now > seq_a,
+            "global cursor advanced past A's record_seq (global={global_now}, seq_a={seq_a})"
+        );
+
+        // detail_with_seq STILL returns A's own (smaller) record_seq, NOT the global.
+        let (_again, seq_a_again) = store
+            .detail_with_seq("api_a")
+            .expect("flow A still resolves");
+        assert_eq!(
+            seq_a_again, seq_a,
+            "record_seq is stable across unrelated mutations"
+        );
+        assert!(
+            seq_a_again < global_now,
+            "record_seq does NOT leapfrog to the global cursor"
+        );
+        // Resolving by the linked response_id returns the SAME record_seq (the join path
+        // must not re-read the global seq either).
+        let (_by_resp, seq_by_resp) = store
+            .detail_with_seq("resp_a")
+            .expect("flow A resolves by response_id");
+        assert_eq!(
+            seq_by_resp, seq_a,
+            "response_id join returns the record's own seq"
+        );
+    }
+
+    /// D7b R2 finding 1: a record's `record_seq` advances ONLY when THAT record mutates,
+    /// and each of its own mutations strictly increases it (so a live frame after a new
+    /// mutation always exceeds the snapshot baseline and is accepted).
+    #[test]
+    fn record_seq_advances_only_on_own_mutation() {
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_a");
+        let (_r0, seq_open) = store.detail_with_seq("api_a").unwrap();
+
+        // An unrelated flow mutates — A's record_seq must NOT move.
+        open_simple(&store, "api_b");
+        let (_r1, seq_after_unrelated) = store.detail_with_seq("api_a").unwrap();
+        assert_eq!(
+            seq_after_unrelated, seq_open,
+            "an unrelated flow's mutation does not advance A's record_seq"
+        );
+
+        // A mutates again (finalize) — its record_seq strictly increases.
+        store.finalize("api_a", FlowStatus::Completed, None, None);
+        let (_r2, seq_after_own) = store.detail_with_seq("api_a").unwrap();
+        assert!(
+            seq_after_own > seq_open,
+            "A's own mutation strictly advances its record_seq ({seq_after_own} > {seq_open})"
+        );
+    }
+
+    /// D7b R2 finding 2: `snapshot_summaries_with_seq` captures the body-free summaries
+    /// AND the FlowStore domain `seq` in ONE lock hold, so the seq is exactly the
+    /// watermark of the summaries returned — never a torn (older-body, newer-cursor)
+    /// pair. The captured seq equals the global `flow_seq()` taken immediately after
+    /// (no mutation in between), and EVERY summary's own `record_seq` is ≤ the captured
+    /// baseline, so a later live frame (strictly newer record_seq) is always accepted.
+    #[test]
+    fn snapshot_summaries_with_seq_is_atomic_and_consistent() {
+        let store = DashboardFlowStore::new();
+        for i in 0..3 {
+            open_simple(&store, &format!("api_{i}"));
+        }
+        store.finalize("api_1", FlowStatus::Completed, None, None);
+
+        let (summaries, seq) = store.snapshot_summaries_with_seq();
+        assert_eq!(
+            summaries.len(),
+            3,
+            "all three flows present in the snapshot"
+        );
+        // The atomically-captured seq matches the live global cursor (nothing mutated
+        // between the atomic read and this read).
+        assert_eq!(
+            seq,
+            store.flow_seq(),
+            "captured seq is the live FlowStore cursor"
+        );
+        // Every record's own watermark is ≤ the baseline → a strictly-newer live frame
+        // for any of them is accepted by the client's `seq > last_seq[flow]` dedup.
+        for s in &summaries {
+            let (_rec, record_seq) = store.detail_with_seq(&s.api_call_id).unwrap();
+            assert!(
+                record_seq <= seq,
+                "record_seq {record_seq} must be <= the snapshot baseline {seq} ({})",
+                s.api_call_id
+            );
+        }
+    }
+
+    /// The disabled store yields the empty/zero pair (mirrors `snapshot_summaries`).
+    #[test]
+    fn snapshot_summaries_with_seq_disabled_is_empty_zero() {
+        let store = DashboardFlowStore::disabled();
+        let (summaries, seq) = store.snapshot_summaries_with_seq();
+        assert!(summaries.is_empty());
+        assert_eq!(seq, 0);
     }
 
     #[test]

@@ -2400,6 +2400,172 @@ async fn dashboard_ws_accepts_valid_cookie_and_origin() {
     );
 }
 
+/// Open a REAL `/dashboard/ws` connection over an ephemeral TCP server (the same
+/// `axum::serve` posture as [`ws_handshake_status`], so hyper injects the `OnUpgrade`
+/// the WS extractor needs), complete the upgrade, and return the live post-101 stream
+/// plus the server's `JoinHandle` so a D7b end-to-end test can read server frames and
+/// send client frames. Panics if the upgrade is not `101`.
+async fn ws_connect(
+    router: axum::Router,
+    cookie: &str,
+    origin: &str,
+) -> (tokio::net::TcpStream, tokio::task::JoinHandle<()>) {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router.into_make_service()).await;
+    });
+
+    let request = format!(
+        "GET /dashboard/ws HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+         Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Cookie: llmconduit_session={cookie}\r\nOrigin: {origin}\r\n\r\n"
+    );
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    // Read until the end of the HTTP response headers (CRLFCRLF). The 101 response
+    // has no body, so any bytes AFTER the header terminator are the first WS frame —
+    // but in practice the server writes the snapshot frame in a later write, so we
+    // stop exactly at the header boundary and leave WS frames for the frame reader.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).await.unwrap();
+        assert!(
+            n == 1,
+            "connection closed before the upgrade response completed"
+        );
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    let head = String::from_utf8_lossy(&head);
+    let code = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0);
+    assert_eq!(code, 101, "expected a 101 WS upgrade, got {code}: {head}");
+    (stream, server)
+}
+
+/// Read ONE server→client WS frame (FIN assumed; server frames are never masked per
+/// RFC 6455 §5.1). Returns `(opcode, payload)`. Handles the 7-bit, 16-bit, and 64-bit
+/// payload-length forms. Used to read the dashboard's initial snapshot frame.
+async fn ws_read_frame(stream: &mut tokio::net::TcpStream) -> (u8, Vec<u8>) {
+    ws_try_read_frame(stream)
+        .await
+        .expect("expected a WS frame, got EOF")
+}
+
+/// Like [`ws_read_frame`] but returns `None` on a clean EOF (the server closed the TCP
+/// connection) instead of panicking — so a teardown test can treat EOF as a valid
+/// "server stopped serving" signal alongside an explicit Close frame.
+async fn ws_try_read_frame(stream: &mut tokio::net::TcpStream) -> Option<(u8, Vec<u8>)> {
+    use tokio::io::AsyncReadExt;
+    let mut hdr = [0u8; 2];
+    // A 0-byte read == EOF; a partial header == abrupt close. Treat both as EOF.
+    if stream.read_exact(&mut hdr).await.is_err() {
+        return None;
+    }
+    let opcode = hdr[0] & 0x0f;
+    assert_eq!(hdr[1] & 0x80, 0, "server frames must NOT be masked");
+    let len = match hdr[1] & 0x7f {
+        126 => {
+            let mut ext = [0u8; 2];
+            stream.read_exact(&mut ext).await.ok()?;
+            u16::from_be_bytes(ext) as usize
+        }
+        127 => {
+            let mut ext = [0u8; 8];
+            stream.read_exact(&mut ext).await.ok()?;
+            u64::from_be_bytes(ext) as usize
+        }
+        n => n as usize,
+    };
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload).await.ok()?;
+    Some((opcode, payload))
+}
+
+/// D7b R2 (refactor regression guard): the split-socket `dashboard_socket` still sends
+/// the initial `type:"snapshot"` message FIRST over a real upgrade. This exercises the
+/// sink half end-to-end (every send now goes through `SplitSink`), proving the
+/// finding-4 socket split did not break the send path.
+#[tokio::test]
+async fn dashboard_ws_sends_initial_snapshot_frame() {
+    let (app, auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+    let (cookie, _exp) = auth.issue_session();
+    let (mut stream, server) = ws_connect(app, &cookie, "https://dash.example.com").await;
+
+    // The FIRST WS frame is a text frame (opcode 0x1) carrying the snapshot envelope.
+    let (opcode, payload) = ws_read_frame(&mut stream).await;
+    assert_eq!(opcode, 0x1, "the first dashboard frame is a text message");
+    let value: serde_json::Value = serde_json::from_slice(&payload).expect("snapshot is JSON");
+    assert_eq!(
+        value["type"],
+        serde_json::json!("snapshot"),
+        "the first message MUST be the type:\"snapshot\" envelope (D7b finding 1)"
+    );
+    // The snapshot carries the four dedup cursors the SPA installs as its baseline.
+    assert!(value["cursors"]["flow_seq"].is_u64());
+    assert!(value["cursors"]["metrics_seq"].is_u64());
+
+    drop(stream);
+    server.abort();
+}
+
+/// D7b R2 finding 4: when the CLIENT sends a WS Close, the server's inbound read
+/// detects it and tears the connection down — replying with its own Close frame rather
+/// than lingering until the cookie `exp`. Without the inbound read, the client close is
+/// invisible and the server task + its broadcast receiver leak until expiry.
+#[tokio::test]
+async fn dashboard_ws_closes_when_client_sends_close() {
+    use tokio::io::AsyncWriteExt;
+    let (app, auth) = authed_router("0.0.0.0:4000".parse().unwrap(), &authed_env());
+    let (cookie, _exp) = auth.issue_session();
+    let (mut stream, server) = ws_connect(app, &cookie, "https://dash.example.com").await;
+
+    // Drain the initial snapshot frame (and any immediate replay frame) is unnecessary;
+    // send a client Close straight away. A client→server frame MUST be masked (RFC 6455
+    // §5.3): FIN+Close opcode (0x88), mask bit set, len 0, 4-byte masking key.
+    let close_frame: [u8; 6] = [0x88, 0x80, 0x00, 0x00, 0x00, 0x00];
+    stream.write_all(&close_frame).await.unwrap();
+    stream.flush().await.unwrap();
+
+    // The server detects the inbound close and tears the connection down — either with
+    // an explicit Close frame (opcode 0x8) or by dropping the socket (a clean EOF). Both
+    // prove finding 4: the inbound read drives teardown. We read frames until we observe
+    // the close/EOF, bounded by a timeout so a REGRESSION (server ignores the inbound
+    // close and lingers until `exp`) fails fast instead of hanging the suite.
+    let tore_down = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws_try_read_frame(&mut stream).await {
+                // Explicit server Close frame.
+                Some((0x8, _)) => return true,
+                // Snapshot / replay text frames may precede teardown; keep reading.
+                Some(_) => {}
+                // Clean EOF: the server dropped the socket → it stopped serving.
+                None => return true,
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        tore_down,
+        Ok(true),
+        "the server MUST tear down the socket after the client's inbound Close (finding 4)"
+    );
+
+    drop(stream);
+    server.abort();
+}
+
 #[tokio::test]
 async fn debug_ws_contract_unchanged_bare_message_route_still_gated() {
     // D7b must NOT change `/debug/ws`: it remains a separately-registered route
