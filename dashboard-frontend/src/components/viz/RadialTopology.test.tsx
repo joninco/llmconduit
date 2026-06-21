@@ -108,6 +108,31 @@ describe('RadialTopology — live node-set changes rebuild the graph (finding 7)
     expect(radialTopologyState.setups).toBe(setupsAfterMount); // no rebuild
     expect(container.querySelector('[data-node-id="vllm-a"] circle')?.getAttribute('fill')).toBe(colors.statusDown);
   });
+
+  it('keeps the SAME node <g> element across a health update — hover target not destroyed (finding 5)', () => {
+    const { container, rerender } = render(
+      <RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} />,
+    );
+    // Capture the live DOM node for vllm-a + arm an open hover on it.
+    const before = container.querySelector('[data-node-id="vllm-a"]');
+    expect(before).not.toBeNull();
+    fireEvent.mouseEnter(before!);
+
+    // A streaming health update (same node set) lands — the OLD code replaced every node <g>,
+    // dropping the hover target; the keyed update reuses the SAME element in place.
+    const recolored = [provider({ id: 'vllm-a', name: 'vllm-a', status: 'cooling', cooling_until_ms: Date.now() + 5000 }), NODES[1]!, NODES[2]!];
+    rerender(<RadialTopology nodes={recolored} edges={EDGES} onSelectUpstream={() => {}} />);
+
+    const after = container.querySelector('[data-node-id="vllm-a"]');
+    // Identity preserved: the exact same DOM element (===), recolored in place.
+    expect(after).toBe(before);
+    expect(after!.querySelector('circle')?.getAttribute('fill')).toBe(colors.statusCooling);
+    // And mouseleave still resolves on the preserved element (the listener was never torn down).
+    const onHover = vi.fn();
+    rerender(<RadialTopology nodes={recolored} edges={EDGES} onSelectUpstream={() => {}} onHover={onHover} />);
+    fireEvent.mouseLeave(container.querySelector('[data-node-id="vllm-a"]')!);
+    expect(onHover).toHaveBeenLastCalledWith(null);
+  });
 });
 
 describe('RadialTopology — prefers-reduced-motion cuts particles', () => {

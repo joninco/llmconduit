@@ -86,7 +86,8 @@ export function joinMonitor(
           if (msg.error) error = msg.error;
         }
         break;
-      // hello / request_remove / snapshot_done carry no per-flow delta content.
+      // hello / usage / request_remove / snapshot_done carry no per-flow delta content (the flow's
+      // authoritative token usage lives on the flow row, not this monitor join).
       default:
         break;
     }

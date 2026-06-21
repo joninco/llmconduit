@@ -25,6 +25,13 @@ export interface River {
   /** First/last segment timestamps (ms) seen for this river — the tok/s window. */
   firstMs: number | null;
   lastMs: number | null;
+  /**
+   * Wall-clock ms the river went TERMINAL (completed/failed), from the monitor's `completed_at_ms`
+   * (falling back to the last segment ts). `null` while running. The linger lifecycle computes its
+   * REMAINING fade from THIS absolute instant — not from mount time — so a long-finished river is
+   * not re-lingered (and re-shown) on every navigation/seek remount (finding 4).
+   */
+  terminalAtMs: number | null;
   /** Approx tokens emitted (chars/4 across output+reasoning) — the meter numerator. */
   approxTokens: number;
   /** Approx tokens/sec over the river's lifetime (0 until ≥2 timestamps). */
@@ -41,7 +48,8 @@ function approxTokensFor(text: string): number {
 /**
  * Fold the monitor ring into rivers keyed by `response_id`. `request_upsert` seeds a river (model
  * + status); `segment_append` appends to the matching channel and advances the tok/s window;
- * `request_status` updates the terminal status; `request_remove` drops the river. Order is the
+ * `request_status` updates the terminal status AND stamps `terminalAtMs` (the absolute finish
+ * instant the linger fade counts from — finding 4); `request_remove` drops the river. Order is the
  * ring order (arrival), so the newest activity is last. Returns rivers in first-seen order.
  */
 export function buildRivers(monitor: DebugWsMessage[]): River[] {
@@ -53,7 +61,7 @@ export function buildRivers(monitor: DebugWsMessage[]): River[] {
     if (!r) {
       r = {
         id, model: null, status: 'running', output: '', reasoning: '', tools: [],
-        firstMs: null, lastMs: null, approxTokens: 0, tokensPerSec: 0,
+        firstMs: null, lastMs: null, terminalAtMs: null, approxTokens: 0, tokensPerSec: 0,
       };
       rivers.set(id, r);
       order.push(id);
@@ -67,6 +75,9 @@ export function buildRivers(monitor: DebugWsMessage[]): River[] {
         const r = ensure(msg.request.response_id);
         r.model = msg.request.model;
         r.status = msg.request.status;
+        // Record the terminal instant from the monitor's own clock (a replayed/already-finished
+        // flow upserts as terminal) so the linger fade counts from when it ACTUALLY finished.
+        r.terminalAtMs = msg.request.status === 'running' ? null : (msg.request.completed_at_ms ?? r.terminalAtMs ?? r.lastMs);
         break;
       }
       case 'segment_append': {
@@ -88,6 +99,9 @@ export function buildRivers(monitor: DebugWsMessage[]): River[] {
       case 'request_status': {
         const r = ensure(msg.response_id);
         r.status = msg.status;
+        // A terminal status stamps the river's finish instant (the monitor's `completed_at_ms`,
+        // falling back to its last segment ts); returning to running clears it.
+        r.terminalAtMs = msg.status === 'running' ? null : (msg.completed_at_ms ?? r.terminalAtMs ?? r.lastMs);
         break;
       }
       case 'request_remove': {
@@ -100,9 +114,12 @@ export function buildRivers(monitor: DebugWsMessage[]): River[] {
       // These arms carry no river body — intentionally ignored, but enumerated so a NEW protocol
       // arm (added to the `DebugWsMessage` union) is a COMPILE error here, not a silent drop
       // (finding 11). `hello` is the handshake; `event_append` feeds the inspector timeline (not the
-      // theater); `snapshot_done` marks end-of-replay.
+      // theater); `usage` is the D3 cumulative-token echo (the authoritative totals live on the flow
+      // rows, not the theater meter, which derives ≈tok/s from segment text); `snapshot_done` marks
+      // end-of-replay.
       case 'hello':
       case 'event_append':
+      case 'usage':
       case 'snapshot_done':
         break;
       default:
@@ -116,6 +133,9 @@ export function buildRivers(monitor: DebugWsMessage[]): River[] {
     if (r.firstMs != null && r.lastMs != null && r.lastMs > r.firstMs) {
       r.tokensPerSec = r.approxTokens / ((r.lastMs - r.firstMs) / 1000);
     }
+    // Defensive: a terminal river whose status carried no `completed_at_ms` still gets a finish
+    // instant from its last segment, so the linger fade has an absolute anchor (finding 4).
+    if (r.status !== 'running' && r.terminalAtMs == null) r.terminalAtMs = r.lastMs;
   }
   return order.map((id) => rivers.get(id)!);
 }

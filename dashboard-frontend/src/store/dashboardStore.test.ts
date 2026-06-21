@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { dashboardStore } from './dashboardStore';
-import type { FlowSummary, SeqCursors } from '../api/types';
+import type { FlowSummary, ProviderHealth, SeqCursors, TopologyResponse } from '../api/types';
 
 /**
  * The MONOTONIC connection-transition generation (`connEpoch`) underpins the kill mutation's
@@ -12,6 +12,23 @@ import type { FlowSummary, SeqCursors } from '../api/types';
 const CURSORS: SeqCursors = { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 };
 function flow(id: string): FlowSummary {
   return { api_call_id: id, method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1 };
+}
+function node(id: string): ProviderHealth {
+  return {
+    id, name: id, route: null, base_url: 'http://x', status: 'healthy', cooling_until_ms: null,
+    last_error: null, served_count: 0, failover_count: 0, consecutive_failures: 0,
+    catalog_fetched_ms: null, catalog_size: 0,
+  };
+}
+function topology(seq: number, nodeIds: string[], price: Record<string, number> = {}): TopologyResponse {
+  return {
+    topology_seq: seq,
+    nodes: nodeIds.map(node),
+    edges: [],
+    price_table: Object.fromEntries(
+      Object.entries(price).map(([m, p]) => [m, { input_per_1k: p, output_per_1k: p, cached_per_1k: p }]),
+    ),
+  };
 }
 
 describe('dashboardStore — monotonic connEpoch (finding 1)', () => {
@@ -111,5 +128,49 @@ describe('dashboardStore — atomic seek cut (finding 1)', () => {
     expect(st.flows.has('live-row')).toBe(false);
     expect(st.seekMonitorSeq).toBe(5);
     expect(st.seekAtMs).toBe(1_700_000_000_000);
+  });
+});
+
+/**
+ * Finding 6 — `seedTopology` reconciles the REST `/topology` read by `topology_seq`. A cached/late
+ * REST response (stale seq) must NOT clobber the newer WS `topology_update` nodes/edges; only the
+ * price table (which WS frames never carry) is refreshed from a stale response. A fresh-or-equal seq
+ * applies fully and advances the cursor (monotonically).
+ */
+describe('dashboardStore — seedTopology seq reconciliation (finding 6)', () => {
+  beforeEach(() => dashboardStore.getState().reset());
+
+  it('applies nodes/edges + advances the cursor when the REST seq is >= current', () => {
+    dashboardStore.getState().seedTopology(topology(3, ['vllm-a'], { 'gpt-4o': 0.01 }));
+    expect(dashboardStore.getState().topologyNodes.map((n) => n.id)).toEqual(['vllm-a']);
+    expect(dashboardStore.getState().cursors.topology_seq).toBe(3);
+    expect(dashboardStore.getState().priceTable['gpt-4o']?.input_per_1k).toBe(0.01);
+  });
+
+  it('a STALE cached REST response does NOT overwrite newer WS nodes/edges — only the price table', () => {
+    // A newer WS topology_update already applied: nodes = [vllm-a, vllm-b] at seq 5.
+    dashboardStore.getState().setCursor('topology_seq', 5);
+    dashboardStore.getState().setTopology([node('vllm-a'), node('vllm-b')], []);
+
+    // A stale cached REST read (seq 3, only one node) resolves AFTER. It must not clobber the WS
+    // nodes; it should only refresh the price table.
+    dashboardStore.getState().seedTopology(topology(3, ['only-stale'], { 'gpt-4o': 0.02 }));
+
+    const st = dashboardStore.getState();
+    expect(st.topologyNodes.map((n) => n.id)).toEqual(['vllm-a', 'vllm-b']); // WS nodes preserved
+    expect(st.cursors.topology_seq).toBe(5); // cursor not moved backwards
+    expect(st.priceTable['gpt-4o']?.input_per_1k).toBe(0.02); // price table refreshed from REST
+  });
+
+  it('a fresher REST response (seq > current) replaces nodes/edges and advances the cursor', () => {
+    dashboardStore.getState().setCursor('topology_seq', 5);
+    dashboardStore.getState().setTopology([node('vllm-a')], []);
+
+    dashboardStore.getState().seedTopology(topology(8, ['vllm-a', 'vllm-b', 'groq'], { m: 0.03 }));
+
+    const st = dashboardStore.getState();
+    expect(st.topologyNodes.map((n) => n.id)).toEqual(['vllm-a', 'vllm-b', 'groq']);
+    expect(st.cursors.topology_seq).toBe(8);
+    expect(st.priceTable['m']?.input_per_1k).toBe(0.03);
   });
 });

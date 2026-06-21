@@ -101,6 +101,62 @@ describe('useSankeyWindow — timestamped deltas, not cumulative totals (finding
     expect(result.current.deltasRef.current).toHaveLength(0);
   });
 
+  it('a route remount does NOT restamp an existing cumulative total as fresh traffic (finding 3)', () => {
+    const ref = { now: 1000 };
+    act(() => {
+      dashboardStore.getState().upsertFlow(flow({ api_call_id: 'long', usage: usage({ prompt: 1_000_000, total: 1_000_000 }) }));
+    });
+    // First mount folds the 1M cumulative once (its initial delta).
+    const first = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
+    expect(first.result.current.deltasRef.current.map((d) => d.total)).toEqual([1_000_000]);
+
+    // Time passes; that 1M ages out of the window (the flow is idle, no new growth).
+    ref.now = 1000 + 40_000;
+    // Unmount (navigate away) then remount (navigate back) — the singleton baseline SURVIVES, so the
+    // remount must NOT re-emit the 1M cumulative as a fresh Date.now()-stamped band.
+    first.unmount();
+    const second = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
+    // The aged-out delta is pruned and NO fresh 1M band is restamped → empty window.
+    expect(second.result.current.deltasRef.current).toEqual([]);
+  });
+
+  it('a seek round-trip (live→seeking→live) does NOT restamp the resumed flows (finding 3)', () => {
+    const ref = { now: 1000 };
+    act(() => {
+      dashboardStore.getState().upsertFlow(flow({ api_call_id: 'a', usage: usage({ prompt: 500, total: 500 }) }));
+    });
+    const { result } = renderHook(() => useSankeyWindow(30_000, clockAt(ref)));
+    expect(result.current.deltasRef.current.map((d) => d.total)).toEqual([500]);
+
+    // Enter seek (frozen cut), then resume LIVE. The live store again holds flow 'a' at the SAME
+    // cumulative 500 (continuity preserved across the round-trip).
+    act(() => {
+      dashboardStore.getState().applySeekCut({
+        rows: [flow({ api_call_id: 'frozen', usage: usage({ prompt: 999, total: 999 }) })],
+        cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+        atMs: 1000, monitorSeq: 0, metrics: null, topology: null,
+      });
+    });
+    expect(result.current.deltasRef.current.map((d) => d.total)).toEqual([500]); // frozen never folds
+    act(() => {
+      // Resume via the real baseline-restore path: live store holds 'a' at the unchanged total 500.
+      dashboardStore.getState().restoreLiveBaseline({
+        cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+        flows: new Map([['a', flow({ api_call_id: 'a', usage: usage({ prompt: 500, total: 500 }) })]]),
+        flowOrder: ['a'], metrics: null, topologyNodes: [], topologyEdges: [], priceTable: {},
+        monitor: [], monitorSeqs: [],
+      });
+    });
+    // 'a' is unchanged across the round-trip → diffs to 0 → NO new band restamped (still just [500]).
+    expect(result.current.deltasRef.current.map((d) => d.total)).toEqual([500]);
+
+    // A REAL post-resume growth on 'a' (500 → 650) folds as the +150 increment only.
+    act(() => {
+      dashboardStore.getState().patchUsage('a', usage({ prompt: 650, total: 650 }));
+    });
+    expect(result.current.deltasRef.current.map((d) => d.total)).toEqual([500, 150]);
+  });
+
   it('resets baselines + ring on a connEpoch change (fresh session never diffs a stale total)', () => {
     const ref = { now: 1000 };
     act(() => {

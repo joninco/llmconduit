@@ -11,10 +11,16 @@
  * Sankey lane costs; that value is also the correctly FROZEN one during seek.
  *
  * SEEK (D11): a frozen snapshot is a point-in-time cut with NO delta history, so we cannot rebuild a
- * rolling rate from it. We synthesize one delta per frozen flow (its cumulative usage at the cut
- * instant) and build the Sankey with `nowMs = seekAtMs`, so the historical token attribution shows
+ * rolling rate from it. We synthesize one delta per frozen flow that was ACTIVE IN THE 30 s WINDOW of
+ * the cut and build the Sankey with `nowMs = seekAtMs`, so the historical token attribution shows
  * as-of the seeked moment with no live data bleeding in (the frozen rows replace the store slices;
  * the live accumulator skips while seeking). `cost_per_min` reads the frozen store metrics.
+ *
+ * WINDOW BOUND (finding 4): a flow's `usage` is its LIFETIME cumulative, so stamping EVERY frozen
+ * flow at the cut instant would paint flows that finished long before the cut as last-30 s traffic.
+ * Instead each synthetic delta is timestamped at the flow's `finished_ms` (or `started_ms` for a
+ * flow still open at the cut) and `buildSankeyModel` filters to `[atMs - 30 s, atMs]` — so only flows
+ * that finished within (or were still open at) the 30 s window of the cut contribute a band.
  */
 import { useEffect, useMemo, useState } from 'react';
 import { TokenSankey } from '../components/viz/TokenSankey';
@@ -82,9 +88,12 @@ function SeekSankey() {
       const u = f.usage;
       const model = f.model_served ?? f.model_requested;
       if (!u || !model || u.total <= 0) continue;
-      // One synthetic delta at the cut instant: the frozen cumulative IS the windowed attribution
-      // for a body-free snapshot (no per-tick history survives the cut).
-      out.push({ ts: atMs, upstream: f.upstream_target ?? null, model, prompt: u.prompt, cached: u.cached, completion: u.completion, total: u.total });
+      // Stamp the synthetic delta at the flow's actual activity instant: a COMPLETED flow at its
+      // `finished_ms` (so a flow that finished BEFORE the 30 s window is filtered out by
+      // `buildSankeyModel`, not painted as last-30 s traffic — finding 4); a flow still OPEN at the
+      // cut is active AT the cut, so it counts at `atMs`.
+      const ts = f.finished_ms ?? atMs;
+      out.push({ ts, upstream: f.upstream_target ?? null, model, prompt: u.prompt, cached: u.cached, completion: u.completion, total: u.total });
     }
     return out;
   }, [flows, atMs]);

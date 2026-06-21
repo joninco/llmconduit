@@ -69,15 +69,46 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     expect(socket.getCursors().monitor).toBe(6);
   });
 
-  it('decodes the GOLDEN nested Monitor fixture (the exact D7 bytes) → all 4 apply', () => {
+  it('decodes the GOLDEN nested Monitor fixture (the exact D7 bytes) → all 5 apply, incl. the usage sibling', () => {
     socket.handleParsed(JSON.parse(GOLDEN_MONITOR_FRAME_JSON));
     const monitor = dashboardStore.getState().monitor;
-    expect(monitor).toHaveLength(4);
+    // ALL 5 siblings applied — a batch carrying a D3 `usage` echo is NOT rejected wholesale.
+    expect(monitor).toHaveLength(5);
     // The NESTED, itself-tagged DebugWsMessage decoded correctly (no flattening).
     expect(monitor[0]?.type).toBe('request_upsert');
-    const last = monitor[3];
+    // The `usage` sibling validated + applied (it rides right after the upsert in the replay order).
+    const usage = monitor[1];
+    expect(usage?.type).toBe('usage');
+    if (usage?.type === 'usage') {
+      expect(usage.response_id).toBe('resp_001');
+      expect(usage.total).toBe(812);
+    }
+    const last = monitor[4];
     expect(last?.type).toBe('request_status');
     if (last?.type === 'request_status') expect(last.status).toBe('completed');
+  });
+
+  it('a Monitor batch with a usage sibling validates as a frame and ALL siblings apply (finding 1 regression)', () => {
+    // Construct a monitor frame whose batch interleaves a `usage` echo among the other arms — the
+    // exact replay shape; isDashboardFrame must accept it and every sibling must land in the ring.
+    const frame: DashboardFrame = {
+      domain: 'monitor',
+      seq: 9,
+      batch: [
+        { type: 'monitor', message: { type: 'request_upsert', request: {
+          response_id: 'resp_Z', model: 'm', started_at_ms: 1, updated_at_ms: 1, completed_at_ms: null, status: 'running',
+          stats: { input_items: 0, tool_count: 0, turn_count: 0, user_messages: 0, assistant_messages: 0, system_messages: 0, developer_messages: 0, reasoning_items: 0, function_calls: 0, function_outputs: 0, tool_items: 0, input_chars: 0, instructions_chars: 0 },
+          error: null,
+        } } },
+        { type: 'monitor', message: { type: 'usage', response_id: 'resp_Z', prompt: 10, completion: 5, total: 15, cached: 0, reasoning: 0 } },
+        { type: 'monitor', message: { type: 'segment_append', response_id: 'resp_Z', segment: { timestamp_ms: 2, kind: 'output', text: 'hi' } } },
+      ],
+    };
+    // The whole envelope validates (the `usage` arm is in the union + guard).
+    expect(isDashboardFrame(frame)).toBe(true);
+    // And applying it lands ALL THREE siblings (no wholesale drop).
+    expect(socket.applyFrame(frame)).toBe(true);
+    expect(dashboardStore.getState().monitor).toHaveLength(3);
   });
 
   it('decodes the GOLDEN usage / flow_status / metric_tick / topology fixtures', () => {
@@ -379,6 +410,16 @@ describe('DebugWsMessage nested validation — full DTO, no skipped casts (findi
 
   it('rejects a request_status with a bad status enum (finding 3)', () => {
     expect(isDebugWsMessage({ type: 'request_status', response_id: 'r', status: 'idle', completed_at_ms: null, error: null })).toBe(false);
+  });
+
+  it('accepts a D3 usage message; rejects one with missing/non-finite token counts (finding 1)', () => {
+    expect(isDebugWsMessage({ type: 'usage', response_id: 'r', prompt: 1, completion: 2, total: 3, cached: 0, reasoning: 0 })).toBe(true);
+    // Missing a token field → rejected.
+    expect(isDebugWsMessage({ type: 'usage', response_id: 'r', prompt: 1, completion: 2, total: 3, cached: 0 })).toBe(false);
+    // Non-finite token → rejected.
+    expect(isDebugWsMessage({ type: 'usage', response_id: 'r', prompt: Number.NaN, completion: 2, total: 3, cached: 0, reasoning: 0 })).toBe(false);
+    // Missing response_id → rejected.
+    expect(isDebugWsMessage({ type: 'usage', prompt: 1, completion: 2, total: 3, cached: 0, reasoning: 0 })).toBe(false);
   });
 });
 

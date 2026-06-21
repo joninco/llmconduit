@@ -393,8 +393,27 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
 
   // Seed nodes/edges + price table from `/topology` (finding 5). The caller seeds only while LIVE,
   // so this never overwrites the frozen seek cut `applySeekCut` installed.
+  //
+  // SEQ RECONCILIATION (finding 6): the REST read can resolve from react-query's CACHE (or land
+  // after a newer WS `topology_update` already applied), so its `topology_seq` may be STALE relative
+  // to the store's current topology cursor. Apply the nodes/edges + advance the cursor ONLY when the
+  // REST `topology_seq >= cursors.topology_seq` (≥ so an equal-seq re-seed is idempotent); a STALE
+  // response updates ONLY the price table (the WS frames carry no prices, so REST is the price
+  // source regardless of seq) and leaves the newer WS nodes/edges + cursor intact. The cursor only
+  // ever moves forward (`max`), never backwards.
   seedTopology: (topology) =>
-    set({ topologyNodes: topology.nodes, topologyEdges: topology.edges, priceTable: topology.price_table }),
+    set((s) => {
+      if (topology.topology_seq >= s.cursors.topology_seq) {
+        return {
+          topologyNodes: topology.nodes,
+          topologyEdges: topology.edges,
+          priceTable: topology.price_table,
+          cursors: { ...s.cursors, topology_seq: topology.topology_seq },
+        };
+      }
+      // Stale REST: keep the newer WS nodes/edges + cursor; refresh only the price table.
+      return { priceTable: topology.price_table };
+    }),
 
   pushMonitor: (msg, seq = 0) =>
     set((s) => {

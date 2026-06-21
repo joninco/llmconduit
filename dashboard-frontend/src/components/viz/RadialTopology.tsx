@@ -202,14 +202,66 @@ export function RadialTopology({
         return realStop();
       };
 
+      // KEYED node elements (finding 5): each node's <g>/circle/label is created ONCE (by node id)
+      // and UPDATED in place on every tick/data change — never destroyed+recreated. Destroying the
+      // hovered node's <g> mid-hover (the old per-tick `replaceChildren`) dropped the hover target
+      // and froze the tooltip at stale coords; a stable <g> keeps the pointer over the same element
+      // and its mouseenter closure reads the live (sim-mutated) `node.x/node.y`. The node SET is
+      // fixed for a setup lifetime (an add/remove bumps `identity` → a fresh setup), so this map is
+      // built once here and reused across all ticks/updates.
+      interface NodeEls { g: SVGGElement; circle: SVGCircleElement; }
+      const nodeEls = new Map<string, NodeEls>();
+      const radiusOf = (node: TopoNode): number =>
+        node.kind === 'gateway' ? HUB_R : node.kind === 'client' ? CLIENT_R : NODE_R;
+
+      const createNode = (node: TopoNode): NodeEls => {
+        const r = radiusOf(node);
+        const g = document.createElementNS(SVG_NS, 'g');
+        g.setAttribute('data-testid', node.kind === 'provider' ? 'topo-node' : `topo-${node.kind}`);
+        g.setAttribute('data-node-id', node.id);
+
+        const circle = document.createElementNS(SVG_NS, 'circle');
+        circle.setAttribute('r', String(r));
+        circle.setAttribute('stroke', colors.bg);
+        circle.setAttribute('stroke-width', '2');
+        g.appendChild(circle);
+
+        const label = document.createElementNS(SVG_NS, 'text');
+        label.textContent = node.label;
+        label.setAttribute('y', String(r + 12));
+        label.setAttribute('text-anchor', 'middle');
+        label.setAttribute('fill', colors.textMuted);
+        label.setAttribute('font-size', '10');
+        label.setAttribute('font-family', 'var(--font-ui)');
+        g.appendChild(label);
+
+        // Provider nodes are interactive. Listeners attach ONCE (the <g> is never recreated), so a
+        // tick/update mid-hover never tears down the listener nor the hover target — they read the
+        // live `node.x/node.y` + `node.id` via closure (finding 5 + finding 7).
+        if (node.kind === 'provider') {
+          g.style.cursor = 'pointer';
+          g.addEventListener('click', () => selectRef.current(node.id));
+          // Report the provider ID (not the health datum) so the view re-resolves CURRENT health by
+          // id on each render — an open tooltip then reflects streaming updates (finding 7).
+          g.addEventListener('mouseenter', () => {
+            const rect = svg.getBoundingClientRect();
+            hoverRef.current?.({ id: node.id, x: rect.left + (node.x ?? 0), y: rect.top + (node.y ?? 0) });
+          });
+          g.addEventListener('mouseleave', () => hoverRef.current?.(null));
+        }
+        nodeLayer.appendChild(g);
+        return { g, circle };
+      };
+
       // Render the SVG from the current node/link positions + the latest health data. Called on
-      // each tick (layout settling) and whenever a live TopologyUpdate lands (recolor only).
+      // each tick (layout settling) and whenever a live TopologyUpdate lands (recolor only). Edges +
+      // particles are NOT hover targets, so the edge layer is rebuilt each call (particles are
+      // transient and settle once the sim stops); the NODE layer is updated in place (keyed).
       const renderGraph = (): void => {
         const latest = dataRef.current;
         const healthById = new Map(latest.nodes.map((p) => [p.id, p]));
         const edgeById = new Map(latest.edges.map((e) => [`${e.from}->${e.to}`, e]));
         edgeLayer.replaceChildren();
-        nodeLayer.replaceChildren();
 
         for (const link of links) {
           const s = link.source as TopoNode;
@@ -253,48 +305,25 @@ export function RadialTopology({
 
         for (const node of graphNodes) {
           if (node.x == null || node.y == null) continue;
-          const r = node.kind === 'gateway' ? HUB_R : node.kind === 'client' ? CLIENT_R : NODE_R;
-          const g = document.createElementNS(SVG_NS, 'g');
-          g.setAttribute('data-testid', node.kind === 'provider' ? 'topo-node' : `topo-${node.kind}`);
-          g.setAttribute('data-node-id', node.id);
-          g.setAttribute('transform', `translate(${node.x} ${node.y})`);
+          // Enter: create the keyed <g> once; Update: reuse it. Never recreate (preserves hover).
+          let els = nodeEls.get(node.id);
+          if (!els) {
+            els = createNode(node);
+            nodeEls.set(node.id, els);
+          }
+          // Update position in place (the sim mutates node.x/node.y each tick).
+          els.g.setAttribute('transform', `translate(${node.x} ${node.y})`);
 
-          const circle = document.createElementNS(SVG_NS, 'circle');
-          circle.setAttribute('r', String(r));
           const health = node.kind === 'provider' ? healthById.get(node.id) : undefined;
           const fill =
             node.kind === 'gateway' ? colors.accent
             : node.kind === 'client' ? colors.textMuted
             : statusColor(health?.status ?? 'down');
-          circle.setAttribute('fill', fill);
-          circle.setAttribute('data-status', health?.status ?? node.kind);
-          circle.setAttribute('stroke', colors.bg);
-          circle.setAttribute('stroke-width', '2');
-          // Cooling nodes pulse (CSS) to draw the eye to a recovering provider, motion permitting.
-          if (!reduced && health?.status === 'cooling') circle.classList.add('topo-node-cooling');
-          g.appendChild(circle);
-
-          const label = document.createElementNS(SVG_NS, 'text');
-          label.textContent = node.label;
-          label.setAttribute('y', String(r + 12));
-          label.setAttribute('text-anchor', 'middle');
-          label.setAttribute('fill', colors.textMuted);
-          label.setAttribute('font-size', '10');
-          label.setAttribute('font-family', 'var(--font-ui)');
-          g.appendChild(label);
-
-          if (node.kind === 'provider' && health) {
-            g.style.cursor = 'pointer';
-            g.addEventListener('click', () => selectRef.current(node.id));
-            // Report the provider ID (not the health datum) so the view re-resolves CURRENT health
-            // by id on each render — an open tooltip then reflects streaming updates (finding 7).
-            g.addEventListener('mouseenter', () => {
-              const rect = svg.getBoundingClientRect();
-              hoverRef.current?.({ id: node.id, x: rect.left + (node.x ?? 0), y: rect.top + (node.y ?? 0) });
-            });
-            g.addEventListener('mouseleave', () => hoverRef.current?.(null));
-          }
-          nodeLayer.appendChild(g);
+          els.circle.setAttribute('fill', fill);
+          els.circle.setAttribute('data-status', health?.status ?? node.kind);
+          // Cooling nodes pulse (CSS); toggle the class in place so a health change recolors without
+          // recreating the element (and a no-longer-cooling node stops pulsing).
+          els.circle.classList.toggle('topo-node-cooling', !reduced && health?.status === 'cooling');
         }
       };
 

@@ -158,4 +158,25 @@ describe('SankeyView — click band → shared filter + navigate; $/min; seek', 
     expect(container.querySelector('[data-testid="sankey-band"][data-model="frozen-model"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="sankey-band"][data-model="live-only"]')).toBeNull();
   });
+
+  it('SEEK: a flow that finished BEFORE the 30s window of the cut is EXCLUDED (finding 4)', () => {
+    seedLiveTopology();
+    const at = Date.now();
+    act(() => {
+      dashboardStore.getState().applySeekCut({
+        rows: [
+          // Finished WITHIN the 30s window of the cut → its lane shows.
+          flow({ model_served: 'recent-model', upstream_target: 'vllm-a', started_ms: at - 5000, finished_ms: at - 2000, usage: usage({ prompt: 100, completion: 100, total: 200 }) }),
+          // Finished an HOUR before the cut → its lifetime total must NOT paint a last-30s band.
+          flow({ model_served: 'ancient-model', upstream_target: 'vllm-b', started_ms: at - 3_600_000, finished_ms: at - 3_500_000, usage: usage({ prompt: 9000, completion: 9000, total: 18000 }) }),
+        ],
+        cursors: { flow_seq: 1, metrics_seq: 1, topology_seq: 1, monitor_seq: 0 },
+        atMs: at, monitorSeq: 0, metrics: metrics(3), topology: TOPOLOGY,
+      });
+    });
+    const { container } = renderWithQuery(<SankeyView />);
+    // The recently-finished flow's band is present; the hour-old flow is filtered out by the window.
+    expect(container.querySelector('[data-testid="sankey-band"][data-model="recent-model"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="sankey-band"][data-model="ancient-model"]')).toBeNull();
+  });
 });

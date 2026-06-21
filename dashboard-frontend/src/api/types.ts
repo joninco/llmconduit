@@ -124,6 +124,21 @@ export type DebugWsMessage =
       completed_at_ms?: number | null;
       error?: string | null;
     }
+  // D3: cumulative token usage for a flow, keyed by `response_id` (the monitor's id; NOT
+  // `api_call_id` — the flow-domain `usage` payload is the api_call_id-keyed one). Emitted live
+  // on each usage-bearing chunk AND replayed once per flow right after its `request_upsert` in a
+  // `snapshot()`/transcript batch. The theater ignores it (token totals live on the flow rows),
+  // but it MUST validate — a batch carrying it (every replayed flow with usage does) is otherwise
+  // rejected WHOLESALE, dropping the entire monitor replay (the theater would never initialize).
+  | {
+      type: 'usage';
+      response_id: string;
+      prompt: number;
+      completion: number;
+      total: number;
+      cached: number;
+      reasoning: number;
+    }
   | { type: 'request_remove'; response_id: string; reason: string }
   | { type: 'snapshot_done' };
 
@@ -133,6 +148,7 @@ export const DEBUG_WS_KINDS: readonly DebugWsMessage['type'][] = [
   'segment_append',
   'event_append',
   'request_status',
+  'usage',
   'request_remove',
   'snapshot_done',
 ];
@@ -642,6 +658,13 @@ export function isDebugWsMessage(v: unknown): v is DebugWsMessage {
       return isStr(v.response_id) && isDebugTimelineEvent(v.event);
     case 'request_status':
       return isStr(v.response_id) && isOneOf(v.status, DEBUG_REQUEST_STATUSES) && isNullableUint(v.completed_at_ms) && isNullableStr(v.error);
+    case 'usage':
+      // D3 cumulative usage (keyed by response_id) — finite token counts; rejecting it would drop
+      // the whole monitor batch it rides in (a replayed flow's usage echo).
+      return (
+        isStr(v.response_id) &&
+        isNum(v.prompt) && isNum(v.completion) && isNum(v.total) && isNum(v.cached) && isNum(v.reasoning)
+      );
     case 'request_remove':
       return isStr(v.response_id) && isStr(v.reason);
     case 'snapshot_done':

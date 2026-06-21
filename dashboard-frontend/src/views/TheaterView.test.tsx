@@ -134,6 +134,9 @@ describe('TheaterView — terminated rivers linger-then-fade-then-remove (findin
   it('keeps a completed river during the linger, fades it, then removes it', () => {
     vi.useFakeTimers();
     try {
+      // The fade is computed from the river's ABSOLUTE finish instant (`completed_at_ms`) vs the
+      // clock, so the terminal timestamp must be NOW (the fake clock) for the linger to start fresh.
+      const finishedAt = Date.now();
       const { getByTestId, queryByTestId } = render(<TheaterView />);
       // A running river is present.
       act(() => {
@@ -143,9 +146,9 @@ describe('TheaterView — terminated rivers linger-then-fade-then-remove (findin
       });
       expect(getByTestId('river')).not.toBeNull();
 
-      // Flip it terminal — it must NOT vanish immediately (it lingers).
+      // Flip it terminal AT the current instant — it must NOT vanish immediately (it lingers).
       act(() => {
-        dashboardStore.getState().pushMonitor({ type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: 2000, error: null }, 1);
+        dashboardStore.getState().pushMonitor({ type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: finishedAt, error: null }, 1);
       });
       expect(getByTestId('river').getAttribute('data-status')).toBe('completed');
       expect(getByTestId('river').getAttribute('data-exiting')).toBeNull();
@@ -162,13 +165,65 @@ describe('TheaterView — terminated rivers linger-then-fade-then-remove (findin
     }
   });
 
+  it('a river that finished long ago is OMITTED immediately on (re)mount — no fresh 4s linger (finding 4)', () => {
+    vi.useFakeTimers();
+    try {
+      // The river went terminal well before this mount (its `completed_at_ms` is 10s in the past,
+      // past linger+fade). The OLD bug armed a fresh `setTimeout(4s)` at mount, re-showing it for 4s;
+      // the absolute-clock lifecycle computes it as already past-fade and drops it on the first render.
+      const longAgo = Date.now() - 10_000;
+      const { queryByTestId } = render(<TheaterView />);
+      act(() => {
+        dashboardStore.getState().pushMonitor(upsert('r1', 'gpt-4o', 'running'), 1);
+        dashboardStore.getState().pushMonitor(seg('r1', 'output', 'hi', longAgo), 1);
+        dashboardStore.getState().pushMonitor({ type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: longAgo, error: null }, 1);
+        dashboardStore.getState().setConnection('live');
+      });
+      // Never shown — it does not restart a 4s linger on mount.
+      expect(queryByTestId('river')).toBeNull();
+      // And advancing the clock does not resurrect it.
+      act(() => { vi.advanceTimersByTime(5_000); });
+      expect(queryByTestId('river')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a remount does NOT restart the linger — remaining fade is computed from the finish instant (finding 4)', () => {
+    vi.useFakeTimers();
+    try {
+      // River finishes 3.9s ago: only ~0.1s of linger remains, then the 0.4s fade. On a remount it
+      // must pick up the REMAINING ~0.5s, not a fresh 4s.
+      const finishedAt = Date.now() - 3_900;
+      pushMonitorBare([
+        upsert('r1', 'gpt-4o', 'running'),
+        seg('r1', 'output', 'hi', finishedAt),
+        { type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: finishedAt, error: null },
+      ]);
+      const { queryByTestId, unmount } = render(<TheaterView />);
+      // Still within the linger tail at mount (rendered, not yet exiting).
+      expect(queryByTestId('river')).not.toBeNull();
+      // Remount (a navigation away + back): the lifecycle resumes from the absolute finish instant.
+      unmount();
+      const { queryByTestId: q2 } = render(<TheaterView />);
+      expect(q2('river')).not.toBeNull();
+      // ~0.6s carries it past linger(0.1 remaining)+fade(0.4) → removed (NOT a fresh 4s window).
+      act(() => { vi.advanceTimersByTime(600); });
+      expect(q2('river')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('clears its linger timers on unmount (no leaked timer fires post-unmount — StrictMode-safe)', () => {
     vi.useFakeTimers();
     try {
+      const finishedAt = Date.now();
       const { unmount } = render(<TheaterView />);
       act(() => {
         dashboardStore.getState().pushMonitor(upsert('r1', 'm', 'completed'), 1);
-        dashboardStore.getState().pushMonitor(seg('r1', 'output', 'done', 1000), 1);
+        dashboardStore.getState().pushMonitor(seg('r1', 'output', 'done', finishedAt), 1);
+        dashboardStore.getState().pushMonitor({ type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: finishedAt, error: null }, 1);
         dashboardStore.getState().setConnection('live');
       });
       unmount();

@@ -16,8 +16,14 @@
 
 /**
  * One `DashboardFrame` for the Monitor domain: ONE envelope (seq = `DebugUpdate.sequence`
- * = 6), `batch` = 4 sibling `DashboardPayload::Monitor`s, each nesting a real
- * itself-tagged `DebugWsMessage`. The dedup test asserts ALL 4 apply.
+ * = 6), `batch` = 5 sibling `DashboardPayload::Monitor`s, each nesting a real
+ * itself-tagged `DebugWsMessage`. The dedup test asserts ALL 5 apply.
+ *
+ * The batch mirrors the Rust `monitor.rs` `snapshot()` replay ORDER for one flow:
+ * `request_upsert` → `usage` (the D3 cumulative-token echo replayed right after the upsert) →
+ * `segment_append`s → `request_status`. The `usage` sibling is the regression guard: a monitor
+ * batch carrying it MUST validate WHOLLY (the union/guard include the `usage` arm) — otherwise the
+ * whole replay is rejected and the theater never initializes.
  */
 export const GOLDEN_MONITOR_FRAME_JSON = JSON.stringify({
   domain: 'monitor',
@@ -44,6 +50,9 @@ export const GOLDEN_MONITOR_FRAME_JSON = JSON.stringify({
         },
       },
     },
+    // D3 cumulative-usage echo (keyed by response_id), replayed right after the upsert — the
+    // sibling that used to drop the whole batch when the union lacked a `usage` arm.
+    { type: 'monitor', message: { type: 'usage', response_id: 'resp_001', prompt: 812, completion: 0, total: 812, cached: 128, reasoning: 0 } },
     { type: 'monitor', message: { type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 1718900000001, kind: 'output', text: 'Hello' } } },
     { type: 'monitor', message: { type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 1718900000002, kind: 'output', text: ', world' } } },
     { type: 'monitor', message: { type: 'request_status', response_id: 'resp_001', status: 'completed', completed_at_ms: 1718900000003, error: null } },
