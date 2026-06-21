@@ -16,6 +16,8 @@
     "shot": "node e2e/shot.mjs"
   },
   "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.2.7",
+    "@fontsource/space-grotesk": "^5.2.10",
     "@tanstack/react-query": "^5.62.7",
     "@tanstack/react-virtual": "^3.11.2",
     "d3-force": "^3.0.0",

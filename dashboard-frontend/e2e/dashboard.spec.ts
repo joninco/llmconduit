@@ -5,6 +5,7 @@ test.describe('Argus dashboard', () => {
     await installDeterminism(page);
     await page.goto('/dashboard/?mock=1', { waitUntil: 'networkidle' });
     await expect(page.getByText(/access token required/i)).toBeVisible();
+    await page.evaluate(() => document.fonts.ready.then(() => undefined));
     await expect(page).toHaveScreenshot('login.png');
     expect(consoleErrors, 'console errors on login shell').toEqual([]);
   });

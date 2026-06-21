@@ -127,7 +127,7 @@ function HeaderRow() {
     <div
       className={cn(
         COLS.grid,
-        'border-b border-line bg-panel-raised py-1.5 text-[10px] uppercase tracking-wide text-text-muted',
+        'border-b border-line bg-panel-raised py-1.5 text-[10px] uppercase tracking-[0.14em] text-text-muted',
       )}
     >
       <span>time</span>
@@ -178,7 +178,7 @@ function FlowRow({
         // recycling positions never trigger a FLIP.
         'transition-colors',
         isError ? 'text-status-down' : 'text-text',
-        selected ? 'bg-accent/15' : 'hover:bg-panel-raised/60',
+        selected ? 'bg-accent/12' : 'hover:bg-accent/[0.06]',
       )}
     >
       <span className="tabular-nums text-text-muted">{fmtClock(flow.started_ms)}</span>

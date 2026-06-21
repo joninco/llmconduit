@@ -12,18 +12,21 @@
  */
 
 /** Canonical RGB channel triples ("R G B"), the ONLY place colors are literally defined. */
+// "Night Watch" — Argus, the hundred-eyed sentinel, rendered as a real-time telemetry
+// instrument: a deep indigo observatory ground, an iris-violet brand accent ("the Eye"),
+// and amber as the twin attention-signal alongside the semantic status traffic-lights.
 export const CHANNELS = {
-  bg: '13 15 18',
-  panel: '22 25 30',
-  panelRaised: '30 35 41',
-  line: '42 49 58',
-  statusHealthy: '88 214 141',
-  statusCooling: '246 196 83',
-  statusDown: '255 107 107',
-  accent: '107 182 255',
-  meta: '197 139 209',
-  text: '230 233 239',
-  textMuted: '139 147 161',
+  bg: '11 13 23',
+  panel: '20 24 38',
+  panelRaised: '28 33 51',
+  line: '42 50 78',
+  statusHealthy: '93 226 162',
+  statusCooling: '244 193 82',
+  statusDown: '255 110 110',
+  accent: '143 139 255',
+  meta: '226 138 196',
+  text: '231 233 243',
+  textMuted: '139 147 173',
 } as const;
 
 type ChannelKey = keyof typeof CHANNELS;
@@ -63,8 +66,10 @@ export const PALETTE: Record<ChannelKey, string> & {
 };
 
 export const FONTS = {
-  ui: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-  mono: 'ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace',
+  // Space Grotesk: the display/UI voice — geometric grotesk with technical character.
+  // IBM Plex Mono: the data voice — every id, model, token count, latency reads as telemetry.
+  ui: '"Space Grotesk", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+  mono: '"IBM Plex Mono", ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace',
 } as const;
 
 /** CSS variable name → channel string ("R G B"). Written to :root by applyTokensToRoot. */

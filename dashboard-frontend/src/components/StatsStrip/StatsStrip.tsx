@@ -108,10 +108,16 @@ const DELTA_CLASS = { up: 'text-status-healthy', down: 'text-status-down', flat:
 /** One chip: label, tabular-nums value + delta arrow, and the metric's sparkline. */
 function ChipCell({ chip, series }: { chip: ChipDescriptor; series: number[] }) {
   return (
-    <div className="flex flex-col gap-grid px-2 py-1" data-testid={`chip-${chip.key}`}>
-      <span className="text-xs uppercase tracking-wide text-text-muted">{chip.label}</span>
+    <div
+      className="flex flex-col gap-1 border-l border-line/50 px-3 py-1 first:border-l-0"
+      data-testid={`chip-${chip.key}`}
+    >
+      <span className="text-[10px] uppercase tracking-[0.14em] text-text-muted">{chip.label}</span>
       <div className="flex items-baseline gap-1">
-        <span className={cn('tabular-nums text-lg font-medium', ACCENT_TEXT[chip.accent])} data-testid="chip-value">
+        <span
+          className={cn('font-mono text-xl font-semibold tabular-nums tracking-tight', ACCENT_TEXT[chip.accent])}
+          data-testid="chip-value"
+        >
           {chip.value}
         </span>
         <span className={cn('text-[10px]', DELTA_CLASS[chip.delta])} aria-hidden data-testid="chip-delta">
@@ -152,7 +158,7 @@ function ConnectionDot({ state }: { state: string }) {
     : state === 'error' ? 'bg-status-down'
     : 'bg-text-muted';
   return (
-    <span className="flex items-center gap-2 text-xs text-text-muted">
+    <span className="flex items-center gap-2 text-[10px] uppercase tracking-[0.14em] text-text-muted">
       <span className={`h-2 w-2 rounded-full ${color}`} aria-hidden />
       {state}
     </span>

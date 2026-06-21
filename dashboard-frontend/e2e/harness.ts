@@ -61,6 +61,8 @@ export async function openView(page: Page, view: { tab: string; ready: string | 
   await page.getByRole('navigation').getByRole('button', { name: view.tab, exact: true }).click();
   await expect(page.getByText(view.ready).first()).toBeVisible();
   await page.waitForLoadState('networkidle');
+  // Self-hosted webfonts must paint before the pixel baseline, else metrics differ run-to-run.
+  await page.evaluate(() => document.fonts.ready.then(() => undefined));
 }
 
 /**

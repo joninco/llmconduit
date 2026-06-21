@@ -34,6 +34,16 @@ pre,
   font-family: var(--font-mono);
 }
 
+/* Masthead — the Argus eye keeps a slow, vigilant watch (the one ambient brand motion).
+   Cut to static by the prefers-reduced-motion block at the bottom of this file. */
+@keyframes argus-watch {
+  0%, 100% { opacity: 0.92; }
+  50% { opacity: 0.5; }
+}
+.argus-eye {
+  animation: argus-watch 3.2s ease-in-out infinite;
+}
+
 /*
  * D12 viz motion (CSS, NOT framer-motion — the §3.3 deferral is honored). Every keyframe below
  * is disabled by the global `prefers-reduced-motion` block at the bottom of this file (it zeroes
