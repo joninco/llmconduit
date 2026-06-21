@@ -30,9 +30,16 @@ The **Argus eye** masthead mark (`NavTabs.tsx`) + tracked `ARGUS` wordmark with
   'self' → CSP `font-src 'self'` safe. No CDN `<link>`.
 - Playwright baselines regenerated against the new design; gates green; committed.
 
+## Shipped beyond identity
+- **Inspector JSON** (`viz/JsonPane` + `viz/jsonFold`): per-path collapsible tree (iris
+  chevrons, per-pane collapse-all, `{ … } N` summaries) + a SHARED search across all three
+  layers (A·B·C) — each pane filters to matches + ancestors, amber match marker + count chip.
+  Reuses the existing path-keyed structural diff + highlight.js; DOM contract preserved.
+
 ## Future passes
-- LIVE indicator as a radar "ping"; filter chips as instrument toggles; Theater stream
-  tiles as scope traces. Keep boldness on the Eye — add only what earns its place.
+- Substring (not line-level) match highlight in the inspector; LIVE indicator as a radar
+  "ping"; filter chips as instrument toggles; Theater stream tiles as scope traces. Keep
+  boldness on the Eye — add only what earns its place.
 
 ## Tried / avoided
 - Avoided swapping the accent to acid-green (would land on the exact AI-design cliché).

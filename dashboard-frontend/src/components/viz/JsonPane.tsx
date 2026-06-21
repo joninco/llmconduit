@@ -1,29 +1,26 @@
 /**
- * JsonPane — a JSON viewer with highlight.js syntax coloring AND per-JSON-path diff tints.
+ * JsonPane — a per-path COLLAPSIBLE + SEARCHABLE JSON viewer with highlight.js syntax coloring
+ * and per-JSON-path diff tints.
  *
- * Why imperative (D10 constraint "StrictMode-safe viz; highlight.js keyed to a ref"): highlight.js
- * writes HTML, so we build the pane's DOM imperatively through `useImperativeViz` — setup runs in
- * `useLayoutEffect`, and the REQUIRED cleanup clears the node. React 18 StrictMode mounts →
- * unmounts → remounts in dev; the cleanup makes that idempotent (no duplicated highlighted nodes,
- * no leaked listeners) — the same contract `DemoViz`/`ForceDemoViz` are tested against.
+ * The structural diff (./FlowDetail/diff) is keyed by JSON PATH, and `toJsonLines` serializes the
+ * value into path-tagged lines, so each rendered line looks up its `DiffKind` tint by path. On top
+ * of that flat list, `jsonFold` pairs each container's open/close lines and computes the visible
+ * rows: collapsed containers render as a single `{ … } N` summary, and an active search query
+ * filters to matching lines plus their ancestors (auto-expanded), flagging matches.
  *
- * Why line-by-line: the structural diff (./FlowDetail/diff) is keyed by JSON PATH, not text line.
- * We serialize the value into path-tagged lines (`toJsonLines`), highlight each line's text, and
- * tint the line's background by its path's `DiffKind`. So syntax color and the add/changed/removed
- * tint coexist without a heavy diff dep. Only the `json` grammar is registered (deterministic,
- * smaller than the full bundle).
+ * Rendered with React (not the old imperative highlight build) so the fold chevrons + search state
+ * are ordinary event handlers; highlight.js still colors each line (per-line `__html`). The DOM
+ * contract is unchanged — `jsonpane-{code,scroll,empty}-<label>` and `.json-line[data-path]`
+ * (`[data-diff]` when tinted) — so the diff/scroll-sync tests hold.
  */
-import { useRef } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import hljs from 'highlight.js/lib/core';
 import json from 'highlight.js/lib/languages/json';
-import { useImperativeViz } from '../../viz/useImperativeViz';
 import { colors } from '../../design/tokens';
 import type { DiffKind, DiffMap } from '../FlowDetail/diff';
 import { toJsonLines } from './jsonLines';
+import { buildFoldModel, computeRows, type FoldRow } from './jsonFold';
 
-// Register the JSON grammar exactly once (idempotent — re-registering is a no-op but we guard
-// so repeated module loads under HMR/tests don't churn). Using `lib/core` keeps the highlighter
-// to the one language we need rather than the full auto-detect bundle.
 let registered = false;
 function ensureJsonLanguage(): void {
   if (registered) return;
@@ -31,54 +28,49 @@ function ensureJsonLanguage(): void {
   registered = true;
 }
 
-/**
- * Which side of a layer comparison this pane is on. `both` is the MIDDLE pane (B): it is the
- * right side of A→B and the left side of B→C at once, so it surfaces added/changed AND removed
- * (the diff is pre-merged by `combineMiddleDiff`) — finding 4.
- */
+function highlightJson(text: string): string {
+  ensureJsonLanguage();
+  try {
+    return hljs.highlight(text, { language: 'json', ignoreIllegals: true }).value || '​';
+  } catch {
+    // A line highlighted in isolation should never throw; fall back to a zero-width space.
+    return text ? escapeHtml(text) : '​';
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>]/g, (c) => (c === '&' ? '&amp;' : c === '<' ? '&lt;' : '&gt;'));
+}
+
 export type DiffSide = 'left' | 'right' | 'both';
 
-/**
- * Background tint (a CSS `background` value — solid color OR gradient) for a path's `DiffKind`,
- * from the design tokens (palette `diff*`). A `left` pane only surfaces `removed` (a field dropped
- * by the next layer); a `right` pane surfaces `added`/`changed`; the `both` middle pane surfaces
- * all three PLUS the composite kinds. `unchanged` and the irrelevant side get no tint.
- *
- * COMPOSITE (pane B only, finding 5): `added-removed` / `changed-removed` mean the path was
- * introduced/changed by A→B AND dropped toward C. On the `both` pane they render a split gradient
- * (the A→B add/changed tint over the B→C remove tint) so BOTH directions are visible at once. On a
- * `left`/`right` pane (which never receives composites from `combineMiddleDiff`) they degrade to the
- * side-relevant half.
- */
+/** Background tint (solid color OR gradient) for a path's `DiffKind` on this pane's side. */
 function tintFor(kind: DiffKind | undefined, side: DiffSide): string | undefined {
   if (!kind) return undefined;
-  if (kind === 'changed') return colors.diffContextBg; // changed tints on every side
+  if (kind === 'changed') return colors.diffContextBg;
   if (kind === 'added') return side === 'left' ? undefined : colors.diffAddBg;
   if (kind === 'removed') return side === 'right' ? undefined : colors.diffRemoveBg;
-  // Composite: the field is both introduced/changed in B and removed toward C.
   if (kind === 'added-removed' || kind === 'changed-removed') {
     const introduced = kind === 'added-removed' ? colors.diffAddBg : colors.diffContextBg;
-    if (side === 'left') return colors.diffRemoveBg; // left sees only the removal
-    if (side === 'right') return introduced; // right sees only the A→B side
-    // The middle (`both`) pane shows BOTH: top half the introduced tint, bottom half the removal.
+    if (side === 'left') return colors.diffRemoveBg;
+    if (side === 'right') return introduced;
     return `linear-gradient(${introduced} 0 50%, ${colors.diffRemoveBg} 50% 100%)`;
   }
   return undefined;
 }
 
+const PAD_BASE = 6;
+const PER_DEPTH = 12;
+
 export interface JsonPaneProps {
-  /** The JSON value to render. `undefined` ⇒ the empty/evicted placeholder is shown instead. */
   value: unknown;
-  /** Path→DiffKind tints (from `diffLayers`). Optional: no map ⇒ no tinting. */
   diff?: DiffMap;
-  /** Which side of the diff this pane renders (controls which kinds tint). Default `right`. */
   side?: DiffSide;
-  /** Accessible label / column heading echoed into a `data-` attr for tests. */
   label: string;
-  /** Shown (instead of highlighted JSON) when the value is absent — e.g. body evicted. */
   emptyLabel?: string;
+  /** Shared search query (from the inspector). Empty ⇒ full document with fold state applied. */
+  query?: string;
   className?: string;
-  /** Forwarded to the SCROLLABLE inner element so the parent can scroll-sync the panes. */
   scrollRef?: React.RefObject<HTMLDivElement>;
   onScroll?: React.UIEventHandler<HTMLDivElement>;
 }
@@ -89,55 +81,64 @@ export function JsonPane({
   side = 'right',
   label,
   emptyLabel = 'body evicted',
+  query = '',
   className,
   scrollRef,
   onScroll,
 }: JsonPaneProps) {
-  const codeRef = useRef<HTMLElement>(null);
+  const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set());
 
-  // Build the highlighted, tinted lines imperatively. Re-runs when the value/diff/side change;
-  // the cleanup empties the node so a re-run or StrictMode remount never stacks duplicate DOM.
-  useImperativeViz(
-    codeRef,
-    (el) => {
-      ensureJsonLanguage();
-      const lines = toJsonLines(value);
-      const frag = document.createDocumentFragment();
-      for (const line of lines) {
-        const div = document.createElement('div');
-        div.className = 'json-line';
-        div.dataset.path = line.path;
-        const kind = diff?.get(line.path);
-        const tint = tintFor(kind, side);
-        if (tint && kind) {
-          // `background` (not `backgroundColor`) so a composite kind's gradient applies (finding 5).
-          div.style.background = tint;
-          div.dataset.diff = kind;
-        }
-        try {
-          div.innerHTML = hljs.highlight(line.text, { language: 'json', ignoreIllegals: true }).value || '​';
-        } catch {
-          // Defensive: a line highlighted in isolation should never throw, but if it does we
-          // fall back to escaped plain text so the pane still renders.
-          div.textContent = line.text || '​';
-        }
-        frag.appendChild(div);
-      }
-      el.replaceChildren(frag);
-      return () => {
-        // FULL teardown (StrictMode safety): drop every highlighted node + injected HTML.
-        el.replaceChildren();
-      };
-    },
-    [value, diff, side],
+  const lines = useMemo(() => toJsonLines(value), [value]);
+  const model = useMemo(() => buildFoldModel(lines), [lines]);
+  const { rows, matchCount } = useMemo(
+    () => computeRows(lines, model, collapsed, query),
+    [lines, model, collapsed, query],
   );
+
+  const searching = query.trim().length > 0;
+
+  const toggle = useCallback((path: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  }, []);
+
+  const allCollapsed = model.containerPaths.length > 0 && collapsed.size >= model.containerPaths.length;
+  const toggleAll = useCallback(() => {
+    setCollapsed((prev) =>
+      prev.size >= model.containerPaths.length ? new Set() : new Set(model.containerPaths),
+    );
+  }, [model.containerPaths]);
 
   const hasValue = value !== undefined;
 
   return (
     <div className={`flex min-h-0 flex-col ${className ?? ''}`} data-testid={`jsonpane-${label}`}>
-      <div className="flex items-center justify-between border-b border-line bg-panel-raised px-3 py-1.5">
-        <span className="text-xs font-medium uppercase tracking-wide text-text-muted">{label}</span>
+      <div className="flex items-center justify-between gap-2 border-b border-line bg-panel-raised px-3 py-1.5">
+        <span className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-[0.12em] text-text-muted">
+          {label}
+          {searching && (
+            <span
+              className="rounded-sm bg-status-cooling/15 px-1 font-mono text-[10px] tracking-normal text-status-cooling"
+              data-testid={`jsonpane-matches-${label}`}
+            >
+              {matchCount}
+            </span>
+          )}
+        </span>
+        {hasValue && !searching && model.containerPaths.length > 0 && (
+          <button
+            type="button"
+            onClick={toggleAll}
+            className="rounded-sm px-1 font-mono text-[10px] uppercase tracking-wide text-text-muted transition-colors hover:text-accent"
+            data-testid={`jsonpane-foldall-${label}`}
+          >
+            {allCollapsed ? 'expand' : 'collapse'}
+          </button>
+        )}
       </div>
       <div
         ref={scrollRef}
@@ -147,10 +148,20 @@ export function JsonPane({
       >
         {hasValue ? (
           <code
-            ref={codeRef}
-            className="hljs block whitespace-pre px-3 py-2 font-mono text-xs leading-relaxed"
+            className="hljs block py-2 font-mono text-xs leading-relaxed"
             data-testid={`jsonpane-code-${label}`}
-          />
+          >
+            {rows.map((row) => (
+              <JsonRow
+                key={row.index}
+                row={row}
+                tint={tintFor(diff?.get(row.line.path), side)}
+                diffKind={diff?.get(row.line.path)}
+                searching={searching}
+                onToggle={toggle}
+              />
+            ))}
+          </code>
         ) : (
           <div
             className="flex h-full items-center justify-center px-3 py-6 text-xs italic text-text-muted"
@@ -160,6 +171,55 @@ export function JsonPane({
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function JsonRow({
+  row,
+  tint,
+  diffKind,
+  searching,
+  onToggle,
+}: {
+  row: FoldRow;
+  tint: string | undefined;
+  diffKind: DiffKind | undefined;
+  searching: boolean;
+  onToggle: (path: string) => void;
+}) {
+  const { line, foldable, folded, isMatch, block } = row;
+  const content = line.text.slice(line.depth * 2); // strip indent (paddingLeft renders depth)
+  const html = useMemo(() => highlightJson(content), [content]);
+  const showChevron = foldable && !searching;
+
+  return (
+    <div
+      className={`json-line flex items-start border-l-2 ${isMatch ? 'border-l-status-cooling' : 'border-l-transparent'}`}
+      data-path={line.path}
+      data-diff={diffKind ? diffKind : undefined}
+      style={{ background: tint, paddingLeft: PAD_BASE + line.depth * PER_DEPTH }}
+    >
+      {showChevron ? (
+        <button
+          type="button"
+          onClick={() => onToggle(line.path)}
+          aria-expanded={!folded}
+          aria-label={`${folded ? 'expand' : 'collapse'} ${line.path}`}
+          className="mr-0.5 w-3 shrink-0 select-none text-center text-text-muted transition-colors hover:text-accent"
+        >
+          {folded ? '▸' : '▾'}
+        </button>
+      ) : (
+        <span className="mr-0.5 w-3 shrink-0" aria-hidden />
+      )}
+      <span className="json-line-text whitespace-pre" dangerouslySetInnerHTML={{ __html: html }} />
+      {folded && block && (
+        <span className="select-none whitespace-pre text-text-muted">
+          {` … ${block.bracketClose}${block.closeSuffix}`}
+          <span className="ml-1.5 rounded-sm bg-line/60 px-1 text-[10px] text-text-muted">{block.childCount}</span>
+        </span>
+      )}
     </div>
   );
 }

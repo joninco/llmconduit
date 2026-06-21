@@ -42,6 +42,9 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   const monitorSeqs = useDashboard((s) => s.monitorSeqs);
   const priceTable = useDashboard((s) => s.priceTable);
   const [tab, setTab] = useState<Tab>('headers');
+  // Shared search across all three layers (A inbound · B normalized · C upstream) — find a field
+  // once and see how it transformed. Each JsonPane filters to matches + their ancestors.
+  const [query, setQuery] = useState('');
 
   // The flow's response_id (engine id) joins the monitor ring to this flow. While seeking we read
   // it from the FROZEN row (not the live REST detail, which is withheld from non-body surfaces).
@@ -122,6 +125,8 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         onClose={onClose}
       />
 
+      <SearchBar value={query} onChange={setQuery} />
+
       {/* 3 scroll-synced panes */}
       <div className="grid min-h-0 flex-1 grid-cols-3 divide-x divide-line" data-testid="pane-row">
         <JsonPane
@@ -129,6 +134,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
           value={detail?.inbound_body}
           diff={diffAB}
           side="left"
+          query={query}
           emptyLabel={emptyBodyLabel(seeking)}
           scrollRef={sync.refFor(0)}
           onScroll={sync.bind(0)}
@@ -138,6 +144,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
           value={detail?.normalized}
           diff={diffBMiddle}
           side="both"
+          query={query}
           emptyLabel={emptyBodyLabel(seeking)}
           scrollRef={sync.refFor(1)}
           onScroll={sync.bind(1)}
@@ -147,6 +154,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
           value={detail?.upstream_body}
           diff={diffBC}
           side="right"
+          query={query}
           emptyLabel={emptyBodyLabel(seeking)}
           scrollRef={sync.refFor(2)}
           onScroll={sync.bind(2)}
@@ -181,6 +189,45 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
 /** When seeking a historical cut, a missing body is explicitly evicted (D5 tradeoff). */
 function emptyBodyLabel(seeking: boolean): string {
   return seeking ? 'body evicted (snapshot)' : 'body evicted';
+}
+
+/** Shared search across the three layers — one query, every pane filters + highlights. */
+function SearchBar({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <div
+      className="flex shrink-0 items-center gap-2 border-b border-line bg-panel-raised px-3 py-1.5"
+      data-testid="json-search-bar"
+    >
+      <div className="flex flex-1 items-center gap-2 rounded-md border border-line bg-panel px-2 py-1 transition-colors focus-within:border-accent/60">
+        <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 shrink-0 text-text-muted" fill="none" aria-hidden="true">
+          <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.5" />
+          <path d="M10.5 10.5 14 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+        </svg>
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="search all layers…"
+          spellCheck={false}
+          className="min-w-0 flex-1 bg-transparent font-mono text-xs text-text placeholder:text-text-muted focus:outline-none"
+          data-testid="json-search-input"
+        />
+        {value && (
+          <button
+            type="button"
+            onClick={() => onChange('')}
+            aria-label="clear search"
+            className="shrink-0 text-text-muted transition-colors hover:text-text"
+          >
+            ✕
+          </button>
+        )}
+      </div>
+      <span className="hidden shrink-0 font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted sm:inline">
+        A · B · C
+      </span>
+    </div>
+  );
 }
 
 function DetailHeader({
