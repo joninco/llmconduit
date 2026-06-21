@@ -13,11 +13,13 @@
  * server-side, so a single `tool` segment can hold several calls concatenated. We therefore split
  * a coalesced tool block on that boundary marker into one card PER call, rather than on `kind`
  * adjacency alone. A tool block with no marker (e.g. a lone streamed call whose fragments carry no
- * header) stays a single card.
+ * header) stays a single card. The boundary rule itself lives in `lib/toolCalls` (`splitToolCallText`
+ * / `TOOL_CALL_BOUNDARY`) so the theater's `riverModel` splits identically — ONE source of truth.
  */
 import { useState } from 'react';
 import type { DebugSegment } from '../../api/types';
 import { cn } from '../../lib/cn';
+import { TOOL_CALL_BOUNDARY, splitToolCallText } from '../../lib/toolCalls';
 
 /** A coalesced run of adjacent same-kind segments (output / reasoning / one or more tool calls). */
 interface Block {
@@ -33,13 +35,6 @@ interface Card {
   text: string;
   ts: number;
 }
-
-/**
- * The explicit per-call boundary the backend writes ahead of each distinct function call's
- * argument stream: `tool arguments <short_id>:` on its own line (monitor.rs). Splitting on it
- * separates concatenated calls into distinct cards (finding 5).
- */
-const TOOL_CALL_BOUNDARY = /^tool arguments .*:\s*$/;
 
 /**
  * Coalesces adjacent same-kind segments into one block. Output/reasoning runs read as one
@@ -62,31 +57,14 @@ function coalesce(segments: DebugSegment[]): Block[] {
 
 /**
  * Splits a coalesced `tool` block into one card per DISTINCT call, cutting on the backend's
- * `tool arguments <id>:` boundary line (finding 5). Text before the first boundary (a streamed
- * call whose fragments carry no header — the finding-2 case) is its own card, so a single
- * markerless tool block stays ONE card. Non-tool blocks pass through unchanged.
+ * `tool arguments <id>:` boundary line (finding 5) via the shared `splitToolCallText` rule. Text
+ * before the first boundary (a streamed call whose fragments carry no header — the finding-2 case)
+ * is its own card, so a single markerless tool block stays ONE card. Non-tool blocks pass through
+ * unchanged.
  */
 function splitToolCalls(block: Block): Card[] {
   if (block.kind !== 'tool') return [{ kind: block.kind, text: block.text, ts: block.ts }];
-  const lines = block.text.split('\n');
-  const cards: Card[] = [];
-  let current: string[] = [];
-  const flush = () => {
-    if (current.length === 0) return;
-    const text = current.join('\n').trim();
-    if (text !== '') cards.push({ kind: 'tool', text, ts: block.ts });
-    current = [];
-  };
-  for (const line of lines) {
-    // A boundary line STARTS a new card (it is the per-call header), and is kept as that card's
-    // first line so the label can still resolve from the call's argument JSON that follows.
-    if (TOOL_CALL_BOUNDARY.test(line)) flush();
-    current.push(line);
-  }
-  flush();
-  // A tool block that produced nothing printable still renders one (empty) card so the run isn't
-  // silently dropped.
-  return cards.length > 0 ? cards : [{ kind: 'tool', text: block.text, ts: block.ts }];
+  return splitToolCallText(block.text).map((text) => ({ kind: 'tool' as const, text, ts: block.ts }));
 }
 
 export function DeltasPanel({ segments }: { segments: DebugSegment[] }) {

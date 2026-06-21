@@ -59,6 +59,39 @@ describe('buildRivers — folds the monitor ring into per-stream rivers', () => 
     expect(river?.tools).toEqual(['search(a)', 'lookup(b)']);
   });
 
+  it('splits BACK-TO-BACK distinct tool calls on the backend boundary marker (no interleaving kind) — D12 R6', () => {
+    // Two distinct calls stream consecutively with NO output/reasoning between them, so they coalesce
+    // into ONE tool run here. The backend (monitor.rs) prefixes each call with a `tool arguments <id>:`
+    // header; splitting on that marker yields one card PER call (sharing DeltasPanel's boundary rule).
+    const monitor: DebugWsMessage[] = [
+      upsert('r1', 'gpt-4o'),
+      // First call: header + fragmented argument JSON.
+      seg('r1', 'tool', 'tool arguments call_aaa:\n{"name":"get_weather",', 1300),
+      seg('r1', 'tool', '"arguments":{"city":"SF"}}\n', 1310),
+      // Second call arrives back-to-back (still kind: tool) — its own boundary header opens a new card.
+      seg('r1', 'tool', 'tool arguments call_bbb:\n{"name":"get_time","arguments":{"tz":"PT"}}', 1320),
+    ];
+    const [river] = buildRivers(monitor);
+    expect(river?.tools).toEqual([
+      'tool arguments call_aaa:\n{"name":"get_weather","arguments":{"city":"SF"}}',
+      'tool arguments call_bbb:\n{"name":"get_time","arguments":{"tz":"PT"}}',
+    ]);
+  });
+
+  it('keeps a single call (one boundary header) as ONE card even when its arguments are fragmented — D12 R6', () => {
+    // A lone call carries exactly one `tool arguments <id>:` header; its fragments must stay ONE card
+    // (the boundary split must not over-split a single call's streamed arguments).
+    const monitor: DebugWsMessage[] = [
+      upsert('r1', 'gpt-4o'),
+      seg('r1', 'tool', 'tool arguments call_aaa:\n{"name":"get_', 1300),
+      seg('r1', 'tool', 'weather","arguments":{"city":"SF"}}', 1310),
+    ];
+    const [river] = buildRivers(monitor);
+    expect(river?.tools).toEqual([
+      'tool arguments call_aaa:\n{"name":"get_weather","arguments":{"city":"SF"}}',
+    ]);
+  });
+
   it('derives tokens/sec from the segment timestamp window (≈ chars/4 over elapsed)', () => {
     const monitor: DebugWsMessage[] = [
       upsert('r1', 'm'),

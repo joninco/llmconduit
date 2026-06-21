@@ -10,6 +10,7 @@
  * on the flow rows. A river with a completed/failed status stops accumulating tok/s (frozen final).
  */
 import { assertNever, type DebugWsMessage, type DebugRequestStatus } from '../../api/types';
+import { splitToolCallText } from '../../lib/toolCalls';
 
 export interface River {
   /** The stream id (`response_id`). */
@@ -21,12 +22,14 @@ export interface River {
   /** Concatenated `reasoning` deltas (dim, collapsible). */
   reasoning: string;
   /**
-   * Tool-call texts, in order (one card each). ADJACENT `tool` segments are COALESCED into a single
-   * entry — a streamed tool call arrives as many `segment_append` fragments of its arguments, and
-   * stamping each fragment as its own card would shred one call into dozens of cards. We accumulate
-   * consecutive tool fragments into the current card (the same delta-coalescing D10 applies to text)
-   * and only START a new card when a non-tool segment (output/reasoning) interleaves, marking the
-   * boundary between distinct tool calls.
+   * Tool-call texts, in order (one card each). A streamed tool call arrives as many `segment_append`
+   * fragments of its arguments, so stamping each fragment as its own card would shred one call into
+   * dozens. We accumulate consecutive tool fragments (the same delta-coalescing D10 applies to text),
+   * then split the coalesced run into one card PER DISTINCT call on the backend's
+   * `tool arguments <id>:` boundary line (the shared `splitToolCallText` rule). So two back-to-back
+   * calls become two cards even with NO interleaving output/reasoning between them (D12 R6), while
+   * fragments WITHIN one call stay a single card. An interleaving non-tool segment also closes the
+   * current run, as before.
    */
   tools: string[];
   /** First/last segment timestamps (ms) seen for this river — the tok/s window. */
@@ -105,8 +108,10 @@ export function buildRivers(monitor: DebugWsMessage[]): River[] {
           r.approxTokens += approxTokensFor(msg.segment.text);
           lastWasTool.set(r.id, false); // a non-tool segment ends the current tool card's run.
         } else {
-          // Coalesce consecutive tool fragments into ONE card (the streamed arguments of a single
-          // call); a fresh card only opens when the previous segment was NOT a tool (D12 R5 MED).
+          // Coalesce consecutive tool fragments into the current run; a fresh run only opens when
+          // the previous segment was NOT a tool (D12 R5 MED). Distinct calls that arrive BACK-TO-BACK
+          // (no interleaving non-tool segment) land in the same run here and are split apart below by
+          // their `tool arguments <id>:` boundary line (D12 R6).
           if (lastWasTool.get(r.id)) {
             r.tools[r.tools.length - 1] += msg.segment.text;
           } else {
@@ -150,6 +155,10 @@ export function buildRivers(monitor: DebugWsMessage[]): River[] {
   // Derive tok/s once per river from its accumulated window. A still-running river with a single
   // timestamp has no measurable rate yet (0); a completed river keeps its final rate.
   for (const r of rivers.values()) {
+    // Split each coalesced tool run into one card per DISTINCT call on the backend's
+    // `tool arguments <id>:` boundary (shared rule with DeltasPanel) — so two back-to-back calls in
+    // one run become two cards, while a single call's fragments stay one card (D12 R6).
+    r.tools = r.tools.flatMap(splitToolCallText);
     if (r.firstMs != null && r.lastMs != null && r.lastMs > r.firstMs) {
       r.tokensPerSec = r.approxTokens / ((r.lastMs - r.firstMs) / 1000);
     }
