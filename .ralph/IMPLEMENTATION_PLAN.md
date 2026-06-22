@@ -7,7 +7,7 @@
 > **Branch:** `worktree-dashboard`. **Inherits:** `AGENTS.md` (commands + hard rules) + REVIEW_PROTOCOL.
 > **Run:** `/ralph-orchestrate --no-review --agents 1` (serial; per-gap Codex review is the gate).
 
-## Status: NOT STARTED — 16 gaps (01–16), serial, per-gap Codex-xhigh reviewed.
+## Status: IN PROGRESS — 1/16 done (01 ✅). 15 gaps remain (02–16), serial, per-gap Codex-xhigh reviewed.
 
 ## The discipline (cross-cutting acceptance — applies to EVERY gap)
 FEATURES.md hardened the framing from "pretty flow artifacts" to "can Argus answer the incident
@@ -58,7 +58,7 @@ Checklist; `[ ]` = not started. Gate: **B** = backend (`cargo test`/`clippy`/`fm
 (`npm run typecheck`/`lint`/`test`/`e2e`). All → Codex-xhigh per REVIEW_PROTOCOL.
 
 ### Phase 0 — Foundation
-- [ ] **01** stats-strip accuracy 🐞⭐ · gate **B+F** · `01-stats-strip-accuracy.md` · investigation-first.
+- [x] **01** stats-strip accuracy 🐞⭐ · gate **B+F** · `01-stats-strip-accuracy.md` · investigation-first. Root cause: live WS `window_tile` hard-coded `active_streams`/`tok-s`/`cost` to `0.0` (+ raw counts as `req/s`); REST-only fix would have left it. Fix: unified WS tick + snapshot onto the REST `metrics_body`; added `samples` u64 (terminal-flow count) end-to-end so zero-sample windows render `—` not `0`.
 
 ### Phase 1 — Data-contract pass (the spine; backend; before any UI)
 - [ ] **02** spine: per-phase timestamps + `first_content_delta_ms` · gate **B** · feeds 10, 16.

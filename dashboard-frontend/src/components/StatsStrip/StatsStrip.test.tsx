@@ -10,6 +10,7 @@ function win(over: Partial<MetricWindow> = {}): MetricWindow {
   return {
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
     p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    samples: 252,
     ...over,
   };
 }
@@ -19,6 +20,7 @@ function metrics(seq: number, over: Partial<MetricsResponse> = {}, windows?: { m
     metrics_seq: seq,
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
     p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    samples: 252,
     windows: { m1: win(windows?.m1), m5: win(windows?.m5), h1: win(windows?.h1) },
     ...over,
   };
@@ -77,6 +79,24 @@ describe('StatsStrip — chips', () => {
     pushMetrics(metrics(1, {}, { m1: { reqs_per_sec: 4 } }));
     pushMetrics(metrics(2, {}, { m1: { reqs_per_sec: 6 } }));
     expect(within(getByTestId('chip-reqs_per_sec')).getByTestId('chip-delta').textContent).toBe('▲');
+  });
+
+  // Gap 01 — don't lie with zeros (end-to-end through the component).
+  it('renders latency/tok-s/cost as "—" (not 0) for a zero-sample window, keeping req/s numeric', () => {
+    const { getByTestId } = renderWithQuery(<StatsStrip />);
+    // Traffic in flight (req/s 2.5, 4 active) but NOTHING finalized → m1.samples = 0.
+    pushMetrics(metrics(1, {}, {
+      m1: { samples: 0, error_pct: 0, p50: 0, p95: 0, p99: 0, tokens_per_sec: 0, cost_per_min: 0, reqs_per_sec: 2.5, active_streams: 4 },
+    }));
+    const val = (k: string) => within(getByTestId(`chip-${k}`)).getByTestId('chip-value').textContent;
+    expect(val('p50')).toBe('—');
+    expect(val('p95')).toBe('—');
+    expect(val('tokens_per_sec')).toBe('—');
+    expect(val('cost_per_min')).toBe('—');
+    expect(val('error_pct')).toBe('—');
+    // The genuinely-measured req/s + the live active count stay numeric.
+    expect(val('reqs_per_sec')).toBe('2.5');
+    expect(val('active_streams')).toBe('4.0');
   });
 });
 

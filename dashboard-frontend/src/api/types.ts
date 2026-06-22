@@ -207,6 +207,14 @@ export interface MetricWindow {
   p99: number;
   tokens_per_sec: number;
   cost_per_min: number;
+  /**
+   * Count of TERMINAL (finalized) flows in this window — the data-quality signal for
+   * "don't lie with zeros" (gap 01). When `samples === 0` the latency/tok-s/cost/error-%
+   * fields were never MEASURED (no finalized flow fed them), so the strip renders them
+   * `unavailable` (`—`); `reqs_per_sec` (a genuine `0` for an idle window) and
+   * `active_streams` (live open-flow count) stay numeric. A finite `u64` on the wire.
+   */
+  samples: number;
 }
 
 export interface MetricTickPayload {
@@ -219,6 +227,8 @@ export interface MetricTickPayload {
   p99: number;
   tokens_per_sec: number;
   cost_per_min: number;
+  /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
+  samples: number;
   windows: {
     m1: MetricWindow;
     m5: MetricWindow;
@@ -431,6 +441,8 @@ export interface MetricsResponse {
   p99: number;
   tokens_per_sec: number;
   cost_per_min: number;
+  /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
+  samples: number;
   windows: {
     m1: MetricWindow;
     m5: MetricWindow;
@@ -559,7 +571,9 @@ function isOptUsage(v: unknown): boolean {
 function isMetricWindow(v: unknown): v is MetricWindow {
   return (
     isObj(v) && isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min)
+    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
+    // `samples` is a non-negative integer count (gap 01 measured/unavailable signal).
+    isUint(v.samples)
   );
 }
 function isMetricWindows(v: unknown): boolean {
@@ -690,7 +704,7 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
       return (
         isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
         isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-        isMetricWindows(v.windows)
+        isUint(v.samples) && isMetricWindows(v.windows)
       );
     case 'flow_status':
       return (
@@ -742,7 +756,7 @@ function isMetricsResponse(v: unknown): v is MetricsResponse {
     isObj(v) && isUint(v.metrics_seq) &&
     isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
     isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-    isMetricWindows(v.windows)
+    isUint(v.samples) && isMetricWindows(v.windows)
   );
 }
 

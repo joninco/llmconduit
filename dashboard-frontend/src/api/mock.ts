@@ -62,11 +62,13 @@ function buildMetrics(): MetricsResponse {
   const win = (m: number) => ({
     reqs_per_sec: 4.2 * m, active_streams: Math.round(3 * m), error_pct: 1.1,
     p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142 * m, cost_per_min: 0.21 * m,
+    samples: Math.round(252 * m),
   });
   return {
     metrics_seq: 1,
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
     p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    samples: 252,
     windows: { m1: win(1), m5: win(0.9), h1: win(0.7) },
   };
 }
@@ -354,6 +356,7 @@ export class MockWebSocket implements WsLike {
         type: 'metric_tick',
         reqs_per_sec: m.reqs_per_sec, active_streams: m.active_streams, error_pct: m.error_pct,
         p50: m.p50, p95: m.p95, p99: m.p99, tokens_per_sec: m.tokens_per_sec, cost_per_min: m.cost_per_min,
+        samples: m.samples,
         windows: m.windows,
       }],
     };

@@ -9,18 +9,18 @@ describe('buildFoldModel — bracket matching + ancestry', () => {
   const model = buildFoldModel(lines);
 
   it('pairs each container open line with its close + counts immediate members', () => {
-    const byPath = (p: string) => [...model.blocksByOpen.values()].find((b) => lines[b.openIndex].path === p);
+    const byPath = (p: string) => [...model.blocksByOpen.values()].find((b) => lines[b.openIndex]!.path === p);
     expect(model.containerPaths.sort()).toEqual(['$', '$.b', '$.d']);
     expect(byPath('$')?.childCount).toBe(3); // a, b, d
     expect(byPath('$.b')?.childCount).toBe(1); // c
     expect(byPath('$.d')?.childCount).toBe(2); // [0], [1]
     const root = byPath('$')!;
-    expect(lines[root.closeIndex].text.trim()).toBe('}');
+    expect(lines[root.closeIndex]!.text.trim()).toBe('}');
   });
 
   it('records ancestor container open-indices per line', () => {
     const cIdx = lines.findIndex((l) => l.path === '$.b.c');
-    const ancestors = model.ancestorsByLine[cIdx].map((i) => lines[i].path);
+    const ancestors = model.ancestorsByLine[cIdx]!.map((i) => lines[i]!.path);
     expect(ancestors).toEqual(['$', '$.b']);
   });
 });

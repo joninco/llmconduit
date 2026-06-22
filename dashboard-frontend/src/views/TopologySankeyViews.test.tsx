@@ -14,7 +14,7 @@ import type { ProviderHealth, TopologyResponse, FlowSummary, MetricsResponse, Us
 
 /** A metrics sample carrying a `cost_per_min` (the authoritative `$`/min source — finding 3). */
 function metrics(costPerMin: number): MetricsResponse {
-  const w = { reqs_per_sec: 0, active_streams: 0, error_pct: 0, p50: 0, p95: 0, p99: 0, tokens_per_sec: 0, cost_per_min: costPerMin };
+  const w = { reqs_per_sec: 0, active_streams: 0, error_pct: 0, p50: 0, p95: 0, p99: 0, tokens_per_sec: 0, cost_per_min: costPerMin, samples: 1 };
   return { metrics_seq: 1, ...w, windows: { m1: w, m5: w, h1: w } };
 }
 function usage(over: Partial<Usage> = {}): Usage {

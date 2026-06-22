@@ -404,6 +404,11 @@ fn rest_window_tile(
         p99: finite(percentiles.p99),
         tokens_per_sec: finite(tokens_per_sec),
         cost_per_min: finite(cost_per_min),
+        // `total` is the count of TERMINAL flows in the window — the gap-01
+        // measured/unavailable signal. `0` here ≠ "zero throughput"; it means NO
+        // finalized flow fed the latency/tok-s/cost fields, so the frontend renders
+        // those `—` (while `reqs_per_sec`'s genuine `0` stays a `0`).
+        samples: total,
     }
 }
 
@@ -431,6 +436,7 @@ pub fn metrics_body(
         p99: m1.p99,
         tokens_per_sec: m1.tokens_per_sec,
         cost_per_min: m1.cost_per_min,
+        samples: m1.samples,
         windows: MetricWindows { m1, m5, h1 },
     }
 }
@@ -520,7 +526,9 @@ fn upstream_edge_rates(
 
 /// Count the flows currently OPEN (live streams) in the FlowStore — the
 /// `active_streams` tile value (the metrics rings count terminals, not liveness).
-fn active_stream_count(gateway: &Gateway) -> u64 {
+/// `pub(crate)` so the live `/dashboard/ws` tick + initial snapshot derive the SAME
+/// open-flow count as the REST `/metrics` read (gap 01 — one source, no drift).
+pub(crate) fn active_stream_count(gateway: &Gateway) -> u64 {
     gateway
         .flow_store()
         .list()
@@ -990,6 +998,79 @@ mod tests {
         prices.insert("GLM-5.1".to_string(), price(1.0, 2.0, 0.0));
         assert!(price_lookup(&prices, "glm-5.1").is_some());
         assert!(price_lookup(&prices, "other").is_none());
+    }
+
+    /// Gap 01 (the honest strip): a window fed by a real TERMINAL flow reports a
+    /// non-zero `samples` count AND real `tokens_per_sec`/`cost_per_min` (priced) +
+    /// the passed-in live `active_streams` — NOT the hard-coded zeros the live WS
+    /// tile used to ship. This is the "a live-flow is counted in the strip" proof,
+    /// exercised through the SAME `metrics_body` builder the live tick now uses.
+    #[test]
+    fn metrics_body_counts_a_terminal_flow_with_real_rates() {
+        use crate::dashboard_flow::FlowStatus as FS;
+        use crate::metrics::MetricsLayer;
+        let metrics = MetricsLayer::new();
+        // One completed flow on a priced model: 1000 prompt + 500 completion tokens.
+        metrics.record_terminal(
+            FS::Completed,
+            Some("glm-5.1"),
+            "/v1/responses",
+            Some("vllm-a"),
+            1200,
+            Some(usage(1000, 500, 0)),
+        );
+        let (view, seq) = metrics.view_with_seq();
+        let mut prices = HashMap::new();
+        prices.insert("glm-5.1".to_string(), price(2.0, 6.0, 0.5));
+        // Live open-flow count threaded in (3 streams currently in flight).
+        let body = metrics_body(&view, seq, 3, &prices);
+
+        // The terminal flow IS counted — the measured/unavailable signal is non-zero.
+        assert_eq!(body.samples, 1, "the finalized flow counts as one sample");
+        assert_eq!(body.windows.m1.samples, 1);
+        // active_streams carries the live count (was hard-coded 0 on the WS tile).
+        assert_eq!(body.active_streams, 3, "live open-flow count is carried");
+        // tokens/s + cost/min are REAL (priced), not 0.0. 1500 tok / 60 s = 25 tok/s.
+        assert!(
+            (body.tokens_per_sec - 25.0).abs() < 1e-9,
+            "tok/s {} == 1500/60",
+            body.tokens_per_sec
+        );
+        // cost = 1000 prompt @2.0/1k + 500 completion @6.0/1k = 2.0 + 3.0 = 5.0 over
+        // 1 minute → cost_per_min ≈ 5.0.
+        assert!(
+            (body.cost_per_min - 5.0).abs() < 1e-9,
+            "cost/min {} == 5.0",
+            body.cost_per_min
+        );
+        // req/s is a TRUE per-second rate (1 req / 60 s), not the raw count.
+        assert!(
+            (body.reqs_per_sec - (1.0 / 60.0)).abs() < 1e-9,
+            "req/s {} == 1/60",
+            body.reqs_per_sec
+        );
+    }
+
+    /// Gap 01 (don't lie with zeros): an EMPTY window (no finalized flow) reports
+    /// `samples == 0` — the signal the frontend reads to render latency/tok-s/cost as
+    /// `unavailable` (`—`) — while `reqs_per_sec` stays a genuine measured `0` (legit
+    /// zero traffic). The two cases are thus distinguishable on the wire.
+    #[test]
+    fn metrics_body_empty_window_reports_zero_samples_not_a_fake_zero() {
+        use crate::metrics::MetricsView;
+        let body = metrics_body(&MetricsView::default(), 0, 0, &HashMap::new());
+        assert_eq!(
+            body.samples, 0,
+            "no finalized flow → zero samples (unavailable)"
+        );
+        assert_eq!(body.windows.m1.samples, 0);
+        assert_eq!(body.windows.m5.samples, 0);
+        assert_eq!(body.windows.h1.samples, 0);
+        // req/s is a genuine measured zero (idle), distinguishable from the unavailable
+        // latency/tok-s/cost above precisely BECAUSE samples == 0.
+        assert_eq!(body.reqs_per_sec, 0.0);
+        assert_eq!(body.tokens_per_sec, 0.0);
+        assert_eq!(body.cost_per_min, 0.0);
     }
 
     /// 1-based paging: page 2 with limit 2 over 5 rows yields rows 3..=4; a limit

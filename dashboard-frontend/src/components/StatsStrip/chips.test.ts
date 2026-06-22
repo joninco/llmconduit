@@ -6,6 +6,7 @@ function win(over: Partial<MetricWindow> = {}): MetricWindow {
   return {
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
     p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    samples: 252,
     ...over,
   };
 }
@@ -52,5 +53,46 @@ describe('chips', () => {
     expect(deltaGlyph('up')).toBe('▲');
     expect(deltaGlyph('down')).toBe('▼');
     expect(deltaGlyph('flat')).toBe('·');
+  });
+
+  // Gap 01 — don't lie with zeros.
+  it('renders sample-derived metrics as UNAVAILABLE (—) when the window has zero samples', () => {
+    // A window with traffic in flight but NOTHING finalized: samples 0, but req/s is a
+    // genuine measured rate (and active_streams a live count). The numeric fields are 0
+    // on the wire (no sample fed them) — they MUST render "—", never "0".
+    const chips = deriveChips(win({ samples: 0, error_pct: 0, p50: 0, p95: 0, p99: 0, tokens_per_sec: 0, cost_per_min: 0, reqs_per_sec: 2.5, active_streams: 4 }), null);
+    const byKey = Object.fromEntries(chips.map((c) => [c.key, c.value]));
+    // Sample-derived metrics are unavailable (—), NOT a fabricated 0.
+    expect(byKey.error_pct).toBe('—');
+    expect(byKey.p50).toBe('—');
+    expect(byKey.p95).toBe('—');
+    expect(byKey.p99).toBe('—');
+    expect(byKey.tokens_per_sec).toBe('—');
+    expect(byKey.cost_per_min).toBe('—');
+    // req/s + active_streams are NOT sample-derived → they show real values.
+    expect(byKey.reqs_per_sec).toBe('2.5');
+    expect(byKey.active_streams).toBe('4.0');
+  });
+
+  it('distinguishes a GENUINE measured zero (samples > 0) from unavailable', () => {
+    // Real traffic finalized (samples 12) that genuinely measured 0 latency/cost/err: those
+    // are honest zeros and render numerically, NOT "—".
+    const chips = deriveChips(win({ samples: 12, error_pct: 0, p50: 0, cost_per_min: 0, reqs_per_sec: 0 }), null);
+    const byKey = Object.fromEntries(chips.map((c) => [c.key, c.value]));
+    expect(byKey.error_pct).toBe('0.0');
+    expect(byKey.p50).toBe('0');
+    expect(byKey.cost_per_min).toBe('0.00');
+    expect(byKey.reqs_per_sec).toBe('0.0'); // genuine idle zero, also numeric
+  });
+
+  it('an unavailable (zero-sample) window has a FLAT delta and no err% threshold accent', () => {
+    const prev = win({ samples: 10, error_pct: 9.9 });
+    const cur = win({ samples: 0, error_pct: 0, p50: 0 });
+    const chips = deriveChips(cur, prev);
+    const err = chips.find((c) => c.key === 'error_pct')!;
+    const p50 = chips.find((c) => c.key === 'p50')!;
+    expect(err.value).toBe('—');
+    expect(err.accent).not.toBe('down'); // an unavailable err% carries no threshold red
+    expect(p50.delta).toBe('flat'); // no trend for an unmeasurable value
   });
 });

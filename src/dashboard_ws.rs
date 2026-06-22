@@ -54,7 +54,6 @@ use crate::dashboard_flow::FlowStatus;
 use crate::dashboard_flow::FlowUsage;
 use crate::engine::Gateway;
 use crate::metrics::MetricsView;
-use crate::metrics::WindowReport;
 use crate::monitor::DebugUpdate;
 use crate::monitor::DebugWsMessage;
 use crate::upstream::ProviderHealthSnapshot;
@@ -153,6 +152,9 @@ pub struct MetricsSnapshot {
     pub p99: f64,
     pub tokens_per_sec: f64,
     pub cost_per_min: f64,
+    /// Terminal-flow sample count of the headline (`m1`) window — the
+    /// measured/unavailable signal mirrored from `windows.m1.samples`.
+    pub samples: u64,
     pub windows: MetricWindows,
 }
 
@@ -271,6 +273,9 @@ pub struct MetricTick {
     pub p99: f64,
     pub tokens_per_sec: f64,
     pub cost_per_min: f64,
+    /// Terminal-flow sample count of the headline (`m1`) window — the
+    /// measured/unavailable signal mirrored from `windows.m1.samples`.
+    pub samples: u64,
     pub windows: MetricWindows,
 }
 
@@ -283,6 +288,14 @@ pub struct MetricWindows {
 }
 
 /// One sliding-window metric tile. Same fields as the headline tile.
+///
+/// `samples` is the count of TERMINAL (finalized) flows that fell in the window —
+/// the data-quality signal the frontend uses to tell a genuine measured `0` from an
+/// `unavailable` gap (gap 01 / "don't lie with zeros"). When `samples == 0` the
+/// latency/tok-s/cost/error-% fields are NOT measurable (no finalized flow fed them),
+/// so the strip renders them `—`; `reqs_per_sec` (a genuine `0` for an idle window)
+/// and `active_streams` (live open-flow count) stay numeric. The field is a finite
+/// `u64`, so it never violates the frozen finite-number wire contract.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MetricWindow {
     pub reqs_per_sec: f64,
@@ -293,6 +306,8 @@ pub struct MetricWindow {
     pub p99: f64,
     pub tokens_per_sec: f64,
     pub cost_per_min: f64,
+    /// Terminal-flow sample count in this window (the measured/unavailable signal).
+    pub samples: u64,
 }
 
 /// A topology node — the D4 `ProviderHealth` shape, except `catalog_size` is
@@ -631,62 +646,38 @@ fn flow_status_payload(record: &FlowRecord, completed_at_ms: Option<u128>) -> Da
 }
 
 /// Build a metrics-domain `MetricTick` frame from a collapsed [`MetricsView`]
-/// (D5). The headline tile repeats the `m1` window. Cost rates require a price
-/// table (D13) not yet wired, so they are `0.0` here (the contract requires the
-/// fields present + finite); the shape is exact.
-pub fn metric_tick_frame(view: &MetricsView, seq: u64) -> DashboardFrame {
-    let m1 = window_tile(&view.window_1m);
+/// (D5), the live open-flow `active_streams` count, and the price table.
+///
+/// Gap 01: the live tick is built from the SAME [`crate::dashboard_api::metrics_body`]
+/// the REST `/dashboard/api/metrics` read uses — ONE honest computation for both
+/// surfaces — so `active_streams`, `tokens_per_sec`, `cost_per_min`, and the TRUE
+/// per-second `reqs_per_sec` carry real values on the live wire (previously this path
+/// hard-coded `active_streams`/`tokens_per_sec`/`cost_per_min` to `0.0` and shipped raw
+/// counts as `reqs_per_sec`, so the strip read all-`0` once it folded a WS tick even
+/// while real traffic streamed). The single-CAS terminal feed stays idempotent; this
+/// only changes how the already-recorded view is collapsed for the wire.
+pub fn metric_tick_frame(
+    view: &MetricsView,
+    seq: u64,
+    active_streams: u64,
+    prices: &std::collections::HashMap<String, ModelPrice>,
+) -> DashboardFrame {
+    let body = crate::dashboard_api::metrics_body(view, seq, active_streams, prices);
     DashboardFrame {
         domain: Domain::Metrics,
         seq,
         batch: vec![DashboardPayload::MetricTick(MetricTick {
-            reqs_per_sec: m1.reqs_per_sec,
-            active_streams: m1.active_streams,
-            error_pct: m1.error_pct,
-            p50: m1.p50,
-            p95: m1.p95,
-            p99: m1.p99,
-            tokens_per_sec: m1.tokens_per_sec,
-            cost_per_min: m1.cost_per_min,
-            windows: MetricWindows {
-                m1,
-                m5: window_tile(&view.window_5m),
-                h1: window_tile(&view.window_1h),
-            },
+            reqs_per_sec: body.reqs_per_sec,
+            active_streams: body.active_streams,
+            error_pct: body.error_pct,
+            p50: body.p50,
+            p95: body.p95,
+            p99: body.p99,
+            tokens_per_sec: body.tokens_per_sec,
+            cost_per_min: body.cost_per_min,
+            samples: body.samples,
+            windows: body.windows,
         })],
-    }
-}
-
-/// Collapse one [`WindowReport`] into a flat metric tile. `reqs_per_sec`/
-/// `tokens_per_sec`/`error_pct` are derived from the window's aggregate counts;
-/// `active_streams`/`cost_per_min` are D5/D13 roll-ups not yet wired (0.0 — shape
-/// exact, values land in D13). The window length is unknown to this view, so the
-/// rate fields report the window's totals; D13's REST aggregation refines them.
-fn window_tile(report: &WindowReport) -> MetricWindow {
-    let percentiles = report.percentiles();
-    let total: u64 = report.total_count();
-    let errors: u64 = report
-        .buckets
-        .iter()
-        .filter(|(key, _)| key.status == crate::metrics::StatusClass::Error)
-        .map(|(_, counts)| counts.count)
-        .fold(0u64, u64::saturating_add);
-    let error_pct = if total > 0 {
-        (errors as f64) / (total as f64) * 100.0
-    } else {
-        0.0
-    };
-    MetricWindow {
-        // Raw counts; D13's REST view divides by the true window seconds. The
-        // contract only requires a finite number here.
-        reqs_per_sec: total as f64,
-        active_streams: 0,
-        error_pct,
-        p50: percentiles.p50,
-        p95: percentiles.p95,
-        p99: percentiles.p99,
-        tokens_per_sec: 0.0,
-        cost_per_min: 0.0,
     }
 }
 
@@ -719,26 +710,20 @@ pub fn topology_frame(snapshot: &ProviderHealthSnapshot) -> DashboardFrame {
 }
 
 /// Build the metrics half of the initial [`SnapshotMessage`] from a collapsed
-/// [`MetricsView`] (D5) + its `metrics_seq`. Same flat tile + three windows as a
-/// live [`DashboardPayload::MetricTick`], with the cursor attached.
-fn metrics_snapshot(view: &MetricsView, metrics_seq: u64) -> MetricsSnapshot {
-    let m1 = window_tile(&view.window_1m);
-    MetricsSnapshot {
-        metrics_seq,
-        reqs_per_sec: m1.reqs_per_sec,
-        active_streams: m1.active_streams,
-        error_pct: m1.error_pct,
-        p50: m1.p50,
-        p95: m1.p95,
-        p99: m1.p99,
-        tokens_per_sec: m1.tokens_per_sec,
-        cost_per_min: m1.cost_per_min,
-        windows: MetricWindows {
-            m1,
-            m5: window_tile(&view.window_5m),
-            h1: window_tile(&view.window_1h),
-        },
-    }
+/// [`MetricsView`] (D5) + its `metrics_seq` + the live open-flow `active_streams`
+/// count + the price table. Same flat tile + three windows as a live
+/// [`DashboardPayload::MetricTick`], with the cursor attached — and built by the SAME
+/// [`crate::dashboard_api::metrics_body`] the REST read and the live tick use (gap 01),
+/// so the initial snapshot's strip is honest from the first frame (real
+/// `active_streams`/`tokens_per_sec`/`cost_per_min`/true rates), not a raw-count/`0.0`
+/// placeholder the SPA would render before the first live tick.
+fn metrics_snapshot(
+    view: &MetricsView,
+    metrics_seq: u64,
+    active_streams: u64,
+    prices: &std::collections::HashMap<String, ModelPrice>,
+) -> MetricsSnapshot {
+    crate::dashboard_api::metrics_body(view, metrics_seq, active_streams, prices)
 }
 
 /// Build the topology half of the initial [`SnapshotMessage`] from a D4
@@ -887,7 +872,16 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // dedup-drop the final flow frame. The flow SUMMARIES still come from the FlowStore.
     let (metrics_view, metrics_seq) = gateway.metrics().view_with_seq();
     let mut last_metrics_seq = metrics_seq;
-    let metrics = Some(metrics_snapshot(&metrics_view, metrics_seq));
+    // Gap 01: build the metrics baseline from the SAME honest tile the REST read +
+    // live tick use — real `active_streams` (live open-flow count) + priced
+    // `cost_per_min`/`tokens_per_sec`/true rates — so the strip is honest from the
+    // first frame, not a raw-count/`0.0` placeholder.
+    let metrics = Some(metrics_snapshot(
+        &metrics_view,
+        metrics_seq,
+        crate::dashboard_api::active_stream_count(&gateway),
+        gateway.price_table(),
+    ));
     let topo = gateway.provider_health_publisher().latest();
     let mut last_topology_version = topo.version;
     let topology = Some(topology_snapshot(&topo));
@@ -982,7 +976,17 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                 let (view, seq) = gateway.metrics().view_with_seq();
                 if seq != last_metrics_seq {
                     last_metrics_seq = seq;
-                    let frame = metric_tick_frame(&view, seq);
+                    // Gap 01: the live tick carries the live open-flow count + price table
+                    // so `active_streams`/`cost_per_min`/`tokens_per_sec`/true rates are
+                    // real (not the old hard-coded `0.0`). `active_streams` is sampled AT
+                    // tick time from the live FlowStore — the honest in-flight count for
+                    // THIS frame.
+                    let frame = metric_tick_frame(
+                        &view,
+                        seq,
+                        crate::dashboard_api::active_stream_count(&gateway),
+                        gateway.price_table(),
+                    );
                     match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
                         SendOutcome::Completed => {}
                         SendOutcome::Expired => {
@@ -1978,6 +1982,7 @@ mod tests {
                 p99: 1840.0,
                 tokens_per_sec: 142.0,
                 cost_per_min: 0.21,
+                samples: 252,
                 windows: MetricWindows {
                     m1: MetricWindow {
                         reqs_per_sec: 4.2,
@@ -1988,6 +1993,7 @@ mod tests {
                         p99: 1840.0,
                         tokens_per_sec: 142.0,
                         cost_per_min: 0.21,
+                        samples: 252,
                     },
                     m5: MetricWindow {
                         reqs_per_sec: 3.8,
@@ -1998,6 +2004,7 @@ mod tests {
                         p99: 1800.0,
                         tokens_per_sec: 128.0,
                         cost_per_min: 0.19,
+                        samples: 1140,
                     },
                     h1: MetricWindow {
                         reqs_per_sec: 2.9,
@@ -2008,6 +2015,7 @@ mod tests {
                         p99: 1700.0,
                         tokens_per_sec: 100.0,
                         cost_per_min: 0.15,
+                        samples: 10440,
                     },
                 },
             })],
@@ -2021,10 +2029,11 @@ mod tests {
                     "type": "metric_tick",
                     "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1,
                     "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21,
+                    "samples": 252,
                     "windows": {
-                        "m1": { "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1, "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21 },
-                        "m5": { "reqs_per_sec": 3.8, "active_streams": 3, "error_pct": 1.0, "p50": 175.0, "p95": 900.0, "p99": 1800.0, "tokens_per_sec": 128.0, "cost_per_min": 0.19 },
-                        "h1": { "reqs_per_sec": 2.9, "active_streams": 2, "error_pct": 0.8, "p50": 160.0, "p95": 850.0, "p99": 1700.0, "tokens_per_sec": 100.0, "cost_per_min": 0.15 }
+                        "m1": { "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1, "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21, "samples": 252 },
+                        "m5": { "reqs_per_sec": 3.8, "active_streams": 3, "error_pct": 1.0, "p50": 175.0, "p95": 900.0, "p99": 1800.0, "tokens_per_sec": 128.0, "cost_per_min": 0.19, "samples": 1140 },
+                        "h1": { "reqs_per_sec": 2.9, "active_streams": 2, "error_pct": 0.8, "p50": 160.0, "p95": 850.0, "p99": 1700.0, "tokens_per_sec": 100.0, "cost_per_min": 0.15, "samples": 10440 }
                     }
                 }
             ]
@@ -2144,7 +2153,12 @@ mod tests {
         let flows = store.snapshot_summaries();
         let flow_seq = store.flow_seq();
 
-        let metrics = Some(metrics_snapshot(&MetricsView::default(), 7));
+        let metrics = Some(metrics_snapshot(
+            &MetricsView::default(),
+            7,
+            0,
+            &std::collections::HashMap::new(),
+        ));
         let snapshot = ProviderHealthSnapshot {
             version: 3,
             providers: vec![ProviderHealth {

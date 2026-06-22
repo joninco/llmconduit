@@ -26,11 +26,11 @@ function snapshot(): SnapshotFrame {
 /** A fully-valid MetricsResponse (passes `isMetricsResponse`) for staged-snapshot tests. */
 const METRIC_WINDOW = {
   reqs_per_sec: 4.2, active_streams: 1, error_pct: 0,
-  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5,
+  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5, samples: 7,
 };
 const METRICS_SNAP = {
   metrics_seq: 5, reqs_per_sec: 4.2, active_streams: 1, error_pct: 0,
-  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5,
+  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5, samples: 7,
   windows: { m1: METRIC_WINDOW, m5: METRIC_WINDOW, h1: METRIC_WINDOW },
 };
 
@@ -260,7 +260,7 @@ describe('frame validation — enums, unsigned-int seq, domain↔payload compati
   it('rejects a metric_tick payload under the FLOW domain (domain↔payload mismatch)', () => {
     expect(isDashboardFrame({
       domain: 'flow', seq: 1,
-      batch: [{ type: 'metric_tick', reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, windows: { m1: win(), m5: win(), h1: win() } }],
+      batch: [{ type: 'metric_tick', reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, windows: { m1: win(), m5: win(), h1: win() } }],
     })).toBe(false);
   });
 
@@ -279,7 +279,7 @@ describe('frame validation — enums, unsigned-int seq, domain↔payload compati
   });
 
   function win() {
-    return { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0 };
+    return { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1 };
   }
 });
 

@@ -10,6 +10,7 @@ function win(over: Partial<MetricWindow> = {}): MetricWindow {
   return {
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
     p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    samples: 252,
     ...over,
   };
 }
@@ -17,6 +18,7 @@ function metrics(seq: number, reqs: number): MetricsResponse {
   return {
     metrics_seq: seq, reqs_per_sec: reqs, active_streams: 3, error_pct: 1.1,
     p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
+    samples: 252,
     windows: { m1: win({ reqs_per_sec: reqs }), m5: win(), h1: win() },
   };
 }

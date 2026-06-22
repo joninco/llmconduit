@@ -510,6 +510,7 @@ export class DashboardSocket {
           p99: payload.p99,
           tokens_per_sec: payload.tokens_per_sec,
           cost_per_min: payload.cost_per_min,
+          samples: payload.samples,
           windows: payload.windows,
         });
         return;
