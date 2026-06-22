@@ -1031,15 +1031,17 @@ impl ReqwestUpstreamClient {
     ///
     /// Round-1 review (F1): the body is STAGED on the token, NOT committed straight onto the
     /// FlowStore record. The L1 telemetry guard commits the token's pending body at finalize,
-    /// AFTER the failover layer has decided the turn's FINAL outcome — and a provider that
-    /// later SERVES the turn clears the pending body first (`clear_pending_response_body`). So
-    /// the record's `upstream_response` reflects the turn's final outcome (provider A 500 →
-    /// provider B 200 leaves it `None`; all-fail commits the last attempt's body), never a
-    /// transient earlier attempt. Last-writer-wins per attempt (the shrink-and-retry's body
-    /// replaces the first attempt's, a later failed provider's replaces an earlier one's).
-    /// The redaction is consistent with the existing request-capture surface; this is a
-    /// diagnostic body shown to the authenticated operator, captured ONLY when explicitly
-    /// opted in.
+    /// AFTER the failover layer has decided the turn's FINAL outcome. Round-2 (HIGH): the
+    /// failover loop (and the bare-leaf dispatch) CLEARS the staged body at the START of each
+    /// attempt, so the record's `upstream_response` reflects the FINAL attempt's outcome — an
+    /// HTTP-status failure stages here and commits its body; a body-less final failure
+    /// (connect/timeout/prefetch-stream-error) never reaches this and commits `None`; a
+    /// provider that later SERVES also clears it (`clear_pending_response_body`). So A 500 →
+    /// B 200 ⇒ `None`; A 500 → B 503 ⇒ B's body; A 500 → B transport/no-first-chunk ⇒ `None`.
+    /// Within ONE attempt this is still last-writer-wins (the shrink-and-retry's body replaces
+    /// the first send's). The redaction is consistent with the existing request-capture
+    /// surface; this is a diagnostic body shown to the authenticated operator, captured ONLY
+    /// when explicitly opted in.
     fn capture_upstream_response_body(&self, serving: Option<&Arc<ServingToken>>, body: &str) {
         if !self.flow_store.is_response_capture_enabled() {
             return;
@@ -1330,6 +1332,15 @@ impl UpstreamClient for ReqwestUpstreamClient {
             let attempt_model = request.model.clone();
             if let Some(serving) = &serving {
                 serving.arm_attempt_header_byte();
+                // Gap 05 review round 2 (HIGH): per-attempt reset of the staged ERROR body
+                // on the bare-leaf (single-attempt, no-failover) path too, so the invariant
+                // "the final outcome decides the committed body" holds identically on every
+                // dispatch path. A fresh `ServingToken` starts empty, so this is normally a
+                // no-op here — but keeping the reset symmetric with the failover loop means
+                // the bare leaf can never commit a body from a stale staging, regardless of
+                // how the token was constructed. The non-2xx site in `dispatch_chat_stream`
+                // re-stages this attempt's own body; a body-less failure leaves it cleared.
+                serving.clear_pending_response_body();
             }
             return match self
                 .dispatch_chat_stream(&url, request, response_id.as_deref(), serving.as_ref())
@@ -1756,6 +1767,18 @@ impl FailoverUpstreamClient {
             // `None` for an HTTP-status failure despite headers having arrived).
             if let Some(serving) = &backend.serving {
                 serving.arm_attempt_header_byte();
+                // Gap 05 review round 2 (HIGH): CLEAR any upstream ERROR body staged by an
+                // EARLIER provider before THIS attempt dispatches, so the FINAL attempt's
+                // outcome — not a stale earlier one — decides the committed body. Without
+                // this, `A=500(body) → B=connect/timeout/prefetch-stream-error(no body)`
+                // would commit A's stale body even though the turn's final failure carried
+                // none: B's body-less failure never re-stages, and the served-path clear
+                // (below) is reached only on a SERVE, not on a body-less failure. Mirrors
+                // `arm_attempt_header_byte`'s per-attempt reset of scratch state — an
+                // HTTP-status failure re-stages its own body, a served attempt clears (as
+                // it already does), and a body-less final failure leaves it cleared ⇒ the
+                // record commits `None`. Idempotent + gated (no-op when capture is off).
+                serving.clear_pending_response_body();
             }
             let stream = match provider
                 .client
@@ -2946,17 +2969,21 @@ struct ServingInfo {
     /// Gap 05 round-1 review (F1): the PENDING upstream RESPONSE/ERROR body for the
     /// TURN — staged here on the shared token instead of committed straight onto the
     /// FlowStore record at the leaf, so the body that finally lands reflects the turn's
-    /// FINAL outcome, not a transient earlier attempt. The leaf stamps the most-recent
-    /// FAILED attempt's captured body here (last-writer-wins per attempt — a later failed
-    /// provider's body overwrites an earlier one); a provider that SUCCESSFULLY serves
-    /// CLEARS it (a served turn has no failure body), mirroring the gap-03 served-attempt-
-    /// is-authoritative model. The L1 telemetry guard `take`s it at finalize and commits
-    /// it via `set_upstream_response`, so the record carries a body IFF the turn ultimately
-    /// failed: provider A 500 → provider B 200 leaves this `None` (cleared on B's serve);
-    /// provider A 500 → provider B 500 leaves B's (last) error body to commit. Already a
-    /// redacted + capped [`CapturedResponseBody`] (the leaf passes the same capped/redacting
-    /// capture), so no `Bytes` slice of the 256 MiB middleware buffer is retained. Gated at
-    /// the leaf (`is_response_capture_enabled`), so when capture is off nothing is staged.
+    /// FINAL outcome, not a transient earlier attempt. Round-2 (HIGH): the slot is CLEARED
+    /// at the START of EACH attempt (the failover loop + the bare-leaf dispatch, the same
+    /// per-attempt reset seam as `attempt_header_byte_ms`), so it holds at most the CURRENT
+    /// attempt's body. A failed HTTP-status attempt stages its body; a body-less failure
+    /// (connect/timeout/prefetch-stream-error) stages nothing; a provider that SUCCESSFULLY
+    /// serves also CLEARS it. So whatever sits here at finalize is exactly the FINAL
+    /// attempt's outcome. The L1 telemetry guard `take`s it at finalize and commits it via
+    /// `set_upstream_response`, so the record carries a body IFF the turn's FINAL attempt
+    /// failed WITH an HTTP body: A 500 → B 200 leaves this `None` (cleared on B's serve);
+    /// A 500 → B 503 leaves B's (final) error body to commit; A 500 → B
+    /// connect/timeout/no-first-chunk leaves it `None` (B's start-of-attempt clear wins and
+    /// B stages nothing). Already a redacted + capped [`CapturedResponseBody`] (the leaf
+    /// passes the same capped/redacting capture), so no `Bytes` slice of the 256 MiB
+    /// middleware buffer is retained. Gated at the leaf (`is_response_capture_enabled`), so
+    /// when capture is off nothing is staged.
     pending_response_body: Option<crate::dashboard_flow::CapturedResponseBody>,
 }
 
@@ -3095,26 +3122,35 @@ impl ServingToken {
     }
 
     /// Gap 05 round-1 review (F1): stage the captured upstream RESPONSE/ERROR `body` of a
-    /// FAILED attempt as the turn's PENDING body. Last-writer-wins per attempt — a later
-    /// failed provider's (or the shrink-and-retry's) body overwrites an earlier one — so on
-    /// an all-providers-fail turn the LAST attempt's error body is what finalize commits.
-    /// The leaf calls this (gated on `is_response_capture_enabled`) at its terminal-error
-    /// sites instead of writing the FlowStore record directly, so a body is committed only
-    /// after the failover layer has decided the turn's final outcome (it is CLEARED the
-    /// instant a later provider serves — see [`clear_pending_response_body`]). `body` is
-    /// already redacted + capped, so no `Bytes` slice of the 256 MiB middleware buffer is
-    /// held.
+    /// FAILED attempt as the turn's PENDING body. The leaf calls this (gated on
+    /// `is_response_capture_enabled`) at its terminal-error sites instead of writing the
+    /// FlowStore record directly, so a body is committed only after the failover layer has
+    /// decided the turn's final outcome. Round-2 (HIGH): the failover loop (and the
+    /// bare-leaf dispatch) CLEARS the slot at the START of each attempt
+    /// ([`clear_pending_response_body`]), so the committed body is the FINAL attempt's, not
+    /// the last attempt that HAPPENED to carry one: a final HTTP-status failure re-stages
+    /// here and commits its body, while a final body-less failure
+    /// (connect/timeout/prefetch-stream-error) — which never calls this — leaves the slot
+    /// cleared and commits `None`. Within ONE attempt this is still last-writer-wins (the
+    /// shrink-and-retry's body overwrites the first send's). The slot is also CLEARED the
+    /// instant a later provider serves. `body` is already redacted + capped, so no `Bytes`
+    /// slice of the 256 MiB middleware buffer is held.
     pub fn set_pending_response_body(&self, body: crate::dashboard_flow::CapturedResponseBody) {
         self.lock().pending_response_body = Some(body);
     }
 
-    /// Gap 05 round-1 review (F1): discard any pending upstream ERROR body because a
-    /// provider has SUCCESSFULLY served the turn. A served turn has no failure body, so an
-    /// earlier failed provider's body (e.g. provider A's 500 before provider B's 200) must
-    /// NOT remain as the turn's `upstream_response` — clearing here is the option-(b)
-    /// "overwrite when a later attempt ultimately serves" semantics, aligned with the
-    /// gap-03 served-attempt-is-authoritative model. Called at the failover serve-success
-    /// seam (the SAME point `set_provider` tags the serving provider). Idempotent.
+    /// Gap 05 — discard any pending upstream ERROR body so the FINAL attempt's outcome
+    /// decides the committed body. Called at TWO seams: (1) round-2 (HIGH) — at the START
+    /// of EACH provider attempt in the failover loop (and the bare-leaf dispatch), the SAME
+    /// per-attempt reset point as `arm_attempt_header_byte`, so an earlier provider's staged
+    /// body never survives a LATER attempt that fails WITHOUT an HTTP body
+    /// (connect/timeout/prefetch-stream-error); (2) round-1 (F1) — at the failover
+    /// serve-success seam (the SAME point `set_provider` tags the serving provider), so a
+    /// served turn commits no failure body. With the per-attempt clear, an HTTP-status
+    /// failure RE-STAGES its own body via `set_pending_response_body` and a body-less
+    /// failure leaves the slot cleared, so the committed body is exactly the FINAL attempt's
+    /// (its body for a final HTTP-status failure, `None` for a final body-less failure or a
+    /// served turn). Idempotent.
     pub fn clear_pending_response_body(&self) {
         self.lock().pending_response_body = None;
     }
@@ -6737,6 +6773,157 @@ mod tests {
         assert!(
             !text.contains("provider A error body"),
             "F1: the earlier provider's body was overwritten by the final one: {text}"
+        );
+    }
+
+    /// Gap 05 review ROUND 2 (HIGH): the edge case the per-attempt clear fixes — provider
+    /// A returns 500 WITH an error body, then provider B fails at the TRANSPORT layer
+    /// (connect refused, no response headers, NO HTTP error body). The turn's FINAL failure
+    /// carried no body, so the committed `upstream_response` must be `None` — NOT provider
+    /// A's stale 500 body. Before the fix, A's body stayed staged through B's body-less
+    /// failure (B never re-stages, and the serve-success clear never fires on an all-fail
+    /// turn) and was wrongly committed. The fix clears the staged body at the START of
+    /// each attempt, so B's start-of-attempt clear discards A's body and nothing re-stages.
+    #[tokio::test]
+    async fn gap05_failover_a500_then_b_transport_failure_commits_no_stale_body() {
+        let down_a = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(r#"{"error":{"message":"provider A stale body"}}"#),
+            )
+            .mount(&down_a)
+            .await;
+
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+
+        // Provider B points at a reserved/closed port → TCP connect refused BEFORE any
+        // response headers: a Connect-class failure with NO HTTP error body to stage.
+        let failover = FailoverUpstreamClient::new(
+            vec![
+                FailoverUpstreamProvider::new(
+                    "primary",
+                    d2_capturing_client(&down_a.uri(), store.clone()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+                FailoverUpstreamProvider::new(
+                    "backup",
+                    d2_capturing_client("http://127.0.0.1:1", store.clone()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+            ],
+            std::time::Duration::from_secs(0),
+        );
+
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some(response_id.clone()),
+            Some(Arc::clone(&token)),
+        );
+        assert!(
+            failover.stream_chat_completion(&backend).await.is_err(),
+            "all providers fail ⇒ the failover dispatch errors"
+        );
+
+        // Round 2 (HIGH): the FINAL attempt (B) failed WITHOUT a body, so the per-attempt
+        // clear left the slot empty — finalize commits `None`, never A's stale 500 body.
+        assert!(
+            token.take_pending_response_body().is_none(),
+            "round 2: a body-less FINAL failure leaves no staged body (A's was cleared)"
+        );
+        store.set_upstream_response(&api_call_id, token.take_pending_response_body());
+
+        let record = store.detail(&api_call_id).expect("record");
+        assert!(
+            record.upstream_response.is_none(),
+            "round 2: a turn whose FINAL failure carried no body commits None, not the \
+             earlier provider's stale 500 body"
+        );
+    }
+
+    /// Gap 05 review ROUND 2 (HIGH): the no-first-chunk variant of the same edge case —
+    /// provider A returns 500 WITH a body, then provider B returns 200 headers but its
+    /// stream ends before yielding ANY chunk (a prefetch `Stream`-class failure). B's 2xx
+    /// path stages NO error body (only non-2xx sites stage), and the serve-success clear is
+    /// reached only on a SUCCESSFUL prefetch — not this post-headers stream failure. So the
+    /// turn's final failure again carries no body, and the committed `upstream_response`
+    /// must be `None`, not provider A's stale 500 body. The per-attempt clear is what makes
+    /// this hold (B's start-of-attempt clear discards A's body).
+    #[tokio::test]
+    async fn gap05_failover_a500_then_b_no_first_chunk_commits_no_stale_body() {
+        let down_a = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(r#"{"error":{"message":"provider A stale body"}}"#),
+            )
+            .mount(&down_a)
+            .await;
+        // Provider B: 200 OK headers but an EMPTY SSE body — the stream ends before the
+        // first chunk, so `prefetch_first_chunk` fails AFTER headers (a Stream-class,
+        // body-less failure on a 2xx that never staged an error body).
+        let empty_b = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(String::new(), "text/event-stream"),
+            )
+            .mount(&empty_b)
+            .await;
+
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+
+        let failover = FailoverUpstreamClient::new(
+            vec![
+                FailoverUpstreamProvider::new(
+                    "primary",
+                    d2_capturing_client(&down_a.uri(), store.clone()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+                FailoverUpstreamProvider::new(
+                    "backup",
+                    d2_capturing_client(&empty_b.uri(), store.clone()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+            ],
+            std::time::Duration::from_secs(0),
+        );
+
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some(response_id.clone()),
+            Some(Arc::clone(&token)),
+        );
+        assert!(
+            failover.stream_chat_completion(&backend).await.is_err(),
+            "A 500 then B no-first-chunk ⇒ the failover dispatch errors"
+        );
+
+        // Round 2 (HIGH): B's 200/no-chunk failure staged no body and cleared A's at the
+        // start of its attempt, so the committed body is None — not A's stale 500.
+        store.set_upstream_response(&api_call_id, token.take_pending_response_body());
+
+        let record = store.detail(&api_call_id).expect("record");
+        assert!(
+            record.upstream_response.is_none(),
+            "round 2: a 200-but-no-first-chunk FINAL failure commits None, not the earlier \
+             provider's stale 500 body"
         );
     }
 
