@@ -299,6 +299,22 @@ impl Attempt {
         let opt = |s: &Option<String>| s.as_ref().map(|s| s.len()).unwrap_or(0);
         opt(&self.provider) + opt(&self.model)
     }
+
+    /// Gap 03 (round-1 review F3): cap this attempt's two dynamic scalar strings
+    /// (`provider`, `model`) to [`SCALAR_CAP`] BEFORE the attempt is retained on the shared
+    /// [`ServingToken`](crate::upstream::ServingToken). The attempt is later cloned UNCHANGED
+    /// into both [`FlowRecord::attempts`] and the evict-safe
+    /// [`TerminalMetricsInputs::attempts`], so without this cap an attacker-controlled
+    /// provider/model string (e.g. a routed alias derived from request input) would bypass
+    /// the store's `SCALAR_CAP` invariant on BOTH the record and the terminal payload (the
+    /// `record_attempts` upsert replaces the vector wholesale and does not re-cap). Reuses
+    /// the SAME [`cap_scalar`] helper every other retained scalar uses — no second cap. The
+    /// bounded enums need no capping (fixed size); the timestamps are `u128` scalars.
+    pub(crate) fn capped(mut self) -> Self {
+        self.provider = self.provider.map(cap_scalar);
+        self.model = self.model.map(cap_scalar);
+        self
+    }
 }
 
 /// The D5 metrics inputs the L1 [`TelemetryGuard`] assembles at finalize from its
@@ -2599,6 +2615,112 @@ mod tests {
         assert_eq!(
             reser, value["attempts"],
             "the attempts round-trip is lossless"
+        );
+    }
+
+    /// F4 (round-1 review): a FULL-summary deserialize→serialize round-trip covering BOTH
+    /// new gap-03 wire fields together — the TOP-LEVEL `first_upstream_byte_ms` AND the
+    /// nested `attempts[]`. The prior round-trip test only re-read the nested `attempts`
+    /// sub-array, never the whole `SnapshotFlowSummary` DTO, so a regression to the new
+    /// top-level field's wire shape would have slipped through (AGENTS.md no-new-wire-field
+    /// -without-round-trip rule). `SnapshotFlowSummary` is `Serialize`-only by design
+    /// (gap-02 precedent), so this round-trips the serialized summary through an EQUIVALENT
+    /// DTO that deserializes both new fields, then re-serializes and asserts both survive
+    /// losslessly. The bounded taxonomic codes survive as the same snake_case tags — no raw
+    /// upstream text on the wire.
+    #[test]
+    fn snapshot_summary_full_dto_round_trip_covers_both_new_wire_fields() {
+        /// Equivalent DTO covering BOTH gap-03 wire fields plus enough sibling scalars to
+        /// be a genuine full-summary round-trip (not just the attempts sub-array). Derives
+        /// `Deserialize` (the production summary is `Serialize`-only) + `Serialize` so the
+        /// re-serialization can be compared for losslessness.
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct RoundTripSummary {
+            api_call_id: String,
+            method: String,
+            uri: String,
+            // `FlowStatus` is `Serialize`-only; it serializes as a snake_case string, so a
+            // `String` here deserializes and re-serializes byte-identically.
+            status: String,
+            started_ms: u128,
+            // Gap 03 nested wire field.
+            attempts: Vec<Attempt>,
+            // Gap 03 top-level wire field — ABSENT when unmeasured (skip_serializing_if);
+            // `default` so a missing key deserializes back to `None` (never `0`).
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            first_upstream_byte_ms: Option<u128>,
+        }
+
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        store.record_attempts(
+            "api_1",
+            vec![
+                failed_attempt("primary", AttemptErrorClass::HttpStatus),
+                served_attempt("backup", Some(321)),
+            ],
+            Some(321),
+        );
+        let record = store.detail("api_1").expect("record");
+        let summary = SnapshotFlowSummary::from_record(&record);
+
+        // Serialize the WHOLE production summary, then deserialize the WHOLE thing into the
+        // equivalent DTO (both new fields, top-level + nested, in ONE pass).
+        let wire = serde_json::to_value(&summary).expect("serialize summary");
+        let back: RoundTripSummary =
+            serde_json::from_value(wire.clone()).expect("deserialize full summary DTO");
+
+        // Both new wire fields survived deserialization.
+        assert_eq!(
+            back.first_upstream_byte_ms,
+            Some(321),
+            "top-level first_upstream_byte_ms survives the full-summary round-trip"
+        );
+        assert_eq!(back.attempts.len(), 2, "nested attempts[] survive");
+        assert_eq!(back.attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(
+            back.attempts[0].error_class,
+            Some(AttemptErrorClass::HttpStatus)
+        );
+        assert!(back.attempts[0].first_upstream_byte_ms.is_none());
+        assert_eq!(back.attempts[1].status, AttemptStatus::Served);
+        assert_eq!(back.attempts[1].first_upstream_byte_ms, Some(321));
+
+        // Re-serialize the DTO and confirm BOTH new fields are byte-identical to the
+        // production wire (compare as `Value` so key order is not a false mismatch).
+        let reser = serde_json::to_value(&back).expect("re-serialize full summary DTO");
+        assert_eq!(
+            reser["first_upstream_byte_ms"], wire["first_upstream_byte_ms"],
+            "top-level first_upstream_byte_ms round-trips losslessly"
+        );
+        assert_eq!(
+            reser["attempts"], wire["attempts"],
+            "nested attempts[] round-trips losslessly"
+        );
+
+        // And the unmeasured case: a summary with NO upstream byte omits the top-level
+        // field on the wire, and the DTO deserializes it back to `None` (never `0`).
+        open_simple(&store, "api_2");
+        store.record_attempts(
+            "api_2",
+            vec![failed_attempt("primary", AttemptErrorClass::Connect)],
+            None,
+        );
+        let record2 = store.detail("api_2").expect("record");
+        let summary2 = SnapshotFlowSummary::from_record(&record2);
+        let wire2 = serde_json::to_value(&summary2).expect("serialize summary2");
+        assert!(
+            !wire2
+                .as_object()
+                .unwrap()
+                .contains_key("first_upstream_byte_ms"),
+            "an unmeasured top-level first byte is ABSENT on the wire (never 0)"
+        );
+        let back2: RoundTripSummary =
+            serde_json::from_value(wire2).expect("deserialize summary2 DTO");
+        assert!(
+            back2.first_upstream_byte_ms.is_none(),
+            "absent top-level field deserializes to None"
         );
     }
 

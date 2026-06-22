@@ -76,38 +76,77 @@ fn now_epoch_ms_u128() -> u128 {
         .unwrap_or(0)
 }
 
+/// Gap 03 round-1 review (F1): stamp NOW (the instant the upstream response headers
+/// arrived) onto the current attempt's wire-byte slot on the shared `ServingToken`.
+/// No-op when no token is threaded (tests / non-engine paths). Called by the leaf right
+/// after `logged_send_chat_request` returns, for BOTH a 2xx and a non-2xx response, so the
+/// failover loop / bare-leaf reads the TRUE wire TTFB even for an HTTP-status failure.
+fn stamp_header_byte(serving: Option<&Arc<ServingToken>>) {
+    if let Some(serving) = serving {
+        serving.stamp_attempt_header_byte(now_epoch_ms_u128());
+    }
+}
+
 /// Gap 03: map a failed-attempt [`AppError`] to a BOUNDED, sanitized taxonomic
 /// [`AttemptErrorClass`](crate::dashboard_flow::AttemptErrorClass) — NEVER raw upstream
 /// text (which stays behind spec 05's gated seam), so the body-free summary can never
-/// leak an unbounded/secret-bearing upstream error body. A `Terminal` failover
-/// disposition (a context-overflow that survived shrink-and-retry) maps to `Terminal`;
-/// a cancellation to `Stream` (an upstream that ended before a chunk); otherwise the
-/// HTTP status class drives 4xx/5xx → `HttpStatus`, with the `Display` text inspected
-/// ONLY for our own fixed timeout/parse markers (still our strings, not the upstream's).
+/// leak an unbounded/secret-bearing upstream error body.
+///
+/// Round-1 review (F2): classification is driven by STRUCTURED metadata and FIXED
+/// gateway-emitted prefixes only — never by a `contains()` substring scan of the full
+/// `Display` text, which can include the redacted-but-attacker-influenced upstream
+/// response body interpolated into `"upstream chat failed with {status}: {body}"`. A raw
+/// body containing the literal text `"timed out"` / `"request failed"` must NOT be able to
+/// flip the bounded code. So:
+///   - `Terminal` disposition (a context-overflow that survived shrink-and-retry) → `Terminal`.
+///   - Otherwise we match the gateway's OWN fixed leaf-error PREFIXES with `starts_with`
+///     against the part of the message BEFORE any `{body}` is interpolated. Each
+///     body-bearing gateway error is `"<fixed prefix> {status}: <body>"` or
+///     `"<fixed prefix>: <reqwest err>"`, so a `starts_with` on the fixed prefix is
+///     immune to body content (the body is strictly after the prefix). Body-free fixed
+///     markers (timeout / stream-ended) match in full.
+///   - Anything else falls back to the HTTP status class (4xx/5xx → `HttpStatus`).
+///
+/// Every prefix below is a constant string this module constructs in `dispatch_chat_stream`
+/// / `send_chat_request` / `prefetch_first_chunk` — none is reachable from upstream text.
 fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptErrorClass {
     use crate::dashboard_flow::AttemptErrorClass;
     use crate::error::FailoverDisposition;
     if err.failover_disposition() == FailoverDisposition::Terminal {
         return AttemptErrorClass::Terminal;
     }
-    // These markers are llmconduit's OWN fixed strings (set in this module's leaf /
-    // failover paths), not raw upstream bodies, so matching them leaks nothing.
     let message = err.to_string();
-    if message.contains("timed out") {
-        return AttemptErrorClass::Timeout;
-    }
-    if message.contains("request failed") {
-        // `upstream chat request failed: …` / `upstream models request failed: …` — the
-        // transport (connect/send) failed before any HTTP response.
+    // Transport/connect failure BEFORE any HTTP response: `send_chat_request` /
+    // `list_models` map a reqwest send error to this fixed prefix; the trailing
+    // `{err}` is a reqwest transport error, not an upstream response body.
+    if message.starts_with("upstream chat request failed:")
+        || message.starts_with("upstream models request failed:")
+        || message.starts_with("upstream completions request failed:")
+    {
         return AttemptErrorClass::Connect;
     }
-    if message.contains("failed to parse") || message.contains("ended before the first chunk") {
+    // Timeout / stream-ended-before-first-chunk: BODY-FREE fixed markers from
+    // `prefetch_first_chunk` / `stream_after_prefetch` — exact, no interpolation.
+    if message == "upstream stream timed out" {
+        return AttemptErrorClass::Timeout;
+    }
+    if message == "upstream stream ended before the first chunk" {
         return AttemptErrorClass::Stream;
     }
-    let status = err.status_code().as_u16();
-    if (400..600).contains(&status) {
+    // Non-2xx HTTP status: `"upstream chat failed with {status}: {body}"`. The `{body}`
+    // is interpolated strictly AFTER this fixed prefix, so `starts_with` cannot be
+    // influenced by body text (a body that itself contains "timed out" / "request failed"
+    // is already excluded above because those branches require the message to START with /
+    // EQUAL their own markers, which this variant never does).
+    if message.starts_with("upstream chat failed with ") {
         return AttemptErrorClass::HttpStatus;
     }
+    // Anything else is a generic gateway-side failover-eligible condition (cooldown,
+    // "no models available", "all providers failed before producing a response"). We do
+    // NOT consult `status_code()` as a fallback: every `AppError::upstream(...)` collapses
+    // to a fixed 502, so a `(400..600)` status check would mislabel EVERY such generic
+    // error as `HttpStatus` — the only true upstream HTTP-status case is the fixed-prefix
+    // branch above. `Other` is the honest bounded code for these.
     AttemptErrorClass::Other
 }
 
@@ -968,21 +1007,25 @@ impl ReqwestUpstreamClient {
     }
 
     /// Gap 03 (bare-leaf path): wrap a successfully-dispatched upstream stream so the
-    /// flow records EXACTLY ONE served [`Attempt`](crate::dashboard_flow::Attempt) whose
-    /// `first_upstream_byte_ms` is the wall-clock instant the FIRST chunk arrives on the
-    /// wire — the bare-leaf analogue of the failover loop's prefetch-point measurement.
-    /// The attempt is pushed onto the shared `ServingToken` (read by the L1 guard at
-    /// finalize for both the record and the evict-safe terminal payload) the moment the
-    /// first item is yielded; if the stream ends with NO item, a `Stream`-class FAILED
-    /// attempt is recorded with `first_upstream_byte_ms = None` (don't-lie-with-zeros).
-    /// Pure pass-through of every chunk afterwards — it never buffers or duplicates
-    /// tokens (AGENTS.md failover-only-pre-first-chunk is untouched: this records, it does
-    /// not retry). No-op wrapper when no token is threaded.
+    /// flow records EXACTLY ONE served [`Attempt`](crate::dashboard_flow::Attempt). Round-1
+    /// review (F1): `first_upstream_byte_ms` is `header_byte_ms` — the wire instant the
+    /// upstream RESPONSE HEADERS arrived (captured by `dispatch_chat_stream` the moment
+    /// `send().await` returned), NOT the later instant the first parsed SSE chunk is
+    /// yielded. The attempt is still RECORDED at first-chunk yield (so a stream that yields
+    /// NO item becomes a FAILED attempt and exactly one attempt is recorded), but the
+    /// measured wire byte time is the header time. Because the dispatch succeeded, headers
+    /// arrived, so `header_byte_ms` is `Some` on this path; it is threaded as the byte time
+    /// for the served chunk AND the "stream produced nothing" `Stream`-class failure
+    /// (headers DID arrive — only the first chunk did not). Pure pass-through of every
+    /// chunk afterwards — it never buffers or duplicates tokens (AGENTS.md
+    /// failover-only-pre-first-chunk is untouched: this records, it does not retry). No-op
+    /// wrapper when no token is threaded.
     fn record_served_attempt_on_first_byte(
         serving: Option<Arc<ServingToken>>,
         mut stream: UpstreamStream,
         start_ms: u128,
         model: String,
+        header_byte_ms: Option<u128>,
     ) -> UpstreamStream {
         let Some(serving) = serving else {
             return stream;
@@ -992,18 +1035,17 @@ impl ReqwestUpstreamClient {
             while let Some(item) = stream.next().await {
                 if !first_byte_recorded {
                     first_byte_recorded = true;
-                    // The first item arrived on the wire. A transport/parse error in the
-                    // FIRST item is still "no usable first chunk" → record a FAILED
-                    // attempt with no wire first-byte; a chunk → a SERVED attempt stamped
-                    // at this instant. Either way exactly one attempt is recorded.
-                    let now = now_epoch_ms_u128();
+                    // The first item arrived. A transport/parse error in the FIRST item is
+                    // still "no usable first chunk" → a FAILED attempt; a chunk → a SERVED
+                    // attempt. Either way exactly one attempt is recorded, and its wire
+                    // first-byte is the HEADER time (F1), never the chunk-yield time.
                     match &item {
                         Ok(_) => serving.record_attempt(crate::dashboard_flow::Attempt {
                             provider: Some("primary".to_string()),
                             model: Some(model.clone()),
                             start_ms,
-                            end_ms: now,
-                            first_upstream_byte_ms: Some(now),
+                            end_ms: now_epoch_ms_u128(),
+                            first_upstream_byte_ms: header_byte_ms,
                             status: crate::dashboard_flow::AttemptStatus::Served,
                             error_class: None,
                             failover_reason: None,
@@ -1011,6 +1053,7 @@ impl ReqwestUpstreamClient {
                         Err(err) => serving.record_attempt(Self::failed_bare_attempt(
                             start_ms,
                             model.clone(),
+                            header_byte_ms,
                             err,
                         )),
                     }
@@ -1018,14 +1061,16 @@ impl ReqwestUpstreamClient {
                 yield item;
             }
             if !first_byte_recorded {
-                // The stream completed without yielding a single item: no first chunk
-                // ever arrived. Record a FAILED attempt (no wire first-byte → `None`).
+                // The stream completed without yielding a single item: no first CHUNK
+                // arrived, but the response HEADERS did (the dispatch succeeded) — so the
+                // wire first-byte is the header time (F1), and this is a `Stream`-class
+                // FAILED attempt.
                 serving.record_attempt(crate::dashboard_flow::Attempt {
                     provider: Some("primary".to_string()),
                     model: Some(model.clone()),
                     start_ms,
                     end_ms: now_epoch_ms_u128(),
-                    first_upstream_byte_ms: None,
+                    first_upstream_byte_ms: header_byte_ms,
                     status: crate::dashboard_flow::AttemptStatus::Failed,
                     error_class: Some(crate::dashboard_flow::AttemptErrorClass::Stream),
                     failover_reason: None,
@@ -1036,11 +1081,14 @@ impl ReqwestUpstreamClient {
 
     /// Gap 03: build a FAILED bare-leaf [`Attempt`](crate::dashboard_flow::Attempt) (the
     /// dispatch errored before producing a stream, OR the first stream item was an error).
-    /// `first_upstream_byte_ms` is `None` (no wire first-byte) and the bounded taxonomic
-    /// `error_class`/`failover_reason` come from `err` — never raw upstream text.
+    /// Round-1 review (F1): `first_upstream_byte_ms` is `header_byte_ms` — `Some` (the wire
+    /// header time) for an HTTP-status failure whose response headers arrived, `None` for a
+    /// connect/timeout-before-response. The bounded taxonomic `error_class`/`failover_reason`
+    /// come from `err` — never raw upstream text.
     fn failed_bare_attempt(
         start_ms: u128,
         model: String,
+        header_byte_ms: Option<u128>,
         err: &AppError,
     ) -> crate::dashboard_flow::Attempt {
         use crate::dashboard_flow::AttemptFailoverReason;
@@ -1056,7 +1104,7 @@ impl ReqwestUpstreamClient {
             model: Some(model),
             start_ms,
             end_ms: now_epoch_ms_u128(),
-            first_upstream_byte_ms: None,
+            first_upstream_byte_ms: header_byte_ms,
             status: AttemptStatus::Failed,
             error_class: Some(classify_attempt_error(err)),
             failover_reason: Some(failover_reason),
@@ -1074,6 +1122,7 @@ impl ReqwestUpstreamClient {
         url: &Url,
         request: ChatCompletionRequest,
         response_id: Option<&str>,
+        serving: Option<&Arc<ServingToken>>,
     ) -> AppResult<UpstreamStream> {
         // First attempt. On a non-2xx whose body indicates a context/completion
         // token-limit overflow, shrink `max_completion_tokens` and retry ONCE.
@@ -1084,6 +1133,12 @@ impl ReqwestUpstreamClient {
         let response = self
             .logged_send_chat_request(url, &request, response_id)
             .await?;
+        // Gap 03 round-1 review (F1): the upstream response HEADERS just arrived — this is
+        // the TRUE on-wire first-byte time. Stamp it BEFORE inspecting the status, so a
+        // non-2xx (HTTP-status failure) attempt carries a measured wire byte time too, not
+        // `None`. A connect/timeout-before-response never reaches here (`?` above
+        // propagated the transport error), so the slot stays `None` for those.
+        stamp_header_byte(serving);
         let status = response.status();
         if status.is_success() {
             return stream_success_response(response, self.max_sse_frame_bytes).await;
@@ -1211,27 +1266,47 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // failover loop owns attempt recording) records EXACTLY ONE attempt for the flow.
         // A leaf nested in a failover/routing client leaves `tag_primary_provider` false,
         // so the failover loop is the sole attempt recorder there (this branch is skipped
-        // — no double-count). The served attempt's wire first-byte is stamped when the
-        // returned stream yields its first chunk (`record_served_attempt_on_first_byte`);
-        // a dispatch error records a FAILED attempt with a bounded taxonomic code.
+        // — no double-count). Round-1 review (F1): the served/failed attempt's
+        // `first_upstream_byte_ms` is the TRUE wire TTFB — the instant the upstream response
+        // HEADERS arrived (`dispatch_chat_stream` stamps the armed slot for both a 2xx and a
+        // non-2xx), NOT the later instant the first parsed SSE chunk is yielded. A dispatch
+        // that fails AFTER headers (a non-2xx) thus carries a measured byte time; a
+        // connect/timeout-before-response leaves it `None` (the slot was never stamped).
         if self.tag_primary_provider {
             let attempt_start_ms = now_epoch_ms_u128();
             let attempt_model = request.model.clone();
+            if let Some(serving) = &serving {
+                serving.arm_attempt_header_byte();
+            }
             return match self
-                .dispatch_chat_stream(&url, request, response_id.as_deref())
+                .dispatch_chat_stream(&url, request, response_id.as_deref(), serving.as_ref())
                 .await
             {
-                Ok(stream) => Ok(Self::record_served_attempt_on_first_byte(
-                    serving,
-                    stream,
-                    attempt_start_ms,
-                    attempt_model,
-                )),
+                Ok(stream) => {
+                    // Headers arrived (the slot holds the wire byte time). The attempt is
+                    // still RECORDED at first-chunk yield so a stream that produces no chunk
+                    // is a FAILED attempt — but its `first_upstream_byte_ms` is the header
+                    // time captured here, not the chunk-yield time.
+                    let header_byte_ms = serving
+                        .as_ref()
+                        .and_then(|serving| serving.take_attempt_header_byte());
+                    Ok(Self::record_served_attempt_on_first_byte(
+                        serving,
+                        stream,
+                        attempt_start_ms,
+                        attempt_model,
+                        header_byte_ms,
+                    ))
+                }
                 Err(err) => {
                     if let Some(serving) = &serving {
+                        // `take_attempt_header_byte` is `Some` for an HTTP-status failure
+                        // (headers arrived) and `None` for a connect/timeout-before-response.
+                        let header_byte_ms = serving.take_attempt_header_byte();
                         serving.record_attempt(Self::failed_bare_attempt(
                             attempt_start_ms,
                             attempt_model,
+                            header_byte_ms,
                             &err,
                         ));
                     }
@@ -1240,7 +1315,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
             };
         }
 
-        self.dispatch_chat_stream(&url, request, response_id.as_deref())
+        self.dispatch_chat_stream(&url, request, response_id.as_deref(), serving.as_ref())
             .await
     }
 
@@ -1619,6 +1694,16 @@ impl FailoverUpstreamClient {
             // does, exactly once per provider it tries.
             let attempt_start_ms = now_epoch_ms_u128();
             let attempt_model = provider_request.request.model.clone();
+            // Gap 03 round-1 review (F1): arm the per-attempt wire-byte slot on the SHARED
+            // token (the nested leaf stamps it the instant `send().await` returns response
+            // headers, for both a 2xx and a non-2xx). Read it after the dispatch resolves:
+            // `Some` once headers arrived (served OR HTTP-status failure), `None` for a
+            // connect/timeout-before-response. This is the TRUE wire TTFB the prior code
+            // missed (it stamped a served attempt only at first-chunk yield and recorded
+            // `None` for an HTTP-status failure despite headers having arrived).
+            if let Some(serving) = &backend.serving {
+                serving.arm_attempt_header_byte();
+            }
             let stream = match provider
                 .client
                 .stream_chat_completion(&provider_request)
@@ -1629,31 +1714,42 @@ impl FailoverUpstreamClient {
                     // Terminal same-provider error (e.g. a context overflow that
                     // survived the leaf shrink-and-retry). Trying the next
                     // provider would just overflow again, so surface it as-is and
-                    // do NOT mark this provider failed (it is not at fault).
+                    // do NOT mark this provider failed (it is not at fault). A context
+                    // overflow IS an HTTP-status response, so its headers arrived — the
+                    // slot carries the wire byte time for the trace.
+                    let header_byte_ms = Self::take_attempt_header_byte(backend);
                     Self::record_attempt(
                         backend,
                         provider,
                         attempt_start_ms,
                         attempt_model,
-                        None,
+                        header_byte_ms,
                         Some(&err),
                     );
                     return Err(err);
                 }
                 Err(err) => {
                     self.mark_failure(provider_index, &err);
+                    // `Some` for an HTTP-status failure (headers arrived), `None` for a
+                    // connect/timeout-before-response (the leaf never reached the stamp).
+                    let header_byte_ms = Self::take_attempt_header_byte(backend);
                     Self::record_attempt(
                         backend,
                         provider,
                         attempt_start_ms,
                         attempt_model,
-                        None,
+                        header_byte_ms,
                         Some(&err),
                     );
                     last_error = Some(err);
                     continue;
                 }
             };
+            // Headers arrived (the dispatch returned `Ok`), so the slot holds the wire byte
+            // time for THIS served/prefetch-failed attempt. Read it ONCE here, before
+            // `prefetch_first_chunk` may take a while waiting for the first chunk — the
+            // measured byte is the header time, not the prefetch-completion time.
+            let header_byte_ms = Self::take_attempt_header_byte(backend);
             match Self::prefetch_first_chunk(stream, request_timeout).await {
                 Ok((first_chunk, stream)) => {
                     self.mark_provider_success(provider_index);
@@ -1665,15 +1761,16 @@ impl FailoverUpstreamClient {
                     if let Some(serving) = &backend.serving {
                         serving.set_provider(provider.name.clone());
                     }
-                    // Gap 03: this attempt SERVED — its first chunk just arrived on the
-                    // wire, so `now` is the measured wire first-byte for this attempt (and
-                    // the flow-level `first_upstream_byte_ms` via `record_attempt`).
+                    // Gap 03 (F1): this attempt SERVED — its `first_upstream_byte_ms` is the
+                    // wire HEADER time (`header_byte_ms`), the instant `send().await`
+                    // returned, NOT the later first-chunk-yield instant. This also seeds the
+                    // flow-level `first_upstream_byte_ms` via `record_attempt`.
                     Self::record_attempt(
                         backend,
                         provider,
                         attempt_start_ms,
                         attempt_model,
-                        Some(now_epoch_ms_u128()),
+                        header_byte_ms,
                         None,
                     );
                     if provider_index > 0 {
@@ -1691,15 +1788,17 @@ impl FailoverUpstreamClient {
                 }
                 Err(err) => {
                     self.mark_failure(provider_index, &err);
-                    // Gap 03: the response began (or timed out) but no first chunk
-                    // arrived, so the attempt FAILED with no wire first-byte (`None`,
-                    // never `0`).
+                    // Gap 03 (F1): the response HEADERS arrived but no first chunk did (a
+                    // stream-ended / timeout-AFTER-headers). Headers were received, so the
+                    // wire byte time IS measured (`header_byte_ms` is `Some`) — only the
+                    // first chunk is absent. `None` here would only occur on a path that
+                    // never received headers, which this arm is not.
                     Self::record_attempt(
                         backend,
                         provider,
                         attempt_start_ms,
                         attempt_model,
-                        None,
+                        header_byte_ms,
                         Some(&err),
                     );
                     last_error = Some(err);
@@ -1711,13 +1810,25 @@ impl FailoverUpstreamClient {
         }))
     }
 
+    /// Gap 03 round-1 review (F1): read the current attempt's wire-header-byte time off the
+    /// shared `ServingToken` (`None` when no token is threaded, or when no response headers
+    /// were ever received — a connect/timeout-before-response). The caller passes the
+    /// result as the attempt's `first_upstream_byte_ms`.
+    fn take_attempt_header_byte(backend: &BackendChatRequest) -> Option<u128> {
+        backend
+            .serving
+            .as_ref()
+            .and_then(|serving| serving.take_attempt_header_byte())
+    }
+
     /// Gap 03: build and push one [`Attempt`](crate::dashboard_flow::Attempt) onto the
     /// flow's shared `ServingToken` (no-op when no token is threaded — tests / non-engine
-    /// paths). `first_upstream_byte_ms` is `Some(now)` ONLY on a served attempt (its first
-    /// chunk arrived) and `None` on a failure (don't-lie-with-zeros — an unmeasured wire
-    /// first-byte is absent, never `0`). On a failure, `err` drives the BOUNDED taxonomic
-    /// `error_class` + `failover_reason` (never raw upstream text — those bodies stay
-    /// spec-05-gated); on a success both are `None`.
+    /// paths). Round-1 review (F1): `first_upstream_byte_ms` is the TRUE wire TTFB the
+    /// caller measured — the instant the upstream response HEADERS arrived (`Some` for a
+    /// served attempt AND for an HTTP-status failure whose headers landed; `None` only for a
+    /// connect/timeout-BEFORE-response, never `0` — don't-lie-with-zeros). On a failure,
+    /// `err` drives the BOUNDED taxonomic `error_class` + `failover_reason` (never raw
+    /// upstream text — those bodies stay spec-05-gated); on a success both are `None`.
     fn record_attempt(
         backend: &BackendChatRequest,
         provider: &FailoverUpstreamProvider,
@@ -2758,6 +2869,19 @@ struct ServingInfo {
     /// attempt's measured value is never clobbered. `None` until a chunk arrives — NEVER
     /// `0` when unmeasured (don't-lie-with-zeros).
     first_upstream_byte_ms: Option<u128>,
+    /// Gap 03 round-1 review (F1): a PER-ATTEMPT scratch slot holding the epoch-ms the
+    /// CURRENT attempt's upstream RESPONSE HEADERS arrived on the wire — the instant
+    /// `logged_send_chat_request` (the `send().await`) returned, stamped by the leaf for
+    /// BOTH a 2xx and a non-2xx response (the status is inspected only AFTER the headers
+    /// land). This is the TRUE wire TTFB: the prior code stamped a served attempt only when
+    /// the first parsed SSE chunk was yielded, and recorded `None` for an HTTP-status
+    /// failure even though headers had already been received. The failover loop / bare-leaf
+    /// `arm`s the slot to `None` before each dispatch and `take`s it after, so a connect /
+    /// timeout-BEFORE-response (where `send().await` errored and the leaf never stamped)
+    /// correctly leaves it `None`. Attempts within one flow are dispatched STRICTLY
+    /// sequentially (the failover loop awaits each fully before the next), so a single slot
+    /// is race-free; it is scratch state, NOT part of the persisted trace.
+    attempt_header_byte_ms: Option<u128>,
 }
 
 /// Interior-mutable serving identity for one flow. A FRESH one is allocated per
@@ -2837,7 +2961,13 @@ impl ServingToken {
     /// first-byte time as the flow-level `first_upstream_byte_ms` (first-write-wins, so
     /// the FIRST served attempt's measured value wins and a later finalize cannot clobber
     /// it with `None`). The order of pushes IS the attempt order the trace renders.
+    ///
+    /// Round-1 review (F3): the attempt's dynamic scalar strings (`provider`/`model`) are
+    /// `cap_scalar`-bounded HERE, at the single retention choke point, so the bounded copy
+    /// is what later rides BOTH the `FlowRecord` and the evict-safe `TerminalMetricsInputs`
+    /// (the store's `record_attempts` replaces the vector wholesale without re-capping).
     pub fn record_attempt(&self, attempt: crate::dashboard_flow::Attempt) {
+        let attempt = attempt.capped();
         let mut info = self.lock();
         if attempt.status == crate::dashboard_flow::AttemptStatus::Served
             && info.first_upstream_byte_ms.is_none()
@@ -2855,6 +2985,37 @@ impl ServingToken {
     pub fn attempts_snapshot(&self) -> (Vec<crate::dashboard_flow::Attempt>, Option<u128>) {
         let info = self.lock();
         (info.attempts.clone(), info.first_upstream_byte_ms)
+    }
+
+    /// Gap 03 round-1 review (F1): arm the per-attempt wire-header-byte slot to `None`
+    /// before a dispatch is issued. The leaf stamps it (via [`stamp_attempt_header_byte`])
+    /// the instant the upstream response headers arrive; the failover loop / bare-leaf
+    /// reads it with [`take_attempt_header_byte`] after the dispatch resolves. Arming
+    /// before each attempt is what makes a connect/timeout-BEFORE-response leave the slot
+    /// `None` (the leaf never reaches the stamp), while an HTTP-status failure — whose
+    /// headers DID arrive — carries the real wire byte time.
+    pub fn arm_attempt_header_byte(&self) {
+        self.lock().attempt_header_byte_ms = None;
+    }
+
+    /// Gap 03 round-1 review (F1): record the epoch-ms the CURRENT attempt's upstream
+    /// response headers arrived (the `send().await` in `logged_send_chat_request` just
+    /// returned), for BOTH a 2xx and a non-2xx response — this is the TRUE on-wire TTFB.
+    /// First-write-wins within the armed window so the FIRST response's header time wins
+    /// even across the leaf's single context-overflow shrink-and-retry (the retry's later
+    /// headers must not overwrite the original wire-first-byte for this attempt).
+    pub fn stamp_attempt_header_byte(&self, ms: u128) {
+        let mut info = self.lock();
+        if info.attempt_header_byte_ms.is_none() {
+            info.attempt_header_byte_ms = Some(ms);
+        }
+    }
+
+    /// Gap 03 round-1 review (F1): read the current attempt's wire-header-byte time
+    /// (`None` when no response headers were ever received — a connect/timeout-before-
+    /// response failure). The caller uses it as the attempt's `first_upstream_byte_ms`.
+    pub fn take_attempt_header_byte(&self) -> Option<u128> {
+        self.lock().attempt_header_byte_ms
     }
 
     /// `(route, provider)` snapshot for D3's finalize attribution.
@@ -6025,6 +6186,43 @@ mod tests {
         );
     }
 
+    /// F2 (round-1 review): the bounded code must be driven by the gateway's OWN fixed
+    /// leaf-error PREFIX, never by a `contains()` scan of the interpolated (redacted but
+    /// attacker-influenced) upstream response body. An HTTP-status failure whose body
+    /// happens to contain the literal text `"timed out"` / `"request failed"` /
+    /// `"failed to parse"` MUST still classify as `HttpStatus` — the body can never flip
+    /// the code to `Timeout`/`Connect`/`Stream`.
+    #[test]
+    fn classify_attempt_error_ignores_upstream_body_text() {
+        use crate::dashboard_flow::AttemptErrorClass;
+        // The gateway builds this exact shape in `dispatch_chat_stream`; `{body}` is the
+        // redacted upstream response body and is fully under the upstream's control.
+        for hostile_body in [
+            "the request timed out upstream",
+            "upstream chat request failed: boom",
+            "could not parse: failed to parse json",
+            "upstream stream ended before the first chunk",
+            "request failed and timed out",
+        ] {
+            let err = AppError::upstream(format!("upstream chat failed with 500: {hostile_body}"));
+            assert_eq!(
+                classify_attempt_error(&err),
+                AttemptErrorClass::HttpStatus,
+                "HTTP-status failure must stay HttpStatus regardless of body text: {hostile_body:?}"
+            );
+        }
+        // A generic non-leaf upstream error (cooldown / no-providers) is `Other`, not
+        // silently `HttpStatus` via the 502-collapse the old `(400..600)` fallback hit.
+        assert_eq!(
+            classify_attempt_error(&AppError::upstream(
+                "all upstream providers are in cooldown; next retry in 5s; last error: x"
+                    .to_string()
+            )),
+            AttemptErrorClass::Other,
+            "a generic 502 gateway error is Other, not HttpStatus"
+        );
+    }
+
     /// A real bare-leaf single success records EXACTLY ONE served attempt with a measured
     /// wire `first_upstream_byte_ms` (the bare-leaf analogue of the prefetch point).
     #[tokio::test]
@@ -6080,10 +6278,14 @@ mod tests {
         );
     }
 
-    /// A real bare-leaf dispatch FAILURE (non-2xx) records ONE failed attempt with NO wire
-    /// first-byte (`None`, never `0`) and a bounded taxonomic error class.
+    /// F1 (round-1 review): a bare-leaf HTTP-status FAILURE (non-2xx) records ONE failed
+    /// attempt that DOES carry a measured wire first-byte — the response HEADERS arrived
+    /// (that is what makes it an HTTP-status failure rather than a connect failure), so the
+    /// wire TTFB is real even though the request ultimately failed. The flow-level first
+    /// byte stays `None` (no attempt SERVED). Contrast `bare_leaf_connect_failure_*` below,
+    /// where headers never arrive and the byte time is `None`.
     #[tokio::test]
-    async fn bare_leaf_dispatch_failure_records_failed_attempt_with_no_first_byte() {
+    async fn bare_leaf_http_status_failure_records_failed_attempt_with_measured_first_byte() {
         use crate::dashboard_flow::AttemptErrorClass;
         use crate::dashboard_flow::AttemptStatus;
         let server = MockServer::start().await;
@@ -6119,8 +6321,57 @@ mod tests {
         assert_eq!(attempts[0].status, AttemptStatus::Failed);
         assert_eq!(attempts[0].error_class, Some(AttemptErrorClass::HttpStatus));
         assert!(
+            attempts[0].first_upstream_byte_ms.is_some(),
+            "F1: an HTTP-status failure received response headers → measured wire first-byte"
+        );
+        assert!(
+            first_byte.is_none(),
+            "no served attempt → no flow-level first byte"
+        );
+    }
+
+    /// F1 (round-1 review): a bare-leaf CONNECT failure (no upstream is listening, so
+    /// `send().await` errors BEFORE any response headers) records ONE failed attempt whose
+    /// wire first-byte is `None` — the slot is never stamped because the leaf never received
+    /// headers. This is the ONLY case F1 leaves `None` (don't-lie-with-zeros).
+    #[tokio::test]
+    async fn bare_leaf_connect_failure_records_failed_attempt_with_no_first_byte() {
+        use crate::dashboard_flow::AttemptErrorClass;
+        use crate::dashboard_flow::AttemptStatus;
+        // A reserved-but-closed port: the TCP connect is refused, so `send().await` fails
+        // before any HTTP response — a transport/connect error, not an HTTP status.
+        let leaf = ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            "http://127.0.0.1:1/v1/".parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        )
+        .into_bare_primary();
+
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some("resp_bare_connect_fail".to_string()),
+            Some(Arc::clone(&token)),
+        );
+        let result = leaf.stream_chat_completion(&backend).await;
+        assert!(result.is_err(), "connect-refused dispatch fails");
+
+        let (attempts, first_byte) = token.attempts_snapshot();
+        assert_eq!(attempts.len(), 1, "one failed attempt recorded");
+        assert_eq!(attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(
+            attempts[0].error_class,
+            Some(AttemptErrorClass::Connect),
+            "a transport failure before any response is classified Connect"
+        );
+        assert!(
             attempts[0].first_upstream_byte_ms.is_none(),
-            "a failed attempt has NO wire first-byte (None, never 0)"
+            "F1: connect-before-response never received headers → no wire first-byte (None)"
         );
         assert!(
             first_byte.is_none(),
@@ -6201,8 +6452,9 @@ mod tests {
             "the failed provider carries a failover_reason"
         );
         assert!(
-            first.first_upstream_byte_ms.is_none(),
-            "the failed provider never received a first chunk (None, never 0)"
+            first.first_upstream_byte_ms.is_some(),
+            "F1: the 503 failed provider DID receive response headers → measured wire \
+             first-byte, even though it never produced a first chunk"
         );
         let last = attempts.last().expect("served attempt");
         assert_eq!(last.provider.as_deref(), Some("backup"));
@@ -6218,6 +6470,117 @@ mod tests {
         assert_eq!(
             first_byte, last.first_upstream_byte_ms,
             "flow-level first byte is the SERVED attempt's wire first-byte"
+        );
+    }
+
+    /// F1 (round-1 review): a forced failover where the FIRST provider's connection is
+    /// REFUSED (no response headers ever arrive) then the second serves. The failed
+    /// provider's attempt is `Connect`-class with `first_upstream_byte_ms == None` (the
+    /// don't-lie-with-zeros case F1 preserves), while the served provider carries a measured
+    /// wire first-byte. Contrast the 503 case above, where the failed provider DID receive
+    /// headers and so DOES carry a byte time.
+    #[tokio::test]
+    async fn failover_connect_refused_then_200_leaves_failed_first_byte_none() {
+        use crate::dashboard_flow::AttemptErrorClass;
+        use crate::dashboard_flow::AttemptStatus;
+        let up = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(d2_sse_ok_body()))
+            .mount(&up)
+            .await;
+
+        let failover = FailoverUpstreamClient::new(
+            vec![
+                // 127.0.0.1:1 is reserved/closed → TCP connect refused before any response.
+                FailoverUpstreamProvider::new(
+                    "primary",
+                    d2_capturing_client("http://127.0.0.1:1", DashboardFlowStore::disabled()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+                FailoverUpstreamProvider::new(
+                    "backup",
+                    d2_capturing_client(&up.uri(), DashboardFlowStore::disabled()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+            ],
+            std::time::Duration::from_secs(0),
+        );
+
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some("resp_failover_connect".to_string()),
+            Some(Arc::clone(&token)),
+        );
+        let mut stream = failover
+            .stream_chat_completion(&backend)
+            .await
+            .expect("failover serves from the backup after the connect refusal");
+        while stream.next().await.is_some() {}
+
+        let (attempts, first_byte) = token.attempts_snapshot();
+        assert!(attempts.len() >= 2, "failed + served attempts recorded");
+        let first = &attempts[0];
+        assert_eq!(first.provider.as_deref(), Some("primary"));
+        assert_eq!(first.status, AttemptStatus::Failed);
+        assert_eq!(
+            first.error_class,
+            Some(AttemptErrorClass::Connect),
+            "a connect refusal is Connect-class"
+        );
+        assert!(
+            first.first_upstream_byte_ms.is_none(),
+            "F1: connect-before-response never received headers → None (never 0)"
+        );
+        let last = attempts.last().expect("served attempt");
+        assert_eq!(last.provider.as_deref(), Some("backup"));
+        assert_eq!(last.status, AttemptStatus::Served);
+        assert!(
+            last.first_upstream_byte_ms.is_some(),
+            "the served provider measured a wire first-byte"
+        );
+        assert_eq!(
+            first_byte, last.first_upstream_byte_ms,
+            "flow-level first byte is the SERVED attempt's wire first-byte, not the failed one's"
+        );
+    }
+
+    /// F3 (round-1 review): an attempt's `provider`/`model` scalars are `cap_scalar`-bounded
+    /// (≤ 4 KiB) when recorded onto the shared `ServingToken`, so the bounded copy is what
+    /// later rides the `FlowRecord` AND the evict-safe terminal payload. An over-cap string
+    /// is truncated before retention; the store's `SCALAR_CAP` invariant cannot be bypassed
+    /// via the attempt trace.
+    #[test]
+    fn serving_token_caps_attempt_scalar_strings() {
+        use crate::dashboard_flow::AttemptStatus;
+        // 4 KiB cap (mirrors dashboard_flow::SCALAR_CAP, which is module-private).
+        const SCALAR_CAP: usize = 4 * 1024;
+        let token = super::ServingToken::default();
+        token.record_attempt(crate::dashboard_flow::Attempt {
+            provider: Some("p".repeat(SCALAR_CAP * 2)),
+            model: Some("m".repeat(SCALAR_CAP * 2)),
+            start_ms: 1,
+            end_ms: 2,
+            first_upstream_byte_ms: Some(2),
+            status: AttemptStatus::Served,
+            error_class: None,
+            failover_reason: None,
+        });
+        let (attempts, _) = token.attempts_snapshot();
+        assert_eq!(attempts.len(), 1);
+        assert!(
+            attempts[0].provider.as_deref().unwrap().len() <= SCALAR_CAP,
+            "F3: provider scalar capped to SCALAR_CAP before retention"
+        );
+        assert!(
+            attempts[0].model.as_deref().unwrap().len() <= SCALAR_CAP,
+            "F3: model scalar capped to SCALAR_CAP before retention"
         );
     }
 }
