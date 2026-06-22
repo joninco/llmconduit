@@ -270,8 +270,13 @@ impl ClientAttribution {
     ///   [`key_hash_label`] → a `key-<12 hex>` display id; the raw key is dropped
     ///   immediately. Each candidate is trimmed and a blank/whitespace-only one is
     ///   SKIPPED (so an empty/`Bearer`-only `Authorization` falls through to
-    ///   `x-api-key` rather than fabricating a hash from the literal). The raw key
-    ///   value is NEVER emitted verbatim — a key carrier is ALWAYS hashed.
+    ///   `x-api-key` rather than fabricating a hash from the literal). A configured
+    ///   header that names the `Authorization` carrier is read through the SAME
+    ///   `bearer_token` scheme normalization as the canonical bearer candidate (NOT the
+    ///   raw header), so a token-less `Bearer`/`Bearer   ` configured `authorization`
+    ///   ALSO yields no candidate and falls through — never the scheme literal
+    ///   `"Bearer"` hashed (review round 2). The raw key value is NEVER emitted verbatim
+    ///   — a key carrier is ALWAYS hashed.
     /// - **Configured header** (caller-asserted id): when `configured_header` names a
     ///   header that is present, non-empty, AND NOT a sensitive key carrier, its value
     ///   becomes the label (verbatim, capped later). A configured header whose NAME is
@@ -306,9 +311,23 @@ impl ClientAttribution {
             // Only when the configured header itself names a sensitive key carrier do we
             // read its value AS A KEY (to be hashed). A non-sensitive configured header
             // is handled by the verbatim branch below, not here.
+            //
+            // A configured `Authorization` header MUST be read through the SAME
+            // `bearer_token` normalization as the canonical candidate above — NOT the raw
+            // `header_value` — so a token-less `Bearer`/`Bearer   ` yields an empty token
+            // (skipped), never the scheme literal `"Bearer"` hashed into a fabricated
+            // label (review round 2). For any other sensitive alias (`api-key`,
+            // `bearer-token`, …) there is no scheme word to strip and the canonical
+            // candidates do not read it, so its raw value is the key to hash.
             configured
                 .filter(|_| configured_is_sensitive)
-                .and_then(|name| header_value(headers, name)),
+                .and_then(|name| {
+                    if name.eq_ignore_ascii_case(axum::http::header::AUTHORIZATION.as_str()) {
+                        bearer_token(headers)
+                    } else {
+                        header_value(headers, name)
+                    }
+                }),
         ];
         for candidate in key_candidates.into_iter().flatten() {
             let token = candidate.trim();
@@ -4197,6 +4216,111 @@ mod tests {
             "an empty bearer with no other key falls through to UA, not a fabricated hash"
         );
         assert_eq!(attr2.label.as_deref(), Some("agent/1.0"));
+    }
+
+    /// Gap 04 review ROUND 2 (MEDIUM): when `LLMCONDUIT_DASHBOARD_CLIENT_HEADER=authorization`
+    /// AND the request carries a token-less `Authorization: Bearer` / `Bearer   `
+    /// (whitespace-only), the configured-sensitive-header key path MUST read the value
+    /// through the SAME `bearer_token` scheme normalization as the canonical bearer
+    /// candidate — so the empty token is skipped and the derivation falls through
+    /// (x-api-key → UA → None). The scheme literal `"Bearer"` is NEVER hashed/emitted.
+    /// The configured `authorization` happy-path (a real `Bearer <token>`) still hashes
+    /// the token (identically to the canonical path), proving the fix did not regress it.
+    #[test]
+    fn client_attribution_configured_authorization_tokenless_bearer_falls_through() {
+        // (a) configured `authorization` + `Authorization: Bearer` (no token) + a valid
+        //     `x-api-key` → falls through to the x-api-key hash; the literal is not hashed.
+        let mut a = HeaderMap::new();
+        a.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer"),
+        );
+        a.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("REAL-XKEY-CFGAUTH-4242"),
+        );
+        let attr_a = ClientAttribution::derive(&a, Some("authorization"));
+        assert_eq!(
+            attr_a.source,
+            Some(ClientSource::KeyHash),
+            "tokenless configured-authorization bearer falls through to the valid x-api-key"
+        );
+        let label_a = attr_a.label.clone().expect("label present");
+        let mut xkey_only = HeaderMap::new();
+        xkey_only.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("REAL-XKEY-CFGAUTH-4242"),
+        );
+        let xkey_label = ClientAttribution::derive(&xkey_only, None).label.unwrap();
+        assert_eq!(
+            label_a, xkey_label,
+            "the label is the x-api-key hash; the scheme literal was never hashed"
+        );
+        assert!(
+            !label_a.contains("Bearer"),
+            "the literal 'Bearer' is never emitted: {label_a}"
+        );
+
+        // (b) configured `authorization` + `Authorization: Bearer   ` (whitespace-only
+        //     token) + only a UA → falls through to the UA fallback (literal never hashed).
+        let mut b = HeaderMap::new();
+        b.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer   "),
+        );
+        b.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("cfgauth/9.9"),
+        );
+        let attr_b = ClientAttribution::derive(&b, Some("authorization"));
+        assert_eq!(
+            attr_b.source,
+            Some(ClientSource::UserAgent),
+            "whitespace-only configured-authorization bearer falls through to UA"
+        );
+        assert_eq!(attr_b.label.as_deref(), Some("cfgauth/9.9"));
+        assert!(!format!("{attr_b:?}").contains("Bearer"));
+
+        // (c) configured `authorization` + `Authorization: Bearer` (no token) and NO
+        //     other signal → honestly unattributed (`None`), never a fabricated label.
+        let mut c = HeaderMap::new();
+        c.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer"),
+        );
+        let attr_c = ClientAttribution::derive(&c, Some("authorization"));
+        assert_eq!(
+            attr_c,
+            ClientAttribution::none(),
+            "tokenless configured-authorization bearer with no other signal is None"
+        );
+
+        // (d) HAPPY PATH: configured `authorization` WITH a real `Bearer <token>` → the
+        //     token is hashed (KeyHash), identical to the canonical bearer path; the
+        //     scheme word is stripped, never part of the hashed value.
+        let mut d = HeaderMap::new();
+        d.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer sk-CFGAUTH-REALTOKEN-1234"),
+        );
+        let attr_d = ClientAttribution::derive(&d, Some("authorization"));
+        assert_eq!(
+            attr_d.source,
+            Some(ClientSource::KeyHash),
+            "configured-authorization WITH a real token still hashes (happy path intact)"
+        );
+        let label_d = attr_d.label.clone().expect("label present");
+        assert!(label_d.starts_with("key-"));
+        // Equals hashing the bare token via the canonical bearer path (scheme stripped).
+        let canonical_label = ClientAttribution::derive(&d, None).label.unwrap();
+        assert_eq!(
+            label_d, canonical_label,
+            "configured-authorization hashes the scheme-stripped token, like the canonical path"
+        );
+        assert!(
+            !label_d.contains("Bearer") && !label_d.contains("CFGAUTH-REALTOKEN"),
+            "neither the scheme word nor the raw token leaks into the label: {label_d}"
+        );
     }
 
     /// User-Agent is the WEAKEST, labelled fallback — used only when there is no key
