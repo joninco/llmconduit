@@ -59,8 +59,8 @@ fn bench_record_usage_disabled(criterion: &mut Criterion) {
         prompt: 100,
         completion: 40,
         total: 140,
-        cached: 10,
-        reasoning: 7,
+        cached: Some(10),
+        reasoning: Some(7),
     };
     criterion.bench_function("record_usage_disabled", |bencher| {
         bencher.iter(|| {

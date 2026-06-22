@@ -60,6 +60,8 @@ export function makeFlow(over: Partial<FlowSummary> = {}): FlowSummary {
     uri: '/v1/responses',
     status: 'completed',
     started_ms: 1_700_000_000_000,
+    // Gap 07: every row carries a cost-confidence tag; default to `unavailable` (no price).
+    cost_confidence: 'unavailable',
     ...over,
   };
 }

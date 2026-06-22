@@ -14,7 +14,7 @@ import type { ProviderHealth, TopologyResponse, FlowSummary, MetricsResponse, Us
 
 /** A metrics sample carrying a `cost_per_min` (the authoritative `$`/min source — finding 3). */
 function metrics(costPerMin: number): MetricsResponse {
-  const w = { reqs_per_sec: 0, active_streams: 0, error_pct: 0, p50: 0, p95: 0, p99: 0, tokens_per_sec: 0, cost_per_min: costPerMin, samples: 1, usage_samples: 1, priced_samples: 1 };
+  const w = { reqs_per_sec: 0, active_streams: 0, error_pct: 0, p50: 0, p95: 0, p99: 0, tokens_per_sec: 0, cost_per_min: costPerMin, samples: 1, usage_samples: 1, priced_samples: 1, cost_confidence: 'estimated' as const };
   return { metrics_seq: 1, ...w, windows: { m1: w, m5: w, h1: w } };
 }
 function usage(over: Partial<Usage> = {}): Usage {
@@ -36,12 +36,12 @@ const TOPOLOGY: TopologyResponse = {
     provider({ id: 'vllm-b', name: 'vllm-b', status: 'cooling', cooling_until_ms: Date.now() + 9000 }),
   ],
   edges: [{ from: 'gateway', to: 'vllm-a', throughput: 3, tokens_per_sec: 90, cost_per_sec: 0.002 }],
-  price_table: { 'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025 } },
+  price_table: { 'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025, cached_price_configured: true } },
 };
 
 function flow(over: Partial<FlowSummary>): FlowSummary {
   return {
-    api_call_id: `api_${Math.random().toString(36).slice(2, 8)}`, method: 'POST', uri: '/v1/responses',
+    api_call_id: `api_${Math.random().toString(36).slice(2, 8)}`, method: 'POST', uri: '/v1/responses', cost_confidence: 'unavailable',
     status: 'completed', started_ms: Date.now() - 2000, finished_ms: Date.now() - 500, ...over,
   };
 }

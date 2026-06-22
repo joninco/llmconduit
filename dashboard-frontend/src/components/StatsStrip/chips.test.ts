@@ -14,6 +14,7 @@ function win(over: Partial<MetricWindow> = {}): MetricWindow {
     samples,
     usage_samples: samples,
     priced_samples: samples,
+    cost_confidence: 'estimated',
     ...over,
   };
 }

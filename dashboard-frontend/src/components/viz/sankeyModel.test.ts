@@ -10,8 +10,8 @@ function delta(over: Partial<SankeyUsageDelta> = {}): SankeyUsageDelta {
 }
 
 const PRICE: Record<string, ModelPrice> = {
-  'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025 },
-  cheap: { input_per_1k: 0.0001, output_per_1k: 0.0001, cached_per_1k: 0.0001 },
+  'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025, cached_price_configured: true },
+  cheap: { input_per_1k: 0.0001, output_per_1k: 0.0001, cached_per_1k: 0.0001, cached_price_configured: true },
 };
 
 describe('buildSankeyModel — 3-column client→gateway→(upstream, model)', () => {

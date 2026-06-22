@@ -39,8 +39,11 @@ const NODES: ProviderHealth[] = [
 ];
 
 const PRICE_TABLE: TopologyResponse['price_table'] = {
-  'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025 },
-  'llama-3.1-70b': { input_per_1k: 0.0008, output_per_1k: 0.0008, cached_per_1k: 0.0004 },
+  // Gap 07: gpt-4o has a CONFIGURED cache rate (presence true) → cached charges are confident.
+  'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025, cached_price_configured: true },
+  // llama has NO configured cache rate (presence false, numeric defaults to 0) → a flow that
+  // bills cached tokens on it is `estimated`, not `confident` (exercises the labelling path).
+  'llama-3.1-70b': { input_per_1k: 0.0008, output_per_1k: 0.0008, cached_per_1k: 0, cached_price_configured: false },
 };
 
 const CATALOG: CatalogEntry[] = [
@@ -55,9 +58,13 @@ const CATALOG: CatalogEntry[] = [
 function seedFlows(): FlowSummary[] {
   const now = Date.now();
   return [
-    { api_call_id: 'api_001', response_id: 'resp_001', method: 'POST', uri: '/v1/responses', status: 'open', model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 812, completion: 240, total: 1052, cached: 128, reasoning: 0 }, started_ms: now - 2400, finished_ms: null, elapsed_ms: 2400, terminal_reason: null, cost: 0.0061 },
-    { api_call_id: 'api_002', response_id: 'resp_002', method: 'POST', uri: '/v1/chat/completions', status: 'completed', model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 1500, completion: 980, total: 2480, cached: 0, reasoning: 120 }, started_ms: now - 12000, finished_ms: now - 7800, elapsed_ms: 4200, terminal_reason: 'response.completed', cost: 0.0019 },
-    { api_call_id: 'api_003', response_id: null, method: 'POST', uri: '/v1/responses', status: 'failed', model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai', usage: null, started_ms: now - 30000, finished_ms: now - 29200, elapsed_ms: 800, terminal_reason: 'upstream 503', cost: null },
+    // Gap 07: llama has cached tokens (128) but NO configured cache rate ⇒ cost is ESTIMATED
+    // (labelled as such in the UI), not confident.
+    { api_call_id: 'api_001', response_id: 'resp_001', method: 'POST', uri: '/v1/responses', status: 'open', model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 812, completion: 240, total: 1052, cached: 128, reasoning: 0 }, started_ms: now - 2400, finished_ms: null, elapsed_ms: 2400, terminal_reason: null, cost: 0.0061, cost_confidence: 'estimated' },
+    // Gap 07: cached/reasoning UNREPORTED (absent ⇒ renders `—`, never `0`); unpriced cache ⇒ estimated.
+    { api_call_id: 'api_002', response_id: 'resp_002', method: 'POST', uri: '/v1/chat/completions', status: 'completed', model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 1500, completion: 980, total: 2480 }, started_ms: now - 12000, finished_ms: now - 7800, elapsed_ms: 4200, terminal_reason: 'response.completed', cost: 0.0019, cost_confidence: 'estimated' },
+    // Gap 07: no usage + a failed call ⇒ cost null ⇒ cost_confidence UNAVAILABLE (renders `—`).
+    { api_call_id: 'api_003', response_id: null, method: 'POST', uri: '/v1/responses', status: 'failed', model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai', usage: null, started_ms: now - 30000, finished_ms: now - 29200, elapsed_ms: 800, terminal_reason: 'upstream 503', cost: null, cost_confidence: 'unavailable' },
   ];
 }
 
@@ -72,6 +79,9 @@ function buildMetrics(): MetricsResponse {
       // priced model, so all three denominators equal `samples` (tok/s + $/min measurable).
       usage_samples: samples,
       priced_samples: samples,
+      // Gap 07: the priced llama model has no configured cache rate (and the seed flow on it
+      // bills/omits cached) ⇒ the aggregate $/min is an ESTIMATE, labelled as such.
+      cost_confidence: 'estimated' as const,
     };
   };
   const m1 = win(1);
@@ -82,6 +92,7 @@ function buildMetrics(): MetricsResponse {
     samples: m1.samples,
     usage_samples: m1.usage_samples,
     priced_samples: m1.priced_samples,
+    cost_confidence: m1.cost_confidence,
     windows: { m1, m5: win(0.9), h1: win(0.7) },
   };
 }
@@ -273,6 +284,7 @@ function buildFlowDetail(id: string): FlowDetail | null {
     finished_ms: base.finished_ms,
     elapsed_ms: base.elapsed_ms,
     cost: base.cost ?? null,
+    cost_confidence: base.cost_confidence,
   };
 }
 
@@ -372,6 +384,7 @@ export class MockWebSocket implements WsLike {
         samples: m.samples,
         usage_samples: m.usage_samples,
         priced_samples: m.priced_samples,
+        cost_confidence: m.cost_confidence,
         windows: m.windows,
       }],
     };

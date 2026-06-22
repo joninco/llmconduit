@@ -9,6 +9,7 @@ function flow(over: Partial<FlowSummary> = {}): FlowSummary {
     uri: '/v1/responses',
     status: 'completed',
     started_ms: 1000,
+    cost_confidence: 'unavailable',
     ...over,
   };
 }
@@ -30,7 +31,7 @@ describe('statusClass — running / 2xx / 4xx / 5xx', () => {
 
 describe('flowCost — server roll-up preferred, else usage × price', () => {
   const price: Record<string, ModelPrice> = {
-    'llama-3.1-70b': { input_per_1k: 0.001, output_per_1k: 0.002, cached_per_1k: 0.0005 },
+    'llama-3.1-70b': { input_per_1k: 0.001, output_per_1k: 0.002, cached_per_1k: 0.0005, cached_price_configured: true },
   };
   it('prefers the precomputed flow.cost', () => {
     expect(flowCost(flow({ cost: 0.42 }), price)).toBe(0.42);
@@ -48,9 +49,17 @@ describe('flowCost — server roll-up preferred, else usage × price', () => {
 
 describe('computeCost', () => {
   it('prices cached prompt tokens at the cached rate', () => {
-    const c = computeCost({ prompt: 2000, completion: 0, total: 2000, cached: 1000, reasoning: 0 }, { input_per_1k: 0.01, output_per_1k: 0, cached_per_1k: 0.001 });
+    const c = computeCost({ prompt: 2000, completion: 0, total: 2000, cached: 1000, reasoning: 0 }, { input_per_1k: 0.01, output_per_1k: 0, cached_per_1k: 0.001, cached_price_configured: true });
     // 1000 billable @0.01 + 1000 cached @0.001 = 0.01 + 0.001
     expect(c).toBeCloseTo(0.011, 6);
+  });
+
+  // Gap 07: an UNREPORTED cached count (absent/null) bills as 0 cached tokens — the whole
+  // prompt then bills at the input rate (matching the Rust `cost_for_usage`).
+  it('bills the whole prompt at the input rate when cached is unreported', () => {
+    const c = computeCost({ prompt: 2000, completion: 0, total: 2000 }, { input_per_1k: 0.01, output_per_1k: 0, cached_per_1k: 0.001, cached_price_configured: false });
+    // cached unreported ⇒ 0 cached tokens ⇒ 2000 billable @0.01 = 0.02 (nothing at cache rate).
+    expect(c).toBeCloseTo(0.02, 6);
   });
 });
 

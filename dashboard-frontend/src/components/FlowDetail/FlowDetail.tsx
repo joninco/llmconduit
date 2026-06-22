@@ -17,11 +17,11 @@
  * shows a distinct state on 403.
  */
 import { useMemo, useState } from 'react';
-import type { FlowDetail as FlowDetailDto, FlowSummary } from '../../api/types';
+import type { CostConfidence, FlowDetail as FlowDetailDto, FlowSummary, Usage } from '../../api/types';
 import { useDashboard } from '../../store/hooks';
 import { Button } from '../ui/Button';
 import { StatusChip } from '../FlowTable/StatusChip';
-import { fmtCost, fmtElapsed, fmtModelPair } from '../FlowTable/format';
+import { fmtCost, fmtElapsed, fmtModelPair, fmtTokens } from '../FlowTable/format';
 import { elapsedMs, flowCost } from '../FlowTable/flowModel';
 import { JsonPane } from '../viz/JsonPane';
 import { combineMiddleDiff, diffLayers } from './diff';
@@ -105,9 +105,19 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
       usage: liveFlow?.usage ?? summary?.usage ?? null,
       model_served: liveFlow?.model_served ?? summary?.model_served ?? null,
       model_requested: liveFlow?.model_requested ?? summary?.model_requested ?? null,
+      cost_confidence: summary?.cost_confidence ?? liveFlow?.cost_confidence ?? 'unavailable',
     };
     return flowCost(merged, priceTable);
   }, [liveFlow, frozenDetail, apiCallId, status, priceTable]);
+
+  // Gap 07 — the cost CONFIDENCE tag for the header label: the server's per-flow tag
+  // (detail roll-up first, then the live row). `estimated` MUST be labelled in the UI
+  // (the cross-cutting rule); `unavailable` rides with a `—` cost. Only meaningful when
+  // a cost actually exists.
+  const costConfidence = frozenDetail?.cost_confidence ?? liveFlow?.cost_confidence ?? 'unavailable';
+  // Gap 07 — the cumulative token usage for the breakdown row (freshest: live, then detail):
+  // cached/reasoning may be UNREPORTED (null/absent) ⇒ `fmtTokens` renders `—`, never `0`.
+  const usage = liveFlow?.usage ?? frozenDetail?.usage ?? null;
 
   return (
     <section className="flex min-h-0 w-[46%] min-w-[420px] flex-col border-l border-line bg-panel" data-testid="flow-detail" aria-label="flow detail">
@@ -116,6 +126,8 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         flow={liveFlow}
         detail={frozenDetail}
         cost={cost}
+        costConfidence={costConfidence}
+        usage={usage}
         seeking={seeking}
         seekAtMs={seekAtMs}
         isActive={isActive}
@@ -235,6 +247,8 @@ function DetailHeader({
   flow,
   detail,
   cost,
+  costConfidence,
+  usage,
   seeking,
   seekAtMs,
   isActive,
@@ -247,6 +261,8 @@ function DetailHeader({
   flow: FlowSummary | null;
   detail: FlowDetailDto | null;
   cost: number | null;
+  costConfidence: CostConfidence;
+  usage: Usage | null;
   seeking: boolean;
   seekAtMs: number | null;
   isActive: boolean;
@@ -299,8 +315,29 @@ function DetailHeader({
         <dt className="text-text-muted">cost / elapsed</dt>
         <dd className="tabular-nums text-text">
           <span className="text-meta">{fmtCost(cost)}</span>
+          {/* Gap 07: an `estimated` cost MUST be labelled (the cross-cutting rule) — a small
+              tag so an operator never mistakes a best-effort figure for a confident one. An
+              `unavailable` cost already reads as `—`; `confident` needs no badge. */}
+          {costConfidence === 'estimated' && (
+            <span
+              className="ml-1.5 rounded-sm bg-status-cooling/15 px-1 py-0.5 text-[10px] uppercase tracking-wide text-status-cooling"
+              data-testid="cost-confidence"
+              data-confidence="estimated"
+              title="cost is an estimate — a billed token class has no configured rate"
+            >
+              est
+            </span>
+          )}
           <span className="text-line"> · </span>
           {fmtElapsed(elapsed)}
+        </dd>
+        {/* Gap 07: the cached/reasoning token breakdown. An UNREPORTED class renders `—`
+            (via `fmtTokens`), NEVER a fabricated `0`; a measured `0` reads `0`. */}
+        <dt className="text-text-muted">cached / reasoning</dt>
+        <dd className="tabular-nums text-text" data-testid="usage-subcounts">
+          <span title="cache-read prompt tokens (— = upstream did not report)">{fmtTokens(usage?.cached)}</span>
+          <span className="text-line"> · </span>
+          <span title="reasoning tokens (— = upstream did not report)">{fmtTokens(usage?.reasoning)}</span>
         </dd>
       </dl>
     </header>

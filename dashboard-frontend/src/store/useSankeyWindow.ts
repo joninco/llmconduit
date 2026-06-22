@@ -214,7 +214,9 @@ function fold(eng: FoldEngine): void {
           upstream: f.upstream_target ?? null,
           model,
           prompt: Math.max(0, u.prompt - (prev?.prompt ?? 0)),
-          cached: Math.max(0, u.cached - (prev?.cached ?? 0)),
+          // Gap 07: an UNREPORTED cached count is treated as 0 token sub-count for the
+          // Sankey band/cost (the lane bills the whole prompt at the input rate).
+          cached: Math.max(0, (u.cached ?? 0) - (prev?.cached ?? 0)),
           completion: Math.max(0, u.completion - (prev?.completion ?? 0)),
           total: dTotal,
         });
@@ -224,7 +226,7 @@ function fold(eng: FoldEngine): void {
     // Always advance the baseline to the latest cumulative — on a SEED frame, a non-positive diff
     // (a corrected/reset total), AND a model-less observation — so the NEXT diff is against the
     // current truth and a later model resolution folds only growth, never the lifetime (D12 R5 HIGH).
-    baselines.set(f.api_call_id, { prompt: u.prompt, cached: u.cached, completion: u.completion, total: u.total });
+    baselines.set(f.api_call_id, { prompt: u.prompt, cached: u.cached ?? 0, completion: u.completion, total: u.total });
   }
 
   const pruned = pruneRing(eng, ts);

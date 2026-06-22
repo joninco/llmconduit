@@ -38,22 +38,43 @@ export const FLOW_STATUSES: readonly FlowStatus[] = ['open', 'completed', 'faile
 export type ProviderStatus = 'healthy' | 'cooling' | 'down';
 export const PROVIDER_STATUSES: readonly ProviderStatus[] = ['healthy', 'cooling', 'down'];
 
+/**
+ * Gap 07 — the CONFIDENCE tier of a `cost` figure (Rust `CostConfidence`, snake_case).
+ * Lets an operator tell a trusted figure from a best-effort estimate from an honest gap:
+ *  - `confident`   — priced AND every billed token class has a known rate (the cached
+ *                    charge is either a reported `0` or priced at a CONFIGURED cache rate).
+ *  - `estimated`   — priced but a class falls back to the default `0.0` cache rate (cached
+ *                    `> 0` or UNREPORTED while no cache rate is configured) — an undercount;
+ *                    MUST be LABELLED as an estimate in the UI (the cross-cutting rule).
+ *  - `unavailable` — no price for the served model ⇒ `cost` is `null` (never a fake `0`).
+ */
+export type CostConfidence = 'confident' | 'estimated' | 'unavailable';
+export const COST_CONFIDENCES: readonly CostConfidence[] = ['confident', 'estimated', 'unavailable'];
+
 /** The debug request lifecycle status (`DebugRequestStatus`, monitor.rs). */
 export type DebugRequestStatus = 'running' | 'completed' | 'failed';
 /** Debug segment kind (`DebugSegmentKind`, monitor.rs). */
 export type DebugSegmentKind = 'output' | 'reasoning' | 'tool';
 
 /**
- * Token-accounting block (`FlowUsage`). The Rust fields are `i64`; we keep them `number`
- * and the validators require finite values. (Non-negative is the contract but not enforced
- * here, since a transient negative would be a Rust bug, not a wire-poisoning vector.)
+ * Token-accounting block (`FlowUsage`). `prompt`/`completion`/`total` are the core counts
+ * the upstream always reports (Rust `i64` → `number`, validated finite).
+ *
+ * Gap 07 — usage CONFIDENCE: `cached`/`reasoning` are the OPTIONAL token classes an upstream
+ * may or may not break out. The Rust side is `Option<i64>` serialized with `skip_serializing_if`,
+ * so an UNREPORTED class is ABSENT on the wire — DISTINCT from a provider-reported `0`. They are
+ * therefore `number | null` and OPTIONAL here: absent/`null` ⇒ UNAVAILABLE (renderers show `—`,
+ * never a fabricated `0`); a present `0` is a measured zero. The distinction is load-bearing for
+ * cost (an unpriced cached charge is `estimated`, not `confident` — see `CostConfidence`).
  */
 export interface Usage {
   prompt: number;
   completion: number;
   total: number;
-  cached: number;
-  reasoning: number;
+  /** Cache-read prompt tokens; absent/`null` ⇒ unreported (UNAVAILABLE), not `0`. */
+  cached?: number | null;
+  /** Reasoning tokens; absent/`null` ⇒ unreported (UNAVAILABLE), not `0`. */
+  reasoning?: number | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +251,13 @@ export interface MetricWindow {
    * from a genuine measured `$0.00`. A finite `u64`.
    */
   priced_samples: number;
+  /**
+   * Gap 07 — the AGGREGATE confidence of this window's `cost_per_min`. `unavailable` when
+   * nothing is priced (`cost_per_min` renders `—`); `estimated` when ANY priced bucket bills
+   * cached at the default `0.0` (no silently-confident total — labelled in the strip);
+   * `confident` only when every priced bucket's billed classes have known rates.
+   */
+  cost_confidence: CostConfidence;
 }
 
 export interface MetricTickPayload {
@@ -248,6 +276,8 @@ export interface MetricTickPayload {
   usage_samples: number;
   /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
   priced_samples: number;
+  /** Headline (`m1`) aggregate cost confidence (gap 07) — labels the headline `$/min`. */
+  cost_confidence: CostConfidence;
   windows: {
     m1: MetricWindow;
     m5: MetricWindow;
@@ -392,6 +422,11 @@ export interface FlowSummary {
   elapsed_ms?: number | null;
   terminal_reason?: string | null;
   cost?: number | null;
+  /**
+   * Gap 07 — the confidence tier of `cost` (always present on the row). `estimated` MUST be
+   * labelled as such; `unavailable` ⇒ `cost` is `null` (renders `—`, never a measured `0`).
+   */
+  cost_confidence: CostConfidence;
 }
 
 /** Body-free frozen summary in a snapshot — identical shape to `FlowSummary` (D1). */
@@ -447,6 +482,8 @@ export interface FlowDetail {
   finished_ms?: number | null;
   elapsed_ms?: number | null;
   cost?: number | null;
+  /** Gap 07 — the confidence tier of `cost` (mirrors `FlowSummary.cost_confidence`). */
+  cost_confidence: CostConfidence;
 }
 
 /** `GET /dashboard/api/metrics` */
@@ -466,6 +503,8 @@ export interface MetricsResponse {
   usage_samples: number;
   /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
   priced_samples: number;
+  /** Headline (`m1`) aggregate cost confidence (gap 07) — labels the headline `$/min`. */
+  cost_confidence: CostConfidence;
   windows: {
     m1: MetricWindow;
     m5: MetricWindow;
@@ -485,6 +524,14 @@ export interface ModelPrice {
   input_per_1k: number;
   output_per_1k: number;
   cached_per_1k: number;
+  /**
+   * Gap 07 — cached-price PRESENCE: whether `cached_per_1k` was EXPLICITLY configured,
+   * distinguishing a real configured `0.0` cache-read rate from an OMITTED one (which also
+   * defaults to `0.0`). Additive — `cached_per_1k` keeps its `number` type. Consumed by the
+   * cost-confidence model (a cached charge against a model with no configured cache rate is
+   * `estimated`) and by spec 08's "$ saved" (which must read presence, not the numeric `0.0`).
+   */
+  cached_price_configured: boolean;
 }
 
 /** `GET /dashboard/api/topology` — nodes/edges + the price table. */
@@ -571,6 +618,10 @@ function isOptStr(v: unknown): boolean {
 function isOptUint(v: unknown): boolean {
   return v === undefined || v === null || isUint(v);
 }
+/** Optional finite number: absent, null, or a finite number (gap 07 cached/reasoning). */
+function isOptNum(v: unknown): boolean {
+  return v === undefined || v === null || isNum(v);
+}
 function isOneOf<T extends string>(v: unknown, set: readonly T[]): v is T {
   return isStr(v) && (set as readonly string[]).includes(v);
 }
@@ -588,8 +639,18 @@ export function isDomain(v: unknown): v is Domain {
   return isOneOf(v, DOMAINS);
 }
 
+/** Validates a `CostConfidence` enum value (gap 07) — confident/estimated/unavailable. */
+function isCostConfidence(v: unknown): v is CostConfidence {
+  return isOneOf(v, COST_CONFIDENCES);
+}
+
 function isUsage(v: unknown): v is Usage {
-  return isObj(v) && isNum(v.prompt) && isNum(v.completion) && isNum(v.total) && isNum(v.cached) && isNum(v.reasoning);
+  // Gap 07: `cached`/`reasoning` are OPTIONAL (absent/null ⇒ unreported/UNAVAILABLE,
+  // distinct from a present finite `0`); `prompt`/`completion`/`total` are required finite.
+  return (
+    isObj(v) && isNum(v.prompt) && isNum(v.completion) && isNum(v.total) &&
+    isOptNum(v.cached) && isOptNum(v.reasoning)
+  );
 }
 function isUsageOrNull(v: unknown): v is Usage | null {
   return v === null || isUsage(v);
@@ -606,7 +667,9 @@ function isMetricWindow(v: unknown): v is MetricWindow {
     // The three per-metric measurability denominators are non-negative integer counts
     // (gap 01): `samples` (latency/error), `usage_samples` (tok/s), `priced_samples`
     // ($/min). All REQUIRED — the Rust tile always emits them.
-    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples)
+    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+    // Gap 07: the aggregate cost-confidence tag is REQUIRED on every window.
+    isCostConfidence(v.cost_confidence)
   );
 }
 function isMetricWindows(v: unknown): boolean {
@@ -630,9 +693,13 @@ function isTopologyEdge(v: unknown): v is TopologyEdge {
   return isObj(v) && isStr(v.from) && isStr(v.to) && isNum(v.throughput) && isNum(v.tokens_per_sec) && isNum(v.cost_per_sec);
 }
 
-/** Validates a complete `ModelPrice` with FINITE numbers (rejects NaN/Inf/missing) — finding 4. */
+/** Validates a complete `ModelPrice` with FINITE numbers (rejects NaN/Inf/missing) — finding 4.
+ * Gap 07: the additive `cached_price_configured` boolean (cached-price presence) is REQUIRED. */
 function isModelPrice(v: unknown): v is ModelPrice {
-  return isObj(v) && isNum(v.input_per_1k) && isNum(v.output_per_1k) && isNum(v.cached_per_1k);
+  return (
+    isObj(v) && isNum(v.input_per_1k) && isNum(v.output_per_1k) && isNum(v.cached_per_1k) &&
+    typeof v.cached_price_configured === 'boolean'
+  );
 }
 /** Validates a `price_table` map: every value a complete finite `ModelPrice` — finding 4. */
 function isPriceTable(v: unknown): v is Record<string, ModelPrice> {
@@ -737,7 +804,8 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
       return (
         isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
         isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-        isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) && isMetricWindows(v.windows)
+        isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+        isCostConfidence(v.cost_confidence) && isMetricWindows(v.windows)
       );
     case 'flow_status':
       return (
@@ -780,7 +848,9 @@ function isFlowSummary(v: unknown): v is FlowSummary {
     isOptUsage(v.usage) &&
     isOneOf(v.status, FLOW_STATUSES) &&
     isUint(v.started_ms) && isOptUint(v.finished_ms) && isOptUint(v.elapsed_ms) &&
-    isOptStr(v.terminal_reason)
+    isOptStr(v.terminal_reason) &&
+    // Gap 07: the per-flow cost-confidence tag is REQUIRED on every row.
+    isCostConfidence(v.cost_confidence)
   );
 }
 
@@ -789,7 +859,8 @@ function isMetricsResponse(v: unknown): v is MetricsResponse {
     isObj(v) && isUint(v.metrics_seq) &&
     isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
     isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) && isMetricWindows(v.windows)
+    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
+    isCostConfidence(v.cost_confidence) && isMetricWindows(v.windows)
   );
 }
 

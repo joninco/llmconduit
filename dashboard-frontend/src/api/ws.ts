@@ -513,6 +513,8 @@ export class DashboardSocket {
           samples: payload.samples,
           usage_samples: payload.usage_samples,
           priced_samples: payload.priced_samples,
+          // Gap 07: thread the aggregate cost confidence from the tick to the store.
+          cost_confidence: payload.cost_confidence,
           windows: payload.windows,
         });
         return;

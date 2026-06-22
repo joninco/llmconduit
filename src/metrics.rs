@@ -131,6 +131,16 @@ pub struct BucketCounts {
     /// render time (`dashboard_api`) where the price table lives, so this layer stays
     /// price-agnostic.
     pub usage_samples: u64,
+    /// Gap 07 — count of usage-bearing terminal flows in this bucket whose `cached`
+    /// token class was UNREPORTED (`None`) by the upstream. The summed `cached_tokens`
+    /// CANNOT distinguish "all flows reported 0 cache hits" from "no flow reported a
+    /// cache breakdown at all" (both sum to `0`), yet they differ for COST confidence:
+    /// an unreported cached against a model with no configured cache rate is an
+    /// `estimated` charge, not `confident`. This counter preserves that per-flow signal
+    /// so the window-level cost-confidence aggregate (`dashboard_api`) can flag a
+    /// window as `estimated` even when `cached_tokens == 0`. Price-agnostic (the cache
+    /// RATE presence is joined at render time where the price table lives).
+    pub unreported_cached_samples: u64,
 }
 
 impl BucketCounts {
@@ -344,6 +354,9 @@ impl WindowRing {
                     .reasoning_tokens
                     .saturating_add(counts.reasoning_tokens);
                 entry.usage_samples = entry.usage_samples.saturating_add(counts.usage_samples);
+                entry.unreported_cached_samples = entry
+                    .unreported_cached_samples
+                    .saturating_add(counts.unreported_cached_samples);
             }
             histogram.merge(&slot.histogram);
         }
@@ -667,12 +680,25 @@ impl MetricsState {
             if let Some(usage) = usage {
                 entry.prompt_tokens = entry.prompt_tokens.saturating_add(usage.prompt);
                 entry.completion_tokens = entry.completion_tokens.saturating_add(usage.completion);
-                entry.cached_tokens = entry.cached_tokens.saturating_add(usage.cached);
-                entry.reasoning_tokens = entry.reasoning_tokens.saturating_add(usage.reasoning);
+                // Gap 07: an UNREPORTED (`None`) cached/reasoning class contributes
+                // nothing to the window THROUGHPUT sum (it is not a `0` charge, it is
+                // "no data") — `unwrap_or(0)` is the correct additive identity here.
+                entry.cached_tokens = entry
+                    .cached_tokens
+                    .saturating_add(usage.cached.unwrap_or(0));
+                entry.reasoning_tokens = entry
+                    .reasoning_tokens
+                    .saturating_add(usage.reasoning.unwrap_or(0));
                 // This terminal flow reported usage → it is a MEASURED token sample
                 // (gap 01 finding 3). A terminal with `usage == None` increments only
                 // `count`, so `tokens_per_sec` over usage-less flows reads `—`.
                 entry.usage_samples = entry.usage_samples.saturating_add(1);
+                // Gap 07: a usage-bearing flow whose `cached` was UNREPORTED preserves
+                // the estimated-cost signal the summed `cached_tokens` would erase.
+                if usage.cached.is_none() {
+                    entry.unreported_cached_samples =
+                        entry.unreported_cached_samples.saturating_add(1);
+                }
             }
             slot.histogram.record(elapsed_ms);
         }
@@ -689,14 +715,24 @@ impl MetricsState {
             let entry = slot.buckets.entry(key.clone()).or_default();
             entry.prompt_tokens = entry.prompt_tokens.saturating_add(usage.prompt);
             entry.completion_tokens = entry.completion_tokens.saturating_add(usage.completion);
-            entry.cached_tokens = entry.cached_tokens.saturating_add(usage.cached);
-            entry.reasoning_tokens = entry.reasoning_tokens.saturating_add(usage.reasoning);
+            // Gap 07: `None` cached/reasoning = unreported, contributes 0 to throughput.
+            entry.cached_tokens = entry
+                .cached_tokens
+                .saturating_add(usage.cached.unwrap_or(0));
+            entry.reasoning_tokens = entry
+                .reasoning_tokens
+                .saturating_add(usage.reasoning.unwrap_or(0));
             // A reported-usage sample (gap 01 finding 3) — the `tokens_per_sec`
             // measurability denominator. The standalone `record_usage` path joins the
             // SAME bucket key as its `record_response`, so on the production terminal
             // path (which uses the atomic `record_terminal`) usage is counted exactly
             // once; this keeps the older split path consistent for its callers/tests.
             entry.usage_samples = entry.usage_samples.saturating_add(1);
+            // Gap 07: preserve the unreported-cached estimated-cost signal (see
+            // `record_terminal`).
+            if usage.cached.is_none() {
+                entry.unreported_cached_samples = entry.unreported_cached_samples.saturating_add(1);
+            }
         }
         self.metrics_seq = self.metrics_seq.saturating_add(1);
     }
@@ -1319,8 +1355,8 @@ mod tests {
                 prompt: 100,
                 completion: 40,
                 total: 140,
-                cached: 10,
-                reasoning: 7,
+                cached: Some(10),
+                reasoning: Some(7),
             },
         );
         metrics.record_usage(
@@ -1332,8 +1368,8 @@ mod tests {
                 prompt: 50,
                 completion: 20,
                 total: 70,
-                cached: 5,
-                reasoning: 3,
+                cached: Some(5),
+                reasoning: Some(3),
             },
         );
         let view = metrics.view();
@@ -1368,8 +1404,8 @@ mod tests {
                 prompt: 100,
                 completion: 40,
                 total: 140,
-                cached: 10,
-                reasoning: 7,
+                cached: Some(10),
+                reasoning: Some(7),
             }),
         );
         // ONE atomic mutation ⇒ exactly one seq bump (not two).
@@ -1445,8 +1481,8 @@ mod tests {
                 prompt: 100,
                 completion: 40,
                 total: 140,
-                cached: 0,
-                reasoning: 0,
+                cached: Some(0),
+                reasoning: Some(0),
             }),
         );
         // 2) unpriced model, usage present → usage sample, NOT priced.
@@ -1460,8 +1496,8 @@ mod tests {
                 prompt: 10,
                 completion: 5,
                 total: 15,
-                cached: 0,
-                reasoning: 0,
+                cached: Some(0),
+                reasoning: Some(0),
             }),
         );
         // 3) priced model, NO usage → counted request, NOT a usage/priced sample.

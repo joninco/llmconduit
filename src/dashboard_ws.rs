@@ -161,6 +161,10 @@ pub struct MetricsSnapshot {
     /// Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability
     /// denominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).
     pub priced_samples: u64,
+    /// Headline (`m1`) aggregate cost confidence (gap 07), mirrored from
+    /// `windows.m1.cost_confidence` — so the headline `$/min` is labelled estimated
+    /// when any priced bucket bills cached at the default `0.0`.
+    pub cost_confidence: crate::dashboard_api::CostConfidence,
     pub windows: MetricWindows,
 }
 
@@ -288,6 +292,10 @@ pub struct MetricTick {
     /// Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability
     /// denominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).
     pub priced_samples: u64,
+    /// Headline (`m1`) aggregate cost confidence (gap 07), mirrored from
+    /// `windows.m1.cost_confidence` — so the headline `$/min` is labelled estimated
+    /// when any priced bucket bills cached at the default `0.0`.
+    pub cost_confidence: crate::dashboard_api::CostConfidence,
     pub windows: MetricWindows,
 }
 
@@ -334,6 +342,14 @@ pub struct MetricWindow {
     /// unpriced model from a genuine measured `$0.00`. All three are finite `u64`s, so
     /// they never violate the frozen finite-number wire contract.
     pub priced_samples: u64,
+    /// Gap 07 — the aggregate [`CostConfidence`](crate::dashboard_api::CostConfidence)
+    /// of this window's `cost_per_min`. `unavailable` when nothing in the window is
+    /// priced (`priced_samples == 0` ⇒ `cost_per_min` renders `—`); `estimated` when
+    /// ANY priced bucket would bill cached tokens at the default `0.0` (cached `> 0` or
+    /// UNREPORTED against a model with no configured cache rate) — no silently-confident
+    /// total; `confident` only when every priced bucket's billed classes have known
+    /// rates. Surfaced so the strip can LABEL an estimated cost as such.
+    pub cost_confidence: crate::dashboard_api::CostConfidence,
 }
 
 /// A topology node — the D4 `ProviderHealth` shape, except `catalog_size` is
@@ -717,6 +733,7 @@ pub fn metric_tick_frame(
             samples: body.samples,
             usage_samples: body.usage_samples,
             priced_samples: body.priced_samples,
+            cost_confidence: body.cost_confidence,
             windows: body.windows,
         })],
     }
@@ -1580,8 +1597,8 @@ mod tests {
                     prompt: i,
                     completion: i,
                     total: 2 * i,
-                    cached: 0,
-                    reasoning: 0,
+                    cached: Some(0),
+                    reasoning: Some(0),
                 },
             );
             store.open(
@@ -2011,8 +2028,8 @@ mod tests {
                     prompt: 812,
                     completion: 512,
                     total: 1324,
-                    cached: 128,
-                    reasoning: 0,
+                    cached: Some(128),
+                    reasoning: Some(0),
                 }),
                 started_ms: 1718900000000,
                 elapsed_ms: Some(3100),
@@ -2061,6 +2078,7 @@ mod tests {
                 samples: 252,
                 usage_samples: 250,
                 priced_samples: 240,
+                cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                 windows: MetricWindows {
                     m1: MetricWindow {
                         reqs_per_sec: 4.2,
@@ -2074,6 +2092,7 @@ mod tests {
                         samples: 252,
                         usage_samples: 250,
                         priced_samples: 240,
+                        cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                     },
                     m5: MetricWindow {
                         reqs_per_sec: 3.8,
@@ -2087,6 +2106,7 @@ mod tests {
                         samples: 1140,
                         usage_samples: 1130,
                         priced_samples: 1100,
+                        cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                     },
                     h1: MetricWindow {
                         reqs_per_sec: 2.9,
@@ -2100,6 +2120,7 @@ mod tests {
                         samples: 10440,
                         usage_samples: 10400,
                         priced_samples: 10000,
+                        cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
                     },
                 },
             })],
@@ -2113,11 +2134,11 @@ mod tests {
                     "type": "metric_tick",
                     "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1,
                     "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21,
-                    "samples": 252, "usage_samples": 250, "priced_samples": 240,
+                    "samples": 252, "usage_samples": 250, "priced_samples": 240, "cost_confidence": "estimated",
                     "windows": {
-                        "m1": { "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1, "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21, "samples": 252, "usage_samples": 250, "priced_samples": 240 },
-                        "m5": { "reqs_per_sec": 3.8, "active_streams": 3, "error_pct": 1.0, "p50": 175.0, "p95": 900.0, "p99": 1800.0, "tokens_per_sec": 128.0, "cost_per_min": 0.19, "samples": 1140, "usage_samples": 1130, "priced_samples": 1100 },
-                        "h1": { "reqs_per_sec": 2.9, "active_streams": 2, "error_pct": 0.8, "p50": 160.0, "p95": 850.0, "p99": 1700.0, "tokens_per_sec": 100.0, "cost_per_min": 0.15, "samples": 10440, "usage_samples": 10400, "priced_samples": 10000 }
+                        "m1": { "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1, "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21, "samples": 252, "usage_samples": 250, "priced_samples": 240, "cost_confidence": "estimated" },
+                        "m5": { "reqs_per_sec": 3.8, "active_streams": 3, "error_pct": 1.0, "p50": 175.0, "p95": 900.0, "p99": 1800.0, "tokens_per_sec": 128.0, "cost_per_min": 0.19, "samples": 1140, "usage_samples": 1130, "priced_samples": 1100, "cost_confidence": "estimated" },
+                        "h1": { "reqs_per_sec": 2.9, "active_streams": 2, "error_pct": 0.8, "p50": 160.0, "p95": 850.0, "p99": 1700.0, "tokens_per_sec": 100.0, "cost_per_min": 0.15, "samples": 10440, "usage_samples": 10400, "priced_samples": 10000, "cost_confidence": "estimated" }
                     }
                 }
             ]

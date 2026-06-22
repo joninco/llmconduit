@@ -92,19 +92,64 @@ pub struct Config {
 /// `cached_per_1k` defaults to `0.0` when a config entry omits it. This is the
 /// SINGLE `ModelPrice` definition for the crate — the dashboard WS topology
 /// snapshot re-exports it so REST + WS agree on the wire shape.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// Gap 07 — cached-price PRESENCE seam. `cached_per_1k` keeps its existing numeric
+/// type (`f64`, default `0.0`), but a `0.0` is AMBIGUOUS: "the provider charges 0
+/// for cache reads" is indistinguishable from "the config entry omitted the rate".
+/// The ADDITIVE `cached_price_configured` boolean records which it is — set `true`
+/// only when the source actually carried a `cached_per_1k` key (decided in the
+/// custom [`Deserialize`] below). Downstream cost-CONFIDENCE (`dashboard_api`)
+/// consumes THIS flag, NOT the numeric `0.0`: a flow that billed cached tokens at a
+/// CONFIGURED rate is `confident`, one that fell back to the default `0.0` is
+/// `estimated`. The flag is serialized additively (the frontend `isModelPrice`
+/// accepts it); `cached_per_1k` stays `number` so the topology/Sankey price table is
+/// NOT a second contract migration (spec 07 item 3).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ModelPrice {
     /// USD per 1k PROMPT (input) tokens.
     pub input_per_1k: f64,
     /// USD per 1k COMPLETION (output) tokens.
     pub output_per_1k: f64,
     /// USD per 1k CACHED (cache-read) prompt tokens. Defaults to `0.0` when the
-    /// config entry omits it (a provider with no cache discount).
-    #[serde(default)]
+    /// config entry omits it (a provider with no cache discount). PRESERVES its
+    /// numeric type (gap 07) — presence is carried by `cached_price_configured`, not
+    /// by nulling this field.
     pub cached_per_1k: f64,
+    /// Gap 07 — whether `cached_per_1k` was EXPLICITLY configured (a `cached_per_1k`
+    /// key was present in the source), distinguishing a real configured `0.0`
+    /// cache-read rate from an OMITTED one (which also defaults to `0.0`). The
+    /// cost-confidence seam reads this so a default-`0.0` cached charge is flagged
+    /// `estimated`, never silently `confident`. Additive on the wire.
+    #[serde(default)]
+    pub cached_price_configured: bool,
 }
 
 impl ModelPrice {
+    /// Construct a price with the cached rate EXPLICITLY configured (presence `true`).
+    /// The constructor for callers that genuinely set a cache-read rate (tests,
+    /// programmatic config). Use [`ModelPrice::without_cached`] when there is no
+    /// configured cache rate (presence `false`, rate defaults to `0.0`).
+    pub fn new(input_per_1k: f64, output_per_1k: f64, cached_per_1k: f64) -> Self {
+        Self {
+            input_per_1k,
+            output_per_1k,
+            cached_per_1k,
+            cached_price_configured: true,
+        }
+    }
+
+    /// Construct a price with NO configured cache-read rate (presence `false`): the
+    /// `cached_per_1k` numeric is the default `0.0` but `cached_price_configured` is
+    /// `false`, so the cost-confidence seam treats a cached charge as `estimated`.
+    pub fn without_cached(input_per_1k: f64, output_per_1k: f64) -> Self {
+        Self {
+            input_per_1k,
+            output_per_1k,
+            cached_per_1k: 0.0,
+            cached_price_configured: false,
+        }
+    }
+
     /// Whether ALL three rates are finite (no NaN/±∞). The frozen `ModelPrice`
     /// contract (and the frontend `isModelPrice` guard) requires finite rates;
     /// `serde_json` serializes NaN/±∞ as `null`, which would silently corrupt the
@@ -115,6 +160,35 @@ impl ModelPrice {
         self.input_per_1k.is_finite()
             && self.output_per_1k.is_finite()
             && self.cached_per_1k.is_finite()
+    }
+}
+
+/// Custom `Deserialize` for [`ModelPrice`] that captures cached-price PRESENCE (gap
+/// 07). `cached_per_1k` is read as an `Option<f64>`: `Some` ⇒ the source carried the
+/// key (`cached_price_configured = true`, rate = the value); `None` ⇒ it was omitted
+/// (`cached_price_configured = false`, rate defaults to `0.0`). This is how a real
+/// configured `0.0` cache-read rate is distinguished from an absent one — both have a
+/// `0.0` numeric, but only the configured one drives a `confident` cost. YAML and the
+/// `LLMCONDUIT_PRICE_TABLE_JSON` env override both feed through here.
+impl<'de> Deserialize<'de> for ModelPrice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            input_per_1k: f64,
+            output_per_1k: f64,
+            #[serde(default)]
+            cached_per_1k: Option<f64>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(ModelPrice {
+            input_per_1k: raw.input_per_1k,
+            output_per_1k: raw.output_per_1k,
+            cached_per_1k: raw.cached_per_1k.unwrap_or(0.0),
+            cached_price_configured: raw.cached_per_1k.is_some(),
+        })
     }
 }
 
@@ -3247,14 +3321,7 @@ model_profiles:
     #[test]
     fn price_for_is_case_insensitive() {
         let mut table = HashMap::new();
-        table.insert(
-            "GLM-5.1".to_string(),
-            ModelPrice {
-                input_per_1k: 1.0,
-                output_per_1k: 2.0,
-                cached_per_1k: 0.0,
-            },
-        );
+        table.insert("GLM-5.1".to_string(), ModelPrice::without_cached(1.0, 2.0));
         let persisted = PersistedConfig {
             price_table: table,
             ..Default::default()
@@ -3282,11 +3349,7 @@ model_profiles:
         // Seed a YAML table the env override must REPLACE.
         config.price_table.insert(
             "yaml-model".to_string(),
-            ModelPrice {
-                input_per_1k: 1.0,
-                output_per_1k: 1.0,
-                cached_per_1k: 0.0,
-            },
+            ModelPrice::without_cached(1.0, 1.0),
         );
         apply_env_overrides(&mut config);
         assert!(
@@ -3303,14 +3366,9 @@ model_profiles:
             std::env::set_var("LLMCONDUIT_PRICE_TABLE_JSON", "{not valid json");
         }
         let mut config2 = PersistedConfig::default();
-        config2.price_table.insert(
-            "kept".to_string(),
-            ModelPrice {
-                input_per_1k: 1.0,
-                output_per_1k: 1.0,
-                cached_per_1k: 0.0,
-            },
-        );
+        config2
+            .price_table
+            .insert("kept".to_string(), ModelPrice::without_cached(1.0, 1.0));
         apply_env_overrides(&mut config2);
         assert!(
             config2.price_table.contains_key("kept"),
@@ -3353,20 +3411,14 @@ model_profiles:
         // `NaN`/overflow literals at parse time, so the filter is exercised directly on
         // a parsed table — the exact post-parse value the env path feeds it.)
         let mut table = HashMap::new();
-        table.insert(
-            "finite".to_string(),
-            ModelPrice {
-                input_per_1k: 1.0,
-                output_per_1k: 2.0,
-                cached_per_1k: 0.0,
-            },
-        );
+        table.insert("finite".to_string(), ModelPrice::without_cached(1.0, 2.0));
         table.insert(
             "nan-input".to_string(),
             ModelPrice {
                 input_per_1k: f64::NAN,
                 output_per_1k: 2.0,
                 cached_per_1k: 0.0,
+                cached_price_configured: false,
             },
         );
         table.insert(
@@ -3375,6 +3427,7 @@ model_profiles:
                 input_per_1k: 1.0,
                 output_per_1k: 2.0,
                 cached_per_1k: f64::INFINITY,
+                cached_price_configured: true,
             },
         );
         retain_finite_prices(&mut table);
@@ -3387,5 +3440,58 @@ model_profiles:
             !table.contains_key("inf-cached"),
             "an ∞ rate in any field drops the entry"
         );
+    }
+
+    /// Gap 07 — cached-price PRESENCE seam. A `ModelPrice` deserialized from a source
+    /// that OMITS `cached_per_1k` has `cached_price_configured == false` (and the
+    /// numeric defaults to `0.0`); one that EXPLICITLY sets `cached_per_1k: 0.0` has
+    /// `cached_price_configured == true` — distinguishing a configured `0.0`
+    /// cache-read rate from an absent one even though BOTH carry the same `0.0`
+    /// numeric. This is the presence bit the cost-confidence seam reads (a default
+    /// `0.0` cached charge ⇒ `estimated`; a configured one ⇒ `confident`). Round-trips
+    /// through serialize → deserialize (AGENTS.md: no new wire field without a proof).
+    #[test]
+    fn model_price_cached_presence_distinguishes_configured_zero_from_omitted() {
+        // OMITTED cached_per_1k ⇒ presence false, numeric defaults to 0.0.
+        let omitted: ModelPrice =
+            serde_yaml::from_str("input_per_1k: 2.0\noutput_per_1k: 6.0\n").expect("yaml");
+        assert_eq!(omitted.cached_per_1k, 0.0);
+        assert!(
+            !omitted.cached_price_configured,
+            "an omitted cached rate is NOT configured"
+        );
+
+        // EXPLICIT cached_per_1k: 0.0 ⇒ presence true (a configured zero cache rate),
+        // distinct from the omitted case above despite the identical numeric.
+        let configured_zero: ModelPrice =
+            serde_yaml::from_str("input_per_1k: 2.0\noutput_per_1k: 6.0\ncached_per_1k: 0.0\n")
+                .expect("yaml");
+        assert_eq!(configured_zero.cached_per_1k, 0.0);
+        assert!(
+            configured_zero.cached_price_configured,
+            "an explicit cached_per_1k: 0.0 IS configured (distinct from omitted)"
+        );
+
+        // A configured non-zero rate is likewise present.
+        let configured: ModelPrice =
+            serde_yaml::from_str("input_per_1k: 2.0\noutput_per_1k: 6.0\ncached_per_1k: 0.5\n")
+                .expect("yaml");
+        assert_eq!(configured.cached_per_1k, 0.5);
+        assert!(configured.cached_price_configured);
+
+        // Round-trip the presence flag through JSON: serialize emits the additive
+        // `cached_price_configured` boolean; it survives a re-parse intact.
+        let json = serde_json::to_string(&configured).expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("re-parse");
+        assert_eq!(value["cached_per_1k"], serde_json::json!(0.5));
+        assert_eq!(value["cached_price_configured"], serde_json::json!(true));
+        let back: ModelPrice = serde_json::from_value(value).expect("deserialize");
+        assert!(back.cached_price_configured);
+        assert_eq!(back.cached_per_1k, 0.5);
+
+        // The `ModelPrice::new` constructor marks the cache rate configured; `without_cached`
+        // does not — the two programmatic seams matching the YAML semantics.
+        assert!(ModelPrice::new(1.0, 2.0, 0.0).cached_price_configured);
+        assert!(!ModelPrice::without_cached(1.0, 2.0).cached_price_configured);
     }
 }

@@ -2058,8 +2058,13 @@ impl Gateway {
                                 prompt: total.prompt,
                                 completion: total.completion,
                                 total: total.total,
-                                cached: total.cached,
-                                reasoning: total.reasoning,
+                                // The BARE `/debug/ws` `DebugWsMessage::Usage` contract is
+                                // integer-only (AGENTS.md — untouched). Gap 07's UNAVAILABLE
+                                // cached/reasoning is a DASHBOARD-surface distinction
+                                // (`FlowUsage`/REST/WS-envelope), so project the optional
+                                // counts to `0` for the legacy debug-UI echo only.
+                                cached: total.cached.unwrap_or(0),
+                                reasoning: total.reasoning.unwrap_or(0),
                             });
                     }
                     // D3: the engine's own accumulated_usage advance (post-loop `add`)
@@ -3996,8 +4001,25 @@ struct AccumulatedUsage {
     input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
-    cached_input_tokens: i64,
-    reasoning_output_tokens: i64,
+    /// Cache-read prompt tokens, or `None` until a chunk REPORTS a cached breakdown
+    /// (gap 07): an upstream that never sends `prompt_tokens_details` leaves this
+    /// `None` (UNAVAILABLE), distinct from a reported `Some(0)`. Once any chunk
+    /// reports it, subsequent chunks accumulate into the `Some`.
+    cached_input_tokens: Option<i64>,
+    /// Reasoning tokens, or `None` until a chunk reports reasoning details / a
+    /// top-level `reasoning_tokens` (gap 07) — UNAVAILABLE vs a reported `Some(0)`.
+    reasoning_output_tokens: Option<i64>,
+}
+
+/// Add an OPTIONAL reported sub-count into an accumulator slot that starts `None`
+/// (gap 07): `None + None = None` (still unreported), but ANY reported chunk promotes
+/// the slot to `Some` and sums subsequent reports. So the flow's cached/reasoning is
+/// UNAVAILABLE only when NO chunk ever reported it; a single reported `0` makes it a
+/// measured `Some(0)`, never collapsing back to unreported.
+fn accumulate_optional(slot: &mut Option<i64>, reported: Option<i64>) {
+    if let Some(value) = reported {
+        *slot = Some(slot.unwrap_or(0) + value);
+    }
 }
 
 impl AccumulatedUsage {
@@ -4005,22 +4027,22 @@ impl AccumulatedUsage {
         self.input_tokens += usage.prompt_tokens;
         self.output_tokens += usage.completion_tokens;
         self.total_tokens += usage.total_tokens;
-        self.cached_input_tokens += usage
-            .prompt_tokens_details
-            .map(|d| d.cached_tokens)
-            .unwrap_or(0);
+        accumulate_optional(
+            &mut self.cached_input_tokens,
+            usage.prompt_tokens_details.map(|d| d.cached_tokens),
+        );
         let reasoning_tokens = usage
             .completion_tokens_details
             .map(|d| d.reasoning_tokens)
             .or(usage.reasoning_tokens);
-        self.reasoning_output_tokens += reasoning_tokens.unwrap_or(0);
+        accumulate_optional(&mut self.reasoning_output_tokens, reasoning_tokens);
     }
 
     /// D3: the running cumulative-so-far as a dashboard [`FlowUsage`] — the
     /// `turn_base` captured at the START of each turn. Adding a within-turn chunk's
     /// (already-cumulative) usage to this base gives the flow's CURRENT total
-    /// without double-counting prior turns. (`ChunkUsage` fields are `i64`; the
-    /// dashboard `FlowUsage` mirrors them 1:1.)
+    /// without double-counting prior turns. The OPTIONAL `cached`/`reasoning` carry
+    /// the gap-07 UNAVAILABLE-vs-reported distinction straight through.
     fn snapshot(&self) -> crate::dashboard_flow::FlowUsage {
         crate::dashboard_flow::FlowUsage {
             prompt: self.input_tokens,
@@ -4039,11 +4061,14 @@ impl AccumulatedUsage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             total_tokens: self.total_tokens,
+            // The CLIENT-facing canonical `ResponseUsage` keeps its integer-only shape
+            // (gap 07's UNAVAILABLE distinction is a dashboard concern, not a client
+            // contract change): an unreported cached/reasoning class projects to `0` here.
             input_tokens_details: Some(ResponseInputTokensDetails {
-                cached_tokens: self.cached_input_tokens,
+                cached_tokens: self.cached_input_tokens.unwrap_or(0),
             }),
             output_tokens_details: Some(ResponseOutputTokensDetails {
-                reasoning_tokens: self.reasoning_output_tokens,
+                reasoning_tokens: self.reasoning_output_tokens.unwrap_or(0),
             }),
         })
     }
@@ -4059,23 +4084,29 @@ fn flow_usage_from_base_and_chunk(
     base: crate::dashboard_flow::FlowUsage,
     chunk: &ChunkUsage,
 ) -> crate::dashboard_flow::FlowUsage {
+    // Gap 07: a chunk reports cached/reasoning only when the upstream sent the detail
+    // block. `None` here means UNAVAILABLE for THIS chunk — it folds into the base via
+    // `accumulate_optional`, so the running total stays `None` until SOME chunk reports
+    // the class (then it is a measured `Some`, incl. a reported `0`).
     let cached = chunk
         .prompt_tokens_details
         .as_ref()
-        .map(|d| d.cached_tokens)
-        .unwrap_or(0);
+        .map(|d| d.cached_tokens);
     let reasoning = chunk
         .completion_tokens_details
         .as_ref()
         .map(|d| d.reasoning_tokens)
-        .or(chunk.reasoning_tokens)
-        .unwrap_or(0);
+        .or(chunk.reasoning_tokens);
+    let mut cached_total = base.cached;
+    accumulate_optional(&mut cached_total, cached);
+    let mut reasoning_total = base.reasoning;
+    accumulate_optional(&mut reasoning_total, reasoning);
     crate::dashboard_flow::FlowUsage {
         prompt: base.prompt + chunk.prompt_tokens,
         completion: base.completion + chunk.completion_tokens,
         total: base.total + chunk.total_tokens,
-        cached: base.cached + cached,
-        reasoning: base.reasoning + reasoning,
+        cached: cached_total,
+        reasoning: reasoning_total,
     }
 }
 

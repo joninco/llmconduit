@@ -125,7 +125,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     // does NOT overwrite the injected detail.
     seedFlows([makeFlow({ api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', started_ms: 1_700_000_000_000 })]);
     const detail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed',
+      flow_seq: 1, api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', cost_confidence: 'unavailable',
       deltas: [], started_ms: 1_700_000_000_000,
       // `b_only` is present in A and B alike (unchanged A→B) but dropped by C — so the ONLY signal
       // for it is the B→C removal, which must surface in pane B (it would be invisible under the
@@ -149,7 +149,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     // `api_replay` is unknown to the mock so the 404 won't replace the injected detail.
     seedFlows([makeFlow({ api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', started_ms: 1_700_000_000_000 })]);
     const detail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed',
+      flow_seq: 1, api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', cost_confidence: 'unavailable',
       started_ms: 1_700_000_000_000,
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
       deltas: [
@@ -186,6 +186,60 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     fireEvent.click(btn);
     expect(mockKillLog).toHaveLength(0);
   });
+
+  // Gap 07 — the inspector header renders `—` for UNREPORTED cached/reasoning (never a fake
+  // `0`) and LABELS an `estimated` cost as such. `api_g07` is unknown to the mock so /flows/:id
+  // 404s and the SEEDED live row drives the header (usage cached/reasoning absent, tag estimated).
+  it('renders — for unreported cached/reasoning and labels an estimated cost', async () => {
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g07',
+        status: 'completed',
+        model_served: 'llama-3.1-70b',
+        upstream_target: 'vllm-a',
+        started_ms: 1_700_000_000_000,
+        cost: 0.0019,
+        cost_confidence: 'estimated',
+        // cached/reasoning UNREPORTED (absent) — must render `—`, never `0`.
+        usage: { prompt: 1500, completion: 980, total: 2480 },
+      }),
+    ]);
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g07" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+
+    // The cached/reasoning subcounts both render the unavailable marker, NOT `0`.
+    const sub = getByTestId('usage-subcounts');
+    expect(sub.textContent).toContain('—');
+    expect(sub.textContent).not.toContain('0');
+
+    // The estimated cost is LABELLED (the cross-cutting rule): an `est` badge is present.
+    const badge = getByTestId('cost-confidence');
+    expect(badge.getAttribute('data-confidence')).toBe('estimated');
+  });
+
+  // Gap 07 — a provider-REPORTED measured `0` cached renders `0` (distinct from `—`).
+  it('renders a measured 0 cached as 0 (distinct from unavailable)', async () => {
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g07b',
+        status: 'completed',
+        model_served: 'gpt-4o',
+        started_ms: 1_700_000_000_000,
+        cost: 0.01,
+        cost_confidence: 'confident',
+        // cached reported as a measured 0; reasoning reported 120.
+        usage: { prompt: 1500, completion: 980, total: 2480, cached: 0, reasoning: 120 },
+      }),
+    ]);
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g07b" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    const sub = getByTestId('usage-subcounts');
+    // A measured 0 reads `0` (not `—`); the reasoning count renders too.
+    expect(sub.textContent).toContain('0');
+    expect(sub.textContent).toContain('120');
+    // A confident cost carries NO estimated badge.
+    expect(() => getByTestId('cost-confidence')).toThrow();
+  });
 });
 
 describe('FlowDetail — time-travel seek + body eviction', () => {
@@ -200,7 +254,7 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
   it('shows the snapshot badge and "body evicted (snapshot)" when seeking with no body', async () => {
     // A detail with evicted bodies (absent fields) — what /flows/:id returns post-eviction.
     const evicted: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_evicted', response_id: 'resp_evicted', status: 'completed',
+      flow_seq: 1, api_call_id: 'api_evicted', response_id: 'resp_evicted', status: 'completed', cost_confidence: 'unavailable',
       deltas: [], started_ms: 1_700_000_000_000,
       // inbound_body / normalized / upstream_body intentionally ABSENT (evicted).
     };
@@ -246,7 +300,7 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
       started_ms: started, cost: 0.1234,
     })]);
     const liveDetail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_frozen', response_id: 'resp_frozen', status: 'open',
+      flow_seq: 1, api_call_id: 'api_frozen', response_id: 'resp_frozen', status: 'open', cost_confidence: 'unavailable',
       deltas: [], started_ms: started,
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
       cost: 0.9999, elapsed_ms: 999_000, // live values that must NOT bleed into the frozen view
@@ -279,7 +333,7 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     act(() => dashboardStore.getState().pushMonitor({ type: 'segment_append', response_id: 'resp_cut', segment: { timestamp_ms: 10, kind: 'output', text: 'IN-CUT' } }, 2));
     act(() => dashboardStore.getState().pushMonitor({ type: 'segment_append', response_id: 'resp_cut', segment: { timestamp_ms: 20, kind: 'output', text: 'POST-CUT' } }, 3));
     const liveDetail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_cut', response_id: 'resp_cut', status: 'open',
+      flow_seq: 1, api_call_id: 'api_cut', response_id: 'resp_cut', status: 'open', cost_confidence: 'unavailable',
       started_ms: started, inbound_headers: { authorization: 'Bearer LEAK' },
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
       deltas: [{ sequence: 1, kind: 'response.output_text.delta', payload: { text: 'REST-LEAK' }, ts_ms: 5 }],

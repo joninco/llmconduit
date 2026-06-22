@@ -27,12 +27,12 @@ function snapshot(): SnapshotFrame {
 const METRIC_WINDOW = {
   reqs_per_sec: 4.2, active_streams: 1, error_pct: 0,
   p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5,
-  samples: 7, usage_samples: 7, priced_samples: 7,
+  samples: 7, usage_samples: 7, priced_samples: 7, cost_confidence: 'estimated' as const,
 };
 const METRICS_SNAP = {
   metrics_seq: 5, reqs_per_sec: 4.2, active_streams: 1, error_pct: 0,
   p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5,
-  samples: 7, usage_samples: 7, priced_samples: 7,
+  samples: 7, usage_samples: 7, priced_samples: 7, cost_confidence: 'estimated' as const,
   windows: { m1: METRIC_WINDOW, m5: METRIC_WINDOW, h1: METRIC_WINDOW },
 };
 
@@ -281,7 +281,7 @@ describe('frame validation — enums, unsigned-int seq, domain↔payload compati
   });
 
   function win() {
-    return { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1 };
+    return { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1, cost_confidence: 'estimated' };
   }
 });
 
@@ -290,7 +290,7 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
     expect(isSnapshotFrame({
       type: 'snapshot',
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
-      flows: [{ api_call_id: 'a', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1 }],
+      flows: [{ api_call_id: 'a', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1, cost_confidence: 'unavailable' }],
       metrics: null, topology: null,
     })).toBe(true);
   });
@@ -335,10 +335,62 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
   });
 
   it('accepts a metric_tick frame carrying the new denominators (regression guard)', () => {
-    const okWindow = { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1 };
+    const okWindow = { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1, cost_confidence: 'estimated' };
     expect(isDashboardFrame({
       domain: 'metrics', seq: 1,
+      batch: [{ type: 'metric_tick', reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1, cost_confidence: 'estimated', windows: { m1: okWindow, m5: okWindow, h1: okWindow } }],
+    })).toBe(true);
+  });
+
+  // Gap 07 — the metric_tick aggregate cost-confidence tag is REQUIRED + must be a valid enum.
+  it('rejects a metric_tick frame MISSING cost_confidence (gap 07)', () => {
+    const okWindow = { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1, cost_confidence: 'estimated' };
+    expect(isDashboardFrame({
+      domain: 'metrics', seq: 1,
+      // headline omits cost_confidence → invalid metric_tick.
       batch: [{ type: 'metric_tick', reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1, windows: { m1: okWindow, m5: okWindow, h1: okWindow } }],
+    })).toBe(false);
+  });
+});
+
+describe('gap 07 — usage confidence wire validation', () => {
+  // A flow_status carrying usage with UNREPORTED (absent) cached/reasoning is ACCEPTED —
+  // the optional classes may be absent (unavailable), distinct from a present `0`.
+  it('accepts a flow_status whose usage omits cached/reasoning (unreported ⇒ absent)', () => {
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'flow_status', api_call_id: 'a', status: 'completed', started_ms: 1,
+        usage: { prompt: 100, completion: 40, total: 140 } }],
+    })).toBe(true);
+    // A present measured `0` for cached/reasoning is likewise accepted (distinct from absent).
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'flow_status', api_call_id: 'a', status: 'completed', started_ms: 1,
+        usage: { prompt: 100, completion: 40, total: 140, cached: 0, reasoning: 0 } }],
+    })).toBe(true);
+  });
+
+  // A snapshot summary MUST carry the per-flow cost_confidence tag, and it must be a valid enum.
+  it('rejects a snapshot summary MISSING cost_confidence; rejects a bad enum value', () => {
+    const base = { api_call_id: 'a', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 1 };
+    expect(isSnapshotFrame({
+      type: 'snapshot',
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [base], // cost_confidence absent → rejected
+      metrics: null, topology: null,
+    })).toBe(false);
+    expect(isSnapshotFrame({
+      type: 'snapshot',
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [{ ...base, cost_confidence: 'bogus' }], // invalid enum → rejected
+      metrics: null, topology: null,
+    })).toBe(false);
+    // A valid tag is accepted.
+    expect(isSnapshotFrame({
+      type: 'snapshot',
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [{ ...base, cost_confidence: 'estimated' }],
+      metrics: null, topology: null,
     })).toBe(true);
   });
 });
@@ -377,8 +429,20 @@ describe('ProviderHealth + price_table validation (findings 2 + 4)', () => {
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [],
       metrics: null,
-      topology: { topology_seq: 1, nodes: [node()], edges: [], price_table: { 'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025 } } },
+      topology: { topology_seq: 1, nodes: [node()], edges: [], price_table: { 'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025, cached_price_configured: true } } },
     })).toBe(true);
+  });
+
+  // Gap 07: the cached-price PRESENCE flag is a REQUIRED additive ModelPrice field.
+  it('rejects a price_table entry MISSING cached_price_configured (gap 07 presence flag)', () => {
+    expect(isSnapshotFrame({
+      type: 'snapshot',
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [],
+      metrics: null,
+      // cached_price_configured absent → an incomplete ModelPrice → rejected.
+      topology: { topology_seq: 1, nodes: [node()], edges: [], price_table: { m: { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025 } } },
+    })).toBe(false);
   });
 
   it('rejects a price_table entry with a non-finite number (finding 4)', () => {
@@ -648,7 +712,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // (`api_frozen`, no `api_live`) and flips `connection='seeking'` — exactly what `applySeekCut`
     // does on the real snapshot resolve.
     dashboardStore.getState().applySeekCut({
-      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500 }],
+      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       atMs: 500, monitorSeq: 0, metrics: null, topology: null,
     });
@@ -697,7 +761,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // Drag-start: pause + capture the live baseline, then land the FROZEN cut ('seeking').
     socket.seek();
     dashboardStore.getState().applySeekCut({
-      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500 }],
+      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       atMs: 500, monitorSeq: 0, metrics: null, topology: null,
     });
@@ -747,7 +811,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // Drag-start: pause, then land the FROZEN cut ('seeking') via the real Scrubber path.
     socket.seek();
     dashboardStore.getState().applySeekCut({
-      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500 }],
+      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       atMs: 500, monitorSeq: 0, metrics: null, topology: null,
     });
@@ -758,7 +822,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     const reconnectSnap: SnapshotFrame = {
       type: 'snapshot',
       cursors: { flow_seq: 5, metrics_seq: 5, topology_seq: 5, monitor_seq: 5 },
-      flows: [{ api_call_id: 'api_snap', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 3000 }],
+      flows: [{ api_call_id: 'api_snap', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 3000, cost_confidence: 'unavailable' }],
       metrics: METRICS_SNAP,
       topology: null,
     };
@@ -863,7 +927,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // seekAtMs/seekMonitorSeq and flips connection='seeking'.
     s.seek();
     dashboardStore.getState().applySeekCut({
-      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500 }],
+      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 42 },
       atMs: 500, monitorSeq: 42, metrics: null, topology: null,
     });

@@ -112,13 +112,20 @@ pub struct FlowRow {
     /// USD cost of the flow (usage × the served model's [`ModelPrice`]). `null`
     /// when no price is configured for `model_served` — never a fabricated zero.
     pub cost: Option<f64>,
+    /// Gap 07 — the [`CostConfidence`] of `cost`: `confident` (priced + every billed
+    /// class has a known rate), `estimated` (a class falls back to the default `0.0`
+    /// cached rate / cached unreported), or `unavailable` (unpriced ⇒ `cost: null`).
+    /// Always present so the frontend can label an `estimated` figure as such and
+    /// distinguish an `unavailable` cost from a measured `$0.00`.
+    pub cost_confidence: CostConfidence,
 }
 
 impl FlowRow {
     /// Build a row from a live [`FlowRecord`], pricing it via the gateway's price
     /// table keyed by the SERVED model (the backend that actually answered).
     fn from_record(record: &FlowRecord, gateway: &Gateway) -> Self {
-        let cost = flow_cost(record.model_served.as_deref(), record.usage, gateway);
+        let (cost, cost_confidence) =
+            flow_cost_and_confidence(record.model_served.as_deref(), record.usage, gateway);
         Self {
             api_call_id: record.api_call_id.clone(),
             response_id: record.response_id.clone(),
@@ -138,6 +145,7 @@ impl FlowRow {
             client_label: record.client_label.clone(),
             client_source: record.client_source,
             cost,
+            cost_confidence,
         }
     }
 
@@ -148,7 +156,8 @@ impl FlowRow {
         summary: &crate::dashboard_flow::SnapshotFlowSummary,
         gateway: &Gateway,
     ) -> Self {
-        let cost = flow_cost(summary.model_served.as_deref(), summary.usage, gateway);
+        let (cost, cost_confidence) =
+            flow_cost_and_confidence(summary.model_served.as_deref(), summary.usage, gateway);
         Self {
             api_call_id: summary.api_call_id.clone(),
             response_id: summary.response_id.clone(),
@@ -167,6 +176,7 @@ impl FlowRow {
             client_label: summary.client_label.clone(),
             client_source: summary.client_source,
             cost,
+            cost_confidence,
         }
     }
 }
@@ -286,6 +296,9 @@ pub struct FlowDetailBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u128>,
     pub cost: Option<f64>,
+    /// Gap 07 — the [`CostConfidence`] of `cost` (confident/estimated/unavailable),
+    /// mirroring the flow-row tag so the inspector labels an `estimated` figure.
+    pub cost_confidence: CostConfidence,
 }
 
 /// One catalog entry (`GET /dashboard/api/catalog` — a BARE array, no cursor).
@@ -354,7 +367,10 @@ pub struct SnapshotQuery {
 /// the JSON: `serde_json::to_vec` ERRORS on a non-finite float, which would 500 the
 /// whole `/flows` (or snapshot) read. A non-finite cost collapses to `0.0` instead.
 pub fn cost_for_usage(usage: FlowUsage, price: ModelPrice) -> f64 {
-    let cached = usage.cached.max(0) as f64;
+    // Gap 07: an UNREPORTED cached count (`None`) bills as 0 cached tokens — the whole
+    // prompt then bills at the input rate (the confidence tier flags this as `estimated`
+    // when no cached rate is configured; the dollar figure stays a best-effort number).
+    let cached = usage.cached.unwrap_or(0).max(0) as f64;
     let prompt = usage.prompt.max(0) as f64;
     let completion = usage.completion.max(0) as f64;
     // Uncached prompt = prompt - cached (never negative).
@@ -366,6 +382,63 @@ pub fn cost_for_usage(usage: FlowUsage, price: ModelPrice) -> f64 {
     )
 }
 
+/// Gap 07 — the CONFIDENCE tier of a flow's `cost`, so an operator can tell a trusted
+/// figure from a best-effort estimate from an honest gap. Emitted alongside `cost` on
+/// every flow row + detail (and aggregated onto the metrics windows). Serializes
+/// snake_case to mirror the data-quality vocabulary the frontend already uses
+/// (`measured`/`derived`/`estimated`/`unavailable`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostConfidence {
+    /// The model is priced AND every billed token class has a known rate: the prompt
+    /// (input) + completion (output) rates always exist when priced, and cached tokens
+    /// either were reported as `0` (nothing billed at the cache rate) OR the model has
+    /// a CONFIGURED cached rate. The dollar figure is trustworthy.
+    Confident,
+    /// The model is priced but a billed class would fall back to an APPROXIMATE rate:
+    /// cached tokens were reported `> 0` (or are UNAVAILABLE) while the model has NO
+    /// configured cached rate, so those tokens silently bill at the default `0.0`
+    /// (an undercount). The figure is a best-effort ESTIMATE — surfaced as such.
+    Estimated,
+    /// No price is configured for the served model: there is NO cost (the row reports
+    /// `cost: null`), so the figure is UNAVAILABLE — never a fabricated `0`. The
+    /// DEFAULT: a window/flow with nothing priced makes no confident claim.
+    #[default]
+    Unavailable,
+}
+
+/// Gap 07 — classify a flow's cost confidence from its served model's price PRESENCE
+/// + the cached-token report. The rules (spec 07 acceptance):
+/// - unpriced model ⇒ [`CostConfidence::Unavailable`] (cost is `None`, never `0`).
+/// - priced AND (`cached == Some(0)` OR `cached_price_configured`) ⇒ `Confident`
+///   (a reported `cached = 0` bills nothing at the cache rate; a configured rate
+///   prices it honestly).
+/// - priced AND (`cached == Some(n>0)` OR `cached == None`) AND NOT
+///   `cached_price_configured` ⇒ `Estimated` (those cached tokens would bill at the
+///   default `0.0` — an undercount, so NOT a silently-`confident` total).
+fn cost_confidence(price: Option<ModelPrice>, usage: Option<FlowUsage>) -> CostConfidence {
+    let Some(price) = price else {
+        return CostConfidence::Unavailable;
+    };
+    // A priced flow with no usage at all still has a (zero-token) cost; with no cached
+    // tokens billed it is trivially confident.
+    let cached = usage.and_then(|usage| usage.cached);
+    match cached {
+        // Reported zero cache tokens: nothing bills at the cache rate ⇒ confident
+        // regardless of whether a cached rate is configured.
+        Some(0) => CostConfidence::Confident,
+        // Reported >0 cached, OR UNAVAILABLE (None) cached: confident ONLY if a cached
+        // rate is configured; otherwise those tokens fall back to the default 0.0.
+        Some(_) | None => {
+            if price.cached_price_configured {
+                CostConfidence::Confident
+            } else {
+                CostConfidence::Estimated
+            }
+        }
+    }
+}
+
 /// A JSON-safe float: the value if finite, else `0.0`. `serde_json` REFUSES to
 /// serialize NaN/±∞ (it errors), so every float that reaches a response body — cost
 /// roll-ups, per-second rates — is passed through this so a degenerate input can
@@ -375,17 +448,27 @@ fn finite(value: f64) -> f64 {
     if value.is_finite() { value } else { 0.0 }
 }
 
-/// Price a flow: `Some(cost)` when BOTH a served model and usage are present AND a
-/// price is configured for that model; `None` otherwise (the row shows `cost:null`).
-fn flow_cost(
+/// Gap 07 — price a flow AND tag its [`CostConfidence`] together, so the two can never
+/// disagree: cost is `Some` exactly when a served model + usage + a configured price
+/// all exist, and the confidence is then `Confident`/`Estimated` per the cached-rate
+/// presence; whenever cost is `None` (unpriced/no-usage/no-model) the confidence is
+/// `Unavailable` (don't-lie-with-zeros: an absent cost is never a confident `0`).
+fn flow_cost_and_confidence(
     model_served: Option<&str>,
     usage: Option<FlowUsage>,
     gateway: &Gateway,
-) -> Option<f64> {
-    let model = model_served?;
-    let usage = usage?;
-    let price = gateway.price_for(model)?;
-    Some(cost_for_usage(usage, price))
+) -> (Option<f64>, CostConfidence) {
+    let price = model_served.and_then(|model| gateway.price_for(model));
+    match (price, usage) {
+        // Priced AND usage present: a real cost, tagged confident/estimated by the
+        // cached-rate presence.
+        (Some(price), Some(usage)) => (
+            Some(cost_for_usage(usage, price)),
+            cost_confidence(Some(price), Some(usage)),
+        ),
+        // Unpriced, OR no usage to bill: no cost, so UNAVAILABLE (never a fake 0).
+        _ => (None, CostConfidence::Unavailable),
+    }
 }
 
 /// The total token throughput of one window (prompt + completion + cached +
@@ -417,8 +500,10 @@ fn window_total_cost(report: &WindowReport, prices: &HashMap<String, ModelPrice>
                     FlowUsage {
                         prompt: counts.prompt_tokens,
                         completion: counts.completion_tokens,
-                        cached: counts.cached_tokens,
-                        reasoning: counts.reasoning_tokens,
+                        // The bucket sums are concrete aggregates (gap 07): the cached/
+                        // reasoning totals are `Some` measured values, not unreported.
+                        cached: Some(counts.cached_tokens),
+                        reasoning: Some(counts.reasoning_tokens),
                         total: 0,
                     },
                     price,
@@ -426,6 +511,41 @@ fn window_total_cost(report: &WindowReport, prices: &HashMap<String, ModelPrice>
             })
         })
         .sum()
+}
+
+/// Gap 07 — the AGGREGATE [`CostConfidence`] of one window's `cost_per_min`. An
+/// aggregate touching ANY non-confident priced flow is itself `estimated` (spec 07:
+/// "no silently-confident totals"):
+/// - NO priced bucket (nothing to bill) ⇒ `Unavailable` (`cost_per_min` renders `—`).
+/// - A priced bucket would bill cached at the default `0.0` — i.e. it billed cached
+///   tokens (`cached_tokens > 0`) OR a usage-bearing flow left cached UNREPORTED
+///   (`unreported_cached_samples > 0`) — while that model has NO configured cached
+///   rate ⇒ `Estimated`.
+/// - Otherwise (every priced bucket either bills no cached tokens AND had none
+///   unreported, or its model has a configured cached rate) ⇒ `Confident`.
+fn window_cost_confidence(
+    report: &WindowReport,
+    prices: &HashMap<String, ModelPrice>,
+) -> CostConfidence {
+    let mut any_priced = false;
+    let mut any_estimated = false;
+    for (key, counts) in &report.buckets {
+        let Some(price) = price_lookup(prices, &key.model) else {
+            continue; // unpriced bucket contributes no cost (and no confidence claim).
+        };
+        any_priced = true;
+        // This priced bucket bills cached at the default 0.0 when it has cached tokens
+        // (or a flow that didn't report cached) AND no configured cache rate.
+        let bills_unknown_cached = counts.cached_tokens > 0 || counts.unreported_cached_samples > 0;
+        if bills_unknown_cached && !price.cached_price_configured {
+            any_estimated = true;
+        }
+    }
+    match (any_priced, any_estimated) {
+        (false, _) => CostConfidence::Unavailable,
+        (true, true) => CostConfidence::Estimated,
+        (true, false) => CostConfidence::Confident,
+    }
 }
 
 /// Exact-then-case-insensitive price lookup over a raw price map, mirroring
@@ -478,6 +598,11 @@ fn rest_window_tile(
     // models) → `cost_per_min` renders `—`, distinguishing "unpriced" from `$0.00`.
     let usage_samples = report.usage_sample_count();
     let priced_samples = report.priced_sample_count(|model| price_lookup(prices, model).is_some());
+    // Gap 07: the aggregate cost confidence for this window's `cost_per_min` — `estimated`
+    // when any priced bucket would silently bill cached at the default `0.0`, so the strip
+    // labels the headline `$/min` rather than presenting a possibly-undercounted total as
+    // confident.
+    let cost_confidence = window_cost_confidence(report, prices);
     // Every float is `finite`-guarded: a non-finite value would make
     // `serde_json::to_vec` error and 500 the `/metrics` read.
     MetricWindow {
@@ -497,6 +622,7 @@ fn rest_window_tile(
         samples: total,
         usage_samples,
         priced_samples,
+        cost_confidence,
     }
 }
 
@@ -527,6 +653,7 @@ pub fn metrics_body(
         samples: m1.samples,
         usage_samples: m1.usage_samples,
         priced_samples: m1.priced_samples,
+        cost_confidence: m1.cost_confidence,
         windows: MetricWindows { m1, m5, h1 },
     }
 }
@@ -599,8 +726,9 @@ fn upstream_edge_rates(
                 FlowUsage {
                     prompt: counts.prompt_tokens,
                     completion: counts.completion_tokens,
-                    cached: counts.cached_tokens,
-                    reasoning: counts.reasoning_tokens,
+                    // Concrete bucket aggregates → measured `Some` (gap 07).
+                    cached: Some(counts.cached_tokens),
+                    reasoning: Some(counts.reasoning_tokens),
                     total: 0,
                 },
                 price,
@@ -799,7 +927,7 @@ pub async fn dashboard_flow_detail(
             &serde_json::json!({ "error": "no flow for that id" }),
         );
     };
-    let cost = flow_cost(
+    let (cost, cost_confidence) = flow_cost_and_confidence(
         record.model_served.as_deref(),
         record.usage,
         gateway.as_ref(),
@@ -847,6 +975,7 @@ pub async fn dashboard_flow_detail(
         finished_ms: record.finished_ms,
         elapsed_ms: record.elapsed_ms,
         cost,
+        cost_confidence,
     };
     json_no_store(StatusCode::OK, &body)
 }
@@ -1043,20 +1172,21 @@ fn json_no_store<T: Serialize>(status: StatusCode, body: &T) -> Response {
 mod tests {
     use super::*;
 
+    /// A price with an EXPLICITLY configured cached rate (presence `true`) — the
+    /// default for these cost tests. Confidence-specific tests use
+    /// `ModelPrice::without_cached` to exercise the unconfigured-cache path.
     fn price(input: f64, output: f64, cached: f64) -> ModelPrice {
-        ModelPrice {
-            input_per_1k: input,
-            output_per_1k: output,
-            cached_per_1k: cached,
-        }
+        ModelPrice::new(input, output, cached)
     }
 
+    /// A usage with a REPORTED (measured) cached count and a reported `0` reasoning
+    /// (gap 07 `Some` — distinct from the UNAVAILABLE `None` the dedicated tests use).
     fn usage(prompt: i64, completion: i64, cached: i64) -> FlowUsage {
         FlowUsage {
             prompt,
             completion,
-            cached,
-            reasoning: 0,
+            cached: Some(cached),
+            reasoning: Some(0),
             total: prompt + completion,
         }
     }
@@ -1330,6 +1460,7 @@ mod tests {
                     client_label: None,
                     client_source: None,
                     cost: None,
+                    cost_confidence: CostConfidence::Unavailable,
                 })
                 .collect()
         };
@@ -1367,6 +1498,7 @@ mod tests {
             client_label: None,
             client_source: None,
             cost: None,
+            cost_confidence: CostConfidence::Unavailable,
         };
 
         // PRESENT: a key-hash attribution emits both snake_case keys with the expected
@@ -1425,6 +1557,7 @@ mod tests {
             finished_ms: None,
             elapsed_ms: None,
             cost: None,
+            cost_confidence: CostConfidence::Unavailable,
         };
 
         // PRESENT (not truncated): a JSON error body survives the round-trip intact,
@@ -1496,5 +1629,196 @@ mod tests {
             Some(FlowStatus::Cancelled)
         );
         assert_eq!(parse_status_filter("bogus"), None);
+    }
+
+    /// Gap 07 — don't-lie-with-zeros for usage: an UNREPORTED (`None`) cached/reasoning
+    /// class is ABSENT on the wire (never a fabricated `0`), and a provider-REPORTED `0`
+    /// is a present, measured `0` — the two are DISTINCT. Round-trips the changed
+    /// `FlowUsage` field through serialize → JSON (AGENTS.md: no changed wire field
+    /// without a proof) at the `FlowRow` projection the frontend reads.
+    #[test]
+    fn flow_usage_unreported_class_is_absent_measured_zero_is_present() {
+        let row = |cached: Option<i64>, reasoning: Option<i64>| FlowRow {
+            api_call_id: "api_u".to_string(),
+            response_id: None,
+            method: "POST".to_string(),
+            uri: "/v1/responses".to_string(),
+            model_requested: None,
+            model_served: None,
+            upstream_target: None,
+            usage: Some(FlowUsage {
+                prompt: 100,
+                completion: 40,
+                total: 140,
+                cached,
+                reasoning,
+            }),
+            status: FlowStatus::Completed,
+            started_ms: 0,
+            finished_ms: None,
+            elapsed_ms: None,
+            terminal_reason: None,
+            client_label: None,
+            client_source: None,
+            cost: None,
+            cost_confidence: CostConfidence::Unavailable,
+        };
+
+        // UNREPORTED cached + reasoning ⇒ both keys OMITTED on the usage object (the
+        // frontend renders `—`), never a fake `0`. prompt/completion/total stay present.
+        let value = serde_json::to_value(row(None, None)).expect("serialize unreported");
+        let usage = value["usage"].as_object().expect("usage object");
+        assert!(
+            !usage.contains_key("cached"),
+            "unreported cached is ABSENT (unavailable), not 0: {usage:?}"
+        );
+        assert!(
+            !usage.contains_key("reasoning"),
+            "unreported reasoning is ABSENT (unavailable), not 0"
+        );
+        assert_eq!(usage["prompt"], serde_json::json!(100));
+        assert_eq!(usage["total"], serde_json::json!(140));
+
+        // A provider-REPORTED 0 is a PRESENT measured `0` — DISTINCT from absent.
+        let value = serde_json::to_value(row(Some(0), Some(0))).expect("serialize zero");
+        let usage = value["usage"].as_object().expect("usage object");
+        assert_eq!(
+            usage["cached"],
+            serde_json::json!(0),
+            "a reported cached=0 is a present measured 0 (≠ unavailable)"
+        );
+        assert_eq!(usage["reasoning"], serde_json::json!(0));
+    }
+
+    /// Gap 07 — cost CONFIDENCE tier rules (spec 07 acceptance). Reuses `cost_confidence`
+    /// directly so each branch is pinned:
+    /// - unpriced ⇒ `unavailable` (cost is `None`, never a fabricated 0);
+    /// - priced + reported `cached = 0` ⇒ `confident` even with NO configured cache rate;
+    /// - priced + `cached > 0`/UNREPORTED + NO configured cache rate ⇒ `estimated`;
+    /// - priced + `cached > 0`/UNREPORTED + a CONFIGURED cache rate ⇒ `confident`.
+    #[test]
+    fn cost_confidence_tiers_match_the_spec() {
+        let priced_no_cache = ModelPrice::without_cached(2.0, 6.0);
+        let priced_with_cache = ModelPrice::new(2.0, 6.0, 0.5);
+        let some = |cached: Option<i64>| {
+            Some(FlowUsage {
+                prompt: 100,
+                completion: 40,
+                total: 140,
+                cached,
+                reasoning: Some(0),
+            })
+        };
+
+        // Unpriced ⇒ unavailable regardless of usage.
+        assert_eq!(
+            cost_confidence(None, some(Some(10))),
+            CostConfidence::Unavailable
+        );
+        // Priced + reported cached = 0 ⇒ confident (nothing bills at the cache rate),
+        // even though this price has NO configured cache rate.
+        assert_eq!(
+            cost_confidence(Some(priced_no_cache), some(Some(0))),
+            CostConfidence::Confident,
+            "a reported cached=0 stays confident"
+        );
+        // Priced + cached > 0 + NO configured cache rate ⇒ estimated (those tokens would
+        // silently bill at the default 0.0).
+        assert_eq!(
+            cost_confidence(Some(priced_no_cache), some(Some(10))),
+            CostConfidence::Estimated,
+            "cached>0 with no configured cache rate ⇒ estimated"
+        );
+        // Priced + UNREPORTED cached + NO configured cache rate ⇒ estimated.
+        assert_eq!(
+            cost_confidence(Some(priced_no_cache), some(None)),
+            CostConfidence::Estimated,
+            "unreported cached with no configured cache rate ⇒ estimated"
+        );
+        // Priced + cached > 0 + a CONFIGURED cache rate ⇒ confident (priced honestly).
+        assert_eq!(
+            cost_confidence(Some(priced_with_cache), some(Some(10))),
+            CostConfidence::Confident,
+            "a configured cache rate prices cached>0 confidently"
+        );
+        // Priced + UNREPORTED cached + a CONFIGURED cache rate ⇒ still confident.
+        assert_eq!(
+            cost_confidence(Some(priced_with_cache), some(None)),
+            CostConfidence::Confident
+        );
+    }
+
+    /// Gap 07 — the AGGREGATE window cost confidence is `estimated` if ANY priced bucket
+    /// would silently bill cached at the default `0.0`: a window with one priced flow
+    /// whose cached was UNREPORTED (against a model with no configured cache rate) reports
+    /// `cost_confidence: estimated` even though the summed `cached_tokens == 0` — no
+    /// silently-confident total. A window with only a reported-cached-0 priced flow stays
+    /// `confident`; an unpriced-only window is `unavailable`.
+    #[test]
+    fn window_cost_confidence_aggregates_estimated() {
+        use crate::dashboard_flow::FlowStatus as FS;
+        use crate::metrics::MetricsLayer;
+        let mut prices = HashMap::new();
+        prices.insert("priced".to_string(), ModelPrice::without_cached(2.0, 6.0));
+
+        // (a) one priced flow with UNREPORTED cached → estimated aggregate.
+        let metrics = MetricsLayer::new();
+        metrics.record_terminal(
+            FS::Completed,
+            Some("priced"),
+            "/v1/responses",
+            Some("vllm-a"),
+            900,
+            Some(FlowUsage {
+                prompt: 1000,
+                completion: 500,
+                total: 1500,
+                cached: None, // unreported
+                reasoning: Some(0),
+            }),
+        );
+        let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
+        assert_eq!(
+            body.cost_confidence,
+            CostConfidence::Estimated,
+            "unreported cached on a no-cache-rate model ⇒ estimated aggregate (summed cached==0)"
+        );
+        assert_eq!(body.windows.m1.cost_confidence, CostConfidence::Estimated);
+
+        // (b) one priced flow with a REPORTED cached=0 → confident aggregate.
+        let metrics = MetricsLayer::new();
+        metrics.record_terminal(
+            FS::Completed,
+            Some("priced"),
+            "/v1/responses",
+            Some("vllm-a"),
+            900,
+            Some(FlowUsage {
+                prompt: 1000,
+                completion: 500,
+                total: 1500,
+                cached: Some(0), // reported zero
+                reasoning: Some(0),
+            }),
+        );
+        let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
+        assert_eq!(
+            body.cost_confidence,
+            CostConfidence::Confident,
+            "a reported cached=0 keeps the aggregate confident"
+        );
+
+        // (c) an unpriced-only window ⇒ unavailable (cost_per_min renders —).
+        let metrics = MetricsLayer::new();
+        metrics.record_terminal(
+            FS::Completed,
+            Some("free"),
+            "/v1/responses",
+            Some("vllm-a"),
+            900,
+            Some(usage(10, 5, 0)),
+        );
+        let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
+        assert_eq!(body.cost_confidence, CostConfidence::Unavailable);
     }
 }

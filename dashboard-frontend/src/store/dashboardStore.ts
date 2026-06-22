@@ -370,6 +370,10 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
         elapsed_ms: p.elapsed_ms ?? prev?.elapsed_ms ?? null,
         terminal_reason: prev?.terminal_reason ?? null,
         cost: prev?.cost ?? null,
+        // Gap 07: the live `flow_status` WS frame carries NO cost/confidence (cost is a REST
+        // roll-up). Keep any prior tag; default to `unavailable` (no confident claim live) —
+        // never fabricate `confident`. The REST `/flows` row supplies the real tag.
+        cost_confidence: prev?.cost_confidence ?? 'unavailable',
       };
       flows.set(p.api_call_id, next);
       return {

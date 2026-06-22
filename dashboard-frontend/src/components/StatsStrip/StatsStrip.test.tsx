@@ -15,6 +15,7 @@ function win(over: Partial<MetricWindow> = {}): MetricWindow {
     samples,
     usage_samples: samples,
     priced_samples: samples,
+    cost_confidence: 'estimated',
     ...over,
   };
 }
@@ -28,6 +29,7 @@ function metrics(seq: number, over: Partial<MetricsResponse> = {}, windows?: { m
     samples: m1.samples,
     usage_samples: m1.usage_samples,
     priced_samples: m1.priced_samples,
+    cost_confidence: m1.cost_confidence,
     windows: { m1, m5: win(windows?.m5), h1: win(windows?.h1) },
     ...over,
   };

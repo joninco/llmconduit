@@ -93,7 +93,8 @@ function SeekSankey() {
       // `buildSankeyModel`, not painted as last-30 s traffic — finding 4); a flow still OPEN at the
       // cut is active AT the cut, so it counts at `atMs`.
       const ts = f.finished_ms ?? atMs;
-      out.push({ ts, upstream: f.upstream_target ?? null, model, prompt: u.prompt, cached: u.cached, completion: u.completion, total: u.total });
+      // Gap 07: unreported cached ⇒ 0 token sub-count for the seek-cut Sankey delta.
+      out.push({ ts, upstream: f.upstream_target ?? null, model, prompt: u.prompt, cached: u.cached ?? 0, completion: u.completion, total: u.total });
     }
     return out;
   }, [flows, atMs]);

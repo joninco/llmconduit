@@ -4744,8 +4744,10 @@ async fn d3_completed_flow_finalizes_with_cumulative_usage() {
     assert_eq!(usage.total, 140);
     assert_eq!(usage.prompt, 100);
     assert_eq!(usage.completion, 40);
-    assert_eq!(usage.cached, 10);
-    assert_eq!(usage.reasoning, 7);
+    // Gap 07: the upstream REPORTED cached/reasoning details, so they are `Some`
+    // (measured), not `None` (unavailable) and not a bare `i64`.
+    assert_eq!(usage.cached, Some(10));
+    assert_eq!(usage.reasoning, Some(7));
     // Monotonic latency stamped (Instant-based), terminal reason set.
     assert!(record.elapsed_ms.is_some());
     assert!(record.finished_ms.is_some());
@@ -5224,7 +5226,7 @@ async fn d3_midstream_cancel_finalizes_cancelled_with_last_usage() {
         usage.total, 120,
         "cancel keeps the LAST upserted cumulative total"
     );
-    assert_eq!(usage.cached, 5);
+    assert_eq!(usage.cached, Some(5));
     // Gap 02 (review round 1): the content delta "Hel" WAS delivered (the test drained
     // it off the SSE stream) BEFORE the hang-up, so TTFT is stamped — a cancel AFTER the
     // first content delta reaches the client keeps the true TTFT. (The None direction —
@@ -5496,11 +5498,7 @@ fn d13_price_table() -> std::collections::HashMap<String, llmconduit::config::Mo
     let mut table = std::collections::HashMap::new();
     table.insert(
         "glm-5.1".to_string(),
-        llmconduit::config::ModelPrice {
-            input_per_1k: 2.0,
-            output_per_1k: 6.0,
-            cached_per_1k: 0.5,
-        },
+        llmconduit::config::ModelPrice::new(2.0, 6.0, 0.5),
     );
     table
 }
@@ -6066,6 +6064,14 @@ async fn d13_flows_filters_and_carries_flow_seq_and_cost() {
         (cost - 0.425).abs() < 1e-9,
         "cost {cost} == usage×price 0.425"
     );
+    // Gap 07: glm-5.1 is priced WITH a configured cache rate (0.5) and the flow
+    // reported cached tokens, so the cost is CONFIDENT (every billed class has a known
+    // rate) — the per-flow confidence tag rides the row end-to-end.
+    assert_eq!(
+        completed_row["cost_confidence"],
+        serde_json::json!("confident"),
+        "priced + configured cache rate ⇒ confident"
+    );
 
     // `status=failed` returns ONLY the failed flow.
     let only_failed = d13_json(d13_get(&app, "/dashboard/api/flows?status=failed").await).await;
@@ -6373,12 +6379,31 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
     );
     let cost = detail["cost"].as_f64().expect("detail cost priced");
     assert!((cost - 0.425).abs() < 1e-9, "detail cost {cost} == 0.425");
+    // Gap 07: the inspector detail carries the cost confidence tag too (confident here —
+    // priced glm-5.1 with a configured cache rate). usage cached is a present measured
+    // value (the upstream reported a cached breakdown), not absent.
+    assert_eq!(detail["cost_confidence"], serde_json::json!("confident"));
+    assert!(
+        usage.get("cached").is_some(),
+        "the upstream reported cached ⇒ a present measured value, not absent"
+    );
 
     // (3) `/metrics` populated — the completed flow bumped the rings.
     let metrics = d13_json(d13_get(&app, "/dashboard/api/metrics").await).await;
     assert!(
         metrics["metrics_seq"].as_u64().unwrap() > 0,
         "the finalized flow advanced metrics_seq"
+    );
+    // Gap 07: the headline + m1 window carry the aggregate cost confidence (confident —
+    // the only priced bucket bills cached at a configured rate).
+    assert_eq!(
+        metrics["cost_confidence"],
+        serde_json::json!("confident"),
+        "aggregate cost confidence rides the metrics body"
+    );
+    assert_eq!(
+        metrics["windows"]["m1"]["cost_confidence"],
+        serde_json::json!("confident")
     );
 
     // (4) `/topology` populated — price table + a topology_seq cursor.

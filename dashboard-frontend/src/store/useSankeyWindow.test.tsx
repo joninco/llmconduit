@@ -15,7 +15,7 @@ function usage(over: Partial<Usage> = {}): Usage {
 function flow(over: Partial<FlowSummary> = {}): FlowSummary {
   return {
     api_call_id: 'api_x', method: 'POST', uri: '/v1/responses', status: 'completed',
-    started_ms: 1_700_000_000_000, model_served: 'gpt-4o', upstream_target: 'vllm-a', ...over,
+    started_ms: 1_700_000_000_000, model_served: 'gpt-4o', upstream_target: 'vllm-a', cost_confidence: 'unavailable', ...over,
   };
 }
 

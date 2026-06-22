@@ -60,9 +60,12 @@ export function flowCost(flow: FlowSummary, priceTable: Record<string, ModelPric
   return computeCost(flow.usage, price);
 }
 
-/** usage × price (per-1k rates). Cached prompt tokens billed at the cached rate. */
+/** usage × price (per-1k rates). Cached prompt tokens billed at the cached rate.
+ * Gap 07: an UNREPORTED (`null`/absent) cached count bills as 0 cached tokens — the whole
+ * prompt then bills at the input rate (matching the Rust `cost_for_usage`). The honest
+ * confidence of that figure rides `cost_confidence`, not this dollar number. */
 export function computeCost(usage: Usage, price: ModelPrice): number {
-  const cached = Math.max(0, usage.cached);
+  const cached = Math.max(0, usage.cached ?? 0);
   const billablePrompt = Math.max(0, usage.prompt - cached);
   return (
     (billablePrompt / 1000) * price.input_per_1k +

@@ -240,7 +240,7 @@ describe('TheaterView — SEEK shows historical summaries, NOT a live river', ()
   function frozenFlow(over: Partial<FlowSummary>): FlowSummary {
     return {
       api_call_id: 'api_x', method: 'POST', uri: '/v1/responses', status: 'completed',
-      started_ms: 1_700_000_000_000, ...over,
+      started_ms: 1_700_000_000_000, cost_confidence: 'unavailable', ...over,
     };
   }
 

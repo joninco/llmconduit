@@ -211,13 +211,31 @@ pub enum FlowStatus {
 }
 
 /// Token usage attached to a flow once the upstream response reports it.
+///
+/// Gap 07 — usage CONFIDENCE. `prompt`/`completion`/`total` are the core counts the
+/// upstream always reports. `cached`/`reasoning` are OPTIONAL token classes the
+/// upstream may or may not break out: a `0` and "the upstream never reported this
+/// class" are DIFFERENT facts. They are therefore `Option<i64>` — `Some(0)` is a
+/// provider-reported zero (e.g. "0 cache hits this turn"), `None` is UNAVAILABLE
+/// (the upstream omitted `prompt_tokens_details`/`completion_tokens_details`). Serialized
+/// with `skip_serializing_if` so an unreported class is ABSENT on the wire (the
+/// frontend renders `—`), never a fabricated `0` (don't-lie-with-zeros). The
+/// distinction is load-bearing for cost confidence: a `cached` charge against a
+/// model with no configured cache rate (or an unreported `cached`) is `estimated`,
+/// not `confident`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct FlowUsage {
     pub prompt: i64,
     pub completion: i64,
     pub total: i64,
-    pub cached: i64,
-    pub reasoning: i64,
+    /// Cache-read prompt tokens. `Some(n)` measured (incl. a reported `0`); `None`
+    /// when the upstream did not report a cached breakdown (UNAVAILABLE, not `0`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached: Option<i64>,
+    /// Reasoning (thinking) tokens. `Some(n)` measured (incl. a reported `0`); `None`
+    /// when the upstream did not report reasoning details (UNAVAILABLE, not `0`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<i64>,
 }
 
 /// Gap 04 — the PROVENANCE of a flow's `client_label`: WHICH non-secret signal the
@@ -2548,8 +2566,8 @@ mod tests {
                 prompt: 10,
                 completion: 5,
                 total: 15,
-                cached: 0,
-                reasoning: 2,
+                cached: Some(0),
+                reasoning: Some(2),
             },
         );
         store.finalize(
@@ -2832,8 +2850,8 @@ mod tests {
                 prompt: 100,
                 completion: 40,
                 total: 140,
-                cached: 10,
-                reasoning: 7,
+                cached: Some(10),
+                reasoning: Some(7),
             });
             let guard = store
                 .engine_guard("api_1", Arc::clone(&token), &AbortHub::new())
@@ -2870,8 +2888,8 @@ mod tests {
                     prompt: 100,
                     completion: 40,
                     total: 140,
-                    cached: 10,
-                    reasoning: 7,
+                    cached: Some(10),
+                    reasoning: Some(7),
                 })
             );
 

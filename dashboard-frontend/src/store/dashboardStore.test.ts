@@ -11,7 +11,7 @@ import type { FlowSummary, ProviderHealth, SeqCursors, TopologyResponse } from '
 
 const CURSORS: SeqCursors = { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 };
 function flow(id: string): FlowSummary {
-  return { api_call_id: id, method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1 };
+  return { api_call_id: id, method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1, cost_confidence: 'unavailable' };
 }
 function node(id: string): ProviderHealth {
   return {
@@ -26,7 +26,7 @@ function topology(seq: number, nodeIds: string[], price: Record<string, number> 
     nodes: nodeIds.map(node),
     edges: [],
     price_table: Object.fromEntries(
-      Object.entries(price).map(([m, p]) => [m, { input_per_1k: p, output_per_1k: p, cached_per_1k: p }]),
+      Object.entries(price).map(([m, p]) => [m, { input_per_1k: p, output_per_1k: p, cached_per_1k: p, cached_price_configured: true }]),
     ),
   };
 }
