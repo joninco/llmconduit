@@ -207,6 +207,32 @@ pub struct FlowDelta {
     pub ts_ms: Option<u128>,
 }
 
+/// Gap 05 — the captured upstream RESPONSE/ERROR body projected onto the live
+/// [`FlowDetailBody`] (the `/dashboard/api/flows/:id` detail path only — NEVER the
+/// body-free list rows or snapshot summaries). `body` is the redacted, capped bytes
+/// parsed back to a JSON `Value` (or a string `Value` for a non-JSON / `[redacted:
+/// unparseable body …]` marker, mirroring the other captured bodies); `truncated`
+/// flags that the cap truncated the raw body, so the dashboard shows a PARTIAL body
+/// honestly rather than presenting it as complete. Present ONLY when capture is armed
+/// AND the turn produced an upstream error body (the live record's
+/// [`upstream_response`](crate::dashboard_flow::FlowRecord::upstream_response) is
+/// `Some`); absent otherwise (capture off / no body / evicted by the byte quota).
+/// Derives `Deserialize` (alongside `Serialize`) so the new wire field round-trips in a
+/// test (AGENTS.md: no new wire field without a deserialize-then-serialize proof) — the
+/// enclosing [`FlowDetailBody`] stays serialize-only (it is only ever a response), so the
+/// round-trip is pinned on THIS self-contained sub-DTO. Consumed by gap 14 (failure
+/// taxonomy).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowUpstreamResponse {
+    /// The redacted, capped upstream response/error body, parsed to JSON (or a string
+    /// `Value` for a non-JSON / marker body). An EMPTY captured body parses to a string
+    /// `""` — distinct from the whole field being ABSENT (capture off / no body).
+    pub body: serde_json::Value,
+    /// Whether the cap truncated the raw body (the retained bytes are a PREFIX). The
+    /// dashboard must flag a truncated body rather than presenting it as complete.
+    pub truncated: bool,
+}
+
 /// `GET /dashboard/api/flows/:id` — the 3-pane inspector body. Carries the summary
 /// fields, the three captured on-wire bodies (inbound, normalized, upstream —
 /// ABSENT, not error, when the summary-byte quota evicted them), the inbound
@@ -231,6 +257,18 @@ pub struct FlowDetailBody {
     /// The captured UPSTREAM on-wire chat body (D2), parsed. Absent when evicted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_body: Option<serde_json::Value>,
+    /// Gap 05 — the captured upstream RESPONSE/ERROR body (parsed) + its `truncated`
+    /// flag, projected from the live record's
+    /// [`upstream_response`](crate::dashboard_flow::FlowRecord::upstream_response).
+    /// Present ONLY on this LIVE detail path (the diagnostic operator endpoint) when
+    /// response capture is armed AND the turn produced an upstream error body; absent
+    /// otherwise (capture off / no body / evicted by the byte quota). DELIBERATELY kept
+    /// OFF the body-free [`FlowRow`] list rows and
+    /// [`SnapshotFlowSummary`](crate::dashboard_flow::SnapshotFlowSummary) (the 135 GiB
+    /// body-free-snapshot invariant). `skip_serializing_if` so an absent body OMITS the
+    /// key. Consumed by gap 14 (failure taxonomy); the React app ignores it until then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_response: Option<FlowUpstreamResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_requested: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -770,6 +808,18 @@ pub async fn dashboard_flow_detail(
         inbound_headers,
         normalized: record.normalized.as_ref().map(parse_captured_body),
         upstream_body: record.upstream_body.as_ref().map(parse_captured_body),
+        // Gap 05: project the captured upstream RESPONSE/ERROR body (bytes + truncated)
+        // onto the LIVE detail body. Parse the redacted/capped bytes like the other
+        // captured bodies; `truncated` rides alongside so the dashboard flags a partial
+        // body. Absent when the record's `upstream_response` is `None` (capture off / no
+        // body / evicted). Stays OFF the list rows + snapshot summaries.
+        upstream_response: record
+            .upstream_response
+            .as_ref()
+            .map(|response| FlowUpstreamResponse {
+                body: parse_captured_body(&response.bytes),
+                truncated: response.truncated,
+            }),
         model_requested: record.model_requested.clone(),
         model_served: record.model_served.clone(),
         upstream_target: record.upstream_target.clone(),
@@ -1314,6 +1364,98 @@ mod tests {
         assert!(
             !obj.contains_key("client_source"),
             "absent source key omitted: {absent}"
+        );
+    }
+
+    /// Gap 05 review F2: `FlowDetailBody` carries the OPTIONAL `upstream_response`
+    /// (the captured upstream RESPONSE/ERROR body + `truncated`) on the LIVE detail path.
+    /// This pins the new wire field with a serialize → deserialize ROUND-TRIP (AGENTS.md:
+    /// no new wire field without a round-trip proof). The enclosing `FlowDetailBody` is
+    /// serialize-only (it is only ever a response), so the round-trip is on the
+    /// self-contained `FlowUpstreamResponse` sub-DTO: we SERIALIZE the whole detail body
+    /// (proving the field is wired in + that `skip_serializing_if` OMITS it when absent),
+    /// then DESERIALIZE the `upstream_response` value back into `FlowUpstreamResponse` and
+    /// assert it survives. Covers PRESENT with `truncated` false AND true, and ABSENT.
+    #[test]
+    fn flow_detail_body_upstream_response_round_trips_present_and_absent() {
+        let base = || FlowDetailBody {
+            flow_seq: 7,
+            api_call_id: "api_d".to_string(),
+            response_id: Some("resp_d".to_string()),
+            inbound_body: None,
+            inbound_headers: None,
+            normalized: None,
+            upstream_body: None,
+            upstream_response: None,
+            model_requested: None,
+            model_served: None,
+            upstream_target: None,
+            usage: None,
+            status: FlowStatus::Failed,
+            deltas: Vec::new(),
+            terminal_reason: None,
+            started_ms: 1,
+            finished_ms: None,
+            elapsed_ms: None,
+            cost: None,
+        };
+
+        // PRESENT (not truncated): a JSON error body survives the round-trip intact,
+        // with `truncated: false`. Serialize the whole detail body, then deserialize the
+        // sub-object back into the typed DTO.
+        let present = FlowDetailBody {
+            upstream_response: Some(FlowUpstreamResponse {
+                body: serde_json::json!({"error": {"message": "backend on fire"}}),
+                truncated: false,
+            }),
+            ..base()
+        };
+        let value = serde_json::to_value(&present).expect("serialize present detail");
+        assert_eq!(
+            value["upstream_response"]["body"]["error"]["message"],
+            serde_json::json!("backend on fire")
+        );
+        assert_eq!(
+            value["upstream_response"]["truncated"],
+            serde_json::json!(false)
+        );
+        let rt: FlowUpstreamResponse = serde_json::from_value(value["upstream_response"].clone())
+            .expect("deserialize present upstream_response");
+        assert_eq!(
+            rt.body,
+            serde_json::json!({"error": {"message": "backend on fire"}}),
+            "the captured body survives serialize → deserialize"
+        );
+        assert!(!rt.truncated, "truncated false survives the round-trip");
+
+        // PRESENT (truncated): a cap-truncated body keeps `truncated: true` across the
+        // round-trip so the dashboard can flag a PARTIAL body.
+        let truncated = FlowDetailBody {
+            upstream_response: Some(FlowUpstreamResponse {
+                body: serde_json::Value::String("partial prefix…".to_string()),
+                truncated: true,
+            }),
+            ..base()
+        };
+        let value = serde_json::to_value(&truncated).expect("serialize truncated detail");
+        assert_eq!(
+            value["upstream_response"]["truncated"],
+            serde_json::json!(true)
+        );
+        let rt: FlowUpstreamResponse = serde_json::from_value(value["upstream_response"].clone())
+            .expect("deserialize truncated upstream_response");
+        assert!(rt.truncated, "truncated true survives the round-trip");
+        assert_eq!(rt.body, serde_json::json!("partial prefix…"));
+
+        // ABSENT: no captured body OMITS the key entirely (skip_serializing_if), never
+        // a `null`.
+        let value = serde_json::to_value(base()).expect("serialize absent detail");
+        assert!(
+            !value
+                .as_object()
+                .expect("object")
+                .contains_key("upstream_response"),
+            "absent upstream_response key omitted (not null): {value}"
         );
     }
 

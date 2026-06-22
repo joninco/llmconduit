@@ -1944,6 +1944,21 @@ impl TelemetryGuard {
             // still carries the attempts for metrics.
             self.store
                 .record_attempts(&self.api_call_id, attempts, first_upstream_byte_ms);
+            // Gap 05 round-1 review (F1): commit the turn's PENDING upstream RESPONSE/ERROR
+            // body — staged on the shared `ServingToken` by the leaf's terminal-error sites
+            // — onto the FlowStore record HERE, at finalize, AFTER the failover layer has
+            // decided the turn's FINAL outcome. The token holds a body IFF the turn
+            // ultimately FAILED with a captured error body: a provider that served the turn
+            // CLEARED it (so a successful turn commits `None` — no stale earlier-attempt
+            // error body), while an all-providers-fail turn carries the LAST attempt's body.
+            // `take` moves it out so a re-finalize cannot re-commit. `set_upstream_response`
+            // is itself gated on the response-capture flag (and no-ops on a pruned/evicted
+            // record), so when capture is off this is a cheap no-op — the leaf staged nothing
+            // anyway.
+            self.store.set_upstream_response(
+                &self.api_call_id,
+                self.serving.take_pending_response_body(),
+            );
             // D6: drop the kill token from the AbortHub on the SAME CAS-winning path
             // that finalizes the record — so EVERY terminal (explicit Completed/Failed
             // here, OR the `Drop` fallback's Cancelled) removes the entry exactly once.

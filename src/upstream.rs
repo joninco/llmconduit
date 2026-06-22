@@ -1020,29 +1020,35 @@ impl ReqwestUpstreamClient {
         );
     }
 
-    /// Gap 05 capture: store the upstream RESPONSE/ERROR `body` for `response_id`
-    /// through the capped + redacting + truncation-flagging serializer. No-op when the
-    /// SEPARATE upstream-response capture gate is off (debug UI off OR the
-    /// `LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE` env flag unset) or no
-    /// `response_id` is threaded — so production and a dashboard-without-the-gate do no
-    /// work and retain nothing. `body` is the already-read upstream error text (a
-    /// `String`/`&str`, NOT the 256 MiB inbound middleware buffer); it is COPIED through
-    /// the capped serializer, so no `Bytes` slice of that buffer is retained. Called at
-    /// the terminal-error sites in [`dispatch_chat_stream`] — the body that actually
-    /// ended the turn (last-writer-wins on the shrink-and-retry path, where the retry's
-    /// error body replaces the first attempt's). The redaction is consistent with the
-    /// existing request-capture surface; this is a diagnostic body shown to the
-    /// authenticated operator, captured ONLY when explicitly opted in.
-    fn capture_upstream_response_body(&self, response_id: Option<&str>, body: &str) {
+    /// Gap 05 capture: STAGE the upstream RESPONSE/ERROR `body` of a FAILED attempt as the
+    /// turn's pending body on the shared `ServingToken`, copied through the capped +
+    /// redacting + truncation-flagging serializer. No-op when the SEPARATE upstream-response
+    /// capture gate is off (debug UI off OR the `LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE`
+    /// env flag unset) or no `serving` token is threaded — so production and a
+    /// dashboard-without-the-gate do no work and retain nothing. `body` is the already-read
+    /// upstream error text (a `String`/`&str`, NOT the 256 MiB inbound middleware buffer); it
+    /// is COPIED through the capped serializer, so no `Bytes` slice of that buffer is retained.
+    ///
+    /// Round-1 review (F1): the body is STAGED on the token, NOT committed straight onto the
+    /// FlowStore record. The L1 telemetry guard commits the token's pending body at finalize,
+    /// AFTER the failover layer has decided the turn's FINAL outcome — and a provider that
+    /// later SERVES the turn clears the pending body first (`clear_pending_response_body`). So
+    /// the record's `upstream_response` reflects the turn's final outcome (provider A 500 →
+    /// provider B 200 leaves it `None`; all-fail commits the last attempt's body), never a
+    /// transient earlier attempt. Last-writer-wins per attempt (the shrink-and-retry's body
+    /// replaces the first attempt's, a later failed provider's replaces an earlier one's).
+    /// The redaction is consistent with the existing request-capture surface; this is a
+    /// diagnostic body shown to the authenticated operator, captured ONLY when explicitly
+    /// opted in.
+    fn capture_upstream_response_body(&self, serving: Option<&Arc<ServingToken>>, body: &str) {
         if !self.flow_store.is_response_capture_enabled() {
             return;
         }
-        let Some(response_id) = response_id else {
+        let Some(serving) = serving else {
             return;
         };
         let captured = crate::dashboard_flow::capture_response_body(body.as_bytes());
-        self.flow_store
-            .set_upstream_response(response_id, Some(captured));
+        serving.set_pending_response_body(captured);
     }
 
     /// Gap 03 (bare-leaf path): wrap a successfully-dispatched upstream stream so the
@@ -1224,9 +1230,9 @@ impl ReqwestUpstreamClient {
             // (failover-eligible) upstream error.
             let retry_body = retry_response.text().await.unwrap_or_default();
             // Gap 05: the RETRY is the body that actually ended the turn on the
-            // shrink-and-retry path — capture IT (last-writer-wins over the first
+            // shrink-and-retry path — stage IT (last-writer-wins over the first
             // attempt's body) so the dashboard shows the upstream's final word.
-            self.capture_upstream_response_body(response_id, &retry_body);
+            self.capture_upstream_response_body(serving, &retry_body);
             if classify_context_overflow(
                 &retry_body,
                 self.min_completion_tokens,
@@ -1250,8 +1256,9 @@ impl ReqwestUpstreamClient {
         }
 
         // Gap 05: a first-attempt non-2xx that did NOT trigger a context-overflow retry
-        // — capture the upstream error body so the operator can see why the turn failed.
-        self.capture_upstream_response_body(response_id, &body);
+        // — stage the upstream error body so the operator can see why the turn failed (it
+        // is cleared if a later failover provider serves; committed at finalize otherwise).
+        self.capture_upstream_response_body(serving, &body);
         Err(AppError::upstream(format!(
             "upstream chat failed with {status}: {}",
             redact_and_truncate_error_body(&body, 500)
@@ -1806,6 +1813,14 @@ impl FailoverUpstreamClient {
                     // wins). The same `Arc` lives on `provider_request`; use `backend`.
                     if let Some(serving) = &backend.serving {
                         serving.set_provider(provider.name.clone());
+                        // Gap 05 (F1): this provider SERVED the turn, so any pending upstream
+                        // ERROR body staged by an EARLIER failed provider (e.g. a 500 before
+                        // this 200) must NOT remain as the turn's `upstream_response` — clear
+                        // it here so finalize commits `None` for a served turn. The served
+                        // attempt is authoritative (gap-03 model). All-providers-fail never
+                        // reaches this seam, so the last attempt's staged body survives to
+                        // commit.
+                        serving.clear_pending_response_body();
                     }
                     // Gap 03 (F1): this attempt SERVED — its `first_upstream_byte_ms` is the
                     // wire HEADER time (`header_byte_ms`), the instant `send().await`
@@ -2928,6 +2943,21 @@ struct ServingInfo {
     /// sequentially (the failover loop awaits each fully before the next), so a single slot
     /// is race-free; it is scratch state, NOT part of the persisted trace.
     attempt_header_byte_ms: Option<u128>,
+    /// Gap 05 round-1 review (F1): the PENDING upstream RESPONSE/ERROR body for the
+    /// TURN — staged here on the shared token instead of committed straight onto the
+    /// FlowStore record at the leaf, so the body that finally lands reflects the turn's
+    /// FINAL outcome, not a transient earlier attempt. The leaf stamps the most-recent
+    /// FAILED attempt's captured body here (last-writer-wins per attempt — a later failed
+    /// provider's body overwrites an earlier one); a provider that SUCCESSFULLY serves
+    /// CLEARS it (a served turn has no failure body), mirroring the gap-03 served-attempt-
+    /// is-authoritative model. The L1 telemetry guard `take`s it at finalize and commits
+    /// it via `set_upstream_response`, so the record carries a body IFF the turn ultimately
+    /// failed: provider A 500 → provider B 200 leaves this `None` (cleared on B's serve);
+    /// provider A 500 → provider B 500 leaves B's (last) error body to commit. Already a
+    /// redacted + capped [`CapturedResponseBody`] (the leaf passes the same capped/redacting
+    /// capture), so no `Bytes` slice of the 256 MiB middleware buffer is retained. Gated at
+    /// the leaf (`is_response_capture_enabled`), so when capture is off nothing is staged.
+    pending_response_body: Option<crate::dashboard_flow::CapturedResponseBody>,
 }
 
 /// Interior-mutable serving identity for one flow. A FRESH one is allocated per
@@ -3062,6 +3092,42 @@ impl ServingToken {
     /// response failure). The caller uses it as the attempt's `first_upstream_byte_ms`.
     pub fn take_attempt_header_byte(&self) -> Option<u128> {
         self.lock().attempt_header_byte_ms
+    }
+
+    /// Gap 05 round-1 review (F1): stage the captured upstream RESPONSE/ERROR `body` of a
+    /// FAILED attempt as the turn's PENDING body. Last-writer-wins per attempt — a later
+    /// failed provider's (or the shrink-and-retry's) body overwrites an earlier one — so on
+    /// an all-providers-fail turn the LAST attempt's error body is what finalize commits.
+    /// The leaf calls this (gated on `is_response_capture_enabled`) at its terminal-error
+    /// sites instead of writing the FlowStore record directly, so a body is committed only
+    /// after the failover layer has decided the turn's final outcome (it is CLEARED the
+    /// instant a later provider serves — see [`clear_pending_response_body`]). `body` is
+    /// already redacted + capped, so no `Bytes` slice of the 256 MiB middleware buffer is
+    /// held.
+    pub fn set_pending_response_body(&self, body: crate::dashboard_flow::CapturedResponseBody) {
+        self.lock().pending_response_body = Some(body);
+    }
+
+    /// Gap 05 round-1 review (F1): discard any pending upstream ERROR body because a
+    /// provider has SUCCESSFULLY served the turn. A served turn has no failure body, so an
+    /// earlier failed provider's body (e.g. provider A's 500 before provider B's 200) must
+    /// NOT remain as the turn's `upstream_response` — clearing here is the option-(b)
+    /// "overwrite when a later attempt ultimately serves" semantics, aligned with the
+    /// gap-03 served-attempt-is-authoritative model. Called at the failover serve-success
+    /// seam (the SAME point `set_provider` tags the serving provider). Idempotent.
+    pub fn clear_pending_response_body(&self) {
+        self.lock().pending_response_body = None;
+    }
+
+    /// Gap 05 round-1 review (F1): the L1 telemetry guard `take`s the turn's pending
+    /// upstream ERROR body at finalize and commits it via `set_upstream_response`. `Some`
+    /// IFF the turn ultimately FAILED with a captured body (a served turn cleared it); takes
+    /// (moves) it out so a re-finalize does not re-commit. `None` when capture was off, no
+    /// upstream error body was produced, or a later provider served.
+    pub fn take_pending_response_body(
+        &self,
+    ) -> Option<crate::dashboard_flow::CapturedResponseBody> {
+        self.lock().pending_response_body.take()
     }
 
     /// `(route, provider)` snapshot for D3's finalize attribution.
@@ -6402,9 +6468,12 @@ mod tests {
     }
 
     /// Gap 05: with the upstream-response capture gate ARMED, a failing turn's upstream
-    /// ERROR body lands on the live FlowStore record (copied through the capped/redacting
-    /// serializer, keyed by the flow's `response_id`). This is the leaf wiring that
-    /// answers "what did the upstream actually say back when this failed?".
+    /// ERROR body is STAGED on the shared `ServingToken` (copied through the capped/redacting
+    /// serializer) and lands on the live FlowStore record when the L1 guard commits it at
+    /// finalize. This is the leaf wiring that answers "what did the upstream actually say
+    /// back when this failed?". Round-1 review (F1): the body rides the token so it reflects
+    /// the turn's FINAL outcome — committed at finalize, here simulated by the guard's
+    /// `set_upstream_response(api_call_id, token.take_pending_response_body())` commit.
     #[tokio::test]
     async fn gap05_leaf_captures_upstream_error_body_when_gate_on() {
         let server = MockServer::start().await;
@@ -6443,6 +6512,11 @@ mod tests {
             "500 dispatch fails"
         );
 
+        // F1: the leaf STAGES the error body on the token; the record carries it only after
+        // the guard commits at finalize. Simulate that commit (the bare-leaf turn FAILED, so
+        // nothing cleared the pending body).
+        store.set_upstream_response(&api_call_id, token.take_pending_response_body());
+
         let record = store.detail(&api_call_id).expect("record");
         let captured = record
             .upstream_response
@@ -6458,7 +6532,8 @@ mod tests {
 
     /// Gap 05: with the gate OFF (the DEFAULT — request capture does not imply response
     /// capture), the SAME failing turn retains NO upstream response body. `None` (absent),
-    /// not an empty body — the gate is a real opt-in, and `set_upstream_response` no-ops.
+    /// not an empty body — the gate is a real opt-in: the leaf stages nothing on the token
+    /// AND `set_upstream_response` no-ops, so even the guard's finalize commit lands `None`.
     #[tokio::test]
     async fn gap05_leaf_does_not_capture_upstream_error_body_when_gate_off() {
         let server = MockServer::start().await;
@@ -6495,10 +6570,173 @@ mod tests {
             "500 dispatch fails"
         );
 
+        // Even driving the guard's finalize commit lands nothing: the leaf staged no body
+        // (gated), and `set_upstream_response` is itself gated off.
+        store.set_upstream_response(&api_call_id, token.take_pending_response_body());
+
         let record = store.detail(&api_call_id).expect("record");
         assert!(
             record.upstream_response.is_none(),
             "gap05: response capture OFF ⇒ no upstream error body retained (None, not empty)"
+        );
+    }
+
+    /// Gap 05 round-1 review (F1): the CORRECTNESS case the review flagged — provider A
+    /// returns 500, provider B serves 200. Provider A's nested leaf STAGES its 500 error
+    /// body on the shared token, but provider B's serve CLEARS it, so the turn's FINAL
+    /// `upstream_response` committed at finalize is `None`. Without the fix, provider A's
+    /// stale error body would remain on a SUCCESSFUL turn (gap 14 would misclassify it).
+    /// The served-attempt-is-authoritative model (gap 03) holds for the captured body too.
+    #[tokio::test]
+    async fn gap05_failover_a500_then_b200_commits_no_stale_error_body() {
+        let down = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(r#"{"error":{"message":"provider A is down"}}"#),
+            )
+            .mount(&down)
+            .await;
+        let up = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(d2_sse_ok_body()))
+            .mount(&up)
+            .await;
+
+        // One shared capture-ARMED store: the flow is opened here, the nested leaves use it
+        // to pass the response-capture gate, and the (simulated) guard commit lands here.
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+
+        // Cooldown 0 so the failover loop tries provider A then B in one dispatch. The
+        // nested leaves are NOT `into_bare_primary` — the failover loop owns provider tagging
+        // (and the gap-05 serve-success clear).
+        let failover = FailoverUpstreamClient::new(
+            vec![
+                FailoverUpstreamProvider::new(
+                    "primary",
+                    d2_capturing_client(&down.uri(), store.clone()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+                FailoverUpstreamProvider::new(
+                    "backup",
+                    d2_capturing_client(&up.uri(), store.clone()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+            ],
+            std::time::Duration::from_secs(0),
+        );
+
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some(response_id.clone()),
+            Some(Arc::clone(&token)),
+        );
+        let mut stream = failover
+            .stream_chat_completion(&backend)
+            .await
+            .expect("failover serves from the backup");
+        while stream.next().await.is_some() {}
+
+        // The token's pending body was cleared by provider B's serve, so a served turn
+        // commits `None` — exactly the guard's finalize commit (here simulated).
+        assert!(
+            token.take_pending_response_body().is_none(),
+            "F1: a later provider serving CLEARS the earlier provider's staged error body"
+        );
+        store.set_upstream_response(&api_call_id, token.take_pending_response_body());
+
+        let record = store.detail(&api_call_id).expect("record");
+        assert!(
+            record.upstream_response.is_none(),
+            "F1: a successful (failed-over) turn must carry NO stale upstream error body"
+        );
+    }
+
+    /// Gap 05 round-1 review (F1): the all-providers-fail case — provider A 500, provider B
+    /// 500. No provider serves, so the serve-success clear never fires; the LAST attempt's
+    /// (provider B's) error body remains staged on the token and is what finalize commits as
+    /// the turn's FINAL `upstream_response`. This is the legitimate "captured body" case the
+    /// fix must preserve (the operator sees the upstream's final word on a genuinely-failed
+    /// turn), distinct from the served-turn `None` above.
+    #[tokio::test]
+    async fn gap05_failover_all_fail_commits_final_error_body() {
+        let down_a = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("provider A error body"))
+            .mount(&down_a)
+            .await;
+        let down_b = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .set_body_string(r#"{"error":{"message":"provider B final word"}}"#),
+            )
+            .mount(&down_b)
+            .await;
+
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+
+        let failover = FailoverUpstreamClient::new(
+            vec![
+                FailoverUpstreamProvider::new(
+                    "primary",
+                    d2_capturing_client(&down_a.uri(), store.clone()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+                FailoverUpstreamProvider::new(
+                    "backup",
+                    d2_capturing_client(&down_b.uri(), store.clone()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+            ],
+            std::time::Duration::from_secs(0),
+        );
+
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some(response_id.clone()),
+            Some(Arc::clone(&token)),
+        );
+        assert!(
+            failover.stream_chat_completion(&backend).await.is_err(),
+            "all providers fail ⇒ the failover dispatch errors"
+        );
+
+        // No provider served, so the last attempt's (provider B's) body is still staged.
+        store.set_upstream_response(&api_call_id, token.take_pending_response_body());
+
+        let record = store.detail(&api_call_id).expect("record");
+        let captured = record
+            .upstream_response
+            .as_ref()
+            .expect("F1: an all-fail turn commits the upstream's final error body");
+        let text = String::from_utf8_lossy(&captured.bytes);
+        assert!(
+            text.contains("provider B final word"),
+            "F1: the FINAL (last-tried) provider's error body is the turn's upstream_response, \
+             not the first provider's: {text}"
+        );
+        assert!(
+            !text.contains("provider A error body"),
+            "F1: the earlier provider's body was overwritten by the final one: {text}"
         );
     }
 
