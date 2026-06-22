@@ -370,6 +370,57 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     expect(getByTestId('cost-confidence').getAttribute('data-confidence')).toBe('estimated');
   });
 
+  // Gap 09 — the inspector header renders a context-window utilization gauge. A flow on a model
+  // WITH a known `context_limit` (the mock catalog's gpt-4o = 128000) + reported usage shows a
+  // DERIVED % + a filled track + a real headroom — never a fabricated 0%/100%. `api_g09` is unknown
+  // to the mock so /flows/:id 404s and the SEEDED live row drives the header; `/catalog` is answered
+  // by the mock so the gauge resolves the served model's window.
+  it('renders a derived context-utilization gauge for a known context_limit + usage (gap 09)', async () => {
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g09',
+        status: 'completed',
+        model_served: 'gpt-4o', // mock catalog: context_limit 128000
+        started_ms: 1_700_000_000_000,
+        // 64000 used / 128000 ⇒ 50.0% (a real derived reading, ok risk).
+        usage: { prompt: 60000, completion: 4000, total: 64000, cached: 0, reasoning: 0 },
+      }),
+    ]);
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g09" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    // The catalog query resolves the gauge to a DERIVED 50.0%.
+    await waitFor(() => expect(getByTestId('context-gauge').getAttribute('data-quality')).toBe('derived'));
+    expect(getByTestId('context-util-pct').textContent).toBe('50.0%');
+    // A real fill + a real headroom (64.0k left of 128k).
+    expect(getByTestId('context-gauge-fill').style.width).toBe('50%');
+    expect(getByTestId('context-headroom').textContent).toContain('64.0k left');
+  });
+
+  // Gap 09 — a flow on a model WITHOUT a known window (the mock catalog's `mystery-model` =
+  // context_limit null) renders the gauge as `—` (unavailable), NEVER a fabricated 0%/100%, even
+  // though usage IS reported. This is the don't-lie-with-zeros core of the gap.
+  it('renders — (unavailable) context gauge when the model context_limit is null (gap 09)', async () => {
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g09b',
+        status: 'completed',
+        model_served: 'mystery-model', // mock catalog: context_limit null (unknown capacity)
+        started_ms: 1_700_000_000_000,
+        usage: { prompt: 9000, completion: 1000, total: 10000, cached: 0, reasoning: 0 },
+      }),
+    ]);
+    const { getByTestId, queryByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g09b" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    // Even after the catalog resolves, an UNKNOWN-window model stays unavailable.
+    await waitFor(() => expect(getByTestId('context-gauge').getAttribute('data-quality')).toBe('unavailable'));
+    const pct = getByTestId('context-util-pct');
+    expect(pct.textContent).toBe('—');
+    expect(pct.textContent).not.toBe('0.0%');
+    expect(pct.textContent).not.toBe('100.0%');
+    // No fill element for an unavailable reading.
+    expect(queryByTestId('context-gauge-fill')).toBeNull();
+  });
+
   // Gap 07 review round 3 (companion) — same stale `unavailable` detail, but the live roll-up is
   // CONFIDENT: the header shows the live cost (paired with `confident`) and carries NO est badge.
   it('pairs a CONFIDENT live cost with its own tag despite an unavailable detail (no est badge)', async () => {

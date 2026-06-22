@@ -24,6 +24,9 @@ import { StatusChip } from '../FlowTable/StatusChip';
 import { fmtElapsed, fmtModelPair, fmtTokens } from '../FlowTable/format';
 import { costDisplay, elapsedMs, flowCost } from '../FlowTable/flowModel';
 import { tokenEconomics } from '../FlowTable/tokenEconomics';
+import { contextLimitFor, contextUtilization, type ContextUtilization } from '../FlowTable/contextUtilization';
+import { ContextGauge } from '../FlowTable/ContextGauge';
+import { useCatalog } from '../FlowTable/useCatalog';
 import { JsonPane } from '../viz/JsonPane';
 import { combineMiddleDiff, diffLayers } from './diff';
 import { joinMonitor } from './monitorJoin';
@@ -42,6 +45,8 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   const monitor = useDashboard((s) => s.monitor);
   const monitorSeqs = useDashboard((s) => s.monitorSeqs);
   const priceTable = useDashboard((s) => s.priceTable);
+  // Gap 09: per-model context-window capacities (gap-06 nullable `context_limit`), for the gauge.
+  const contextLimits = useCatalog();
   const [tab, setTab] = useState<Tab>('headers');
   // Shared search across all three layers (A inbound · B normalized · C upstream) — find a field
   // once and see how it transformed. Each JsonPane filters to matches + their ancestors.
@@ -150,6 +155,18 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
     };
     return tokenEconomics(econFlow, priceTable);
   }, [liveFlow, frozenDetail, apiCallId, status, usage, priceTable]);
+  // Gap 09 — the context-window utilization for the gauge: the freshest usage (live, then detail)
+  // against the SERVED model's `context_limit` (gap-06 nullable catalog). `null` limit (unknown
+  // capacity) OR unreported usage ⇒ the gauge renders `—`, never a fabricated 0%/100%. The served
+  // model (then requested) is the one actually run, so its window is the relevant ceiling.
+  const contextUtil = useMemo<ContextUtilization>(() => {
+    const limit = contextLimitFor(
+      liveFlow?.model_served ?? frozenDetail?.model_served,
+      liveFlow?.model_requested ?? frozenDetail?.model_requested,
+      contextLimits,
+    );
+    return contextUtilization(usage, limit);
+  }, [liveFlow, frozenDetail, usage, contextLimits]);
 
   return (
     <section className="flex min-h-0 w-[46%] min-w-[420px] flex-col border-l border-line bg-panel" data-testid="flow-detail" aria-label="flow detail">
@@ -161,6 +178,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         costConfidence={costConfidence}
         usage={usage}
         econ={econ}
+        contextUtil={contextUtil}
         seeking={seeking}
         seekAtMs={seekAtMs}
         isActive={isActive}
@@ -290,6 +308,7 @@ function DetailHeader({
   costConfidence,
   usage,
   econ,
+  contextUtil,
   seeking,
   seekAtMs,
   isActive,
@@ -305,6 +324,7 @@ function DetailHeader({
   costConfidence: CostConfidence;
   usage: Usage | null;
   econ: ReturnType<typeof tokenEconomics>;
+  contextUtil: ContextUtilization;
   seeking: boolean;
   seekAtMs: number | null;
   isActive: boolean;
@@ -415,6 +435,14 @@ function DetailHeader({
               derived
             </span>
           )}
+        </dd>
+        {/* Gap 09: the context-window utilization gauge (% used + remaining headroom + a near/over
+            badge). `derived` only with a known model `context_limit` (gap-06) + reported usage;
+            UNKNOWN capacity or unreported usage ⇒ `—` and an empty dashed track, NEVER a fabricated
+            0%/100%. Spans the full row (it is a bar, not a scalar). */}
+        <dt className="self-start text-text-muted" title="context-window utilization: used tokens vs the model's context window">context</dt>
+        <dd className="min-w-0">
+          <ContextGauge util={contextUtil} />
         </dd>
       </dl>
     </header>

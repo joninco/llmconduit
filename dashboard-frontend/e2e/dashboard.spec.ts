@@ -74,6 +74,43 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on the tokens popover').toEqual([]);
   });
 
+  // Gap 09: the FlowDetail inspector shows a context-window utilization gauge, and the flows
+  // screen shows an aggregate context-pressure stat. The gauge must render a DERIVED % for a flow
+  // on a model WITH a known context window, and `—` (unavailable) for one WITHOUT — never a
+  // fabricated 0%/100%. Covers the acceptance criterion: gauge WITH and WITHOUT `context_limit`.
+  test('context gauge: derived with a known limit, — without (gap 09)', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[0]!); // Flows
+    await page.waitForTimeout(400);
+
+    // The aggregate context-pressure stat is present, with a measured-coverage readout.
+    await expect(page.getByTestId('context-pressure-panel')).toBeVisible();
+    await expect(page.getByTestId('context-pressure-coverage')).toContainText('measured');
+
+    // api_001 is served by llama-3.1-70b (catalog context_limit 131072) + reports usage → the
+    // inspector gauge reads a DERIVED utilization, not `—`.
+    const known = page.getByTestId('flow-row').filter({ hasText: '/v1/responses' }).first();
+    await known.click();
+    await expect(page.getByTestId('flow-detail')).toBeVisible();
+    const gauge = page.getByTestId('context-gauge');
+    await expect(gauge).toBeVisible();
+    await expect(gauge).toHaveAttribute('data-quality', 'derived');
+    await expect(page.getByTestId('context-util-pct')).not.toHaveText('—');
+    await expect(page.getByTestId('context-gauge-fill')).toBeVisible();
+
+    // api_004 is served by `mystery-model` (catalog context_limit NULL) but DOES report usage →
+    // the gauge must read `—` (unknown capacity), NEVER 0% / 100%. Select by the model id (unique
+    // to that row) so the known-window llama row on the same endpoint is not picked instead.
+    const unknown = page.getByTestId('flow-row').filter({ hasText: 'mystery-model' }).first();
+    await unknown.click();
+    await expect(page.getByTestId('context-gauge')).toHaveAttribute('data-quality', 'unavailable');
+    const pct = page.getByTestId('context-util-pct');
+    await expect(pct).toHaveText('—');
+    await expect(page.getByTestId('context-gauge-fill')).toHaveCount(0);
+
+    expect(consoleErrors, 'console errors on the context gauge').toEqual([]);
+  });
+
   for (const view of VIEWS) {
     test(`${view.name}: renders + no console errors + matches baseline`, async ({ page, consoleErrors }) => {
       await login(page);

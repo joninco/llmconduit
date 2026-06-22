@@ -65,6 +65,10 @@ function seedFlows(): FlowSummary[] {
     { api_call_id: 'api_002', response_id: 'resp_002', method: 'POST', uri: '/v1/chat/completions', status: 'completed', model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 1500, completion: 980, total: 2480 }, started_ms: now - 12000, finished_ms: now - 7800, elapsed_ms: 4200, terminal_reason: 'response.completed', cost: 0.0019, cost_confidence: 'estimated' },
     // Gap 07: no usage + a failed call ⇒ cost null ⇒ cost_confidence UNAVAILABLE (renders `—`).
     { api_call_id: 'api_003', response_id: null, method: 'POST', uri: '/v1/responses', status: 'failed', model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai', usage: null, started_ms: now - 30000, finished_ms: now - 29200, elapsed_ms: 800, terminal_reason: 'upstream 503', cost: null, cost_confidence: 'unavailable' },
+    // Gap 09: served by a model whose upstream advertises NO context window (`mystery-model` ⇒
+    // catalog context_limit null) but WITH reported usage. The context gauge must render `—`
+    // (UNKNOWN capacity), NEVER a fabricated 0%/100% — distinct from a flow on a known-window model.
+    { api_call_id: 'api_004', response_id: 'resp_004', method: 'POST', uri: '/v1/chat/completions', status: 'completed', model_requested: 'mystery-model', model_served: 'mystery-model', upstream_target: 'vllm-b', usage: { prompt: 4096, completion: 512, total: 4608 }, started_ms: now - 18000, finished_ms: now - 16000, elapsed_ms: 2000, terminal_reason: 'response.completed', cost: null, cost_confidence: 'unavailable' },
   ];
 }
 

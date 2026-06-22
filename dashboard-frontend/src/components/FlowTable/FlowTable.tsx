@@ -18,10 +18,12 @@ import { cn } from '../../lib/cn';
 import { StatusChip } from './StatusChip';
 import { TokensCell } from './TokensCell';
 import { CacheEconomics } from './CacheEconomics';
+import { ContextPressure } from './ContextPressure';
 import { fmtClock, fmtElapsed, fmtModelPair } from './format';
 import { costDisplay, elapsedMs, flowCost, isFailover, shortId, statusClass } from './flowModel';
 import { FilterBar } from './FilterBar';
 import { useFlowRows } from './useFlowRows';
+import { useCatalog } from './useCatalog';
 
 const ROW_HEIGHT = 30;
 const OVERSCAN = 12;
@@ -60,6 +62,10 @@ export function FlowTable({
   const setFilters = flowFilterStore.getState().setFilters;
   const { rows, total, models, upstreams } = useFlowRows(filters);
   const priceTable = useDashboard((s) => s.priceTable);
+  // Gap 09: the per-model context-window capacities (gap-06 nullable `context_limit`), for the
+  // aggregate context-pressure stat. A `null`/absent window is UNKNOWN ⇒ that flow is excluded from
+  // the pressure figures (never a fabricated 0%/100%).
+  const contextLimits = useCatalog();
   // SEEK coherence (finding 6): while seeking, an OPEN row's elapsed must derive from the FROZEN
   // cut `at_ms` (the snapshot instant) rather than wall-clock `Date.now()`, which would tick the
   // frozen view forward. `seekAtMs` is null while LIVE → rows fall back to `Date.now()` per render.
@@ -120,6 +126,10 @@ export function FlowTable({
           </div>
         )}
       </div>
+      {/* Gap 09: the AGGREGATE context-pressure stat — peak context-window utilization + near/over
+          counts across the SAME filtered rows. An always-visible stat under the table (outside the
+          virtualized scroll container, so it does not affect row layout). */}
+      <ContextPressure rows={rows} limits={contextLimits} />
       {/* Gap 08: the AGGREGATE cache-hit rate / "$ saved" by model, rolled up over the SAME filtered
           rows the table shows. A collapsed secondary surface under the table (never inside the
           virtualized scroll container, so it does not affect row layout). */}
