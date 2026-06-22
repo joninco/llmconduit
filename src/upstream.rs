@@ -5648,6 +5648,7 @@ mod tests {
             "/v1/responses".to_string(),
             crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
             None,
+            crate::dashboard_flow::ClientAttribution::none(),
         );
         store.link(response_id.clone(), api_call_id.clone());
         (api_call_id, response_id)

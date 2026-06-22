@@ -1370,6 +1370,7 @@ mod tests {
             "/v1/responses".to_string(),
             redact_headers(&HeaderMap::new()),
             Some(capture_body(b"{}")),
+            crate::dashboard_flow::ClientAttribution::none(),
         );
         store.link("resp_001".to_string(), "api_001".to_string());
 
@@ -1484,6 +1485,7 @@ mod tests {
             "/v1/responses".to_string(),
             redact_headers(&HeaderMap::new()),
             Some(capture_body(b"{}")),
+            crate::dashboard_flow::ClientAttribution::none(),
         );
         store.link("resp_cxl".to_string(), "api_cxl".to_string());
         // The FlowStore finalizes the flow Cancelled (the D3 client-hangup terminal).
@@ -1550,6 +1552,7 @@ mod tests {
             "/v1/responses".to_string(),
             redact_headers(&HeaderMap::new()),
             Some(capture_body(b"{}")),
+            crate::dashboard_flow::ClientAttribution::none(),
         );
         store.link("resp_a".to_string(), "api_a".to_string());
 
@@ -1587,6 +1590,7 @@ mod tests {
                 "/v1/responses".to_string(),
                 redact_headers(&HeaderMap::new()),
                 Some(capture_body(b"{}")),
+                crate::dashboard_flow::ClientAttribution::none(),
             );
         }
         store.finalize(
@@ -1637,6 +1641,7 @@ mod tests {
             "/v1/responses".to_string(),
             redact_headers(&HeaderMap::new()),
             Some(capture_body(b"{}")),
+            crate::dashboard_flow::ClientAttribution::none(),
         );
         store.link("resp_a".to_string(), "api_a".to_string());
 
@@ -1713,6 +1718,7 @@ mod tests {
             "/v1/responses".to_string(),
             redact_headers(&HeaderMap::new()),
             Some(capture_body(b"{}")),
+            crate::dashboard_flow::ClientAttribution::none(),
         );
         // `resp_1` links to `api_a`. Now BOTH `"api_a"` (the id itself) and `"resp_1"`
         // (the linked response_id) resolve to the SAME record — two DISTINCT alias ids.
@@ -1784,6 +1790,7 @@ mod tests {
             "/v1/responses".to_string(),
             redact_headers(&HeaderMap::new()),
             Some(capture_body(b"{}")),
+            crate::dashboard_flow::ClientAttribution::none(),
         );
         store.link("resp_a".to_string(), "api_a".to_string());
 
@@ -2258,6 +2265,7 @@ mod tests {
             "/v1/responses".to_string(),
             redact_headers(&HeaderMap::new()),
             Some(capture_body(b"{}")),
+            crate::dashboard_flow::ClientAttribution::none(),
         );
         store.finalize("api_001", FlowStatus::Completed, None, None);
         let flows = store.snapshot_summaries();

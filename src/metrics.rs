@@ -1525,6 +1525,7 @@ mod tests {
             "/v1/responses".to_string(),
             crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
             None,
+            crate::dashboard_flow::ClientAttribution::none(),
         );
         flow.finalize(
             "api_1",
@@ -1577,6 +1578,7 @@ mod tests {
                 "/v1/responses".to_string(),
                 crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
                 Some(crate::dashboard_flow::capture_body(&big_body)),
+                crate::dashboard_flow::ClientAttribution::none(),
             );
             flow.finalize(&api, FlowStatus::Completed, None, Some("p".to_string()));
         }
@@ -1668,6 +1670,7 @@ mod tests {
             "/v1/responses".to_string(),
             crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
             None,
+            crate::dashboard_flow::ClientAttribution::none(),
         );
         topo.publish(Vec::new()); // version 2
         let cut2 = metrics.snapshot(&flow, &topo).expect("cut2");
@@ -1738,6 +1741,7 @@ mod tests {
                         "/v1/responses".to_string(),
                         crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
                         None,
+                        crate::dashboard_flow::ClientAttribution::none(),
                     );
                     flow.finalize(
                         &api,
@@ -1826,6 +1830,7 @@ mod tests {
                         "/v1/responses".to_string(),
                         crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
                         None,
+                        crate::dashboard_flow::ClientAttribution::none(),
                     );
                     metrics.record_response(
                         FlowStatus::Completed,

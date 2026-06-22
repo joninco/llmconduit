@@ -197,6 +197,152 @@ pub struct FlowUsage {
     pub reasoning: i64,
 }
 
+/// Gap 04 — the PROVENANCE of a flow's `client_label`: WHICH non-secret signal the
+/// attribution was derived from. Tagged so the dashboard (spec 15) can render the
+/// weaker User-Agent fallback DIFFERENTLY from the stronger key-hash / configured-id
+/// attribution — a `user_agent`-sourced label is NOT an identity claim. Serializes
+/// snake_case; `Deserialize` so the body-free [`SnapshotFlowSummary`] round-trips on
+/// the WS/snapshot wire (AGENTS.md: no new wire field without a round-trip test).
+///
+/// Priority order (strongest → weakest), honored by [`ClientAttribution::derive`]:
+/// `KeyHash` → `ConfiguredHeader` → `UserAgent`. There is NO proxy auth-principal
+/// source today (the proxy forwards keys, it does not authenticate a principal), so
+/// one is deliberately absent until such a seam exists (spec 04 / Codex review).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientSource {
+    /// Derived from a non-reversible SHA-256 digest of the inbound API key (the raw
+    /// key is NEVER stored/emitted; only a short hex prefix of its hash becomes the
+    /// label). The strongest attribution seam: the same caller key groups stably.
+    KeyHash,
+    /// Derived from an operator-configured NON-SECRET request header (e.g.
+    /// `x-client-id`) — an explicit caller-supplied identity. Stronger than UA, but
+    /// caller-asserted (unverified), so weaker than the key-hash.
+    ConfiguredHeader,
+    /// Derived from the `User-Agent` header. A WEAK, labelled fallback only — NOT an
+    /// identity model (any caller can spoof it). Present so a flow with no key and no
+    /// configured id still shows SOMETHING, clearly tagged as the weakest source.
+    UserAgent,
+}
+
+/// Gap 04 — a flow's request-scoped client attribution: a stable, non-secret
+/// `label` PLUS the [`ClientSource`] it was derived from. Both `None` when the
+/// request carries no key, no configured-id header, and no User-Agent — an absent
+/// identity is `None` (renders `—` downstream), NEVER a fabricated id or empty
+/// string (don't-lie-with-zeros). Derived ONCE in the middleware at the
+/// PRE-redaction seam ([`ClientAttribution::derive`]) — the only point the raw key
+/// is still present — and threaded into [`DashboardFlowStore::open`]. The raw key is
+/// hashed in-place and dropped; it is never stored on this struct, the
+/// [`FlowRecord`], the persisted `Config`, or any log/WS surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientAttribution {
+    pub label: Option<String>,
+    pub source: Option<ClientSource>,
+}
+
+/// Number of leading hex chars of the key-hash kept as the display id. 12 hex chars
+/// = 48 bits: enough to make accidental collisions between distinct caller keys
+/// vanishingly unlikely for a dashboard's working set, while keeping the label short
+/// and revealing NOTHING about the key (a one-way digest prefix is not invertible).
+const KEY_HASH_DISPLAY_HEX_LEN: usize = 12;
+
+impl ClientAttribution {
+    /// The empty attribution (no key, no configured id, no UA). Both fields `None`.
+    /// The constructor every non-deriving caller (tests, the disabled path) uses so
+    /// a flow with no client signal stays honestly unattributed.
+    pub fn none() -> Self {
+        Self {
+            label: None,
+            source: None,
+        }
+    }
+
+    /// Derive the attribution from the RAW (pre-redaction) request headers, honoring
+    /// the priority order `KeyHash → ConfiguredHeader → UserAgent → None`. MUST be
+    /// called BEFORE the headers are redacted — it is the only point the raw API key
+    /// is still readable, and it hashes that key in-place (never retaining it).
+    ///
+    /// - **Key-hash**: the inbound `Authorization` bearer token (the part after a
+    ///   case-insensitive `Bearer ` prefix, else the whole value) OR the `x-api-key`
+    ///   value is run through [`key_hash_label`] → a `key-<12 hex>` display id; the
+    ///   raw key is dropped immediately. A blank/whitespace-only key is ignored.
+    /// - **Configured header**: when `configured_header` names a header that is
+    ///   present and non-empty, its value becomes the label (verbatim, capped later).
+    /// - **User-Agent**: a present, non-empty `User-Agent` becomes the (weak) label.
+    /// - Otherwise [`none`](Self::none).
+    pub fn derive(headers: &axum::http::HeaderMap, configured_header: Option<&str>) -> Self {
+        // 1) Strongest: a one-way hash of the inbound API key. Prefer the bearer
+        //    token in `Authorization`; fall back to `x-api-key`. The raw key is read,
+        //    hashed, and dropped HERE — it is never stored or returned.
+        if let Some(raw_key) = bearer_token(headers).or_else(|| api_key_header(headers))
+            && !raw_key.trim().is_empty()
+        {
+            return Self {
+                label: Some(key_hash_label(raw_key.trim())),
+                source: Some(ClientSource::KeyHash),
+            };
+        }
+        // 2) An operator-configured NON-SECRET caller-id header (e.g. `x-client-id`).
+        if let Some(name) = configured_header
+            && !name.trim().is_empty()
+            && let Some(value) = header_value(headers, name.trim())
+            && !value.trim().is_empty()
+        {
+            return Self {
+                label: Some(value.trim().to_string()),
+                source: Some(ClientSource::ConfiguredHeader),
+            };
+        }
+        // 3) Weakest: the User-Agent fallback (clearly tagged, NOT an identity claim).
+        if let Some(ua) = header_value(headers, axum::http::header::USER_AGENT.as_str())
+            && !ua.trim().is_empty()
+        {
+            return Self {
+                label: Some(ua.trim().to_string()),
+                source: Some(ClientSource::UserAgent),
+            };
+        }
+        Self::none()
+    }
+}
+
+/// Read a header value as a `&str`, or `None` when absent / non-UTF-8.
+fn header_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+/// The bearer token from `Authorization`, i.e. the part after a case-insensitive
+/// `Bearer ` prefix. When the header has no `Bearer ` prefix the whole value is
+/// returned (still a credential to hash). `None` when the header is absent/non-UTF-8.
+fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    let value = header_value(headers, axum::http::header::AUTHORIZATION.as_str())?;
+    let trimmed = value.trim_start();
+    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("Bearer ") {
+        Some(trimmed[7..].trim_start())
+    } else {
+        Some(value)
+    }
+}
+
+/// The raw `x-api-key` header value (the Anthropic-style key carrier). `None` when
+/// absent/non-UTF-8.
+fn api_key_header(headers: &axum::http::HeaderMap) -> Option<&str> {
+    header_value(headers, "x-api-key")
+}
+
+/// Gap 04 — turn a raw API key into a STABLE, NON-REVERSIBLE display id:
+/// `key-<first 12 hex chars of SHA-256(key)>`. SHA-256 is one-way, so the label
+/// reveals nothing about the key; the SAME key always yields the SAME label (stable
+/// grouping) and a DIFFERENT key a different label (collision-resistant). The raw
+/// key is consumed only to feed the digest and is never stored or logged. This is
+/// the SINGLE definition of the key→label mapping so the seam has one audited form.
+fn key_hash_label(raw_key: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(raw_key.as_bytes());
+    let hex = hex::encode(digest);
+    format!("key-{}", &hex[..KEY_HASH_DISPLAY_HEX_LEN])
+}
+
 /// Gap 03 — the outcome of one upstream dispatch attempt. Snake_case on the wire so
 /// the body-free [`SnapshotFlowSummary`] carries it to the failover/attempt-trace UI
 /// (spec 11) and the per-provider metrics aggregation (spec 12).
@@ -446,6 +592,20 @@ pub struct FlowRecord {
     /// (don't-lie-with-zeros); a missing measurement renders `—` downstream. Measured at
     /// the prefetch point (failover) / the bare-leaf first-chunk seam, first-write-wins.
     pub first_upstream_byte_ms: Option<u128>,
+    /// Gap 04 — a STABLE, NON-SECRET client attribution label: a key-hash display id
+    /// (`key-<hex>`), a configured caller-id header value, or a User-Agent fallback —
+    /// per [`ClientAttribution::derive`]'s priority order. Derived ONCE at the
+    /// PRE-redaction middleware seam (the only point the raw key is readable) and set
+    /// at [`open`](DashboardFlowStore::open); the raw key is hashed in-place and NEVER
+    /// stored here. `None` when the request carries no key, no configured id, and no
+    /// UA — an absent identity is `None` (renders `—` downstream), NEVER a fabricated
+    /// id (don't-lie-with-zeros). Capped to [`SCALAR_CAP`] + counted in
+    /// [`summary_bytes`](FlowRecord::summary_bytes).
+    pub client_label: Option<String>,
+    /// Gap 04 — the [`ClientSource`] `client_label` was derived from, so the weaker
+    /// `UserAgent` fallback is visibly distinguishable from a key-hash / configured-id
+    /// attribution downstream. `None` exactly when `client_label` is `None`.
+    pub client_source: Option<ClientSource>,
 }
 
 /// Gap 02 — the per-phase timestamp bundle carried by every [`FlowRecord`] and
@@ -589,6 +749,7 @@ impl FlowRecord {
             + opt(&self.model_served)
             + opt(&self.upstream_target)
             + opt(&self.terminal_reason)
+            + opt(&self.client_label)
             + attempts
     }
 
@@ -637,6 +798,18 @@ pub struct SnapshotFlowSummary {
     /// the wire, that one is the first content delta to the client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_upstream_byte_ms: Option<u128>,
+    /// Gap 04 — the STABLE, NON-SECRET client attribution label (key-hash display id /
+    /// configured caller-id / User-Agent fallback), body-free scalar metadata projected
+    /// from the record. `None` (absent on the wire) when the request carried no
+    /// attributable signal — renders `—` downstream, NEVER a fabricated id. The raw key
+    /// is never present here (only the one-way hash prefix ever existed as a label).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_label: Option<String>,
+    /// Gap 04 — the [`ClientSource`] the label was derived from, so the dashboard can
+    /// render the weak `user_agent` fallback differently from a key-hash / configured-id
+    /// attribution. `None` (absent) exactly when `client_label` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_source: Option<ClientSource>,
 }
 
 impl SnapshotFlowSummary {
@@ -661,6 +834,11 @@ impl SnapshotFlowSummary {
             // the summary so the WS/snapshot wire carries it.
             attempts: record.attempts.clone(),
             first_upstream_byte_ms: record.first_upstream_byte_ms,
+            // Gap 04: the client attribution is body-free scalar metadata — project the
+            // label + its source onto the summary (NEVER the raw key; only the one-way
+            // hash prefix ever existed). `ClientSource` is `Copy`.
+            client_label: record.client_label.clone(),
+            client_source: record.client_source,
         }
     }
 }
@@ -760,6 +938,12 @@ impl DashboardFlowStore {
     /// and headers are [`CapturedBody`]/[`CapturedHeaders`] — minted ONLY by the
     /// capture primitives, so they are provably redacted + capped (D1 R2 #2); every
     /// other dynamic scalar is `cap_scalar`-bounded here before storage.
+    ///
+    /// Gap 04: `client` is the pre-derived [`ClientAttribution`] (a key-hash display
+    /// id / configured caller-id / UA fallback, or [`ClientAttribution::none`]). It is
+    /// already derived from the RAW headers at the middleware seam (the raw key was
+    /// hashed + dropped THERE — it never reaches the store); its `label` is
+    /// `cap_scalar`-bounded here like every other retained scalar.
     pub fn open(
         &self,
         api_call_id: String,
@@ -767,6 +951,7 @@ impl DashboardFlowStore {
         uri: String,
         headers: CapturedHeaders,
         inbound_body: Option<CapturedBody>,
+        client: ClientAttribution,
     ) {
         if !self.enabled {
             return;
@@ -807,6 +992,11 @@ impl DashboardFlowStore {
             // onto the shared `ServingToken`, threaded into the record at finalize.
             attempts: Vec::new(),
             first_upstream_byte_ms: None,
+            // Gap 04: the client attribution was derived pre-redaction at the middleware
+            // seam; cap the label like every other retained scalar. `None` stays `None`
+            // (an unattributed flow renders `—` downstream, never a fabricated id).
+            client_label: client.label.map(cap_scalar),
+            client_source: client.source,
         };
         let mut state = self.lock();
         state.prune_expired(now);
@@ -1772,6 +1962,7 @@ mod tests {
             "/v1/responses".to_string(),
             no_headers(),
             None,
+            ClientAttribution::none(),
         );
     }
 
@@ -1785,6 +1976,7 @@ mod tests {
             "/v1/responses".to_string(),
             no_headers(),
             Some(cap(b"{}")),
+            ClientAttribution::none(),
         );
         store.link("resp_1".to_string(), "api_1".to_string());
         store.record_usage("api_1", FlowUsage::default());
@@ -1812,6 +2004,7 @@ mod tests {
             "/v1/responses".to_string(),
             redact_headers(&headers),
             Some(cap(b"{\"model\":\"m\"}")),
+            ClientAttribution::none(),
         );
         let records = store.list();
         assert_eq!(records.len(), 1);
@@ -2854,6 +3047,7 @@ mod tests {
                 "/v1/responses".to_string(),
                 no_headers(),
                 Some(cap(&json)),
+                ClientAttribution::none(),
             );
         }
         assert_eq!(store.list().len(), 3, "records survive body eviction");
@@ -2891,6 +3085,7 @@ mod tests {
             "/v1/responses".to_string(),
             no_headers(),
             Some(cap(array_body.as_bytes())),
+            ClientAttribution::none(),
         );
         assert!(
             store.detail("api_0").unwrap().inbound_body.is_some(),
@@ -2903,6 +3098,7 @@ mod tests {
             "/".to_string() + &"u".repeat(64 * 1024),
             no_headers(),
             None,
+            ClientAttribution::none(),
         );
         store.set_upstream(
             "api_1",
@@ -2956,6 +3152,7 @@ mod tests {
                 "/v1/responses".to_string(),
                 captured_headers.clone(),
                 None, // no body → body eviction cannot help
+                ClientAttribution::none(),
             );
         }
         // The store stayed under quota by evicting oldest WHOLE records.
@@ -3302,6 +3499,7 @@ mod tests {
             "/v1/responses".to_string(),
             redact_headers(&headers),
             Some(capture_body(inbound)),
+            ClientAttribution::none(),
         );
         let upstream = br#"{"api_key":"UPSTREAMKEYSECRET","model":"m"}"#;
         store.set_upstream(
@@ -3341,6 +3539,7 @@ mod tests {
             "/v1/responses".to_string(),
             no_headers(),
             Some(cap(b"{\"model\":\"m\"}")),
+            ClientAttribution::none(),
         );
         let summaries = store.snapshot_summaries();
         assert_eq!(summaries.len(), 1);
@@ -3365,6 +3564,7 @@ mod tests {
             "/v1/responses".to_string(),
             no_headers(),
             Some(cap(malformed)),
+            ClientAttribution::none(),
         );
         let record = store.detail("api_1").expect("record");
         let body = record.inbound_body.as_ref().expect("inbound stored");
@@ -3636,6 +3836,253 @@ mod tests {
         assert_eq!(
             phases, summary.phases,
             "phases survive the summary round-trip"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gap 04 — client_label / key-hash attribution.
+    // -----------------------------------------------------------------------
+
+    /// `Authorization: Bearer <key>` (or `x-api-key`) → a `key-<hex>` label tagged
+    /// `KeyHash`. A request that ALSO carries a User-Agent still resolves to the
+    /// key-hash (the strongest source wins the priority order, not the weaker UA).
+    #[test]
+    fn client_attribution_key_hash_wins_over_user_agent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer sk-RAWKEYVALUE-123"),
+        );
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("curl/8.1"),
+        );
+        let attr = ClientAttribution::derive(&headers, None);
+        assert_eq!(attr.source, Some(ClientSource::KeyHash));
+        let label = attr.label.clone().expect("key-hash label present");
+        assert!(label.starts_with("key-"), "label is a key-hash id: {label}");
+        // `key-` + 12 hex chars.
+        assert_eq!(label.len(), 4 + KEY_HASH_DISPLAY_HEX_LEN);
+        assert!(
+            label["key-".len()..].chars().all(|c| c.is_ascii_hexdigit()),
+            "label hex tail: {label}"
+        );
+        // The raw key never appears anywhere in the attribution.
+        assert!(
+            !label.contains("RAWKEYVALUE"),
+            "raw key never embedded in label: {label}"
+        );
+        assert!(!format!("{attr:?}").contains("RAWKEYVALUE"));
+
+        // `x-api-key` is the alternate carrier and yields a key-hash too.
+        let mut xkey = HeaderMap::new();
+        xkey.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("anthropic-RAWKEYVALUE-123"),
+        );
+        let attr2 = ClientAttribution::derive(&xkey, None);
+        assert_eq!(attr2.source, Some(ClientSource::KeyHash));
+        assert!(attr2.label.unwrap().starts_with("key-"));
+    }
+
+    /// The SAME key yields the SAME label across requests (stable grouping); a
+    /// DIFFERENT key yields a DIFFERENT label (collision-resistant). The label is a
+    /// one-way digest prefix, so it is not the key and cannot be inverted.
+    #[test]
+    fn client_attribution_key_hash_is_stable_and_distinct() {
+        let derive = |bearer: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                HeaderName::from_static("authorization"),
+                HeaderValue::from_str(bearer).unwrap(),
+            );
+            ClientAttribution::derive(&h, None).label.unwrap()
+        };
+        let a1 = derive("Bearer sk-aaaaaaaaaaaa");
+        let a2 = derive("Bearer sk-aaaaaaaaaaaa");
+        let b = derive("Bearer sk-bbbbbbbbbbbb");
+        assert_eq!(a1, a2, "same key → same label (stable)");
+        assert_ne!(a1, b, "different key → different label");
+        // A bare token without the `Bearer ` prefix hashes the same as the equivalent
+        // bearer value (the scheme prefix is stripped before hashing).
+        let bare = derive("sk-aaaaaaaaaaaa");
+        assert_eq!(
+            bare, a1,
+            "bearer-stripped key hashes identically to bare key"
+        );
+    }
+
+    /// The configured caller-id header is the SECOND priority: with no key it wins
+    /// over the User-Agent; its value (not a hash) is the label, tagged
+    /// `ConfiguredHeader`.
+    #[test]
+    fn client_attribution_configured_header_beats_user_agent() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-client-id"),
+            HeaderValue::from_static("team-alpha"),
+        );
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("curl/8.1"),
+        );
+        let attr = ClientAttribution::derive(&headers, Some("x-client-id"));
+        assert_eq!(attr.source, Some(ClientSource::ConfiguredHeader));
+        assert_eq!(attr.label.as_deref(), Some("team-alpha"));
+
+        // When NO configured header name is supplied, the same request falls through
+        // to the User-Agent fallback instead.
+        let ua_only = ClientAttribution::derive(&headers, None);
+        assert_eq!(ua_only.source, Some(ClientSource::UserAgent));
+        assert_eq!(ua_only.label.as_deref(), Some("curl/8.1"));
+    }
+
+    /// User-Agent is the WEAKEST, labelled fallback — used only when there is no key
+    /// and no configured-id header. Tagged `UserAgent` so the dashboard can render it
+    /// as the weak source it is.
+    #[test]
+    fn client_attribution_user_agent_is_the_weak_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("my-app/2.0"),
+        );
+        let attr = ClientAttribution::derive(&headers, Some("x-client-id"));
+        assert_eq!(attr.source, Some(ClientSource::UserAgent));
+        assert_eq!(attr.label.as_deref(), Some("my-app/2.0"));
+    }
+
+    /// Don't-lie-with-zeros: a request with NO key, NO configured id, and NO
+    /// User-Agent yields `None`/`None` — an honestly unattributed flow, never a
+    /// fabricated id or empty string. A blank key / blank UA is treated as absent.
+    #[test]
+    fn client_attribution_none_when_no_signal() {
+        // Truly empty headers.
+        let empty = ClientAttribution::derive(&HeaderMap::new(), Some("x-client-id"));
+        assert_eq!(empty, ClientAttribution::none());
+        assert!(empty.label.is_none() && empty.source.is_none());
+
+        // A blank/whitespace bearer token and a blank UA do not fabricate a label.
+        let mut blanks = HeaderMap::new();
+        blanks.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer    "),
+        );
+        blanks.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("   "),
+        );
+        let attr = ClientAttribution::derive(&blanks, None);
+        assert_eq!(
+            attr,
+            ClientAttribution::none(),
+            "blank key + blank UA → unattributed, not empty-string-as-id"
+        );
+    }
+
+    /// End-to-end through the store: a flow opened with a key-hash attribution
+    /// carries `client_label`/`client_source` on the `FlowRecord` AND the projected
+    /// `SnapshotFlowSummary`, and the raw key NEVER appears in the record, the
+    /// summary, or its serialized JSON (the redaction assertion).
+    #[test]
+    fn client_attribution_flows_to_record_and_summary_without_raw_key() {
+        let store = DashboardFlowStore::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer sk-SUPERSECRETKEY-xyz"),
+        );
+        let attr = ClientAttribution::derive(&headers, None);
+        let expected_label = attr.label.clone().unwrap();
+        store.open(
+            "api_client".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            redact_headers(&headers),
+            Some(cap(b"{\"model\":\"m\"}")),
+            attr,
+        );
+
+        // Record carries the label + source; NOT the raw key.
+        let record = store.detail("api_client").expect("record present");
+        assert_eq!(
+            record.client_label.as_deref(),
+            Some(expected_label.as_str())
+        );
+        assert_eq!(record.client_source, Some(ClientSource::KeyHash));
+        assert!(record.client_label.as_deref().unwrap().starts_with("key-"));
+        assert!(
+            !format!("{record:?}").contains("SUPERSECRETKEY"),
+            "raw key never stored on the FlowRecord"
+        );
+
+        // Summary projection carries it, and its serialized JSON has the snake_case
+        // fields with NO raw key anywhere.
+        let summary = store.snapshot_summaries().into_iter().next().unwrap();
+        assert_eq!(
+            summary.client_label.as_deref(),
+            Some(expected_label.as_str())
+        );
+        assert_eq!(summary.client_source, Some(ClientSource::KeyHash));
+        let json = serde_json::to_string(&summary).expect("serialize summary");
+        assert!(
+            !json.contains("SUPERSECRETKEY"),
+            "raw key never on the wire: {json}"
+        );
+        assert!(json.contains("\"client_source\":\"key_hash\""), "{json}");
+        assert!(
+            json.contains(&format!("\"client_label\":\"{expected_label}\"")),
+            "{json}"
+        );
+    }
+
+    /// An unattributed flow (`ClientAttribution::none()`) serializes with NO
+    /// `client_label`/`client_source` keys at all (absent ⇒ renders `—` downstream,
+    /// never `null`-as-zero or an empty string). `ClientSource` itself round-trips
+    /// (serialize → deserialize) for the WS/snapshot wire contract.
+    #[test]
+    fn client_attribution_absent_on_wire_and_source_round_trips() {
+        let store = DashboardFlowStore::new();
+        store.open(
+            "api_anon".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            no_headers(),
+            None,
+            ClientAttribution::none(),
+        );
+        let summary = store.snapshot_summaries().into_iter().next().unwrap();
+        assert!(summary.client_label.is_none());
+        assert!(summary.client_source.is_none());
+        let value = serde_json::to_value(&summary).expect("to_value");
+        assert!(
+            value.get("client_label").is_none(),
+            "absent label key omitted: {value}"
+        );
+        assert!(
+            value.get("client_source").is_none(),
+            "absent source key omitted: {value}"
+        );
+
+        // The wire enum round-trips for every variant (no new wire field without a
+        // round-trip test — AGENTS.md).
+        for source in [
+            ClientSource::KeyHash,
+            ClientSource::ConfiguredHeader,
+            ClientSource::UserAgent,
+        ] {
+            let json = serde_json::to_string(&source).expect("serialize source");
+            let back: ClientSource = serde_json::from_str(&json).expect("deserialize source");
+            assert_eq!(source, back, "ClientSource round-trips: {json}");
+        }
+        // The snake_case wire spellings are stable.
+        assert_eq!(
+            serde_json::to_string(&ClientSource::KeyHash).unwrap(),
+            "\"key_hash\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ClientSource::UserAgent).unwrap(),
+            "\"user_agent\""
         );
     }
 }

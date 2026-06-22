@@ -445,6 +445,18 @@ async fn log_api_call(
                 .extensions
                 .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
             let inbound_body = Some(crate::dashboard_flow::capture_body(&body_bytes));
+            // Gap 04: derive the client attribution from the RAW headers BEFORE they are
+            // redacted — this is the only point the raw API key is still readable, and
+            // `derive` hashes it in-place (a one-way SHA-256 prefix becomes the label; the
+            // raw key is dropped, never stored/logged). The optional configured caller-id
+            // header NAME is read env-only (`LLMCONDUIT_DASHBOARD_CLIENT_HEADER`) so no
+            // secret/identity config lands in the `Debug`/`Clone` persisted `Config`
+            // struct — mirroring the dashboard auth env-only posture. The header name is
+            // non-secret; only the api-key VALUE is, and it is never persisted.
+            let client = crate::dashboard_flow::ClientAttribution::derive(
+                &headers,
+                dashboard_client_header().as_deref(),
+            );
             let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
             gateway.flow_store().open(
                 api_call_id.clone(),
@@ -452,6 +464,7 @@ async fn log_api_call(
                 uri.path().to_string(),
                 headers_redacted,
                 inbound_body,
+                client,
             );
             gateway.flow_store().middleware_guard(&api_call_id)
         } else {
@@ -515,6 +528,23 @@ fn header_for_log(headers: &HeaderMap, name: &str) -> String {
         .and_then(|value| value.to_str().ok())
         .map(compact_for_log)
         .unwrap_or_default()
+}
+
+/// Env var naming the OPTIONAL non-secret request header that carries an explicit
+/// caller id (e.g. `x-client-id`) for the dashboard's client attribution (gap 04).
+const ENV_DASHBOARD_CLIENT_HEADER: &str = "LLMCONDUIT_DASHBOARD_CLIENT_HEADER";
+
+/// The operator-configured caller-id header NAME, read ENV-ONLY (never from the
+/// persisted `Config`, which is `Debug`/`Clone` — keeping attribution config out of
+/// it mirrors the dashboard auth env-only posture; AGENTS.md). The header name itself
+/// is non-secret — only the api-key VALUE is sensitive, and that is never persisted.
+/// `None`/blank ⇒ the configured-header attribution source is simply skipped (the
+/// derivation falls through to the User-Agent fallback). Trimmed; blank ⇒ `None`.
+fn dashboard_client_header() -> Option<String> {
+    std::env::var(ENV_DASHBOARD_CLIENT_HEADER)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn summarize_api_body(path: &str, body: &Bytes) -> String {

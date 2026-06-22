@@ -113,6 +113,7 @@ fn bench_coordinated_snapshot(criterion: &mut Criterion) {
             "/v1/responses".to_string(),
             llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
             None,
+            llmconduit::dashboard_flow::ClientAttribution::none(),
         );
         flow_store.finalize(
             &api,

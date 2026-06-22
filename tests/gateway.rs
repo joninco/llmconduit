@@ -3932,6 +3932,7 @@ async fn d5_metrics_populate_only_at_terminal_finalize_not_midstream() {
         "/v1/responses".to_string(),
         llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
         None,
+        llmconduit::dashboard_flow::ClientAttribution::none(),
     );
     // Before driving the stream to completion, metrics must be empty (no record at
     // open time, no mid-stream record).
@@ -4012,6 +4013,7 @@ async fn d5_coordinated_snapshot_is_internally_consistent_end_to_end() {
         "/v1/responses".to_string(),
         llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
         None,
+        llmconduit::dashboard_flow::ClientAttribution::none(),
     );
     let request = base_request(vec![user_message("hi")]);
     let _ = collect_stream(
@@ -4097,6 +4099,7 @@ async fn d5_lock_order_stress_no_deadlock_under_concurrent_flows_and_snapshots()
                     "/v1/responses".to_string(),
                     llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
                     None,
+                    llmconduit::dashboard_flow::ClientAttribution::none(),
                 );
                 flow_store.finalize(
                     &api,
@@ -4669,6 +4672,7 @@ fn d3_open_flow(gateway: &Gateway) -> String {
         "/v1/responses".to_string(),
         llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
         None,
+        llmconduit::dashboard_flow::ClientAttribution::none(),
     );
     api_call_id
 }
@@ -6364,6 +6368,7 @@ async fn d13_historical_snapshot_active_streams_is_frozen_to_the_cut() {
         "/v1/responses".to_string(),
         llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
         None,
+        llmconduit::dashboard_flow::ClientAttribution::none(),
     );
 
     // Coordinated cut while the flow is open ⇒ the cut's summaries carry 1 open flow.
