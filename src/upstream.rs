@@ -104,7 +104,9 @@ fn stamp_header_byte(serving: Option<&Arc<ServingToken>>) {
 ///     body-bearing gateway error is `"<fixed prefix> {status}: <body>"` or
 ///     `"<fixed prefix>: <reqwest err>"`, so a `starts_with` on the fixed prefix is
 ///     immune to body content (the body is strictly after the prefix). Body-free fixed
-///     markers (timeout / stream-ended) match in full.
+///     markers (timeout / stream-ended) match in full. First-chunk read/parse failures
+///     from `stream_success_response` (`"failed to parse upstream chat chunk: …"` /
+///     `"failed to read upstream SSE: …"`) match their fixed prefix → `Stream`.
 ///   - Anything else falls back to the HTTP status class (4xx/5xx → `HttpStatus`).
 ///
 /// Every prefix below is a constant string this module constructs in `dispatch_chat_stream`
@@ -140,6 +142,18 @@ fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptError
     // EQUAL their own markers, which this variant never does).
     if message.starts_with("upstream chat failed with ") {
         return AttemptErrorClass::HttpStatus;
+    }
+    // First-chunk read/parse failure: `stream_success_response` builds these two FIXED
+    // gateway prefixes — `"failed to parse upstream chat chunk: {err}; payload={body}"`
+    // and `"failed to read upstream SSE: {err}"`. The interpolated tail (`{err}` =
+    // serde/transport error, plus a redacted `{body}`) is strictly AFTER the prefix, so a
+    // `starts_with` on the fixed prefix is immune to payload/body content (it never
+    // reintroduces the F2 substring scan). These belong to the `Stream` taxonomy: the
+    // response began but the first chunk could not be read/parsed.
+    if message.starts_with("failed to parse upstream chat chunk:")
+        || message.starts_with("failed to read upstream SSE:")
+    {
+        return AttemptErrorClass::Stream;
     }
     // Anything else is a generic gateway-side failover-eligible condition (cooldown,
     // "no models available", "all providers failed before producing a response"). We do
@@ -6173,6 +6187,24 @@ mod tests {
             )),
             AttemptErrorClass::Stream
         );
+        // First-chunk read/parse failures from `stream_success_response` carry FIXED
+        // gateway prefixes and must classify as `Stream`, not fall through to `Other`.
+        assert_eq!(
+            classify_attempt_error(&AppError::upstream(
+                "failed to parse upstream chat chunk: expected value at line 1 column 1; \
+                 payload=<redacted>"
+                    .to_string()
+            )),
+            AttemptErrorClass::Stream,
+            "first-chunk parse failure must classify as Stream"
+        );
+        assert_eq!(
+            classify_attempt_error(&AppError::upstream(
+                "failed to read upstream SSE: connection reset by peer".to_string()
+            )),
+            AttemptErrorClass::Stream,
+            "first-chunk SSE read failure must classify as Stream"
+        );
         assert_eq!(
             classify_attempt_error(&AppError::upstream("upstream chat failed with 503: x")),
             AttemptErrorClass::HttpStatus
@@ -6203,6 +6235,12 @@ mod tests {
             "could not parse: failed to parse json",
             "upstream stream ended before the first chunk",
             "request failed and timed out",
+            // Bodies echoing the NEW first-chunk Stream prefixes must NOT flip a
+            // genuine HTTP-status failure to `Stream` (the prefix sits AFTER the
+            // fixed `"upstream chat failed with {status}: "`, so `starts_with` on
+            // the Stream prefixes can never match here).
+            "failed to parse upstream chat chunk: injected",
+            "failed to read upstream SSE: injected",
         ] {
             let err = AppError::upstream(format!("upstream chat failed with 500: {hostile_body}"));
             assert_eq!(
