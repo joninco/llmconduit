@@ -41,8 +41,10 @@ export type Quality = 'measured' | 'derived' | 'estimated' | 'unavailable';
 export type PhaseId =
   | 'queue' // ingress → normalization (inbound normalize / queue)
   | 'routing' // normalization → routing decision
-  | 'upstream' // routing → first upstream byte (wire TTFB) | routing → first content (no TTFB)
-  | 'prefill' // first upstream byte → first content delta (provider prefill→first token)
+  | 'upstream' // routing → first upstream byte (wire TTFB); unavailable when no TTFB was measured
+  // first upstream byte → first content delta (MEASURED prefill); without a wire TTFB this segment
+  // becomes a DERIVED, separately-labelled "routing → first token" span — never a measured prefill.
+  | 'prefill'
   | 'generation' // first content delta → stream end (token streaming)
   | 'finalize'; // stream end → finalize (server-side wrap-up)
 
@@ -56,7 +58,11 @@ export interface PhaseSegment {
    * A finite `0` is a REAL measured ~0ms phase (distinct from unavailable). Never negative.
    */
   durationMs: number | null;
-  /** `measured`/`derived` when both endpoints were known; `unavailable` when one was missing. */
+  /**
+   * `measured` ⇔ BOTH of the segment's REAL endpoints were known; `unavailable` when one was
+   * missing. `derived` is a labelled stand-in span over a KNOWN pair that is NOT the segment's true
+   * endpoints (e.g. routing→first-content when the wire TTFB is absent) — shown, never claimed measured.
+   */
   quality: Quality;
   /**
    * True when the segment's endpoints were observed out of order (end < start) and the duration
@@ -238,9 +244,12 @@ export function latencyBreakdown(
       'routing → first upstream byte (wire TTFB)',
       'unavailable — no upstream first-byte measured (attempt failed pre-headers, or unmeasured)',
     ),
-    // Prefill→first content: from the wire first byte (preferred) to the first CONTENT delta. When
-    // the wire byte is unknown, anchor on routing so the provider-side latency is still shown
-    // (labelled accordingly) rather than dropped — still a KNOWN pair (routing, firstContent).
+    // Prefill→first content: the MEASURED provider prefill phase is `first upstream byte → first
+    // content delta`. It is `measured` ONLY when BOTH real endpoints are known. When the wire first
+    // byte is UNKNOWN we do NOT relabel a different endpoint pair as the measured prefill — instead
+    // we expose a SEPARATELY-LABELLED `derived` "routing → first token" span (a known pair, but a
+    // wider window that folds the unmeasured upstream wait into it), so the provider-side latency is
+    // still shown without ever claiming it is the measured prefill phase (gap-10 review round 1).
     upstreamByte !== null
       ? span(
           'prefill',
@@ -248,16 +257,16 @@ export function latencyBreakdown(
           upstreamByte,
           firstContent,
           'measured',
-          'first upstream byte → first content delta',
+          'first upstream byte → first content delta (measured)',
           'unavailable — no first content delta (errored before content, or unmeasured)',
         )
       : span(
           'prefill',
-          'upstream → first token',
+          'routing → first token',
           routing,
           firstContent,
-          'measured',
-          'routing → first content delta (no wire TTFB measured)',
+          'derived',
+          'derived: routing → first content delta (no wire TTFB measured — folds the unmeasured upstream wait into this span; NOT the measured prefill phase)',
           'unavailable — no first content delta (errored before content, or unmeasured)',
         ),
     span(

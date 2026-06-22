@@ -157,6 +157,22 @@ test.describe('Argus dashboard', () => {
     await expect(page.getByTestId('latency-ttft')).toHaveAttribute('data-quality', 'unavailable');
     await expect(page.getByTestId('latency-ttft')).toContainText('—');
 
+    // api_004 (mystery-model: full content spine but NO wire first byte / no served attempt): the
+    // prefill segment must NOT be presented as a MEASURED prefill from routing→content (gap-10 review
+    // round 1). It is a SEPARATELY-LABELLED `derived` "routing → first token" span — `data-quality`
+    // is `derived` (not `measured`), it carries a visible `derived` badge, and its label is NOT
+    // "prefill". The wire TTFB headline is unavailable since no first byte was measured.
+    const mystery = page.getByTestId('flow-row').filter({ hasText: 'mystery' }).first();
+    await mystery.click();
+    const prefillLegend = page.getByTestId('latency-legend-prefill');
+    await expect(prefillLegend).toHaveAttribute('data-quality', 'derived');
+    await expect(prefillLegend).not.toHaveAttribute('data-quality', 'measured');
+    await expect(page.getByTestId('latency-derived-prefill')).toBeVisible(); // the labelled `derived` marker
+    await expect(prefillLegend).toContainText(/routing/i);
+    await expect(prefillLegend).not.toContainText(/^prefill/);
+    await expect(page.getByTestId('latency-dur-prefill')).not.toHaveText('—'); // a real (derived) duration
+    await expect(page.getByTestId('latency-ttfb')).toHaveAttribute('data-quality', 'unavailable');
+
     expect(consoleErrors, 'console errors on the latency breakdown').toEqual([]);
   });
 

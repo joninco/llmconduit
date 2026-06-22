@@ -98,15 +98,52 @@ describe('latencyBreakdown — honest per-flow phase decomposition (gap 10)', ()
     expect(seg(withByte, 'prefill')).toMatchObject({ durationMs: 150, quality: 'measured' });
     expect(withByte.ttfb).toMatchObject({ valueMs: 250, quality: 'measured' });
 
-    // WITHOUT the wire byte: upstream wait is unavailable, and prefill ANCHORS on routing→content
-    // (the no-TTFB path) so the provider-side latency is still shown rather than dropped.
+    // WITHOUT the wire byte: upstream wait is unavailable, and the prefill segment is shown as a
+    // SEPARATELY-LABELLED `derived` "routing → first token" span (a known pair, but NOT the measured
+    // prefill phase — its true left endpoint, the wire first byte, is absent). Gap-10 review round 1:
+    // it must NOT be tagged `measured`, and it must NOT be labelled as the measured prefill.
     const noByte = latencyBreakdown(
       flow({ ingress_ms: T, routing_decision_ms: T + 50, first_content_delta_ms: T + 400 }),
       [],
     );
     expect(seg(noByte, 'upstream')).toMatchObject({ durationMs: null, quality: 'unavailable' });
-    expect(seg(noByte, 'prefill')).toMatchObject({ durationMs: 350, quality: 'measured' }); // routing→content
+    const noBytePrefill = seg(noByte, 'prefill');
+    expect(noBytePrefill).toMatchObject({ durationMs: 350, quality: 'derived' }); // routing→content
+    // It is DERIVED, never measured, and labelled as a routing→first-token span (not "prefill").
+    expect(noBytePrefill.quality).not.toBe('measured');
+    expect(noBytePrefill.label).toMatch(/routing/i);
+    expect(noBytePrefill.label).not.toMatch(/^prefill/i);
+    expect(noBytePrefill.detail).toMatch(/derived/i);
+    expect(noBytePrefill.detail).toMatch(/not the measured prefill/i);
     expect(noByte.ttfb).toMatchObject({ valueMs: null, quality: 'unavailable' });
+  });
+
+  it('prefill is MEASURED only with a real wire TTFB; with TTFB absent (content present) it is a labelled DERIVED span, not measured (gap-10 review round 1)', () => {
+    // BOTH endpoints present (wire first byte + first content) ⇒ a genuine MEASURED prefill phase.
+    const both = latencyBreakdown(
+      flow({ ingress_ms: T, routing_decision_ms: T + 50, first_upstream_byte_ms: T + 240, first_content_delta_ms: T + 400 }),
+      [],
+    );
+    const measuredPrefill = seg(both, 'prefill');
+    expect(measuredPrefill).toMatchObject({ durationMs: 160, quality: 'measured' }); // TTFB→content
+    expect(measuredPrefill.label).toMatch(/prefill/i);
+    expect(measuredPrefill.detail).toMatch(/first upstream byte/i);
+
+    // TTFB ABSENT but first content present ⇒ prefill is NOT measured. Honest options: a labelled
+    // `derived` stand-in span (chosen here) — never a `measured` prefill built from routing→content.
+    const noTtfb = latencyBreakdown(
+      flow({ ingress_ms: T, routing_decision_ms: T + 50, first_content_delta_ms: T + 400 }),
+      [],
+    );
+    const derivedSpan = seg(noTtfb, 'prefill');
+    expect(derivedSpan.quality).toBe('derived');
+    expect(derivedSpan.quality).not.toBe('measured');
+    // The known pair still yields the real routing→content duration (no fabrication, no negative).
+    expect(derivedSpan.durationMs).toBe(350);
+    expect(derivedSpan.durationMs).toBeGreaterThanOrEqual(0);
+    // Labelled as a routing→first-token span — never presented as the measured prefill phase.
+    expect(derivedSpan.label).not.toMatch(/^prefill/i);
+    expect(derivedSpan.detail.toLowerCase()).toContain('not the measured prefill');
   });
 
   it('reads the wire TTFB from the SERVED attempt, ignoring failed attempts', () => {

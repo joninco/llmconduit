@@ -110,7 +110,8 @@ function seedFlows(): FlowSummary[] {
     // catalog context_limit null) but WITH reported usage. The context gauge must render `—`
     // (UNKNOWN capacity), NEVER a fabricated 0%/100% — distinct from a flow on a known-window model.
     // Gap 10: full phases but NO attempts/first_upstream_byte ⇒ the upstream-wait segment is
-    // unavailable and the prefill segment anchors on routing→first-content (the no-TTFB path).
+    // unavailable and the prefill segment is a SEPARATELY-LABELLED `derived` routing→first-token
+    // span (the no-TTFB path — never a measured prefill, since the wire first byte is absent).
     {
       api_call_id: 'api_004', response_id: 'resp_004', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
       model_requested: 'mystery-model', model_served: 'mystery-model', upstream_target: 'vllm-b',

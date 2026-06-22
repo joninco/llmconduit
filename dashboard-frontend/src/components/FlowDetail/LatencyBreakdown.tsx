@@ -13,6 +13,9 @@
  * Data quality (consumes `latencyBreakdown`, never fabricates):
  *  - a phase whose endpoint is unknown ⇒ its segment is UNAVAILABLE: `—`, no bar width, a dashed
  *    legend marker — DISTINCT from a real ~0ms phase (`0ms`, a hairline solid segment).
+ *  - a segment whose TRUE endpoint is unknown but a wider known pair stands in (the prefill phase
+ *    without a wire TTFB ⇒ a routing→first-token span) is tagged `derived` and carries a visible
+ *    `derived` legend badge — shown for context, NEVER presented as the measured phase.
  *  - TTFT is `measured` (first content delta) or, until then, an `estimated` first-visible-activity
  *    fallback that is LABELLED `est` (dashboard-visible activity, never claimed as upstream TTFB).
  *  - stream `tok/s` is `derived`; unavailable ⇒ `—`, never `0`.
@@ -177,6 +180,18 @@ function LegendRow({ seg }: { seg: PhaseSegment }) {
       />
       <span className={cn('text-[11px]', unavailable ? 'text-text-muted' : 'text-text')} title={seg.detail}>
         {seg.label}
+        {/* A `derived` segment is a labelled stand-in over a known pair that is NOT this phase's true
+            endpoints (e.g. routing→first-content when the wire TTFB is absent). Surface it visibly so
+            it is never read as a measured phase — mirrors the headline figures' `derived` badge. */}
+        {seg.quality === 'derived' && (
+          <span
+            className="ml-1 rounded-sm bg-accent/15 px-1 py-0.5 text-[9px] uppercase tracking-wide text-accent"
+            title={seg.detail}
+            data-testid={`latency-derived-${seg.id}`}
+          >
+            derived
+          </span>
+        )}
         {seg.disordered && (
           <span className="ml-1 text-[9px] uppercase tracking-wide text-status-cooling" title="clock skew — endpoints out of order, clamped to 0 (not negative)" data-testid={`latency-skew-${seg.id}`}>
             skew

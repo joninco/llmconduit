@@ -76,6 +76,26 @@ describe('LatencyBreakdown component (gap 10)', () => {
     expect(getByTestId('latency-seg-routing')).toBeTruthy();
   });
 
+  it('renders the no-TTFB prefill as a labelled DERIVED span (badge + routing label), not a measured prefill (gap-10 review round 1)', () => {
+    const { getByTestId } = renderModel(
+      // full content spine but NO wire first byte / no served attempt (the no-TTFB path).
+      flow({ ingress_ms: T, routing_decision_ms: T + 50, first_content_delta_ms: T + 400 }),
+    );
+    const prefill = getByTestId('latency-legend-prefill');
+    // Provenance is DERIVED (never measured) and a visible `derived` badge is rendered.
+    expect(prefill.getAttribute('data-quality')).toBe('derived');
+    expect(getByTestId('latency-derived-prefill').textContent).toBe('derived');
+    // The label is the routing→first-token span, NOT the measured "prefill → first token".
+    expect(prefill.textContent).toContain('routing');
+    expect(prefill.textContent).not.toContain('prefill →');
+    // A real (derived) duration renders — not `—`, not a fabricated 0.
+    expect(getByTestId('latency-dur-prefill').textContent).toBe('350ms');
+    // The segment still gets a bar fill (it IS a known span), with the derived provenance attribute.
+    expect(getByTestId('latency-seg-prefill').getAttribute('data-quality')).toBe('derived');
+    // Wire TTFB headline is unavailable (no first byte measured) ⇒ `—`.
+    expect(getByTestId('latency-ttfb').getAttribute('data-quality')).toBe('unavailable');
+  });
+
   it('labels a DERIVED first-visible-activity TTFT with an `est` badge', () => {
     const { getByTestId } = renderModel(
       flow({ started_ms: T, ingress_ms: T, routing_decision_ms: T + 50 }),
