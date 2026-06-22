@@ -26,11 +26,13 @@ function snapshot(): SnapshotFrame {
 /** A fully-valid MetricsResponse (passes `isMetricsResponse`) for staged-snapshot tests. */
 const METRIC_WINDOW = {
   reqs_per_sec: 4.2, active_streams: 1, error_pct: 0,
-  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5, samples: 7,
+  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5,
+  samples: 7, usage_samples: 7, priced_samples: 7,
 };
 const METRICS_SNAP = {
   metrics_seq: 5, reqs_per_sec: 4.2, active_streams: 1, error_pct: 0,
-  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5, samples: 7,
+  p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.5,
+  samples: 7, usage_samples: 7, priced_samples: 7,
   windows: { m1: METRIC_WINDOW, m5: METRIC_WINDOW, h1: METRIC_WINDOW },
 };
 
@@ -260,7 +262,7 @@ describe('frame validation — enums, unsigned-int seq, domain↔payload compati
   it('rejects a metric_tick payload under the FLOW domain (domain↔payload mismatch)', () => {
     expect(isDashboardFrame({
       domain: 'flow', seq: 1,
-      batch: [{ type: 'metric_tick', reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, windows: { m1: win(), m5: win(), h1: win() } }],
+      batch: [{ type: 'metric_tick', reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1, windows: { m1: win(), m5: win(), h1: win() } }],
     })).toBe(false);
   });
 
@@ -279,7 +281,7 @@ describe('frame validation — enums, unsigned-int seq, domain↔payload compati
   });
 
   function win() {
-    return { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1 };
+    return { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1 };
   }
 });
 
@@ -308,6 +310,36 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
       flows: [{ api_call_id: 'a', method: 'POST', uri: '/x', status: 'bogus', started_ms: 1 }],
       metrics: null, topology: null,
     })).toBe(false);
+  });
+
+  // Gap 01 finding 3 — the new per-metric denominators are REQUIRED wire fields.
+  it('rejects a snapshot whose metric window is MISSING usage_samples/priced_samples', () => {
+    // A window with `samples` but lacking the new denominators must be rejected (the
+    // frontend would otherwise be unable to tell tok/s + $/min availability apart).
+    const badWindow = { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1 /* usage_samples/priced_samples missing */ };
+    const badMetrics = { metrics_seq: 1, reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1, windows: { m1: badWindow, m5: badWindow, h1: badWindow } };
+    expect(isSnapshotFrame({
+      type: 'snapshot',
+      cursors: { flow_seq: 0, metrics_seq: 1, topology_seq: 0, monitor_seq: 0 },
+      flows: [], metrics: badMetrics, topology: null,
+    })).toBe(false);
+  });
+
+  it('rejects a metric_tick frame whose headline is MISSING the new denominators', () => {
+    const okWindow = { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1 };
+    expect(isDashboardFrame({
+      domain: 'metrics', seq: 1,
+      // headline omits usage_samples/priced_samples → invalid metric_tick payload.
+      batch: [{ type: 'metric_tick', reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, windows: { m1: okWindow, m5: okWindow, h1: okWindow } }],
+    })).toBe(false);
+  });
+
+  it('accepts a metric_tick frame carrying the new denominators (regression guard)', () => {
+    const okWindow = { reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1 };
+    expect(isDashboardFrame({
+      domain: 'metrics', seq: 1,
+      batch: [{ type: 'metric_tick', reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1, windows: { m1: okWindow, m5: okWindow, h1: okWindow } }],
+    })).toBe(true);
   });
 });
 

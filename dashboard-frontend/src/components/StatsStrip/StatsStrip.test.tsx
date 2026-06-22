@@ -7,21 +7,28 @@ import { renderWithQuery, resetWorld } from '../testHarness';
 import { CHIP_METRICS } from './chips';
 
 function win(over: Partial<MetricWindow> = {}): MetricWindow {
+  // Fully-measured default: the three denominators mirror `samples` unless overridden.
+  const samples = over.samples ?? 252;
   return {
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
     p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
-    samples: 252,
+    samples,
+    usage_samples: samples,
+    priced_samples: samples,
     ...over,
   };
 }
 
 function metrics(seq: number, over: Partial<MetricsResponse> = {}, windows?: { m1?: Partial<MetricWindow>; m5?: Partial<MetricWindow>; h1?: Partial<MetricWindow> }): MetricsResponse {
+  const m1 = win(windows?.m1);
   return {
     metrics_seq: seq,
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
     p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
-    samples: 252,
-    windows: { m1: win(windows?.m1), m5: win(windows?.m5), h1: win(windows?.h1) },
+    samples: m1.samples,
+    usage_samples: m1.usage_samples,
+    priced_samples: m1.priced_samples,
+    windows: { m1, m5: win(windows?.m5), h1: win(windows?.h1) },
     ...over,
   };
 }
@@ -97,6 +104,29 @@ describe('StatsStrip — chips', () => {
     // The genuinely-measured req/s + the live active count stay numeric.
     expect(val('reqs_per_sec')).toBe('2.5');
     expect(val('active_streams')).toBe('4.0');
+  });
+
+  // Gap 01 finding 4 — provenance/quality is rendered on every chip (data-quality).
+  it('renders a data-quality provenance tag on every chip', () => {
+    const { getByTestId } = renderWithQuery(<StatsStrip />);
+    pushMetrics(metrics(1));
+    const quality = (k: string) => getByTestId(`chip-${k}`).getAttribute('data-quality');
+    expect(quality('reqs_per_sec')).toBe('measured');
+    expect(quality('active_streams')).toBe('measured');
+    expect(quality('p50')).toBe('derived');
+    expect(quality('tokens_per_sec')).toBe('derived');
+    expect(quality('cost_per_min')).toBe('estimated'); // priced → labelled estimated
+  });
+
+  it('flips a chip data-quality to "unavailable" when its metric is unmeasurable', () => {
+    const { getByTestId } = renderWithQuery(<StatsStrip />);
+    // No usage reported (usage/priced 0) though latency IS measured (samples 12).
+    pushMetrics(metrics(1, {}, { m1: { samples: 12, usage_samples: 0, priced_samples: 0 } }));
+    const quality = (k: string) => getByTestId(`chip-${k}`).getAttribute('data-quality');
+    expect(quality('p50')).toBe('derived'); // latency measured
+    expect(quality('tokens_per_sec')).toBe('unavailable'); // no usage → gap
+    expect(quality('cost_per_min')).toBe('unavailable'); // no priced usage → gap
+    expect(quality('reqs_per_sec')).toBe('measured'); // never gated
   });
 });
 

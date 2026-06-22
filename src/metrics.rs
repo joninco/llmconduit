@@ -120,6 +120,17 @@ pub struct BucketCounts {
     pub completion_tokens: i64,
     pub cached_tokens: i64,
     pub reasoning_tokens: i64,
+    /// Count of the TERMINAL flows in this bucket that actually carried token usage
+    /// (gap 01 review round 1, finding 3): token throughput is only MEASURABLE for a
+    /// flow whose final usage was reported. A finalized flow with no `usage` (an
+    /// upstream that omitted the usage block, or a failure before any token
+    /// accounting) bumps `count` but NOT this — so a window whose flows all lack usage
+    /// reports `usage_samples == 0` and the strip renders `tokens_per_sec` as
+    /// `unavailable` (`—`) instead of a fabricated `0`. The COST denominator is the
+    /// subset of these whose served model has a configured price; it is derived at
+    /// render time (`dashboard_api`) where the price table lives, so this layer stays
+    /// price-agnostic.
+    pub usage_samples: u64,
 }
 
 impl BucketCounts {
@@ -332,6 +343,7 @@ impl WindowRing {
                 entry.reasoning_tokens = entry
                     .reasoning_tokens
                     .saturating_add(counts.reasoning_tokens);
+                entry.usage_samples = entry.usage_samples.saturating_add(counts.usage_samples);
             }
             histogram.merge(&slot.histogram);
         }
@@ -362,6 +374,32 @@ impl WindowReport {
         self.buckets
             .values()
             .map(|counts| counts.count)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Total count of TERMINAL flows that reported token usage across all keys (gap 01
+    /// finding 3) — the `tokens_per_sec` measurability denominator. `0` ⇒ no flow in
+    /// the window carried usage ⇒ the strip renders `tokens_per_sec` as `unavailable`.
+    pub fn usage_sample_count(&self) -> u64 {
+        self.buckets
+            .values()
+            .map(|counts| counts.usage_samples)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Count of usage-bearing terminal flows whose served model has a configured price
+    /// in `prices` (gap 01 finding 3) — the `cost_per_min` measurability denominator.
+    /// `0` ⇒ no PRICED usage sample in the window ⇒ the strip renders `cost_per_min` as
+    /// `unavailable` (`—`), distinguishing "unpriced model" from a genuine `$0.00`. The
+    /// price lookup matches [`crate::dashboard_api`]'s exact-then-case-insensitive rule.
+    pub fn priced_sample_count<F>(&self, has_price: F) -> u64
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.buckets
+            .iter()
+            .filter(|(key, _)| has_price(&key.model))
+            .map(|(_, counts)| counts.usage_samples)
             .fold(0u64, u64::saturating_add)
     }
 }
@@ -631,6 +669,10 @@ impl MetricsState {
                 entry.completion_tokens = entry.completion_tokens.saturating_add(usage.completion);
                 entry.cached_tokens = entry.cached_tokens.saturating_add(usage.cached);
                 entry.reasoning_tokens = entry.reasoning_tokens.saturating_add(usage.reasoning);
+                // This terminal flow reported usage → it is a MEASURED token sample
+                // (gap 01 finding 3). A terminal with `usage == None` increments only
+                // `count`, so `tokens_per_sec` over usage-less flows reads `—`.
+                entry.usage_samples = entry.usage_samples.saturating_add(1);
             }
             slot.histogram.record(elapsed_ms);
         }
@@ -649,6 +691,12 @@ impl MetricsState {
             entry.completion_tokens = entry.completion_tokens.saturating_add(usage.completion);
             entry.cached_tokens = entry.cached_tokens.saturating_add(usage.cached);
             entry.reasoning_tokens = entry.reasoning_tokens.saturating_add(usage.reasoning);
+            // A reported-usage sample (gap 01 finding 3) — the `tokens_per_sec`
+            // measurability denominator. The standalone `record_usage` path joins the
+            // SAME bucket key as its `record_response`, so on the production terminal
+            // path (which uses the atomic `record_terminal`) usage is counted exactly
+            // once; this keeps the older split path consistent for its callers/tests.
+            entry.usage_samples = entry.usage_samples.saturating_add(1);
         }
         self.metrics_seq = self.metrics_seq.saturating_add(1);
     }
@@ -1376,6 +1424,69 @@ mod tests {
         assert_eq!(counts.count, 1);
         assert_eq!(counts.prompt_tokens, 0, "no tokens recorded");
         assert_eq!(counts.completion_tokens, 0);
+    }
+
+    #[test]
+    fn usage_samples_count_only_usage_bearing_terminals() {
+        // Gap 01 finding 3: `usage_samples` is the `tokens_per_sec` measurability
+        // denominator, and `priced_sample_count` the `cost_per_min` one. A terminal
+        // WITH usage bumps both `count` and `usage_samples`; one WITHOUT usage bumps
+        // only `count`. A usage-bearing flow on an UNPRICED model counts as a usage
+        // sample but NOT a priced sample.
+        let metrics = MetricsLayer::new();
+        // 1) priced model, usage present → usage + priced sample.
+        metrics.record_terminal(
+            FlowStatus::Completed,
+            Some("priced-m"),
+            "/v1/responses",
+            Some("p"),
+            10,
+            Some(FlowUsage {
+                prompt: 100,
+                completion: 40,
+                total: 140,
+                cached: 0,
+                reasoning: 0,
+            }),
+        );
+        // 2) unpriced model, usage present → usage sample, NOT priced.
+        metrics.record_terminal(
+            FlowStatus::Completed,
+            Some("free-m"),
+            "/v1/responses",
+            Some("p"),
+            10,
+            Some(FlowUsage {
+                prompt: 10,
+                completion: 5,
+                total: 15,
+                cached: 0,
+                reasoning: 0,
+            }),
+        );
+        // 3) priced model, NO usage → counted request, NOT a usage/priced sample.
+        metrics.record_terminal(
+            FlowStatus::Failed,
+            Some("priced-m"),
+            "/v1/responses",
+            Some("p"),
+            10,
+            None,
+        );
+        let view = metrics.view();
+        let window = &view.window_1m;
+        assert_eq!(window.total_count(), 3, "all three terminals counted");
+        assert_eq!(
+            window.usage_sample_count(),
+            2,
+            "only the two usage-bearing terminals are usage samples"
+        );
+        // Only "priced-m" has a price → exactly one priced usage sample (case #1).
+        let priced = window.priced_sample_count(|model| model.eq_ignore_ascii_case("priced-m"));
+        assert_eq!(
+            priced, 1,
+            "only the priced-model usage-bearing terminal is a priced sample"
+        );
     }
 
     #[test]

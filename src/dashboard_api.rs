@@ -393,6 +393,16 @@ fn rest_window_tile(
     let reqs_per_sec = total as f64 / window_secs;
     let tokens_per_sec = window_total_tokens(report) as f64 / window_secs;
     let cost_per_min = window_total_cost(report, prices) / (window_secs / 60.0);
+    // Per-metric measurability denominators (gap 01 review round 1, finding 3): token
+    // and cost availability are SEPARATE from latency/error. `usage_samples` counts
+    // terminal flows that reported usage; `priced_samples` the subset whose served
+    // model has a configured price (derived HERE, where the price table lives, so
+    // `metrics.rs` stays price-agnostic). A window can have `samples > 0` (latency
+    // measured) yet `usage_samples == 0` (no flow reported tokens) → `tokens_per_sec`
+    // renders `—`; or `usage_samples > 0` yet `priced_samples == 0` (only unpriced
+    // models) → `cost_per_min` renders `—`, distinguishing "unpriced" from `$0.00`.
+    let usage_samples = report.usage_sample_count();
+    let priced_samples = report.priced_sample_count(|model| price_lookup(prices, model).is_some());
     // Every float is `finite`-guarded: a non-finite value would make
     // `serde_json::to_vec` error and 500 the `/metrics` read.
     MetricWindow {
@@ -404,11 +414,14 @@ fn rest_window_tile(
         p99: finite(percentiles.p99),
         tokens_per_sec: finite(tokens_per_sec),
         cost_per_min: finite(cost_per_min),
-        // `total` is the count of TERMINAL flows in the window — the gap-01
+        // `total` is the count of TERMINAL flows in the window — the latency/error
         // measured/unavailable signal. `0` here ≠ "zero throughput"; it means NO
-        // finalized flow fed the latency/tok-s/cost fields, so the frontend renders
-        // those `—` (while `reqs_per_sec`'s genuine `0` stays a `0`).
+        // finalized flow fed the latency/error fields, so the frontend renders those
+        // `—` (while `reqs_per_sec`'s genuine `0` stays a `0`). Token/cost availability
+        // use the separate denominators above.
         samples: total,
+        usage_samples,
+        priced_samples,
     }
 }
 
@@ -437,6 +450,8 @@ pub fn metrics_body(
         tokens_per_sec: m1.tokens_per_sec,
         cost_per_min: m1.cost_per_min,
         samples: m1.samples,
+        usage_samples: m1.usage_samples,
+        priced_samples: m1.priced_samples,
         windows: MetricWindows { m1, m5, h1 },
     }
 }
@@ -1028,6 +1043,15 @@ mod tests {
         // The terminal flow IS counted — the measured/unavailable signal is non-zero.
         assert_eq!(body.samples, 1, "the finalized flow counts as one sample");
         assert_eq!(body.windows.m1.samples, 1);
+        // The flow reported usage on a PRICED model → both per-metric denominators are
+        // non-zero (gap 01 finding 3): tok/s and $/min are both measurable here.
+        assert_eq!(
+            body.usage_samples, 1,
+            "the usage-bearing flow is a usage sample"
+        );
+        assert_eq!(body.windows.m1.usage_samples, 1);
+        assert_eq!(body.priced_samples, 1, "priced model → a priced sample");
+        assert_eq!(body.windows.m1.priced_samples, 1);
         // active_streams carries the live count (was hard-coded 0 on the WS tile).
         assert_eq!(body.active_streams, 3, "live open-flow count is carried");
         // tokens/s + cost/min are REAL (priced), not 0.0. 1500 tok / 60 s = 25 tok/s.
@@ -1066,11 +1090,123 @@ mod tests {
         assert_eq!(body.windows.m1.samples, 0);
         assert_eq!(body.windows.m5.samples, 0);
         assert_eq!(body.windows.h1.samples, 0);
+        // The per-metric denominators are zero too → tok/s + $/min are unavailable.
+        assert_eq!(body.usage_samples, 0);
+        assert_eq!(body.priced_samples, 0);
+        assert_eq!(body.windows.m1.usage_samples, 0);
+        assert_eq!(body.windows.m1.priced_samples, 0);
         // req/s is a genuine measured zero (idle), distinguishable from the unavailable
         // latency/tok-s/cost above precisely BECAUSE samples == 0.
         assert_eq!(body.reqs_per_sec, 0.0);
         assert_eq!(body.tokens_per_sec, 0.0);
         assert_eq!(body.cost_per_min, 0.0);
+    }
+
+    /// Gap 01 finding 3 (per-metric availability): a window can have measured LATENCY
+    /// (`samples > 0`) yet UNMEASURABLE tokens/cost. Two terminal flows finalize — one
+    /// with usage on a PRICED model, one with NO usage at all and one with usage on an
+    /// UNPRICED model — so `samples` (latency) and the two token/cost denominators
+    /// diverge. The frontend reads each denominator independently to decide `—` vs a
+    /// number, so this asserts they are emitted independently and correctly.
+    #[test]
+    fn metrics_body_per_metric_denominators_diverge() {
+        use crate::dashboard_flow::FlowStatus as FS;
+        use crate::metrics::MetricsLayer;
+        let metrics = MetricsLayer::new();
+        // (a) usage on a PRICED model → counts toward samples + usage + priced.
+        metrics.record_terminal(
+            FS::Completed,
+            Some("glm-5.1"),
+            "/v1/responses",
+            Some("vllm-a"),
+            900,
+            Some(usage(1000, 500, 0)),
+        );
+        // (b) NO usage (e.g. an upstream that omitted it) → samples only.
+        metrics.record_terminal(
+            FS::Completed,
+            Some("glm-5.1"),
+            "/v1/responses",
+            Some("vllm-a"),
+            900,
+            None,
+        );
+        // (c) usage on an UNPRICED model → samples + usage, but NOT priced.
+        metrics.record_terminal(
+            FS::Completed,
+            Some("free-model"),
+            "/v1/responses",
+            Some("vllm-a"),
+            900,
+            Some(usage(10, 5, 0)),
+        );
+        let (view, seq) = metrics.view_with_seq();
+        let mut prices = HashMap::new();
+        prices.insert("glm-5.1".to_string(), price(2.0, 6.0, 0.5));
+        let body = metrics_body(&view, seq, 0, &prices);
+
+        // Latency is measurable for all three finalized flows.
+        assert_eq!(
+            body.samples, 3,
+            "three finalized flows → latency measurable"
+        );
+        // Two of the three reported usage → tok/s measurable, but distinct from samples.
+        assert_eq!(
+            body.usage_samples, 2,
+            "two usage-bearing flows → tok/s measurable (≠ samples)"
+        );
+        // Only one of those two is on a priced model → cost measurable for exactly one.
+        assert_eq!(
+            body.priced_samples, 1,
+            "only the priced-model usage flow → $/min measurable (≠ usage_samples)"
+        );
+        // The headline mirrors the m1 window's per-metric denominators.
+        assert_eq!(body.windows.m1.samples, 3);
+        assert_eq!(body.windows.m1.usage_samples, 2);
+        assert_eq!(body.windows.m1.priced_samples, 1);
+    }
+
+    /// Round-trip (AGENTS.md: no new wire fields without a round-trip test): the new
+    /// `usage_samples`/`priced_samples` wire fields survive a serialize → JSON → re-parse
+    /// cycle at BOTH the headline and the per-window level, with the exact values the
+    /// `metrics_body` builder produced. This pins the byte contract the frozen frontend
+    /// validators (`isMetricWindow`/`isMetricsResponse`) decode.
+    #[test]
+    fn metrics_body_new_sample_fields_round_trip_through_json() {
+        use crate::dashboard_flow::FlowStatus as FS;
+        use crate::metrics::MetricsLayer;
+        let metrics = MetricsLayer::new();
+        metrics.record_terminal(
+            FS::Completed,
+            Some("glm-5.1"),
+            "/v1/responses",
+            Some("vllm-a"),
+            900,
+            Some(usage(1000, 500, 0)),
+        );
+        let (view, seq) = metrics.view_with_seq();
+        let mut prices = HashMap::new();
+        prices.insert("glm-5.1".to_string(), price(2.0, 6.0, 0.5));
+        let body = metrics_body(&view, seq, 2, &prices);
+
+        // Serialize → JSON bytes → re-parse: the fields must survive intact.
+        let json = serde_json::to_string(&body).expect("serialize metrics body");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("re-parse");
+        // Headline mirrors.
+        assert_eq!(value["usage_samples"], serde_json::json!(1));
+        assert_eq!(value["priced_samples"], serde_json::json!(1));
+        // Per-window (m1 fed the terminal; m5/h1 share the same epoch ⇒ same counts).
+        for window in ["m1", "m5", "h1"] {
+            assert_eq!(value["windows"][window]["samples"], serde_json::json!(1));
+            assert_eq!(
+                value["windows"][window]["usage_samples"],
+                serde_json::json!(1)
+            );
+            assert_eq!(
+                value["windows"][window]["priced_samples"],
+                serde_json::json!(1)
+            );
+        }
     }
 
     /// 1-based paging: page 2 with limit 2 over 5 rows yields rows 3..=4; a limit

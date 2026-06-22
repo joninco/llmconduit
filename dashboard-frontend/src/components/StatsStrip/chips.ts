@@ -8,12 +8,25 @@
 import type { MetricWindow } from '../../api/types';
 import { colors } from '../../design/tokens';
 import { fmtTokens } from '../FlowTable/format';
-import type { MetricKey } from './metricHistory';
+import { metricUnavailable, type MetricKey } from './metricHistory';
 
 /** Error-% threshold above which the err chip turns red (spec: "red above threshold"). */
 export const ERROR_PCT_THRESHOLD = 5;
 
 export type DeltaDir = 'up' | 'down' | 'flat';
+
+/**
+ * The data-quality provenance of a chip's value (IMPLEMENTATION_PLAN cross-cutting rule:
+ * EVERY rendered metric is tagged measured / derived / estimated / unavailable). Rendered
+ * via `data-quality` + an ARIA/title hint on the chip so operators can tell a directly
+ * counted value from a derived/estimated one from an honest gap:
+ *  - `measured`     — directly counted off the live gateway (`req/s`, `active_streams`).
+ *  - `derived`      — computed from finalized-flow samples (err%, p50/p95/p99, tok/s).
+ *  - `estimated`    — priced via the configured price table, i.e. a modelled estimate
+ *                     ($/min). MUST be surfaced as such (the plan calls this out).
+ *  - `unavailable`  — not measurable in this window; the value renders `—`, never `0`.
+ */
+export type MetricQuality = 'measured' | 'derived' | 'estimated' | 'unavailable';
 
 export interface ChipDescriptor {
   key: MetricKey;
@@ -26,6 +39,11 @@ export interface ChipDescriptor {
   accent: 'accent' | 'healthy' | 'meta' | 'down' | 'text';
   /** Direction of change vs. the previous sample (drives the delta arrow). */
   delta: DeltaDir;
+  /**
+   * Data-quality provenance of the rendered value (finding 4). `unavailable` whenever
+   * the value is `—`; otherwise the metric's intrinsic tier (measured/derived/estimated).
+   */
+  quality: MetricQuality;
   /** uPlot stroke as hex for the sparkline (mirrors `stroke`, kept explicit for clarity). */
   sparkStroke: string;
 }
@@ -71,24 +89,24 @@ interface MetricSpec {
   stroke: string;
   accent: ChipDescriptor['accent'];
   /**
-   * Whether this metric is derived from FINALIZED-flow samples (latency/tok-s/cost/err%).
-   * Such a metric is UNMEASURABLE in a window with no finalized flow (`samples === 0`) — it
-   * renders `unavailable` (`—`) rather than a fabricated `0` (gap 01, "don't lie with zeros").
-   * `req/s` (a genuine measured `0` when idle) and `active_streams` (the live open-flow count)
-   * are NOT sample-derived, so they always render their numeric value.
+   * Intrinsic data-quality tier when the value IS available (finding 4). `measured` for
+   * directly-counted metrics, `derived` for sample-computed ones, `estimated` for the
+   * price-modelled cost. Collapses to `unavailable` when the metric's denominator is `0`
+   * (the denominator itself lives in `METRIC_AVAILABILITY` in metricHistory).
    */
-  sampleDerived: boolean;
+  quality: Exclude<MetricQuality, 'unavailable'>;
 }
 
 const METRIC_SPECS: readonly MetricSpec[] = [
-  { key: 'reqs_per_sec', label: 'req/s', fmt: fmtRate, stroke: colors.accent, accent: 'accent', sampleDerived: false },
-  { key: 'active_streams', label: 'active', fmt: fmtRate, stroke: colors.accent, accent: 'text', sampleDerived: false },
-  { key: 'error_pct', label: 'err %', fmt: fmtPct, stroke: colors.statusDown, accent: 'text', sampleDerived: true },
-  { key: 'p50', label: 'p50 ms', fmt: fmtMs, stroke: colors.statusHealthy, accent: 'text', sampleDerived: true },
-  { key: 'p95', label: 'p95 ms', fmt: fmtMs, stroke: colors.statusCooling, accent: 'text', sampleDerived: true },
-  { key: 'p99', label: 'p99 ms', fmt: fmtMs, stroke: colors.statusDown, accent: 'text', sampleDerived: true },
-  { key: 'tokens_per_sec', label: 'tok/s', fmt: fmtTokens, stroke: colors.statusHealthy, accent: 'healthy', sampleDerived: true },
-  { key: 'cost_per_min', label: '$/min', fmt: fmtMoney, stroke: colors.meta, accent: 'meta', sampleDerived: true },
+  { key: 'reqs_per_sec', label: 'req/s', fmt: fmtRate, stroke: colors.accent, accent: 'accent', quality: 'measured' },
+  { key: 'active_streams', label: 'active', fmt: fmtRate, stroke: colors.accent, accent: 'text', quality: 'measured' },
+  { key: 'error_pct', label: 'err %', fmt: fmtPct, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
+  { key: 'p50', label: 'p50 ms', fmt: fmtMs, stroke: colors.statusHealthy, accent: 'text', quality: 'derived' },
+  { key: 'p95', label: 'p95 ms', fmt: fmtMs, stroke: colors.statusCooling, accent: 'text', quality: 'derived' },
+  { key: 'p99', label: 'p99 ms', fmt: fmtMs, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
+  { key: 'tokens_per_sec', label: 'tok/s', fmt: fmtTokens, stroke: colors.statusHealthy, accent: 'healthy', quality: 'derived' },
+  // $/min is PRICED via the configured price table → an estimate, surfaced as such.
+  { key: 'cost_per_min', label: '$/min', fmt: fmtMoney, stroke: colors.meta, accent: 'meta', quality: 'estimated' },
 ];
 
 /** The unavailable / no-data marker (a value that cannot be measured renders this, never `0`). */
@@ -101,27 +119,32 @@ export const CHIP_METRICS: readonly MetricKey[] = METRIC_SPECS.map((s) => s.key)
  * Derive every chip descriptor for the current + previous window samples. `cur === null`
  * (no tick yet) renders every value as the unavailable marker with a flat delta.
  *
- * Don't-lie-with-zeros (gap 01): when the window has NO finalized-flow samples
- * (`cur.samples === 0`), the sample-derived metrics (err%/p50/p95/p99/tok-s/$/min) are
- * UNMEASURABLE — they render `unavailable` (`—`), NEVER a fabricated `0`, with a flat delta
- * (an unmeasurable value has no trend) and no threshold accent. `req/s` (a genuine measured
- * `0` for an idle window) and `active_streams` (the live open-flow count) are NOT
- * sample-derived, so they still render their real numeric value — keeping a real `0` and an
- * `unavailable` distinguishable on the strip.
+ * Don't-lie-with-zeros + per-metric availability (gap 01 findings 3/4): each metric has its
+ * OWN measurability denominator — latency/err% need a finalized flow (`samples`), tok/s needs
+ * a flow that REPORTED usage (`usage_samples`), $/min needs a usage-bearing flow on a PRICED
+ * model (`priced_samples`). A window can have `samples > 0` yet `usage_samples === 0` (no
+ * tokens reported) or `priced_samples === 0` (only unpriced models): those metrics render
+ * `unavailable` (`—`), NEVER a fabricated `0`, with a flat delta and no threshold accent.
+ * `req/s` (a genuine idle `0`) and `active_streams` (the live open count) are never gated.
+ * Every chip also carries a `quality` provenance tag (measured/derived/estimated/unavailable).
  */
 export function deriveChips(cur: MetricWindow | null, prev: MetricWindow | null): ChipDescriptor[] {
   return METRIC_SPECS.map((spec): ChipDescriptor => {
-    // A sample-derived metric with zero samples in the window is unavailable (not measured).
-    const unavailable = !cur || (spec.sampleDerived && cur.samples === 0);
-    const value = unavailable ? UNAVAILABLE : spec.fmt(cur[spec.key]);
+    // Unmeasurable when there is no window, or this metric's own denominator is 0.
+    const unavailable = metricUnavailable(cur, spec.key);
+    const value = unavailable || !cur ? UNAVAILABLE : spec.fmt(cur[spec.key]);
     // The err% chip turns red ABOVE the threshold — but only when it is actually MEASURED
     // (an unavailable err% carries no threshold accent); others keep their static accent.
     const accent: ChipDescriptor['accent'] =
-      !unavailable && spec.key === 'error_pct' && cur.error_pct > ERROR_PCT_THRESHOLD ? 'down' : spec.accent;
-    // No trend direction for an unavailable value, nor across the genuine→unavailable boundary.
-    const delta = !unavailable && (!prev || !(spec.sampleDerived && prev.samples === 0))
+      !unavailable && cur && spec.key === 'error_pct' && cur.error_pct > ERROR_PCT_THRESHOLD ? 'down' : spec.accent;
+    // No trend direction for an unavailable value, nor across the genuine→unavailable boundary
+    // (the previous sample being unavailable for THIS metric makes the delta meaningless).
+    const prevUnavailable = metricUnavailable(prev, spec.key);
+    const delta = !unavailable && cur && !prevUnavailable
       ? deltaDir(cur[spec.key], prev?.[spec.key])
       : 'flat';
+    // Provenance (finding 4): `unavailable` when `—`, else the metric's intrinsic tier.
+    const quality: MetricQuality = unavailable ? 'unavailable' : spec.quality;
     return {
       key: spec.key,
       label: spec.label,
@@ -129,6 +152,7 @@ export function deriveChips(cur: MetricWindow | null, prev: MetricWindow | null)
       stroke: spec.stroke,
       accent,
       delta,
+      quality,
       sparkStroke: spec.stroke,
     };
   });

@@ -3,10 +3,17 @@ import type { MetricWindow } from '../../api/types';
 import { CHIP_METRICS, deriveChips, deltaGlyph, ERROR_PCT_THRESHOLD } from './chips';
 
 function win(over: Partial<MetricWindow> = {}): MetricWindow {
+  // Default to a fully-measured window: the three denominators mirror `samples` so a test
+  // that sets `samples: 0` (no finalized flow) also zeroes the tok/s + $/min denominators
+  // unless it overrides them — keeping the gap-01 "unavailable" semantics intact. A test
+  // that needs to diverge them (samples > 0 but usage/priced = 0) passes them explicitly.
+  const samples = over.samples ?? 252;
   return {
     reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
     p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
-    samples: 252,
+    samples,
+    usage_samples: samples,
+    priced_samples: samples,
     ...over,
   };
 }
@@ -94,5 +101,68 @@ describe('chips', () => {
     expect(err.value).toBe('—');
     expect(err.accent).not.toBe('down'); // an unavailable err% carries no threshold red
     expect(p50.delta).toBe('flat'); // no trend for an unmeasurable value
+  });
+
+  // Gap 01 finding 3 — per-metric availability denominators diverge.
+  it('renders tok/s + $/min as "—" when usage was not reported, even though latency IS measured', () => {
+    // samples 12 (latency measured) but usage_samples 0 (no flow reported tokens) and so
+    // priced_samples 0 too. Latency/err% are real; tok/s + $/min are unmeasurable → "—".
+    const chips = deriveChips(win({ samples: 12, usage_samples: 0, priced_samples: 0, p50: 200, tokens_per_sec: 0, cost_per_min: 0 }), null);
+    const byKey = Object.fromEntries(chips.map((c) => [c.key, c.value]));
+    expect(byKey.p50).toBe('200'); // latency measured (samples > 0)
+    expect(byKey.error_pct).toBe('1.1');
+    expect(byKey.tokens_per_sec).toBe('—'); // no usage sample → unmeasurable
+    expect(byKey.cost_per_min).toBe('—'); // no priced usage sample → unmeasurable
+  });
+
+  it('renders $/min as "—" when usage WAS reported but on an unpriced model (tok/s stays numeric)', () => {
+    // usage_samples 8 (tok/s measurable) but priced_samples 0 (only unpriced models) →
+    // $/min is unmeasurable ("—"), distinct from a genuine $0.00. tok/s renders normally.
+    const chips = deriveChips(win({ samples: 8, usage_samples: 8, priced_samples: 0, tokens_per_sec: 142, cost_per_min: 0 }), null);
+    const byKey = Object.fromEntries(chips.map((c) => [c.key, c.value]));
+    expect(byKey.tokens_per_sec).toBe('142'); // usage present → measurable
+    expect(byKey.cost_per_min).toBe('—'); // no priced sample → unavailable, not $0.00
+  });
+
+  // Gap 01 finding 4 — provenance/quality on every chip state.
+  it('tags each chip with measured/derived/estimated provenance when available', () => {
+    const chips = deriveChips(win(), null);
+    const byKey = Object.fromEntries(chips.map((c) => [c.key, c.quality]));
+    expect(byKey.reqs_per_sec).toBe('measured');
+    expect(byKey.active_streams).toBe('measured');
+    expect(byKey.error_pct).toBe('derived');
+    expect(byKey.p50).toBe('derived');
+    expect(byKey.p95).toBe('derived');
+    expect(byKey.p99).toBe('derived');
+    expect(byKey.tokens_per_sec).toBe('derived');
+    expect(byKey.cost_per_min).toBe('estimated'); // priced → estimated, surfaced as such
+  });
+
+  it('tags an unmeasurable metric as "unavailable" while measured ones keep their tier', () => {
+    // samples 0 → latency/err%/tok-s/$/min all unavailable; req/s + active stay measured.
+    const chips = deriveChips(win({ samples: 0 }), null);
+    const byKey = Object.fromEntries(chips.map((c) => [c.key, c.quality]));
+    expect(byKey.reqs_per_sec).toBe('measured');
+    expect(byKey.active_streams).toBe('measured');
+    expect(byKey.error_pct).toBe('unavailable');
+    expect(byKey.p50).toBe('unavailable');
+    expect(byKey.tokens_per_sec).toBe('unavailable');
+    expect(byKey.cost_per_min).toBe('unavailable');
+  });
+
+  it('tags cost as unavailable but tok/s as derived when only pricing is missing', () => {
+    const chips = deriveChips(win({ samples: 8, usage_samples: 8, priced_samples: 0 }), null);
+    const byKey = Object.fromEntries(chips.map((c) => [c.key, c.quality]));
+    expect(byKey.tokens_per_sec).toBe('derived'); // usage present
+    expect(byKey.cost_per_min).toBe('unavailable'); // unpriced → not an estimate, a gap
+  });
+
+  it('every chip carries a quality tag from the closed set (no chip is untagged)', () => {
+    const valid = new Set(['measured', 'derived', 'estimated', 'unavailable']);
+    for (const cur of [win(), win({ samples: 0 }), null]) {
+      for (const chip of deriveChips(cur, null)) {
+        expect(valid.has(chip.quality), `${chip.key} → ${chip.quality}`).toBe(true);
+      }
+    }
   });
 });

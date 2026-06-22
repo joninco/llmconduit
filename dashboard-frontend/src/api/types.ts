@@ -209,12 +209,27 @@ export interface MetricWindow {
   cost_per_min: number;
   /**
    * Count of TERMINAL (finalized) flows in this window — the data-quality signal for
-   * "don't lie with zeros" (gap 01). When `samples === 0` the latency/tok-s/cost/error-%
-   * fields were never MEASURED (no finalized flow fed them), so the strip renders them
-   * `unavailable` (`—`); `reqs_per_sec` (a genuine `0` for an idle window) and
-   * `active_streams` (live open-flow count) stay numeric. A finite `u64` on the wire.
+   * LATENCY + error-% (gap 01). When `samples === 0` the latency/error-% fields were
+   * never MEASURED (no finalized flow fed them), so the strip renders them `unavailable`
+   * (`—`); `reqs_per_sec` (a genuine `0` for an idle window) and `active_streams` (live
+   * open-flow count) stay numeric. A finite `u64` on the wire.
    */
   samples: number;
+  /**
+   * Count of those terminal flows that reported token usage (gap 01 review round 1,
+   * finding 3) — the SEPARATE `tokens_per_sec` measurability denominator. Token/cost
+   * availability is NOT the same as `samples`: a window can have `samples > 0` yet
+   * `usage_samples === 0` (every finalized flow omitted usage), and then `tokens_per_sec`
+   * is unmeasurable → it renders `—`, NEVER a fabricated `0`. A finite `u64`.
+   */
+  usage_samples: number;
+  /**
+   * Count of usage-bearing terminal flows whose served model has a configured price
+   * (gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no PRICED
+   * usage in the window ⇒ `cost_per_min` renders `—`, distinguishing an unpriced model
+   * from a genuine measured `$0.00`. A finite `u64`.
+   */
+  priced_samples: number;
 }
 
 export interface MetricTickPayload {
@@ -229,6 +244,10 @@ export interface MetricTickPayload {
   cost_per_min: number;
   /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
   samples: number;
+  /** Headline (`m1`) usage-sample count — the tok/s denominator (finding 3). */
+  usage_samples: number;
+  /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
+  priced_samples: number;
   windows: {
     m1: MetricWindow;
     m5: MetricWindow;
@@ -443,6 +462,10 @@ export interface MetricsResponse {
   cost_per_min: number;
   /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
   samples: number;
+  /** Headline (`m1`) usage-sample count — the tok/s denominator (finding 3). */
+  usage_samples: number;
+  /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
+  priced_samples: number;
   windows: {
     m1: MetricWindow;
     m5: MetricWindow;
@@ -572,8 +595,10 @@ function isMetricWindow(v: unknown): v is MetricWindow {
   return (
     isObj(v) && isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
     isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-    // `samples` is a non-negative integer count (gap 01 measured/unavailable signal).
-    isUint(v.samples)
+    // The three per-metric measurability denominators are non-negative integer counts
+    // (gap 01): `samples` (latency/error), `usage_samples` (tok/s), `priced_samples`
+    // ($/min). All REQUIRED — the Rust tile always emits them.
+    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples)
   );
 }
 function isMetricWindows(v: unknown): boolean {
@@ -704,7 +729,7 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
       return (
         isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
         isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-        isUint(v.samples) && isMetricWindows(v.windows)
+        isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) && isMetricWindows(v.windows)
       );
     case 'flow_status':
       return (
@@ -756,7 +781,7 @@ function isMetricsResponse(v: unknown): v is MetricsResponse {
     isObj(v) && isUint(v.metrics_seq) &&
     isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
     isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-    isUint(v.samples) && isMetricWindows(v.windows)
+    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) && isMetricWindows(v.windows)
   );
 }
 

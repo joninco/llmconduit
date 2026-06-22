@@ -153,8 +153,14 @@ pub struct MetricsSnapshot {
     pub tokens_per_sec: f64,
     pub cost_per_min: f64,
     /// Terminal-flow sample count of the headline (`m1`) window — the
-    /// measured/unavailable signal mirrored from `windows.m1.samples`.
+    /// measured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.
     pub samples: u64,
+    /// Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability
+    /// denominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).
+    pub usage_samples: u64,
+    /// Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability
+    /// denominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).
+    pub priced_samples: u64,
     pub windows: MetricWindows,
 }
 
@@ -274,8 +280,14 @@ pub struct MetricTick {
     pub tokens_per_sec: f64,
     pub cost_per_min: f64,
     /// Terminal-flow sample count of the headline (`m1`) window — the
-    /// measured/unavailable signal mirrored from `windows.m1.samples`.
+    /// measured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.
     pub samples: u64,
+    /// Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability
+    /// denominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).
+    pub usage_samples: u64,
+    /// Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability
+    /// denominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).
+    pub priced_samples: u64,
     pub windows: MetricWindows,
 }
 
@@ -306,8 +318,22 @@ pub struct MetricWindow {
     pub p99: f64,
     pub tokens_per_sec: f64,
     pub cost_per_min: f64,
-    /// Terminal-flow sample count in this window (the measured/unavailable signal).
+    /// Terminal-flow sample count in this window (the measured/unavailable signal for
+    /// latency + error-%). `0` ⇒ no finalized flow fed the latency/error fields ⇒ they
+    /// render `—`.
     pub samples: u64,
+    /// Count of those terminal flows that reported token usage (gap 01 review round 1,
+    /// finding 3) — the SEPARATE `tokens_per_sec` measurability denominator. Token and
+    /// cost availability are NOT the same as `samples`: a window can have `samples > 0`
+    /// yet `usage_samples == 0` (every finalized flow omitted usage), in which case
+    /// `tokens_per_sec`/`cost_per_min` are unmeasurable and render `—`, never a fake `0`.
+    pub usage_samples: u64,
+    /// Count of usage-bearing terminal flows whose served model has a configured price
+    /// (gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no
+    /// PRICED usage in the window ⇒ `cost_per_min` renders `—`, distinguishing an
+    /// unpriced model from a genuine measured `$0.00`. All three are finite `u64`s, so
+    /// they never violate the frozen finite-number wire contract.
+    pub priced_samples: u64,
 }
 
 /// A topology node — the D4 `ProviderHealth` shape, except `catalog_size` is
@@ -645,6 +671,19 @@ fn flow_status_payload(record: &FlowRecord, completed_at_ms: Option<u128>) -> Da
     }
 }
 
+/// The next STRICTLY-MONOTONIC metrics-domain wire cursor (gap 01 review round 1,
+/// finding 1). `view_seq` is the metrics ring's own `metrics_seq`; `last_emitted` is the
+/// last cursor this connection put on the wire. Returns `max(view_seq, last_emitted + 1)`:
+/// a genuine ring advance carries the true `view_seq`, while an active-stream-only change
+/// (which does NOT bump `view_seq`) still advances the cursor by one so the frame is not
+/// dropped as a same-seq duplicate by the client's per-domain `seq <= cursor` dedup. The
+/// result is always `> last_emitted`, keeping the metrics domain's `{domain, seq}` cursor
+/// monotonic WITHOUT a global watermark (AGENTS.md). `saturating_add` guards the (absurd)
+/// `u64::MAX` edge so the cursor never wraps.
+fn next_metrics_cursor(view_seq: u64, last_emitted: u64) -> u64 {
+    view_seq.max(last_emitted.saturating_add(1))
+}
+
 /// Build a metrics-domain `MetricTick` frame from a collapsed [`MetricsView`]
 /// (D5), the live open-flow `active_streams` count, and the price table.
 ///
@@ -676,6 +715,8 @@ pub fn metric_tick_frame(
             tokens_per_sec: body.tokens_per_sec,
             cost_per_min: body.cost_per_min,
             samples: body.samples,
+            usage_samples: body.usage_samples,
+            priced_samples: body.priced_samples,
             windows: body.windows,
         })],
     }
@@ -871,7 +912,27 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // delayed monitor update can never inherit a newer FlowStore mutation seq and
     // dedup-drop the final flow frame. The flow SUMMARIES still come from the FlowStore.
     let (metrics_view, metrics_seq) = gateway.metrics().view_with_seq();
+    // The raw VIEW seq last observed off the metrics ring — used to detect whether the
+    // aggregated tile changed (a terminal finalized).
     let mut last_metrics_seq = metrics_seq;
+    // Gap 01 review round 1 (finding 1): `active_streams` changes while a request is
+    // IN FLIGHT, but the metrics ring `metrics_seq` only advances at terminal finalize,
+    // so a tick gated solely on `seq != last_metrics_seq` never re-emits for an
+    // active-count change — the strip's live count freezes at the snapshot value until
+    // the next finalize. We therefore ALSO emit when the live `active_streams` count
+    // changes, sampled at tick time. Track the active count carried by THIS snapshot so
+    // the first such change is detected.
+    let snapshot_active = crate::dashboard_api::active_stream_count(&gateway);
+    let mut last_active = snapshot_active;
+    // The MONOTONIC metrics-domain wire cursor we have emitted (per-domain `{domain,
+    // seq}`, NOT a global watermark — AGENTS.md). It starts at the snapshot's
+    // `metrics_seq` baseline and only ever increases. An active-only change (no view-seq
+    // bump) nudges it forward by 1 via `next_metrics_cursor`, and a real view-seq bump
+    // takes the max — so every emitted frame carries a STRICTLY GREATER `seq` than the
+    // last, which the client's `seq <= cursor` whole-frame dedup (and the `metrics_seq`
+    // sample dedup) both accept. This is what lets a same-view-seq active change reach
+    // the strip (the client previously dropped same-seq metrics frames).
+    let mut last_emitted_metrics_seq = metrics_seq;
     // Gap 01: build the metrics baseline from the SAME honest tile the REST read +
     // live tick use — real `active_streams` (live open-flow count) + priced
     // `cost_per_min`/`tokens_per_sec`/true rates — so the strip is honest from the
@@ -879,7 +940,7 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     let metrics = Some(metrics_snapshot(
         &metrics_view,
         metrics_seq,
-        crate::dashboard_api::active_stream_count(&gateway),
+        snapshot_active,
         gateway.price_table(),
     ));
     let topo = gateway.provider_health_publisher().latest();
@@ -972,21 +1033,29 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                 }
             }
             _ = metric_ticker.tick() => {
-                // Atomic view + seq (finding 2): pair the tile body with its own cursor.
+                // Atomic view + seq (D7b R2 finding 2): pair the tile body with its own
+                // ring cursor. `active_streams` is sampled AT tick time from the live
+                // FlowStore — the honest in-flight count for THIS frame.
                 let (view, seq) = gateway.metrics().view_with_seq();
-                if seq != last_metrics_seq {
+                let active = crate::dashboard_api::active_stream_count(&gateway);
+                // Gap 01 finding 1: emit when EITHER the aggregated view changed
+                // (`seq` advanced at a terminal finalize) OR the live open-flow count
+                // changed (a request started/ended mid-flight, which does NOT bump the
+                // ring seq). Without the active-count clause, an in-flight count change
+                // never reaches the strip until the next finalize.
+                if seq != last_metrics_seq || active != last_active {
                     last_metrics_seq = seq;
+                    last_active = active;
+                    // Stamp a STRICTLY-MONOTONIC metrics-domain cursor: the real view
+                    // seq, or (for an active-only change that did not advance it) one
+                    // past the last emitted cursor. Either way `> last_emitted`, so the
+                    // client accepts the frame instead of dropping it as a same-seq dup.
+                    let emit_seq = next_metrics_cursor(seq, last_emitted_metrics_seq);
+                    last_emitted_metrics_seq = emit_seq;
                     // Gap 01: the live tick carries the live open-flow count + price table
                     // so `active_streams`/`cost_per_min`/`tokens_per_sec`/true rates are
-                    // real (not the old hard-coded `0.0`). `active_streams` is sampled AT
-                    // tick time from the live FlowStore — the honest in-flight count for
-                    // THIS frame.
-                    let frame = metric_tick_frame(
-                        &view,
-                        seq,
-                        crate::dashboard_api::active_stream_count(&gateway),
-                        gateway.price_table(),
-                    );
+                    // real (not the old hard-coded `0.0`).
+                    let frame = metric_tick_frame(&view, emit_seq, active, gateway.price_table());
                     match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
                         SendOutcome::Completed => {}
                         SendOutcome::Expired => {
@@ -1983,6 +2052,8 @@ mod tests {
                 tokens_per_sec: 142.0,
                 cost_per_min: 0.21,
                 samples: 252,
+                usage_samples: 250,
+                priced_samples: 240,
                 windows: MetricWindows {
                     m1: MetricWindow {
                         reqs_per_sec: 4.2,
@@ -1994,6 +2065,8 @@ mod tests {
                         tokens_per_sec: 142.0,
                         cost_per_min: 0.21,
                         samples: 252,
+                        usage_samples: 250,
+                        priced_samples: 240,
                     },
                     m5: MetricWindow {
                         reqs_per_sec: 3.8,
@@ -2005,6 +2078,8 @@ mod tests {
                         tokens_per_sec: 128.0,
                         cost_per_min: 0.19,
                         samples: 1140,
+                        usage_samples: 1130,
+                        priced_samples: 1100,
                     },
                     h1: MetricWindow {
                         reqs_per_sec: 2.9,
@@ -2016,6 +2091,8 @@ mod tests {
                         tokens_per_sec: 100.0,
                         cost_per_min: 0.15,
                         samples: 10440,
+                        usage_samples: 10400,
+                        priced_samples: 10000,
                     },
                 },
             })],
@@ -2029,16 +2106,49 @@ mod tests {
                     "type": "metric_tick",
                     "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1,
                     "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21,
-                    "samples": 252,
+                    "samples": 252, "usage_samples": 250, "priced_samples": 240,
                     "windows": {
-                        "m1": { "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1, "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21, "samples": 252 },
-                        "m5": { "reqs_per_sec": 3.8, "active_streams": 3, "error_pct": 1.0, "p50": 175.0, "p95": 900.0, "p99": 1800.0, "tokens_per_sec": 128.0, "cost_per_min": 0.19, "samples": 1140 },
-                        "h1": { "reqs_per_sec": 2.9, "active_streams": 2, "error_pct": 0.8, "p50": 160.0, "p95": 850.0, "p99": 1700.0, "tokens_per_sec": 100.0, "cost_per_min": 0.15, "samples": 10440 }
+                        "m1": { "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1, "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21, "samples": 252, "usage_samples": 250, "priced_samples": 240 },
+                        "m5": { "reqs_per_sec": 3.8, "active_streams": 3, "error_pct": 1.0, "p50": 175.0, "p95": 900.0, "p99": 1800.0, "tokens_per_sec": 128.0, "cost_per_min": 0.19, "samples": 1140, "usage_samples": 1130, "priced_samples": 1100 },
+                        "h1": { "reqs_per_sec": 2.9, "active_streams": 2, "error_pct": 0.8, "p50": 160.0, "p95": 850.0, "p99": 1700.0, "tokens_per_sec": 100.0, "cost_per_min": 0.15, "samples": 10440, "usage_samples": 10400, "priced_samples": 10000 }
                     }
                 }
             ]
         });
         assert_eq!(got, want);
+    }
+
+    /// Gap 01 finding 1: the metrics-domain cursor stays STRICTLY MONOTONIC across both
+    /// a genuine ring advance AND an active-stream-only change (which does not bump the
+    /// ring `metrics_seq`). An active-only change must still produce a `seq` greater than
+    /// the last emitted one so the client does not drop it as a same-seq duplicate; a
+    /// later genuine ring advance must still win when it is higher.
+    #[test]
+    fn next_metrics_cursor_is_strictly_monotonic_for_active_only_changes() {
+        // Baseline: snapshot seeded the cursor at the ring seq (say 5).
+        let mut emitted = 5u64;
+        // Active-stream-only change: ring seq unchanged (5), cursor must advance to 6.
+        let next = next_metrics_cursor(5, emitted);
+        assert_eq!(
+            next, 6,
+            "active-only change advances the cursor past the last"
+        );
+        assert!(next > emitted);
+        emitted = next;
+        // Another active-only change: 5 -> 7 (still strictly increasing).
+        let next = next_metrics_cursor(5, emitted);
+        assert_eq!(next, 7);
+        emitted = next;
+        // A genuine ring advance to seq 9 (a terminal finalized): the true seq wins
+        // because it exceeds last_emitted + 1.
+        let next = next_metrics_cursor(9, emitted);
+        assert_eq!(next, 9, "a higher ring seq is carried verbatim");
+        assert!(next > emitted);
+        emitted = next;
+        // A ring seq that did NOT advance past the nudged cursor still increments by one
+        // (never goes backwards, never repeats).
+        let next = next_metrics_cursor(9, emitted);
+        assert_eq!(next, 10);
     }
 
     /// The `topology_update` payload matches `GOLDEN_TOPOLOGY_FRAME_JSON`:

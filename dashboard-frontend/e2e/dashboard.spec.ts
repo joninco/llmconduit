@@ -30,6 +30,17 @@ test.describe('Argus dashboard', () => {
       // A real, non-zero reading (the mock's seeded window is all > 0).
       expect(text, `${key} reads a real number`).toMatch(/[1-9]/);
     }
+
+    // Gap 01 finding 4: every chip exposes its data-quality provenance. The mock window
+    // is fully measured, so directly-counted metrics read `measured`, sample-derived ones
+    // `derived`, and the priced cost `estimated` (labelled as such, per the plan).
+    const quality = (key: string) => page.getByTestId(`chip-${key}`).getAttribute('data-quality');
+    expect(await quality('reqs_per_sec')).toBe('measured');
+    expect(await quality('active_streams')).toBe('measured');
+    expect(await quality('p50')).toBe('derived');
+    expect(await quality('tokens_per_sec')).toBe('derived');
+    expect(await quality('cost_per_min')).toBe('estimated');
+
     expect(consoleErrors, 'console errors on the stats strip').toEqual([]);
   });
 

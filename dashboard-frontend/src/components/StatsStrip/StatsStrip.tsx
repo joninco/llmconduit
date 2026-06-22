@@ -105,18 +105,39 @@ const ACCENT_TEXT: Record<ChipDescriptor['accent'], string> = {
 
 const DELTA_CLASS = { up: 'text-status-healthy', down: 'text-status-down', flat: 'text-text-muted' } as const;
 
-/** One chip: label, tabular-nums value + delta arrow, and the metric's sparkline. */
+/**
+ * Human-readable provenance label per quality tier (finding 4) — surfaced in the chip's
+ * `title` + screen-reader text so an operator can tell a directly-counted value from a
+ * derived/estimated one from an honest gap, exactly as the IMPLEMENTATION_PLAN requires.
+ */
+const QUALITY_LABEL: Record<ChipDescriptor['quality'], string> = {
+  measured: 'measured',
+  derived: 'derived from finalized-flow samples',
+  estimated: 'estimated (priced via the configured price table)',
+  unavailable: 'unavailable — not measurable in this window',
+};
+
+/** One chip: label, tabular-nums value + delta arrow, a provenance tag, and the sparkline. */
 function ChipCell({ chip, series }: { chip: ChipDescriptor; series: number[] }) {
+  const qualityText = QUALITY_LABEL[chip.quality];
   return (
     <div
       className="flex flex-col gap-1 border-l border-line/50 px-3 py-1 first:border-l-0"
       data-testid={`chip-${chip.key}`}
+      // Provenance exposed to the DOM (finding 4): tests + tooling can assert the tag, and
+      // the `title` gives operators a hover hint. EVERY chip carries one of
+      // measured/derived/estimated/unavailable.
+      data-quality={chip.quality}
+      title={`${chip.label}: ${qualityText}`}
     >
       <span className="text-[10px] uppercase tracking-[0.14em] text-text-muted">{chip.label}</span>
       <div className="flex items-baseline gap-1">
         <span
           className={cn('font-mono text-xl font-semibold tabular-nums tracking-tight', ACCENT_TEXT[chip.accent])}
           data-testid="chip-value"
+          // Make the provenance available to assistive tech without cluttering the visual
+          // (the value reads e.g. "142 (derived from finalized-flow samples)").
+          aria-label={`${chip.label} ${chip.value}, ${qualityText}`}
         >
           {chip.value}
         </span>

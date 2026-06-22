@@ -511,6 +511,8 @@ export class DashboardSocket {
           tokens_per_sec: payload.tokens_per_sec,
           cost_per_min: payload.cost_per_min,
           samples: payload.samples,
+          usage_samples: payload.usage_samples,
+          priced_samples: payload.priced_samples,
           windows: payload.windows,
         });
         return;

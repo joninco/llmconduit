@@ -27,6 +27,56 @@ export type MetricKey =
   | 'tokens_per_sec'
   | 'cost_per_min';
 
+/**
+ * Which per-window count is a metric's MEASURABILITY denominator (gap 01 findings 2/3 —
+ * token and cost availability are SEPARATE from latency). `0` for the relevant count means
+ * the metric is unmeasurable in that window → the chip renders `—` and the sparkline draws
+ * a gap, never a fabricated `0`:
+ *  - `always`  — not sample-gated (`req/s` idle-`0`, `active_streams` live count).
+ *  - `samples` — needs a finalized flow (err%, p50/p95/p99).
+ *  - `usage`   — needs a finalized flow that REPORTED usage (`tokens_per_sec`).
+ *  - `priced`  — needs a usage-bearing flow on a PRICED model (`cost_per_min`).
+ * Lives here (the pure history module) so both the sparkline (`seriesFor`) and the chip
+ * value (`deriveChips`) read one source — and so there is no chips↔history import cycle.
+ */
+export type Availability = 'always' | 'samples' | 'usage' | 'priced';
+
+/** Each metric's measurability denominator (gap 01 finding 3). */
+export const METRIC_AVAILABILITY: Record<MetricKey, Availability> = {
+  reqs_per_sec: 'always',
+  active_streams: 'always',
+  error_pct: 'samples',
+  p50: 'samples',
+  p95: 'samples',
+  p99: 'samples',
+  tokens_per_sec: 'usage',
+  cost_per_min: 'priced',
+};
+
+/** Read a window's measurability denominator for an `Availability` tier. */
+function denominatorFor(window: MetricWindow, availability: Availability): number {
+  switch (availability) {
+    case 'always':
+      return Number.POSITIVE_INFINITY; // never gated
+    case 'samples':
+      return window.samples;
+    case 'usage':
+      return window.usage_samples;
+    case 'priced':
+      return window.priced_samples;
+  }
+}
+
+/**
+ * Whether `metric` is UNMEASURABLE for `window` — its measurability denominator is `0`.
+ * A `null` window (no tick yet) is unavailable for every metric. Shared by `seriesFor`
+ * (sparkline → gap) AND `deriveChips` (value → `—`) so the trend and the value agree.
+ */
+export function metricUnavailable(window: MetricWindow | null, metric: MetricKey): boolean {
+  if (!window) return true;
+  return denominatorFor(window, METRIC_AVAILABILITY[metric]) === 0;
+}
+
 /** Sparkline depth (samples retained per window). Spec: 60-sample sparklines. */
 export const HISTORY_DEPTH = 60;
 
@@ -64,9 +114,19 @@ export function appendTick(
   };
 }
 
-/** Extract the `metric` field across a window's ring into the Sparkline's `number[]`. */
+/**
+ * Extract the `metric` field across a window's ring into the Sparkline's `number[]`.
+ *
+ * Availability-aware (gap 01 finding 2): a sample-derived point that was UNMEASURABLE in
+ * its sample (e.g. `tokens_per_sec` when that sample's `usage_samples === 0`, or
+ * `cost_per_min` when `priced_samples === 0`) is emitted as `NaN` — uPlot renders a GAP
+ * there rather than plotting a raw `0`, so an unavailable p50/tok-s/$/min never draws a
+ * misleading zero trend. `metricUnavailable` (above) is the same predicate the chip value
+ * uses, so the sparkline and the chip agree on what is real vs. a gap. `req/s`/
+ * `active_streams` are never gated, so their series is the raw values.
+ */
 export function seriesFor(history: MetricHistory, window: WindowKey, metric: MetricKey): number[] {
-  return history[window].map((w) => w[metric]);
+  return history[window].map((w) => (metricUnavailable(w, metric) ? NaN : w[metric]));
 }
 
 /** The newest sample for a window (the live chip VALUE), or null before any tick. */
