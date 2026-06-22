@@ -240,6 +240,75 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     // A confident cost carries NO estimated badge.
     expect(() => getByTestId('cost-confidence')).toThrow();
   });
+
+  // Gap 07 review round 3 — the cost VALUE and its CONFIDENCE tag must derive from the SAME source.
+  // A stale REST detail row carrying `cost: null, cost_confidence: 'unavailable'` must NOT mask an
+  // ESTIMATED live roll-up: the header must show the LIVE cost WITH its `est` badge, never `—`.
+  // `api_g07c` is unknown to the mock so /flows/:id 404s and never overwrites the injected detail.
+  it('does not let an unavailable detail tag mask an ESTIMATED live cost (paired source)', async () => {
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g07c',
+        status: 'completed',
+        model_served: 'llama-3.1-70b',
+        upstream_target: 'vllm-a',
+        started_ms: 1_700_000_000_000,
+        // LIVE roll-up: an estimated cost that MUST surface (value + est marker), not be masked.
+        cost: 0.0042,
+        cost_confidence: 'estimated',
+        usage: { prompt: 1500, completion: 980, total: 2480 },
+      }),
+    ]);
+    const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_g07c" onClose={noop} />);
+    // Inject a stale detail with NO cost + an `unavailable` tag — the desync trap. Were the tag
+    // derived independently (detail-first), it would mask the live estimated cost as `—`.
+    const staleDetail: FlowDetailDto = {
+      flow_seq: 1, api_call_id: 'api_g07c', status: 'completed',
+      cost: null, cost_confidence: 'unavailable',
+      deltas: [], started_ms: 1_700_000_000_000,
+      inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
+    };
+    act(() => queryClient.setQueryData(['flows', 'api_g07c'], staleDetail));
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+
+    // The LIVE estimated cost is shown (NOT `—`), paired with its own `estimated` tag → est badge.
+    const costCell = getByTestId('detail-cost');
+    expect(costCell.textContent).toContain('$0.0042');
+    expect(costCell.textContent).not.toBe('—');
+    expect(costCell.getAttribute('data-confidence')).toBe('estimated');
+    expect(getByTestId('cost-confidence').getAttribute('data-confidence')).toBe('estimated');
+  });
+
+  // Gap 07 review round 3 (companion) — same stale `unavailable` detail, but the live roll-up is
+  // CONFIDENT: the header shows the live cost (paired with `confident`) and carries NO est badge.
+  it('pairs a CONFIDENT live cost with its own tag despite an unavailable detail (no est badge)', async () => {
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g07d',
+        status: 'completed',
+        model_served: 'gpt-4o',
+        started_ms: 1_700_000_000_000,
+        cost: 0.0099,
+        cost_confidence: 'confident',
+        usage: { prompt: 1500, completion: 980, total: 2480, cached: 0, reasoning: 0 },
+      }),
+    ]);
+    const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_g07d" onClose={noop} />);
+    const staleDetail: FlowDetailDto = {
+      flow_seq: 1, api_call_id: 'api_g07d', status: 'completed',
+      cost: null, cost_confidence: 'unavailable',
+      deltas: [], started_ms: 1_700_000_000_000,
+      inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
+    };
+    act(() => queryClient.setQueryData(['flows', 'api_g07d'], staleDetail));
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+
+    const costCell = getByTestId('detail-cost');
+    expect(costCell.textContent).toContain('$0.0099');
+    expect(costCell.getAttribute('data-confidence')).toBe('confident');
+    // A confident cost carries NO estimated badge — the `unavailable` detail tag did not leak.
+    expect(() => getByTestId('cost-confidence')).toThrow();
+  });
 });
 
 describe('FlowDetail — time-travel seek + body eviction', () => {

@@ -80,17 +80,35 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   const sync = useScrollSync(3);
   const isActive = status === 'open';
 
-  // Cost from the MERGED flow+detail data: prefer the server roll-up (detail.cost, else the live
-  // row's cost), and only fall back to usage×price when neither roll-up exists. Building a merged
-  // summary (live status/usage wins; roll-up cost + detail fields fill gaps) lets `flowCost` apply
-  // its own roll-up-first precedence, so a live row LACKING cost no longer hides `detail.cost`.
+  // Cost + its confidence tag are derived TOGETHER as a PAIR from the SAME source (gap 07 review
+  // round 3): the displayed dollar value and the `estimated`/`unavailable` provenance tag MUST never
+  // come from different rows, or a stale `detail` row with `cost: null, cost_confidence: 'unavailable'`
+  // can mask an `estimated` LIVE cost as `—` (dropping the figure AND its est marker).
+  //
+  // Source precedence MIRRORS `flowCost`'s own roll-up-first precedence so the tag follows the value:
+  //   1. server detail roll-up (`detail.cost` finite)  ⇒ pair with `detail.cost_confidence`
+  //   2. else the live row's roll-up (`liveFlow.cost` finite) ⇒ pair with `liveFlow.cost_confidence`
+  //   3. else usage×price fallback (neither roll-up) ⇒ freshest tag, live-first, mirroring the merged
+  //      usage source (`liveFlow.usage ?? detail.usage`), so the tag tracks the usage being priced.
+  // Building a merged summary (live status/usage wins; roll-up cost + detail fields fill gaps) lets
+  // `flowCost` apply its roll-up-first precedence, so a live row LACKING cost no longer hides
+  // `detail.cost`.
   //
   // SEEK coherence (finding 1/3): while seeking, `liveFlow` IS the frozen snapshot row and the live
-  // REST detail is withheld (`frozenDetail` is null) — so cost derives EXCLUSIVELY from the frozen
-  // summary, never the live REST roll-up.
-  const cost = useMemo(() => {
+  // REST detail is withheld (`frozenDetail` is null) — so BOTH cost and its tag derive EXCLUSIVELY
+  // from the frozen summary, never the live REST roll-up.
+  const { cost, costConfidence } = useMemo<{ cost: number | null; costConfidence: CostConfidence }>(() => {
     const summary = frozenDetail;
-    if (!liveFlow && !summary) return null;
+    if (!liveFlow && !summary) return { cost: null, costConfidence: 'unavailable' };
+    const detailRollup = isFiniteNumber(summary?.cost);
+    const liveRollup = isFiniteNumber(liveFlow?.cost);
+    // The tag is taken from the EXACT source that supplies the displayed cost value.
+    const costConfidence: CostConfidence = detailRollup
+      ? summary!.cost_confidence
+      : liveRollup
+        ? liveFlow!.cost_confidence
+        : // usage×price fallback (no roll-up either side): freshest tag, mirroring the merged usage.
+          liveFlow?.cost_confidence ?? summary?.cost_confidence ?? 'unavailable';
     const merged: FlowSummary = {
       ...(summary ?? {}),
       ...(liveFlow ?? {}),
@@ -105,16 +123,10 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
       usage: liveFlow?.usage ?? summary?.usage ?? null,
       model_served: liveFlow?.model_served ?? summary?.model_served ?? null,
       model_requested: liveFlow?.model_requested ?? summary?.model_requested ?? null,
-      cost_confidence: summary?.cost_confidence ?? liveFlow?.cost_confidence ?? 'unavailable',
+      cost_confidence: costConfidence,
     };
-    return flowCost(merged, priceTable);
+    return { cost: flowCost(merged, priceTable), costConfidence };
   }, [liveFlow, frozenDetail, apiCallId, status, priceTable]);
-
-  // Gap 07 — the cost CONFIDENCE tag for the header label: the server's per-flow tag
-  // (detail roll-up first, then the live row). `estimated` MUST be labelled in the UI
-  // (the cross-cutting rule); `unavailable` rides with a `—` cost. Only meaningful when
-  // a cost actually exists.
-  const costConfidence = frozenDetail?.cost_confidence ?? liveFlow?.cost_confidence ?? 'unavailable';
   // Gap 07 — the cumulative token usage for the breakdown row (freshest: live, then detail):
   // cached/reasoning may be UNREPORTED (null/absent) ⇒ `fmtTokens` renders `—`, never `0`.
   const usage = liveFlow?.usage ?? frozenDetail?.usage ?? null;
@@ -201,6 +213,13 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
 /** When seeking a historical cut, a missing body is explicitly evicted (D5 tradeoff). */
 function emptyBodyLabel(seeking: boolean): string {
   return seeking ? 'body evicted (snapshot)' : 'body evicted';
+}
+
+/** A roll-up cost is "present" (drives the displayed value) only when it is a finite number —
+ * mirrors `flowCost`'s `typeof === 'number' && Number.isFinite` guard, so the paired confidence
+ * tag is chosen from the SAME source `flowCost` will actually read the cost from. */
+function isFiniteNumber(v: number | null | undefined): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
 }
 
 /** Shared search across the three layers — one query, every pane filters + highlights. */
