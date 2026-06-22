@@ -142,7 +142,9 @@ export const MALFORMED_FRAME_JSON = JSON.stringify({
   domain: 'flow',
   seq: 99,
   batch: [
-    { type: 'usage', api_call_id: 'api_x' /* missing prompt/completion/total/cached/reasoning */ },
+    // Missing the REQUIRED prompt/completion/total (cached/reasoning are OPTIONAL since
+    // gap 07 — their absence alone is valid, so this stays invalid on the required counts).
+    { type: 'usage', api_call_id: 'api_x' },
   ],
 });
 

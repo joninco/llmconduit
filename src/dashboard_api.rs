@@ -514,24 +514,43 @@ fn window_total_cost(report: &WindowReport, prices: &HashMap<String, ModelPrice>
 }
 
 /// Gap 07 — the AGGREGATE [`CostConfidence`] of one window's `cost_per_min`. An
-/// aggregate touching ANY non-confident priced flow is itself `estimated` (spec 07:
+/// aggregate touching ANY non-confident component is itself `estimated` (spec 07:
 /// "no silently-confident totals"):
 /// - NO priced bucket (nothing to bill) ⇒ `Unavailable` (`cost_per_min` renders `—`).
 /// - A priced bucket would bill cached at the default `0.0` — i.e. it billed cached
 ///   tokens (`cached_tokens > 0`) OR a usage-bearing flow left cached UNREPORTED
 ///   (`unreported_cached_samples > 0`) — while that model has NO configured cached
 ///   rate ⇒ `Estimated`.
+/// - An UNPRICED but USAGE-BEARING bucket (`usage_samples > 0`, no configured price)
+///   COEXISTS with priced buckets ⇒ `Estimated` (gap 07 review round 1, finding 2). Its
+///   real spend is OMITTED from `cost_per_min` entirely (unpriced ⇒ contributes `0`), so
+///   the reported total is a PARTIAL undercount of the window's true cost — exactly the
+///   kind of silently-confident total the spec forbids. It is NOT `unavailable` (some
+///   buckets ARE priced, so `cost_per_min` is a real number that renders), just an
+///   incomplete one. A usage-LESS unpriced bucket (a flow that reported no tokens, e.g. a
+///   failure) adds no missing cost, so it does NOT taint the window.
 /// - Otherwise (every priced bucket either bills no cached tokens AND had none
-///   unreported, or its model has a configured cached rate) ⇒ `Confident`.
+///   unreported or has a configured cached rate, AND no unpriced bucket bore usage) ⇒
+///   `Confident`.
 fn window_cost_confidence(
     report: &WindowReport,
     prices: &HashMap<String, ModelPrice>,
 ) -> CostConfidence {
     let mut any_priced = false;
     let mut any_estimated = false;
+    // Tracked SEPARATELY from `any_estimated` because an unpriced usage-bearing bucket
+    // only forces `estimated` when a priced bucket ALSO exists (a window that is ALL
+    // unpriced stays `unavailable` — nothing was billed at all).
+    let mut unpriced_usage_bearing = false;
     for (key, counts) in &report.buckets {
         let Some(price) = price_lookup(prices, &key.model) else {
-            continue; // unpriced bucket contributes no cost (and no confidence claim).
+            // Unpriced bucket: its cost is OMITTED from the window total. If it carried
+            // real usage, the total is a partial undercount — flag it (resolved against
+            // `any_priced` below). A usage-less unpriced bucket adds no missing cost.
+            if counts.usage_samples > 0 {
+                unpriced_usage_bearing = true;
+            }
+            continue;
         };
         any_priced = true;
         // This priced bucket bills cached at the default 0.0 when it has cached tokens
@@ -541,7 +560,10 @@ fn window_cost_confidence(
             any_estimated = true;
         }
     }
-    match (any_priced, any_estimated) {
+    // An unpriced usage-bearing bucket taints the total ONLY when something priced
+    // contributes to it (otherwise the window is `unavailable`, handled below).
+    let partial_from_unpriced = any_priced && unpriced_usage_bearing;
+    match (any_priced, any_estimated || partial_from_unpriced) {
         (false, _) => CostConfidence::Unavailable,
         (true, true) => CostConfidence::Estimated,
         (true, false) => CostConfidence::Confident,
@@ -1820,5 +1842,103 @@ mod tests {
         );
         let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
         assert_eq!(body.cost_confidence, CostConfidence::Unavailable);
+    }
+
+    /// Gap 07 review round 1, finding 2 — a MIXED window (one CONFIDENT priced bucket
+    /// PLUS one UNPRICED usage-bearing bucket) is `estimated`, NOT `confident`: the
+    /// unpriced bucket's real spend is OMITTED from `cost_per_min`, so the total is a
+    /// PARTIAL undercount of the window's true cost — a silently-confident total the
+    /// spec forbids. It stays `estimated` (not `unavailable`) because the priced bucket
+    /// makes `cost_per_min` a real, rendered number. A contrast case proves a usage-LESS
+    /// unpriced bucket (a flow that reported NO tokens) does NOT taint a confident window
+    /// (it adds no missing cost), and `unavailable` is still reserved for an all-unpriced
+    /// window.
+    #[test]
+    fn window_cost_confidence_mixed_priced_and_unpriced_usage_is_estimated() {
+        use crate::dashboard_flow::FlowStatus as FS;
+        use crate::metrics::MetricsLayer;
+        // The priced model has a CONFIGURED cache rate, so its own bucket is confident —
+        // isolating the unpriced-bucket effect (no cached-rate fallback confounder).
+        let mut prices = HashMap::new();
+        prices.insert("priced".to_string(), ModelPrice::new(2.0, 6.0, 1.0));
+
+        // (d) confident priced bucket (reported cached=0, configured cache rate) PLUS an
+        // unpriced usage-bearing bucket ⇒ estimated (partial total).
+        let metrics = MetricsLayer::new();
+        metrics.record_terminal(
+            FS::Completed,
+            Some("priced"),
+            "/v1/responses",
+            Some("vllm-a"),
+            900,
+            Some(FlowUsage {
+                prompt: 1000,
+                completion: 500,
+                total: 1500,
+                cached: Some(0), // reported zero ⇒ this bucket alone is confident
+                reasoning: Some(0),
+            }),
+        );
+        metrics.record_terminal(
+            FS::Completed,
+            Some("free"), // unpriced, but it carried real usage
+            "/v1/responses",
+            Some("vllm-b"),
+            500,
+            Some(usage(800, 400, 0)),
+        );
+        let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
+        assert_eq!(
+            body.cost_confidence,
+            CostConfidence::Estimated,
+            "a priced-confident bucket + an unpriced USAGE-BEARING bucket ⇒ estimated \
+             (the unpriced spend is omitted from cost_per_min — a partial total)"
+        );
+        assert_eq!(body.windows.m1.cost_confidence, CostConfidence::Estimated);
+        // The priced bucket makes the total a real number (NOT unavailable): a priced
+        // sample exists, so $/min renders.
+        assert_eq!(
+            body.priced_samples, 1,
+            "exactly the priced bucket is countable"
+        );
+        assert!(
+            body.cost_per_min > 0.0,
+            "cost_per_min is a real (if partial) number, so estimated — not unavailable"
+        );
+
+        // (e) confident priced bucket PLUS a usage-LESS unpriced bucket (no tokens
+        // reported — e.g. a failure) ⇒ STILL confident: the unpriced bucket adds no
+        // missing cost, so the total is complete.
+        let metrics = MetricsLayer::new();
+        metrics.record_terminal(
+            FS::Completed,
+            Some("priced"),
+            "/v1/responses",
+            Some("vllm-a"),
+            900,
+            Some(FlowUsage {
+                prompt: 1000,
+                completion: 500,
+                total: 1500,
+                cached: Some(0),
+                reasoning: Some(0),
+            }),
+        );
+        // A terminal flow on an unpriced model that reported NO usage (usage_samples == 0
+        // for its bucket): bumps the count but contributes no token throughput/cost.
+        metrics.record_terminal(
+            FS::Failed,
+            Some("free"),
+            "/v1/responses",
+            Some("vllm-b"),
+            120,
+            None,
+        );
+        let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
+        assert_eq!(
+            body.cost_confidence,
+            CostConfidence::Confident,
+            "a usage-LESS unpriced bucket adds no missing cost ⇒ the window stays confident"
+        );
     }
 }

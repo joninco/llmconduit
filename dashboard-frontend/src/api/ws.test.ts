@@ -151,6 +151,34 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     })).toBe(false);
   });
 
+  it('usage: cached/reasoning are OPTIONAL — absent/null/0 all valid, distinct on the wire (gap 07 finding 1)', () => {
+    // ABSENT cached/reasoning → valid (an unreported class is omitted, not a fake 0).
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'usage', api_call_id: 'api_x', prompt: 1, completion: 1, total: 2 }],
+    })).toBe(true);
+    // Explicit null → valid (UNAVAILABLE).
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'usage', api_call_id: 'api_x', prompt: 1, completion: 1, total: 2, cached: null, reasoning: null }],
+    })).toBe(true);
+    // Present 0 → valid (a measured zero, DISTINCT from absent/null).
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'usage', api_call_id: 'api_x', prompt: 1, completion: 1, total: 2, cached: 0, reasoning: 0 }],
+    })).toBe(true);
+    // The REQUIRED core counts are still enforced (a missing total is rejected).
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'usage', api_call_id: 'api_x', prompt: 1, completion: 1 }],
+    })).toBe(false);
+    // A non-numeric cached is rejected.
+    expect(isDashboardFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'usage', api_call_id: 'api_x', prompt: 1, completion: 1, total: 2, cached: 'x' }],
+    })).toBe(false);
+  });
+
   it('drops a stale frame WHOLESALE when seq <= last_seq[domain]', () => {
     socket.applyFrame(buildMonitorFrame(6));
     expect(dashboardStore.getState().monitor).toHaveLength(4);
@@ -191,6 +219,30 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     expect(dashboardStore.getState().flows.get('api_001')?.usage).toEqual({
       prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 16,
     });
+  });
+
+  it('a usage frame with UNREPORTED cached/reasoning does not store a fabricated 0 (gap 07 finding 1)', () => {
+    socket.applyFrame({
+      domain: 'flow', seq: 1,
+      batch: [{ type: 'flow_status', api_call_id: 'api_u', status: 'open', model_served: 'm', upstream_target: 'u', usage: null, started_ms: 1000, elapsed_ms: 10 }],
+    });
+    // A usage frame that OMITS cached/reasoning (the upstream never broke them out).
+    expect(socket.applyFrame({
+      domain: 'flow', seq: 2,
+      batch: [{ type: 'usage', api_call_id: 'api_u', prompt: 100, completion: 50, total: 150 }],
+    })).toBe(true);
+    const usage = dashboardStore.getState().flows.get('api_u')?.usage;
+    expect(usage?.prompt).toBe(100);
+    expect(usage?.total).toBe(150);
+    // The unreported classes are NOT a measured 0 — they are absent/nullish (render `—`).
+    expect(usage?.cached ?? null).toBeNull();
+    expect(usage?.reasoning ?? null).toBeNull();
+    // And a present 0 is preserved as a measured zero, distinct from the above.
+    socket.applyFrame({
+      domain: 'flow', seq: 3,
+      batch: [{ type: 'usage', api_call_id: 'api_u', prompt: 100, completion: 50, total: 150, cached: 0, reasoning: null }],
+    });
+    expect(dashboardStore.getState().flows.get('api_u')?.usage?.cached).toBe(0);
   });
 });
 

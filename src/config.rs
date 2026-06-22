@@ -165,10 +165,20 @@ impl ModelPrice {
 
 /// Custom `Deserialize` for [`ModelPrice`] that captures cached-price PRESENCE (gap
 /// 07). `cached_per_1k` is read as an `Option<f64>`: `Some` ⇒ the source carried the
-/// key (`cached_price_configured = true`, rate = the value); `None` ⇒ it was omitted
-/// (`cached_price_configured = false`, rate defaults to `0.0`). This is how a real
+/// key, `None` ⇒ it was omitted (rate then defaults to `0.0`). This is how a real
 /// configured `0.0` cache-read rate is distinguished from an absent one — both have a
-/// `0.0` numeric, but only the configured one drives a `confident` cost. YAML and the
+/// `0.0` numeric, but only the configured one drives a `confident` cost.
+///
+/// PRESENCE round-trip (gap 07 review round 1, finding 3): `ModelPrice` SERIALIZES the
+/// additive `cached_price_configured` boolean (via the derived `Serialize`), so a
+/// re-parse MUST honor an EXPLICIT flag rather than re-deriving presence solely from
+/// `cached_per_1k`. Otherwise a [`ModelPrice::without_cached`] price (numeric
+/// `cached_per_1k: 0.0`, presence `false`) round-trips as CONFIGURED — its serialized
+/// `cached_per_1k: 0.0` is `Some`, so the old `is_some()` heuristic flipped presence to
+/// `true` and a default-`0.0` cached charge was silently re-tagged `confident`. So:
+/// PREFER the explicit `cached_price_configured` when present; fall back to the
+/// presence-of-`cached_per_1k` heuristic ONLY when the flag is absent (a hand-written
+/// YAML entry that gives a rate but no flag is still treated as configured). YAML and the
 /// `LLMCONDUIT_PRICE_TABLE_JSON` env override both feed through here.
 impl<'de> Deserialize<'de> for ModelPrice {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -181,13 +191,22 @@ impl<'de> Deserialize<'de> for ModelPrice {
             output_per_1k: f64,
             #[serde(default)]
             cached_per_1k: Option<f64>,
+            // An EXPLICIT presence flag (re-read on a round-trip of a serialized price).
+            // `None` ⇒ the source omitted it (hand-written config) ⇒ fall back to the
+            // cached_per_1k-presence heuristic below.
+            #[serde(default)]
+            cached_price_configured: Option<bool>,
         }
         let raw = Raw::deserialize(deserializer)?;
         Ok(ModelPrice {
             input_per_1k: raw.input_per_1k,
             output_per_1k: raw.output_per_1k,
             cached_per_1k: raw.cached_per_1k.unwrap_or(0.0),
-            cached_price_configured: raw.cached_per_1k.is_some(),
+            // Prefer the explicit flag (round-trips a serialized `false` faithfully);
+            // else derive from whether a `cached_per_1k` key was present.
+            cached_price_configured: raw
+                .cached_price_configured
+                .unwrap_or_else(|| raw.cached_per_1k.is_some()),
         })
     }
 }
@@ -3493,5 +3512,71 @@ model_profiles:
         // does not — the two programmatic seams matching the YAML semantics.
         assert!(ModelPrice::new(1.0, 2.0, 0.0).cached_price_configured);
         assert!(!ModelPrice::without_cached(1.0, 2.0).cached_price_configured);
+    }
+
+    /// Gap 07 review round 1, finding 3 — a NO-cache-rate price (`without_cached`,
+    /// numeric `cached_per_1k: 0.0`, presence `false`) MUST round-trip as STILL NOT
+    /// configured. The serialized form carries BOTH `cached_per_1k: 0.0` AND
+    /// `cached_price_configured: false`; the re-parse must PREFER the explicit `false`
+    /// flag over the presence-of-`cached_per_1k` heuristic (which would otherwise see
+    /// `Some(0.0)` and flip presence to `true`, silently re-tagging a default-`0.0`
+    /// cached charge as `confident`). This is the round-trip the prior presence test
+    /// only proved for the `true` case.
+    #[test]
+    fn model_price_configured_false_round_trips_as_not_configured() {
+        let unconfigured = ModelPrice::without_cached(2.0, 6.0);
+        assert!(!unconfigured.cached_price_configured);
+
+        // The serialized form carries the explicit flag alongside the numeric 0.0.
+        let json = serde_json::to_string(&unconfigured).expect("serialize");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("re-parse");
+        assert_eq!(value["cached_per_1k"], serde_json::json!(0.0));
+        assert_eq!(
+            value["cached_price_configured"],
+            serde_json::json!(false),
+            "serialize emits the explicit presence flag"
+        );
+
+        // The re-parse honors the explicit `false` — NOT re-derived to `true` from the
+        // present `cached_per_1k: 0.0`.
+        let back: ModelPrice = serde_json::from_value(value).expect("deserialize");
+        assert!(
+            !back.cached_price_configured,
+            "a serialized no-cache-rate price stays NOT configured on re-parse \
+             (explicit flag beats the cached_per_1k-presence heuristic)"
+        );
+        assert_eq!(back.cached_per_1k, 0.0);
+        assert_eq!(back, unconfigured, "full round-trip equality");
+
+        // A whole `Config` round-trip through YAML (the persisted path) preserves it too:
+        // the price serializes with its `cached_price_configured: false` and reloads NOT
+        // configured, so the cost-confidence seam keeps tagging its cached charge
+        // `estimated` rather than silently `confident`.
+        let mut table = HashMap::new();
+        table.insert("no-cache".to_string(), ModelPrice::without_cached(2.0, 6.0));
+        let persisted = PersistedConfig {
+            price_table: table,
+            ..Default::default()
+        };
+        let yaml = serde_yaml::to_string(&persisted).expect("serialize config");
+        let reloaded: PersistedConfig = serde_yaml::from_str(&yaml).expect("reload config");
+        let config = Config::from_persisted(&reloaded).expect("config");
+        let price = config.price_for("no-cache").expect("priced");
+        assert!(
+            !price.cached_price_configured,
+            "the no-cache-rate price survives a full Config YAML round-trip as NOT configured"
+        );
+
+        // An EXPLICIT `cached_price_configured: true` is honored even when
+        // `cached_per_1k` is OMITTED (the flag is authoritative when present).
+        let flag_only: ModelPrice = serde_yaml::from_str(
+            "input_per_1k: 2.0\noutput_per_1k: 6.0\ncached_price_configured: true\n",
+        )
+        .expect("yaml");
+        assert!(
+            flag_only.cached_price_configured,
+            "an explicit flag wins even with cached_per_1k omitted"
+        );
+        assert_eq!(flag_only.cached_per_1k, 0.0);
     }
 }

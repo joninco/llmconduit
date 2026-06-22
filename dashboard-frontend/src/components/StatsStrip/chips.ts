@@ -5,7 +5,7 @@
  * DOM-free so it is unit-testable and the component stays a thin renderer. Formatting reuses the
  * flow-table formatters where they fit (tokens), and adds small local ones for rates/latency/%.
  */
-import type { MetricWindow } from '../../api/types';
+import type { CostConfidence, MetricWindow } from '../../api/types';
 import { colors } from '../../design/tokens';
 import { fmtTokens } from '../FlowTable/format';
 import { metricUnavailable, type MetricKey } from './metricHistory';
@@ -81,6 +81,28 @@ function deltaDir(cur: number, prev: number | undefined): DeltaDir {
   return 'flat';
 }
 
+/**
+ * The $/min chip's provenance tier from the backend's AGGREGATE `cost_confidence` (gap 07
+ * review round 1, finding 5). Called ONLY when the cost is available (the `unavailable`
+ * denominator branch wins otherwise):
+ *  - `confident`   → `derived`   (a real cost computed from finalized-flow samples — every
+ *                                 priced bucket's billed classes have known rates).
+ *  - `estimated`   → `estimated` (some priced bucket bills cached at the default 0.0, or an
+ *                                 unpriced bucket bears usage — a labelled best-effort estimate).
+ *  - `unavailable` → `unavailable` (defensive; this normally coincides with `priced_samples ===
+ *                                 0`, which the denominator branch already caught).
+ */
+function costQuality(confidence: CostConfidence): MetricQuality {
+  switch (confidence) {
+    case 'confident':
+      return 'derived';
+    case 'estimated':
+      return 'estimated';
+    case 'unavailable':
+      return 'unavailable';
+  }
+}
+
 /** Per-metric display config: label, formatter, stroke. Order = strip display order. */
 interface MetricSpec {
   key: MetricKey;
@@ -105,7 +127,9 @@ const METRIC_SPECS: readonly MetricSpec[] = [
   { key: 'p95', label: 'p95 ms', fmt: fmtMs, stroke: colors.statusCooling, accent: 'text', quality: 'derived' },
   { key: 'p99', label: 'p99 ms', fmt: fmtMs, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
   { key: 'tokens_per_sec', label: 'tok/s', fmt: fmtTokens, stroke: colors.statusHealthy, accent: 'healthy', quality: 'derived' },
-  // $/min is PRICED via the configured price table → an estimate, surfaced as such.
+  // $/min: the static tier here is a FALLBACK only — its real quality is derived per-sample from
+  // the backend `cost_confidence` (gap 07 finding 5, see `costQuality`), so a confident aggregate
+  // reads `derived` and an estimated one reads `estimated` (no longer always `estimated`).
   { key: 'cost_per_min', label: '$/min', fmt: fmtMoney, stroke: colors.meta, accent: 'meta', quality: 'estimated' },
 ];
 
@@ -143,8 +167,19 @@ export function deriveChips(cur: MetricWindow | null, prev: MetricWindow | null)
     const delta = !unavailable && cur && !prevUnavailable
       ? deltaDir(cur[spec.key], prev?.[spec.key])
       : 'flat';
-    // Provenance (finding 4): `unavailable` when `—`, else the metric's intrinsic tier.
-    const quality: MetricQuality = unavailable ? 'unavailable' : spec.quality;
+    // Provenance (finding 4): `unavailable` when `—`, else the metric's intrinsic tier — EXCEPT
+    // the cost chip, whose tier is the AGGREGATE `cost_confidence` the backend reports (gap 07
+    // review round 1, finding 5), not a hard-coded `estimated`. A `confident` aggregate (every
+    // priced bucket's billed classes have known rates) is a real DERIVED figure; an `estimated`
+    // one (some priced bucket bills cached at the default 0.0, or an unpriced bucket bears usage)
+    // is a labelled estimate. `unavailable` is already handled by the denominator branch above
+    // (it coincides with `priced_samples === 0`), so operators can finally tell a confident
+    // aggregate cost from an estimated one instead of every `$/min` always reading `estimated`.
+    const quality: MetricQuality = unavailable
+      ? 'unavailable'
+      : spec.key === 'cost_per_min' && cur
+        ? costQuality(cur.cost_confidence)
+        : spec.quality;
     return {
       key: spec.key,
       label: spec.label,

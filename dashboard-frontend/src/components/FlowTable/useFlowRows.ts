@@ -82,12 +82,23 @@ function mergeRows(
  *  - finished_ms / elapsed_ms / cost / terminal_reason: roll-up/terminal fields — LIVE wins when it
  *    HAS them (a completing flow streams elapsed/finished), else the REST roll-up backfills, so a
  *    live update never blanks the server's values (finding 5).
+ *  - cost_confidence: PAIRED with `cost` (gap 07 review round 1, finding 4). It is non-nullable
+ *    (always a present tag, defaulting to `unavailable`), so it cannot use `??`. A WS-created row
+ *    carries the store DEFAULT `unavailable` until the backend sends the real tag — so it follows
+ *    `cost`'s source: when the LIVE row authored a real cost (`live.cost != null`) its own
+ *    confidence wins; otherwise the REST roll-up's confidence backfills ALONGSIDE the REST `cost`,
+ *    so the tag never stays stuck at `unavailable` after the server reports a confident/estimated
+ *    cost. This keeps the rendered `$` and its confidence label CONSISTENT (same source).
  *
  * Returns the live row UNCHANGED when nothing actually differs, to avoid needless object churn (and
  * keep referential stability for the virtualizer).
  */
 function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): FlowSummary {
   if (!rest) return live;
+  // `cost` is live-first, REST-backfilled. `cost_confidence` follows the SAME source so the dollar
+  // figure and its confidence label always agree: if the live frame supplied the cost, use its tag;
+  // else adopt the REST roll-up's tag together with the REST cost.
+  const liveAuthoredCost = live.cost != null;
   const merged: FlowSummary = {
     ...live,
     // REST-authoritative request line: replace a WS placeholder with the real value.
@@ -102,6 +113,7 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
     finished_ms: live.finished_ms ?? rest.finished_ms ?? null,
     elapsed_ms: live.elapsed_ms ?? rest.elapsed_ms ?? null,
     cost: live.cost ?? rest.cost ?? null,
+    cost_confidence: liveAuthoredCost ? live.cost_confidence : rest.cost_confidence,
     terminal_reason: live.terminal_reason ?? rest.terminal_reason ?? null,
   };
   return shallowEqualSummary(live, merged) ? live : merged;
@@ -119,6 +131,10 @@ function shallowEqualSummary(a: FlowSummary, b: FlowSummary): boolean {
     (a.finished_ms ?? null) === (b.finished_ms ?? null) &&
     (a.elapsed_ms ?? null) === (b.elapsed_ms ?? null) &&
     (a.cost ?? null) === (b.cost ?? null) &&
+    // Gap 07 finding 4: the confidence tag is part of row identity — a backfill that only
+    // changes `cost_confidence` (e.g. unavailable → estimated once the server tag lands) MUST
+    // produce a new object so the row re-renders with the corrected label.
+    a.cost_confidence === b.cost_confidence &&
     (a.terminal_reason ?? null) === (b.terminal_reason ?? null)
   );
 }

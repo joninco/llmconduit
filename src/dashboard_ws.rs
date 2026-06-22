@@ -23,7 +23,10 @@
 //! therefore SPLITS each `DebugUpdate`:
 //! - `DebugWsMessage::Usage` → a flow-domain [`DashboardPayload::Usage`] (the
 //!   `api_call_id` + `model_served` recovered from the [`crate::dashboard_flow::DashboardFlowStore`]
-//!   by `response_id` via its link index).
+//!   by `response_id` via its link index). The core `prompt`/`completion`/`total` come
+//!   from the monitor message; the OPTIONAL `cached`/`reasoning` come from the resolved
+//!   [`crate::dashboard_flow::FlowRecord::usage`] so an unreported class is honestly
+//!   ABSENT, not the monitor message's integer-only `0` (gap 07 review round 1).
 //! - `DebugWsMessage::RequestStatus` → a flow-domain [`DashboardPayload::FlowStatus`]
 //!   (same FlowStore lookup for the authoritative key + served identity + usage).
 //! - every OTHER `DebugWsMessage` → a monitor-domain [`DashboardPayload::Monitor`]
@@ -231,6 +234,16 @@ pub enum DashboardPayload {
     Monitor { message: DebugWsMessage },
     /// Per-flow cumulative token usage (flow domain). Keyed by `api_call_id`;
     /// `response_id` is an optional secondary correlation.
+    ///
+    /// Gap 07 review round 1, finding 1 — `cached`/`reasoning` are `Option<i64>`
+    /// serialized with `skip_serializing_if`, mirroring [`FlowUsage`] (and the frontend
+    /// `UsagePayload`): an UNREPORTED class is ABSENT on the wire, DISTINCT from a
+    /// provider-reported `0`. They are SOURCED from the authoritative
+    /// [`FlowRecord::usage`] (the honest `Option<i64>`), NOT from the monitor
+    /// [`DebugWsMessage::Usage`] (which collapses an unreported class to a bare `0` — the
+    /// BARE `/debug/ws` contract that AGENTS.md freezes integer-only). The always-present
+    /// `prompt`/`completion`/`total` stay the monitor's freshest cumulative counts. This
+    /// stops a live dashboard row showing an unavailable token class as a measured zero.
     Usage {
         api_call_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,8 +251,14 @@ pub enum DashboardPayload {
         prompt: i64,
         completion: i64,
         total: i64,
-        cached: i64,
-        reasoning: i64,
+        /// Cache-read prompt tokens; `Some(n)` measured (incl. a reported `0`), `None`
+        /// (absent on the wire) ⇒ the upstream did not report a cached breakdown.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cached: Option<i64>,
+        /// Reasoning tokens; `Some(n)` measured (incl. a reported `0`), `None` (absent on
+        /// the wire) ⇒ the upstream did not report reasoning details.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning: Option<i64>,
     },
     /// The flat `/api/metrics`-shaped metric tile (metrics domain).
     MetricTick(MetricTick),
@@ -480,8 +499,12 @@ pub fn frames_for_update(
                 prompt,
                 completion,
                 total,
-                cached,
-                reasoning,
+                // `cached`/`reasoning` from the monitor message are the BARE integer-only
+                // contract (an unreported class is `0` here). The dashboard `Usage`
+                // payload sources its OPTIONAL cached/reasoning from `FlowRecord.usage`
+                // instead (gap 07 review round 1, finding 1), so the monitor's collapsed
+                // values are intentionally NOT carried onto the enrichment intent.
+                ..
             } => {
                 let intent = intent_for(&mut intents, &mut intent_index, response_id);
                 // Latest Usage wins for a repeated response_id within one update.
@@ -489,8 +512,6 @@ pub fn frames_for_update(
                     prompt: *prompt,
                     completion: *completion,
                     total: *total,
-                    cached: *cached,
-                    reasoning: *reasoning,
                 });
             }
             DebugWsMessage::RequestStatus {
@@ -515,14 +536,26 @@ pub fn frames_for_update(
     let mut flow_batch: Vec<DashboardPayload> = Vec::new();
     for merged in &merged {
         if let Some(tokens) = merged.usage {
+            // Gap 07 review round 1, finding 1: the always-present core counts
+            // (`prompt`/`completion`/`total`) ride the monitor's freshest cumulative
+            // values, but the OPTIONAL `cached`/`reasoning` come from the authoritative
+            // `FlowRecord.usage` (honest `Option<i64>`) so an UNREPORTED class serializes
+            // ABSENT — never the monitor message's collapsed `0` (a measured-zero lie).
+            // The record is the SAME snapshot `flow_status` is built from, so the two flow
+            // payloads agree. When the record has no usage yet, both optionals are `None`
+            // (absent), which is correct: the class is unreported on this flow so far.
+            let (cached, reasoning) = merged
+                .record
+                .usage
+                .map_or((None, None), |usage| (usage.cached, usage.reasoning));
             flow_batch.push(DashboardPayload::Usage {
                 api_call_id: merged.record.api_call_id.clone(),
                 response_id: Some(merged.response_id.clone()),
                 prompt: tokens.prompt,
                 completion: tokens.completion,
                 total: tokens.total,
-                cached: tokens.cached,
-                reasoning: tokens.reasoning,
+                cached,
+                reasoning,
             });
         }
         if let Some(completed_at_ms) = merged.status_completed_at_ms {
@@ -553,15 +586,16 @@ pub fn frames_for_update(
     frames
 }
 
-/// The five monitor-reported cumulative token counts carried by a `usage` enrichment
-/// payload (the same fields as a [`DebugWsMessage::Usage`]).
+/// The always-present monitor-reported cumulative token counts carried by a `usage`
+/// enrichment payload. The optional `cached`/`reasoning` classes are NOT here: the
+/// dashboard `Usage` payload sources those from the authoritative [`FlowRecord::usage`]
+/// (gap 07 review round 1, finding 1) so an unreported class is honestly absent, not the
+/// monitor message's collapsed `0`.
 #[derive(Debug, Clone, Copy)]
 struct UsageTokens {
     prompt: i64,
     completion: i64,
     total: i64,
-    cached: i64,
-    reasoning: i64,
 }
 
 /// A pending flow-domain enrichment for ONE `response_id`, accumulated across the
@@ -1390,6 +1424,21 @@ mod tests {
             crate::dashboard_flow::ClientAttribution::none(),
         );
         store.link("resp_001".to_string(), "api_001".to_string());
+        // Gap 07 review round 1, finding 1: the dashboard `Usage` payload sources its
+        // OPTIONAL cached/reasoning from the authoritative `FlowRecord.usage`, NOT from
+        // the monitor message. Seed the record with cached REPORTED (`Some(128)`) but
+        // reasoning UNREPORTED (`None`) so the payload proves BOTH directions: a present
+        // class carries its value, an absent class stays absent (never a fake `0`).
+        store.record_usage(
+            "api_001",
+            FlowUsage {
+                prompt: 812,
+                completion: 240,
+                total: 1052,
+                cached: Some(128),
+                reasoning: None,
+            },
+        );
 
         let update = DebugUpdate {
             sequence: 4,
@@ -1407,6 +1456,9 @@ mod tests {
                     prompt: 812,
                     completion: 240,
                     total: 1052,
+                    // The monitor message COLLAPSES an unreported class to `0` (the bare
+                    // `/debug/ws` contract). The dashboard payload must NOT echo this `0`
+                    // for `reasoning` — it sources reasoning from the record (`None`).
                     cached: 128,
                     reasoning: 0,
                 },
@@ -1432,6 +1484,7 @@ mod tests {
                 response_id,
                 total,
                 cached,
+                reasoning,
                 ..
             } => {
                 assert_eq!(
@@ -1440,10 +1493,24 @@ mod tests {
                 );
                 assert_eq!(response_id.as_deref(), Some("resp_001"));
                 assert_eq!(*total, 1052);
-                assert_eq!(*cached, 128);
+                // cached came from the RECORD (`Some(128)`), not the monitor `i64`.
+                assert_eq!(*cached, Some(128));
+                // reasoning was UNREPORTED on the record ⇒ absent (NOT the monitor's `0`).
+                assert_eq!(
+                    *reasoning, None,
+                    "an unreported reasoning class is absent, not the monitor message's 0"
+                );
             }
             other => panic!("expected usage payload, got {other:?}"),
         }
+        // The unreported `reasoning` serializes ABSENT (don't-lie-with-zeros); the
+        // reported `cached` serializes as its value.
+        let usage_json = serde_json::to_value(&flow.batch[0]).expect("serialize usage");
+        assert_eq!(usage_json["cached"], serde_json::json!(128));
+        assert!(
+            usage_json.get("reasoning").is_none(),
+            "unreported reasoning is omitted on the wire, never a fabricated 0"
+        );
         match &flow.batch[1] {
             DashboardPayload::FlowStatus {
                 api_call_id,
@@ -1981,7 +2048,10 @@ mod tests {
     }
 
     /// The `usage` payload matches `GOLDEN_USAGE_FRAME_JSON`: `type:"usage"`,
-    /// `api_call_id` + `response_id` + the five token fields, under domain `flow`.
+    /// `api_call_id` + `response_id` + the five token fields, under domain `flow`. With
+    /// BOTH cached/reasoning REPORTED (`Some`), the bytes are byte-identical to the frozen
+    /// frontend golden fixture (`ws.fixtures.ts`) — the `Option` migration (gap 07 review
+    /// round 1, finding 1) is wire-compatible when the classes are present.
     #[test]
     fn usage_frame_matches_golden_fixture_bytes() {
         let frame = DashboardFrame {
@@ -1993,8 +2063,8 @@ mod tests {
                 prompt: 812,
                 completion: 240,
                 total: 1052,
-                cached: 128,
-                reasoning: 0,
+                cached: Some(128),
+                reasoning: Some(0),
             }],
         };
         let got: serde_json::Value = serde_json::to_value(&frame).expect("serialize");
@@ -2006,6 +2076,60 @@ mod tests {
             ]
         });
         assert_eq!(got, want);
+    }
+
+    /// Gap 07 review round 1, finding 1 — an UNREPORTED cached/reasoning class is OMITTED
+    /// on the dashboard `usage` wire (don't-lie-with-zeros), DISTINCT from a present `0`.
+    /// `prompt`/`completion`/`total` always serialize. This is the absence-vs-`0`
+    /// guarantee the frontend `UsagePayload` (optional `cached`/`reasoning`) relies on.
+    #[test]
+    fn usage_frame_omits_unreported_cached_reasoning() {
+        let frame = DashboardFrame {
+            domain: Domain::Flow,
+            seq: 7,
+            batch: vec![DashboardPayload::Usage {
+                api_call_id: "api_002".to_string(),
+                response_id: None,
+                prompt: 100,
+                completion: 50,
+                total: 150,
+                cached: None,    // unreported ⇒ absent on the wire
+                reasoning: None, // unreported ⇒ absent on the wire
+            }],
+        };
+        let got: serde_json::Value = serde_json::to_value(&frame).expect("serialize");
+        let want: serde_json::Value = serde_json::json!({
+            "domain": "flow",
+            "seq": 7,
+            "batch": [
+                { "type": "usage", "api_call_id": "api_002", "prompt": 100, "completion": 50, "total": 150 }
+            ]
+        });
+        assert_eq!(
+            got, want,
+            "unreported cached/reasoning (and a None response_id) are all absent — never a fabricated 0"
+        );
+
+        // A REPORTED zero is DISTINCT — it serializes as a present `0`.
+        let reported_zero = DashboardPayload::Usage {
+            api_call_id: "api_003".to_string(),
+            response_id: None,
+            prompt: 1,
+            completion: 1,
+            total: 2,
+            cached: Some(0),
+            reasoning: None,
+        };
+        let json = serde_json::to_value(&reported_zero).expect("serialize");
+        assert_eq!(
+            json["cached"],
+            serde_json::json!(0),
+            "a reported 0 is present"
+        );
+        assert!(
+            json.get("reasoning").is_none(),
+            "an unreported class is still absent alongside a reported-0 sibling"
+        );
     }
 
     /// The `flow_status` payload matches `GOLDEN_FLOW_STATUS_FRAME_JSON`:

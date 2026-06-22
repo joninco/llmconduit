@@ -166,4 +166,35 @@ describe('chips', () => {
       }
     }
   });
+
+  // Gap 07 review round 1, finding 5 — the $/min chip's quality/label is DERIVED from the
+  // backend aggregate `cost_confidence`, not a hard-coded `estimated`. Operators can now tell a
+  // confident aggregate cost from an estimated one.
+  it('a CONFIDENT aggregate $/min reads as "derived", not "estimated"', () => {
+    const chip = deriveChips(win({ cost_confidence: 'confident' }), null).find((c) => c.key === 'cost_per_min')!;
+    expect(chip.value).toBe('0.21'); // a real, rendered number
+    expect(chip.quality).toBe('derived'); // confident ⇒ a real computed cost, not a modelled estimate
+  });
+
+  it('an ESTIMATED aggregate $/min stays labelled "estimated"', () => {
+    const chip = deriveChips(win({ cost_confidence: 'estimated' }), null).find((c) => c.key === 'cost_per_min')!;
+    expect(chip.value).toBe('0.21');
+    expect(chip.quality).toBe('estimated'); // a priced bucket bills cached at the default 0.0 (or an unpriced bucket bears usage)
+  });
+
+  it('an UNAVAILABLE cost ($/min) renders "—" and is tagged unavailable regardless of the cost_confidence value', () => {
+    // priced_samples 0 ⇒ the denominator branch makes $/min unavailable; the cost_confidence the
+    // backend pairs with that is `unavailable` too, but even a stray non-unavailable tag cannot
+    // resurrect a value (the denominator wins).
+    const chip = deriveChips(win({ samples: 8, usage_samples: 8, priced_samples: 0, cost_confidence: 'unavailable' }), null)
+      .find((c) => c.key === 'cost_per_min')!;
+    expect(chip.value).toBe('—');
+    expect(chip.quality).toBe('unavailable');
+  });
+
+  it('the $/min cost_confidence override does NOT affect the tok/s chip (only the cost chip)', () => {
+    // tok/s keeps its intrinsic `derived` tier even when the window cost is confident.
+    const toks = deriveChips(win({ cost_confidence: 'confident' }), null).find((c) => c.key === 'tokens_per_sec')!;
+    expect(toks.quality).toBe('derived');
+  });
 });

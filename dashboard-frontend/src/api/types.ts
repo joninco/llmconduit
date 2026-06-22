@@ -214,8 +214,16 @@ export interface UsagePayload {
   prompt: number;
   completion: number;
   total: number;
-  cached: number;
-  reasoning: number;
+  /**
+   * Gap 07 — usage CONFIDENCE on the live `usage` frame, mirroring {@link Usage}. The Rust
+   * dashboard `Usage` payload sources `cached`/`reasoning` from `FlowRecord.usage`
+   * (`Option<i64>` with `skip_serializing_if`), so an UNREPORTED class is ABSENT on the wire —
+   * DISTINCT from a provider-reported `0`. They are therefore `number | null` and OPTIONAL:
+   * absent/`null` ⇒ UNAVAILABLE (the row renders `—`, never a fabricated `0`); a present `0`
+   * is a measured zero. (`prompt`/`completion`/`total` are always-present finite counts.)
+   */
+  cached?: number | null;
+  reasoning?: number | null;
 }
 
 /** Sliding-window metric tiles (mirrors `/dashboard/api/metrics`, sans cursor). */
@@ -796,9 +804,12 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
       // Nested, itself-tagged DebugWsMessage (NOT flattened) — finding 1.
       return isDebugWsMessage(v.message);
     case 'usage':
+      // Gap 07: `cached`/`reasoning` are OPTIONAL (absent/null ⇒ unreported/UNAVAILABLE,
+      // distinct from a present finite `0`); `prompt`/`completion`/`total` required finite.
       return (
         isStr(v.api_call_id) && isOptStr(v.response_id) &&
-        isNum(v.prompt) && isNum(v.completion) && isNum(v.total) && isNum(v.cached) && isNum(v.reasoning)
+        isNum(v.prompt) && isNum(v.completion) && isNum(v.total) &&
+        isOptNum(v.cached) && isOptNum(v.reasoning)
       );
     case 'metric_tick':
       return (

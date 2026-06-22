@@ -94,6 +94,56 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
     const merged = result.current.rows.find((r) => r.api_call_id === 'api_live2');
     expect(merged?.cost).toBe(0.99); // live roll-up preferred over REST
   });
+
+  // Gap 07 review round 1, finding 4 — a WS-created row defaults `cost_confidence` to the store
+  // `unavailable`; the REST roll-up backfills the REAL tag ALONGSIDE the REST cost.
+  it('backfills the REST cost_confidence onto a WS row stuck at the unavailable default', async () => {
+    // REST row carries the server cost + its confidence tag.
+    stubFlowsFetch([
+      makeFlow({ api_call_id: 'api_cc', status: 'completed', cost: 0.42, cost_confidence: 'estimated' }),
+    ]);
+    // A WS-created row: a flow_status patch minted it with cost null + the default `unavailable`.
+    act(() =>
+      dashboardStore.getState().patchFlowStatus({
+        type: 'flow_status',
+        api_call_id: 'api_cc',
+        response_id: null,
+        status: 'open',
+        model_requested: null,
+        model_served: null,
+        upstream_target: null,
+        usage: null,
+        started_ms: 1_700_000_000_000,
+        elapsed_ms: null,
+      }),
+    );
+    // Sanity: the WS row really starts at the unavailable default before REST merges.
+    expect(dashboardStore.getState().flows.get('api_cc')?.cost_confidence).toBe('unavailable');
+
+    const { result } = renderRows();
+    await waitFor(() => {
+      const r = result.current.rows.find((row) => row.api_call_id === 'api_cc');
+      expect(r?.cost).toBe(0.42);
+    });
+    const row = result.current.rows.find((r) => r.api_call_id === 'api_cc');
+    // The confidence tag is backfilled with the cost (no longer stuck at `unavailable`)…
+    expect(row?.cost_confidence).toBe('estimated');
+    // …while the live 'open' status still wins.
+    expect(row?.status).toBe('open');
+  });
+
+  // The confidence tag is PAIRED with the cost source: when the LIVE row authored a real cost, its
+  // own tag wins over the REST roll-up (so the dollar figure + label stay consistent).
+  it('keeps the LIVE cost_confidence when the live row authored the cost', async () => {
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_cc2', status: 'completed', cost: 0.42, cost_confidence: 'estimated' })]);
+    seedFlows([makeFlow({ api_call_id: 'api_cc2', status: 'open', cost: 0.99, cost_confidence: 'confident' })]);
+    const { result } = renderRows();
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); });
+    const merged = result.current.rows.find((r) => r.api_call_id === 'api_cc2');
+    expect(merged?.cost).toBe(0.99); // live cost wins
+    expect(merged?.cost_confidence).toBe('confident'); // its paired tag wins too
+  });
 });
 
 describe('useFlowRows — a WS-created row backfills REST-authoritative fields (finding 3)', () => {
