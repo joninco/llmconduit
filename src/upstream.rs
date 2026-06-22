@@ -67,6 +67,50 @@ fn instant_deadline_to_epoch_ms(deadline: Option<Instant>) -> Option<u64> {
     Some(now_epoch_ms().saturating_add(remaining.as_millis() as u64))
 }
 
+/// Wall-clock epoch-ms as `u128`, matching the dashboard FlowStore's `started_ms`/phase
+/// stamps (gap 03 attempt timestamps). A clock that is before `UNIX_EPOCH` yields `0`.
+fn now_epoch_ms_u128() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Gap 03: map a failed-attempt [`AppError`] to a BOUNDED, sanitized taxonomic
+/// [`AttemptErrorClass`](crate::dashboard_flow::AttemptErrorClass) — NEVER raw upstream
+/// text (which stays behind spec 05's gated seam), so the body-free summary can never
+/// leak an unbounded/secret-bearing upstream error body. A `Terminal` failover
+/// disposition (a context-overflow that survived shrink-and-retry) maps to `Terminal`;
+/// a cancellation to `Stream` (an upstream that ended before a chunk); otherwise the
+/// HTTP status class drives 4xx/5xx → `HttpStatus`, with the `Display` text inspected
+/// ONLY for our own fixed timeout/parse markers (still our strings, not the upstream's).
+fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptErrorClass {
+    use crate::dashboard_flow::AttemptErrorClass;
+    use crate::error::FailoverDisposition;
+    if err.failover_disposition() == FailoverDisposition::Terminal {
+        return AttemptErrorClass::Terminal;
+    }
+    // These markers are llmconduit's OWN fixed strings (set in this module's leaf /
+    // failover paths), not raw upstream bodies, so matching them leaks nothing.
+    let message = err.to_string();
+    if message.contains("timed out") {
+        return AttemptErrorClass::Timeout;
+    }
+    if message.contains("request failed") {
+        // `upstream chat request failed: …` / `upstream models request failed: …` — the
+        // transport (connect/send) failed before any HTTP response.
+        return AttemptErrorClass::Connect;
+    }
+    if message.contains("failed to parse") || message.contains("ended before the first chunk") {
+        return AttemptErrorClass::Stream;
+    }
+    let status = err.status_code().as_u16();
+    if (400..600).contains(&status) {
+        return AttemptErrorClass::HttpStatus;
+    }
+    AttemptErrorClass::Other
+}
+
 /// Per-provider serving status for the topology map (D4). `Cooling` while inside
 /// the failure cooldown window; `Down` once a cooling provider has also crossed
 /// [`DOWN_THRESHOLD`] consecutive failures; `Healthy` otherwise.
@@ -922,6 +966,196 @@ impl ReqwestUpstreamClient {
             Some(captured),
         );
     }
+
+    /// Gap 03 (bare-leaf path): wrap a successfully-dispatched upstream stream so the
+    /// flow records EXACTLY ONE served [`Attempt`](crate::dashboard_flow::Attempt) whose
+    /// `first_upstream_byte_ms` is the wall-clock instant the FIRST chunk arrives on the
+    /// wire — the bare-leaf analogue of the failover loop's prefetch-point measurement.
+    /// The attempt is pushed onto the shared `ServingToken` (read by the L1 guard at
+    /// finalize for both the record and the evict-safe terminal payload) the moment the
+    /// first item is yielded; if the stream ends with NO item, a `Stream`-class FAILED
+    /// attempt is recorded with `first_upstream_byte_ms = None` (don't-lie-with-zeros).
+    /// Pure pass-through of every chunk afterwards — it never buffers or duplicates
+    /// tokens (AGENTS.md failover-only-pre-first-chunk is untouched: this records, it does
+    /// not retry). No-op wrapper when no token is threaded.
+    fn record_served_attempt_on_first_byte(
+        serving: Option<Arc<ServingToken>>,
+        mut stream: UpstreamStream,
+        start_ms: u128,
+        model: String,
+    ) -> UpstreamStream {
+        let Some(serving) = serving else {
+            return stream;
+        };
+        Box::pin(async_stream::stream! {
+            let mut first_byte_recorded = false;
+            while let Some(item) = stream.next().await {
+                if !first_byte_recorded {
+                    first_byte_recorded = true;
+                    // The first item arrived on the wire. A transport/parse error in the
+                    // FIRST item is still "no usable first chunk" → record a FAILED
+                    // attempt with no wire first-byte; a chunk → a SERVED attempt stamped
+                    // at this instant. Either way exactly one attempt is recorded.
+                    let now = now_epoch_ms_u128();
+                    match &item {
+                        Ok(_) => serving.record_attempt(crate::dashboard_flow::Attempt {
+                            provider: Some("primary".to_string()),
+                            model: Some(model.clone()),
+                            start_ms,
+                            end_ms: now,
+                            first_upstream_byte_ms: Some(now),
+                            status: crate::dashboard_flow::AttemptStatus::Served,
+                            error_class: None,
+                            failover_reason: None,
+                        }),
+                        Err(err) => serving.record_attempt(Self::failed_bare_attempt(
+                            start_ms,
+                            model.clone(),
+                            err,
+                        )),
+                    }
+                }
+                yield item;
+            }
+            if !first_byte_recorded {
+                // The stream completed without yielding a single item: no first chunk
+                // ever arrived. Record a FAILED attempt (no wire first-byte → `None`).
+                serving.record_attempt(crate::dashboard_flow::Attempt {
+                    provider: Some("primary".to_string()),
+                    model: Some(model.clone()),
+                    start_ms,
+                    end_ms: now_epoch_ms_u128(),
+                    first_upstream_byte_ms: None,
+                    status: crate::dashboard_flow::AttemptStatus::Failed,
+                    error_class: Some(crate::dashboard_flow::AttemptErrorClass::Stream),
+                    failover_reason: None,
+                });
+            }
+        })
+    }
+
+    /// Gap 03: build a FAILED bare-leaf [`Attempt`](crate::dashboard_flow::Attempt) (the
+    /// dispatch errored before producing a stream, OR the first stream item was an error).
+    /// `first_upstream_byte_ms` is `None` (no wire first-byte) and the bounded taxonomic
+    /// `error_class`/`failover_reason` come from `err` — never raw upstream text.
+    fn failed_bare_attempt(
+        start_ms: u128,
+        model: String,
+        err: &AppError,
+    ) -> crate::dashboard_flow::Attempt {
+        use crate::dashboard_flow::AttemptFailoverReason;
+        use crate::dashboard_flow::AttemptStatus;
+        use crate::error::FailoverDisposition;
+        let failover_reason = if err.failover_disposition() == FailoverDisposition::Terminal {
+            AttemptFailoverReason::TerminalNoFailover
+        } else {
+            AttemptFailoverReason::ProviderFailed
+        };
+        crate::dashboard_flow::Attempt {
+            provider: Some("primary".to_string()),
+            model: Some(model),
+            start_ms,
+            end_ms: now_epoch_ms_u128(),
+            first_upstream_byte_ms: None,
+            status: AttemptStatus::Failed,
+            error_class: Some(classify_attempt_error(err)),
+            failover_reason: Some(failover_reason),
+        }
+    }
+
+    /// The leaf's actual chat-completions dispatch: POST the finalized + sanitized
+    /// `request`, with the G1 context-overflow shrink-and-retry. Split out of
+    /// [`stream_chat_completion`](Self::stream_chat_completion) so the bare-leaf path can
+    /// wrap the result for gap-03 attempt recording WITHOUT duplicating the recording
+    /// across this method's several return sites. `response_id` keys the D2 on-wire body
+    /// capture (already performed by `logged_send_chat_request`).
+    async fn dispatch_chat_stream(
+        &self,
+        url: &Url,
+        request: ChatCompletionRequest,
+        response_id: Option<&str>,
+    ) -> AppResult<UpstreamStream> {
+        // First attempt. On a non-2xx whose body indicates a context/completion
+        // token-limit overflow, shrink `max_completion_tokens` and retry ONCE.
+        // This happens before any SSE chunk is parsed/yielded downstream, so it
+        // can never duplicate already-streamed tokens, and it stays inside the
+        // leaf client so the failover/routing layers never see a context-limit
+        // error as a provider failure (it is a same-provider shrink-and-retry).
+        let response = self
+            .logged_send_chat_request(url, &request, response_id)
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            return stream_success_response(response, self.max_sse_frame_bytes).await;
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        if let Some(retry) = classify_context_overflow(
+            &body,
+            self.min_completion_tokens,
+            Some(estimate_leaf_input_tokens(&request)),
+        ) {
+            let mut retried = request.clone();
+            retried.max_output_tokens = Some(retry.max_completion_tokens);
+            // The reduced budget lives on the typed `max_output_tokens` field
+            // (serialized as `max_tokens`). Any max-token ALIAS that flowed into
+            // `extra_body` (`max_tokens`, `max_completion_tokens`,
+            // `max_output_tokens`) would serialize alongside and let the upstream
+            // honor the stale oversized value, defeating the retry. Mirror the
+            // engine's "explicit field removes conflicting default keys" rule and
+            // strip them so only the reduced typed field applies.
+            remove_max_token_aliases(&mut retried.extra_body);
+            tracing::warn!(
+                reason = retry.reason,
+                ctx_limit = retry.ctx_limit,
+                input_tokens = retry.input_tokens.unwrap_or(0),
+                input_is_lower_bound = retry.input_tokens_is_lower_bound,
+                new_max_completion_tokens = retry.max_completion_tokens,
+                "upstream context-window overflow; retrying once with reduced completion budget"
+            );
+            // D2: the retry is the body that ACTUALLY goes on the wire on the shrink
+            // path, so the capture must reflect the shrunk request (same `response_id`).
+            let retry_response = self
+                .logged_send_chat_request(url, &retried, response_id)
+                .await?;
+            let retry_status = retry_response.status();
+            if retry_status.is_success() {
+                return stream_success_response(retry_response, self.max_sse_frame_bytes).await;
+            }
+            // The retry ALSO failed. If it is again a context overflow, this is a
+            // same-provider sizing problem, not a provider failure: surface a
+            // TERMINAL error so `FailoverUpstreamClient`/routing does NOT retry
+            // the same oversized prompt on another provider (only one shrink-and-
+            // retry is allowed; we do not loop). Any other non-2xx is a normal
+            // (failover-eligible) upstream error.
+            let retry_body = retry_response.text().await.unwrap_or_default();
+            if classify_context_overflow(
+                &retry_body,
+                self.min_completion_tokens,
+                Some(estimate_leaf_input_tokens(&retried)),
+            )
+            .is_some()
+            {
+                return Err(AppError::upstream_with_disposition(
+                    format!(
+                        "upstream context-window overflow persisted after shrink-and-retry; \
+                         failed with {retry_status}: {}",
+                        redact_and_truncate_error_body(&retry_body, 500)
+                    ),
+                    FailoverDisposition::Terminal,
+                ));
+            }
+            return Err(AppError::upstream(format!(
+                "upstream chat failed with {retry_status}: {}",
+                redact_and_truncate_error_body(&retry_body, 500)
+            )));
+        }
+
+        Err(AppError::upstream(format!(
+            "upstream chat failed with {status}: {}",
+            redact_and_truncate_error_body(&body, 500)
+        )))
+    }
 }
 
 #[async_trait]
@@ -973,86 +1207,41 @@ impl UpstreamClient for ReqwestUpstreamClient {
             serving.set_model_served_final(request.model.clone());
         }
 
-        // First attempt. On a non-2xx whose body indicates a context/completion
-        // token-limit overflow, shrink `max_completion_tokens` and retry ONCE.
-        // This happens before any SSE chunk is parsed/yielded downstream, so it
-        // can never duplicate already-streamed tokens, and it stays inside the
-        // leaf client so the failover/routing layers never see a context-limit
-        // error as a provider failure (it is a same-provider shrink-and-retry).
-        let response = self
-            .logged_send_chat_request(&url, &request, response_id.as_deref())
-            .await?;
-        let status = response.status();
-        if status.is_success() {
-            return stream_success_response(response, self.max_sse_frame_bytes).await;
-        }
-
-        let body = response.text().await.unwrap_or_default();
-        if let Some(retry) = classify_context_overflow(
-            &body,
-            self.min_completion_tokens,
-            Some(estimate_leaf_input_tokens(&request)),
-        ) {
-            let mut retried = request.clone();
-            retried.max_output_tokens = Some(retry.max_completion_tokens);
-            // The reduced budget lives on the typed `max_output_tokens` field
-            // (serialized as `max_tokens`). Any max-token ALIAS that flowed into
-            // `extra_body` (`max_tokens`, `max_completion_tokens`,
-            // `max_output_tokens`) would serialize alongside and let the upstream
-            // honor the stale oversized value, defeating the retry. Mirror the
-            // engine's "explicit field removes conflicting default keys" rule and
-            // strip them so only the reduced typed field applies.
-            remove_max_token_aliases(&mut retried.extra_body);
-            tracing::warn!(
-                reason = retry.reason,
-                ctx_limit = retry.ctx_limit,
-                input_tokens = retry.input_tokens.unwrap_or(0),
-                input_is_lower_bound = retry.input_tokens_is_lower_bound,
-                new_max_completion_tokens = retry.max_completion_tokens,
-                "upstream context-window overflow; retrying once with reduced completion budget"
-            );
-            // D2: the retry is the body that ACTUALLY goes on the wire on the shrink
-            // path, so the capture must reflect the shrunk request (same `response_id`).
-            let retry_response = self
-                .logged_send_chat_request(&url, &retried, response_id.as_deref())
-                .await?;
-            let retry_status = retry_response.status();
-            if retry_status.is_success() {
-                return stream_success_response(retry_response, self.max_sse_frame_bytes).await;
-            }
-            // The retry ALSO failed. If it is again a context overflow, this is a
-            // same-provider sizing problem, not a provider failure: surface a
-            // TERMINAL error so `FailoverUpstreamClient`/routing does NOT retry
-            // the same oversized prompt on another provider (only one shrink-and-
-            // retry is allowed; we do not loop). Any other non-2xx is a normal
-            // (failover-eligible) upstream error.
-            let retry_body = retry_response.text().await.unwrap_or_default();
-            if classify_context_overflow(
-                &retry_body,
-                self.min_completion_tokens,
-                Some(estimate_leaf_input_tokens(&retried)),
-            )
-            .is_some()
+        // Gap 03: the bare-leaf path (this leaf IS the engine's upstream directly — no
+        // failover loop owns attempt recording) records EXACTLY ONE attempt for the flow.
+        // A leaf nested in a failover/routing client leaves `tag_primary_provider` false,
+        // so the failover loop is the sole attempt recorder there (this branch is skipped
+        // — no double-count). The served attempt's wire first-byte is stamped when the
+        // returned stream yields its first chunk (`record_served_attempt_on_first_byte`);
+        // a dispatch error records a FAILED attempt with a bounded taxonomic code.
+        if self.tag_primary_provider {
+            let attempt_start_ms = now_epoch_ms_u128();
+            let attempt_model = request.model.clone();
+            return match self
+                .dispatch_chat_stream(&url, request, response_id.as_deref())
+                .await
             {
-                return Err(AppError::upstream_with_disposition(
-                    format!(
-                        "upstream context-window overflow persisted after shrink-and-retry; \
-                         failed with {retry_status}: {}",
-                        redact_and_truncate_error_body(&retry_body, 500)
-                    ),
-                    FailoverDisposition::Terminal,
-                ));
-            }
-            return Err(AppError::upstream(format!(
-                "upstream chat failed with {retry_status}: {}",
-                redact_and_truncate_error_body(&retry_body, 500)
-            )));
+                Ok(stream) => Ok(Self::record_served_attempt_on_first_byte(
+                    serving,
+                    stream,
+                    attempt_start_ms,
+                    attempt_model,
+                )),
+                Err(err) => {
+                    if let Some(serving) = &serving {
+                        serving.record_attempt(Self::failed_bare_attempt(
+                            attempt_start_ms,
+                            attempt_model,
+                            &err,
+                        ));
+                    }
+                    Err(err)
+                }
+            };
         }
 
-        Err(AppError::upstream(format!(
-            "upstream chat failed with {status}: {}",
-            redact_and_truncate_error_body(&body, 500)
-        )))
+        self.dispatch_chat_stream(&url, request, response_id.as_deref())
+            .await
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
@@ -1420,6 +1609,16 @@ impl FailoverUpstreamClient {
         for provider_index in provider_indices {
             let provider = &self.providers[provider_index];
             let provider_request = Self::request_for_provider(provider, backend);
+            // Gap 03: per-attempt provenance. `start_ms` is the wall-clock the dispatch
+            // is issued; the provider's on-wire model is `provider_request.request.model`
+            // (post `request_for_provider` remap). The attempt's outcome (served / failed)
+            // is recorded onto the shared `ServingToken` at each terminal arm below, so
+            // the failover trace shows WHICH provider failed, WHY (bounded taxonomic
+            // code), HOW LONG, and WHAT eventually served. The nested leaf is NOT
+            // `tag_primary_provider`-marked, so IT records no attempt — only this loop
+            // does, exactly once per provider it tries.
+            let attempt_start_ms = now_epoch_ms_u128();
+            let attempt_model = provider_request.request.model.clone();
             let stream = match provider
                 .client
                 .stream_chat_completion(&provider_request)
@@ -1431,10 +1630,26 @@ impl FailoverUpstreamClient {
                     // survived the leaf shrink-and-retry). Trying the next
                     // provider would just overflow again, so surface it as-is and
                     // do NOT mark this provider failed (it is not at fault).
+                    Self::record_attempt(
+                        backend,
+                        provider,
+                        attempt_start_ms,
+                        attempt_model,
+                        None,
+                        Some(&err),
+                    );
                     return Err(err);
                 }
                 Err(err) => {
                     self.mark_failure(provider_index, &err);
+                    Self::record_attempt(
+                        backend,
+                        provider,
+                        attempt_start_ms,
+                        attempt_model,
+                        None,
+                        Some(&err),
+                    );
                     last_error = Some(err);
                     continue;
                 }
@@ -1450,6 +1665,17 @@ impl FailoverUpstreamClient {
                     if let Some(serving) = &backend.serving {
                         serving.set_provider(provider.name.clone());
                     }
+                    // Gap 03: this attempt SERVED — its first chunk just arrived on the
+                    // wire, so `now` is the measured wire first-byte for this attempt (and
+                    // the flow-level `first_upstream_byte_ms` via `record_attempt`).
+                    Self::record_attempt(
+                        backend,
+                        provider,
+                        attempt_start_ms,
+                        attempt_model,
+                        Some(now_epoch_ms_u128()),
+                        None,
+                    );
                     if provider_index > 0 {
                         tracing::info!(
                             provider = %provider.name,
@@ -1465,6 +1691,17 @@ impl FailoverUpstreamClient {
                 }
                 Err(err) => {
                     self.mark_failure(provider_index, &err);
+                    // Gap 03: the response began (or timed out) but no first chunk
+                    // arrived, so the attempt FAILED with no wire first-byte (`None`,
+                    // never `0`).
+                    Self::record_attempt(
+                        backend,
+                        provider,
+                        attempt_start_ms,
+                        attempt_model,
+                        None,
+                        Some(&err),
+                    );
                     last_error = Some(err);
                 }
             }
@@ -1472,6 +1709,56 @@ impl FailoverUpstreamClient {
         Err(last_error.unwrap_or_else(|| {
             AppError::upstream("all upstream providers failed before producing a response")
         }))
+    }
+
+    /// Gap 03: build and push one [`Attempt`](crate::dashboard_flow::Attempt) onto the
+    /// flow's shared `ServingToken` (no-op when no token is threaded — tests / non-engine
+    /// paths). `first_upstream_byte_ms` is `Some(now)` ONLY on a served attempt (its first
+    /// chunk arrived) and `None` on a failure (don't-lie-with-zeros — an unmeasured wire
+    /// first-byte is absent, never `0`). On a failure, `err` drives the BOUNDED taxonomic
+    /// `error_class` + `failover_reason` (never raw upstream text — those bodies stay
+    /// spec-05-gated); on a success both are `None`.
+    fn record_attempt(
+        backend: &BackendChatRequest,
+        provider: &FailoverUpstreamProvider,
+        start_ms: u128,
+        model: String,
+        first_upstream_byte_ms: Option<u128>,
+        err: Option<&AppError>,
+    ) {
+        use crate::dashboard_flow::AttemptFailoverReason;
+        use crate::dashboard_flow::AttemptStatus;
+        use crate::error::FailoverDisposition;
+        let Some(serving) = &backend.serving else {
+            return;
+        };
+        let (status, error_class, failover_reason) = match err {
+            None => (AttemptStatus::Served, None, None),
+            Some(err) => {
+                let reason = if err.failover_disposition() == FailoverDisposition::Terminal {
+                    // A terminal disposition ends the flow — failover did NOT advance to
+                    // another provider; record that for the trace.
+                    AttemptFailoverReason::TerminalNoFailover
+                } else {
+                    AttemptFailoverReason::ProviderFailed
+                };
+                (
+                    AttemptStatus::Failed,
+                    Some(classify_attempt_error(err)),
+                    Some(reason),
+                )
+            }
+        };
+        serving.record_attempt(crate::dashboard_flow::Attempt {
+            provider: Some(provider.name.clone()),
+            model: Some(model),
+            start_ms,
+            end_ms: now_epoch_ms_u128(),
+            first_upstream_byte_ms,
+            status,
+            error_class,
+            failover_reason,
+        });
     }
 
     async fn proxy_completions_from_provider(
@@ -2459,6 +2746,18 @@ struct ServingInfo {
     model_served: Option<String>,
     model_finalized: bool,
     usage: Option<crate::dashboard_flow::FlowUsage>,
+    /// Gap 03: the ordered per-attempt failover trace. The failover loop pushes one
+    /// [`Attempt`](crate::dashboard_flow::Attempt) per provider it tries (failed ones +
+    /// the served one); the bare-leaf/single-upstream path pushes exactly one. Carried on
+    /// the shared token (like `usage`) so the L1 telemetry guard reads the complete trace
+    /// at finalize for BOTH the FlowStore record AND the evict-safe terminal metrics
+    /// payload (spec 12's source), independent of FlowStore retention.
+    attempts: Vec<crate::dashboard_flow::Attempt>,
+    /// Gap 03: the flow-level wire time-to-first-byte (epoch-ms the FIRST upstream chunk
+    /// of the SERVING attempt arrived on the wire). First-write-wins so the served
+    /// attempt's measured value is never clobbered. `None` until a chunk arrives — NEVER
+    /// `0` when unmeasured (don't-lie-with-zeros).
+    first_upstream_byte_ms: Option<u128>,
 }
 
 /// Interior-mutable serving identity for one flow. A FRESH one is allocated per
@@ -2530,6 +2829,32 @@ impl ServingToken {
     /// record eviction.
     pub fn set_usage(&self, usage: crate::dashboard_flow::FlowUsage) {
         self.lock().usage = Some(usage);
+    }
+
+    /// Gap 03: append one upstream-dispatch [`Attempt`](crate::dashboard_flow::Attempt)
+    /// to the ordered failover trace (the failover loop calls this per provider; the
+    /// bare-leaf path calls it once). If the attempt SERVED, also record its wire
+    /// first-byte time as the flow-level `first_upstream_byte_ms` (first-write-wins, so
+    /// the FIRST served attempt's measured value wins and a later finalize cannot clobber
+    /// it with `None`). The order of pushes IS the attempt order the trace renders.
+    pub fn record_attempt(&self, attempt: crate::dashboard_flow::Attempt) {
+        let mut info = self.lock();
+        if attempt.status == crate::dashboard_flow::AttemptStatus::Served
+            && info.first_upstream_byte_ms.is_none()
+            && let Some(byte_ms) = attempt.first_upstream_byte_ms
+        {
+            info.first_upstream_byte_ms = Some(byte_ms);
+        }
+        info.attempts.push(attempt);
+    }
+
+    /// Gap 03: the `(attempts, first_upstream_byte_ms)` snapshot the L1 telemetry guard
+    /// reads at finalize — for BOTH the FlowStore record and the evict-safe terminal
+    /// metrics payload (spec 12's source). Cloning the small trace under the lock keeps it
+    /// independent of FlowStore retention.
+    pub fn attempts_snapshot(&self) -> (Vec<crate::dashboard_flow::Attempt>, Option<u128>) {
+        let info = self.lock();
+        (info.attempts.clone(), info.first_upstream_byte_ms)
     }
 
     /// `(route, provider)` snapshot for D3's finalize attribution.
@@ -3621,9 +3946,12 @@ mod tests {
     use super::ReqwestUpstreamClient;
     use super::UpstreamModelEntry;
     use super::UpstreamRequestLogger;
+    use super::classify_attempt_error;
     use super::extract_supported_model_catalog;
     use super::sanitize_chat_request;
     use super::should_proxy_request_header;
+    use crate::error::AppError;
+    use crate::error::FailoverDisposition;
     use crate::models::chat::ChatCompletionRequest;
     use crate::models::chat::ChatMessage;
     use http::HeaderName;
@@ -5607,6 +5935,289 @@ mod tests {
         assert_eq!(
             key.model, "served-model",
             "D5 metrics bucket attributes the actual served model on a failover remap"
+        );
+    }
+
+    // ---- Gap 03: `attempts[]` + `first_upstream_byte_ms` ----
+
+    /// `record_attempt` pushes attempts in order; the FIRST served attempt's wire
+    /// first-byte becomes the flow-level `first_upstream_byte_ms` (first-write-wins), and
+    /// a FAILED attempt never sets it (don't-lie-with-zeros — no measured wire byte).
+    #[test]
+    fn serving_token_records_attempts_and_first_byte_first_write_wins() {
+        use crate::dashboard_flow::AttemptErrorClass;
+        use crate::dashboard_flow::AttemptFailoverReason;
+        use crate::dashboard_flow::AttemptStatus;
+        let token = super::ServingToken::default();
+        token.record_attempt(crate::dashboard_flow::Attempt {
+            provider: Some("p0".to_string()),
+            model: Some("m".to_string()),
+            start_ms: 10,
+            end_ms: 20,
+            first_upstream_byte_ms: None,
+            status: AttemptStatus::Failed,
+            error_class: Some(AttemptErrorClass::HttpStatus),
+            failover_reason: Some(AttemptFailoverReason::ProviderFailed),
+        });
+        token.record_attempt(crate::dashboard_flow::Attempt {
+            provider: Some("p1".to_string()),
+            model: Some("m".to_string()),
+            start_ms: 21,
+            end_ms: 40,
+            first_upstream_byte_ms: Some(30),
+            status: AttemptStatus::Served,
+            error_class: None,
+            failover_reason: None,
+        });
+        // A later served attempt cannot clobber the recorded flow-level first byte.
+        token.record_attempt(crate::dashboard_flow::Attempt {
+            provider: Some("p2".to_string()),
+            model: Some("m".to_string()),
+            start_ms: 41,
+            end_ms: 60,
+            first_upstream_byte_ms: Some(50),
+            status: AttemptStatus::Served,
+            error_class: None,
+            failover_reason: None,
+        });
+        let (attempts, first_byte) = token.attempts_snapshot();
+        assert_eq!(attempts.len(), 3, "all attempts recorded in order");
+        assert_eq!(attempts[0].provider.as_deref(), Some("p0"));
+        assert_eq!(attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(attempts[1].status, AttemptStatus::Served);
+        assert_eq!(
+            first_byte,
+            Some(30),
+            "first served attempt's wire first-byte wins; a later one cannot clobber it"
+        );
+    }
+
+    /// The taxonomy maps llmconduit's own bounded error shapes — never raw upstream text.
+    #[test]
+    fn classify_attempt_error_is_bounded_taxonomy() {
+        use crate::dashboard_flow::AttemptErrorClass;
+        assert_eq!(
+            classify_attempt_error(&AppError::upstream("upstream stream timed out".to_string())),
+            AttemptErrorClass::Timeout
+        );
+        assert_eq!(
+            classify_attempt_error(&AppError::upstream(
+                "upstream chat request failed: connection refused".to_string()
+            )),
+            AttemptErrorClass::Connect
+        );
+        assert_eq!(
+            classify_attempt_error(&AppError::upstream(
+                "upstream stream ended before the first chunk".to_string()
+            )),
+            AttemptErrorClass::Stream
+        );
+        assert_eq!(
+            classify_attempt_error(&AppError::upstream("upstream chat failed with 503: x")),
+            AttemptErrorClass::HttpStatus
+        );
+        assert_eq!(
+            classify_attempt_error(&AppError::upstream_with_disposition(
+                "overflow persisted",
+                FailoverDisposition::Terminal
+            )),
+            AttemptErrorClass::Terminal
+        );
+    }
+
+    /// A real bare-leaf single success records EXACTLY ONE served attempt with a measured
+    /// wire `first_upstream_byte_ms` (the bare-leaf analogue of the prefetch point).
+    #[tokio::test]
+    async fn bare_leaf_single_success_records_one_served_attempt_with_first_byte() {
+        use crate::dashboard_flow::AttemptStatus;
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(d2_sse_ok_body()))
+            .mount(&server)
+            .await;
+
+        let leaf = ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        )
+        .into_bare_primary();
+
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some("resp_bare".to_string()),
+            Some(Arc::clone(&token)),
+        );
+        let mut stream = leaf
+            .stream_chat_completion(&backend)
+            .await
+            .expect("stream opens");
+        // The served attempt's first byte is recorded WHEN the first chunk is consumed.
+        while stream.next().await.is_some() {}
+
+        let (attempts, first_byte) = token.attempts_snapshot();
+        assert_eq!(attempts.len(), 1, "bare leaf records exactly one attempt");
+        assert_eq!(attempts[0].status, AttemptStatus::Served);
+        assert_eq!(attempts[0].provider.as_deref(), Some("primary"));
+        assert!(
+            attempts[0].first_upstream_byte_ms.is_some(),
+            "served attempt measured a wire first-byte"
+        );
+        assert!(
+            attempts[0].error_class.is_none(),
+            "served attempt has no error_class"
+        );
+        assert_eq!(
+            first_byte, attempts[0].first_upstream_byte_ms,
+            "flow-level first byte is the served attempt's wire first-byte"
+        );
+    }
+
+    /// A real bare-leaf dispatch FAILURE (non-2xx) records ONE failed attempt with NO wire
+    /// first-byte (`None`, never `0`) and a bounded taxonomic error class.
+    #[tokio::test]
+    async fn bare_leaf_dispatch_failure_records_failed_attempt_with_no_first_byte() {
+        use crate::dashboard_flow::AttemptErrorClass;
+        use crate::dashboard_flow::AttemptStatus;
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+
+        let leaf = ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        )
+        .into_bare_primary();
+
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some("resp_bare_fail".to_string()),
+            Some(Arc::clone(&token)),
+        );
+        let result = leaf.stream_chat_completion(&backend).await;
+        assert!(result.is_err(), "503 dispatch fails");
+
+        let (attempts, first_byte) = token.attempts_snapshot();
+        assert_eq!(attempts.len(), 1, "one failed attempt recorded");
+        assert_eq!(attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(attempts[0].error_class, Some(AttemptErrorClass::HttpStatus));
+        assert!(
+            attempts[0].first_upstream_byte_ms.is_none(),
+            "a failed attempt has NO wire first-byte (None, never 0)"
+        );
+        assert!(
+            first_byte.is_none(),
+            "no served attempt → no flow-level first byte"
+        );
+    }
+
+    /// A forced failover (first provider 503, second 200) records ≥2 attempts: the first
+    /// FAILED with a `failover_reason`, the LAST SERVED with a measured wire first-byte.
+    /// This also covers ROUTING mode's attempt source: routing delegates to the selected
+    /// provider's failover client, so attempts come from THIS loop — never a sibling
+    /// routing upstream (AGENTS.md hard rule).
+    #[tokio::test]
+    async fn failover_503_then_200_records_failed_then_served_attempts() {
+        use crate::dashboard_flow::AttemptErrorClass;
+        use crate::dashboard_flow::AttemptFailoverReason;
+        use crate::dashboard_flow::AttemptStatus;
+        let down = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("primary down"))
+            .mount(&down)
+            .await;
+        let up = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(d2_sse_ok_body()))
+            .mount(&up)
+            .await;
+
+        // Two providers; cooldown 0 so the failover loop tries both in one dispatch.
+        let failover = FailoverUpstreamClient::new(
+            vec![
+                FailoverUpstreamProvider::new(
+                    "primary",
+                    d2_capturing_client(&down.uri(), DashboardFlowStore::disabled()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+                FailoverUpstreamProvider::new(
+                    "backup",
+                    d2_capturing_client(&up.uri(), DashboardFlowStore::disabled()),
+                    None,
+                    None,
+                    JsonMap::new(),
+                ),
+            ],
+            std::time::Duration::from_secs(0),
+        );
+
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some("resp_failover".to_string()),
+            Some(Arc::clone(&token)),
+        );
+        let mut stream = failover
+            .stream_chat_completion(&backend)
+            .await
+            .expect("failover serves from the backup");
+        while stream.next().await.is_some() {}
+
+        let (attempts, first_byte) = token.attempts_snapshot();
+        assert!(
+            attempts.len() >= 2,
+            "failover records the failed provider AND the served one ({})",
+            attempts.len()
+        );
+        let first = &attempts[0];
+        assert_eq!(first.provider.as_deref(), Some("primary"));
+        assert_eq!(first.status, AttemptStatus::Failed);
+        assert_eq!(first.error_class, Some(AttemptErrorClass::HttpStatus));
+        assert_eq!(
+            first.failover_reason,
+            Some(AttemptFailoverReason::ProviderFailed),
+            "the failed provider carries a failover_reason"
+        );
+        assert!(
+            first.first_upstream_byte_ms.is_none(),
+            "the failed provider never received a first chunk (None, never 0)"
+        );
+        let last = attempts.last().expect("served attempt");
+        assert_eq!(last.provider.as_deref(), Some("backup"));
+        assert_eq!(last.status, AttemptStatus::Served);
+        assert!(
+            last.error_class.is_none(),
+            "served attempt has no error_class"
+        );
+        assert!(
+            last.first_upstream_byte_ms.is_some(),
+            "the served attempt measured a wire first-byte"
+        );
+        assert_eq!(
+            first_byte, last.first_upstream_byte_ms,
+            "flow-level first byte is the SERVED attempt's wire first-byte"
         );
     }
 }

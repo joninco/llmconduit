@@ -197,6 +197,110 @@ pub struct FlowUsage {
     pub reasoning: i64,
 }
 
+/// Gap 03 — the outcome of one upstream dispatch attempt. Snake_case on the wire so
+/// the body-free [`SnapshotFlowSummary`] carries it to the failover/attempt-trace UI
+/// (spec 11) and the per-provider metrics aggregation (spec 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptStatus {
+    /// This attempt produced the first chunk on the wire — it is the SERVING attempt.
+    Served,
+    /// This attempt failed before producing a chunk (connect error, non-2xx, timeout,
+    /// or a parse/stream error before the first chunk). Failover then tried the next.
+    Failed,
+}
+
+/// Gap 03 — a BOUNDED, sanitized, taxonomic failure code for a failed attempt. This is
+/// NOT raw upstream error text (which stays behind spec 05's separately-gated seam): it
+/// is a fixed enum so the body-free summary can never become a backdoor for an
+/// unbounded/secret-bearing upstream error body. `error_class` is `None` on the served
+/// attempt (don't-lie-with-zeros for the success case). Serializes snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptErrorClass {
+    /// The upstream connection or request transport failed before any response.
+    Connect,
+    /// The upstream returned a non-2xx HTTP status (a provider-failure-shaped 4xx/5xx).
+    HttpStatus,
+    /// The attempt timed out waiting for the response / first chunk.
+    Timeout,
+    /// The response began but the first chunk could not be read/parsed (stream error
+    /// before the first chunk, or the stream ended before any chunk).
+    Stream,
+    /// A same-provider terminal failure surfaced as-is (e.g. a context-window overflow
+    /// that persisted after the leaf's shrink-and-retry — failover does NOT retry it on
+    /// another provider; AGENTS.md). Carried for provenance even though it ends the flow.
+    Terminal,
+    /// Any other failover-eligible upstream error not covered above.
+    Other,
+}
+
+/// Gap 03 — a BOUNDED, sanitized, taxonomic reason a failed attempt triggered failover
+/// to the next provider. Like [`AttemptErrorClass`], this is a fixed enum — never raw
+/// upstream text — so it is safe on the body-free summary. `None` on the served attempt
+/// (it did not fail over). Serializes snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptFailoverReason {
+    /// The provider failed before the first chunk and failover moved to the next.
+    ProviderFailed,
+    /// The provider's failure was same-provider terminal — failover did NOT advance
+    /// (recorded so the trace shows WHY no further provider was tried).
+    TerminalNoFailover,
+}
+
+/// Gap 03 — one upstream dispatch attempt's full provenance: WHICH provider, WHAT model,
+/// HOW LONG it took, WHEN the first wire byte arrived, and the OUTCOME. The failover loop
+/// records one per provider it tries (failed ones + the served one); a non-failover
+/// (bare-leaf / single-upstream / routing-with-no-fallback) flow records exactly one.
+///
+/// All timestamps are MEASURED epoch-ms (`now_ms`). `first_upstream_byte_ms` is the wire
+/// instant the attempt's FIRST chunk arrived — `None` when the attempt never received
+/// response headers / a first chunk (a connect/timeout/non-2xx failure), so an unmeasured
+/// first-byte time is `None`, NEVER `0` (don't-lie-with-zeros). `error_class` /
+/// `failover_reason` are `None` on the served attempt and are BOUNDED taxonomic codes
+/// (never raw upstream text) on a failed attempt — they ride the body-free summary, so
+/// raw error bodies stay behind spec 05's gated seam. Snake_case + `skip_serializing_if`
+/// so a `None` field is absent on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct Attempt {
+    /// The provider name this attempt dispatched to (the failover provider's name, the
+    /// routing route's name, or the synthetic `"primary"` for a bare single upstream).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The model actually sent on the wire for this attempt (post provider-remap), when
+    /// known. `None` when the attempt failed before the on-wire model was finalized.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Epoch-ms the attempt began (the dispatch was issued). Always measured.
+    pub start_ms: u128,
+    /// Epoch-ms the attempt resolved (served first chunk, or failed). Always measured.
+    pub end_ms: u128,
+    /// Epoch-ms the FIRST chunk arrived on the wire for this attempt. `None` when the
+    /// attempt never received a first chunk (failed before response headers) — NEVER `0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_upstream_byte_ms: Option<u128>,
+    /// Served vs failed.
+    pub status: AttemptStatus,
+    /// Bounded taxonomic failure code; `None` on the served attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<AttemptErrorClass>,
+    /// Bounded taxonomic failover reason; `None` on the served attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failover_reason: Option<AttemptFailoverReason>,
+}
+
+impl Attempt {
+    /// Bytes this attempt contributes to the live summary-byte quota: only the two
+    /// dynamic scalar strings it retains (the bounded enums are fixed-size). Counted so
+    /// a flood of long provider/model strings on a long failover chain cannot blow the
+    /// quota silently (mirrors [`FlowRecord::summary_bytes`]).
+    fn summary_bytes(&self) -> usize {
+        let opt = |s: &Option<String>| s.as_ref().map(|s| s.len()).unwrap_or(0);
+        opt(&self.provider) + opt(&self.model)
+    }
+}
+
 /// The D5 metrics inputs the L1 [`TelemetryGuard`] assembles at finalize from its
 /// OWN evict-safe sources (D5 R3 MEDIUM): the `endpoint` captured at claim (when the
 /// record provably exists) + the shared `ServingToken` (which carries the resolved
@@ -213,6 +317,11 @@ pub struct TerminalMetricsInputs {
     pub endpoint: String,
     pub upstream: Option<String>,
     pub usage: Option<FlowUsage>,
+    /// Gap 03 — the per-attempt trace, read off the shared `ServingToken` at finalize
+    /// alongside `usage`. Carried on the evict-safe terminal payload (NOT only the
+    /// FlowStore record) so spec 12 can aggregate per-provider metrics without
+    /// re-reading the evictable record. Empty when the flow recorded no attempt.
+    pub attempts: Vec<Attempt>,
 }
 
 /// Request-extension newtype carrying the `api_call_id` minted by `log_api_call`
@@ -307,6 +416,20 @@ pub struct FlowRecord {
     /// fields are monotonic (`ingress ≤ normalization ≤ routing ≤ first_content_delta
     /// ≤ stream_end ≤ finalize`) even if the wall clock steps backwards between seams.
     pub phases: PhaseTimings,
+    /// Gap 03 — the per-attempt failover trace: one [`Attempt`] per upstream dispatch the
+    /// failover loop tried (failed providers + the served one), or exactly one for a
+    /// non-failover (bare-leaf / single-upstream / routing-no-fallback) flow. Threaded
+    /// from the shared `ServingToken` into the record at finalize (the SAME evict-safe
+    /// source that feeds the terminal metrics payload), so the record and the metrics
+    /// path agree. Empty until finalize / when no attempt was recorded.
+    pub attempts: Vec<Attempt>,
+    /// Gap 03 — the flow-level wire time-to-first-byte: the epoch-ms the FIRST upstream
+    /// chunk of the SERVING attempt arrived ON THE WIRE (distinct from gap 02's
+    /// client-facing `first_content_delta_ms` TTFT). `None` when no upstream byte ever
+    /// arrived (every attempt failed before response headers) — NEVER `0`
+    /// (don't-lie-with-zeros); a missing measurement renders `—` downstream. Measured at
+    /// the prefetch point (failover) / the bare-leaf first-chunk seam, first-write-wins.
+    pub first_upstream_byte_ms: Option<u128>,
 }
 
 /// Gap 02 — the per-phase timestamp bundle carried by every [`FlowRecord`] and
@@ -437,6 +560,7 @@ impl FlowRecord {
             .iter()
             .map(|(name, value)| name.len() + value.len())
             .sum();
+        let attempts: usize = self.attempts.iter().map(Attempt::summary_bytes).sum();
         body(&self.inbound_body)
             + body(&self.normalized)
             + body(&self.upstream_body)
@@ -449,6 +573,7 @@ impl FlowRecord {
             + opt(&self.model_served)
             + opt(&self.upstream_target)
             + opt(&self.terminal_reason)
+            + attempts
     }
 
     /// Total bytes held by the three body `Arc`s only (the eviction target).
@@ -487,6 +612,15 @@ pub struct SnapshotFlowSummary {
     /// only — no body retention, so the snapshots-are-body-free invariant holds.
     #[serde(flatten)]
     pub phases: PhaseTimings,
+    /// Gap 03 — the per-attempt failover trace (body-free: each [`Attempt`] holds only
+    /// scalar provenance + bounded taxonomic codes, never a raw upstream error body).
+    /// Empty array when no attempt was recorded. The attempt-trace UI (spec 11) reads it.
+    pub attempts: Vec<Attempt>,
+    /// Gap 03 — flow-level wire time-to-first-byte (`None` ⇒ absent ⇒ renders `—`, never
+    /// `0`). Distinct from `first_content_delta_ms`: this is the upstream's first byte on
+    /// the wire, that one is the first content delta to the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_upstream_byte_ms: Option<u128>,
 }
 
 impl SnapshotFlowSummary {
@@ -507,6 +641,10 @@ impl SnapshotFlowSummary {
             terminal_reason: record.terminal_reason.clone(),
             // Gap 02: `PhaseTimings` is `Copy` — scalar metadata, no body.
             phases: record.phases,
+            // Gap 03: the attempt trace is body-free scalar provenance — clone it onto
+            // the summary so the WS/snapshot wire carries it.
+            attempts: record.attempts.clone(),
+            first_upstream_byte_ms: record.first_upstream_byte_ms,
         }
     }
 }
@@ -649,6 +787,10 @@ impl DashboardFlowStore {
                 phases.stamp_ingress(now);
                 phases
             },
+            // Gap 03: no attempt has run yet; the failover/leaf layers record attempts
+            // onto the shared `ServingToken`, threaded into the record at finalize.
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
         };
         let mut state = self.lock();
         state.prune_expired(now);
@@ -809,6 +951,45 @@ impl DashboardFlowStore {
         state.update(api_call_id, |record| {
             record.usage = Some(usage);
         });
+    }
+
+    /// Gap 03 — thread the per-attempt failover trace + the flow-level wire
+    /// time-to-first-byte onto the record. Driven at finalize from the shared
+    /// `ServingToken` (the SAME evict-safe source the terminal metrics payload reads), so
+    /// the record and the metrics path carry identical attempt data. `attempts` REPLACES
+    /// (not appends): the token holds the complete ordered trace, so a re-finalize just
+    /// re-writes the same vector (idempotent). `first_upstream_byte_ms` is
+    /// first-write-wins (only fills the slot when still `None`) so the served attempt's
+    /// measured wire-TTFB is never clobbered by a later `None`. No-op when disabled,
+    /// unknown, or when `attempts` is empty AND no byte time is supplied (so a bare
+    /// non-instrumented path adds nothing). Bumps `record_seq` like the other mutators.
+    pub fn record_attempts(
+        &self,
+        api_call_id: &str,
+        attempts: Vec<Attempt>,
+        first_upstream_byte_ms: Option<u128>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        if attempts.is_empty() && first_upstream_byte_ms.is_none() {
+            return;
+        }
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
+        state.update(api_call_id, |record| {
+            if !attempts.is_empty() {
+                record.attempts = attempts.clone();
+            }
+            // First-write-wins: a measured wire-first-byte must not be overwritten by a
+            // later unmeasured (`None`) finalize path.
+            if record.first_upstream_byte_ms.is_none()
+                && let Some(byte_ms) = first_upstream_byte_ms
+            {
+                record.first_upstream_byte_ms = Some(byte_ms);
+            }
+        });
+        state.enforce_caps(self.summary_quota_bytes);
     }
 
     /// Gap 02 — stamp the **routing decision** phase: the engine resolved the served
@@ -1291,6 +1472,13 @@ impl TelemetryGuard {
             // pruned/evicted) FlowStore record. Captured BEFORE the `store.finalize`
             // below so it is independent of whether the record still exists.
             let (model_served, usage) = self.serving.metrics_snapshot();
+            // Gap 03: the per-attempt trace + flow-level wire-first-byte ride the SAME
+            // evict-safe `ServingToken` as `usage`, so the terminal metrics payload (spec
+            // 12's source) carries every attempt even if the FlowStore record is
+            // pruned/evicted before finalize. Snapshot them here, BEFORE the
+            // `store.finalize`/`record_attempts` below, so the payload is independent of
+            // whether the record still exists.
+            let (attempts, first_upstream_byte_ms) = self.serving.attempts_snapshot();
             *self
                 .terminal_metrics
                 .lock()
@@ -1300,9 +1488,16 @@ impl TelemetryGuard {
                     endpoint: self.endpoint.clone(),
                     upstream: serving.clone(),
                     usage,
+                    attempts: attempts.clone(),
                 });
             self.store
                 .finalize(&self.api_call_id, status, terminal_reason, serving);
+            // Gap 03: ALSO thread the attempt trace onto the FlowStore record (the
+            // attempt-trace UI reads the record/summary). Same evict-safe source; a
+            // pruned/evicted record makes this a no-op, but the terminal payload above
+            // still carries the attempts for metrics.
+            self.store
+                .record_attempts(&self.api_call_id, attempts, first_upstream_byte_ms);
             // D6: drop the kill token from the AbortHub on the SAME CAS-winning path
             // that finalizes the record — so EVERY terminal (explicit Completed/Failed
             // here, OR the `Drop` fallback's Cancelled) removes the entry exactly once.
@@ -2227,6 +2422,254 @@ mod tests {
             assert_eq!(key.upstream, "backend-b");
             assert_eq!(counts.prompt_tokens, 100);
             assert_eq!(counts.completion_tokens, 40);
+        }
+    }
+
+    // ---- Gap 03: `attempts[]` + `first_upstream_byte_ms` ----
+
+    fn served_attempt(provider: &str, byte_ms: Option<u128>) -> Attempt {
+        Attempt {
+            provider: Some(provider.to_string()),
+            model: Some("served-m".to_string()),
+            start_ms: 100,
+            end_ms: 200,
+            first_upstream_byte_ms: byte_ms,
+            status: AttemptStatus::Served,
+            error_class: None,
+            failover_reason: None,
+        }
+    }
+
+    fn failed_attempt(provider: &str, class: AttemptErrorClass) -> Attempt {
+        Attempt {
+            provider: Some(provider.to_string()),
+            model: Some("m".to_string()),
+            start_ms: 10,
+            end_ms: 50,
+            first_upstream_byte_ms: None,
+            status: AttemptStatus::Failed,
+            error_class: Some(class),
+            failover_reason: Some(AttemptFailoverReason::ProviderFailed),
+        }
+    }
+
+    /// `record_attempts` threads the trace + flow-level wire-first-byte onto the record;
+    /// the body-free summary projects them. A non-failover flow has exactly one attempt.
+    #[test]
+    fn record_attempts_threads_onto_record_and_summary() {
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        store.record_attempts(
+            "api_1",
+            vec![served_attempt("primary", Some(150))],
+            Some(150),
+        );
+
+        let record = store.detail("api_1").expect("record");
+        assert_eq!(
+            record.attempts.len(),
+            1,
+            "single-success flow has exactly one attempt"
+        );
+        assert_eq!(record.attempts[0].status, AttemptStatus::Served);
+        assert_eq!(record.first_upstream_byte_ms, Some(150));
+
+        let summary = store
+            .snapshot_summaries()
+            .into_iter()
+            .find(|s| s.api_call_id == "api_1")
+            .expect("summary");
+        assert_eq!(summary.attempts.len(), 1);
+        assert_eq!(summary.first_upstream_byte_ms, Some(150));
+    }
+
+    /// A forced-failover trace (failed then served) threads ≥2 attempts onto the record;
+    /// the flow-level first byte is the SERVED attempt's; first-write-wins on re-finalize.
+    #[test]
+    fn record_attempts_failover_trace_and_first_byte_first_write_wins() {
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        let attempts = vec![
+            failed_attempt("primary", AttemptErrorClass::HttpStatus),
+            served_attempt("backup", Some(220)),
+        ];
+        store.record_attempts("api_1", attempts, Some(220));
+        let record = store.detail("api_1").expect("record");
+        assert_eq!(record.attempts.len(), 2, "failed provider + served one");
+        assert_eq!(record.attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(
+            record.attempts[0].failover_reason,
+            Some(AttemptFailoverReason::ProviderFailed)
+        );
+        assert!(record.attempts[0].first_upstream_byte_ms.is_none());
+        assert_eq!(record.attempts[1].status, AttemptStatus::Served);
+        assert_eq!(record.first_upstream_byte_ms, Some(220));
+
+        // A later finalize with no byte time cannot clobber the measured value.
+        store.record_attempts("api_1", Vec::new(), None);
+        assert_eq!(
+            store.detail("api_1").unwrap().first_upstream_byte_ms,
+            Some(220),
+            "first_upstream_byte_ms is first-write-wins"
+        );
+    }
+
+    /// don't-lie-with-zeros: a flow where no upstream byte arrived has
+    /// `first_upstream_byte_ms == None`, which is ABSENT on the wire (never `0`).
+    #[test]
+    fn record_attempts_no_upstream_byte_is_none_and_absent() {
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        store.record_attempts(
+            "api_1",
+            vec![failed_attempt("primary", AttemptErrorClass::Connect)],
+            None,
+        );
+        let record = store.detail("api_1").expect("record");
+        assert!(record.first_upstream_byte_ms.is_none());
+
+        let summary = SnapshotFlowSummary::from_record(&record);
+        let value = serde_json::to_value(&summary).expect("serialize");
+        let obj = value.as_object().expect("object");
+        assert!(
+            !obj.contains_key("first_upstream_byte_ms"),
+            "an unmeasured first byte is ABSENT, never 0"
+        );
+        // The attempt's own unmeasured first-byte is likewise absent, but a failed
+        // attempt DOES carry its bounded taxonomic codes.
+        let attempt0 = obj["attempts"][0].as_object().expect("attempt object");
+        assert!(!attempt0.contains_key("first_upstream_byte_ms"));
+        assert_eq!(attempt0["error_class"], serde_json::json!("connect"));
+        assert_eq!(
+            attempt0["failover_reason"],
+            serde_json::json!("provider_failed")
+        );
+    }
+
+    /// The body-free summary survives a deserialize→serialize round-trip carrying the
+    /// attempt trace + flow-level first byte, and `error_class`/`failover_reason` are the
+    /// BOUNDED taxonomic snake_case codes — NOT raw upstream text (raw bodies stay
+    /// spec-05-gated). Proves the new wire fields round-trip (AGENTS.md no-new-wire-field
+    /// -without-round-trip rule).
+    #[test]
+    fn snapshot_summary_attempts_round_trip_and_bounded_codes() {
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        store.record_attempts(
+            "api_1",
+            vec![
+                failed_attempt("primary", AttemptErrorClass::Timeout),
+                served_attempt("backup", Some(220)),
+            ],
+            Some(220),
+        );
+        let record = store.detail("api_1").expect("record");
+        let summary = SnapshotFlowSummary::from_record(&record);
+
+        let value = serde_json::to_value(&summary).expect("serialize");
+        // Bounded taxonomic codes on the wire — snake_case enum tags, not raw text.
+        let json = value.to_string();
+        assert!(json.contains("\"error_class\":\"timeout\""));
+        assert!(json.contains("\"failover_reason\":\"provider_failed\""));
+        assert!(json.contains("\"status\":\"served\""));
+        assert!(json.contains("\"status\":\"failed\""));
+        assert_eq!(value["first_upstream_byte_ms"].as_u64(), Some(220));
+
+        // AGENTS.md: a NEW wire field needs a deserialize→serialize round-trip proving it
+        // survives. `SnapshotFlowSummary` is Serialize-only (gap-02 precedent), so
+        // round-trip the new `attempts[]` payload (`Attempt` derives both) out of the
+        // serialized summary and back. The bounded enums survive as the same taxonomic
+        // codes — no raw upstream text appears.
+        let attempts_json = value["attempts"].to_string();
+        let back: Vec<Attempt> =
+            serde_json::from_str(&attempts_json).expect("deserialize attempts");
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].error_class, Some(AttemptErrorClass::Timeout));
+        assert_eq!(
+            back[0].failover_reason,
+            Some(AttemptFailoverReason::ProviderFailed)
+        );
+        assert_eq!(back[0].status, AttemptStatus::Failed);
+        assert!(back[0].first_upstream_byte_ms.is_none());
+        assert_eq!(back[1].status, AttemptStatus::Served);
+        assert_eq!(back[1].first_upstream_byte_ms, Some(220));
+        // Re-serialize and confirm the round-trip is lossless (compare as `Value` so
+        // struct-field order vs. `Value`'s sorted-key order is not a false mismatch).
+        let reser: serde_json::Value = serde_json::to_value(&back).expect("re-serialize attempts");
+        assert_eq!(
+            reser, value["attempts"],
+            "the attempts round-trip is lossless"
+        );
+    }
+
+    /// The L1 guard threads the attempt trace from the shared `ServingToken` into BOTH the
+    /// FlowStore record AND the evict-safe terminal metrics payload at finalize.
+    #[test]
+    fn guard_finalize_threads_attempts_into_record_and_terminal_payload() {
+        let store = DashboardFlowStore::new();
+        open_simple(&store, "api_1");
+        let token = serving();
+        // The failover/leaf layers push attempts onto the token before finalize.
+        token.record_attempt(failed_attempt("primary", AttemptErrorClass::HttpStatus));
+        token.record_attempt(served_attempt("backup", Some(220)));
+        let guard = store
+            .engine_guard("api_1", Arc::clone(&token), &AbortHub::new())
+            .expect("claim");
+        guard.finalize(FlowStatus::Completed, None);
+
+        // (1) The record carries the full trace + the served attempt's wire first-byte.
+        let record = store.detail("api_1").expect("record");
+        assert_eq!(record.attempts.len(), 2);
+        assert_eq!(record.attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(record.attempts[1].status, AttemptStatus::Served);
+        assert_eq!(record.first_upstream_byte_ms, Some(220));
+
+        // (2) The evict-safe terminal payload carries the SAME attempts (spec 12's source).
+        let inputs = guard.terminal_metrics().expect("terminal metrics");
+        assert_eq!(inputs.attempts.len(), 2);
+        assert_eq!(inputs.attempts[0].provider.as_deref(), Some("primary"));
+        assert_eq!(inputs.attempts[1].provider.as_deref(), Some("backup"));
+    }
+
+    /// Evict-safe acceptance: when the FlowStore record is EVICTED before finalize, the
+    /// terminal payload STILL carries ALL attempts (spec 12 aggregates from it without
+    /// re-reading the gone record). Asserted for both eviction mechanisms.
+    #[test]
+    fn attempts_survive_record_eviction_before_finalize() {
+        for evict_via_ttl in [true, false] {
+            let store = DashboardFlowStore::new();
+            open_simple(&store, "api_1");
+            let token = serving();
+            token.record_attempt(failed_attempt("primary", AttemptErrorClass::Timeout));
+            token.record_attempt(served_attempt("backup", Some(220)));
+            let guard = store
+                .engine_guard("api_1", Arc::clone(&token), &AbortHub::new())
+                .expect("claim");
+
+            if evict_via_ttl {
+                store.force_started_ms("api_1", 0);
+                store.prune_at(FLOW_TTL_MS + 100);
+            } else {
+                for index in 0..(FLOW_CAP + 1) {
+                    open_simple(&store, &format!("filler_{index}"));
+                }
+            }
+            assert!(
+                store.detail("api_1").is_none(),
+                "record evicted before finalize (evict_via_ttl={evict_via_ttl})"
+            );
+
+            guard.finalize(FlowStatus::Completed, None);
+            let inputs = guard
+                .terminal_metrics()
+                .expect("terminal payload survives record eviction");
+            assert_eq!(
+                inputs.attempts.len(),
+                2,
+                "ALL attempts ride the terminal payload despite eviction (evict_via_ttl={evict_via_ttl})"
+            );
+            assert_eq!(inputs.attempts[1].status, AttemptStatus::Served);
+            assert_eq!(inputs.attempts[1].first_upstream_byte_ms, Some(220));
         }
     }
 

@@ -7,7 +7,7 @@
 > **Branch:** `worktree-dashboard`. **Inherits:** `AGENTS.md` (commands + hard rules) + REVIEW_PROTOCOL.
 > **Run:** `/ralph-orchestrate --no-review --agents 1` (serial; per-gap Codex review is the gate).
 
-## Status: IN PROGRESS — 2/16 done (01 ✅, 02 ✅). 14 gaps remain (03–16), serial, per-gap Codex-xhigh reviewed.
+## Status: IN PROGRESS — 3/16 done (01 ✅, 02 ✅, 03 ✅). 13 gaps remain (04–16), serial, per-gap Codex-xhigh reviewed.
 
 ## The discipline (cross-cutting acceptance — applies to EVERY gap)
 FEATURES.md hardened the framing from "pretty flow artifacts" to "can Argus answer the incident
@@ -62,7 +62,7 @@ Checklist; `[ ]` = not started. Gate: **B** = backend (`cargo test`/`clippy`/`fm
 
 ### Phase 1 — Data-contract pass (the spine; backend; before any UI)
 - [x] **02** spine: per-phase timestamps + `first_content_delta_ms` 🔭⚙️⭐ · gate **B** · feeds 10, 16. Added `PhaseTimings{ingress_ms, normalization_done_ms, routing_decision_ms, first_content_delta_ms, stream_end_ms, finalize_ms}` (all `Option<u128>`, first-write-wins + monotonic-clamp) on `FlowRecord` + flattened onto body-free `SnapshotFlowSummary` (so it reaches the WS/snapshot wire). Seams: open→ingress, `set_normalized`→normalization, engine pre-spawn (post-lower)→routing, `OutputTextDelta` arm→TTFT (content-only), end of `run_turn`→stream_end, `finalize`→finalize. Missing phase = `None` ⇒ absent JSON (don't-lie-with-zeros). `routing` lives at the engine seam (not the leaf) so it fires for mock + real upstreams.
-- [ ] **03** spine: `attempts[]` + `first_upstream_byte_ms` · gate **B** · feeds 11, 12.
+- [x] **03** spine: `attempts[]` + `first_upstream_byte_ms` · gate **B** · feeds 11, 12. Added `Attempt{provider,model,start_ms,end_ms,first_upstream_byte_ms,status,error_class,failover_reason}` (bounded snake_case taxonomic codes, NOT raw upstream text) on `FlowRecord` + body-free `SnapshotFlowSummary` + the evict-safe `TerminalMetricsInputs` (spec-12 source). Attempts ride the shared `ServingToken` (same evict-safe seam as usage): the failover loop records one per provider (failed+served), the bare leaf records exactly one (served via a first-byte stream wrap / failed via dispatch error). The L1 guard threads them into BOTH the record AND the terminal payload at finalize. `first_upstream_byte_ms` = wire TTFB (distinct from gap-02's content TTFT), measured at the prefetch point. Mid-stream failure appends NO attempt (failover-pre-first-chunk untouched); routing-mode attempts come only from the selected provider's failover loop. don't-lie-with-zeros: unmeasured times are `None`→absent, never `0`.
 - [ ] **04** spine: `client_label` / key-hash · gate **B** · feeds 15.
 - [ ] **05** spine: gated upstream response/error-body capture · gate **B** · feeds 14.
 - [ ] **06** spine: surface per-model max-context (nullable `context_limit`) · gate **B+F** (contract migration) · feeds 09.
