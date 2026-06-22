@@ -64,6 +64,29 @@ const BODY_CAP: usize = 128 * 1024;
 /// (body scalars, headers, ids, method, uri, models, target, terminal reason).
 const SCALAR_CAP: usize = 4 * 1024;
 
+/// Gap 05 — env flag that opts INTO upstream RESPONSE/ERROR-body capture. SEPARATE
+/// from the debug-UI gate (which arms request-body capture): even with the dashboard
+/// on, the upstream response/error body is captured ONLY when this is an explicit
+/// affirmative. OFF by default — a diagnostic operator turns it on to answer "what did
+/// the upstream actually say back when this turn failed?". Read env-only (never a
+/// persisted `Config` field, mirroring the dashboard auth posture).
+const ENV_CAPTURE_UPSTREAM_RESPONSE: &str = "LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE";
+
+/// A boolean env flag is true only for the explicit affirmative values `1`/`true`/
+/// `yes` (case-insensitive). Anything else — including unset — is false, so upstream
+/// response capture stays OFF unless explicitly opted in. Mirrors
+/// [`crate::dashboard_auth`]'s `env_flag` (kept local so this module owns its own gate
+/// rather than widening that one's visibility).
+fn capture_response_env_flag() -> bool {
+    matches!(
+        std::env::var(ENV_CAPTURE_UPSTREAM_RESPONSE)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 /// CAS claim state: the flow is open and unclaimed by a telemetry writer (D3 L0).
 pub const CLAIM_OPEN_L0: u8 = 0;
 /// CAS claim state: a telemetry writer holds the claim (D3 L1).
@@ -591,6 +614,54 @@ impl CapturedBody {
 #[derive(Debug, Clone)]
 pub struct CapturedHeaders(Vec<(String, String)>);
 
+/// Gap 05 — an upstream RESPONSE/ERROR body that has ALREADY been through the capped +
+/// redacting capture primitive, paired with whether the cap TRUNCATED it. The ONLY way
+/// to mint one is [`capture_response_body`], so (like [`CapturedBody`]) a caller cannot
+/// hand the store an unredacted / over-cap / slice-retaining body. Holds an
+/// `Arc<[u8]>` ≤ `BODY_CAP` with secrets redacted; `truncated` records whether the raw
+/// body exceeded `BODY_CAP` (so the dashboard can flag a partial body honestly rather
+/// than presenting it as complete — don't-lie-with-zeros for bodies).
+#[derive(Debug, Clone)]
+pub struct CapturedResponseBody {
+    body: Arc<[u8]>,
+    truncated: bool,
+}
+
+impl CapturedResponseBody {
+    /// Move the inner capture into the record-facing [`UpstreamResponseBody`] (cheap
+    /// `Arc` clone of the redacted bytes + the truncation flag).
+    fn into_record(self) -> UpstreamResponseBody {
+        UpstreamResponseBody {
+            bytes: self.body,
+            truncated: self.truncated,
+        }
+    }
+}
+
+/// Gap 05 — the upstream RESPONSE/ERROR body as retained on a live [`FlowRecord`]: the
+/// redacted, capped bytes plus the truncation flag. `Some(_)` means a body WAS captured
+/// (distinct from `None` = capture disabled or no body); an EMPTY `bytes` distinguishes
+/// "captured an empty body" from both. NOT placed on [`SnapshotFlowSummary`] — bodies
+/// live only on the live record (the 135 GiB worst-case, body-free-snapshot invariant).
+#[derive(Debug, Clone)]
+pub struct UpstreamResponseBody {
+    /// Redacted, capped response/error bytes (≤ `BODY_CAP`). May be EMPTY — that is a
+    /// genuinely captured empty body, NOT an absent one (the absent case is the outer
+    /// `Option` being `None`).
+    pub bytes: Arc<[u8]>,
+    /// Whether the cap truncated the raw body (raw length exceeded `BODY_CAP`). When
+    /// `true`, `bytes` is a PREFIX, not the whole body — the dashboard must flag it.
+    pub truncated: bool,
+}
+
+impl UpstreamResponseBody {
+    /// Bytes this capture contributes to the live summary-byte quota (the retained
+    /// `Arc<[u8]>` length; the `bool` is fixed-size and not counted).
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
 /// The authoritative live record for one inference flow. NOT `Serialize`: it holds
 /// an `Arc<AtomicU8>` (the D3 claim) and an `Instant`, and carries the raw capped
 /// body `Arc<[u8]>`s; the dashboard surface serializes the body-free
@@ -626,6 +697,19 @@ pub struct FlowRecord {
     pub normalized: Option<Arc<[u8]>>,
     /// Capped + redacted upstream chat body (set by D2).
     pub upstream_body: Option<Arc<[u8]>>,
+    /// Gap 05 — the capped + redacted upstream RESPONSE/ERROR body (set by
+    /// [`set_upstream_response`](DashboardFlowStore::set_upstream_response) at the leaf
+    /// when a turn fails with a non-2xx). OPTIONAL and OFF by default: populated ONLY
+    /// when the SEPARATE [`ENV_CAPTURE_UPSTREAM_RESPONSE`] gate is on (distinct from the
+    /// debug-UI gate that arms request capture) AND the upstream actually returned an
+    /// error body. Tri-state, don't-lie-with-zeros: `None` ⇒ capture disabled OR no
+    /// body captured; `Some(b)` with `b.bytes` empty ⇒ a genuinely captured EMPTY body;
+    /// `Some(b)` with `b.truncated` ⇒ a partial (cap-truncated) body the dashboard must
+    /// flag. Copied through the capped/redacting serializer (NEVER a `Bytes` slice of
+    /// the 256 MiB middleware buffer); evicted with the other bodies under the summary
+    /// quota and NEVER projected onto the body-free [`SnapshotFlowSummary`]. Consumed by
+    /// gap 14 (failure taxonomy); the React app ignores it until then.
+    pub upstream_response: Option<UpstreamResponseBody>,
     pub model_requested: Option<String>,
     pub model_served: Option<String>,
     pub upstream_target: Option<String>,
@@ -809,9 +893,15 @@ impl FlowRecord {
             .map(|(name, value)| name.len() + value.len())
             .sum();
         let attempts: usize = self.attempts.iter().map(Attempt::summary_bytes).sum();
+        let response_body = self
+            .upstream_response
+            .as_ref()
+            .map(UpstreamResponseBody::len)
+            .unwrap_or(0);
         body(&self.inbound_body)
             + body(&self.normalized)
             + body(&self.upstream_body)
+            + response_body
             + headers
             + self.api_call_id.len()
             + opt(&self.response_id)
@@ -825,15 +915,27 @@ impl FlowRecord {
             + attempts
     }
 
-    /// Total bytes held by the three body `Arc`s only (the eviction target).
+    /// Total bytes held by the captured-body `Arc`s only (the eviction target):
+    /// the three request layers plus the gap-05 upstream RESPONSE/ERROR body.
     fn body_bytes(&self) -> usize {
         let body = |b: &Option<Arc<[u8]>>| b.as_ref().map(|b| b.len()).unwrap_or(0);
-        body(&self.inbound_body) + body(&self.normalized) + body(&self.upstream_body)
+        let response_body = self
+            .upstream_response
+            .as_ref()
+            .map(UpstreamResponseBody::len)
+            .unwrap_or(0);
+        body(&self.inbound_body)
+            + body(&self.normalized)
+            + body(&self.upstream_body)
+            + response_body
     }
 
     /// Whether the record still retains any body (eviction candidate).
     fn has_body(&self) -> bool {
-        self.inbound_body.is_some() || self.normalized.is_some() || self.upstream_body.is_some()
+        self.inbound_body.is_some()
+            || self.normalized.is_some()
+            || self.upstream_body.is_some()
+            || self.upstream_response.is_some()
     }
 }
 
@@ -960,15 +1062,24 @@ struct DashboardFlowState {
 #[derive(Clone, Debug)]
 pub struct DashboardFlowStore {
     enabled: bool,
+    /// Gap 05 — whether upstream RESPONSE/ERROR-body capture is armed. SEPARATE from
+    /// `enabled` (the debug-UI gate): `set_upstream_response` no-ops unless BOTH are
+    /// true. Read env-only from [`ENV_CAPTURE_UPSTREAM_RESPONSE`] in `new()` (OFF by
+    /// default); `disabled()` leaves it false. Never derived from a persisted `Config`.
+    response_capture_enabled: bool,
     state: Arc<Mutex<DashboardFlowState>>,
     summary_quota_bytes: usize,
 }
 
 impl DashboardFlowStore {
     /// Enabled store (debug UI on). Uses the default 64 MiB summary-byte quota.
+    /// Upstream RESPONSE/ERROR-body capture is armed ONLY when the separate
+    /// [`ENV_CAPTURE_UPSTREAM_RESPONSE`] env flag is an explicit affirmative (OFF by
+    /// default) — request capture does not imply response capture.
     pub fn new() -> Self {
         Self {
             enabled: true,
+            response_capture_enabled: capture_response_env_flag(),
             state: Arc::new(Mutex::new(DashboardFlowState::default())),
             summary_quota_bytes: DEFAULT_SUMMARY_QUOTA_BYTES,
         }
@@ -979,6 +1090,21 @@ impl DashboardFlowStore {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
+            response_capture_enabled: false,
+            state: Arc::new(Mutex::new(DashboardFlowState::default())),
+            summary_quota_bytes: DEFAULT_SUMMARY_QUOTA_BYTES,
+        }
+    }
+
+    /// Test-only: an enabled store with the gap-05 upstream-response capture gate set
+    /// deterministically (the production `new()` reads the gate from a process-global
+    /// env var, which is racy across parallel tests). Lets a test exercise the
+    /// capture-ON and capture-OFF branches without mutating the environment.
+    #[cfg(test)]
+    pub(crate) fn new_with_response_capture(response_capture_enabled: bool) -> Self {
+        Self {
+            enabled: true,
+            response_capture_enabled,
             state: Arc::new(Mutex::new(DashboardFlowState::default())),
             summary_quota_bytes: DEFAULT_SUMMARY_QUOTA_BYTES,
         }
@@ -986,6 +1112,13 @@ impl DashboardFlowStore {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Gap 05 — whether upstream RESPONSE/ERROR-body capture is armed (debug UI on AND
+    /// the separate env gate set). The leaf checks this before reading an error body
+    /// into a capture so that, when capture is off, no work and no retention happen.
+    pub fn is_response_capture_enabled(&self) -> bool {
+        self.enabled && self.response_capture_enabled
     }
 
     /// The FlowStore's per-domain mutation cursor (D5): a monotonic counter bumped
@@ -1042,6 +1175,10 @@ impl DashboardFlowStore {
             inbound_body: inbound_body.map(CapturedBody::into_arc),
             normalized: None,
             upstream_body: None,
+            // Gap 05: the upstream RESPONSE/ERROR body is captured later (and only when
+            // the separate capture gate is on AND the turn failed with an error body) —
+            // `None` here = no upstream response captured yet.
+            upstream_response: None,
             model_requested: None,
             model_served: None,
             upstream_target: None,
@@ -1135,6 +1272,37 @@ impl DashboardFlowStore {
             if upstream_body.is_some() {
                 record.upstream_body = upstream_body.clone();
             }
+        });
+        state.enforce_caps(self.summary_quota_bytes);
+    }
+
+    /// Gap 05 — attach the upstream RESPONSE/ERROR body to a flow's record. NO-OP
+    /// unless [`is_response_capture_enabled`](Self::is_response_capture_enabled) (debug
+    /// UI on AND the separate `LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE` gate set)
+    /// — so production and a dashboard-without-the-gate retain nothing here. `body` is a
+    /// [`CapturedResponseBody`] (provably redacted + capped + truncation-flagged via the
+    /// same capped/redacting serializer the request layers use), so a `Bytes` slice of
+    /// the 256 MiB middleware buffer is NEVER retained. `id` may be the flow's
+    /// `api_call_id` OR its `response_id` (the leaf only knows the latter); `update`
+    /// joins by either via the link index, mirroring [`set_upstream`](Self::set_upstream).
+    /// First-write-wins is NOT enforced: a shrink-and-retry whose retry also fails
+    /// overwrites the first error body with the one that actually ended the turn (the
+    /// leaf calls this once per terminal error). Counted in the body quota + evicted with
+    /// the other bodies; NEVER projected onto the body-free [`SnapshotFlowSummary`].
+    pub fn set_upstream_response(&self, id: &str, body: Option<CapturedResponseBody>) {
+        if !self.is_response_capture_enabled() {
+            return;
+        }
+        // Nothing to record (the leaf passes `None` only defensively) — avoid taking the
+        // lock + churning the quota for a no-op.
+        let Some(body) = body else {
+            return;
+        };
+        let response = body.into_record();
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
+        state.update(id, |record| {
+            record.upstream_response = Some(response.clone());
         });
         state.enforce_caps(self.summary_quota_bytes);
     }
@@ -1922,6 +2090,7 @@ impl DashboardFlowState {
             next.inbound_body = None;
             next.normalized = None;
             next.upstream_body = None;
+            next.upstream_response = None;
             self.by_id.insert(id, Arc::new(next));
             self.live_summary_bytes = self.live_summary_bytes.saturating_sub(freed);
         }
@@ -1961,6 +2130,26 @@ impl DashboardFlowState {
 pub fn capture_body(raw: &[u8]) -> CapturedBody {
     let bytes = crate::redaction::capture_capped_redacted(raw, BODY_CAP, SCALAR_CAP);
     CapturedBody(Arc::from(bytes.into_boxed_slice()))
+}
+
+/// Gap 05 — capped + redacting capture of an upstream RESPONSE/ERROR body → a
+/// [`CapturedResponseBody`], plus a TRUNCATION flag. Same guarantees as
+/// [`capture_body`] (the body is redacted + capped via the shared O(CAP) primitive and
+/// NEVER retains a slice of `raw`), so the leaf can copy the upstream error body it
+/// already read (a `String`/`&[u8]`) without keeping the 256 MiB middleware buffer
+/// alive. `truncated` is `raw.len() > BODY_CAP` — i.e. the RAW body exceeded the cap, so
+/// the retained bytes are a prefix the dashboard must flag (don't present a partial body
+/// as complete). Note the redacted output can be a fixed marker (`[redacted: unparseable
+/// body …]`) for a non-JSON/over-bound body; `truncated` reflects the raw input length,
+/// independent of that marker, so an over-cap body is flagged truncated even when the
+/// stored bytes are the marker.
+pub fn capture_response_body(raw: &[u8]) -> CapturedResponseBody {
+    let truncated = raw.len() > BODY_CAP;
+    let bytes = crate::redaction::capture_capped_redacted(raw, BODY_CAP, SCALAR_CAP);
+    CapturedResponseBody {
+        body: Arc::from(bytes.into_boxed_slice()),
+        truncated,
+    }
 }
 
 /// Capture a `Serialize` value (the typed on-wire request) into a [`CapturedBody`]
@@ -3156,6 +3345,7 @@ mod tests {
     fn summary_quota_evicts_oldest_bodies_keeping_records() {
         let store = DashboardFlowStore {
             enabled: true,
+            response_capture_enabled: false,
             state: Arc::new(Mutex::new(DashboardFlowState::default())),
             summary_quota_bytes: 4 * 1024,
         };
@@ -3200,6 +3390,7 @@ mod tests {
         // (under-quota by itself) survives.
         let store = DashboardFlowStore {
             enabled: true,
+            response_capture_enabled: false,
             state: Arc::new(Mutex::new(DashboardFlowState::default())),
             summary_quota_bytes: 16 * 1024,
         };
@@ -3260,6 +3451,7 @@ mod tests {
         // until under quota, so the quota is a HARD bound.
         let store = DashboardFlowStore {
             enabled: true,
+            response_capture_enabled: false,
             state: Arc::new(Mutex::new(DashboardFlowState::default())),
             // ~10 capped-scalar records fit; many more must force whole-record eviction.
             summary_quota_bytes: 64 * 1024,
@@ -3701,6 +3893,219 @@ mod tests {
         assert!(
             text.starts_with("[redacted: unparseable body"),
             "fixed marker stored for a malformed body: {text}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Gap 05 — gated upstream RESPONSE/ERROR-body capture (the spine seam).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn upstream_response_capture_off_by_default() {
+        // The plain debug-UI store (`new()`) does NOT arm response capture unless the
+        // separate env flag is set — request capture does not imply response capture.
+        let store = DashboardFlowStore::new();
+        assert!(
+            store.is_enabled(),
+            "debug-UI store is enabled for request capture"
+        );
+        // Whatever the ambient env, a freshly-constructed store reflects the flag; this
+        // test only asserts the gate is SEPARATE — a request-capture store with the gate
+        // OFF retains no response body.
+        if !store.is_response_capture_enabled() {
+            open_simple(&store, "api_1");
+            store.set_upstream_response("api_1", Some(capture_response_body(b"{\"error\":\"x\"}")));
+            let record = store.detail("api_1").expect("record");
+            assert!(
+                record.upstream_response.is_none(),
+                "capture-disabled store retains no upstream response body"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_response_captured_when_gate_on() {
+        // Gate ON: a failing turn's error body lands on the LIVE record, keyed by the
+        // flow's `response_id` (the only id the leaf knows) via the link index.
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        assert!(store.is_response_capture_enabled());
+        open_simple(&store, "api_1");
+        store.link("resp_1".to_string(), "api_1".to_string());
+        let body = br#"{"error":{"message":"upstream exploded","type":"server_error"}}"#;
+        store.set_upstream_response("resp_1", Some(capture_response_body(body)));
+
+        let record = store.detail("api_1").expect("record");
+        let captured = record
+            .upstream_response
+            .as_ref()
+            .expect("response body captured");
+        assert!(!captured.truncated, "a small body is not truncated");
+        let text = String::from_utf8_lossy(&captured.bytes);
+        assert!(
+            text.contains("upstream exploded"),
+            "the diagnostic error body is retained for the operator: {text}"
+        );
+        // The capture is an OWNED, capped Arc — never a slice of a larger buffer.
+        assert!(captured.bytes.len() <= BODY_CAP);
+    }
+
+    #[test]
+    fn upstream_response_capture_disabled_store_retains_none() {
+        // Explicitly gate OFF: even the dedicated mutator no-ops, so `None` (absent),
+        // NOT an empty body, represents "capture disabled" — distinct from a captured
+        // empty body (the don't-lie-with-zeros tri-state).
+        let store = DashboardFlowStore::new_with_response_capture(false);
+        assert!(!store.is_response_capture_enabled());
+        open_simple(&store, "api_1");
+        store.set_upstream_response("api_1", Some(capture_response_body(b"{\"error\":\"x\"}")));
+        let record = store.detail("api_1").expect("record");
+        assert!(
+            record.upstream_response.is_none(),
+            "capture-off ⇒ None (absent), never a fabricated/empty body"
+        );
+    }
+
+    #[test]
+    fn upstream_response_empty_body_is_distinct_from_absent() {
+        // A genuinely EMPTY upstream error body (e.g. a 500 with no payload) is still a
+        // CAPTURED event: `Some(_)`, distinct from `None` (capture disabled / nothing
+        // captured). The redacting serializer records a non-JSON/empty body as the fixed
+        // `[redacted: unparseable body 0 bytes]` marker — an HONEST representation that
+        // records the body existed AND was empty, never masquerading as "no error" and
+        // never a fabricated body. The don't-lie-with-zeros distinction the spec wants is
+        // exactly this `Some` (an error happened, body was empty) vs `None` (no capture).
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        open_simple(&store, "api_1");
+        store.set_upstream_response("api_1", Some(capture_response_body(b"")));
+        let record = store.detail("api_1").expect("record");
+        let captured = record
+            .upstream_response
+            .as_ref()
+            .expect("an empty body is still CAPTURED (Some), not absent");
+        let text = String::from_utf8_lossy(&captured.bytes);
+        assert_eq!(
+            text, "[redacted: unparseable body 0 bytes]",
+            "captured-empty is recorded honestly as the 0-bytes marker, not a fake body"
+        );
+        assert!(!captured.truncated, "an empty body is not truncated");
+
+        // Contrast: a flow with NO response capture has `None` here — the two states are
+        // never conflated (capture-disabled / no-body vs captured-empty).
+        let off = DashboardFlowStore::new_with_response_capture(false);
+        open_simple(&off, "api_off");
+        off.set_upstream_response("api_off", Some(capture_response_body(b"")));
+        assert!(
+            off.detail("api_off").unwrap().upstream_response.is_none(),
+            "capture disabled ⇒ None, distinct from the captured-empty Some above"
+        );
+    }
+
+    #[test]
+    fn upstream_response_over_cap_is_truncated_and_flagged() {
+        // A body exceeding `BODY_CAP` is capped AND flagged truncated, so the dashboard
+        // never presents a partial body as complete. The retained bytes stay ≤ cap.
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        open_simple(&store, "api_1");
+        // A valid-JSON-ish payload far larger than the cap (a long string value). Build
+        // it big enough that the raw length exceeds BODY_CAP regardless of redaction.
+        let filler = "A".repeat(BODY_CAP * 2);
+        let body = format!("{{\"error\":\"{filler}\"}}");
+        assert!(body.len() > BODY_CAP, "test body exceeds the cap");
+        store.set_upstream_response("api_1", Some(capture_response_body(body.as_bytes())));
+
+        let record = store.detail("api_1").expect("record");
+        let captured = record
+            .upstream_response
+            .as_ref()
+            .expect("over-cap body captured");
+        assert!(
+            captured.truncated,
+            "an over-cap body is flagged truncated (don't present partial as complete)"
+        );
+        assert!(
+            captured.bytes.len() <= BODY_CAP,
+            "retained bytes stay within the cap regardless of raw size"
+        );
+    }
+
+    #[test]
+    fn upstream_response_body_is_redacted() {
+        // The captured error body goes through the SAME redacting serializer as the
+        // request layers — a secret echoed back in the upstream error never persists.
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        open_simple(&store, "api_1");
+        let body = br#"{"error":"bad key","api_key":"RESPONSEKEYSECRET"}"#;
+        store.set_upstream_response("api_1", Some(capture_response_body(body)));
+        let record = store.detail("api_1").expect("record");
+        let captured = record.upstream_response.as_ref().expect("captured");
+        let text = String::from_utf8_lossy(&captured.bytes);
+        assert!(
+            !text.contains("RESPONSEKEYSECRET"),
+            "upstream-response api_key redacted: {text}"
+        );
+    }
+
+    #[test]
+    fn upstream_response_body_not_on_snapshot_summary() {
+        // The body-free invariant (135 GiB worst case): the response body lives ONLY on
+        // the live record; the serialized snapshot summary never carries it.
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        open_simple(&store, "api_1");
+        let body = br#"{"error":"SNAPSHOTERRORMARKER"}"#;
+        store.set_upstream_response("api_1", Some(capture_response_body(body)));
+        // Sanity: it IS on the live record.
+        assert!(store.detail("api_1").unwrap().upstream_response.is_some());
+
+        let summaries = store.snapshot_summaries();
+        assert_eq!(summaries.len(), 1);
+        let json = serde_json::to_string(&summaries[0]).expect("serialize summary");
+        assert!(
+            !json.contains("upstream_response"),
+            "no response-body field on the snapshot summary"
+        );
+        assert!(
+            !json.contains("SNAPSHOTERRORMARKER"),
+            "no response-body CONTENT on the snapshot summary: {json}"
+        );
+    }
+
+    #[test]
+    fn upstream_response_body_counts_toward_quota_and_evicts() {
+        // The response body is part of the body-eviction target: under quota pressure it
+        // is shed (record survives body-free), exactly like the request layers — so it
+        // cannot blow the 135 GiB-guard summary quota. D5 evict-safety.
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        open_simple(&store, "api_1");
+        // A non-trivial valid-JSON error body so the redactor keeps the bytes (not a
+        // fixed marker) and the retained length is a meaningful quota contribution.
+        let mut json = Vec::new();
+        json.extend_from_slice(br#"{"error":""#);
+        json.extend(std::iter::repeat_n(b'a', 8 * 1024));
+        json.extend_from_slice(br#""}"#);
+        store.set_upstream_response("api_1", Some(capture_response_body(&json)));
+        let before = store.detail("api_1").unwrap();
+        let captured_len = before
+            .upstream_response
+            .as_ref()
+            .map(|r| r.bytes.len())
+            .unwrap_or(0);
+        assert!(captured_len > 0, "captured a non-empty body");
+
+        // Force eviction with a quota BELOW the body size but ABOVE the record's tiny
+        // scalars (api_call_id/method/uri ≈ tens of bytes): phase-1 sheds the body and
+        // the record SURVIVES body-free (the body is the eviction target, not the row).
+        let quota = 1024;
+        assert!(captured_len > quota, "the body exceeds the test quota");
+        {
+            let mut state = store.lock();
+            // The response body is counted in the running total (proving it is quota-visible).
+            assert!(state.live_summary_bytes >= captured_len);
+            state.enforce_summary_quota(quota);
+        }
+        let after = store.detail("api_1").expect("record survives body-free");
+        assert!(
+            after.upstream_response.is_none(),
+            "response body evicted under quota pressure (record survives)"
         );
     }
 

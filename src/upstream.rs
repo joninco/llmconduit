@@ -1020,6 +1020,31 @@ impl ReqwestUpstreamClient {
         );
     }
 
+    /// Gap 05 capture: store the upstream RESPONSE/ERROR `body` for `response_id`
+    /// through the capped + redacting + truncation-flagging serializer. No-op when the
+    /// SEPARATE upstream-response capture gate is off (debug UI off OR the
+    /// `LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE` env flag unset) or no
+    /// `response_id` is threaded — so production and a dashboard-without-the-gate do no
+    /// work and retain nothing. `body` is the already-read upstream error text (a
+    /// `String`/`&str`, NOT the 256 MiB inbound middleware buffer); it is COPIED through
+    /// the capped serializer, so no `Bytes` slice of that buffer is retained. Called at
+    /// the terminal-error sites in [`dispatch_chat_stream`] — the body that actually
+    /// ended the turn (last-writer-wins on the shrink-and-retry path, where the retry's
+    /// error body replaces the first attempt's). The redaction is consistent with the
+    /// existing request-capture surface; this is a diagnostic body shown to the
+    /// authenticated operator, captured ONLY when explicitly opted in.
+    fn capture_upstream_response_body(&self, response_id: Option<&str>, body: &str) {
+        if !self.flow_store.is_response_capture_enabled() {
+            return;
+        }
+        let Some(response_id) = response_id else {
+            return;
+        };
+        let captured = crate::dashboard_flow::capture_response_body(body.as_bytes());
+        self.flow_store
+            .set_upstream_response(response_id, Some(captured));
+    }
+
     /// Gap 03 (bare-leaf path): wrap a successfully-dispatched upstream stream so the
     /// flow records EXACTLY ONE served [`Attempt`](crate::dashboard_flow::Attempt). Round-1
     /// review (F1): `first_upstream_byte_ms` is `header_byte_ms` — the wire instant the
@@ -1198,6 +1223,10 @@ impl ReqwestUpstreamClient {
             // retry is allowed; we do not loop). Any other non-2xx is a normal
             // (failover-eligible) upstream error.
             let retry_body = retry_response.text().await.unwrap_or_default();
+            // Gap 05: the RETRY is the body that actually ended the turn on the
+            // shrink-and-retry path — capture IT (last-writer-wins over the first
+            // attempt's body) so the dashboard shows the upstream's final word.
+            self.capture_upstream_response_body(response_id, &retry_body);
             if classify_context_overflow(
                 &retry_body,
                 self.min_completion_tokens,
@@ -1220,6 +1249,9 @@ impl ReqwestUpstreamClient {
             )));
         }
 
+        // Gap 05: a first-attempt non-2xx that did NOT trigger a context-overflow retry
+        // — capture the upstream error body so the operator can see why the turn failed.
+        self.capture_upstream_response_body(response_id, &body);
         Err(AppError::upstream(format!(
             "upstream chat failed with {status}: {}",
             redact_and_truncate_error_body(&body, 500)
@@ -6366,6 +6398,107 @@ mod tests {
         assert!(
             first_byte.is_none(),
             "no served attempt → no flow-level first byte"
+        );
+    }
+
+    /// Gap 05: with the upstream-response capture gate ARMED, a failing turn's upstream
+    /// ERROR body lands on the live FlowStore record (copied through the capped/redacting
+    /// serializer, keyed by the flow's `response_id`). This is the leaf wiring that
+    /// answers "what did the upstream actually say back when this failed?".
+    #[tokio::test]
+    async fn gap05_leaf_captures_upstream_error_body_when_gate_on() {
+        let server = MockServer::start().await;
+        let error_body =
+            r#"{"error":{"message":"backend is on fire","type":"server_error","code":500}}"#;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(error_body))
+            .mount(&server)
+            .await;
+
+        // Capture-armed store (gate ON, deterministic — no env mutation).
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+        let leaf = ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        )
+        .into_bare_primary()
+        .with_flow_store(store.clone());
+
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some(response_id.clone()),
+            Some(Arc::clone(&token)),
+        );
+        assert!(
+            leaf.stream_chat_completion(&backend).await.is_err(),
+            "500 dispatch fails"
+        );
+
+        let record = store.detail(&api_call_id).expect("record");
+        let captured = record
+            .upstream_response
+            .as_ref()
+            .expect("gap05: upstream error body captured onto the record");
+        assert!(!captured.truncated, "a small error body is not truncated");
+        let text = String::from_utf8_lossy(&captured.bytes);
+        assert!(
+            text.contains("backend is on fire"),
+            "the diagnostic upstream error body is retained for the operator: {text}"
+        );
+    }
+
+    /// Gap 05: with the gate OFF (the DEFAULT — request capture does not imply response
+    /// capture), the SAME failing turn retains NO upstream response body. `None` (absent),
+    /// not an empty body — the gate is a real opt-in, and `set_upstream_response` no-ops.
+    #[tokio::test]
+    async fn gap05_leaf_does_not_capture_upstream_error_body_when_gate_off() {
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("backend is on fire"))
+            .mount(&server)
+            .await;
+
+        // Request capture ON (default debug-UI store) but the response gate OFF.
+        let store = DashboardFlowStore::new_with_response_capture(false);
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+        let leaf = ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        )
+        .into_bare_primary()
+        .with_flow_store(store.clone());
+
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some(response_id.clone()),
+            Some(Arc::clone(&token)),
+        );
+        assert!(
+            leaf.stream_chat_completion(&backend).await.is_err(),
+            "500 dispatch fails"
+        );
+
+        let record = store.detail(&api_call_id).expect("record");
+        assert!(
+            record.upstream_response.is_none(),
+            "gap05: response capture OFF ⇒ no upstream error body retained (None, not empty)"
         );
     }
 
