@@ -4974,6 +4974,89 @@ async fn gap02_error_before_content_leaves_ttft_and_stream_end_none() {
 }
 
 #[tokio::test]
+async fn gap02_cancel_before_first_content_delta_leaves_ttft_none() {
+    // Gap 02 (review round 1, HIGH): TTFT is stamped ONLY AFTER the first content
+    // delta's `send_event` is delivered to the client. If the client hangs up BEFORE
+    // any content delta is delivered, `first_content_delta_ms` stays None — a closed /
+    // cancelled stream must NOT record a TTFT for a token the client never saw.
+    //
+    // The upstream parks (never yields a content chunk) so the engine is suspended in
+    // `next_upstream_chunk`'s `tx.closed()` select when the client drops the receiver:
+    // the content arm is never reached, and the flow finalizes Cancelled with TTFT None.
+    // (The DELIVERED-then-cancelled direction — TTFT IS kept — is asserted by
+    // `d3_midstream_cancel_finalizes_cancelled_with_last_usage`, which drains a content
+    // delta before hanging up.)
+    let upstream = PendingChunkUpstream::new();
+    let stream_polled = upstream.stream_polled.notified();
+    let stream_dropped = upstream.stream_dropped.notified();
+    let gateway = test_gateway_with_flow_store_upstream(Arc::new(upstream.clone()));
+    let api_call_id = d3_open_flow(&gateway);
+
+    let request = base_request(vec![user_message("count")]);
+    let mut stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+
+    // Drain the preamble (`response.created`, `response.in_progress`) — these are NOT
+    // content deltas, so they must not stamp TTFT. The upstream then parks waiting for a
+    // chunk that never comes, so no `output_text.delta` is ever produced or delivered.
+    let _created = stream.next().await;
+    let _in_progress = stream.next().await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_polled)
+        .await
+        .expect("upstream parked before yielding any content chunk");
+
+    // Client hangs up BEFORE the first content delta is delivered.
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_dropped)
+        .await
+        .expect("upstream stream dropped after the client hung up pre-content");
+
+    let record = d3_await_terminal(&gateway, &api_call_id).await;
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Cancelled,
+        "a pre-content hang-up finalizes Cancelled"
+    );
+    let p = record.phases;
+    assert!(
+        p.first_content_delta_ms.is_none(),
+        "no content delta was delivered to the client ⇒ TTFT is None, NEVER stamped for \
+         an undelivered token — got {:?}",
+        p.first_content_delta_ms
+    );
+    // Routing was decided (the request reached the wire) and finalize always stamps —
+    // so the absent TTFT is the content-specific gate firing, not a missing-seam
+    // artifact. There was no clean stream end either (the client hung up mid-stream).
+    assert!(
+        p.routing_decision_ms.is_some(),
+        "the request was dispatched to the upstream (routing stamped)"
+    );
+    assert!(
+        p.stream_end_ms.is_none(),
+        "a cancelled stream never reached a clean stream end ⇒ stream_end None"
+    );
+    assert!(
+        p.finalize_ms.is_some(),
+        "every terminal stamps finalize, even Cancelled"
+    );
+    // And the absent TTFT serializes as ABSENT on the body-free summary (not 0/null).
+    let summary = gateway
+        .flow_store()
+        .snapshot_summaries()
+        .into_iter()
+        .find(|s| s.api_call_id == api_call_id)
+        .expect("summary for the cancelled flow");
+    let json = serde_json::to_string(&summary).expect("serialize summary");
+    assert!(
+        !json.contains("first_content_delta_ms"),
+        "an undelivered TTFT must be ABSENT from the wire, not 0/null: {json}"
+    );
+}
+
+#[tokio::test]
 async fn d3_multi_chunk_usage_does_not_double_count() {
     // THE no-double-count test: a single turn emits MULTIPLE cumulative usage
     // chunks. The record's usage must equal the FINAL chunk total, not the sum of
@@ -5119,6 +5202,16 @@ async fn d3_midstream_cancel_finalizes_cancelled_with_last_usage() {
         "cancel keeps the LAST upserted cumulative total"
     );
     assert_eq!(usage.cached, 5);
+    // Gap 02 (review round 1): the content delta "Hel" WAS delivered (the test drained
+    // it off the SSE stream) BEFORE the hang-up, so TTFT is stamped — a cancel AFTER the
+    // first content delta reaches the client keeps the true TTFT. (The None direction —
+    // a hang-up BEFORE any content delta is delivered — is the dedicated test
+    // `gap02_cancel_before_first_content_delta_leaves_ttft_none`.)
+    assert!(
+        record.phases.first_content_delta_ms.is_some(),
+        "the first content delta was delivered before the cancel ⇒ TTFT stamped — got {:?}",
+        record.phases.first_content_delta_ms
+    );
     assert_eq!(
         record.claim.load(std::sync::atomic::Ordering::SeqCst),
         llmconduit::dashboard_flow::CLAIM_FINALIZED,

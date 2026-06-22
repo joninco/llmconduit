@@ -2089,17 +2089,6 @@ impl Gateway {
                         }
                         StreamEmission::OutputTextDelta(delta) => {
                             let target = event_state.active_message_target()?;
-                            // Gap 02 (true TTFT): stamp `first_content_delta` on the
-                            // FIRST canonical CONTENT delta to the client — this arm is
-                            // content-only (reasoning/tool-argument/signature deltas have
-                            // their own arms below), so a stream that emits reasoning or
-                            // tool deltas first does NOT stamp TTFT early. First-write-wins
-                            // in the store makes only the first content delta stamp. Gated
-                            // on an `api_call_id` so the production hot path (no dashboard)
-                            // skips even the disabled-store early-return's call overhead.
-                            if let Some(api_call_id) = &api_call_id {
-                                self.flow_store().stamp_first_content_delta(api_call_id);
-                            }
                             self.monitor.emit_with(response_id.as_str(), || {
                                 MonitorEventKind::OutputTextDelta {
                                     delta: delta.clone(),
@@ -2111,6 +2100,21 @@ impl Gateway {
                                 &abort_token,
                             )
                             .await?;
+                            // Gap 02 (true TTFT): stamp `first_content_delta` ONLY AFTER the
+                            // FIRST canonical CONTENT delta's `send_event` returns Ok — i.e.
+                            // the delta was actually handed off to the client. Stamping
+                            // before the `.await?` would record TTFT even when the send fails
+                            // (client hung up / kill token fired) and the first token never
+                            // reached the client (review round 1, HIGH). This arm is
+                            // content-only (reasoning/tool-argument/signature deltas have
+                            // their own arms below), so a stream that emits reasoning or tool
+                            // deltas first does NOT stamp TTFT early. First-write-wins in the
+                            // store makes only the first delivered content delta stamp. Gated
+                            // on an `api_call_id` so the production hot path (no dashboard)
+                            // skips even the disabled-store early-return's call overhead.
+                            if let Some(api_call_id) = &api_call_id {
+                                self.flow_store().stamp_first_content_delta(api_call_id);
+                            }
                         }
                         StreamEmission::ReasoningItemAdded(item) => {
                             let target = event_state.register_item(&item);
