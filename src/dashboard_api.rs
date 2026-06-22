@@ -27,6 +27,7 @@
 //! `active_streams` is the live count of OPEN flows (the metrics rings don't track
 //! liveness; the FlowStore does).
 
+use crate::dashboard_flow::ClientSource;
 use crate::dashboard_flow::FlowRecord;
 use crate::dashboard_flow::FlowStatus;
 use crate::dashboard_flow::FlowUsage;
@@ -95,6 +96,19 @@ pub struct FlowRow {
     pub elapsed_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,
+    /// Gap 04 — the STABLE, NON-SECRET client attribution label (key-hash `key-<hex>`
+    /// display id / configured caller-id / User-Agent fallback), projected from the
+    /// flow record/summary. `skip_serializing_if` so an unattributed flow OMITS the key
+    /// (absent ⇒ renders `—`, never a fabricated id). Additive/optional: the frontend
+    /// ignores it until the client-attribution UI (gap 15). The raw key is never here —
+    /// only the one-way hash prefix ever existed as a label.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_label: Option<String>,
+    /// Gap 04 — the [`ClientSource`] the label was derived from (so the weak
+    /// `user_agent` fallback is distinguishable from a key-hash / configured-id). `None`
+    /// (absent) exactly when `client_label` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_source: Option<ClientSource>,
     /// USD cost of the flow (usage × the served model's [`ModelPrice`]). `null`
     /// when no price is configured for `model_served` — never a fabricated zero.
     pub cost: Option<f64>,
@@ -119,6 +133,10 @@ impl FlowRow {
             finished_ms: record.finished_ms,
             elapsed_ms: record.elapsed_ms,
             terminal_reason: record.terminal_reason.clone(),
+            // Gap 04: thread the attribution (label + source) onto the row — body-free
+            // scalar metadata; the raw key is never here (only the one-way hash prefix).
+            client_label: record.client_label.clone(),
+            client_source: record.client_source,
             cost,
         }
     }
@@ -145,6 +163,9 @@ impl FlowRow {
             finished_ms: summary.finished_ms,
             elapsed_ms: summary.elapsed_ms,
             terminal_reason: summary.terminal_reason.clone(),
+            // Gap 04: same attribution projection from the body-free snapshot summary.
+            client_label: summary.client_label.clone(),
+            client_source: summary.client_source,
             cost,
         }
     }
@@ -1229,6 +1250,8 @@ mod tests {
                     finished_ms: None,
                     elapsed_ms: None,
                     terminal_reason: None,
+                    client_label: None,
+                    client_source: None,
                     cost: None,
                 })
                 .collect()
@@ -1241,6 +1264,57 @@ mod tests {
         assert_eq!(apply_paging(rows(5), None, None).len(), 5);
         // Out-of-range page ⇒ empty.
         assert!(apply_paging(rows(3), Some(9), Some(2)).is_empty());
+    }
+
+    /// Gap 04 review F3: `FlowRow` carries the OPTIONAL `client_label`/`client_source`
+    /// attribution fields, serialized with `skip_serializing_if` so a PRESENT pair emits
+    /// the snake_case keys (with the key-hash label + `key_hash` source) while an ABSENT
+    /// pair OMITS both keys entirely (never `null`/empty-string-as-id). This pins the
+    /// `/flows` + `/snapshot` summary wire contract for the new fields.
+    #[test]
+    fn flow_row_serializes_optional_client_attribution_present_and_absent() {
+        let base = || FlowRow {
+            api_call_id: "api_x".to_string(),
+            response_id: None,
+            method: "POST".to_string(),
+            uri: "/v1/responses".to_string(),
+            model_requested: None,
+            model_served: None,
+            upstream_target: None,
+            usage: None,
+            status: FlowStatus::Open,
+            started_ms: 0,
+            finished_ms: None,
+            elapsed_ms: None,
+            terminal_reason: None,
+            client_label: None,
+            client_source: None,
+            cost: None,
+        };
+
+        // PRESENT: a key-hash attribution emits both snake_case keys with the expected
+        // values (the label is a `key-<hex>` id — a one-way prefix, never a raw key).
+        let present = FlowRow {
+            client_label: Some("key-deadbeef0123".to_string()),
+            client_source: Some(ClientSource::KeyHash),
+            ..base()
+        };
+        let value = serde_json::to_value(&present).expect("serialize present row");
+        assert_eq!(value["client_label"], serde_json::json!("key-deadbeef0123"));
+        assert_eq!(value["client_source"], serde_json::json!("key_hash"));
+
+        // ABSENT: an unattributed row OMITS both keys (skip_serializing_if), so the
+        // frontend sees no key rather than a fabricated `null`/`0`.
+        let absent = serde_json::to_value(base()).expect("serialize absent row");
+        let obj = absent.as_object().expect("object");
+        assert!(
+            !obj.contains_key("client_label"),
+            "absent label key omitted: {absent}"
+        );
+        assert!(
+            !obj.contains_key("client_source"),
+            "absent source key omitted: {absent}"
+        );
     }
 
     /// The `status=` filter parses the frozen open/completed/failed/cancelled enum

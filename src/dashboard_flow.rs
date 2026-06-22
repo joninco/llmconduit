@@ -262,30 +262,70 @@ impl ClientAttribution {
     /// called BEFORE the headers are redacted — it is the only point the raw API key
     /// is still readable, and it hashes that key in-place (never retaining it).
     ///
-    /// - **Key-hash**: the inbound `Authorization` bearer token (the part after a
-    ///   case-insensitive `Bearer ` prefix, else the whole value) OR the `x-api-key`
-    ///   value is run through [`key_hash_label`] → a `key-<12 hex>` display id; the
-    ///   raw key is dropped immediately. A blank/whitespace-only key is ignored.
-    /// - **Configured header**: when `configured_header` names a header that is
-    ///   present and non-empty, its value becomes the label (verbatim, capped later).
-    /// - **User-Agent**: a present, non-empty `User-Agent` becomes the (weak) label.
+    /// - **Key-hash** (strongest): the FIRST non-blank inbound credential — the
+    ///   `Authorization` bearer token (the part after a case-insensitive `Bearer `
+    ///   prefix, requiring a NON-EMPTY token), then the `x-api-key` value, then a
+    ///   configured header that itself NAMES a sensitive key carrier (per
+    ///   [`crate::redaction::is_sensitive_payload_key`]) — is run through
+    ///   [`key_hash_label`] → a `key-<12 hex>` display id; the raw key is dropped
+    ///   immediately. Each candidate is trimmed and a blank/whitespace-only one is
+    ///   SKIPPED (so an empty/`Bearer`-only `Authorization` falls through to
+    ///   `x-api-key` rather than fabricating a hash from the literal). The raw key
+    ///   value is NEVER emitted verbatim — a key carrier is ALWAYS hashed.
+    /// - **Configured header** (caller-asserted id): when `configured_header` names a
+    ///   header that is present, non-empty, AND NOT a sensitive key carrier, its value
+    ///   becomes the label (verbatim, capped later). A configured header whose NAME is
+    ///   sensitive is NEVER emitted verbatim: it is only ever a key-hash source above,
+    ///   and if it carried no usable key it is SUPPRESSED here (security: F1) — the
+    ///   derivation falls through to the User-Agent fallback instead of leaking the
+    ///   raw value of e.g. `LLMCONDUIT_DASHBOARD_CLIENT_HEADER=api-key`.
+    /// - **User-Agent** (weakest): a present, non-empty `User-Agent` becomes the (weak)
+    ///   label.
     /// - Otherwise [`none`](Self::none).
     pub fn derive(headers: &axum::http::HeaderMap, configured_header: Option<&str>) -> Self {
-        // 1) Strongest: a one-way hash of the inbound API key. Prefer the bearer
-        //    token in `Authorization`; fall back to `x-api-key`. The raw key is read,
-        //    hashed, and dropped HERE — it is never stored or returned.
-        if let Some(raw_key) = bearer_token(headers).or_else(|| api_key_header(headers))
-            && !raw_key.trim().is_empty()
-        {
-            return Self {
-                label: Some(key_hash_label(raw_key.trim())),
-                source: Some(ClientSource::KeyHash),
-            };
+        // The operator-configured caller-id header name (trimmed; blank ⇒ absent) and
+        // whether it names a sensitive KEY carrier. A sensitive name is treated ONLY as
+        // a key-hash source (hashed, never verbatim) — never as a verbatim configured
+        // label, so it can never leak its raw value (F1).
+        let configured = configured_header
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let configured_is_sensitive =
+            configured.is_some_and(crate::redaction::is_sensitive_payload_key);
+
+        // 1) Strongest: a one-way hash of the FIRST non-blank inbound credential. Each
+        //    candidate is normalized/trimmed BEFORE the fallback decision, so an
+        //    empty/`Bearer`-only `Authorization` (a blank candidate) is SKIPPED and the
+        //    next carrier is tried (F2) instead of fabricating a hash from the literal.
+        //    A configured header that NAMES a key carrier joins this list so its value
+        //    is hashed, never emitted verbatim (F1). The raw key is read, hashed, and
+        //    dropped HERE — never stored or returned.
+        let key_candidates = [
+            bearer_token(headers),
+            api_key_header(headers),
+            // Only when the configured header itself names a sensitive key carrier do we
+            // read its value AS A KEY (to be hashed). A non-sensitive configured header
+            // is handled by the verbatim branch below, not here.
+            configured
+                .filter(|_| configured_is_sensitive)
+                .and_then(|name| header_value(headers, name)),
+        ];
+        for candidate in key_candidates.into_iter().flatten() {
+            let token = candidate.trim();
+            if !token.is_empty() {
+                return Self {
+                    label: Some(key_hash_label(token)),
+                    source: Some(ClientSource::KeyHash),
+                };
+            }
         }
         // 2) An operator-configured NON-SECRET caller-id header (e.g. `x-client-id`).
-        if let Some(name) = configured_header
-            && !name.trim().is_empty()
-            && let Some(value) = header_value(headers, name.trim())
+        //    A configured header whose NAME is sensitive is NEVER taken verbatim here —
+        //    it was a key-hash source above; if it carried no usable key it is dropped
+        //    (suppressed), NOT leaked as a verbatim label (F1).
+        if !configured_is_sensitive
+            && let Some(name) = configured
+            && let Some(value) = header_value(headers, name)
             && !value.trim().is_empty()
         {
             return Self {
@@ -312,16 +352,29 @@ fn header_value<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'
 }
 
 /// The bearer token from `Authorization`, i.e. the part after a case-insensitive
-/// `Bearer ` prefix. When the header has no `Bearer ` prefix the whole value is
-/// returned (still a credential to hash). `None` when the header is absent/non-UTF-8.
+/// `Bearer` scheme word (followed by whitespace OR end-of-string). When the header has
+/// no `Bearer` scheme the whole value is returned (still a credential to hash). `None`
+/// when the header is absent/non-UTF-8. The returned slice MAY be empty/whitespace (an
+/// `Authorization: Bearer`-only or blank header — with OR without a trailing space);
+/// the caller ([`ClientAttribution::derive`]) trims each candidate and SKIPS a blank one
+/// BEFORE the fallback, so an empty bearer never suppresses a valid `x-api-key` nor
+/// fabricates a hash from the literal scheme word `"Bearer"` (F2).
 fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
     let value = header_value(headers, axum::http::header::AUTHORIZATION.as_str())?;
     let trimmed = value.trim_start();
-    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("Bearer ") {
-        Some(trimmed[7..].trim_start())
-    } else {
-        Some(value)
+    // Strip a leading case-insensitive `Bearer` scheme word ONLY when it is the whole
+    // value or is followed by whitespace — so `Bearer`/`Bearer ` (token-less) yields an
+    // empty token (skipped by the caller), not the literal word treated as a credential.
+    if let Some(rest) = trimmed
+        .get(..6)
+        .filter(|p| p.eq_ignore_ascii_case("Bearer"))
+    {
+        let after = &trimmed[rest.len()..];
+        if after.is_empty() || after.starts_with(char::is_whitespace) {
+            return Some(after.trim_start());
+        }
     }
+    Some(value)
 }
 
 /// The raw `x-api-key` header value (the Anthropic-style key carrier). `None` when
@@ -2811,22 +2864,23 @@ mod tests {
         );
     }
 
-    /// F4 (round-1 review): a FULL-summary deserialize→serialize round-trip covering BOTH
-    /// new gap-03 wire fields together — the TOP-LEVEL `first_upstream_byte_ms` AND the
-    /// nested `attempts[]`. The prior round-trip test only re-read the nested `attempts`
-    /// sub-array, never the whole `SnapshotFlowSummary` DTO, so a regression to the new
-    /// top-level field's wire shape would have slipped through (AGENTS.md no-new-wire-field
-    /// -without-round-trip rule). `SnapshotFlowSummary` is `Serialize`-only by design
-    /// (gap-02 precedent), so this round-trips the serialized summary through an EQUIVALENT
-    /// DTO that deserializes both new fields, then re-serializes and asserts both survive
-    /// losslessly. The bounded taxonomic codes survive as the same snake_case tags — no raw
-    /// upstream text on the wire.
+    /// F4 (round-1 reviews): a FULL-summary deserialize→serialize round-trip covering
+    /// EVERY new optional wire field together — gap-03's TOP-LEVEL `first_upstream_byte_ms`
+    /// plus the nested `attempts[]`, AND gap-04's `client_label` plus `client_source`. The
+    /// original round-trip test only re-read the nested `attempts` sub-array, so a
+    /// regression to a new top-level field's wire shape (or the gap-04 attribution fields)
+    /// would have slipped through (AGENTS.md no-new-wire-field-without-round-trip rule).
+    /// `SnapshotFlowSummary` is `Serialize`-only by design (gap-02 precedent), so this
+    /// round-trips the serialized summary through an EQUIVALENT DTO that deserializes all
+    /// new fields, then re-serializes and asserts each survives losslessly — PRESENT and
+    /// ABSENT. The bounded taxonomic codes and the `client_source` enum survive as the
+    /// same snake_case tags; the `client_label` is only ever a one-way `key-<hex>` prefix.
     #[test]
     fn snapshot_summary_full_dto_round_trip_covers_both_new_wire_fields() {
-        /// Equivalent DTO covering BOTH gap-03 wire fields plus enough sibling scalars to
-        /// be a genuine full-summary round-trip (not just the attempts sub-array). Derives
-        /// `Deserialize` (the production summary is `Serialize`-only) + `Serialize` so the
-        /// re-serialization can be compared for losslessness.
+        /// Equivalent DTO covering EVERY new wire field (gap 03 + gap 04) plus enough
+        /// sibling scalars to be a genuine full-summary round-trip (not just the attempts
+        /// sub-array). Derives `Deserialize` (the production summary is `Serialize`-only)
+        /// + `Serialize` so the re-serialization can be compared for losslessness.
         #[derive(Debug, serde::Serialize, serde::Deserialize)]
         struct RoundTripSummary {
             api_call_id: String,
@@ -2842,10 +2896,33 @@ mod tests {
             // `default` so a missing key deserializes back to `None` (never `0`).
             #[serde(default, skip_serializing_if = "Option::is_none")]
             first_upstream_byte_ms: Option<u128>,
+            // Gap 04 wire fields — ABSENT when the flow is unattributed; `default` so a
+            // missing key deserializes back to `None` (never an empty-string-as-id).
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            client_label: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            client_source: Option<ClientSource>,
         }
 
+        // PRESENT case: a flow opened WITH a key-hash attribution carries both gap-04
+        // fields. Derive the attribution from a bearer header so the label is a genuine
+        // `key-<hex>` prefix (the raw key is hashed in `derive`, never stored).
         let store = DashboardFlowStore::new();
-        open_simple(&store, "api_1");
+        let mut key_headers = HeaderMap::new();
+        key_headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer sk-ROUNDTRIP-SECRET-key"),
+        );
+        let key_attr = ClientAttribution::derive(&key_headers, None);
+        let expected_label = key_attr.label.clone().expect("key-hash label");
+        store.open(
+            "api_1".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            redact_headers(&key_headers),
+            None,
+            key_attr,
+        );
         store.record_attempts(
             "api_1",
             vec![
@@ -2858,12 +2935,17 @@ mod tests {
         let summary = SnapshotFlowSummary::from_record(&record);
 
         // Serialize the WHOLE production summary, then deserialize the WHOLE thing into the
-        // equivalent DTO (both new fields, top-level + nested, in ONE pass).
+        // equivalent DTO (every new field, top-level + nested, in ONE pass).
         let wire = serde_json::to_value(&summary).expect("serialize summary");
+        // The raw key is never on the wire — only the one-way hash prefix.
+        assert!(
+            !wire.to_string().contains("ROUNDTRIP-SECRET"),
+            "raw key absent from the summary wire: {wire}"
+        );
         let back: RoundTripSummary =
             serde_json::from_value(wire.clone()).expect("deserialize full summary DTO");
 
-        // Both new wire fields survived deserialization.
+        // Every new wire field survived deserialization.
         assert_eq!(
             back.first_upstream_byte_ms,
             Some(321),
@@ -2878,8 +2960,19 @@ mod tests {
         assert!(back.attempts[0].first_upstream_byte_ms.is_none());
         assert_eq!(back.attempts[1].status, AttemptStatus::Served);
         assert_eq!(back.attempts[1].first_upstream_byte_ms, Some(321));
+        // Gap 04: both attribution fields survive (label = the key-hash, source = KeyHash).
+        assert_eq!(
+            back.client_label.as_deref(),
+            Some(expected_label.as_str()),
+            "client_label survives the full-summary round-trip"
+        );
+        assert_eq!(
+            back.client_source,
+            Some(ClientSource::KeyHash),
+            "client_source survives the full-summary round-trip"
+        );
 
-        // Re-serialize the DTO and confirm BOTH new fields are byte-identical to the
+        // Re-serialize the DTO and confirm EVERY new field is byte-identical to the
         // production wire (compare as `Value` so key order is not a false mismatch).
         let reser = serde_json::to_value(&back).expect("re-serialize full summary DTO");
         assert_eq!(
@@ -2890,9 +2983,18 @@ mod tests {
             reser["attempts"], wire["attempts"],
             "nested attempts[] round-trips losslessly"
         );
+        assert_eq!(
+            reser["client_label"], wire["client_label"],
+            "client_label round-trips losslessly"
+        );
+        assert_eq!(
+            reser["client_source"], wire["client_source"],
+            "client_source round-trips losslessly"
+        );
 
-        // And the unmeasured case: a summary with NO upstream byte omits the top-level
-        // field on the wire, and the DTO deserializes it back to `None` (never `0`).
+        // ABSENT case: an unattributed flow with NO upstream byte omits ALL the optional
+        // top-level fields on the wire, and the DTO deserializes them back to `None`
+        // (never `0`/empty-string-as-id).
         open_simple(&store, "api_2");
         store.record_attempts(
             "api_2",
@@ -2902,18 +3004,24 @@ mod tests {
         let record2 = store.detail("api_2").expect("record");
         let summary2 = SnapshotFlowSummary::from_record(&record2);
         let wire2 = serde_json::to_value(&summary2).expect("serialize summary2");
+        let obj2 = wire2.as_object().unwrap();
         assert!(
-            !wire2
-                .as_object()
-                .unwrap()
-                .contains_key("first_upstream_byte_ms"),
+            !obj2.contains_key("first_upstream_byte_ms"),
             "an unmeasured top-level first byte is ABSENT on the wire (never 0)"
+        );
+        assert!(
+            !obj2.contains_key("client_label") && !obj2.contains_key("client_source"),
+            "an unattributed flow omits both gap-04 fields on the wire: {wire2}"
         );
         let back2: RoundTripSummary =
             serde_json::from_value(wire2).expect("deserialize summary2 DTO");
         assert!(
             back2.first_upstream_byte_ms.is_none(),
             "absent top-level field deserializes to None"
+        );
+        assert!(
+            back2.client_label.is_none() && back2.client_source.is_none(),
+            "absent gap-04 fields deserialize to None"
         );
     }
 
@@ -3935,6 +4043,160 @@ mod tests {
         let ua_only = ClientAttribution::derive(&headers, None);
         assert_eq!(ua_only.source, Some(ClientSource::UserAgent));
         assert_eq!(ua_only.label.as_deref(), Some("curl/8.1"));
+    }
+
+    /// Gap 04 review F1 (HIGH key-leak): a CONFIGURED client header whose NAME is a
+    /// sensitive key carrier (e.g. `api-key`, `authorization`) must NEVER have its raw
+    /// value emitted verbatim into `client_label` — it is treated as a KEY-HASH source
+    /// (one-way SHA-256 prefix), exactly like `x-api-key`. Before the fix,
+    /// `LLMCONDUIT_DASHBOARD_CLIENT_HEADER=api-key` leaked the raw `api-key` value
+    /// because only `x-api-key`/bearer were hashed.
+    #[test]
+    fn client_attribution_sensitive_configured_header_is_hashed_not_leaked() {
+        // `api-key` (the unhyphenated `apikey` alias of `x-api-key`) configured as the
+        // caller-id header: its value must be HASHED, never the raw value as a label.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("api-key"),
+            HeaderValue::from_static("RAW-APIKEY-LEAK-9999"),
+        );
+        let attr = ClientAttribution::derive(&headers, Some("api-key"));
+        assert_eq!(
+            attr.source,
+            Some(ClientSource::KeyHash),
+            "a sensitive configured header is a key-hash source, not verbatim"
+        );
+        let label = attr.label.clone().expect("hashed label present");
+        assert!(label.starts_with("key-"), "label is a key-hash id: {label}");
+        assert!(
+            !label.contains("RAW-APIKEY-LEAK") && !label.contains("9999"),
+            "raw configured-header value NEVER leaks into the label: {label}"
+        );
+        assert!(
+            !format!("{attr:?}").contains("RAW-APIKEY-LEAK"),
+            "raw value absent from the Debug dump too"
+        );
+
+        // `authorization` configured as the caller-id header (a raw token, no `Bearer `
+        // scheme): still hashed, never emitted verbatim.
+        let mut auth = HeaderMap::new();
+        auth.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("RAW-AUTHZ-LEAK-8888"),
+        );
+        let attr2 = ClientAttribution::derive(&auth, Some("authorization"));
+        assert_eq!(attr2.source, Some(ClientSource::KeyHash));
+        let label2 = attr2.label.clone().expect("hashed label present");
+        assert!(label2.starts_with("key-"));
+        assert!(
+            !label2.contains("RAW-AUTHZ-LEAK") && !label2.contains("8888"),
+            "raw authorization value NEVER leaks: {label2}"
+        );
+
+        // The hash of a sensitive configured header equals the hash of the SAME value
+        // arriving via the canonical key path — one audited key→label mapping, so the
+        // configured-header path is not a second, weaker (leaky) form.
+        let mut canonical = HeaderMap::new();
+        canonical.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("RAW-APIKEY-LEAK-9999"),
+        );
+        let canonical_label = ClientAttribution::derive(&canonical, None).label.unwrap();
+        assert_eq!(
+            label, canonical_label,
+            "configured sensitive header hashes identically to the canonical key path"
+        );
+    }
+
+    /// Gap 04 review F1: a configured header whose NAME is sensitive but which carries
+    /// NO usable key value (absent or blank) is SUPPRESSED — the derivation falls
+    /// through to the weaker User-Agent fallback rather than ever emitting the sensitive
+    /// header verbatim. (A sensitive name is ONLY ever a key-hash source; it can never
+    /// become a verbatim `ConfiguredHeader` label.)
+    #[test]
+    fn client_attribution_sensitive_configured_header_blank_is_suppressed_not_verbatim() {
+        // Sensitive configured header present but BLANK → not a key (skipped), and never
+        // taken verbatim → falls through to the UA fallback.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("api-key"),
+            HeaderValue::from_static("   "),
+        );
+        headers.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("curl/8.1"),
+        );
+        let attr = ClientAttribution::derive(&headers, Some("api-key"));
+        assert_eq!(
+            attr.source,
+            Some(ClientSource::UserAgent),
+            "a blank sensitive configured header is suppressed, falling through to UA"
+        );
+        assert_eq!(attr.label.as_deref(), Some("curl/8.1"));
+
+        // Sensitive configured header ABSENT entirely, no UA → honestly unattributed
+        // (never a verbatim/empty configured label).
+        let none = ClientAttribution::derive(&HeaderMap::new(), Some("authorization"));
+        assert_eq!(none, ClientAttribution::none());
+    }
+
+    /// Gap 04 review F2 (MEDIUM): each key candidate is normalized/trimmed BEFORE the
+    /// fallback. An `Authorization: Bearer`-only (empty token) header must NOT suppress
+    /// a valid `x-api-key` nor fabricate a hash from the literal `"Bearer"` — the blank
+    /// bearer is skipped and the real `x-api-key` is hashed instead.
+    #[test]
+    fn client_attribution_empty_bearer_falls_through_to_x_api_key() {
+        let mut headers = HeaderMap::new();
+        // `Bearer` with no token (the scheme-stripped, trimmed token is empty).
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("REAL-XKEY-VALUE-7777"),
+        );
+        let attr = ClientAttribution::derive(&headers, None);
+        assert_eq!(
+            attr.source,
+            Some(ClientSource::KeyHash),
+            "the valid x-api-key is used, not suppressed by the empty bearer"
+        );
+        let label = attr.label.clone().expect("label present");
+        // The label is the hash of the x-api-key, identical to hashing it alone — so the
+        // empty `Authorization` neither suppressed nor poisoned the candidate.
+        let mut xkey_only = HeaderMap::new();
+        xkey_only.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("REAL-XKEY-VALUE-7777"),
+        );
+        let xkey_label = ClientAttribution::derive(&xkey_only, None).label.unwrap();
+        assert_eq!(
+            label, xkey_label,
+            "empty bearer falls through to x-api-key; the literal is never hashed"
+        );
+        // And the literal scheme word never becomes a label.
+        assert!(!label.contains("Bearer"));
+
+        // `Authorization: Bearer    ` (trailing whitespace only) with NO other key and a
+        // UA → the blank bearer is skipped entirely and the UA fallback is used (the
+        // literal is never fabricated into a hash).
+        let mut blank = HeaderMap::new();
+        blank.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer    "),
+        );
+        blank.insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("agent/1.0"),
+        );
+        let attr2 = ClientAttribution::derive(&blank, None);
+        assert_eq!(
+            attr2.source,
+            Some(ClientSource::UserAgent),
+            "an empty bearer with no other key falls through to UA, not a fabricated hash"
+        );
+        assert_eq!(attr2.label.as_deref(), Some("agent/1.0"));
     }
 
     /// User-Agent is the WEAKEST, labelled fallback — used only when there is no key
