@@ -436,11 +436,12 @@ function DetailHeader({
             </span>
           )}
         </dd>
-        {/* Gap 09: the context-window utilization gauge (% used + remaining headroom + a near/over
-            badge). `derived` only with a known model `context_limit` (gap-06) + reported usage;
-            UNKNOWN capacity or unreported usage ⇒ `—` and an empty dashed track, NEVER a fabricated
-            0%/100%. Spans the full row (it is a bar, not a scalar). */}
-        <dt className="self-start text-text-muted" title="context-window utilization: used tokens vs the model's context window">context</dt>
+        {/* Gap 09: the context-window utilization gauge (% of the input window the PROMPT consumed +
+            remaining headroom + a near/over badge). Numerator is `Usage.prompt` only (spec 09 /
+            FEATURES item 4) — the completion is not counted. `derived` only with a known model
+            `context_limit` (gap-06) + reported prompt usage; UNKNOWN capacity or unreported prompt ⇒
+            `—` and an empty dashed track, NEVER a fabricated 0%/100%. Spans the full row (a bar). */}
+        <dt className="self-start text-text-muted" title="context-window utilization: prompt (input) tokens vs the model's context window">context</dt>
         <dd className="min-w-0">
           <ContextGauge util={contextUtil} />
         </dd>

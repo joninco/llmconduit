@@ -3,7 +3,7 @@ import {
   CONTEXT_WARN_PCT,
   aggregateContextPressure,
   contextLimitFor,
-  contextUsedTokens,
+  contextPromptTokens,
   contextUtilization,
   type ContextLimitMap,
 } from './contextUtilization';
@@ -11,33 +11,49 @@ import type { Usage } from '../../api/types';
 
 const usage = (over: Partial<Usage> = {}): Usage => ({ prompt: 0, completion: 0, total: 0, ...over });
 
-describe('contextUsedTokens — the window numerator (don\'t-lie-with-zeros)', () => {
-  it('prefers the reported total (authoritative sum)', () => {
-    expect(contextUsedTokens(usage({ prompt: 800, completion: 200, total: 1100 }))).toBe(1100);
+describe('contextPromptTokens — the window numerator is PROMPT ONLY (spec 09: prompt ÷ max_context)', () => {
+  it('is the prompt tokens — completion/total are NOT counted (they do not inflate the window)', () => {
+    // prompt 800, completion 200, total 1100 ⇒ numerator is 800 (the input), NOT 1100/1000.
+    expect(contextPromptTokens(usage({ prompt: 800, completion: 200, total: 1100 }))).toBe(800);
   });
-  it('falls back to prompt+completion when total is non-finite', () => {
-    expect(contextUsedTokens({ prompt: 800, completion: 200, total: Number.NaN })).toBe(1000);
+  it('ignores `total` entirely (even when total is the larger authoritative sum)', () => {
+    expect(contextPromptTokens({ prompt: 500, completion: 9999, total: 10499 })).toBe(500);
   });
-  it('uses a partial (prompt-only) block as a usable lower bound', () => {
-    expect(contextUsedTokens({ prompt: 500, completion: Number.NaN, total: Number.NaN })).toBe(500);
+  it('a finite prompt is used even when completion/total are non-finite (prompt is what matters)', () => {
+    expect(contextPromptTokens({ prompt: 500, completion: Number.NaN, total: Number.NaN })).toBe(500);
+  });
+  it('a measured 0 prompt is a real 0 (NOT null)', () => {
+    expect(contextPromptTokens(usage({ prompt: 0, completion: 1000, total: 1000 }))).toBe(0);
+  });
+  it('non-finite prompt ⇒ null (unreported numerator), regardless of completion/total', () => {
+    expect(contextPromptTokens({ prompt: Number.NaN, completion: 200, total: 200 })).toBeNull();
   });
   it('null usage ⇒ null (unreported numerator)', () => {
-    expect(contextUsedTokens(null)).toBeNull();
-    expect(contextUsedTokens(undefined)).toBeNull();
+    expect(contextPromptTokens(null)).toBeNull();
+    expect(contextPromptTokens(undefined)).toBeNull();
   });
 });
 
 describe('contextUtilization — derived % only with BOTH inputs known (gap 09 oracle)', () => {
-  it('known limit + known usage ⇒ a real DERIVED %, remaining headroom, ok risk', () => {
-    // 8000 used / 32768 ⇒ 24.4%
+  it('known limit + known usage ⇒ a real DERIVED % from PROMPT ONLY, remaining headroom, ok risk', () => {
+    // numerator is prompt 6000 (NOT total 8000): 6000 / 32768 ⇒ 18.3%. completion 2000 is IGNORED
+    // (it does not occupy the input window) — this is the spec-09 prompt÷max_context semantics.
     const u = contextUtilization(usage({ prompt: 6000, completion: 2000, total: 8000 }), 32768);
     expect(u.quality).toBe('derived');
-    expect(u.percentLabel).toBe('24.4%');
-    expect(u.fraction).toBeCloseTo(8000 / 32768, 6);
-    expect(u.usedTokens).toBe(8000);
+    expect(u.percentLabel).toBe('18.3%');
+    expect(u.fraction).toBeCloseTo(6000 / 32768, 6);
+    expect(u.usedTokens).toBe(6000); // the PROMPT, not the 8000 total
     expect(u.contextLimit).toBe(32768);
-    expect(u.remainingTokens).toBe(32768 - 8000);
-    expect(u.remainingLabel).toBe('24.8k');
+    expect(u.remainingTokens).toBe(32768 - 6000);
+    expect(u.remainingLabel).toBe('26.8k');
+    expect(u.risk).toBe('ok');
+  });
+
+  it('completions do NOT inflate the % — a huge completion against a small prompt stays low', () => {
+    // prompt 1000 / 100000 ⇒ 1.0%; the (buggy) total-based numerator (1000+90000) would read 91.0%.
+    const u = contextUtilization(usage({ prompt: 1000, completion: 90000, total: 91000 }), 100000);
+    expect(u.percentLabel).toBe('1.0%');
+    expect(u.usedTokens).toBe(1000);
     expect(u.risk).toBe('ok');
   });
 
@@ -85,9 +101,19 @@ describe('contextUtilization — derived % only with BOTH inputs known (gap 09 o
     expect(u.fraction).toBeNull();
     expect(u.remainingLabel).toBe('—');
     expect(u.risk).toBe('none');
-    // The used count is still surfaced (it WAS measured) even though the % is unavailable.
-    expect(u.usedTokens).toBe(1000);
+    // The prompt count is still surfaced (it WAS measured) even though the % is unavailable.
+    expect(u.usedTokens).toBe(800); // the PROMPT, not the 1000 total
     expect(u.contextLimit).toBeNull();
+  });
+
+  it('UNREPORTED prompt (non-finite) against a known limit ⇒ unavailable, even if total is finite', () => {
+    // A usage block with a non-finite prompt has no numerator ⇒ `—`, never a fabricated %.
+    const u = contextUtilization({ prompt: Number.NaN, completion: 500, total: 500 }, 32768);
+    expect(u.quality).toBe('unavailable');
+    expect(u.percentLabel).toBe('—');
+    expect(u.usedTokens).toBeNull();
+    expect(u.contextLimit).toBe(32768);
+    expect(u.risk).toBe('none');
   });
 
   it('a 0 or negative context_limit is treated as UNKNOWN capacity ⇒ unavailable (no /0)', () => {
@@ -130,22 +156,25 @@ describe('contextLimitFor — served-then-requested model resolution', () => {
 describe('aggregateContextPressure — peak + near/over over a flow set (gap 09 aggregate)', () => {
   const limits: ContextLimitMap = { small: 1000, big: 128000, unknown: null };
 
-  it('peak is the MAX derived utilization; near/over count only measured flows', () => {
+  it('peak + near/over are computed from PROMPT only — completions never inflate the aggregate', () => {
+    // Each flow carries a fat completion. Under the old (buggy) total-based numerator EVERY flow
+    // would read >= 100% (e.g. the 'big' flow's 12800+128000 total ⇒ 110%), corrupting the peak
+    // and the near/over counts. Prompt-only keeps them honest: only the prompt occupies the window.
     const agg = aggregateContextPressure(
       [
-        { model_served: 'small', usage: usage({ prompt: 900, completion: 0, total: 900 }) }, // 90% near
-        { model_served: 'big', usage: usage({ prompt: 12800, completion: 0, total: 12800 }) }, // 10% ok
-        { model_served: 'small', usage: usage({ prompt: 1100, completion: 0, total: 1100 }) }, // 110% over (peak)
+        { model_served: 'small', usage: usage({ prompt: 900, completion: 5000, total: 5900 }) }, // prompt 90% near
+        { model_served: 'big', usage: usage({ prompt: 12800, completion: 128000, total: 140800 }) }, // prompt 10% ok
+        { model_served: 'small', usage: usage({ prompt: 1100, completion: 5000, total: 6100 }) }, // prompt 110% over (peak)
       ],
       limits,
     );
     expect(agg.measuredFlows).toBe(3);
     expect(agg.totalFlows).toBe(3);
-    expect(agg.peakFraction).toBeCloseTo(1.1, 6);
+    expect(agg.peakFraction).toBeCloseTo(1.1, 6); // 1100/1000, NOT 6100/1000
     expect(agg.peakLabel).toBe('110.0%');
     expect(agg.peakRisk).toBe('over');
-    expect(agg.nearCount).toBe(2); // the 90% + the 110%
-    expect(agg.overCount).toBe(1); // the 110%
+    expect(agg.nearCount).toBe(2); // the prompt-90% + the prompt-110% (the 'big' flow stays ok)
+    expect(agg.overCount).toBe(1); // only the prompt-110%
   });
 
   it('EXCLUDES unmeasurable flows (unknown limit / unreported usage) from the figures', () => {

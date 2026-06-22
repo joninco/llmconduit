@@ -9,21 +9,22 @@ const usage = (over: Partial<Usage> = {}): Usage => ({ prompt: 0, completion: 0,
 describe('ContextGauge — per-flow context-window utilization (gap 09)', () => {
   afterEach(cleanup);
 
-  it('renders a DERIVED % + headroom + a filled track for a known limit + usage', () => {
+  it('renders a DERIVED % (PROMPT-only) + headroom + a filled track for a known limit + usage', () => {
+    // numerator is prompt 6000 (NOT total 8000): 6000/32768 ⇒ 18.3%. completion 2000 is ignored.
     const util = contextUtilization(usage({ prompt: 6000, completion: 2000, total: 8000 }), 32768);
     const { getByTestId } = render(<ContextGauge util={util} />);
     const gauge = getByTestId('context-gauge');
     expect(gauge.getAttribute('data-quality')).toBe('derived');
-    expect(getByTestId('context-util-pct').textContent).toBe('24.4%');
-    expect(getByTestId('context-headroom').textContent).toContain('24.8k left');
+    expect(getByTestId('context-util-pct').textContent).toBe('18.3%');
+    expect(getByTestId('context-headroom').textContent).toContain('26.8k left');
     // The fill is present (a real reading) with a clamped width.
     const fill = getByTestId('context-gauge-fill');
     expect(fill).toBeTruthy();
-    expect(fill.style.width).toBe('24.4140625%');
-    // No near/over badge at 24%.
+    expect(fill.style.width).toBe('18.310546875%');
+    // No near/over badge at 18%.
     expect(gauge.querySelector('[data-testid="context-risk-badge"]')).toBeNull();
-    // Caption shows used / capacity.
-    expect(getByTestId('context-gauge-caption').textContent).toContain('8.0k / 32.8k');
+    // Caption shows prompt / capacity.
+    expect(getByTestId('context-gauge-caption').textContent).toContain('6.0k / 32.8k');
   });
 
   it('flags a NEAR-limit flow with an amber `near` badge', () => {
@@ -65,8 +66,9 @@ describe('ContextGauge — per-flow context-window utilization (gap 09)', () => 
     // No fill at all for an unavailable reading (the track is the dashed "no reading" rail).
     expect(queryByTestId('context-gauge-fill')).toBeNull();
     expect(queryByTestId('context-risk-badge')).toBeNull();
-    // The capacity half of the caption reads "—" (unknown), the used half still shows (it was measured).
-    expect(getByTestId('context-gauge-caption').textContent).toContain('1.0k / — ctx');
+    // The capacity half of the caption reads "—" (unknown); the prompt half still shows (it was
+    // measured): prompt 800 (NOT the 1000 total) ⇒ "800 / — ctx".
+    expect(getByTestId('context-gauge-caption').textContent).toContain('800 / — ctx');
   });
 
   it('UNREPORTED usage (null) ⇒ "—" even with a known limit (no 0% fabrication)', () => {

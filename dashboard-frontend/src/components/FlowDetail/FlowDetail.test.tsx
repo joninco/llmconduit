@@ -382,15 +382,17 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
         status: 'completed',
         model_served: 'gpt-4o', // mock catalog: context_limit 128000
         started_ms: 1_700_000_000_000,
-        // 64000 used / 128000 ⇒ 50.0% (a real derived reading, ok risk).
-        usage: { prompt: 60000, completion: 4000, total: 64000, cached: 0, reasoning: 0 },
+        // PROMPT 64000 / 128000 ⇒ 50.0% (spec 09: prompt ÷ max_context). The completion 4000 is
+        // IGNORED — the (buggy) total-based numerator would have read 68000/128000 = 53.1%.
+        usage: { prompt: 64000, completion: 4000, total: 68000, cached: 0, reasoning: 0 },
       }),
     ]);
     const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g09" onClose={noop} />);
     await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
-    // The catalog query resolves the gauge to a DERIVED 50.0%.
+    // The catalog query resolves the gauge to a DERIVED 50.0% (from the PROMPT, not the total).
     await waitFor(() => expect(getByTestId('context-gauge').getAttribute('data-quality')).toBe('derived'));
     expect(getByTestId('context-util-pct').textContent).toBe('50.0%');
+    expect(getByTestId('context-util-pct').textContent).not.toBe('53.1%'); // not the inflated total
     // A real fill + a real headroom (64.0k left of 128k).
     expect(getByTestId('context-gauge-fill').style.width).toBe('50%');
     expect(getByTestId('context-headroom').textContent).toContain('64.0k left');

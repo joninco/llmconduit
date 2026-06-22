@@ -8,13 +8,17 @@
  * color tracks the risk band (healthy → cooling → down), mirroring `STATUS_COLOR` so the gauge reads
  * the same as every other status surface.
  *
+ * Utilization is `prompt (input) tokens ÷ model context_limit` (spec 09 / FEATURES item 4) — the
+ * completion the model emits is NOT counted (it does not occupy the input window).
+ *
  * Data quality (consumes `contextUtilization`, never fabricates):
- *  - utilization is `derived` ONLY when both used tokens AND a known `context_limit` exist; the
+ *  - utilization is `derived` ONLY when both prompt tokens AND a known `context_limit` exist; the
  *    `data-quality` attribute + the rendered string reflect that.
- *  - UNKNOWN capacity (gap-06 `null`) OR unreported usage ⇒ `—` and an EMPTY (un-filled) track — NOT
- *    a fabricated `0%`/`100%` and not a full/empty-as-zero gauge. The "unavailable" track is visibly
- *    distinct (a dashed, muted rail) from a real `0%` fill (a solid rail at 0 width).
- *  - a real `0%` (measured 0 used / known limit) renders `0.0%` with an (empty-but-derived) fill,
+ *  - UNKNOWN capacity (gap-06 `null`) OR unreported prompt usage ⇒ `—` and an EMPTY (un-filled)
+ *    track — NOT a fabricated `0%`/`100%` and not a full/empty-as-zero gauge. The "unavailable"
+ *    track is visibly distinct (a dashed, muted rail) from a real `0%` fill (a solid rail at 0
+ *    width).
+ *  - a real `0%` (measured 0 prompt / known limit) renders `0.0%` with an (empty-but-derived) fill,
  *    distinct from unavailable.
  */
 import type { ContextUtilization, UtilRisk } from './contextUtilization';
@@ -54,8 +58,8 @@ export function ContextGauge({ util }: { util: ContextUtilization }) {
           data-testid="context-util-pct"
           title={
             derived
-              ? 'context-window utilization = used tokens ÷ model context limit (derived)'
-              : 'context utilization unavailable — unknown model context limit or unreported usage (— not 0%)'
+              ? 'context-window utilization = prompt (input) tokens ÷ model context limit (derived)'
+              : 'context utilization unavailable — unknown model context limit or unreported prompt usage (— not 0%)'
           }
         >
           {util.percentLabel}

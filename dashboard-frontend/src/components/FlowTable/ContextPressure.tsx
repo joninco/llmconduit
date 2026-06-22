@@ -7,10 +7,13 @@
  * A compact always-visible stat (the "aggregate context-pressure stat exists" acceptance criterion),
  * sitting beside the gap-08 cache-economics strip under the table.
  *
+ * Utilization (per flow) is `Usage.prompt ÷ context_limit` (spec 09 / FEATURES item 4) — the
+ * completion is NOT counted, so a large output never inflates the peak / near / over figures.
+ *
  * Data quality (consumes the gap-06 nullable catalog + gap-07 usage, never fabricates):
  *  - the peak is `derived` over flows whose utilization is measurable (known limit + reported
- *    usage); a flow set with NONE measurable renders `—` (unavailable), NOT a fabricated `0%` peak
- *    (see `aggregateContextPressure`).
+ *    prompt usage); a flow set with NONE measurable renders `—` (unavailable), NOT a fabricated
+ *    `0%` peak (see `aggregateContextPressure`).
  *  - the near/over counts only ever count MEASURED flows — an unknown-limit or unreported-usage flow
  *    is excluded entirely, never silently treated as 0% or 100%.
  *  - the `measured / total` coverage is shown so an operator sees at a glance how much of the set is

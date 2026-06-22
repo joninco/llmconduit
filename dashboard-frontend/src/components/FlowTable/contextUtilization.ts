@@ -6,24 +6,25 @@
  * The operator question (spec 09): "Are we near max context — risking slow prefill, truncation,
  * or 400s?" This makes that legible WITHOUT lying.
  *
+ * The numerator is `Usage.prompt` ONLY — the INPUT context that must FIT inside the window before
+ * prefill. Spec 09 / FEATURES item 4 define utilization as `% = Usage.prompt ÷ max_context`. The
+ * completion tokens the model EMITS are produced one-at-a-time during decode and are NOT what an
+ * operator is asking about ("will my input fit / am I near truncation / 400s?"); folding them in
+ * (via `total` or `prompt + completion`) would INFLATE the gauge and the aggregate peak/near/over
+ * counts. So `total`/`completion`/`cached`/`reasoning` are deliberately IGNORED here.
+ *
  * Data-quality contract (baked into every value here — Codex checks this):
- *  - Utilization `%` is `derived` (`used ÷ context_limit`). It is `derived` ONLY when BOTH inputs
- *    are known finite integers; otherwise it is `unavailable` (`—`), NEVER a fabricated `0%`/`100%`:
+ *  - Utilization `%` is `derived` (`prompt ÷ context_limit`). It is `derived` ONLY when BOTH inputs
+ *    are known finite numbers; otherwise it is `unavailable` (`—`), NEVER a fabricated `0%`/`100%`:
  *      • `context_limit` is `null`/absent (gap-06 UNKNOWN capacity) ⇒ unavailable — you cannot
  *        divide by an unknown denominator, and a `0` ceiling would read as garbage/infinite use.
- *      • the used-token count is `null`/unreported (the gap-07 `Option`) ⇒ unavailable — you cannot
- *        divide by an unknown numerator either. This is distinct from a measured `0` used.
- *  - A genuine `0%` (a real `0` used tokens against a KNOWN limit) is a DERIVED zero (renders
+ *      • `Usage.prompt` is `null`/unreported/non-finite (no usage block) ⇒ unavailable — you cannot
+ *        divide by an unknown numerator either. This is distinct from a measured `0` prompt.
+ *  - A genuine `0%` (a real `0` prompt tokens against a KNOWN limit) is a DERIVED zero (renders
  *    `0.0%`), distinct from `—` (unavailable). "Unknown capacity" is never shown as "0% used".
- *  - The OVERFLOW-risk flag is raised ONLY with a real `context_limit` + a real used count: it is a
- *    derived signal, never inferred from missing data.
- *
- * The "used" tokens charged against the window = prompt (the context the model had to ingest) PLUS
- * completion (the tokens it emitted into the same window). `total` is preferred when the upstream
- * reports it (it is the authoritative sum and may include classes the split omits); otherwise it
- * falls back to `prompt + completion`. `cached`/`reasoning` are NOT separately added — they are
- * already accounted inside prompt/completion/total (cached is a subset of prompt; reasoning is a
- * subset of completion/total), so adding them would double-count the window.
+ *  - The OVERFLOW-risk flag is raised ONLY with a real `context_limit` + a real prompt count: it is
+ *    a derived signal, never inferred from missing data. An over-budget prompt (`prompt > limit`)
+ *    reads HONESTLY (`> 100%`); only the bar FILL clamps to 100% (a bar cannot exceed its track).
  */
 import type { Usage } from '../../api/types';
 import { fmtTokens } from './format';
@@ -52,14 +53,14 @@ export interface ContextUtilization {
   /** `derived` only when both used + context_limit are known; else `unavailable`. */
   quality: UtilQuality;
   /**
-   * Utilization fraction `used / context_limit`, clamped to `>= 0`. `null` when unavailable.
+   * Utilization fraction `prompt / context_limit`, clamped to `>= 0`. `null` when unavailable.
    * NOT clamped at the top: an over-budget flow can read `> 1` (e.g. `1.04`) so the overflow is
    * honestly visible rather than silently pinned at 100%.
    */
   fraction: number | null;
   /** Display percent string (`72.4%`, `0.0%`, `103.2%`) or `—` when unavailable. */
   percentLabel: string;
-  /** Tokens used (prompt+completion / total). `null` when usage is unreported. */
+  /** Prompt (input) tokens charged against the window. `null` when prompt usage is unreported. */
   usedTokens: number | null;
   /** The model's context capacity (gap-06). `null` when unknown. */
   contextLimit: number | null;
@@ -89,22 +90,17 @@ function unavailable(usedTokens: number | null, contextLimit: number | null): Co
 }
 
 /**
- * The tokens charged against the context window for a usage block: prefer the upstream-reported
- * `total` (authoritative sum), else `prompt + completion`. Returns `null` when neither yields a
- * finite count (usage unreported) — the don't-lie-with-zeros numerator gate.
+ * The PROMPT (input) tokens charged against the context window for a usage block — the numerator
+ * of spec-09 utilization (`% = Usage.prompt ÷ max_context`). ONLY `usage.prompt` is the context the
+ * model must INGEST before prefill; `completion`/`total`/`cached`/`reasoning` are deliberately NOT
+ * counted (folding them in would inflate the gauge and the aggregate). Returns `null` when `prompt`
+ * is absent/unreported/non-finite (no usage block, or a partial block missing a finite prompt) —
+ * the don't-lie-with-zeros numerator gate. A finite `0` prompt is a MEASURED zero (NOT null).
  */
-export function contextUsedTokens(usage: Usage | null | undefined): number | null {
+export function contextPromptTokens(usage: Usage | null | undefined): number | null {
   if (!usage) return null;
-  if (Number.isFinite(usage.total)) return Math.max(0, usage.total);
-  const { prompt, completion } = usage;
-  if (Number.isFinite(prompt) && Number.isFinite(completion)) {
-    return Math.max(0, prompt + completion);
-  }
-  // A partial usage block (e.g. only prompt) still yields a usable lower-bound numerator: the
-  // prompt alone is real context the model ingested. Completion-only is likewise usable.
-  if (Number.isFinite(prompt)) return Math.max(0, prompt);
-  if (Number.isFinite(completion)) return Math.max(0, completion);
-  return null;
+  if (!Number.isFinite(usage.prompt)) return null;
+  return Math.max(0, usage.prompt);
 }
 
 /** Map a derived utilization fraction to its risk band (only called when quality is derived). */
@@ -129,7 +125,7 @@ export function contextUtilization(
   usage: Usage | null | undefined,
   contextLimit: number | null | undefined,
 ): ContextUtilization {
-  const used = contextUsedTokens(usage);
+  const used = contextPromptTokens(usage); // the prompt-only numerator (spec 09)
   // Normalize the capacity: only a finite, strictly-positive limit is a usable denominator. A
   // `null`, NaN, or `<= 0` limit is UNKNOWN capacity ⇒ unavailable (NOT a fabricated 0%/100%).
   const limit =
@@ -142,7 +138,7 @@ export function contextUtilization(
     return unavailable(used, limit);
   }
 
-  const fraction = used / limit; // may exceed 1 when over budget (kept honest, not clamped)
+  const fraction = used / limit; // may exceed 1 when prompt over budget (kept honest, not clamped)
   const remainingTokens = Math.max(0, limit - used);
   const risk = riskFor(fraction);
   return {
