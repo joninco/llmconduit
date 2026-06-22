@@ -4,226 +4,342 @@ Argus is the realtime observability dashboard for **llmconduit** (the LLM proxy 
 watches every request flow `client → gateway → upstream provider`, capturing the request
 transformation, model routing / failover, tokens, cost, latency, and live output.
 
-This is a catalog of high-value features — what is shipped and what is proposed — each with the
-insight it delivers and how it fits the existing architecture: the authoritative
-`DashboardFlowStore` (D1), `MetricsLayer` (D5), `MonitorHub` transcript ring, `ProviderHealth`
-(D4), the price table (D13), and the "Night Watch" instrument design system (`src/design/`).
+This is a catalog of high-value features — shipped and proposed — each with the operator question
+it answers and how it fits the existing seams: `DashboardFlowStore` (D1), `MetricsLayer` (D5),
+`MonitorHub` transcript ring, `ProviderHealth` (D4), the price table (D13). Design language lives
+in `dashboard-frontend/src/design/DESIGN_NOTES.md` ("Night Watch" instrument aesthetic) — it is the
+*how it looks*; this doc is the *what it should do and why*.
 
-**Legend** — ✅ shipped · 🔭 proposed · ⚙️ needs a backend seam · ⭐ high priority · 🐞 correctness
+> v2 — hardened after an adversarial design review. The framing shifted from "pretty flow
+> artifacts" to "can Argus answer the incident question?" — *was this slow/expensive/failed because
+> of the client, the prompt, routing, failover, provider prefill, decode speed, or our own gateway?*
 
-**Design ethos.** Every feature reads as an *instrument readout*, not a generic SaaS widget:
-mono telemetry numerals (IBM Plex Mono), the iris "Eye" accent for interaction, amber as the
-attention-signal, semantic status traffic-lights (mint / amber / red). Honest empty + loading
-states ("unavailable", never a fake `0`). DoD matches the project bar: executable test green ·
-`tsc` · `eslint --max-warnings 0` · `vitest` · Playwright e2e · keyboard focus · reduced-motion.
+---
+
+## How to read this
+
+**Status** — ✅ shipped · 🔭 proposed · ⚙️ needs a backend seam · ⭐ high priority · 🐞 correctness
+
+**Data quality** — every metric a feature renders is tagged so the UI never implies more precision
+than it has:
+- `measured` — recorded directly (a timestamp, a token count on the wire).
+- `derived` — computed from measured values (stream tok/s = completion ÷ stream duration).
+- `estimated` — an approximation with a known error bound (must be labelled as such in the UI).
+- `unavailable` — not captured. **Render it as such — never as `0`.**
+
+**Entry shape** — *Answers* (operator question) · *Data* (quality + required fields/source) ·
+*Surface* (where it lands) · *Backend* (seam, if any) · *Risk* (when relevant) · *Effort* (S/M/L).
+
+### Principle: don't lie with zeros
+Unknown cost, unreported `cached`/`reasoning` tokens, an un-measured first-token time, a provider
+that didn't return usage — all must read `unavailable` / `—`, not a fabricated `0`. A confident
+wrong number is worse than an honest gap, and this dashboard is an instrument operators trust during
+incidents. The CLIENT column already does this (renders `—`); make it the rule everywhere.
+
+---
+
+## The spine — per-flow execution trace 🔭⚙️⭐
+
+The single highest-value addition, and the backbone the latency / failover / routing / error
+features below all hang off. Today a flow is a set of artifacts (bodies, deltas, a lumped
+`elapsed`); it is not a *trace*.
+
+- **Answers:** "where did this request spend its time, and what actually happened to it?"
+- **Data:** `measured` phases — ingress → normalization → routing decision → upstream attempt(s) →
+  first upstream byte → first content token → stream end → finalization. Requires new backend
+  timestamps (`first_upstream_byte_ms`, `first_content_delta_ms`) + an `attempts[]` array.
+- **Surface:** a horizontal phase waterfall in the inspector header (Night Watch: iris stream
+  segment, amber when a phase exceeds threshold), expandable to the attempt/error detail.
+- **Backend:** the big one — D2 (identity) + D3 (telemetry guard) emit per-phase timestamps and the
+  attempt sequence into the `FlowRecord`. Unblocks honest versions of Latency, Failover, and
+  Per-provider latency below.
+- **Effort:** M–L. **Do the data-contract part early** (see build order) — many features stay
+  dishonest until it exists.
 
 ---
 
 ## Performance & latency
 
-### Per-flow latency breakdown — TTFT · stream · tok/s 🔭⭐
-- **What:** replace the single lumped `elapsed` ("3.1s") with a timing waterfall — `queue →
-  time-to-first-token → stream duration` — plus per-flow tokens/sec and inter-token latency.
-- **Insight:** *why was THIS request slow?* Distinguishes a slow provider (high TTFT) from a
-  long generation (many tokens) — the defining LLM-serving metric, today invisible.
-- **Fits:** derive from the timestamped monitor timeline events (`DebugTimelineEvent.timestamp_ms`)
-  + `started_ms` / `finished_ms` + `Usage.completion`. **Frontend-only, no backend change.** Lands
-  as a "Timing" section in the inspector header (beside cost/elapsed) + a thin waterfall bar (iris
-  stream segment, amber when TTFT crosses a threshold).
-- **Effort:** M. *Caveat:* TTFT precision is bounded by the first `output` segment's timestamp
-  granularity — surface "first-activity latency" honestly if events are coarsely batched.
+### Per-flow latency breakdown 🔭⚙️⭐
+- **Answers:** "was it slow at the provider (prefill/TTFT) or just a long generation?"
+- **Data:** *true* TTFT is `measured` only once the spine adds `first_content_delta_ms`. Until then,
+  a frontend-`derived` **"first-visible-activity latency"** (first monitor `output` segment
+  `timestamp_ms` − `started_ms`) is the honest fallback — label it as such, it is dashboard-visible
+  activity, not upstream first byte. Stream tok/s = `derived` (completion ÷ stream duration).
+- **Surface:** a "Timing" line in the inspector header + a slice of the spine waterfall.
+- **Backend:** none for the labelled fallback; the real TTFT rides the spine.
+- **Effort:** M. *Note:* true per-token cadence ("inter-token latency") is NOT derivable if segments
+  are batched — see streaming-stall health for the measured version.
 
-### Per-provider latency distribution ⚙️🔭
-- **What:** p50/p95/p99 + error rate *per upstream*, in the topology node tooltip and a per-provider
-  stat row.
-- **Insight:** which provider is degrading — today `CooldownTooltip` shows the GLOBAL window p99,
-  not the node's own.
-- **Fits:** extend the D4 `ProviderHealth` DTO (status / cooling_until_ms / served_count /
-  failover_count / consecutive_failures / catalog) with per-provider latency percentiles, fed by a
-  per-provider ring in `MetricsLayer`. Drives node sizing/color + the tooltip. **Backend seam** (Rust)
-  + frontend.
-- **Effort:** M–L.
+### Streaming stall / inter-token health 🔭⚙️
+- **Answers:** "did the model stall mid-generation?"
+- **Data:** `measured` `max_inter_chunk_gap_ms`, `stall_count`, `first_chunk_ms` — emitted by the
+  backend at chunk arrival (the frontend only sees batched segments, so this can't be faked client-side).
+- **Surface:** a stall marker on the theater stream + an inspector timing row.
+- **Backend:** D3 records inter-chunk gaps. **Effort:** M.
+
+### Per-provider latency + error distribution 🔭⚙️
+- **Answers:** "which upstream is degrading?"
+- **Data:** p50/p95/p99 + error rate **per upstream**, from `attempts[]` (the spine) so a failed
+  primary is counted — final-served latency alone hides unhealthy providers. `ProviderHealth` today
+  is point-in-time and the tooltip shows the *global* p99.
+- **Surface:** `CooldownTooltip` + node sizing/color in the topology.
+- **Backend:** extend the D4 DTO with per-provider percentiles fed by a per-provider `MetricsLayer`
+  ring. **Effort:** M–L.
 
 ### Outlier / slow-request spotlight 🔭
-- **What:** auto-flag flows whose latency or tok/s is a statistical outlier for their model; a
-  "slowest" quick-filter chip.
-- **Insight:** surface the tail without scrolling the table.
-- **Fits:** compute from FlowStore rows + `MetricsLayer` percentiles client-side; a filter chip +
-  a subtle amber row marker (reuse the inspector's match-marker treatment). Frontend.
-- **Effort:** S–M.
+- **Answers:** "show me the tail without scrolling."
+- **Data:** `derived` — flag flows beyond a percentile for their model.
+- **Surface:** a "slowest" filter chip + an amber row marker (reuse the inspector match-marker).
+- **Backend:** none. **Effort:** S–M.
 
 ---
 
-## Cost & tokens
+## Context & tokens
+
+### Context-window utilization 🔭⚙️
+- **Answers:** "are we near max context — risking slow prefill, truncation, or 400s?"
+- **Data:** `derived` `% = Usage.prompt ÷ max_context` + remaining tokens + overflow risk. Needs the
+  served model's `max_context` / `max_model_len` (vLLM reports it on `/v1/models`; e.g. the live
+  GLM-5.2 advertised 500k) surfaced via the D4 provider catalog.
+- **Surface:** a gauge in the inspector header + an aggregate "context pressure" stat.
+- **Backend:** expose per-model max-context in the catalog DTO. **Effort:** M.
 
 ### Token economics — cached · reasoning · cache-hit % 🔭⭐
-- **What:** surface the `cached` and `reasoning` token counts **already captured** in `Usage` but
-  dropped by the UI; show cache-hit % and reasoning-token share per flow and in aggregate.
-- **Insight:** cache hits = direct cost savings; reasoning tokens = hidden spend on reasoning
-  models. Today the table shows only `prompt / completion` (e.g. `812 / 512`).
-- **Fits:** `Usage` already carries `prompt / completion / total / cached / reasoning` (D3) — it is
-  on the wire. Add a tokens breakdown popover on the table's tokens cell + an inspector line, and
-  combine with the price table for "$ saved by cache". **Frontend-only — a pure win.**
-- **Effort:** S.
-
-### Cost attribution & budgets ⚙️🔭
-- **What:** cost rolled up by model / provider / client / window, with optional budget thresholds
-  that flip a gauge amber → red.
-- **Insight:** *where is the money going, and am I over budget?*
-- **Fits:** `MetricsLayer` cost windows + the price table + FlowStore grouping. Rollups land in the
-  Analytics view (below); budget thresholds go in the D13 config route. Mostly frontend; budgets
-  want a small config field.
-- **Effort:** M.
+- **Answers:** "is prefix caching saving money, and what are reasoning models really costing?"
+- **Data:** `measured` `Usage.{cached, reasoning}` are already on the wire but dropped by the UI.
+  **Distinguish `0` from `unavailable`** — a provider that doesn't report cached tokens is not a
+  cache miss. `$ saved by cache` is only valid (`derived`) when the price table carries a *separate
+  cached-input price* for that model — otherwise show the token split without a dollar claim.
+- **Surface:** a breakdown popover on the table's tokens cell + an inspector line + aggregate
+  cache-hit rate by model/client.
+- **Backend:** none for the split; cached-input pricing is a price-table addition. **Effort:** S.
 
 ---
 
-## Reliability & errors
+## Reliability & routing
 
-### Failure deep-dive & error taxonomy 🔭⭐
-- **What:** an enriched Error surface — group failures by `terminal_reason` + HTTP class, show the
-  error RATE per model/provider, and the upstream error body when captured.
-- **Insight:** *what is failing and why*, at a glance, instead of one red row at a time.
-- **Fits:** `terminal_reason` + `status` are on every `FlowSummary`; the MonitorHub join already
-  carries a monitor error. Enrich the inspector `ErrorTab` + add an error-rate chip to the stats
-  strip / topology node. Frontend; retaining the upstream error body is a small D3 seam if not
-  already kept.
-- **Effort:** M.
+### Failover / attempt trace 🔭⚙️
+- **Answers:** "which provider failed, why, how long did we wait, and what served?"
+- **Data:** `measured` `attempts[]` (provider, model, start/end, status/error class, first-byte,
+  failover reason) — the spine's array. Today only the final `upstream_target` + an `FO` badge show.
+- **Surface:** an instrument stepper in the inspector header (`A failed: 503 · 0.8s → B served`).
+- **Backend:** capture the attempt sequence (D2/D4). **Effort:** M.
 
-### Failover / routing chain 🔭⚙️
-- **What:** for a re-routed request (the `FO` badge), show the ordered attempt chain — `provider A
-  (failed: reason) → provider B (served)` — as a compact instrument stepper.
-- **Insight:** *why* a request failed over and what it cost in latency.
-- **Fits:** D2 request identity + `ProviderHealth.failover_count`; needs the per-attempt sequence
-  retained on the `FlowRecord` (a D2/D4 seam) — today only the final served upstream shows. Renders
-  in the inspector header.
-- **Effort:** M–L.
+### Failure taxonomy & error deep-dive 🔭⚙️
+- **Answers:** "what is failing and why, in aggregate — not one red row at a time?"
+- **Data:** `measured` `terminal_reason` + status (already present) grouped + error RATE per
+  model/provider. The **upstream response/error body is NOT among the captured bodies** (those are
+  the three *request* layers) — surfacing it needs a new, separately-gated response-capture seam.
+- **Surface:** enriched inspector `ErrorTab` + an error-rate chip on the stats strip/topology.
+- **Backend:** error-body capture is the only new seam; grouping is frontend. **Effort:** M.
 
-### Cooldown / circuit-breaker timeline 🔭
-- **What:** a lane per provider showing health transitions (healthy → cooling → down → recovered)
-  across the scrubber window.
-- **Insight:** correlate failure bursts with provider cooldowns.
-- **Fits:** D4 health + `cooling_until_ms` + the scrubber's time axis (`Scrubber.tsx`). A lane under
-  the topology or scrubber. Frontend if health history is retained (else a small ring).
-- **Effort:** M.
+### Provider health history (cooldown timeline) 🔭⚙️
+- **Answers:** "did failures line up with a provider cooling/recovering?"
+- **Data:** `measured` health transitions (healthy → cooling → down → recovered) over time — needs a
+  retained ring; `ProviderHealth` today is point-in-time only, so this is **not** frontend-only.
+- **Surface:** a lane per provider under the topology/scrubber, on the scrubber's time axis.
+- **Backend:** a small health-transition ring. **Effort:** M.
 
 ---
 
-## Flows, search & identity
+## Cost & reliability targets
 
-### Client identity & per-client breakdown 🔭⭐
-- **What:** wire the user-agent (D1 already captures it) into a `client` label; fill the table's
-  CLIENT column (today `—`) and enable per-client filter + rollup.
-- **Insight:** which app/agent drives traffic, cost, and errors.
-- **Fits:** the **documented D1/D13 TODO** — D1 captures the UA header; add a derived `client` to the
-  `/flows` summary shape (D13). The column already renders honestly; this is pure wiring.
-- **Effort:** S.
+### Cost attribution & budgets 🔭⚙️
+- **Answers:** "where is the money going, and am I over budget?"
+- **Data:** `derived` cost by model/provider/client/window (`MetricsLayer` + price table + grouping).
+  Tag rows with `estimated` when any flow lacks a confident price.
+- **Surface:** the analytics view (below) + budget thresholds in the D13 config route.
+- **Backend:** budget config field. **Effort:** M.
+
+### SLO / error-budget view 🔭⚙️
+- **Answers:** "are we inside our reliability/latency target, and how fast are we burning budget?"
+- **Data:** `derived` burn-rate against per-model/provider/client targets — more honest than a raw
+  red gauge.
+- **Surface:** an overview tile + a burn-down sparkline.
+- **Backend:** target config. **Effort:** M.
+
+---
+
+## Identity & multi-tenancy
+
+### Client / key / app attribution 🔭⚙️⭐
+- **Answers:** "who is generating the cost, errors, latency — or abuse?"
+- **Data:** a stable `client_label` from (in priority) auth principal / API-key **hash** / a
+  configured header, with user-agent as a *fallback*, not the identity model. **Never expose raw
+  secrets** — hash keys. The CLIENT column already renders `—` honestly.
+- **Surface:** the CLIENT column + a per-client filter and rollup.
+- **Backend:** derive + emit `client_label` on the `/flows` summary (the D1/D13 TODO captures UA;
+  key-hash attribution is the stronger seam). **Effort:** M.
+
+---
+
+## Flows, search & comparison
+
+> **Read the Safety & governance section first** — searching and exporting captured bodies is where
+> sensitive-data risk concentrates.
+
+### "Effective changes" transform summary 🔭⚙️
+- **Answers:** "what did llmconduit actually change before upstream?" — the proxy's whole job.
+- **Data:** `measured` a compact semantic diff above the raw 3-pane bodies: profile matched, model
+  remap, defaults applied, system-prefix injected, `chat_template_kwargs` merged, tools stripped.
+- **Surface:** a summary strip atop the inspector (the raw structural diff stays below).
+- **Backend:** emit the applied-transform record (D2/D3 know these decisions). **Effort:** M.
 
 ### Full-text flow search 🔭
-- **What:** extend the per-flow JSON search (✅ just shipped) to a TABLE-level search — match across
-  captured bodies / headers / model / id, not only the open flow.
-- **Insight:** *find every request that sent `temperature=0`, used tool X, or hit provider Y.*
-- **Fits:** FlowStore retains capped + redacted bodies (D1); reuse the `viz/jsonFold` search core
-  across rows. A search field in the `FilterBar`; matches filter the table. Frontend over retained
-  bodies.
-- **Effort:** M.
+- **Answers:** "find every request that sent `temperature=0`, used tool X, or hit provider Y."
+- **Data:** `measured` over FlowStore's capped+redacted request bodies; reuse the `viz/jsonFold`
+  search core across rows.
+- **Surface:** a search field in the `FilterBar`; matches filter the table.
+- **Risk:** searches captured bodies — gate behind the retention/redaction policy below.
+- **Backend:** none. **Effort:** M.
 
 ### Flow comparison — diff two flows 🔭
-- **What:** select two flows → side-by-side structural diff of their request / normalized / upstream
-  bodies + timing + cost.
-- **Insight:** *why did this one fail / cost more / route differently than that one?*
-- **Fits:** the path-keyed `diffLayers` engine already powers the 3-pane inspector — point it at two
-  FLOWS instead of two layers. A "compare" affordance from table multi-select. Frontend.
-- **Effort:** M.
-
-### Aggregate analytics view 🔭⭐
-- **What:** a 5th nav tab — the "control room" summary: top models/providers by volume · cost ·
-  latency · error-rate over the window; cost-over-time; error breakdown; token-mix.
-- **Insight:** the operator's at-a-glance *how is the gateway doing* without reading individual flows.
-- **Fits:** `MetricsLayer` windows + FlowStore aggregation + price table; a new route in the hash
-  router (`flows | topology | sankey | theater | analytics`). Pure frontend over existing data — the
-  segmented gauge + uPlot-trend instrument design shines here.
-- **Effort:** M–L.
+- **Answers:** "why did this one fail / cost more / route differently than that one?"
+- **Data:** reuse the path-keyed `diffLayers` engine, pointed at two flows instead of two layers.
+- **Surface:** a "compare" affordance from table multi-select. **Backend:** none. **Effort:** M.
 
 ---
 
-## Streaming & content
+## Aggregate / overview
+
+### Control-room analytics view 🔭⚙️
+- **Answers:** "how is the gateway doing, at a glance?"
+- **Data:** top models/providers by volume · cost · latency · error-rate; cost-over-time; token-mix.
+  **Gated on data quality** — without per-client, per-attempt, true timing, and price confidence it
+  is a pretty summary of incomplete data, so it lands *after* the data-contract pass, not before.
+- **Surface:** a 5th hash route (`flows | topology | sankey | theater | overview`) — segmented gauge
+  clusters + uPlot trends.
+- **Backend:** consumes the spine. **Effort:** M–L.
+
+---
+
+## Streaming
 
 ### Theater enhancements 🔭
-- **What:** expandable tool cards (parity with the inspector), a persisted reasoning-visibility
-  toggle, a per-stream tok/s sparkline, and pin/fullscreen a single stream.
-- **Insight:** watch a live generation in depth — tools + reasoning + rate — not just output text.
-- **Fits:** `viz/River.tsx` already renders output/reasoning/tools; the inspector's `DeltasPanel`
-  already has expandable tool cards — share the component. Frontend.
-- **Effort:** S–M.
+- **Answers:** "watch a live generation in depth." (Shipped Theater already has tok/s + fullscreen —
+  this adds the missing depth, not a re-do.)
+- **Data:** expandable tool cards (today NOT expandable — parity with the inspector's `DeltasPanel`),
+  a persisted reasoning-visibility toggle, and a stall/inter-token marker (from streaming-stall health).
+- **Surface:** `viz/River.tsx`; share the inspector's tool-card component.
+- **Backend:** none (stall marker rides streaming-stall health). **Effort:** S–M.
 
 ---
 
-## Operability
+## Integration & export
 
-### Export & replay 🔭⚙️
-- **What:** export a captured flow as JSON or a ready-to-run `curl`; (gated) REPLAY a request back
-  through the gateway.
-- **Insight:** reproduce + share a request; replay to validate a fix.
-- **Fits:** the flow body is already in the store (export = frontend). Replay rides the D6/D7
-  mutation policy + CSRF double-submit (`mutations_enabled` gate) — security-sensitive,
-  operator-authorized only, same posture as the Kill button.
-- **Effort:** export S; replay M (security review).
+### Prometheus / OpenTelemetry export 🔭⚙️
+- **Answers:** "can this feed our real monitoring + alerting, not just a browser tab?"
+- **Data:** a `/metrics` scrape endpoint and/or OTel spans/events per flow + attempt + upstream call
+  + tool/search call. This is what makes alerting *real* (see below).
+- **Surface:** none (it's an egress) — documented endpoints.
+- **Backend:** an exporter over `MetricsLayer` + the spine. **Effort:** M–L.
 
-### Alerts & thresholds 🔭
-- **What:** operator-set thresholds (error% > X, p99 > Y, $/min > Z) that flip the relevant gauge
-  amber/red and optionally raise a banner.
-- **Insight:** don't stare at the dashboard — let it shout.
-- **Fits:** `MetricsLayer` values + the stats-strip gauges (already color-capable — ERR% goes red).
-  Threshold config in the D13 config route. Frontend + small config.
-- **Effort:** M.
+### Export flow as JSON / curl 🔭
+- **Answers:** "reproduce or share this exact request."
+- **Data:** the flow body is already in the store — pure frontend serialization, redaction-aware.
+- **Surface:** an inspector action. **Risk:** strip secrets on export. **Effort:** S.
+
+---
+
+## Operability (gated mutations)
+
+### Replay a request 🔭⚙️
+- **Answers:** "re-send this through the gateway to test a fix." Split from export — a *different risk
+  class*.
+- **Risk:** **dangerous** — spends money, repeats tool/search side effects, can re-expose secrets.
+  Requires explicit confirm, header stripping, the D6/D7 `mutations_enabled` + CSRF gate, **and an
+  audit log entry** (same posture as Kill, plus audit).
+- **Backend:** a guarded replay route. **Effort:** M (security review mandatory).
+
+### Visual thresholds → real alerting 🔭⚙️
+- **Answers:** "let the instrument shout instead of being watched."
+- **Data:** two tiers — (a) `derived` **visual thresholds** that flip a gauge amber/red in-dashboard
+  (frontend + small config), and (b) **real alerting** (error% / p99 / $-spike → webhook/PagerDuty)
+  which belongs on the OTel/Prometheus egress, not a banner in a tab.
+- **Surface:** stats-strip gauges (already color-capable) + threshold config in D13.
+- **Backend:** (b) rides the exporter. **Effort:** M.
+
+---
+
+## Safety & governance
+
+### Retention, sampling & body-capture policy 🔭⚙️
+- **Answers:** "what sensitive data are we storing, for how long, and can I turn it down?"
+- **Data:** operator knobs — disable/sample body capture, extra header redaction, retention cap,
+  export policy. A prerequisite to shipping full-text body search + replay responsibly.
+- **Surface:** the D13 config route + a visible "capture: on/sampled/off" indicator.
+- **Backend:** D1 capture is already capped+redacting; add the policy knobs. **Effort:** M.
+
+### Abuse / secret-leak detection 🔭⚙️
+- **Answers:** "did a request carry credentials, PII, or prompt-injection-looking content?"
+- **Data:** deterministic secret/credential patterns over captured bodies+headers first; flag, don't
+  block. Be honest that this is a *signal*, not a security product.
+- **Surface:** a flag chip on the flow row + an inspector finding.
+- **Backend:** a scan pass on capture. **Effort:** M–L.
+
+### Web-search / tool-call observability 🔭⚙️
+- **Answers:** "are server-side search/tool loops driving latency or failures?" (llmconduit runs
+  bounded web_search + tool handling server-side.)
+- **Data:** `measured` search rounds, query count, per-search latency, ceiling-hit/timeout, and
+  injected error text; rejected mixed-tool batches.
+- **Surface:** an inspector "Tools" tab + an aggregate tool-latency stat.
+- **Backend:** emit search/tool spans. **Effort:** M.
+
+---
+
+## UX
 
 ### Command palette & keyboard nav 🔭
-- **What:** ⌘K palette — jump to a flow by id, switch views, run a search, toggle live/seek; full
-  keyboard nav of the table + inspector.
-- **Insight:** operator speed — an instrument you drive without the mouse.
-- **Fits:** pure frontend over the existing hash router + stores; squarely on the instrument ethos.
-- **Effort:** M.
+- **Answers:** operator speed — drive the instrument without the mouse.
+- **Data:** none — pure frontend over the hash router + stores.
+- **Surface:** ⌘K palette + table/inspector keyboard nav.
+- **Effort:** M. *Priority:* nice-to-have; do it after the data model is sound.
 
 ---
 
-## Foundations (fix before trusting insight)
+## Foundations (fix before trusting any insight)
 
 ### Stats-strip accuracy 🐞⭐
-- **What:** the headline gauges read `0.0` with fresh real traffic sitting in the table (observed on
-  the live vLLM run). Confirm whether it is window-decay or a `MetricsLayer` ↔ FlowStore wiring gap,
-  and fix.
-- **Why first:** every metric and insight above sits on the headline numbers — if they are wrong,
-  trust in the whole instrument erodes.
-- **Fits:** `MetricsLayer` (D5) feeding `StatsStrip`; verify the rolling window folds recent flows.
-- **Effort:** S–M (investigation).
+- **Answers:** the headline gauges read `0.0` with fresh real traffic in the table (observed on the
+  live vLLM run). Every number above reads off these — fix first.
+- **Suspects (broaden the hunt):** window-decay vs `MetricsLayer`↔FlowStore wiring; server/client
+  clock skew; the time-travel seek cursor freezing the strip; a stale WS snapshot; a unit conversion;
+  a window-boundary off-by-one; or metrics fed only by *completed* flows (so live ones never count).
+- **Surface:** `StatsStrip` ← `MetricsLayer` (D5). **Effort:** S–M (investigation).
 
 ---
 
 ## Suggested build order
 
-A pragmatic sequence — fix the foundation, then ship the cheap pure-frontend wins that use
-already-captured data, then the flagship insight, then the bigger views and backend seams.
+The hard lesson from review: **don't ship UI polish on top of a weak data model** — it produces
+attractive summaries of incomplete data. Fix the foundation, harden the data contract, *then* build
+the surfaces.
 
-|  # | feature | why here | size |
+|  # | step | why here | size |
 |-|-|-|-|
 | 1 | Stats-strip accuracy 🐞 | foundation — everything reads off it | S–M |
-| 2 | Token economics ⭐ | data already on the wire; pure win | S |
-| 3 | Client identity ⭐ | documented TODO; column already renders | S |
-| 4 | Per-flow latency breakdown ⭐ | flagship LLM insight; frontend-only | M |
-| 5 | Failure deep-dive | turns scattered red rows into a picture | M |
-| 6 | Aggregate analytics view ⭐ | operator's at-a-glance control room | M–L |
-| 7 | Full-text flow search | extends the inspector search just shipped | M |
-| 8 | Theater enhancements | shares inspector components | S–M |
-| 9 | Per-provider latency ⚙️ | needs ProviderHealth DTO + ring | M–L |
-| 10 | Failover chain ⚙️ | needs per-attempt capture | M–L |
-| 11 | Export / replay, Alerts, Command palette | operability polish | M |
+| 2 | **Data-contract pass** ⚙️ (spine): per-phase timestamps, `attempts[]`, `client_label`/key-hash, response-body capture flag, price confidence, per-model max-context | unblocks the *honest* version of most features below | M–L |
+| 3 | Token economics (with `unavailable` states) ⭐ | already on the wire; cheap honest win | S |
+| 4 | Context-window utilization | LLM-specific, high signal | M |
+| 5 | Per-flow latency breakdown (real TTFT off the spine) ⭐ | flagship insight, now honest | M |
+| 6 | Failover / attempt trace ⚙️ | core gateway value — ahead of analytics | M |
+| 7 | Per-provider latency + error distribution ⚙️ | core gateway value | M–L |
+| 8 | Failure taxonomy | scattered red rows → a picture | M |
+| 9 | Client / key attribution ⭐ | who drives cost/errors | M |
+| 10 | Control-room overview ⭐ | now backed by real fields | M–L |
+| 11 | Retention/privacy controls ⚙️ → full-text search + flow compare | privacy gate *before* body search | M |
+| 12 | Export JSON/curl · effective-changes summary · theater depth | cheap, high-value surfaces | S–M |
+| 13 | OTel/Prometheus export → real alerting ⚙️ | feed production monitoring | M–L |
+| 14 | Web-search/tool observability · SLO view · abuse scan | deeper ops | M |
+| 15 | Replay (gated+audited) · command palette | risk-class + polish, last | M |
 
 ---
 
 ## Already shipped (for reference)
 
-- ✅ **Transformation inspector** (D10) — 3-pane `inbound → normalized → upstream` structural diff,
-  now **per-path collapsible + searchable across all three layers**.
+- ✅ **Transformation inspector** (D10) — 3-pane `inbound → normalized → upstream` *request*
+  structural diff, now **per-path collapsible + searchable across all three layers**.
 - ✅ **Topology map** (D4/D12) — provider routing graph, click-to-filter, cooldown/health tooltip.
 - ✅ **Token Sankey** (D12) — client → gateway → model token flow, cost-ramp bands, click-to-filter.
 - ✅ **Theater** (D12) — live per-stream output / reasoning / tool cards, tok/s, fullscreen.
