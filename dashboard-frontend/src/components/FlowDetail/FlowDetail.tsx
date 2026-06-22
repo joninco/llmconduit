@@ -26,6 +26,8 @@ import { costDisplay, elapsedMs, flowCost } from '../FlowTable/flowModel';
 import { tokenEconomics } from '../FlowTable/tokenEconomics';
 import { contextLimitFor, contextUtilization, type ContextUtilization } from '../FlowTable/contextUtilization';
 import { ContextGauge } from '../FlowTable/ContextGauge';
+import { latencyBreakdown, type LatencyBreakdown as LatencyBreakdownModel, type SpineFlow } from './latencyBreakdown';
+import { LatencyBreakdown } from './LatencyBreakdown';
 import { useCatalog } from '../FlowTable/useCatalog';
 import { JsonPane } from '../viz/JsonPane';
 import { combineMiddleDiff, diffLayers } from './diff';
@@ -167,6 +169,37 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
     );
     return contextUtilization(usage, limit);
   }, [liveFlow, frozenDetail, usage, contextLimits]);
+  // Gap 10 — the per-flow LATENCY BREAKDOWN (the phase waterfall + the Timing line). The PRIMARY
+  // source is the gap-02 phase epochs + gap-03 served-attempt wire TTFB, read live-first
+  // (`liveFlow`) then from the frozen detail (seek). When `first_content_delta_ms` is absent the
+  // model falls back to the monitor `output` segments for a DERIVED first-visible-activity TTFT
+  // (explicitly labelled). Both the spine fields AND the monitor join are already cut-bounded
+  // upstream (seek coherence holds): `liveFlow` is the frozen row while seeking, and `join` is the
+  // cut-bounded monitor join (finding 1). The merged spine prefers the live row's freshest phase
+  // values, filling any gap from the frozen detail.
+  const latency = useMemo<LatencyBreakdownModel>(() => {
+    // Merge the freshest spine: live row first (its phase/attempt fields win), frozen detail fills
+    // gaps. Both carry the same flattened `PhaseTimings` + `attempts`/`first_upstream_byte_ms`.
+    const spine: SpineFlow | null = liveFlow || frozenDetail
+      ? {
+          started_ms: liveFlow?.started_ms ?? frozenDetail?.started_ms ?? 0,
+          ingress_ms: liveFlow?.ingress_ms ?? frozenDetail?.ingress_ms,
+          normalization_done_ms: liveFlow?.normalization_done_ms ?? frozenDetail?.normalization_done_ms,
+          routing_decision_ms: liveFlow?.routing_decision_ms ?? frozenDetail?.routing_decision_ms,
+          first_content_delta_ms: liveFlow?.first_content_delta_ms ?? frozenDetail?.first_content_delta_ms,
+          stream_end_ms: liveFlow?.stream_end_ms ?? frozenDetail?.stream_end_ms,
+          finalize_ms: liveFlow?.finalize_ms ?? frozenDetail?.finalize_ms,
+          finished_ms: liveFlow?.finished_ms ?? frozenDetail?.finished_ms,
+          elapsed_ms: liveFlow?.elapsed_ms ?? frozenDetail?.elapsed_ms,
+          attempts: liveFlow?.attempts ?? frozenDetail?.attempts,
+          first_upstream_byte_ms: liveFlow?.first_upstream_byte_ms ?? frozenDetail?.first_upstream_byte_ms,
+          usage,
+        }
+      : null;
+    // The derived-TTFT fallback source: the cut-bounded monitor `output` segments for this flow.
+    const outputs = join.segments.filter((s) => s.kind === 'output');
+    return latencyBreakdown(spine, outputs);
+  }, [liveFlow, frozenDetail, usage, join.segments]);
 
   return (
     <section className="flex min-h-0 w-[46%] min-w-[420px] flex-col border-l border-line bg-panel" data-testid="flow-detail" aria-label="flow detail">
@@ -179,6 +212,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         usage={usage}
         econ={econ}
         contextUtil={contextUtil}
+        latency={latency}
         seeking={seeking}
         seekAtMs={seekAtMs}
         isActive={isActive}
@@ -309,6 +343,7 @@ function DetailHeader({
   usage,
   econ,
   contextUtil,
+  latency,
   seeking,
   seekAtMs,
   isActive,
@@ -325,6 +360,7 @@ function DetailHeader({
   usage: Usage | null;
   econ: ReturnType<typeof tokenEconomics>;
   contextUtil: ContextUtilization;
+  latency: LatencyBreakdownModel;
   seeking: boolean;
   seekAtMs: number | null;
   isActive: boolean;
@@ -444,6 +480,15 @@ function DetailHeader({
         <dt className="self-start text-text-muted" title="context-window utilization: prompt (input) tokens vs the model's context window">context</dt>
         <dd className="min-w-0">
           <ContextGauge util={contextUtil} />
+        </dd>
+        {/* Gap 10: the per-flow latency breakdown — a "Timing" line (TTFT/wire TTFB/total/tok-s)
+            + a phase waterfall (queue → routing → upstream → prefill → generation → finalize). TTFT
+            is `measured` from the gap-02 first-content-delta, else a labelled `estimated`
+            first-visible-activity fallback from the monitor output segments; a phase with a missing
+            endpoint renders `—` (no bar), never a fabricated 0ms. Spans the full row. */}
+        <dt className="self-start text-text-muted" title="latency breakdown: where the turn spent its wall-clock — provider prefill/TTFT vs generation">timing</dt>
+        <dd className="min-w-0">
+          <LatencyBreakdown model={latency} />
         </dd>
       </dl>
     </header>

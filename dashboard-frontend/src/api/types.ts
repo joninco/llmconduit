@@ -51,6 +51,100 @@ export const PROVIDER_STATUSES: readonly ProviderStatus[] = ['healthy', 'cooling
 export type CostConfidence = 'confident' | 'estimated' | 'unavailable';
 export const COST_CONFIDENCES: readonly CostConfidence[] = ['confident', 'estimated', 'unavailable'];
 
+// ---------------------------------------------------------------------------
+// Gap 02 / 03 spine — per-phase timestamps + the per-attempt failover trace.
+// These mirror the Rust `PhaseTimings` (`#[serde(flatten)]`) + `Attempt` /
+// `first_upstream_byte_ms` on `FlowRecord`/`SnapshotFlowSummary`. They are the
+// PRIMARY (measured) source for the gap-10 latency breakdown; every field is
+// OPTIONAL (Rust `Option<_>` + `skip_serializing_if` ⇒ ABSENT, never `0`, when
+// the phase/attempt did not occur or was not measured). The frontend consumes
+// them when present and falls back to the monitor `output` segments otherwise.
+// ---------------------------------------------------------------------------
+
+/**
+ * Gap 02 — the per-phase wall-clock timestamps (epoch-ms) a turn passes through, flattened
+ * onto the flow object as sibling scalar fields (mirrors the Rust `#[serde(flatten)]
+ * PhaseTimings`). Each is a MEASURED epoch-ms instant or ABSENT (the phase did not occur /
+ * was not measured) — NEVER `0` (don't-lie-with-zeros: a real wall-clock epoch is never `0`,
+ * so a present value unambiguously means "this phase ran"). Where present they are monotonic
+ * (`ingress ≤ normalization ≤ routing ≤ first_content_delta ≤ stream_end ≤ finalize`).
+ *
+ * Mixed into `FlowSummary`/`FlowDetail` rather than nested, because the Rust side flattens
+ * them onto the flow. A pair of present neighbours yields a DERIVED sub-duration; a missing
+ * endpoint makes that sub-duration UNAVAILABLE (rendered `—`, never a 0ms segment).
+ */
+export interface PhaseTimings {
+  /** Request ingress (≈ `started_ms`); the left edge the waterfall anchors against. */
+  ingress_ms?: number | null;
+  /** Inbound→canonical normalization settled. Absent if the flow errored pre-normalization. */
+  normalization_done_ms?: number | null;
+  /** Upstream routing/lowering decision committed. Absent if the flow never reached the wire. */
+  routing_decision_ms?: number | null;
+  /**
+   * True client TTFT — the first canonical **content** SSE delta to the client (NOT reasoning,
+   * tool-argument, refusal, or signature deltas). Absent if the flow errored before any content.
+   * When present ⇒ the breakdown labels TTFT **measured**.
+   */
+  first_content_delta_ms?: number | null;
+  /** Stream completion (terminal `response.completed`/`incomplete`). Absent on a mid-stream error. */
+  stream_end_ms?: number | null;
+  /** Terminal finalize (every terminal: completed/failed/cancelled); the right edge. */
+  finalize_ms?: number | null;
+}
+
+/** Gap 03 — one upstream dispatch attempt's outcome (Rust `AttemptStatus`, snake_case). */
+export type AttemptStatus = 'served' | 'failed';
+export const ATTEMPT_STATUSES: readonly AttemptStatus[] = ['served', 'failed'];
+
+/**
+ * Gap 03 — a BOUNDED, sanitized taxonomic failure code for a failed attempt (Rust
+ * `AttemptErrorClass`, snake_case). NOT raw upstream error text — a fixed enum, safe on the
+ * body-free summary. `null`/absent on the served attempt.
+ */
+export type AttemptErrorClass = 'connect' | 'http_status' | 'timeout' | 'stream' | 'terminal' | 'other';
+export const ATTEMPT_ERROR_CLASSES: readonly AttemptErrorClass[] = [
+  'connect',
+  'http_status',
+  'timeout',
+  'stream',
+  'terminal',
+  'other',
+];
+
+/**
+ * Gap 03 — a BOUNDED taxonomic reason a failed attempt triggered failover (Rust
+ * `AttemptFailoverReason`, snake_case). `null`/absent on the served attempt.
+ */
+export type AttemptFailoverReason = 'provider_failed' | 'terminal_no_failover';
+export const ATTEMPT_FAILOVER_REASONS: readonly AttemptFailoverReason[] = [
+  'provider_failed',
+  'terminal_no_failover',
+];
+
+/**
+ * Gap 03 — one upstream dispatch attempt's full provenance (Rust `Attempt`): WHICH provider,
+ * WHAT model, WHEN it began/resolved, WHEN the first wire byte arrived, and the OUTCOME. The
+ * failover loop records one per provider it tried (failed ones + the served one); a non-failover
+ * flow records exactly one. `first_upstream_byte_ms` is `null`/absent when the attempt never
+ * received response headers (failed before a first chunk) — NEVER `0`. `error_class`/
+ * `failover_reason` are `null`/absent on the served attempt and bounded taxonomic codes (never
+ * raw upstream text) on a failed one. The gap-10 breakdown reads the SERVED attempt's
+ * `first_upstream_byte_ms` to ENRICH the upstream-wait segment (wire TTFB).
+ */
+export interface Attempt {
+  provider?: string | null;
+  model?: string | null;
+  /** Epoch-ms the attempt was dispatched. Always measured. */
+  start_ms: number;
+  /** Epoch-ms the attempt resolved (served first chunk, or failed). Always measured. */
+  end_ms: number;
+  /** Epoch-ms the FIRST wire chunk arrived for this attempt; `null`/absent when none did (never `0`). */
+  first_upstream_byte_ms?: number | null;
+  status: AttemptStatus;
+  error_class?: AttemptErrorClass | null;
+  failover_reason?: AttemptFailoverReason | null;
+}
+
 /** The debug request lifecycle status (`DebugRequestStatus`, monitor.rs). */
 export type DebugRequestStatus = 'running' | 'completed' | 'failed';
 /** Debug segment kind (`DebugSegmentKind`, monitor.rs). */
@@ -307,7 +401,7 @@ export interface MetricTickPayload {
  * (mirrors the `Option<String>` fields on `FlowRecord`). Validator: require `api_call_id`,
  * accept optional `response_id`.
  */
-export interface FlowStatusPayload {
+export interface FlowStatusPayload extends PhaseTimings {
   type: 'flow_status';
   /** REQUIRED authoritative flow key (matches D1 FlowRecord + D6 kill + D13 `:id`). */
   api_call_id: ApiCallId;
@@ -321,6 +415,10 @@ export interface FlowStatusPayload {
   usage: Usage | null;
   started_ms: number;
   elapsed_ms?: number | null;
+  /** Gap 03 — the per-attempt failover trace (optional; present once the backend projects it). */
+  attempts?: Attempt[];
+  /** Gap 03 — flow-level wire TTFB; `null`/absent, never `0`. */
+  first_upstream_byte_ms?: number | null;
 }
 
 /**
@@ -415,7 +513,7 @@ export interface SeqCursors {
  * Keyed by `api_call_id`; `response_id`, models, target, usage, and the timing fields are
  * optional exactly as the Rust `Option<_>` fields are. `cost` is a D13 roll-up addition.
  */
-export interface FlowSummary {
+export interface FlowSummary extends PhaseTimings {
   api_call_id: ApiCallId;
   response_id?: ResponseId | null;
   method: string;
@@ -435,6 +533,19 @@ export interface FlowSummary {
    * labelled as such; `unavailable` ⇒ `cost` is `null` (renders `—`, never a measured `0`).
    */
   cost_confidence: CostConfidence;
+  /**
+   * Gap 03 — the per-attempt failover trace (each `Attempt` is body-free scalar provenance +
+   * bounded taxonomic codes). Absent/empty when no attempt was recorded. The gap-10 breakdown
+   * reads the served attempt's `first_upstream_byte_ms`; the gap-11 stepper reads the whole list.
+   * (The `PhaseTimings` epoch fields are mixed in via `extends` — flattened on the Rust wire.)
+   */
+  attempts?: Attempt[];
+  /**
+   * Gap 03 — flow-level wire time-to-first-byte (the served attempt's first on-wire chunk).
+   * Distinct from `first_content_delta_ms` (the first content delta to the CLIENT). `null`/absent
+   * ⇒ no upstream byte ever arrived (renders `—`, never `0`).
+   */
+  first_upstream_byte_ms?: number | null;
 }
 
 /** Body-free frozen summary in a snapshot — identical shape to `FlowSummary` (D1). */
@@ -470,7 +581,7 @@ export interface FlowDelta {
  * the three captured bodies (absent, not error, when evicted) + replayed deltas. Keyed by
  * `api_call_id`.
  */
-export interface FlowDetail {
+export interface FlowDetail extends PhaseTimings {
   flow_seq: number;
   api_call_id: ApiCallId;
   response_id?: ResponseId | null;
@@ -492,6 +603,14 @@ export interface FlowDetail {
   cost?: number | null;
   /** Gap 07 — the confidence tier of `cost` (mirrors `FlowSummary.cost_confidence`). */
   cost_confidence: CostConfidence;
+  /**
+   * Gap 03 — the per-attempt failover trace (the served attempt's `first_upstream_byte_ms`
+   * enriches the gap-10 upstream-wait segment). Optional/absent until the backend projects it
+   * onto this detail DTO. (The `PhaseTimings` epoch fields are mixed in via `extends`.)
+   */
+  attempts?: Attempt[];
+  /** Gap 03 — flow-level wire TTFB (the served attempt's first on-wire byte); `null`/absent, never `0`. */
+  first_upstream_byte_ms?: number | null;
 }
 
 /** `GET /dashboard/api/metrics` */
@@ -650,6 +769,47 @@ export function isDomain(v: unknown): v is Domain {
 /** Validates a `CostConfidence` enum value (gap 07) — confident/estimated/unavailable. */
 function isCostConfidence(v: unknown): v is CostConfidence {
   return isOneOf(v, COST_CONFIDENCES);
+}
+
+/**
+ * Gap 03 — validates one `Attempt` (the WS/snapshot wire is not trusted): `start_ms`/`end_ms`
+ * REQUIRED uints, `status` a known enum, the optional fields absent/null or their right shape.
+ * `error_class`/`failover_reason` must be the bounded taxonomic enums (rejects raw text leaking
+ * onto the body-free summary). Exported so the consuming surfaces (gap 10/11) can re-validate.
+ */
+export function isAttempt(v: unknown): v is Attempt {
+  return (
+    isObj(v) &&
+    isOptStr(v.provider) && isOptStr(v.model) &&
+    isUint(v.start_ms) && isUint(v.end_ms) &&
+    isOptUint(v.first_upstream_byte_ms) &&
+    isOneOf(v.status, ATTEMPT_STATUSES) &&
+    (v.error_class === undefined || v.error_class === null || isOneOf(v.error_class, ATTEMPT_ERROR_CLASSES)) &&
+    (v.failover_reason === undefined || v.failover_reason === null || isOneOf(v.failover_reason, ATTEMPT_FAILOVER_REASONS))
+  );
+}
+
+/** Optional attempts list: absent, null, or an array of valid `Attempt`s (gap 03). */
+function isOptAttempts(v: unknown): boolean {
+  return v === undefined || v === null || (Array.isArray(v) && v.every(isAttempt));
+}
+
+/**
+ * Gap 02 — the per-phase timestamps are OPTIONAL flattened siblings on the flow object. Each is
+ * absent/null or an unsigned-int epoch (never `0`-as-unmeasured on the wire, but a present `0`
+ * would still validate as a uint — the don't-lie-with-zeros distinction is enforced by the Rust
+ * `skip_serializing_if`, so an unmeasured phase is ABSENT, not `0`). Validates the bundle is
+ * shaped (no negative/fractional epoch sneaks in).
+ */
+function isOptPhaseTimings(v: Record<string, unknown>): boolean {
+  return (
+    isOptUint(v.ingress_ms) &&
+    isOptUint(v.normalization_done_ms) &&
+    isOptUint(v.routing_decision_ms) &&
+    isOptUint(v.first_content_delta_ms) &&
+    isOptUint(v.stream_end_ms) &&
+    isOptUint(v.finalize_ms)
+  );
 }
 
 function isUsage(v: unknown): v is Usage {
@@ -823,7 +983,9 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
         isStr(v.api_call_id) && isOptStr(v.response_id) &&
         isOneOf(v.status, FLOW_STATUSES) &&
         isOptStr(v.model_requested) && isOptStr(v.model_served) && isOptStr(v.upstream_target) &&
-        isUsageOrNull(v.usage) && isUint(v.started_ms) && isOptUint(v.elapsed_ms)
+        isUsageOrNull(v.usage) && isUint(v.started_ms) && isOptUint(v.elapsed_ms) &&
+        // Gap 02/03: optional spine fields on the live flow update — validated when present.
+        isOptPhaseTimings(v) && isOptAttempts(v.attempts) && isOptUint(v.first_upstream_byte_ms)
       );
     case 'topology_update':
       return Array.isArray(v.nodes) && Array.isArray(v.edges) && v.nodes.every(isProviderHealth) && v.edges.every(isTopologyEdge);
@@ -861,7 +1023,10 @@ function isFlowSummary(v: unknown): v is FlowSummary {
     isUint(v.started_ms) && isOptUint(v.finished_ms) && isOptUint(v.elapsed_ms) &&
     isOptStr(v.terminal_reason) &&
     // Gap 07: the per-flow cost-confidence tag is REQUIRED on every row.
-    isCostConfidence(v.cost_confidence)
+    isCostConfidence(v.cost_confidence) &&
+    // Gap 02/03: the optional spine fields, when present, must be well-shaped (don't trust the
+    // wire). Absent ⇒ the summary predates the spine projection / the phase didn't occur.
+    isOptPhaseTimings(v) && isOptAttempts(v.attempts) && isOptUint(v.first_upstream_byte_ms)
   );
 }
 

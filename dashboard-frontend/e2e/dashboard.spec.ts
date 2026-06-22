@@ -111,6 +111,55 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on the context gauge').toEqual([]);
   });
 
+  // Gap 10: the FlowDetail inspector shows a per-flow latency breakdown — a "Timing" line
+  // (TTFT/wire TTFB/total/tok-s) + a phase waterfall. The MEASURED/derived TTFT label must switch
+  // correctly: a flow with the full gap-02 spine reads a MEASURED TTFT (no est badge) and renders
+  // every waterfall segment; a flow that errored before content shows its prefill/generation
+  // segments as `—` (unavailable), never a fabricated 0ms.
+  test('latency breakdown: measured TTFT + waterfall, — on missing phases (gap 10)', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[0]!); // Flows
+    await page.waitForTimeout(400);
+
+    // api_002 (completed) carries the FULL phase spine (incl. stream_end + finalize) + a served
+    // attempt with a wire first byte → a MEASURED TTFT (first_content_delta), a measured wire TTFB,
+    // and EVERY waterfall segment present (incl. generation + finalize). Select it by its endpoint,
+    // excluding the mystery-model row on the same endpoint.
+    const known = page
+      .getByTestId('flow-row')
+      .filter({ hasText: '/v1/chat/completions' })
+      .filter({ hasNotText: 'mystery' })
+      .first();
+    await known.click();
+    await expect(page.getByTestId('flow-detail')).toBeVisible();
+    const breakdown = page.getByTestId('latency-breakdown');
+    await expect(breakdown).toBeVisible();
+
+    const ttft = page.getByTestId('latency-ttft');
+    await expect(ttft).toHaveAttribute('data-quality', 'measured');
+    await expect(ttft).not.toContainText('—');
+    // A MEASURED TTFT carries NO est badge (the derived fallback would).
+    await expect(ttft.getByTestId('latency-quality-badge')).toHaveCount(0);
+    // The wire TTFB segment is enriched (measured) and the full waterfall is present.
+    await expect(page.getByTestId('latency-ttfb')).toHaveAttribute('data-quality', 'measured');
+    await expect(page.getByTestId('latency-seg-upstream')).toBeVisible();
+    await expect(page.getByTestId('latency-seg-generation')).toBeVisible();
+    await expect(page.getByTestId('latency-seg-finalize')).toBeVisible();
+
+    // api_003 (failed before content): the prefill + generation segments are UNAVAILABLE — `—`, NOT
+    // 0ms — and have no bar fill. Select the failed row by its upstream (`openai`, unique to it).
+    const failed = page.getByTestId('flow-row').filter({ hasText: 'openai' }).first();
+    await failed.click();
+    await expect(page.getByTestId('latency-legend-prefill')).toHaveAttribute('data-quality', 'unavailable');
+    await expect(page.getByTestId('latency-dur-prefill')).toHaveText('—');
+    await expect(page.getByTestId('latency-seg-prefill')).toHaveCount(0); // no width in the bar
+    // TTFT for an errored-before-content flow reads `—` (unavailable), never 0.
+    await expect(page.getByTestId('latency-ttft')).toHaveAttribute('data-quality', 'unavailable');
+    await expect(page.getByTestId('latency-ttft')).toContainText('—');
+
+    expect(consoleErrors, 'console errors on the latency breakdown').toEqual([]);
+  });
+
   for (const view of VIEWS) {
     test(`${view.name}: renders + no console errors + matches baseline`, async ({ page, consoleErrors }) => {
       await login(page);

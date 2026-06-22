@@ -39,3 +39,14 @@ export function fmtModelPair(requested?: string | null, served?: string | null):
   if (requested && served) return requested === served ? served : `${requested} → ${served}`;
   return served ?? requested ?? '—';
 }
+
+/**
+ * Throughput → compact `tok/s` (`142 tok/s`, `1.2k tok/s`). `null` ⇒ "—" (UNAVAILABLE, never a
+ * fabricated `0`). A measured `0` would read `0 tok/s` (distinct from unavailable). Used by the
+ * gap-10 latency breakdown's derived stream-rate readout.
+ */
+export function fmtTokensPerSec(n: number | null): string {
+  if (n === null || !Number.isFinite(n)) return '—';
+  if (n < 1000) return `${n < 10 ? n.toFixed(1) : Math.round(n)} tok/s`;
+  return `${(n / 1000).toFixed(1)}k tok/s`;
+}

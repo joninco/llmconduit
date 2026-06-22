@@ -60,15 +60,66 @@ function seedFlows(): FlowSummary[] {
   return [
     // Gap 07: llama has cached tokens (128) but NO configured cache rate ⇒ cost is ESTIMATED
     // (labelled as such in the UI), not confident.
-    { api_call_id: 'api_001', response_id: 'resp_001', method: 'POST', uri: '/v1/responses', status: 'open', model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 812, completion: 240, total: 1052, cached: 128, reasoning: 0 }, started_ms: now - 2400, finished_ms: null, elapsed_ms: 2400, terminal_reason: null, cost: 0.0061, cost_confidence: 'estimated' },
+    // Gap 10: FULL phase spine + a served attempt with a wire first byte (open, still streaming) ⇒
+    // the latency breakdown reads a MEASURED TTFT (first_content_delta) + wire TTFB + every segment.
+    {
+      api_call_id: 'api_001', response_id: 'resp_001', method: 'POST', uri: '/v1/responses', status: 'open',
+      model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a',
+      usage: { prompt: 812, completion: 240, total: 1052, cached: 128, reasoning: 0 },
+      started_ms: now - 2400, finished_ms: null, elapsed_ms: 2400, terminal_reason: null,
+      cost: 0.0061, cost_confidence: 'estimated',
+      // ingress → +30ms normalize → +20ms routing → +220ms wire TTFB → +180ms first content
+      // (still streaming: no stream_end/finalize yet ⇒ generation/finalize segments unavailable).
+      ingress_ms: now - 2400, normalization_done_ms: now - 2370, routing_decision_ms: now - 2350,
+      first_content_delta_ms: now - 1950, first_upstream_byte_ms: now - 2130,
+      attempts: [
+        { provider: 'vllm-a', model: 'llama-3.1-70b', start_ms: now - 2350, end_ms: now - 2130, first_upstream_byte_ms: now - 2130, status: 'served' },
+      ],
+    },
     // Gap 07: cached/reasoning UNREPORTED (absent ⇒ renders `—`, never `0`); unpriced cache ⇒ estimated.
-    { api_call_id: 'api_002', response_id: 'resp_002', method: 'POST', uri: '/v1/chat/completions', status: 'completed', model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a', usage: { prompt: 1500, completion: 980, total: 2480 }, started_ms: now - 12000, finished_ms: now - 7800, elapsed_ms: 4200, terminal_reason: 'response.completed', cost: 0.0019, cost_confidence: 'estimated' },
+    // Gap 10: a COMPLETED flow with the full phase spine ⇒ every segment measured, tok/s derived.
+    {
+      api_call_id: 'api_002', response_id: 'resp_002', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
+      model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a',
+      usage: { prompt: 1500, completion: 980, total: 2480 },
+      started_ms: now - 12000, finished_ms: now - 7800, elapsed_ms: 4200, terminal_reason: 'response.completed',
+      cost: 0.0019, cost_confidence: 'estimated',
+      ingress_ms: now - 12000, normalization_done_ms: now - 11960, routing_decision_ms: now - 11940,
+      first_upstream_byte_ms: now - 11700, first_content_delta_ms: now - 11500,
+      stream_end_ms: now - 7820, finalize_ms: now - 7800,
+      attempts: [
+        { provider: 'vllm-a', model: 'llama-3.1-70b', start_ms: now - 11940, end_ms: now - 11700, first_upstream_byte_ms: now - 11700, status: 'served' },
+      ],
+    },
     // Gap 07: no usage + a failed call ⇒ cost null ⇒ cost_confidence UNAVAILABLE (renders `—`).
-    { api_call_id: 'api_003', response_id: null, method: 'POST', uri: '/v1/responses', status: 'failed', model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai', usage: null, started_ms: now - 30000, finished_ms: now - 29200, elapsed_ms: 800, terminal_reason: 'upstream 503', cost: null, cost_confidence: 'unavailable' },
+    // Gap 10: ERRORED BEFORE CONTENT — ingress/normalize/routing/finalize stamped, but NO
+    // first_content_delta_ms / stream_end_ms ⇒ the prefill + generation segments are UNAVAILABLE
+    // (`—`, never 0ms); the attempt FAILED pre-headers ⇒ no wire TTFB. TTFT/tok/s ⇒ `—`.
+    {
+      api_call_id: 'api_003', response_id: null, method: 'POST', uri: '/v1/responses', status: 'failed',
+      model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai',
+      usage: null, started_ms: now - 30000, finished_ms: now - 29200, elapsed_ms: 800,
+      terminal_reason: 'upstream 503', cost: null, cost_confidence: 'unavailable',
+      ingress_ms: now - 30000, normalization_done_ms: now - 29970, routing_decision_ms: now - 29950,
+      finalize_ms: now - 29200,
+      attempts: [
+        { provider: 'openai', model: 'gpt-4o', start_ms: now - 29950, end_ms: now - 29200, status: 'failed', error_class: 'http_status', failover_reason: 'terminal_no_failover' },
+      ],
+    },
     // Gap 09: served by a model whose upstream advertises NO context window (`mystery-model` ⇒
     // catalog context_limit null) but WITH reported usage. The context gauge must render `—`
     // (UNKNOWN capacity), NEVER a fabricated 0%/100% — distinct from a flow on a known-window model.
-    { api_call_id: 'api_004', response_id: 'resp_004', method: 'POST', uri: '/v1/chat/completions', status: 'completed', model_requested: 'mystery-model', model_served: 'mystery-model', upstream_target: 'vllm-b', usage: { prompt: 4096, completion: 512, total: 4608 }, started_ms: now - 18000, finished_ms: now - 16000, elapsed_ms: 2000, terminal_reason: 'response.completed', cost: null, cost_confidence: 'unavailable' },
+    // Gap 10: full phases but NO attempts/first_upstream_byte ⇒ the upstream-wait segment is
+    // unavailable and the prefill segment anchors on routing→first-content (the no-TTFB path).
+    {
+      api_call_id: 'api_004', response_id: 'resp_004', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
+      model_requested: 'mystery-model', model_served: 'mystery-model', upstream_target: 'vllm-b',
+      usage: { prompt: 4096, completion: 512, total: 4608 },
+      started_ms: now - 18000, finished_ms: now - 16000, elapsed_ms: 2000, terminal_reason: 'response.completed',
+      cost: null, cost_confidence: 'unavailable',
+      ingress_ms: now - 18000, normalization_done_ms: now - 17960, routing_decision_ms: now - 17940,
+      first_content_delta_ms: now - 17600, stream_end_ms: now - 16020, finalize_ms: now - 16000,
+    },
   ];
 }
 
@@ -289,6 +340,17 @@ function buildFlowDetail(id: string): FlowDetail | null {
     elapsed_ms: base.elapsed_ms,
     cost: base.cost ?? null,
     cost_confidence: base.cost_confidence,
+    // Gap 10: project the gap-02 phase epochs + gap-03 attempts/wire-TTFB from the seed flow onto
+    // the inspector detail (mirrors how the live row carries them) so the latency breakdown reads
+    // the MEASURED spine when the flow is opened via the REST detail path.
+    ingress_ms: base.ingress_ms,
+    normalization_done_ms: base.normalization_done_ms,
+    routing_decision_ms: base.routing_decision_ms,
+    first_content_delta_ms: base.first_content_delta_ms,
+    stream_end_ms: base.stream_end_ms,
+    finalize_ms: base.finalize_ms,
+    attempts: base.attempts,
+    first_upstream_byte_ms: base.first_upstream_byte_ms,
   };
 }
 

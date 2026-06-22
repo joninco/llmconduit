@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fmtClock, fmtCost, fmtElapsed, fmtModelPair, fmtTokens } from './format';
+import { fmtClock, fmtCost, fmtElapsed, fmtModelPair, fmtTokens, fmtTokensPerSec } from './format';
 
 describe('format helpers — null ⇒ "—" (don\'t-lie-with-zeros)', () => {
   it('fmtElapsed: null/non-finite ⇒ "—", else compact', () => {
@@ -47,5 +47,20 @@ describe('fmtTokens — the catalog context_limit renderer (gap 06)', () => {
     expect(fmtTokens(128000)).toBe('128.0k'); // gpt-4o
     expect(fmtTokens(131072)).toBe('131.1k'); // llama-3.1-70b
     expect(fmtTokens(2_500_000)).toBe('2.50m');
+  });
+});
+
+describe('fmtTokensPerSec — the gap-10 stream throughput renderer', () => {
+  it('null/non-finite ⇒ "—" (unavailable), never "0"', () => {
+    expect(fmtTokensPerSec(null)).toBe('—');
+    expect(fmtTokensPerSec(Number.NaN)).toBe('—');
+    expect(fmtTokensPerSec(null)).not.toBe('0 tok/s');
+  });
+
+  it('a real measured throughput ⇒ a compact tok/s string', () => {
+    expect(fmtTokensPerSec(0)).toBe('0.0 tok/s'); // a measured zero is distinct from unavailable
+    expect(fmtTokensPerSec(4.2)).toBe('4.2 tok/s');
+    expect(fmtTokensPerSec(142)).toBe('142 tok/s');
+    expect(fmtTokensPerSec(1500)).toBe('1.5k tok/s');
   });
 });

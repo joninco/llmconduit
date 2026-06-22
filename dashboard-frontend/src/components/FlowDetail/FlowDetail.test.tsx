@@ -453,6 +453,79 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     // A confident cost carries NO estimated badge — the `unavailable` detail tag did not leak.
     expect(() => getByTestId('cost-confidence')).toThrow();
   });
+
+  // Gap 10 — the inspector header renders the latency breakdown. A flow whose live row carries the
+  // full gap-02 phase spine + a gap-03 served attempt with a wire first byte ⇒ a MEASURED TTFT +
+  // wire TTFB + every waterfall segment. `api_g10` is unknown to the mock so /flows/:id 404s and the
+  // SEEDED live row drives the header (the spine fields flatten onto the row).
+  it('renders a MEASURED latency breakdown from the live spine (gap 10)', async () => {
+    const t0 = 1_700_000_000_000;
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g10',
+        status: 'completed',
+        model_served: 'llama-3.1-70b',
+        started_ms: t0,
+        usage: { prompt: 100, completion: 500, total: 600, cached: 0, reasoning: 0 },
+        ingress_ms: t0,
+        normalization_done_ms: t0 + 30,
+        routing_decision_ms: t0 + 50,
+        first_upstream_byte_ms: t0 + 270,
+        first_content_delta_ms: t0 + 450,
+        stream_end_ms: t0 + 1450,
+        finalize_ms: t0 + 1470,
+        attempts: [{ provider: 'vllm-a', model: 'llama-3.1-70b', start_ms: t0 + 50, end_ms: t0 + 270, first_upstream_byte_ms: t0 + 270, status: 'served' }],
+      }),
+    ]);
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g10" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+
+    // TTFT is MEASURED (first content − ingress = 450ms) — no est badge.
+    await waitFor(() => expect(getByTestId('latency-ttft').getAttribute('data-quality')).toBe('measured'));
+    expect(getByTestId('latency-ttft').textContent).toContain('450ms');
+    expect(getByTestId('latency-ttft').querySelector('[data-testid="latency-quality-badge"]')).toBeNull();
+    // Wire TTFB is measured (270ms) and the upstream-wait segment is enriched.
+    expect(getByTestId('latency-ttfb').getAttribute('data-quality')).toBe('measured');
+    expect(getByTestId('latency-seg-upstream').getAttribute('data-quality')).toBe('measured');
+    // Every phase legend reads measured.
+    for (const id of ['queue', 'routing', 'upstream', 'prefill', 'generation', 'finalize']) {
+      expect(getByTestId(`latency-legend-${id}`).getAttribute('data-quality')).toBe('measured');
+    }
+  });
+
+  // Gap 10 — when `first_content_delta_ms` is ABSENT for a flow, the breakdown falls back to a
+  // DERIVED "first-visible-activity" TTFT from the live monitor `output` segments, LABELLED `est`
+  // (never presented as the measured upstream first byte). Drive it via the live monitor ring.
+  it('falls back to a DERIVED (est) TTFT from monitor output when first_content_delta is absent (gap 10)', async () => {
+    const t0 = 1_700_000_000_000;
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g10b',
+        response_id: 'resp_g10b',
+        status: 'open',
+        model_served: 'llama-3.1-70b',
+        started_ms: t0,
+        // phases present EXCEPT first_content_delta (the spine has not stamped TTFT for this flow).
+        ingress_ms: t0,
+        normalization_done_ms: t0 + 30,
+        routing_decision_ms: t0 + 50,
+      }),
+    ]);
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g10b" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+
+    // Before any visible activity ⇒ TTFT unavailable (`—`), never 0.
+    await waitFor(() => expect(getByTestId('latency-ttft').getAttribute('data-quality')).toBe('unavailable'));
+    expect(getByTestId('latency-ttft').textContent).toContain('—');
+
+    // A live monitor `output` segment 300ms after started_ms supplies the DERIVED fallback.
+    pushMonitor({ type: 'segment_append', response_id: 'resp_g10b', segment: { timestamp_ms: t0 + 300, kind: 'output', text: 'Hi' } }, 4);
+    await waitFor(() => expect(getByTestId('latency-ttft').getAttribute('data-quality')).toBe('estimated'));
+    expect(getByTestId('latency-ttft').textContent).toContain('300ms');
+    // It is LABELLED `est` (a derived first-visible-activity figure, not the measured upstream byte).
+    const badge = getByTestId('latency-ttft').querySelector('[data-testid="latency-quality-badge"]');
+    expect(badge?.textContent).toBe('est');
+  });
 });
 
 describe('FlowDetail — time-travel seek + body eviction', () => {
