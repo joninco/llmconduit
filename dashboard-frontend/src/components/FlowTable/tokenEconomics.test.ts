@@ -138,6 +138,51 @@ describe('aggregateCacheByKey — by-model roll-up (gap 08)', () => {
     expect(agg!.estimated).toBe(true);
   });
 
+  // Round-1 regression (review gap-08 #1): the confidence taint MUST run for EVERY grouped flow,
+  // including flows that did NOT report cached. A confident cached member alongside a non-confident
+  // UNREPORTED member previously rendered as fully confident (the taint was gated on the
+  // cached-reported branch). One non-confident member of any kind makes the group an estimate.
+  it('a non-confident UNREPORTED flow still taints the group ⇒ estimated (every-member taint)', () => {
+    const rows = [
+      // confident, reported cached — contributes to the rate.
+      flow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: usage({ prompt: 1000, cached: 250 }) }),
+      // non-confident, UNREPORTED cached — excluded from the rate, but MUST still taint confidence.
+      flow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'estimated', usage: usage({ prompt: 1000 }) }),
+    ];
+    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served, PRICE_TABLE);
+    // The rate still derives ONLY from the reported member (250/1000) — no zero-lie reintroduced.
+    expect(agg!.hitRate).toEqual({ value: '25.0%', quality: 'derived' });
+    expect(agg!.reportedSamples).toBe(1);
+    expect(agg!.totalSamples).toBe(2);
+    // The unreported estimated member taints the whole group.
+    expect(agg!.estimated).toBe(true);
+  });
+
+  // Round-1 regression (review gap-08 #2 contract side): an estimated group whose flows never
+  // reported cached (rate unavailable) is STILL flagged estimated, so the UI can badge it. This is
+  // the data half of the always-label fix; the render half is asserted in CacheEconomics.test.tsx.
+  it('a non-confident group with NO reported cached ⇒ rate "—" yet estimated === true', () => {
+    const rows = [
+      flow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'estimated', usage: usage() }), // unreported cached
+      flow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'unavailable', usage: usage() }),
+    ];
+    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served, PRICE_TABLE);
+    expect(agg!.hitRate).toEqual({ value: '—', quality: 'unavailable' });
+    expect(agg!.reportedSamples).toBe(0);
+    expect(agg!.estimated).toBe(true);
+  });
+
+  // Guard the inverse: an all-confident group with NO reported cached is NOT flagged estimated
+  // (no spurious badge on a clean-but-unmeasured group).
+  it('an all-confident group with NO reported cached ⇒ estimated === false (no spurious label)', () => {
+    const rows = [
+      flow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: usage() }),
+      flow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'confident', usage: usage() }),
+    ];
+    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served, PRICE_TABLE);
+    expect(agg!.estimated).toBe(false);
+  });
+
   it('a model with cached but NO configured cache price ⇒ hit rate shown, "$ saved" "—"', () => {
     const rows = [flow({ api_call_id: 'a', model_served: 'llama-3.1-70b', cost_confidence: 'estimated', usage: usage({ cached: 250 }) })];
     const [agg] = aggregateCacheByKey(rows, (f) => f.model_served, PRICE_TABLE);

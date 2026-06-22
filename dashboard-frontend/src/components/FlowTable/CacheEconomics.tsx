@@ -11,8 +11,10 @@
  *  - the hit rate is `derived` over flows that REPORTED `cached`; a model whose flows never reported
  *    cached renders `—` (unavailable), NOT a fabricated 0% (see `aggregateCacheByKey`).
  *  - "$ saved" sums only flows with a CONFIGURED cached price (presence) → `—` when none.
- *  - a model group is badged `est` when ANY contributing flow's `cost_confidence !== 'confident'`
- *    (the cross-cutting "label estimates" rule); a fully-confident group carries no badge.
+ *  - a model group is badged `est` when ANY grouped flow's `cost_confidence !== 'confident'` (the
+ *    cross-cutting "label estimates" rule), independent of whether a hit rate is shown — an estimated
+ *    row with an unavailable rate but a derived `$ saved` still carries the badge; a fully-confident
+ *    group carries no badge.
  *
  * Collapsed by default (a dense secondary surface under the table); the header summarises the
  * overall reported-sample coverage so an operator sees at a glance whether caching is measurable.
@@ -104,8 +106,10 @@ function AggregateRow({ agg }: { agg: CacheAggregateRow }) {
         </span>
         {/* The cross-cutting rule: an aggregate that includes a non-confident member is an
             ESTIMATE — labelled, so a confident roll-up is never confused with a best-effort one.
-            Only meaningful when a rate is actually shown. */}
-        {agg.estimated && agg.hitRate.quality !== 'unavailable' && (
+            Rendered whenever the group is estimated, INDEPENDENT of `hitRate.quality`: a derived
+            `$ saved` (or a zero-denominator / unavailable-rate row) must still carry the `est` label
+            so an estimate is never shown unlabelled. */}
+        {agg.estimated && (
           <span
             className="ml-1.5 rounded-sm bg-status-cooling/15 px-1 text-[9px] uppercase tracking-wide text-status-cooling"
             data-testid="agg-est"

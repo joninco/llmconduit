@@ -166,9 +166,10 @@ export function tokenEconomics(
  *  - `saved` sums the per-flow `derived` savings, counting ONLY flows with a configured cached
  *    price (presence) AND a reported cached count; `savedConfigured` is true iff at least one flow
  *    contributed — so a group with no configured cache price shows the hit rate but NO dollar total.
- *  - `confident` is true iff EVERY contributing flow's `cost_confidence === 'confident'`; otherwise
- *    the group is `estimated` and MUST be labelled (the cross-cutting rule) — a single estimated
- *    member taints the aggregate.
+ *  - `confident` is true iff EVERY grouped flow's `cost_confidence === 'confident'` — the taint runs
+ *    for ALL members, NOT only the cached-reporting ones, so a group with a confident cached sample
+ *    plus a non-confident UNREPORTED sample is still `estimated`. Otherwise the group MUST be
+ *    labelled (the cross-cutting rule) — a single non-confident member taints the aggregate.
  */
 export interface CacheAggregate {
   /** Group key (a model id or a client label). */
@@ -185,7 +186,7 @@ export interface CacheAggregate {
   savedDollars: number;
   /** True iff ≥1 flow contributed a configured-price saving (gates the `$ saved` column). */
   savedConfigured: boolean;
-  /** False iff ANY contributing flow is not `confident` ⇒ the aggregate is `estimated` (labelled). */
+  /** False iff ANY grouped flow (reported or not) is not `confident` ⇒ the aggregate is `estimated`. */
   confident: boolean;
 }
 
@@ -235,6 +236,12 @@ export function aggregateCacheByKey(
     }
     agg.totalSamples += 1;
 
+    // Confidence taint runs for EVERY grouped flow — including flows that did NOT report cached
+    // (unreported / `usage === null`). A single non-confident member (estimated/unavailable) makes
+    // the whole group an estimate; gating this on the cached-reported branch (as gap-08 round 0 did)
+    // would let a group with [confident cached + non-confident unreported] render as fully confident.
+    if (flow.cost_confidence !== 'confident') agg.confident = false;
+
     const usage = flow.usage ?? null;
     const cached = usage?.cached;
     // A flow contributes to the hit rate ONLY when it reported a finite cached count.
@@ -242,8 +249,6 @@ export function aggregateCacheByKey(
       agg.reportedSamples += 1;
       agg.cachedTokens += Math.max(0, cached);
       if (Number.isFinite(usage.prompt)) agg.promptTokens += Math.max(0, usage.prompt);
-      // A contributing flow that is not `confident` taints the whole aggregate → estimated.
-      if (flow.cost_confidence !== 'confident') agg.confident = false;
 
       // $ saved contribution: only with a CONFIGURED cached price (presence), never the default 0.0.
       const model = flow.model_served ?? flow.model_requested ?? null;
@@ -271,9 +276,11 @@ export function aggregateCacheByKey(
       saved,
       reportedSamples: agg.reportedSamples,
       totalSamples: agg.totalSamples,
-      // A group is an estimate when any contributing flow is non-confident; a group with NO
-      // contributing (reported) flow has no rate to qualify, so it is not flagged estimated.
-      estimated: agg.reportedSamples > 0 && !agg.confident,
+      // A group is an estimate when ANY member is non-confident (taint runs for every grouped flow,
+      // reported or not). Independent of whether a hit rate is shown — a non-confident unreported
+      // member still makes the group an estimate, and the `est` badge must surface it even when the
+      // hit rate is `—` (unavailable). The badge's own render must not re-gate on hit-rate quality.
+      estimated: !agg.confident,
     };
   });
 

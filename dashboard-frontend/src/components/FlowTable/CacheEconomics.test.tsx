@@ -58,6 +58,42 @@ describe('CacheEconomics — aggregate cache-hit by model (gap 08)', () => {
     expect(within(table).getByTestId('agg-est')).toBeTruthy();
   });
 
+  // Round-1 regression (review gap-08 #2): the `est` badge MUST render whenever the group is
+  // estimated, INDEPENDENT of the hit-rate quality. Previously the badge was suppressed on an
+  // unavailable rate, so an estimated row with a derived `$ saved` (zero-denominator case below)
+  // showed the dollar figure with NO estimate label.
+  it('shows the est badge on an estimated row even when the hit rate is unavailable (zero denominator + derived $ saved)', () => {
+    const rows = [
+      // prompt 0 ⇒ hit-rate denominator 0 ⇒ rate unavailable; cached 100 reported with gpt-4o's
+      // CONFIGURED price ⇒ a DERIVED `$ saved`. One estimated member ⇒ the group is an estimate.
+      makeFlow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 0, completion: 100, total: 100, cached: 100 } }),
+      makeFlow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'estimated', usage: { prompt: 0, completion: 100, total: 100, cached: 100 } }),
+    ];
+    const { container } = render(<CacheEconomics rows={rows} priceTable={PRICE_TABLE} />);
+    const table = expand(container);
+    const row = within(table).getByTestId('cache-economics-row');
+    // Rate is unavailable (zero denominator) — the badge must NOT be gated on this.
+    expect(within(row).getByTestId('agg-hit-rate').getAttribute('data-quality')).toBe('unavailable');
+    // A derived `$ saved` IS shown — so an estimate label is mandatory beside it.
+    expect(within(row).getByTestId('agg-saved').getAttribute('data-quality')).toBe('derived');
+    // The fix: the est badge is present despite the unavailable rate.
+    expect(within(row).getByTestId('agg-est')).toBeTruthy();
+  });
+
+  // The unreported-cached variant: an estimated group whose flows never reported cached (rate AND
+  // $ saved unavailable) still carries the est badge — the label tracks confidence, not the rate.
+  it('shows the est badge on an estimated group with no reported cached (unavailable rate)', () => {
+    const rows = [
+      makeFlow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'estimated', usage: { prompt: 1000, completion: 100, total: 1100 } }),
+      makeFlow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 1000, completion: 100, total: 1100 } }),
+    ];
+    const { container } = render(<CacheEconomics rows={rows} priceTable={PRICE_TABLE} />);
+    const table = expand(container);
+    const row = within(table).getByTestId('cache-economics-row');
+    expect(within(row).getByTestId('agg-hit-rate').getAttribute('data-quality')).toBe('unavailable');
+    expect(within(row).getByTestId('agg-est')).toBeTruthy();
+  });
+
   it('a model whose flows never reported cached ⇒ "—" hit rate (unavailable), not a fabricated 0%', () => {
     const rows = [
       makeFlow({ api_call_id: 'a', model_served: 'llama-3.1-70b', usage: { prompt: 1000, completion: 100, total: 1100 } }),
