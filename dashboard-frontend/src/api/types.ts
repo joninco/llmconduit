@@ -495,10 +495,18 @@ export interface TopologyResponse {
   price_table: Record<string, ModelPrice>;
 }
 
-/** Catalog entry (`GET /dashboard/api/catalog` returns a BARE array — no cursor). */
+/**
+ * Catalog entry (`GET /dashboard/api/catalog` returns a BARE array — no cursor).
+ *
+ * `context_limit` is the per-model max-context window (tokens). NULLABLE (gap 06):
+ * the backend serializes it ABSENT/`null` when the upstream advertises no window —
+ * distinct from a real `0`. Renderers MUST show `—` (unavailable) on `null`/absent,
+ * NEVER `0` (a `0` ceiling reads as garbage/infinite utilization in the gap-09
+ * gauge). Optional + `| null` so an omitted key and an explicit `null` both type.
+ */
 export interface CatalogEntry {
   id: string;
-  context_limit: number;
+  context_limit?: number | null;
 }
 
 /** `GET /dashboard/api/snapshot?at=<unix_ms>` */

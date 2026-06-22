@@ -289,12 +289,28 @@ pub struct FlowDetailBody {
 }
 
 /// One catalog entry (`GET /dashboard/api/catalog` — a BARE array, no cursor).
-/// Mirrors the frozen `CatalogEntry`: `{id, context_limit}` (a non-null count; an
-/// upstream that reports no window collapses to `0`).
-#[derive(Debug, Clone, Serialize)]
+/// `{id, context_limit}` where `context_limit` is the per-model max-context window
+/// surfaced from the upstream `/v1/models` snapshot (gap 06).
+///
+/// NULLABLE end-to-end (gap 06 contract migration): `context_limit` is
+/// `Option<i64>`, serialized as `null` when the upstream advertises no window —
+/// distinct from a real `0`. Previously this DTO collapsed a missing window to a
+/// non-null `0` (`unwrap_or(0)`), which lies-with-zeros: a `0` ceiling reads as
+/// garbage/infinite utilization downstream (spec 09's context-window gauge).
+/// `measured` when advertised; `unavailable`/`None` when the upstream omits it.
+/// The frontend renders `—` on `null`, NEVER `0`. Derives `Deserialize` alongside
+/// `Serialize` so the changed wire field round-trips in a test (AGENTS.md: no
+/// changed wire field without a deserialize-then-serialize proof).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogEntry {
     pub id: String,
-    pub context_limit: i64,
+    /// The per-model max-context window (tokens), or `null`/absent when the
+    /// upstream advertises none. `skip_serializing_if` so an unavailable window
+    /// OMITS the key rather than emitting `null` — either is honest (the frontend
+    /// type is `number | null` with the field optional); both are distinct from a
+    /// real `0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<i64>,
 }
 
 /// `GET /dashboard/api/snapshot?at=<unix_ms>` — a body-free frozen cut. Mirrors
@@ -860,7 +876,15 @@ pub async fn dashboard_topology(State(gateway): State<Arc<Gateway>>) -> Response
 /// `GET /dashboard/api/catalog` — the model catalog as a BARE array `[{id,
 /// context_limit}]` (no cursor; a static-ish read). Sourced from the upstream
 /// `/v1/models` snapshot via the `UpstreamClient` (ids + per-model context
-/// window); an upstream that reports no window collapses `context_limit` to `0`.
+/// window), reusing the SAME `context_limit_by_id` parse that feeds G3 budgeting
+/// (no second max-context parser — gap 06).
+///
+/// `context_limit` is surfaced NULLABLE: an upstream that advertises no window
+/// yields `None` (serialized absent), NOT a non-null `0`. The prior `unwrap_or(0)`
+/// collapse is removed (gap 06): it lied-with-zeros — a `0` ceiling is
+/// indistinguishable from a real value and reads as garbage/infinite utilization
+/// in spec 09's gauge. The frontend renders `—` on the missing window.
+///
 /// An upstream catalog-fetch failure yields an empty array (the dashboard simply
 /// shows no catalog) rather than a 5xx that would blank the whole view.
 pub async fn dashboard_catalog(State(gateway): State<Arc<Gateway>>) -> Response {
@@ -869,7 +893,10 @@ pub async fn dashboard_catalog(State(gateway): State<Arc<Gateway>>) -> Response 
             .into_iter()
             .map(|entry| CatalogEntry {
                 id: entry.id,
-                context_limit: entry.context_limit.unwrap_or(0),
+                // Pass the parsed `Option<i64>` THROUGH unchanged: a known window
+                // serializes as the integer, an unknown one as absent/null. Do NOT
+                // re-collapse to 0 (the gap 06 lie-with-zeros fix).
+                context_limit: entry.context_limit,
             })
             .collect::<Vec<_>>(),
         Err(_) => Vec::new(),

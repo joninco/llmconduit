@@ -60,6 +60,10 @@ struct MockUpstream {
     responses: CannedResponses,
     supported_models: Arc<Mutex<Vec<String>>>,
     supported_model_queries: Arc<Mutex<usize>>,
+    /// Per-model advertised context windows surfaced through
+    /// `supported_model_catalog` (gap 06). A model absent here reports
+    /// `context_limit: None` (the upstream advertises no window). Empty by default.
+    context_limits: Arc<Mutex<Vec<(String, i64)>>>,
     /// Per-model finalization policies (effort/family/kwargs), built from the
     /// test config by the gateway harness so the mock's leaf-mirror applies the
     /// SAME profile kwargs the production leaf would (T1). Empty by default
@@ -95,6 +99,17 @@ impl MockUpstream {
         S: Into<String>,
     {
         *self.supported_models.lock().await = models.into_iter().map(Into::into).collect();
+    }
+
+    /// Supply per-model advertised context windows surfaced through
+    /// `supported_model_catalog` (gap 06). Models not listed report `None`.
+    async fn set_context_limits<I, S>(&self, limits: I)
+    where
+        I: IntoIterator<Item = (S, i64)>,
+        S: Into<String>,
+    {
+        *self.context_limits.lock().await =
+            limits.into_iter().map(|(id, n)| (id.into(), n)).collect();
     }
 
     async fn supported_model_queries(&self) -> usize {
@@ -142,6 +157,7 @@ impl UpstreamClient for MockUpstream {
     ) -> Result<Vec<UpstreamModelEntry>, llmconduit::error::AppError> {
         let mut query_count = self.supported_model_queries.lock().await;
         *query_count += 1;
+        let limits = self.context_limits.lock().await.clone();
         Ok(self
             .supported_models
             .lock()
@@ -149,7 +165,10 @@ impl UpstreamClient for MockUpstream {
             .iter()
             .map(|id| UpstreamModelEntry {
                 id: id.clone(),
-                context_limit: None,
+                context_limit: limits
+                    .iter()
+                    .find(|(limit_id, _)| limit_id == id)
+                    .map(|(_, limit)| *limit),
             })
             .collect())
     }
@@ -5837,10 +5856,13 @@ async fn d13_topology_shape_carries_seq_and_price_table() {
 #[tokio::test]
 async fn d13_catalog_is_a_bare_array_no_cursor() {
     // `/catalog` is the lone BARE array `[{id, context_limit}]` — NO cursor (a
-    // static-ish read, not a mutating domain). An upstream that reports no window
-    // collapses `context_limit` to 0 (non-null, per the frozen `CatalogEntry`).
+    // static-ish read, not a mutating domain). Gap 06: `context_limit` is NULLABLE
+    // end-to-end — a model WITH an advertised window serializes the integer, a model
+    // WITHOUT serializes ABSENT/null (NEVER a non-null `0`, the prior lie-with-zeros).
     let upstream = MockUpstream::default();
     upstream.set_supported_models(["model-a", "model-b"]).await;
+    // `model-a` advertises a 32k window; `model-b` advertises none.
+    upstream.set_context_limits([("model-a", 32_768_i64)]).await;
     let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
         "0.0.0.0:4000".parse().unwrap(),
         &d13_env(false),
@@ -5854,12 +5876,72 @@ async fn d13_catalog_is_a_bare_array_no_cursor() {
         .as_array()
         .expect("catalog is a BARE array (no cursor)");
     assert_eq!(array.len(), 2);
+
+    // Model WITH an advertised window ⇒ the real integer.
     assert_eq!(array[0]["id"], serde_json::json!("model-a"));
     assert_eq!(
         array[0]["context_limit"],
-        serde_json::json!(0),
-        "no upstream window ⇒ context_limit collapses to 0 (non-null)"
+        serde_json::json!(32_768),
+        "an advertised window surfaces as the integer"
     );
+
+    // Model WITHOUT an advertised window ⇒ ABSENT (not `0`, not present-and-null
+    // garbage). `skip_serializing_if = Option::is_none` omits the key entirely; the
+    // critical invariant is that it is NEVER the integer `0` (which would read as an
+    // infinite/garbage utilization downstream in spec 09's gauge).
+    assert_eq!(array[1]["id"], serde_json::json!("model-b"));
+    assert!(
+        array[1].get("context_limit").is_none()
+            || array[1]["context_limit"] == serde_json::Value::Null,
+        "no upstream window ⇒ context_limit is unavailable (absent/null), NEVER 0: got {:?}",
+        array[1].get("context_limit"),
+    );
+    assert_ne!(
+        array[1]["context_limit"],
+        serde_json::json!(0),
+        "don't-lie-with-zeros: a missing window must NOT collapse to 0"
+    );
+}
+
+#[test]
+fn d13_catalog_entry_context_limit_round_trips_nullable() {
+    // AGENTS.md: no changed wire field without a deserialize-then-serialize proof.
+    // Gap 06 changed `CatalogEntry.context_limit` from non-null `i64` to nullable
+    // `Option<i64>` — pin both arms (Some(n) ⇒ integer survives; None ⇒ absent, NOT
+    // `0`) through a JSON round-trip.
+    use llmconduit::dashboard_api::CatalogEntry;
+
+    // Some(n): the integer survives serialize → deserialize → serialize.
+    let known = CatalogEntry {
+        id: "model-a".to_string(),
+        context_limit: Some(32_768),
+    };
+    let known_json = serde_json::to_value(&known).expect("serialize known");
+    assert_eq!(known_json["context_limit"], serde_json::json!(32_768));
+    let known_back: CatalogEntry = serde_json::from_value(known_json).expect("deserialize known");
+    assert_eq!(known_back.context_limit, Some(32_768));
+
+    // None: serializes ABSENT (skip_serializing_if), NEVER `0`; and an absent key
+    // deserializes back to None.
+    let unknown = CatalogEntry {
+        id: "model-b".to_string(),
+        context_limit: None,
+    };
+    let unknown_json = serde_json::to_value(&unknown).expect("serialize unknown");
+    assert!(
+        unknown_json.get("context_limit").is_none(),
+        "None ⇒ the key is OMITTED (skip_serializing_if), never serialized as 0"
+    );
+    let unknown_back: CatalogEntry =
+        serde_json::from_value(unknown_json).expect("deserialize unknown (absent key)");
+    assert_eq!(unknown_back.context_limit, None);
+
+    // An EXPLICIT `null` on the wire also deserializes to None (robust to either
+    // honest absent/null encoding).
+    let explicit_null: CatalogEntry =
+        serde_json::from_value(serde_json::json!({ "id": "m", "context_limit": null }))
+            .expect("deserialize explicit null");
+    assert_eq!(explicit_null.context_limit, None);
 }
 
 /// Build a `--with-debug-ui` app + its gateway over a wiremock upstream (the REAL

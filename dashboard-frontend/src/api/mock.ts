@@ -47,6 +47,9 @@ const CATALOG: CatalogEntry[] = [
   { id: 'gpt-4o', context_limit: 128000 },
   { id: 'llama-3.1-70b', context_limit: 131072 },
   { id: 'qwen2.5-coder-32b', context_limit: 32768 },
+  // gap 06: a model whose upstream advertises NO window ⇒ `null` (unavailable),
+  // distinct from a real `0`. Renderers show `—`, never `0`.
+  { id: 'mystery-model', context_limit: null },
 ];
 
 function seedFlows(): FlowSummary[] {

@@ -60,11 +60,21 @@ describe('DashboardClient — typed reads against the D13 shapes (mock)', () => 
     expect(Array.isArray(res.flows)).toBe(true);
   });
 
-  it('catalog() returns a BARE array (no cursor)', async () => {
+  it('catalog() returns a BARE array (no cursor) with a NULLABLE context_limit', async () => {
     const client = new DashboardClient({ fetchImpl: mockFetch });
     const cat = await client.catalog();
     expect(Array.isArray(cat)).toBe(true);
-    expect(cat[0]).toHaveProperty('context_limit');
+    const first = cat[0];
+    expect(first).toBeDefined();
+    expect(first).toHaveProperty('context_limit');
+    // gap 06: a real window surfaces as a number...
+    expect(typeof first?.context_limit).toBe('number');
+    // ...and a model with no advertised window surfaces as `null` (unavailable),
+    // NEVER a non-null `0` (the lie-with-zeros the gap removed).
+    const unavailable = cat.find((e) => e.id === 'mystery-model');
+    expect(unavailable).toBeDefined();
+    expect(unavailable?.context_limit ?? null).toBeNull();
+    expect(unavailable?.context_limit).not.toBe(0);
   });
 });
 
