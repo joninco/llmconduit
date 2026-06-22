@@ -23,6 +23,7 @@ import { Button } from '../ui/Button';
 import { StatusChip } from '../FlowTable/StatusChip';
 import { fmtElapsed, fmtModelPair, fmtTokens } from '../FlowTable/format';
 import { costDisplay, elapsedMs, flowCost } from '../FlowTable/flowModel';
+import { tokenEconomics } from '../FlowTable/tokenEconomics';
 import { JsonPane } from '../viz/JsonPane';
 import { combineMiddleDiff, diffLayers } from './diff';
 import { joinMonitor } from './monitorJoin';
@@ -130,6 +131,25 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   // Gap 07 — the cumulative token usage for the breakdown row (freshest: live, then detail):
   // cached/reasoning may be UNREPORTED (null/absent) ⇒ `fmtTokens` renders `—`, never `0`.
   const usage = liveFlow?.usage ?? frozenDetail?.usage ?? null;
+  // Gap 08 — the token-economics breakdown (cache-hit rate + "$ saved by cache"), MIRRORING the
+  // FlowTable tokens-cell popover so the inspector line shows the SAME honest figures. Built from
+  // the freshest usage + the served model (for the cached-price PRESENCE gate). `usage`/model are
+  // resolved live-first (seek ⇒ frozen-only); the served model gates `$ saved` via the gap-07
+  // `cached_price_configured` flag — never the defaulted numeric `0.0`.
+  const econ = useMemo(() => {
+    const model = liveFlow?.model_served ?? frozenDetail?.model_served ?? liveFlow?.model_requested ?? frozenDetail?.model_requested ?? null;
+    const econFlow: FlowSummary = {
+      api_call_id: apiCallId,
+      method: 'POST',
+      uri: '',
+      status: status ?? 'open',
+      started_ms: liveFlow?.started_ms ?? frozenDetail?.started_ms ?? 0,
+      cost_confidence: 'unavailable',
+      usage,
+      model_served: model,
+    };
+    return tokenEconomics(econFlow, priceTable);
+  }, [liveFlow, frozenDetail, apiCallId, status, usage, priceTable]);
 
   return (
     <section className="flex min-h-0 w-[46%] min-w-[420px] flex-col border-l border-line bg-panel" data-testid="flow-detail" aria-label="flow detail">
@@ -140,6 +160,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         cost={cost}
         costConfidence={costConfidence}
         usage={usage}
+        econ={econ}
         seeking={seeking}
         seekAtMs={seekAtMs}
         isActive={isActive}
@@ -268,6 +289,7 @@ function DetailHeader({
   cost,
   costConfidence,
   usage,
+  econ,
   seeking,
   seekAtMs,
   isActive,
@@ -282,6 +304,7 @@ function DetailHeader({
   cost: number | null;
   costConfidence: CostConfidence;
   usage: Usage | null;
+  econ: ReturnType<typeof tokenEconomics>;
   seeking: boolean;
   seekAtMs: number | null;
   isActive: boolean;
@@ -361,6 +384,37 @@ function DetailHeader({
           <span title="cache-read prompt tokens (— = upstream did not report)">{fmtTokens(usage?.cached)}</span>
           <span className="text-line"> · </span>
           <span title="reasoning tokens (— = upstream did not report)">{fmtTokens(usage?.reasoning)}</span>
+        </dd>
+        {/* Gap 08: the cache economics line, MIRRORING the table tokens-cell popover. The cache-hit
+            rate is `derived` (`—` when cached unreported, never a 0% miss); "$ saved" is `derived`
+            and shows only with a CONFIGURED cached price (presence) + a reported cached count —
+            otherwise `—` (no fabricated saving). */}
+        <dt className="text-text-muted">cache hit / $ saved</dt>
+        <dd className="tabular-nums text-text" data-testid="cache-economics">
+          <span data-testid="cache-hit" data-quality={econ.cacheHit.quality} title="cache-hit rate cached/prompt (derived; — = cached unreported)">
+            {econ.cacheHit.value}
+          </span>
+          <span className="text-line"> · </span>
+          <span
+            data-testid="cache-saved"
+            data-quality={econ.saved.quality}
+            title={econ.cachedPriceConfigured
+              ? '$ saved by serving cached tokens at the cached rate (derived)'
+              : '$ saved unavailable — no configured cached price for this model'}
+          >
+            {econ.saved.value}
+          </span>
+          {/* The "$ saved" figure is DERIVED — labelled so an operator never reads it as a billed
+              (measured) cost. Only rendered when a real saving figure is shown. */}
+          {econ.saved.quality === 'derived' && (
+            <span
+              className="ml-1.5 rounded-sm bg-accent/15 px-1 py-0.5 text-[10px] uppercase tracking-wide text-accent"
+              data-testid="saved-derived"
+              title="cache saving is a derived figure (input rate − cached rate)"
+            >
+              derived
+            </span>
+          )}
         </dd>
       </dl>
     </header>

@@ -44,6 +44,36 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on the stats strip').toEqual([]);
   });
 
+  // Gap 08: the tokens cell reveals a token-economics popover (cached/reasoning split + cache-hit
+  // + "$ saved"), and the aggregate cache-economics panel rolls the hit rate up by model. The
+  // popover must render the split AND an honest `—` for an UNREPORTED class (never a fabricated 0).
+  test('tokens popover shows the cached/reasoning split + — on unreported (gap 08)', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[0]!); // Flows
+    await page.waitForTimeout(400);
+
+    // api_002's seed flow reports prompt/completion but UNREPORTED cached/reasoning → the popover
+    // must show `—` for those classes, not `0`. Hover its tokens cell to reveal the breakdown.
+    const row = page.getByTestId('flow-row').filter({ hasText: '/v1/chat/completions' }).first();
+    await row.getByTestId('tokens-cell').hover();
+    const popover = page.getByTestId('tokens-popover');
+    await expect(popover).toBeVisible();
+    // The split lines are present…
+    await expect(popover.getByTestId('econ-line-cached')).toBeVisible();
+    await expect(popover.getByTestId('econ-line-reasoning')).toBeVisible();
+    // …and the unreported cached class reads the unavailable marker, NEVER `0`.
+    const cachedLine = popover.getByTestId('econ-line-cached');
+    await expect(cachedLine).toHaveAttribute('data-quality', 'unavailable');
+    await expect(cachedLine).toContainText('—');
+
+    // The aggregate cache-economics panel expands to a per-model roll-up.
+    await page.getByTestId('cache-economics-toggle').click();
+    await expect(page.getByTestId('cache-economics-table')).toBeVisible();
+    await expect(page.getByTestId('cache-economics-row').first()).toBeVisible();
+
+    expect(consoleErrors, 'console errors on the tokens popover').toEqual([]);
+  });
+
   for (const view of VIEWS) {
     test(`${view.name}: renders + no console errors + matches baseline`, async ({ page, consoleErrors }) => {
       await login(page);

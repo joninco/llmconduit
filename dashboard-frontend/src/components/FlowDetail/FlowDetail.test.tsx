@@ -217,6 +217,97 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     expect(badge.getAttribute('data-confidence')).toBe('estimated');
   });
 
+  // Gap 08 — the inspector cache-economics line MIRRORS the table popover: a measured priced flow
+  // shows a DERIVED cache-hit rate + "$ saved" (labelled `derived`). `api_g08` is unknown to the
+  // mock so /flows/:id 404s and the SEEDED live row drives the header. The price table is seeded
+  // with gpt-4o (a CONFIGURED cached price → presence licenses the $ figure).
+  it('shows the cache-hit rate and a labelled derived $ saved for a priced cached flow (gap 08)', async () => {
+    // seedFlows (applySnapshot, topology: null) resets priceTable, so seed the price table AFTER.
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g08',
+        status: 'completed',
+        model_served: 'gpt-4o',
+        started_ms: 1_700_000_000_000,
+        cost: 0.01,
+        cost_confidence: 'confident',
+        // 250 cached of 1000 prompt ⇒ 25.0% hit; saved = (250/1000)*(0.005-0.0025) = 0.000625.
+        usage: { prompt: 1000, completion: 200, total: 1200, cached: 250, reasoning: 0 },
+      }),
+    ]);
+    act(() => dashboardStore.getState().seedTopology({
+      topology_seq: 1, nodes: [], edges: [],
+      price_table: { 'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025, cached_price_configured: true } },
+    }));
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g08" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+
+    const hit = getByTestId('cache-hit');
+    expect(hit.getAttribute('data-quality')).toBe('derived');
+    expect(hit.textContent).toContain('25.0%');
+    const saved = getByTestId('cache-saved');
+    expect(saved.getAttribute('data-quality')).toBe('derived');
+    expect(saved.textContent).toContain('$0.0006');
+    // The derived saving is LABELLED so it is never read as a billed (measured) cost.
+    expect(getByTestId('saved-derived')).toBeTruthy();
+  });
+
+  // Gap 08 — UNREPORTED cached ⇒ the cache-economics line reads `—` for both hit + $ saved
+  // (never a fabricated 0% / $0.00), even when the model HAS a configured cache price.
+  it('renders — for cache-hit and $ saved when cached is unreported (gap 08)', async () => {
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g08b',
+        status: 'completed',
+        model_served: 'gpt-4o',
+        started_ms: 1_700_000_000_000,
+        cost: 0.01,
+        cost_confidence: 'confident',
+        usage: { prompt: 1000, completion: 200, total: 1200 }, // cached unreported
+      }),
+    ]);
+    act(() => dashboardStore.getState().seedTopology({
+      topology_seq: 1, nodes: [], edges: [],
+      price_table: { 'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025, cached_price_configured: true } },
+    }));
+    const { getByTestId, queryByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g08b" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    const econ = getByTestId('cache-economics');
+    expect(econ.textContent).toContain('—');
+    expect(getByTestId('cache-hit').getAttribute('data-quality')).toBe('unavailable');
+    expect(getByTestId('cache-saved').getAttribute('data-quality')).toBe('unavailable');
+    // No derived saving figure ⇒ no `derived` badge.
+    expect(queryByTestId('saved-derived')).toBeNull();
+  });
+
+  // Gap 08 — a model with cached tokens but NO configured cache price: the hit rate is derived
+  // (from counts) but "$ saved" is `—` (presence gate — no fabricated saving from the numeric 0.0).
+  it('shows a derived hit rate but — for $ saved when no cached price is configured (gap 08)', async () => {
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g08c',
+        status: 'completed',
+        model_served: 'llama-3.1-70b',
+        started_ms: 1_700_000_000_000,
+        cost: 0.002,
+        cost_confidence: 'estimated',
+        usage: { prompt: 1000, completion: 200, total: 1200, cached: 300 },
+      }),
+    ]);
+    act(() => dashboardStore.getState().seedTopology({
+      topology_seq: 1, nodes: [], edges: [],
+      price_table: { 'llama-3.1-70b': { input_per_1k: 0.0008, output_per_1k: 0.0008, cached_per_1k: 0, cached_price_configured: false } },
+    }));
+    const { getByTestId, queryByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g08c" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    expect(getByTestId('cache-hit').getAttribute('data-quality')).toBe('derived');
+    expect(getByTestId('cache-hit').textContent).toContain('30.0%');
+    const saved = getByTestId('cache-saved');
+    expect(saved.getAttribute('data-quality')).toBe('unavailable');
+    expect(saved.textContent).toContain('—');
+    expect(queryByTestId('saved-derived')).toBeNull();
+  });
+
   // Gap 07 — a provider-REPORTED measured `0` cached renders `0` (distinct from `—`).
   it('renders a measured 0 cached as 0 (distinct from unavailable)', async () => {
     seedFlows([

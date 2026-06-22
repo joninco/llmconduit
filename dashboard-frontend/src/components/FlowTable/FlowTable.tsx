@@ -16,7 +16,9 @@ import { useDashboard, useFlowFilter } from '../../store/hooks';
 import { flowFilterStore } from '../../store/flowFilterStore';
 import { cn } from '../../lib/cn';
 import { StatusChip } from './StatusChip';
-import { fmtClock, fmtElapsed, fmtModelPair, fmtTokens } from './format';
+import { TokensCell } from './TokensCell';
+import { CacheEconomics } from './CacheEconomics';
+import { fmtClock, fmtElapsed, fmtModelPair } from './format';
 import { costDisplay, elapsedMs, flowCost, isFailover, shortId, statusClass } from './flowModel';
 import { FilterBar } from './FilterBar';
 import { useFlowRows } from './useFlowRows';
@@ -118,6 +120,10 @@ export function FlowTable({
           </div>
         )}
       </div>
+      {/* Gap 08: the AGGREGATE cache-hit rate / "$ saved" by model, rolled up over the SAME filtered
+          rows the table shows. A collapsed secondary surface under the table (never inside the
+          virtualized scroll container, so it does not affect row layout). */}
+      <CacheEconomics rows={rows} priceTable={priceTable} />
     </div>
   );
 }
@@ -165,8 +171,6 @@ function FlowRow({
   // `cost_confidence`, so an `estimated` row is visibly labelled and an `unavailable` one renders
   // `—` (never a fabricated `$0.00`) — the same contract the StatsStrip $/min chip + FlowDetail use.
   const cost = costDisplay(flowCost(flow, priceTable), flow.cost_confidence);
-  const tokensIn = flow.usage?.prompt;
-  const tokensOut = flow.usage?.completion;
 
   return (
     <button
@@ -204,9 +208,7 @@ function FlowRow({
       <span>
         <StatusChip status={flow.status} terminalReason={flow.terminal_reason} />
       </span>
-      <span className="text-right tabular-nums text-text-muted">
-        {fmtTokens(tokensIn)}<span className="text-line"> / </span>{fmtTokens(tokensOut)}
-      </span>
+      <TokensCell flow={flow} priceTable={priceTable} />
       <span className="flex items-center justify-end gap-1 text-right tabular-nums text-meta">
         <span data-testid="flow-cost" data-confidence={cost.confidence}>{cost.value}</span>
         {/* Gap 07: an `estimated` per-flow cost MUST be labelled (the cross-cutting rule) — a
