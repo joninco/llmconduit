@@ -1198,6 +1198,17 @@ impl Gateway {
             }
         }
 
+        // Gap 02: the routing/lowering decision is now SETTLED — the served model is
+        // resolved, the candidate plan was fetched, and the canonical request lowered
+        // to the upstream chat payload without error (every pre-spawn `?` above passed).
+        // Stamp the `routing_decision` phase HERE, at the engine seam, so it fires for
+        // every upstream client (mock or real) the instant the engine commits to a
+        // backend — distinct from the leaf's later on-the-wire body capture. First
+        // write-wins keeps the FIRST decision on a multi-turn flow. Gated on
+        // `api_call_id` so the production hot path skips the call.
+        if let Some(api_call_id) = api_call_id.as_deref() {
+            self.flow_store().stamp_routing_decision(api_call_id);
+        }
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
         let response_id = format!("resp_{}", Uuid::new_v4().simple());
@@ -2078,6 +2089,17 @@ impl Gateway {
                         }
                         StreamEmission::OutputTextDelta(delta) => {
                             let target = event_state.active_message_target()?;
+                            // Gap 02 (true TTFT): stamp `first_content_delta` on the
+                            // FIRST canonical CONTENT delta to the client — this arm is
+                            // content-only (reasoning/tool-argument/signature deltas have
+                            // their own arms below), so a stream that emits reasoning or
+                            // tool deltas first does NOT stamp TTFT early. First-write-wins
+                            // in the store makes only the first content delta stamp. Gated
+                            // on an `api_call_id` so the production hot path (no dashboard)
+                            // skips even the disabled-store early-return's call overhead.
+                            if let Some(api_call_id) = &api_call_id {
+                                self.flow_store().stamp_first_content_delta(api_call_id);
+                            }
                             self.monitor.emit_with(response_id.as_str(), || {
                                 MonitorEventKind::OutputTextDelta {
                                     delta: delta.clone(),
@@ -2398,6 +2420,16 @@ impl Gateway {
         } else {
             self.send_event(&tx, completed_event(resource), &abort_token)
                 .await?;
+        }
+        // Gap 02: the terminal `response.completed`/`response.incomplete` has been
+        // emitted — stamp the `stream_end` phase. This is the clean-completion edge
+        // (the spawned closure's `guard.finalize` stamps `finalize` immediately after);
+        // a flow that errored/cancelled before here never reaches this `?`-guarded path,
+        // so `stream_end` stays `None` for it. Gated on `api_call_id` so the production
+        // hot path skips the call. The `?`s above mean we only reach here on a clean
+        // emit, which is exactly the semantics we want.
+        if let Some(api_call_id) = &api_call_id {
+            self.flow_store().stamp_stream_end(api_call_id);
         }
         self.monitor.emit(response_id, MonitorEventKind::Completed);
         Ok(())

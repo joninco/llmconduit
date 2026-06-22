@@ -4738,6 +4738,242 @@ async fn d3_completed_flow_finalizes_with_cumulative_usage() {
 }
 
 #[tokio::test]
+async fn gap02_phases_populate_on_real_streamed_turn() {
+    // Gap 02 acceptance: a real streamed turn populates ALL six per-phase timestamps
+    // on the FlowRecord (and the body-free SnapshotFlowSummary projection), and they
+    // are monotonic: ingress ≤ normalization ≤ routing ≤ first_content_delta ≤
+    // stream_end ≤ finalize.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "Hello")),
+            Ok(usage_chunk("chat-1", 100, 40, 140, Some(10), Some(7))),
+        ])
+        .await;
+    let gateway = test_gateway_with_flow_store(upstream, MockSearch::default());
+    let api_call_id = d3_open_flow(&gateway);
+
+    let request = base_request(vec![user_message("hi")]);
+    let stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+    let _events = collect_stream(stream).await; // drain to completion
+
+    let record = d3_await_terminal(&gateway, &api_call_id).await;
+    let p = record.phases;
+    assert!(p.ingress_ms.is_some(), "ingress stamped");
+    assert!(p.normalization_done_ms.is_some(), "normalization stamped");
+    assert!(
+        p.routing_decision_ms.is_some(),
+        "routing stamped (on the wire)"
+    );
+    assert!(
+        p.first_content_delta_ms.is_some(),
+        "first_content_delta stamped (a content delta was streamed)"
+    );
+    assert!(
+        p.stream_end_ms.is_some(),
+        "stream_end stamped (clean completion)"
+    );
+    assert!(p.finalize_ms.is_some(), "finalize stamped (terminal)");
+
+    // Monotonic across all measured phases.
+    let order = [
+        ("ingress", p.ingress_ms.unwrap()),
+        ("normalization", p.normalization_done_ms.unwrap()),
+        ("routing", p.routing_decision_ms.unwrap()),
+        ("first_content_delta", p.first_content_delta_ms.unwrap()),
+        ("stream_end", p.stream_end_ms.unwrap()),
+        ("finalize", p.finalize_ms.unwrap()),
+    ];
+    for win in order.windows(2) {
+        assert!(
+            win[0].1 <= win[1].1,
+            "phase order violated: {}={} > {}={}",
+            win[0].0,
+            win[0].1,
+            win[1].0,
+            win[1].1
+        );
+    }
+
+    // The body-free summary projection carries the SAME phases (the WS/snapshot wire),
+    // and serializes them as numeric siblings — never the zero sentinel.
+    let summary = gateway
+        .flow_store()
+        .snapshot_summaries()
+        .into_iter()
+        .find(|s| s.api_call_id == api_call_id)
+        .expect("summary for the flow");
+    assert_eq!(summary.phases, p, "summary mirrors the record's phases");
+    let json = serde_json::to_string(&summary).expect("serialize summary");
+    assert!(json.contains("\"first_content_delta_ms\":"));
+    // Don't-lie-with-zeros at the wire: every MEASURED phase is a real epoch-ms value
+    // (> 0), never the `0` sentinel that would be indistinguishable from "didn't
+    // happen". (Assert on the structured values, not a substring — `elapsed_ms` is a
+    // legitimately-0 monotonic delta on a sub-ms mock turn and must not trip this.)
+    for (name, value) in [
+        ("ingress", p.ingress_ms),
+        ("normalization", p.normalization_done_ms),
+        ("routing", p.routing_decision_ms),
+        ("first_content_delta", p.first_content_delta_ms),
+        ("stream_end", p.stream_end_ms),
+        ("finalize", p.finalize_ms),
+    ] {
+        assert!(
+            value.unwrap() > 0,
+            "measured phase `{name}` must be a real epoch ms, never the 0 sentinel"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gap02_reasoning_deltas_do_not_stamp_ttft_content_does() {
+    // Gap 02 acceptance (the load-bearing TTFT semantics): `first_content_delta_ms`
+    // stamps on the FIRST CONTENT delta only. Prove BOTH directions on real streamed
+    // turns:
+    //   (a) a stream that emits ONLY reasoning deltas (no content) finishes with
+    //       first_content_delta_ms == None — reasoning deltas DO NOT stamp it; and
+    //   (b) a stream that emits reasoning deltas THEN a content delta stamps it (so it
+    //       was the content delta, not the earlier reasoning, that set TTFT).
+
+    // (a) reasoning-only stream → no content delta ever ⇒ TTFT None.
+    let reasoning_only = MockUpstream::default();
+    reasoning_only
+        .push_response(vec![
+            Ok(reasoning_chunk("chat-r", "thinking hard")),
+            Ok(reasoning_chunk("chat-r", " still thinking")),
+            Ok(usage_chunk("chat-r", 10, 0, 10, None, Some(8))),
+        ])
+        .await;
+    let gw_a = test_gateway_with_flow_store(reasoning_only, MockSearch::default());
+    let api_a = d3_open_flow(&gw_a);
+    let stream_a = gw_a
+        .clone()
+        .stream_responses_with_api_call_id(
+            base_request(vec![user_message("hi")]),
+            Some(api_a.clone()),
+        )
+        .await
+        .expect("stream");
+    let _ = collect_stream(stream_a).await;
+    let rec_a = d3_await_terminal(&gw_a, &api_a).await;
+    assert_eq!(
+        rec_a.status,
+        llmconduit::dashboard_flow::FlowStatus::Completed,
+        "reasoning-only turn still completes"
+    );
+    assert!(
+        rec_a.phases.first_content_delta_ms.is_none(),
+        "reasoning deltas (no content) must NOT stamp TTFT — got {:?}",
+        rec_a.phases.first_content_delta_ms
+    );
+    // It DID stream (reasoning) and DID complete, so stream_end is stamped — only TTFT
+    // is absent, proving the gate is content-specific, not a missing-seam artifact.
+    assert!(
+        rec_a.phases.stream_end_ms.is_some(),
+        "the reasoning-only turn still reached a clean stream end"
+    );
+
+    // (b) reasoning THEN content → TTFT stamped, and ordered AFTER normalization/routing.
+    let reasoning_then_content = MockUpstream::default();
+    reasoning_then_content
+        .push_response(vec![
+            Ok(reasoning_chunk("chat-rc", "let me think")),
+            Ok(content_chunk("chat-rc", "Answer")),
+            Ok(usage_chunk("chat-rc", 10, 5, 15, None, Some(4))),
+        ])
+        .await;
+    let gw_b = test_gateway_with_flow_store(reasoning_then_content, MockSearch::default());
+    let api_b = d3_open_flow(&gw_b);
+    let stream_b = gw_b
+        .clone()
+        .stream_responses_with_api_call_id(
+            base_request(vec![user_message("hi")]),
+            Some(api_b.clone()),
+        )
+        .await
+        .expect("stream");
+    let _ = collect_stream(stream_b).await;
+    let rec_b = d3_await_terminal(&gw_b, &api_b).await;
+    let p = rec_b.phases;
+    assert!(
+        p.first_content_delta_ms.is_some(),
+        "a content delta after reasoning DOES stamp TTFT"
+    );
+    assert!(
+        p.routing_decision_ms.unwrap() <= p.first_content_delta_ms.unwrap(),
+        "TTFT is at/after the routing decision (the content arrived after dispatch)"
+    );
+    assert!(
+        p.first_content_delta_ms.unwrap() <= p.stream_end_ms.unwrap(),
+        "TTFT precedes stream end"
+    );
+}
+
+#[tokio::test]
+async fn gap02_error_before_content_leaves_ttft_and_stream_end_none() {
+    // Gap 02 acceptance: a flow that errors BEFORE any content delta has
+    // first_content_delta_ms == None (don't-lie-with-zeros — absent, never 0), and no
+    // clean stream_end either; but finalize still stamps (every terminal does).
+    let upstream = MockUpstream::default();
+    // The upstream stream yields an error as its first item — no content is ever
+    // emitted to the client.
+    upstream
+        .push_response(vec![Err(llmconduit::error::AppError::upstream(
+            "upstream exploded before first token",
+        ))])
+        .await;
+    let gateway = test_gateway_with_flow_store(upstream, MockSearch::default());
+    let api_call_id = d3_open_flow(&gateway);
+
+    let request = base_request(vec![user_message("hi")]);
+    let stream = gateway
+        .clone()
+        .stream_responses_with_api_call_id(request, Some(api_call_id.clone()))
+        .await
+        .expect("stream");
+    let _events = collect_stream(stream).await; // drains the failed stream
+
+    let record = d3_await_terminal(&gateway, &api_call_id).await;
+    assert_eq!(
+        record.status,
+        llmconduit::dashboard_flow::FlowStatus::Failed,
+        "an upstream error before content finalizes Failed"
+    );
+    let p = record.phases;
+    assert!(
+        p.first_content_delta_ms.is_none(),
+        "no content delta was emitted ⇒ TTFT is None, NEVER 0 — got {:?}",
+        p.first_content_delta_ms
+    );
+    assert!(
+        p.stream_end_ms.is_none(),
+        "the turn never reached a clean stream end ⇒ stream_end None"
+    );
+    // Finalize still fired for the failed terminal (right edge always present).
+    assert!(
+        p.finalize_ms.is_some(),
+        "every terminal stamps finalize, even Failed"
+    );
+    // And the absent phases serialize as ABSENT on the body-free summary (not 0/null).
+    let summary = gateway
+        .flow_store()
+        .snapshot_summaries()
+        .into_iter()
+        .find(|s| s.api_call_id == api_call_id)
+        .expect("summary");
+    let json = serde_json::to_string(&summary).expect("serialize");
+    assert!(
+        !json.contains("first_content_delta_ms"),
+        "an unmeasured TTFT must be ABSENT from the wire, not 0/null: {json}"
+    );
+    assert!(!json.contains("stream_end_ms"), "stream_end absent: {json}");
+}
+
+#[tokio::test]
 async fn d3_multi_chunk_usage_does_not_double_count() {
     // THE no-double-count test: a single turn emits MULTIPLE cumulative usage
     // chunks. The record's usage must equal the FINAL chunk total, not the sum of

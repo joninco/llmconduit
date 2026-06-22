@@ -7,7 +7,7 @@
 > **Branch:** `worktree-dashboard`. **Inherits:** `AGENTS.md` (commands + hard rules) + REVIEW_PROTOCOL.
 > **Run:** `/ralph-orchestrate --no-review --agents 1` (serial; per-gap Codex review is the gate).
 
-## Status: IN PROGRESS — 1/16 done (01 ✅). 15 gaps remain (02–16), serial, per-gap Codex-xhigh reviewed.
+## Status: IN PROGRESS — 2/16 done (01 ✅, 02 ✅). 14 gaps remain (03–16), serial, per-gap Codex-xhigh reviewed.
 
 ## The discipline (cross-cutting acceptance — applies to EVERY gap)
 FEATURES.md hardened the framing from "pretty flow artifacts" to "can Argus answer the incident
@@ -61,7 +61,7 @@ Checklist; `[ ]` = not started. Gate: **B** = backend (`cargo test`/`clippy`/`fm
 - [x] **01** stats-strip accuracy 🐞⭐ · gate **B+F** · `01-stats-strip-accuracy.md` · investigation-first. Root cause: live WS `window_tile` hard-coded `active_streams`/`tok-s`/`cost` to `0.0` (+ raw counts as `req/s`); REST-only fix would have left it. Fix: unified WS tick + snapshot onto the REST `metrics_body`; added `samples` u64 (terminal-flow count) end-to-end so zero-sample windows render `—` not `0`.
 
 ### Phase 1 — Data-contract pass (the spine; backend; before any UI)
-- [ ] **02** spine: per-phase timestamps + `first_content_delta_ms` · gate **B** · feeds 10, 16.
+- [x] **02** spine: per-phase timestamps + `first_content_delta_ms` 🔭⚙️⭐ · gate **B** · feeds 10, 16. Added `PhaseTimings{ingress_ms, normalization_done_ms, routing_decision_ms, first_content_delta_ms, stream_end_ms, finalize_ms}` (all `Option<u128>`, first-write-wins + monotonic-clamp) on `FlowRecord` + flattened onto body-free `SnapshotFlowSummary` (so it reaches the WS/snapshot wire). Seams: open→ingress, `set_normalized`→normalization, engine pre-spawn (post-lower)→routing, `OutputTextDelta` arm→TTFT (content-only), end of `run_turn`→stream_end, `finalize`→finalize. Missing phase = `None` ⇒ absent JSON (don't-lie-with-zeros). `routing` lives at the engine seam (not the leaf) so it fires for mock + real upstreams.
 - [ ] **03** spine: `attempts[]` + `first_upstream_byte_ms` · gate **B** · feeds 11, 12.
 - [ ] **04** spine: `client_label` / key-hash · gate **B** · feeds 15.
 - [ ] **05** spine: gated upstream response/error-body capture · gate **B** · feeds 14.
