@@ -16,8 +16,8 @@ import { useDashboard, useFlowFilter } from '../../store/hooks';
 import { flowFilterStore } from '../../store/flowFilterStore';
 import { cn } from '../../lib/cn';
 import { StatusChip } from './StatusChip';
-import { fmtClock, fmtCost, fmtElapsed, fmtModelPair, fmtTokens } from './format';
-import { elapsedMs, flowCost, isFailover, shortId, statusClass } from './flowModel';
+import { fmtClock, fmtElapsed, fmtModelPair, fmtTokens } from './format';
+import { costDisplay, elapsedMs, flowCost, isFailover, shortId, statusClass } from './flowModel';
 import { FilterBar } from './FilterBar';
 import { useFlowRows } from './useFlowRows';
 
@@ -161,7 +161,10 @@ function FlowRow({
   const klass = statusClass(flow.status, flow.terminal_reason);
   const isError = klass === 'client-error' || klass === 'server-error';
   const failover = isFailover(flow);
-  const cost = flowCost(flow, priceTable);
+  // Gap 07: derive the dollar STRING and the `estimated` flag TOGETHER from the cost + the per-flow
+  // `cost_confidence`, so an `estimated` row is visibly labelled and an `unavailable` one renders
+  // `—` (never a fabricated `$0.00`) — the same contract the StatsStrip $/min chip + FlowDetail use.
+  const cost = costDisplay(flowCost(flow, priceTable), flow.cost_confidence);
   const tokensIn = flow.usage?.prompt;
   const tokensOut = flow.usage?.completion;
 
@@ -204,7 +207,21 @@ function FlowRow({
       <span className="text-right tabular-nums text-text-muted">
         {fmtTokens(tokensIn)}<span className="text-line"> / </span>{fmtTokens(tokensOut)}
       </span>
-      <span className="text-right tabular-nums text-meta">{fmtCost(cost)}</span>
+      <span className="flex items-center justify-end gap-1 text-right tabular-nums text-meta">
+        <span data-testid="flow-cost" data-confidence={cost.confidence}>{cost.value}</span>
+        {/* Gap 07: an `estimated` per-flow cost MUST be labelled (the cross-cutting rule) — a
+            compact marker so an operator never mistakes a best-effort row for a confident one on
+            the main flow surface. `unavailable` already reads as `—`; `confident` needs no badge. */}
+        {cost.estimated && (
+          <span
+            className="shrink-0 rounded-sm bg-status-cooling/15 px-1 text-[9px] uppercase tracking-wide text-status-cooling"
+            data-testid="flow-cost-est"
+            title="cost is an estimate — a billed token class has no configured rate"
+          >
+            est
+          </span>
+        )}
+      </span>
       <span className="text-right tabular-nums text-text-muted">{fmtElapsed(elapsedMs(flow, nowMs))}</span>
     </button>
   );

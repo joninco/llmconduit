@@ -8,7 +8,9 @@
  * directly and folds each flow's usage GROWTH into TIMESTAMPED deltas pruned to the window — so a
  * long-running flow's lifetime total never inflates the 30 s rate. The `$`/min readout is the
  * authoritative `MetricTick.cost_per_min` from the store (finding 3), NOT a local projection of the
- * Sankey lane costs; that value is also the correctly FROZEN one during seek.
+ * Sankey lane costs; that value is also the correctly FROZEN one during seek. Gap 07: it is rendered
+ * via `costPerMinDisplay`, so an absent/unpriced window shows `—/min` (never `$0.00/min`) and an
+ * estimated aggregate is labelled `est` — the readout never lies with zero nor drops confidence.
  *
  * SEEK (D11): a frozen snapshot is a point-in-time cut with NO delta history, so we cannot rebuild a
  * rolling rate from it. We synthesize one delta per frozen flow that was ACTIVE IN THE 30 s WINDOW of
@@ -25,6 +27,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { TokenSankey } from '../components/viz/TokenSankey';
 import { buildSankeyModel, type SankeyUsageDelta } from '../components/viz/sankeyModel';
+import { costPerMinDisplay, type CostDisplay } from '../components/FlowTable/flowModel';
 import { useDashboard } from '../store/hooks';
 import { useSankeyWindow } from '../store/useSankeyWindow';
 import { useTopologyQuery } from '../store/useTopologyQuery';
@@ -46,7 +49,11 @@ export function SankeyView() {
 /** LIVE: bands from the rolling delta window; `$`/min from the live `MetricTick.cost_per_min`. */
 function LiveSankey() {
   const priceTable = useDashboard((s) => s.priceTable);
-  const costPerMin = useDashboard((s) => s.metrics?.cost_per_min ?? 0);
+  // Gap 07: derive the `$`/min readout from the live metrics window's cost + confidence + priced
+  // denominator — NOT a bare `?? 0`. An absent window or an unpriced one (`priced_samples === 0`)
+  // renders `—/min` (never `$0.00/min`); an `estimated` aggregate is labelled.
+  const metrics = useDashboard((s) => s.metrics);
+  const cost = costPerMinDisplay(metrics);
   const { version, deltasRef } = useSankeyWindow(WINDOW_MS);
   // A ~1 s recompute tick (spec: "Recompute ~1 s") so the rolling window SLIDES even when the store
   // is momentarily idle: `buildSankeyModel` filters deltas by `nowMs`, so advancing the clock drains
@@ -67,7 +74,7 @@ function LiveSankey() {
     [version, nowMs, priceTable],
   );
 
-  return <SankeyChrome model={model} costPerMin={costPerMin} seeking={false} />;
+  return <SankeyChrome model={model} cost={cost} seeking={false} />;
 }
 
 /**
@@ -79,7 +86,10 @@ function SeekSankey() {
   const flows = useDashboard((s) => s.flows);
   const priceTable = useDashboard((s) => s.priceTable);
   const seekAtMs = useDashboard((s) => s.seekAtMs);
-  const costPerMin = useDashboard((s) => s.metrics?.cost_per_min ?? 0);
+  // Gap 07: `$`/min reads the FROZEN metrics cut's cost + confidence (not `?? 0`) — `—/min` when the
+  // frozen window is absent or unpriced, `est`-labelled when the frozen aggregate is estimated.
+  const metrics = useDashboard((s) => s.metrics);
+  const cost = costPerMinDisplay(metrics);
   const atMs = seekAtMs ?? Date.now();
 
   const deltas = useMemo<SankeyUsageDelta[]>(() => {
@@ -100,17 +110,18 @@ function SeekSankey() {
   }, [flows, atMs]);
 
   const model = useMemo(() => buildSankeyModel(deltas, priceTable, atMs, WINDOW_MS), [deltas, priceTable, atMs]);
-  return <SankeyChrome model={model} costPerMin={costPerMin} seeking />;
+  return <SankeyChrome model={model} cost={cost} seeking />;
 }
 
 /** Shared chrome: header (with `$`/min + the seek affordance), empty state, and the chart. */
 function SankeyChrome({
   model,
-  costPerMin,
+  cost,
   seeking,
 }: {
   model: ReturnType<typeof buildSankeyModel>;
-  costPerMin: number;
+  /** Gap 07: the render-ready `$`/min display (`—` for absent/unpriced, `est` flag for estimated). */
+  cost: CostDisplay;
   seeking: boolean;
 }) {
   function onSelect(m: string, upstream: string | null): void {
@@ -126,8 +137,20 @@ function SankeyChrome({
       <header className="mb-3 flex items-center gap-3">
         <h2 className="text-base font-semibold text-text">Token Sankey</h2>
         <p className="text-sm text-text-muted">client → gateway → model · band = tokens/30s · click a band to filter flows</p>
-        <span className="ml-auto tabular-nums text-sm text-meta" data-testid="sankey-cost-per-min">
-          ${costPerMin.toFixed(2)}/min
+        {/* Gap 07: `$`/min honors `cost_confidence` + the priced denominator — `—/min` for an
+            absent/unpriced window (NEVER `$0.00/min`), and an `est` marker for an estimated
+            aggregate so the readout is never silently confident. */}
+        <span className="ml-auto flex items-center gap-1 tabular-nums text-sm text-meta">
+          <span data-testid="sankey-cost-per-min" data-confidence={cost.confidence}>{cost.value}/min</span>
+          {cost.estimated && (
+            <span
+              className="shrink-0 rounded-sm bg-status-cooling/15 px-1 text-[9px] uppercase tracking-wide text-status-cooling"
+              data-testid="sankey-cost-est"
+              title="cost is an estimate — a billed token class has no configured rate"
+            >
+              est
+            </span>
+          )}
         </span>
         {seeking && (
           <span

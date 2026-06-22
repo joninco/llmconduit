@@ -126,6 +126,32 @@ describe('FlowTable — live WS update + interactions', () => {
     expect(onSelect).toHaveBeenCalledWith('api_click');
   });
 
+  // Gap 07 (review round 2): the per-flow cost cell consumes `cost_confidence`, so an estimated row
+  // is visually distinct from a confident one and an unavailable one renders `—` (never `$0.00`).
+  it('a confident cost renders plain dollars with NO est marker', () => {
+    seedFlows([makeFlow({ api_call_id: 'api_conf', status: 'completed', cost: 0.0061, cost_confidence: 'confident' })]);
+    const { getByTestId, queryByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    expect(getByTestId('flow-cost').textContent).toBe('$0.0061');
+    expect(getByTestId('flow-cost').getAttribute('data-confidence')).toBe('confident');
+    expect(queryByTestId('flow-cost-est')).toBeNull();
+  });
+
+  it('an estimated cost is LABELLED with an est marker', () => {
+    seedFlows([makeFlow({ api_call_id: 'api_est', status: 'completed', cost: 0.0019, cost_confidence: 'estimated' })]);
+    const { getByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    expect(getByTestId('flow-cost').textContent).toBe('$0.0019');
+    expect(getByTestId('flow-cost-est')).toBeTruthy();
+    expect(getByTestId('flow-cost').getAttribute('data-confidence')).toBe('estimated');
+  });
+
+  it('an unavailable cost renders — (never $0.00) and no est marker', () => {
+    // The default makeFlow row is unpriced (cost_confidence unavailable, no cost) — it must read `—`.
+    seedFlows([makeFlow({ api_call_id: 'api_unp', status: 'failed', cost: null, cost_confidence: 'unavailable' })]);
+    const { getByTestId, queryByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    expect(getByTestId('flow-cost').textContent).toBe('—');
+    expect(queryByTestId('flow-cost-est')).toBeNull();
+  });
+
   it('the client column does NOT mislabel the HTTP method; renders "—" when absent (finding 6)', () => {
     // The summary carries no user-agent yet, so the client cell must be the honest unavailable
     // marker — NOT the request method (POST), which it previously showed.

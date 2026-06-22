@@ -12,9 +12,14 @@ import { flowFilterStore } from '../store/flowFilterStore';
 import { renderWithQuery, resetWorld } from '../components/testHarness';
 import type { ProviderHealth, TopologyResponse, FlowSummary, MetricsResponse, Usage } from '../api/types';
 
-/** A metrics sample carrying a `cost_per_min` (the authoritative `$`/min source — finding 3). */
-function metrics(costPerMin: number): MetricsResponse {
-  const w = { reqs_per_sec: 0, active_streams: 0, error_pct: 0, p50: 0, p95: 0, p99: 0, tokens_per_sec: 0, cost_per_min: costPerMin, samples: 1, usage_samples: 1, priced_samples: 1, cost_confidence: 'estimated' as const };
+/** A metrics sample carrying a `cost_per_min` (the authoritative `$`/min source — finding 3).
+ * Gap 07: `priced_samples`/`cost_confidence` are overridable so the `$/min` readout's
+ * unavailable (`—/min`) + estimated-label branches can be exercised. */
+function metrics(
+  costPerMin: number,
+  over: Partial<Pick<MetricsResponse, 'priced_samples' | 'cost_confidence'>> = {},
+): MetricsResponse {
+  const w = { reqs_per_sec: 0, active_streams: 0, error_pct: 0, p50: 0, p95: 0, p99: 0, tokens_per_sec: 0, cost_per_min: costPerMin, samples: 1, usage_samples: 1, priced_samples: 1, cost_confidence: 'estimated' as const, ...over };
   return { metrics_seq: 1, ...w, windows: { m1: w, m5: w, h1: w } };
 }
 function usage(over: Partial<Usage> = {}): Usage {
@@ -117,6 +122,64 @@ describe('SankeyView — click band → shared filter + navigate; $/min; seek', 
     expect(window.location.hash).toBe('#/flows');
   });
 
+  // Gap 07 (review round 2): the `$`/min readout honors `cost_confidence` + the priced denominator
+  // — `—/min` for an absent/unpriced window (never `$0.00/min`), `est`-labelled when estimated.
+  it('$/min: a confident aggregate renders plain, with NO est marker', () => {
+    act(() => {
+      dashboardStore.getState().applySnapshot({
+        cursors: { flow_seq: 1, metrics_seq: 1, topology_seq: 1, monitor_seq: 0 },
+        flows: [flow({ model_served: 'gpt-4o', upstream_target: 'vllm-a', usage: usage({ prompt: 100, completion: 50, total: 150 }) })],
+        metrics: metrics(2.5, { cost_confidence: 'confident' }), topology: TOPOLOGY,
+      });
+      dashboardStore.getState().setConnection('live');
+    });
+    const { getByTestId, queryByTestId } = renderWithQuery(<SankeyView />);
+    expect(getByTestId('sankey-cost-per-min').textContent).toBe('$2.50/min');
+    expect(getByTestId('sankey-cost-per-min').getAttribute('data-confidence')).toBe('confident');
+    expect(queryByTestId('sankey-cost-est')).toBeNull();
+  });
+
+  it('$/min: an estimated aggregate is LABELLED with an est marker', () => {
+    act(() => {
+      dashboardStore.getState().applySnapshot({
+        cursors: { flow_seq: 1, metrics_seq: 1, topology_seq: 1, monitor_seq: 0 },
+        flows: [flow({ model_served: 'gpt-4o', upstream_target: 'vllm-a', usage: usage({ prompt: 100, completion: 50, total: 150 }) })],
+        metrics: metrics(0.21, { cost_confidence: 'estimated' }), topology: TOPOLOGY,
+      });
+      dashboardStore.getState().setConnection('live');
+    });
+    const { getByTestId } = renderWithQuery(<SankeyView />);
+    expect(getByTestId('sankey-cost-per-min').textContent).toBe('$0.21/min');
+    expect(getByTestId('sankey-cost-est')).toBeTruthy();
+  });
+
+  it('$/min: an unpriced window (priced_samples 0) renders —/min, NEVER $0.00/min', () => {
+    act(() => {
+      dashboardStore.getState().applySnapshot({
+        cursors: { flow_seq: 1, metrics_seq: 1, topology_seq: 1, monitor_seq: 0 },
+        flows: [flow({ model_served: 'gpt-4o', upstream_target: 'vllm-a', usage: usage({ prompt: 100, completion: 50, total: 150 }) })],
+        metrics: metrics(0, { priced_samples: 0, cost_confidence: 'unavailable' }), topology: TOPOLOGY,
+      });
+      dashboardStore.getState().setConnection('live');
+    });
+    const { getByTestId, queryByTestId } = renderWithQuery(<SankeyView />);
+    expect(getByTestId('sankey-cost-per-min').textContent).toBe('—/min');
+    expect(queryByTestId('sankey-cost-est')).toBeNull();
+  });
+
+  it('$/min: an absent metrics window renders —/min (no tick yet), never $0.00/min', () => {
+    act(() => {
+      dashboardStore.getState().applySnapshot({
+        cursors: { flow_seq: 1, metrics_seq: 1, topology_seq: 1, monitor_seq: 0 },
+        flows: [flow({ model_served: 'gpt-4o', upstream_target: 'vllm-a', usage: usage({ prompt: 100, completion: 50, total: 150 }) })],
+        metrics: null, topology: TOPOLOGY,
+      });
+      dashboardStore.getState().setConnection('live');
+    });
+    const { getByTestId } = renderWithQuery(<SankeyView />);
+    expect(getByTestId('sankey-cost-per-min').textContent).toBe('—/min');
+  });
+
   it('renders a band end-to-end from a live flow (the rolling-delta accumulator path — finding 2)', () => {
     // The accumulator's lifetime-total-not-recounted behavior is proven deterministically in
     // useSankeyWindow.test.tsx; here we assert the live view wires the accumulator → a band.
@@ -157,6 +220,21 @@ describe('SankeyView — click band → shared filter + navigate; $/min; seek', 
     // Only the FROZEN model lane is present; the live-only flow does not bleed in.
     expect(container.querySelector('[data-testid="sankey-band"][data-model="frozen-model"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="sankey-band"][data-model="live-only"]')).toBeNull();
+  });
+
+  it('SEEK: $/min reads the FROZEN cut and renders —/min when the frozen window is unpriced (gap 07)', () => {
+    seedLiveTopology();
+    const at = Date.now();
+    act(() => {
+      dashboardStore.getState().applySeekCut({
+        rows: [flow({ model_served: 'frozen-model', upstream_target: 'vllm-a', started_ms: at - 2000, finished_ms: at - 500, usage: usage({ prompt: 1000, completion: 1000, total: 2000 }) })],
+        cursors: { flow_seq: 1, metrics_seq: 1, topology_seq: 1, monitor_seq: 0 },
+        atMs: at, monitorSeq: 0, metrics: metrics(0, { priced_samples: 0, cost_confidence: 'unavailable' }), topology: TOPOLOGY,
+      });
+    });
+    const { getByTestId } = renderWithQuery(<SankeyView />);
+    expect(getByTestId('sankey-historical')).not.toBeNull();
+    expect(getByTestId('sankey-cost-per-min').textContent).toBe('—/min');
   });
 
   it('SEEK: a flow that finished BEFORE the 30s window of the cut is EXCLUDED (finding 4)', () => {

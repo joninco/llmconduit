@@ -7,10 +7,65 @@
  * fields) and may be absent until D2/D3 attach them. Every derivation here tolerates the
  * partially-populated row a live `flow_status` produces before usage/target arrive.
  */
-import type { FlowStatus, FlowSummary, ModelPrice, Usage } from '../../api/types';
+import type { CostConfidence, FlowStatus, FlowSummary, ModelPrice, Usage } from '../../api/types';
+import { fmtCost } from './format';
 
 /** Coarse status bucket used for the colored chip (running / 2xx / 4xx / 5xx). */
 export type StatusClass = 'running' | 'ok' | 'client-error' | 'server-error';
+
+/**
+ * The render-ready cost display for ANY `$` surface (gap 07 — the never-lie-with-zero +
+ * label-estimated contract applied uniformly). Mirrors the `StatsStrip` chip provenance: the
+ * dollar STRING and an `estimated` flag are derived TOGETHER from the cost + its `cost_confidence`,
+ * so no cost render site can drop the confidence or paint an absent/unpriced cost as `$0.00`.
+ *  - `value`     — the formatted string (`$0.0061`, `—`). `—` ⇒ UNAVAILABLE (never a fabricated `$0.00`).
+ *  - `estimated` — the figure is a labelled best-effort estimate (a billed token class bills at the
+ *                  default `0.0` rate) — the surface MUST badge/title it `est`.
+ *  - `confidence`— the raw tier (handy for `data-confidence` attributes / tests).
+ */
+export interface CostDisplay {
+  value: string;
+  estimated: boolean;
+  confidence: CostConfidence;
+}
+
+/**
+ * Derive the cost-cell display from a (possibly null) dollar figure + its backend confidence tag.
+ *
+ * Don't-lie-with-zeros (gap 07): an `unavailable` confidence ALWAYS renders `—`, even if some stale
+ * dollar figure rode alongside it — an unpriced/absent cost must NEVER read as a measured `$0.00`.
+ * A genuine measured `$0` (a priced flow with `confident`/`estimated` tag and `cost === 0`) stays
+ * distinct: it renders `$0.00`. `estimated` is surfaced as a labelled best-effort figure.
+ */
+export function costDisplay(cost: number | null, confidence: CostConfidence): CostDisplay {
+  // `unavailable` ⇒ no trustworthy cost: render `—` regardless of any accompanying number, so an
+  // unpriced row can never masquerade as a measured `$0.00` (the cost should already be null here).
+  const value = confidence === 'unavailable' ? '—' : fmtCost(cost);
+  return { value, estimated: confidence === 'estimated', confidence };
+}
+
+/**
+ * The `$`/min readout display for a metrics window (the Sankey + any rate surface). The cost is the
+ * window's `cost_per_min`; it is UNAVAILABLE — `—/min`, never `$0.00/min` — when the window is
+ * absent OR nothing was priced (`priced_samples === 0`) OR the aggregate tag is `unavailable`. An
+ * `estimated` aggregate is badged. Mirrors the `$/min` chip's denominator + `cost_confidence` logic
+ * (the chip's `metricUnavailable` gate is `priced_samples === 0`). `metrics === null` (no tick yet)
+ * ⇒ unavailable.
+ */
+export function costPerMinDisplay(
+  metrics: { cost_per_min: number; priced_samples: number; cost_confidence: CostConfidence } | null,
+): CostDisplay {
+  // No window, nothing priced, or an explicitly-unavailable aggregate ⇒ unavailable (`—/min`),
+  // distinguishing an unpriced/idle window from a genuine measured `$0.00/min`.
+  if (!metrics || metrics.priced_samples === 0 || metrics.cost_confidence === 'unavailable') {
+    return { value: '—', estimated: false, confidence: 'unavailable' };
+  }
+  return {
+    value: `$${metrics.cost_per_min.toFixed(2)}`,
+    estimated: metrics.cost_confidence === 'estimated',
+    confidence: metrics.cost_confidence,
+  };
+}
 
 /**
  * Maps a `FlowStatus` (+ optional terminal reason) to the chip class. `open` is "running"

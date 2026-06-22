@@ -21,8 +21,8 @@ import type { CostConfidence, FlowDetail as FlowDetailDto, FlowSummary, Usage } 
 import { useDashboard } from '../../store/hooks';
 import { Button } from '../ui/Button';
 import { StatusChip } from '../FlowTable/StatusChip';
-import { fmtCost, fmtElapsed, fmtModelPair, fmtTokens } from '../FlowTable/format';
-import { elapsedMs, flowCost } from '../FlowTable/flowModel';
+import { fmtElapsed, fmtModelPair, fmtTokens } from '../FlowTable/format';
+import { costDisplay, elapsedMs, flowCost } from '../FlowTable/flowModel';
 import { JsonPane } from '../viz/JsonPane';
 import { combineMiddleDiff, diffLayers } from './diff';
 import { joinMonitor } from './monitorJoin';
@@ -271,6 +271,10 @@ function DetailHeader({
   onKill: () => void;
   onClose: () => void;
 }) {
+  // Gap 07: render the dollar STRING + the `estimated` flag together via the shared contract, so an
+  // `unavailable` cost reads `—` (never `$0.00`) even if a stray number rode with the tag, and an
+  // estimated figure is labelled — identical to the FlowTable + Sankey $ surfaces.
+  const costView = costDisplay(cost, costConfidence);
   const status = flow?.status ?? detail?.status ?? 'open';
   const modelReq = flow?.model_requested ?? detail?.model_requested;
   const modelServed = flow?.model_served ?? detail?.model_served;
@@ -314,11 +318,11 @@ function DetailHeader({
         <dd className="font-mono text-text">{upstream}</dd>
         <dt className="text-text-muted">cost / elapsed</dt>
         <dd className="tabular-nums text-text">
-          <span className="text-meta">{fmtCost(cost)}</span>
+          <span className="text-meta" data-testid="detail-cost" data-confidence={costView.confidence}>{costView.value}</span>
           {/* Gap 07: an `estimated` cost MUST be labelled (the cross-cutting rule) — a small
               tag so an operator never mistakes a best-effort figure for a confident one. An
               `unavailable` cost already reads as `—`; `confident` needs no badge. */}
-          {costConfidence === 'estimated' && (
+          {costView.estimated && (
             <span
               className="ml-1.5 rounded-sm bg-status-cooling/15 px-1 py-0.5 text-[10px] uppercase tracking-wide text-status-cooling"
               data-testid="cost-confidence"

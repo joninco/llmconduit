@@ -1,6 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import type { FlowSummary, ModelPrice } from '../../api/types';
-import { statusClass, flowCost, computeCost, elapsedMs, isFailover, shortId } from './flowModel';
+import {
+  statusClass,
+  flowCost,
+  computeCost,
+  costDisplay,
+  costPerMinDisplay,
+  elapsedMs,
+  isFailover,
+  shortId,
+} from './flowModel';
 
 function flow(over: Partial<FlowSummary> = {}): FlowSummary {
   return {
@@ -60,6 +69,50 @@ describe('computeCost', () => {
     const c = computeCost({ prompt: 2000, completion: 0, total: 2000 }, { input_per_1k: 0.01, output_per_1k: 0, cached_per_1k: 0.001, cached_price_configured: false });
     // cached unreported ⇒ 0 cached tokens ⇒ 2000 billable @0.01 = 0.02 (nothing at cache rate).
     expect(c).toBeCloseTo(0.02, 6);
+  });
+});
+
+// Gap 07 (review round 2): the never-lie-with-zero + label-estimated contract, applied uniformly.
+describe('costDisplay — per-flow cost honors cost_confidence', () => {
+  it('confident: plain dollars, no est marker', () => {
+    expect(costDisplay(0.0061, 'confident')).toEqual({ value: '$0.0061', estimated: false, confidence: 'confident' });
+  });
+  it('confident: a genuine measured $0 stays $0.00 (distinct from unavailable)', () => {
+    expect(costDisplay(0, 'confident')).toEqual({ value: '$0.00', estimated: false, confidence: 'confident' });
+  });
+  it('estimated: dollars WITH the est flag (must be labelled)', () => {
+    expect(costDisplay(0.0019, 'estimated')).toEqual({ value: '$0.0019', estimated: true, confidence: 'estimated' });
+  });
+  it('unavailable: renders — (a null cost), no est marker', () => {
+    expect(costDisplay(null, 'unavailable')).toEqual({ value: '—', estimated: false, confidence: 'unavailable' });
+  });
+  it('unavailable NEVER lies with zero — a stray 0 alongside an unavailable tag still renders —', () => {
+    // Defensive: an unpriced row must not masquerade as a measured $0.00 even if a 0 leaks through.
+    expect(costDisplay(0, 'unavailable').value).toBe('—');
+  });
+});
+
+describe('costPerMinDisplay — $/min honors the priced denominator + confidence', () => {
+  const win = (over: Partial<{ cost_per_min: number; priced_samples: number; cost_confidence: 'confident' | 'estimated' | 'unavailable' }>) =>
+    ({ cost_per_min: 0, priced_samples: 1, cost_confidence: 'confident' as const, ...over });
+
+  it('null metrics ⇒ unavailable (—/min, no readout yet)', () => {
+    expect(costPerMinDisplay(null)).toEqual({ value: '—', estimated: false, confidence: 'unavailable' });
+  });
+  it('priced_samples 0 ⇒ unavailable (unpriced window, NEVER $0.00/min)', () => {
+    expect(costPerMinDisplay(win({ cost_per_min: 0, priced_samples: 0, cost_confidence: 'unavailable' })).value).toBe('—');
+  });
+  it('confident ⇒ plain $/min, no est marker', () => {
+    expect(costPerMinDisplay(win({ cost_per_min: 2.5, cost_confidence: 'confident' }))).toEqual({ value: '$2.50', estimated: false, confidence: 'confident' });
+  });
+  it('a genuine measured $0/min on a priced window stays $0.00 (distinct from unavailable)', () => {
+    expect(costPerMinDisplay(win({ cost_per_min: 0, priced_samples: 3, cost_confidence: 'confident' })).value).toBe('$0.00');
+  });
+  it('estimated ⇒ $/min WITH the est flag (labelled)', () => {
+    expect(costPerMinDisplay(win({ cost_per_min: 0.21, cost_confidence: 'estimated' }))).toEqual({ value: '$0.21', estimated: true, confidence: 'estimated' });
+  });
+  it('unavailable aggregate ⇒ — even if priced_samples > 0 (no silently-confident zero)', () => {
+    expect(costPerMinDisplay(win({ cost_per_min: 0, priced_samples: 2, cost_confidence: 'unavailable' })).value).toBe('—');
   });
 });
 

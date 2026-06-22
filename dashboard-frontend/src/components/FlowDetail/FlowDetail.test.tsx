@@ -295,9 +295,11 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     // carries a DIFFERENT (post-seek) cost and a long elapsed. While seeking, the header must show
     // the frozen row's cost and an elapsed derived from the cut `at_ms`, not wall-clock Date.now().
     const started = 1_700_000_000_000;
+    // Gap 07: a real server roll-up cost carries a real confidence tag — pair the $ with `confident`
+    // so the header renders it (an `unavailable` tag would correctly render `—`, never `$0.1234`).
     seedFlows([makeFlow({
       api_call_id: 'api_frozen', response_id: 'resp_frozen', status: 'open',
-      started_ms: started, cost: 0.1234,
+      started_ms: started, cost: 0.1234, cost_confidence: 'confident',
     })]);
     const liveDetail: FlowDetailDto = {
       flow_seq: 1, api_call_id: 'api_frozen', response_id: 'resp_frozen', status: 'open', cost_confidence: 'unavailable',
