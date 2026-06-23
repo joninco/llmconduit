@@ -27,10 +27,12 @@
 //! `active_streams` is the live count of OPEN flows (the metrics rings don't track
 //! liveness; the FlowStore does).
 
+use crate::dashboard_flow::Attempt;
 use crate::dashboard_flow::ClientSource;
 use crate::dashboard_flow::FlowRecord;
 use crate::dashboard_flow::FlowStatus;
 use crate::dashboard_flow::FlowUsage;
+use crate::dashboard_flow::PhaseTimings;
 use crate::dashboard_ws::MetricWindow;
 use crate::dashboard_ws::MetricWindows;
 use crate::dashboard_ws::MetricsSnapshot;
@@ -118,6 +120,29 @@ pub struct FlowRow {
     /// Always present so the frontend can label an `estimated` figure as such and
     /// distinguish an `unavailable` cost from a measured `$0.00`.
     pub cost_confidence: CostConfidence,
+    /// Gap 10b — the gap-02 per-phase wall-clock timestamps, FLATTENED onto the row as
+    /// sibling scalar fields (`ingress_ms`/`first_content_delta_ms`/…), mirroring the
+    /// Rust `#[serde(flatten)] PhaseTimings` on `SnapshotFlowSummary`. The list row
+    /// surfaces TTFT (`first_content_delta_ms`) per spec 10; the full bundle is carried
+    /// (each field is `skip_serializing_if = None`, so an unmeasured phase is ABSENT, never
+    /// `0`) so the inspector + the gap-16 overview read the same shape off either the
+    /// row or the detail. Scalar metadata only — body-free (AGENTS.md snapshots-are-body-
+    /// free invariant holds; these are `u128` epochs, not bodies).
+    #[serde(flatten)]
+    pub phases: PhaseTimings,
+    /// Gap 10b — the gap-03 per-attempt failover trace projected onto the row (spec 11's
+    /// stepper reads the whole list; spec 10 reads the served attempt's
+    /// `first_upstream_byte_ms`). Each [`Attempt`] is body-free scalar provenance + bounded
+    /// taxonomic codes — never a raw upstream error body. `skip_serializing_if =
+    /// Vec::is_empty` so a flow with no recorded attempt OMITS the key (the frontend's
+    /// `attempts?` is absent), matching the body-free summary's wire shape.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<Attempt>,
+    /// Gap 10b — the gap-03 flow-level wire time-to-first-byte (the served attempt's first
+    /// on-wire chunk). Distinct from `first_content_delta_ms` (the first content delta to
+    /// the CLIENT). `None` ⇒ absent ⇒ renders `—` downstream, NEVER `0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_upstream_byte_ms: Option<u128>,
 }
 
 impl FlowRow {
@@ -146,6 +171,13 @@ impl FlowRow {
             client_source: record.client_source,
             cost,
             cost_confidence,
+            // Gap 10b: project the gap-02 phases + gap-03 attempts/wire-TTFB from the live
+            // record onto the row. `PhaseTimings` is `Copy`; the attempts vec is cloned
+            // (body-free scalar provenance). No recompute — just thread the already-measured
+            // spine fields through so the gap-10/11/16 surfaces light up against the row.
+            phases: record.phases,
+            attempts: record.attempts.clone(),
+            first_upstream_byte_ms: record.first_upstream_byte_ms,
         }
     }
 
@@ -177,6 +209,13 @@ impl FlowRow {
             client_source: summary.client_source,
             cost,
             cost_confidence,
+            // Gap 10b: the body-free `SnapshotFlowSummary` ALREADY carries the gap-02 phases
+            // + gap-03 attempts/wire-TTFB (specs 02/03) — thread them straight onto the row
+            // so a `/snapshot` cut's rows carry the same measured spine as the live `/flows`
+            // rows. No recompute.
+            phases: summary.phases,
+            attempts: summary.attempts.clone(),
+            first_upstream_byte_ms: summary.first_upstream_byte_ms,
         }
     }
 }
@@ -299,6 +338,27 @@ pub struct FlowDetailBody {
     /// Gap 07 — the [`CostConfidence`] of `cost` (confident/estimated/unavailable),
     /// mirroring the flow-row tag so the inspector labels an `estimated` figure.
     pub cost_confidence: CostConfidence,
+    /// Gap 10b — the gap-02 per-phase wall-clock timestamps, FLATTENED onto the detail
+    /// body (mirrors the `#[serde(flatten)] PhaseTimings` on `SnapshotFlowSummary`). The
+    /// inspector's gap-10 latency waterfall reads the FULL phase set here (ingress →
+    /// normalization → routing → first_content_delta → stream_end → finalize). Each field
+    /// is `skip_serializing_if = None`, so an unmeasured phase is ABSENT, never `0`
+    /// (don't-lie-with-zeros). Scalar `u128` epochs — not bodies.
+    #[serde(flatten)]
+    pub phases: PhaseTimings,
+    /// Gap 10b — the gap-03 per-attempt failover trace, projected onto the detail body
+    /// (spec 11's inspector stepper reads the whole list; spec 10 reads the served
+    /// attempt's `first_upstream_byte_ms` to enrich the upstream-wait segment). Each
+    /// [`Attempt`] is body-free scalar provenance + bounded taxonomic codes — never a raw
+    /// upstream error body. `skip_serializing_if = Vec::is_empty` so a flow with no recorded
+    /// attempt OMITS the key (matches the frontend's optional `attempts?`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<Attempt>,
+    /// Gap 10b — the gap-03 flow-level wire time-to-first-byte (the served attempt's first
+    /// on-wire chunk). Distinct from `first_content_delta_ms` (first content delta to the
+    /// CLIENT). `None` ⇒ absent ⇒ renders `—`, NEVER `0`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_upstream_byte_ms: Option<u128>,
 }
 
 /// One catalog entry (`GET /dashboard/api/catalog` — a BARE array, no cursor).
@@ -998,6 +1058,14 @@ pub async fn dashboard_flow_detail(
         elapsed_ms: record.elapsed_ms,
         cost,
         cost_confidence,
+        // Gap 10b: project the FULL gap-02 phase spine + gap-03 attempts/wire-TTFB from the
+        // live record onto the inspector detail — this is where the gap-10 waterfall + the
+        // gap-11 attempt stepper live. `PhaseTimings` is `Copy`; the attempts vec is cloned
+        // (body-free scalar provenance). No recompute — the spine was measured by the engine
+        // (gaps 02/03); the detail just threads it through.
+        phases: record.phases,
+        attempts: record.attempts.clone(),
+        first_upstream_byte_ms: record.first_upstream_byte_ms,
     };
     json_no_store(StatusCode::OK, &body)
 }
@@ -1483,6 +1551,9 @@ mod tests {
                     client_source: None,
                     cost: None,
                     cost_confidence: CostConfidence::Unavailable,
+                    phases: PhaseTimings::default(),
+                    attempts: Vec::new(),
+                    first_upstream_byte_ms: None,
                 })
                 .collect()
         };
@@ -1521,6 +1592,9 @@ mod tests {
             client_source: None,
             cost: None,
             cost_confidence: CostConfidence::Unavailable,
+            phases: PhaseTimings::default(),
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
         };
 
         // PRESENT: a key-hash attribution emits both snake_case keys with the expected
@@ -1580,6 +1654,9 @@ mod tests {
             elapsed_ms: None,
             cost: None,
             cost_confidence: CostConfidence::Unavailable,
+            phases: PhaseTimings::default(),
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
         };
 
         // PRESENT (not truncated): a JSON error body survives the round-trip intact,
@@ -1641,6 +1718,184 @@ mod tests {
         );
     }
 
+    /// Gap 10b — a measured attempt the spine-projection tests reuse: a SERVED attempt
+    /// with a wire first byte (so `first_upstream_byte_ms` is `Some`) and no error
+    /// class/failover reason (the success case). Body-free scalar provenance only.
+    fn served_attempt() -> Attempt {
+        Attempt {
+            provider: Some("vllm-a".to_string()),
+            model: Some("llama-3.1-70b".to_string()),
+            start_ms: 1_000,
+            end_ms: 1_220,
+            first_upstream_byte_ms: Some(1_220),
+            status: crate::dashboard_flow::AttemptStatus::Served,
+            error_class: None,
+            failover_reason: None,
+        }
+    }
+
+    /// Gap 10b — a measured phase bundle the spine-projection tests reuse: every phase
+    /// stamped (a fully-completed flow), monotonic. The unit `0` is never used as an
+    /// epoch (a real wall-clock stamp is large), so a present value unambiguously means
+    /// "this phase ran".
+    fn measured_phases() -> PhaseTimings {
+        PhaseTimings {
+            ingress_ms: Some(1_000),
+            normalization_done_ms: Some(1_030),
+            routing_decision_ms: Some(1_050),
+            first_content_delta_ms: Some(1_500),
+            stream_end_ms: Some(5_320),
+            finalize_ms: Some(5_340),
+        }
+    }
+
+    /// Gap 10b — `FlowRow` (the `/flows` list + `/snapshot` summary row) PROJECTS the
+    /// gap-02 phases (flattened) + gap-03 attempts + `first_upstream_byte_ms`. This pins
+    /// the row wire contract for the spine fields: a measured flow EMITS the flattened
+    /// phase scalars (`ingress_ms`/`first_content_delta_ms`/…), the `attempts` array (with
+    /// the served attempt's wire first byte), and `first_upstream_byte_ms`; an unmeasured
+    /// flow OMITS every spine key (don't-lie-with-zeros: absent, never `0`). The flattened
+    /// `PhaseTimings` + each `Attempt` are deserialized BACK into their (Deserialize) DTOs
+    /// to prove the round-trip survives (AGENTS.md: no new wire field without a round-trip).
+    #[test]
+    fn flow_row_projects_spine_fields_present_and_absent() {
+        let base = || FlowRow {
+            api_call_id: "api_s".to_string(),
+            response_id: None,
+            method: "POST".to_string(),
+            uri: "/v1/responses".to_string(),
+            model_requested: None,
+            model_served: None,
+            upstream_target: None,
+            usage: None,
+            status: FlowStatus::Completed,
+            started_ms: 1_000,
+            finished_ms: None,
+            elapsed_ms: None,
+            terminal_reason: None,
+            client_label: None,
+            client_source: None,
+            cost: None,
+            cost_confidence: CostConfidence::Unavailable,
+            phases: PhaseTimings::default(),
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
+        };
+
+        // PRESENT: a measured flow projects the flattened phases + attempts + wire TTFB.
+        let present = FlowRow {
+            phases: measured_phases(),
+            attempts: vec![served_attempt()],
+            first_upstream_byte_ms: Some(1_220),
+            ..base()
+        };
+        let value = serde_json::to_value(&present).expect("serialize present row");
+        // Phases are FLATTENED as sibling scalars on the row (not nested).
+        assert_eq!(value["ingress_ms"], serde_json::json!(1_000));
+        assert_eq!(value["first_content_delta_ms"], serde_json::json!(1_500));
+        assert_eq!(value["finalize_ms"], serde_json::json!(5_340));
+        assert_eq!(value["first_upstream_byte_ms"], serde_json::json!(1_220));
+        // The attempt survives a round-trip back into the typed `Attempt`.
+        let attempts: Vec<Attempt> =
+            serde_json::from_value(value["attempts"].clone()).expect("deserialize attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].status,
+            crate::dashboard_flow::AttemptStatus::Served
+        );
+        assert_eq!(attempts[0].first_upstream_byte_ms, Some(1_220));
+        // The flattened phases survive a round-trip back into `PhaseTimings`.
+        let phases: PhaseTimings =
+            serde_json::from_value(value.clone()).expect("deserialize flattened phases");
+        assert_eq!(phases, measured_phases());
+
+        // ABSENT: an unmeasured flow OMITS every spine key — no flattened phase scalar, no
+        // `attempts`, no `first_upstream_byte_ms` (don't-lie-with-zeros: absent, never `0`).
+        let value = serde_json::to_value(base()).expect("serialize absent row");
+        let obj = value.as_object().expect("object");
+        for key in [
+            "ingress_ms",
+            "normalization_done_ms",
+            "routing_decision_ms",
+            "first_content_delta_ms",
+            "stream_end_ms",
+            "finalize_ms",
+            "attempts",
+            "first_upstream_byte_ms",
+        ] {
+            assert!(
+                !obj.contains_key(key),
+                "absent spine key {key} omitted (not 0/null): {value}"
+            );
+        }
+    }
+
+    /// Gap 10b — `FlowDetailBody` (the `/flows/:id` inspector) PROJECTS the FULL gap-02
+    /// phase set (flattened) + the gap-03 attempts + `first_upstream_byte_ms` (this is where
+    /// gap 10's waterfall + gap 11's attempt stepper live). Same present/absent + round-trip
+    /// proof as the row, on the detail DTO.
+    #[test]
+    fn flow_detail_body_projects_spine_fields_present_and_absent() {
+        let base = || FlowDetailBody {
+            flow_seq: 3,
+            api_call_id: "api_sd".to_string(),
+            response_id: None,
+            inbound_body: None,
+            inbound_headers: None,
+            normalized: None,
+            upstream_body: None,
+            upstream_response: None,
+            model_requested: None,
+            model_served: None,
+            upstream_target: None,
+            usage: None,
+            status: FlowStatus::Completed,
+            deltas: Vec::new(),
+            terminal_reason: None,
+            started_ms: 1_000,
+            finished_ms: None,
+            elapsed_ms: None,
+            cost: None,
+            cost_confidence: CostConfidence::Unavailable,
+            phases: PhaseTimings::default(),
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
+        };
+
+        // PRESENT: the inspector carries the measured waterfall + attempt trace.
+        let present = FlowDetailBody {
+            phases: measured_phases(),
+            attempts: vec![served_attempt()],
+            first_upstream_byte_ms: Some(1_220),
+            ..base()
+        };
+        let value = serde_json::to_value(&present).expect("serialize present detail");
+        assert_eq!(value["ingress_ms"], serde_json::json!(1_000));
+        assert_eq!(value["stream_end_ms"], serde_json::json!(5_320));
+        assert_eq!(value["first_upstream_byte_ms"], serde_json::json!(1_220));
+        let attempts: Vec<Attempt> =
+            serde_json::from_value(value["attempts"].clone()).expect("deserialize attempts");
+        assert_eq!(attempts, vec![served_attempt()]);
+        let phases: PhaseTimings =
+            serde_json::from_value(value.clone()).expect("deserialize flattened phases");
+        assert_eq!(phases, measured_phases());
+
+        // ABSENT: an errored-before-content flow omits the spine keys it never measured.
+        let value = serde_json::to_value(base()).expect("serialize absent detail");
+        let obj = value.as_object().expect("object");
+        for key in [
+            "ingress_ms",
+            "first_content_delta_ms",
+            "attempts",
+            "first_upstream_byte_ms",
+        ] {
+            assert!(
+                !obj.contains_key(key),
+                "absent spine key {key} omitted on detail (not 0/null): {value}"
+            );
+        }
+    }
+
     /// The `status=` filter parses the frozen open/completed/failed/cancelled enum
     /// and ignores an unrecognized value (a typo hides no rows).
     #[test]
@@ -1684,6 +1939,9 @@ mod tests {
             client_source: None,
             cost: None,
             cost_confidence: CostConfidence::Unavailable,
+            phases: PhaseTimings::default(),
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
         };
 
         // UNREPORTED cached + reasoning ⇒ both keys OMITTED on the usage object (the

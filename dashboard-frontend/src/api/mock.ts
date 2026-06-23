@@ -421,6 +421,13 @@ export class MockWebSocket implements WsLike {
   }
 
   private flowFrame(): DashboardFrame {
+    // Gap 10b: a LIVE `flow_status` frame now carries the spine fields the Rust
+    // `flow_status_payload` projects off the live record — the gap-02 phases (flattened
+    // siblings), the gap-03 served attempt, and the wire TTFB — so the live path exercises
+    // the REAL projected wire shape (a row's waterfall + stepper light up off the socket,
+    // not only off the REST detail). Anchored to a single `started` so the phases stay
+    // monotonic (ingress ≤ … ≤ finalize).
+    const started = Date.now() - 3100;
     return {
       domain: 'flow',
       seq: ++this.seq.flow,
@@ -433,8 +440,18 @@ export class MockWebSocket implements WsLike {
         model_served: 'llama-3.1-70b',
         upstream_target: 'vllm-a',
         usage: { prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 0 },
-        started_ms: Date.now() - 3100,
+        started_ms: started,
         elapsed_ms: 3100,
+        ingress_ms: started,
+        normalization_done_ms: started + 30,
+        routing_decision_ms: started + 50,
+        first_upstream_byte_ms: started + 260,
+        first_content_delta_ms: started + 440,
+        stream_end_ms: started + 3080,
+        finalize_ms: started + 3100,
+        attempts: [
+          { provider: 'vllm-a', model: 'llama-3.1-70b', start_ms: started + 50, end_ms: started + 260, first_upstream_byte_ms: started + 260, status: 'served' },
+        ],
       }],
     };
   }

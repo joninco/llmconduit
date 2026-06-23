@@ -51,10 +51,12 @@
 //! The bare `DebugWsMessage` contract on `/debug/ws` (debug_ui.rs) is untouched —
 //! the batched envelope is dashboard-only.
 
+use crate::dashboard_flow::Attempt;
 use crate::dashboard_flow::DashboardFlowStore;
 use crate::dashboard_flow::FlowRecord;
 use crate::dashboard_flow::FlowStatus;
 use crate::dashboard_flow::FlowUsage;
+use crate::dashboard_flow::PhaseTimings;
 use crate::engine::Gateway;
 use crate::metrics::MetricsView;
 use crate::monitor::DebugUpdate;
@@ -264,6 +266,16 @@ pub enum DashboardPayload {
     MetricTick(MetricTick),
     /// Per-flow lifecycle status (flow domain). Keyed by `api_call_id`; carries
     /// the served identity + cumulative usage + timing.
+    ///
+    /// Gap 10b — the spine fields that are meaningful PROGRESSIVELY for a LIVE flow ride
+    /// here too: the gap-02 `phases` (the phases reached SO FAR — `#[serde(flatten)]` as
+    /// sibling scalar fields, mirroring `SnapshotFlowSummary`), the gap-03 `attempts` (the
+    /// attempts recorded so far — empty until finalize threads them onto the record, hence
+    /// `skip_serializing_if = Vec::is_empty`), and the gap-03 `first_upstream_byte_ms` (wire
+    /// TTFB once the serving attempt's first chunk arrives). All projected from the live
+    /// [`FlowRecord`] — no recompute. Each is OPTIONAL/absent when not yet measured, so a
+    /// live row lights up its latency waterfall / attempt stepper incrementally and an
+    /// unmeasured phase/attempt is ABSENT, never `0` (don't-lie-with-zeros).
     FlowStatus {
         api_call_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,6 +291,20 @@ pub enum DashboardPayload {
         started_ms: u128,
         #[serde(skip_serializing_if = "Option::is_none")]
         elapsed_ms: Option<u128>,
+        /// Gap 10b — the gap-02 per-phase timestamps reached so far, flattened as sibling
+        /// scalar fields (`ingress_ms`/`first_content_delta_ms`/…). `skip_serializing_if`
+        /// per-field ⇒ an unreached phase is ABSENT, never `0`.
+        #[serde(flatten)]
+        phases: PhaseTimings,
+        /// Gap 10b — the gap-03 per-attempt failover trace recorded so far (empty until the
+        /// L1 guard threads the attempts onto the record at finalize). Body-free scalar
+        /// provenance; `skip_serializing_if = Vec::is_empty` ⇒ absent while empty.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        attempts: Vec<Attempt>,
+        /// Gap 10b — the gap-03 flow-level wire TTFB (the serving attempt's first on-wire
+        /// chunk), once measured. `None` ⇒ absent ⇒ renders `—`, never `0`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_upstream_byte_ms: Option<u128>,
     },
     /// The provider topology cut (topology domain): nodes (D4 `ProviderHealth`,
     /// `catalog_size` flattened to a non-null count) + gateway→provider edges.
@@ -718,6 +744,14 @@ fn flow_status_payload(record: &FlowRecord, completed_at_ms: Option<u128>) -> Da
         usage: record.usage,
         started_ms: record.started_ms,
         elapsed_ms,
+        // Gap 10b: project the gap-02 phases + gap-03 attempts/wire-TTFB reached so far
+        // from the SAME record snapshot the rest of this payload is built from (no second
+        // read, no recompute). `PhaseTimings` is `Copy`; the attempts vec is cloned. A
+        // not-yet-reached phase / not-yet-recorded attempt stays absent on the wire so the
+        // live row lights up incrementally and never shows a fabricated `0`.
+        phases: record.phases,
+        attempts: record.attempts.clone(),
+        first_upstream_byte_ms: record.first_upstream_byte_ms,
     }
 }
 
@@ -2157,6 +2191,12 @@ mod tests {
                 }),
                 started_ms: 1718900000000,
                 elapsed_ms: Some(3100),
+                // Gap 10b: the spine fields are absent on this golden fixture (an all-`None`
+                // `PhaseTimings` + an empty attempts vec + `None` TTFB), so they `skip` and
+                // the wire bytes stay byte-for-byte identical to `GOLDEN_FLOW_STATUS_FRAME_JSON`.
+                phases: PhaseTimings::default(),
+                attempts: Vec::new(),
+                first_upstream_byte_ms: None,
             }],
         };
         let got: serde_json::Value = serde_json::to_value(&frame).expect("serialize");
@@ -2179,6 +2219,110 @@ mod tests {
             ]
         });
         assert_eq!(got, want);
+    }
+
+    /// Gap 10b — the live `flow_status` payload PROJECTS the spine fields that are
+    /// meaningful PROGRESSIVELY for a LIVE flow: the gap-02 `phases` (flattened as sibling
+    /// scalars on the payload), the gap-03 `attempts`, and the gap-03 `first_upstream_byte_ms`.
+    /// A flow with measured phases/attempts EMITS them (so a live row lights up its waterfall
+    /// and stepper incrementally); a flow without them OMITS every spine key (absent, never a
+    /// fabricated `0`). The flattened `PhaseTimings` and each `Attempt` deserialize back into
+    /// their DTOs to prove the round-trip (AGENTS.md: no new wire field without one).
+    #[test]
+    fn flow_status_payload_projects_spine_fields_present_and_absent() {
+        use crate::dashboard_flow::Attempt;
+        use crate::dashboard_flow::AttemptStatus;
+        use crate::dashboard_flow::PhaseTimings;
+
+        let phases = PhaseTimings {
+            ingress_ms: Some(1_000),
+            normalization_done_ms: Some(1_030),
+            routing_decision_ms: Some(1_050),
+            first_content_delta_ms: Some(1_500),
+            stream_end_ms: None,
+            finalize_ms: None,
+        };
+        let attempt = Attempt {
+            provider: Some("vllm-a".to_string()),
+            model: Some("llama-3.1-70b".to_string()),
+            start_ms: 1_050,
+            end_ms: 1_220,
+            first_upstream_byte_ms: Some(1_220),
+            status: AttemptStatus::Served,
+            error_class: None,
+            failover_reason: None,
+        };
+
+        // PRESENT: a live flow that has reached first content + recorded its serving attempt.
+        let present = DashboardPayload::FlowStatus {
+            api_call_id: "api_001".to_string(),
+            response_id: Some("resp_001".to_string()),
+            status: FlowStatus::Open,
+            model_requested: None,
+            model_served: Some("llama-3.1-70b".to_string()),
+            upstream_target: Some("vllm-a".to_string()),
+            usage: None,
+            started_ms: 1_000,
+            elapsed_ms: Some(500),
+            phases,
+            attempts: vec![attempt.clone()],
+            first_upstream_byte_ms: Some(1_220),
+        };
+        let value = serde_json::to_value(&present).expect("serialize present payload");
+        // Phases flattened as sibling scalars next to `type` (NOT nested).
+        assert_eq!(value["ingress_ms"], serde_json::json!(1_000));
+        assert_eq!(value["first_content_delta_ms"], serde_json::json!(1_500));
+        assert_eq!(value["first_upstream_byte_ms"], serde_json::json!(1_220));
+        // The not-yet-reached phases (stream_end/finalize) are ABSENT, never `0`.
+        let obj = value.as_object().expect("object");
+        assert!(
+            !obj.contains_key("stream_end_ms"),
+            "unreached phase absent: {value}"
+        );
+        assert!(
+            !obj.contains_key("finalize_ms"),
+            "unreached phase absent: {value}"
+        );
+        // Round-trip the attempt + flattened phases back into their DTOs.
+        let attempts: Vec<Attempt> =
+            serde_json::from_value(value["attempts"].clone()).expect("deserialize attempts");
+        assert_eq!(attempts, vec![attempt]);
+        let rt: PhaseTimings =
+            serde_json::from_value(value.clone()).expect("deserialize flattened phases");
+        assert_eq!(rt, phases);
+
+        // ABSENT: a freshly-opened flow with no spine measured yet omits every spine key.
+        let absent = DashboardPayload::FlowStatus {
+            api_call_id: "api_002".to_string(),
+            response_id: None,
+            status: FlowStatus::Open,
+            model_requested: None,
+            model_served: None,
+            upstream_target: None,
+            usage: None,
+            started_ms: 1_000,
+            elapsed_ms: None,
+            phases: PhaseTimings::default(),
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
+        };
+        let value = serde_json::to_value(&absent).expect("serialize absent payload");
+        let obj = value.as_object().expect("object");
+        for key in [
+            "ingress_ms",
+            "normalization_done_ms",
+            "routing_decision_ms",
+            "first_content_delta_ms",
+            "stream_end_ms",
+            "finalize_ms",
+            "attempts",
+            "first_upstream_byte_ms",
+        ] {
+            assert!(
+                !obj.contains_key(key),
+                "absent spine key {key} omitted on live flow_status (not 0/null): {value}"
+            );
+        }
     }
 
     /// The `metric_tick` payload matches the flat `GOLDEN_METRIC_TICK_FRAME_JSON`
