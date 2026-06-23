@@ -9,6 +9,16 @@
 
 ## Status: IN PROGRESS — 10/16 done (01 ✅, 02 ✅, 03 ✅, 04 ✅, 05 ✅, 06 ✅, 07 ✅, 08 ✅, 09 ✅, 10 ✅) + inserted **10b** ✅ (spine→wire-DTO projection — closes gap 10's production discovery). 6 gaps remain (11–16), serial, per-gap Codex-xhigh reviewed.
 
+## Resume notes (2026-06-22 handover — fresh session continues here)
+- **Orchestrator state:** `.ralph/orchestrate.wt-dash-0622-1322.state.md` (per-gap ledger: commits, review verdicts, rounds).
+- **Done:** 01–10 + **10b**, all Codex-xhigh APPROVED. 28 commits since `34efe42`; **HEAD `184a2f6`**; one descriptive `git tag` per gap/fix. Tree clean.
+- **Next (numeric order is dependency-safe):** **11** (dep 03+10b — attempts now reach the wire) → **12** (dep 03, gate **B**) → **13** (dep 12) → **14** (dep 05) → **15** (dep 04) → **16** (dep 02,03,04,07,**12**; LAST). 16 needs 12, so 12 must precede 16.
+- **THREAT MODEL (critical):** Argus is a DIAGNOSTIC dashboard — operator visibility of headers/keys/bodies is INTENDED, not a leak. See the new **REVIEW_PROTOCOL.md "Scope note"**; do NOT let Codex re-raise operator-exposure "leaks" (gap 04 burned 3 rounds on that before it was ruled a non-issue). Memory/perf/correctness/don't-lie-with-zeros invariants ARE still load-bearing.
+- **Deferred:** gap **04** R3 findings deferred as non-issues per the ruling (see state file). gap **07** took **4** review rounds (extended 1 past the nominal 3-round cap because findings were strictly converging with no judgment call — that's the bar for extending; otherwise halt-to-human at 3).
+- **Convention:** `.ralph/COMPLETED_TASKS.md` is GITIGNORED (full archive) — build/fix subagents WRITE it but must NOT `git add -f` it (one early subagent force-added it; untracked in `f52deec`). Each gap's plan line is compressed to `- [x]` with a 1-paragraph summary; full detail lives in COMPLETED_TASKS.md.
+- **Per-gap loop:** build subagent (B or B+F green → commit) → **Codex-xhigh review of the commit diff** (REVIEW_PROTOCOL.md, credit-rotation aware) → fix subagent if findings (≤3 rounds) → record in state → next gap. `--no-review` (orchestrator's built-in review off) + `--agents 1` (serial).
+- **Resume command:** `/ralph-orchestrate --no-review --agents 1` (it will read this plan + state and pick up at gap 11). Or `/ralph-orchestrate --no-review --agents 1 --session wt-dash-0622-1322` to continue the same ledger.
+
 ## The discipline (cross-cutting acceptance — applies to EVERY gap)
 FEATURES.md hardened the framing from "pretty flow artifacts" to "can Argus answer the incident
 question?" Two rules are acceptance criteria on every gap, not nice-to-haves:

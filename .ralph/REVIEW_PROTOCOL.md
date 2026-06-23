@@ -7,6 +7,19 @@ Gemini, no Opus (Opus is the implementer/orchestrator; it does not also review h
 > This REPLACES `ralph-orchestrate`'s built-in end-of-run multi-model review. Run the orchestrator
 > with `--no-review` and `--agents 1`; this protocol is the review instead.
 
+## Scope note — this is a DIAGNOSTIC dashboard (product-owner ruling 2026-06-22)
+The Argus dashboard is an auth-gated DIAGNOSTIC tool; showing full request detail (headers, keys,
+bodies) to the operator is the INTENDED PURPOSE, not a leak. When constructing the Codex review
+prompt, instruct the reviewer to NOT flag "the dashboard exposes a credential / header / body to the
+operator" as a finding. (Gap 04's review burned 3 rounds on spurious HIGH "key-leak" findings before
+this was ruled out — don't repeat it.)
+STILL load-bearing — reviewers MUST flag these (they are real for NON-security reasons):
+memory/perf invariants (no retention of `Bytes` slices of the 256 MiB middleware body buffer — copy
+via the capped/redacting serializer; no body on historical snapshots — body-free `SnapshotFlowSummary`
+only), per-domain `{domain,seq}` cursors, cancellation selects on `tx.closed()`,
+failover-pre-first-chunk-only, canonical-Responses-only, replay integrity, correctness, and the
+cross-cutting **don't-lie-with-zeros** / data-quality-tag contract (the heart of every gap).
+
 ## When
 After a gap's build subagent has: executable test green → `cargo test` green → `cargo clippy --all-targets`
 clean → `cargo fmt` → committed. THEN, before selecting the next gap, run the review on that commit.
