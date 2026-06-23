@@ -526,6 +526,78 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     const badge = getByTestId('latency-ttft').querySelector('[data-testid="latency-quality-badge"]');
     expect(badge?.textContent).toBe('est');
   });
+
+  // Gap 10b review round 2 — the inspector SPINE merge had the same empty-array drop as the table
+  // merge: a live row carrying `attempts: []` (a snapshot's "no attempt recorded yet") would, under
+  // `liveFlow?.attempts ?? frozenDetail?.attempts`, SUPPRESS the populated REST detail trace — so the
+  // latency model's wire TTFB (read from the served attempt's `first_upstream_byte_ms`) wrongly went
+  // `unavailable`. `pickAttempts` lets the non-empty REST detail attempts surface. `api_g10c` is
+  // unknown to the mock so /flows/:id 404s and never overwrites the injected detail.
+  it('a live attempts[] [] does NOT suppress the populated REST detail trace (wire TTFB measured)', async () => {
+    const t0 = 1_700_000_000_000;
+    // The live store row carries the phase spine but an EMPTY attempts list (snapshot serialization).
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g10c',
+        status: 'completed',
+        model_served: 'llama-3.1-70b',
+        started_ms: t0,
+        usage: { prompt: 100, completion: 500, total: 600, cached: 0, reasoning: 0 },
+        ingress_ms: t0,
+        routing_decision_ms: t0 + 50,
+        first_content_delta_ms: t0 + 450,
+        stream_end_ms: t0 + 1450,
+        attempts: [], // EMPTY — the "no attempt recorded yet" serialization; must NOT win.
+      }),
+    ]);
+    const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_g10c" onClose={noop} />);
+    // The REST detail carries the POPULATED served attempt (with a wire first byte) + flow-level TTFB.
+    const detail: FlowDetailDto = {
+      flow_seq: 1, api_call_id: 'api_g10c', status: 'completed', cost_confidence: 'unavailable',
+      deltas: [], started_ms: t0,
+      inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
+      attempts: [{ provider: 'vllm-a', model: 'llama-3.1-70b', start_ms: t0 + 50, end_ms: t0 + 270, first_upstream_byte_ms: t0 + 270, status: 'served' }],
+      first_upstream_byte_ms: t0 + 270,
+    };
+    act(() => queryClient.setQueryData(['flows', 'api_g10c'], detail));
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+
+    // The REST detail's served attempt surfaces ⇒ wire TTFB is MEASURED (270ms), not unavailable —
+    // proving the empty live [] did not suppress the populated trace.
+    await waitFor(() => expect(getByTestId('latency-ttfb').getAttribute('data-quality')).toBe('measured'));
+    expect(getByTestId('latency-ttfb').textContent).toContain('270ms');
+    // The upstream-wait segment is likewise enriched from the served attempt's first byte.
+    expect(getByTestId('latency-seg-upstream').getAttribute('data-quality')).toBe('measured');
+  });
+
+  // Gap 10b review round 2 (companion) — both sides empty ⇒ the wire TTFB is honestly `unavailable`
+  // (`—`), never a fabricated 0ms, and no attempt is invented.
+  it('renders an unavailable wire TTFB when both live and detail attempts are empty (no fabrication)', async () => {
+    const t0 = 1_700_000_000_000;
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_g10d',
+        status: 'completed',
+        model_served: 'llama-3.1-70b',
+        started_ms: t0,
+        ingress_ms: t0,
+        first_content_delta_ms: t0 + 450,
+        attempts: [], // no served attempt anywhere…
+      }),
+    ]);
+    const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_g10d" onClose={noop} />);
+    const detail: FlowDetailDto = {
+      flow_seq: 1, api_call_id: 'api_g10d', status: 'completed', cost_confidence: 'unavailable',
+      deltas: [], started_ms: t0,
+      inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
+      attempts: [], // …and the detail is empty too (no fabricated wire byte).
+    };
+    act(() => queryClient.setQueryData(['flows', 'api_g10d'], detail));
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    // No served attempt + no flow-level first byte ⇒ wire TTFB unavailable, rendered `—`, never 0.
+    await waitFor(() => expect(getByTestId('latency-ttfb').getAttribute('data-quality')).toBe('unavailable'));
+    expect(getByTestId('latency-ttfb').textContent).toContain('—');
+  });
 });
 
 describe('FlowDetail — time-travel seek + body eviction', () => {

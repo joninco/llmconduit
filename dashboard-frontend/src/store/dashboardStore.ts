@@ -7,6 +7,7 @@
  * time a payload reaches a setter it is known to be fresh.
  */
 import { createStore } from 'zustand/vanilla';
+import { pickAttempts } from '../api/attempts';
 import type {
   FlowStatusPayload,
   FlowSummary,
@@ -393,7 +394,13 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
         first_content_delta_ms: p.first_content_delta_ms ?? prev?.first_content_delta_ms,
         stream_end_ms: p.stream_end_ms ?? prev?.stream_end_ms,
         finalize_ms: p.finalize_ms ?? prev?.finalize_ms,
-        attempts: p.attempts ?? prev?.attempts,
+        // `attempts` is an ARRAY, so `p.attempts ?? prev?.attempts` is WRONG (gap 10b review round
+        // 2): an empty `attempts: []` is the "no attempt recorded yet" serialization, and `??` only
+        // falls back on null/undefined — so a LATER frame carrying `[]` would ERASE an
+        // earlier-known NON-EMPTY trace. `pickAttempts` (non-empty wins, else keep prior) treats a
+        // later empty array as "no update", so a known trace is never lost; a later NON-EMPTY frame
+        // still updates it. (Mirrors the scalar-field rule: a later frame never erases a known phase.)
+        attempts: pickAttempts(p.attempts, prev?.attempts),
         first_upstream_byte_ms: p.first_upstream_byte_ms ?? prev?.first_upstream_byte_ms,
       };
       flows.set(p.api_call_id, next);

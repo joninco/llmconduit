@@ -17,6 +17,7 @@ import { useQuery } from '@tanstack/react-query';
 import type { FlowSummary } from '../../api/types';
 import { useDashboard } from '../../store/hooks';
 import { getConnection, queryKeys } from '../../api/connection';
+import { pickAttempts, sameAttempts } from '../../api/attempts';
 import type { FlowFilters } from './filterTypes';
 
 export interface FlowRowsResult {
@@ -126,7 +127,13 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
     first_content_delta_ms: live.first_content_delta_ms ?? rest.first_content_delta_ms,
     stream_end_ms: live.stream_end_ms ?? rest.stream_end_ms,
     finalize_ms: live.finalize_ms ?? rest.finalize_ms,
-    attempts: live.attempts ?? rest.attempts,
+    // `attempts` is an ARRAY, so it CANNOT use the scalar `live ?? rest` rule the phase epochs use:
+    // a snapshot summary serializes `attempts: []` ("no attempt recorded yet") rather than omitting
+    // it, and `??` would treat that `[]` as authoritative — BLOCKING the REST backfill of a populated
+    // gap-11 trace (gap 10b review round 2). `pickAttempts` instead lets a NON-EMPTY list (either
+    // side) win and treats an empty array as ABSENT for backfill, so a snapshot `[]` never wrongly
+    // empties the merged trace.
+    attempts: pickAttempts(live.attempts, rest.attempts),
     first_upstream_byte_ms: live.first_upstream_byte_ms ?? rest.first_upstream_byte_ms,
   };
   return shallowEqualSummary(live, merged) ? live : merged;
@@ -152,9 +159,8 @@ function shallowEqualSummary(a: FlowSummary, b: FlowSummary): boolean {
     // Gap 02/03 (gap 10b): the projected spine fields are part of row identity too — a REST
     // backfill that only adds timing/attempt data (live row had none) MUST produce a new object
     // so the row re-renders and the gap-10/11 consumers see it (else the projected data is
-    // discarded). `attempts` is compared by REFERENCE (the merge takes `live ?? rest`, so a
-    // backfilled list is a new reference vs the live `undefined`). Phase epochs compare `?? null`
-    // so an absent↔null pair is treated as equal (no spurious re-render).
+    // discarded). Phase epochs compare `?? null` so an absent↔null pair is treated as equal (no
+    // spurious re-render); `attempts` uses `sameAttempts` (see below — `[]` and absent are equal).
     (a.ingress_ms ?? null) === (b.ingress_ms ?? null) &&
     (a.normalization_done_ms ?? null) === (b.normalization_done_ms ?? null) &&
     (a.routing_decision_ms ?? null) === (b.routing_decision_ms ?? null) &&
@@ -162,7 +168,11 @@ function shallowEqualSummary(a: FlowSummary, b: FlowSummary): boolean {
     (a.stream_end_ms ?? null) === (b.stream_end_ms ?? null) &&
     (a.finalize_ms ?? null) === (b.finalize_ms ?? null) &&
     (a.first_upstream_byte_ms ?? null) === (b.first_upstream_byte_ms ?? null) &&
-    (a.attempts ?? null) === (b.attempts ?? null)
+    // `attempts` is compared via `sameAttempts`: EMPTY and ABSENT are the same "no trace" state
+    // (a snapshot's `[]` vs the merge's normalized `undefined` must NOT churn a new object), but a
+    // backfilled NON-EMPTY list is a new reference ⇒ unequal, so the row re-renders and the
+    // gap-10/11 consumers see the trace (gap 10b review round 2).
+    sameAttempts(a.attempts, b.attempts)
   );
 }
 

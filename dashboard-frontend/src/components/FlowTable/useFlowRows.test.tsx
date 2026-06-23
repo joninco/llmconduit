@@ -271,6 +271,51 @@ describe('useFlowRows — live row backfills REST-projected spine fields (gap 10
     const row = result.current.rows.find((r) => r.api_call_id === 'api_spine2');
     expect(row?.first_content_delta_ms).toBe(1_700_000_000_222); // live wins
   });
+
+  // Gap 10b review round 2 — an EMPTY live `attempts: []` (a snapshot's "no attempt recorded yet")
+  // must NOT block the REST `/flows` backfill of a POPULATED trace. The old `live.attempts ?? rest`
+  // treated `[]` as authoritative; `pickAttempts` lets the non-empty REST list win.
+  it('an empty live attempts[] does NOT block the populated REST attempts backfill', async () => {
+    stubFlowsFetch([
+      makeFlow({ api_call_id: 'api_att', status: 'completed', attempts: [SERVED], first_upstream_byte_ms: SERVED.first_upstream_byte_ms }),
+    ]);
+    // The live store row carries an EMPTY attempts list (the snapshot serialization for "none yet").
+    seedFlows([makeFlow({ api_call_id: 'api_att', status: 'open', attempts: [] })]);
+
+    const { result } = renderRows();
+    await waitFor(() => {
+      const r = result.current.rows.find((row) => row.api_call_id === 'api_att');
+      expect(r?.attempts).toEqual([SERVED]);
+    });
+    const row = result.current.rows.find((r) => r.api_call_id === 'api_att');
+    expect(row?.attempts).toEqual([SERVED]); // REST trace surfaced, not the empty live []
+    expect(row?.status).toBe('open'); // live status still wins
+  });
+
+  it('a NON-EMPTY live attempts[] WINS over the REST projection (live-first)', async () => {
+    const FAILED = { provider: 'vllm-a', model: 'llama-3.1-70b', start_ms: 1_700_000_000_000, end_ms: 1_700_000_000_080, status: 'failed' as const, error_class: 'http_status' as const };
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_att2', status: 'completed', attempts: [SERVED] })]);
+    // The live row carries a fuller (2-attempt) failover trace — it must win over the single REST one.
+    seedFlows([makeFlow({ api_call_id: 'api_att2', status: 'open', attempts: [FAILED, SERVED] })]);
+    const { result } = renderRows();
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); });
+    const row = result.current.rows.find((r) => r.api_call_id === 'api_att2');
+    expect(row?.attempts).toEqual([FAILED, SERVED]); // live (non-empty) wins
+  });
+
+  it('both sides empty/absent ⇒ no attempts (honestly absent, no fabricated entry)', async () => {
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_att3', status: 'completed', attempts: [] })]);
+    seedFlows([makeFlow({ api_call_id: 'api_att3', status: 'open', attempts: [] })]);
+    const { result } = renderRows();
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); });
+    const row = result.current.rows.find((r) => r.api_call_id === 'api_att3');
+    // Both empty ⇒ the merged row reports NO trace: an empty (or absent) list, never a fabricated
+    // attempt. (When nothing changed the merge returns the live row unchanged, preserving its `[]`;
+    // either way `[]`/absent both mean "no attempts" to the gap-10/11 consumers.)
+    expect(row?.attempts ?? []).toEqual([]);
+  });
 });
 
 describe('useFlowRows — combined union is globally newest-on-top (finding 4)', () => {

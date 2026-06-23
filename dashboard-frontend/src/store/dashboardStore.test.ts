@@ -281,4 +281,33 @@ describe('dashboardStore — patchFlowStatus threads projected spine fields (gap
     expect(row?.first_content_delta_ms).not.toBe(0);
     expect(row?.attempts ?? null).toBeNull();
   });
+
+  // Gap 10b review round 2 — `attempts` is an ARRAY: a LATER frame carrying an EMPTY `attempts: []`
+  // (the "no attempt recorded yet" serialization) must NOT erase an earlier-known NON-EMPTY trace.
+  // The old `p.attempts ?? prev?.attempts` only fell back on null/undefined, so a `[]` would wipe it;
+  // `pickAttempts` treats a later empty array as "no update".
+  it('a later frame with an EMPTY attempts[] does NOT erase a prior non-empty trace', () => {
+    // Frame 1 establishes the failover trace.
+    dashboardStore.getState().patchFlowStatus(frame({ attempts: [SERVED] }));
+    expect(dashboardStore.getState().flows.get('api_spine')?.attempts).toEqual([SERVED]);
+    // Frame 2 carries an EMPTY attempts list (a snapshot/projection that recorded none this frame).
+    dashboardStore.getState().patchFlowStatus(frame({ status: 'completed', attempts: [] }));
+    const row = dashboardStore.getState().flows.get('api_spine');
+    expect(row?.status).toBe('completed'); // the new status landed…
+    expect(row?.attempts).toEqual([SERVED]); // …but the known trace was NOT erased by the empty [].
+  });
+
+  it('a later frame with a NON-EMPTY attempts[] UPDATES the prior trace (real failover progression)', () => {
+    const FAILED: Attempt = {
+      provider: 'vllm-a', model: 'llama-3.1-70b',
+      start_ms: 1_700_000_000_000, end_ms: 1_700_000_000_080,
+      status: 'failed', error_class: 'http_status',
+    };
+    // Frame 1: only the failed attempt is known so far.
+    dashboardStore.getState().patchFlowStatus(frame({ attempts: [FAILED] }));
+    expect(dashboardStore.getState().flows.get('api_spine')?.attempts).toEqual([FAILED]);
+    // Frame 2: the full trace (failover then served) — a non-empty later frame WINS.
+    dashboardStore.getState().patchFlowStatus(frame({ attempts: [FAILED, SERVED] }));
+    expect(dashboardStore.getState().flows.get('api_spine')?.attempts).toEqual([FAILED, SERVED]);
+  });
 });

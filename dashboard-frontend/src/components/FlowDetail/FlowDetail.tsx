@@ -28,6 +28,7 @@ import { contextLimitFor, contextUtilization, type ContextUtilization } from '..
 import { ContextGauge } from '../FlowTable/ContextGauge';
 import { latencyBreakdown, type LatencyBreakdown as LatencyBreakdownModel, type SpineFlow } from './latencyBreakdown';
 import { LatencyBreakdown } from './LatencyBreakdown';
+import { pickAttempts } from '../../api/attempts';
 import { useCatalog } from '../FlowTable/useCatalog';
 import { JsonPane } from '../viz/JsonPane';
 import { combineMiddleDiff, diffLayers } from './diff';
@@ -191,7 +192,12 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
           finalize_ms: liveFlow?.finalize_ms ?? frozenDetail?.finalize_ms,
           finished_ms: liveFlow?.finished_ms ?? frozenDetail?.finished_ms,
           elapsed_ms: liveFlow?.elapsed_ms ?? frozenDetail?.elapsed_ms,
-          attempts: liveFlow?.attempts ?? frozenDetail?.attempts,
+          // `attempts` is an ARRAY — it must NOT use the scalar `live ?? rest` rule (gap 10b review
+          // round 2). A live/snapshot row can carry `attempts: []` ("no attempt recorded yet"), and
+          // `??` would treat that `[]` as authoritative, SUPPRESSING the populated REST detail trace
+          // so the latency model's wire TTFB (served attempt) goes `unavailable`. `pickAttempts` lets
+          // a NON-EMPTY list (either side) win and treats `[]` as absent for backfill.
+          attempts: pickAttempts(liveFlow?.attempts, frozenDetail?.attempts),
           first_upstream_byte_ms: liveFlow?.first_upstream_byte_ms ?? frozenDetail?.first_upstream_byte_ms,
           usage,
         }
