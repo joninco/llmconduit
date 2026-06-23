@@ -115,6 +115,19 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
     cost: live.cost ?? rest.cost ?? null,
     cost_confidence: liveAuthoredCost ? live.cost_confidence : rest.cost_confidence,
     terminal_reason: live.terminal_reason ?? rest.terminal_reason ?? null,
+    // Gap 02/03 (gap 10b) — the projected spine fields, merged live-first / REST-backed so the
+    // measured latency waterfall (gap 10) + attempt trace (gap 11) light up for a MERGED row.
+    // The REST `/flows` row now projects them too; a live frame's freshest value wins, else the
+    // REST projection backfills. `??` keeps an unmeasured phase ABSENT (never `0`) — the breakdown
+    // renders `—`, never a fabricated segment. (`PhaseTimings` fields are flattened via `extends`.)
+    ingress_ms: live.ingress_ms ?? rest.ingress_ms,
+    normalization_done_ms: live.normalization_done_ms ?? rest.normalization_done_ms,
+    routing_decision_ms: live.routing_decision_ms ?? rest.routing_decision_ms,
+    first_content_delta_ms: live.first_content_delta_ms ?? rest.first_content_delta_ms,
+    stream_end_ms: live.stream_end_ms ?? rest.stream_end_ms,
+    finalize_ms: live.finalize_ms ?? rest.finalize_ms,
+    attempts: live.attempts ?? rest.attempts,
+    first_upstream_byte_ms: live.first_upstream_byte_ms ?? rest.first_upstream_byte_ms,
   };
   return shallowEqualSummary(live, merged) ? live : merged;
 }
@@ -135,7 +148,21 @@ function shallowEqualSummary(a: FlowSummary, b: FlowSummary): boolean {
     // changes `cost_confidence` (e.g. unavailable → estimated once the server tag lands) MUST
     // produce a new object so the row re-renders with the corrected label.
     a.cost_confidence === b.cost_confidence &&
-    (a.terminal_reason ?? null) === (b.terminal_reason ?? null)
+    (a.terminal_reason ?? null) === (b.terminal_reason ?? null) &&
+    // Gap 02/03 (gap 10b): the projected spine fields are part of row identity too — a REST
+    // backfill that only adds timing/attempt data (live row had none) MUST produce a new object
+    // so the row re-renders and the gap-10/11 consumers see it (else the projected data is
+    // discarded). `attempts` is compared by REFERENCE (the merge takes `live ?? rest`, so a
+    // backfilled list is a new reference vs the live `undefined`). Phase epochs compare `?? null`
+    // so an absent↔null pair is treated as equal (no spurious re-render).
+    (a.ingress_ms ?? null) === (b.ingress_ms ?? null) &&
+    (a.normalization_done_ms ?? null) === (b.normalization_done_ms ?? null) &&
+    (a.routing_decision_ms ?? null) === (b.routing_decision_ms ?? null) &&
+    (a.first_content_delta_ms ?? null) === (b.first_content_delta_ms ?? null) &&
+    (a.stream_end_ms ?? null) === (b.stream_end_ms ?? null) &&
+    (a.finalize_ms ?? null) === (b.finalize_ms ?? null) &&
+    (a.first_upstream_byte_ms ?? null) === (b.first_upstream_byte_ms ?? null) &&
+    (a.attempts ?? null) === (b.attempts ?? null)
   );
 }
 

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { dashboardStore } from './dashboardStore';
-import type { FlowSummary, ProviderHealth, SeqCursors, TopologyResponse } from '../api/types';
+import type { Attempt, FlowStatusPayload, FlowSummary, ProviderHealth, SeqCursors, TopologyResponse } from '../api/types';
 
 /**
  * The MONOTONIC connection-transition generation (`connEpoch`) underpins the kill mutation's
@@ -172,5 +172,113 @@ describe('dashboardStore — seedTopology seq reconciliation (finding 6)', () =>
     expect(st.topologyNodes.map((n) => n.id)).toEqual(['vllm-a', 'vllm-b', 'groq']);
     expect(st.cursors.topology_seq).toBe(8);
     expect(st.priceTable['m']?.input_per_1k).toBe(0.03);
+  });
+});
+
+/**
+ * Gap 10b (review round 1, finding 1) — `patchFlowStatus` must THREAD the projected spine fields
+ * (gap-02 phase epochs + gap-03 `attempts`/`first_upstream_byte_ms`) off the live `flow_status`
+ * frame onto the store row, so the measured latency waterfall + attempt trace light up for a LIVE
+ * flow. A later frame that OMITS a field must NOT erase an earlier-known value (progressive frames),
+ * and an absent phase must stay ABSENT (never a fabricated `0`).
+ */
+describe('dashboardStore — patchFlowStatus threads projected spine fields (gap 10b finding 1)', () => {
+  beforeEach(() => dashboardStore.getState().reset());
+
+  const SERVED: Attempt = {
+    provider: 'openai',
+    model: 'gpt-4o',
+    start_ms: 1_700_000_000_100,
+    end_ms: 1_700_000_000_400,
+    first_upstream_byte_ms: 1_700_000_000_350,
+    status: 'served',
+  };
+
+  /** A `flow_status` frame carrying the spine fields (omitted keys fall back to defaults below). */
+  function frame(over: Partial<FlowStatusPayload> = {}): FlowStatusPayload {
+    return {
+      type: 'flow_status',
+      api_call_id: 'api_spine',
+      response_id: null,
+      status: 'open',
+      model_requested: null,
+      model_served: null,
+      upstream_target: null,
+      usage: null,
+      started_ms: 1_700_000_000_000,
+      elapsed_ms: null,
+      ...over,
+    };
+  }
+
+  it('lands phases / attempts / first_upstream_byte_ms from a flow_status frame into the store', () => {
+    dashboardStore.getState().patchFlowStatus(
+      frame({
+        ingress_ms: 1_700_000_000_000,
+        normalization_done_ms: 1_700_000_000_050,
+        routing_decision_ms: 1_700_000_000_090,
+        first_content_delta_ms: 1_700_000_000_500,
+        stream_end_ms: 1_700_000_001_000,
+        finalize_ms: 1_700_000_001_100,
+        attempts: [SERVED],
+        first_upstream_byte_ms: 1_700_000_000_350,
+      }),
+    );
+
+    const row = dashboardStore.getState().flows.get('api_spine');
+    expect(row?.ingress_ms).toBe(1_700_000_000_000);
+    expect(row?.normalization_done_ms).toBe(1_700_000_000_050);
+    expect(row?.routing_decision_ms).toBe(1_700_000_000_090);
+    expect(row?.first_content_delta_ms).toBe(1_700_000_000_500);
+    expect(row?.stream_end_ms).toBe(1_700_000_001_000);
+    expect(row?.finalize_ms).toBe(1_700_000_001_100);
+    expect(row?.first_upstream_byte_ms).toBe(1_700_000_000_350);
+    expect(row?.attempts).toEqual([SERVED]);
+  });
+
+  it('a later frame OMITTING a field KEEPS the prior known value (progressive frames)', () => {
+    // Frame 1 establishes the early phases + the attempt trace.
+    dashboardStore.getState().patchFlowStatus(
+      frame({
+        ingress_ms: 1_700_000_000_000,
+        routing_decision_ms: 1_700_000_000_090,
+        first_content_delta_ms: 1_700_000_000_500,
+        attempts: [SERVED],
+        first_upstream_byte_ms: 1_700_000_000_350,
+      }),
+    );
+    // Frame 2 is the terminal frame: it adds `stream_end_ms`/`finalize_ms` but OMITS the earlier
+    // phase epochs + attempts (a real progressive stream does not re-send every field each frame).
+    dashboardStore.getState().patchFlowStatus(
+      frame({
+        status: 'completed',
+        stream_end_ms: 1_700_000_001_000,
+        finalize_ms: 1_700_000_001_100,
+        elapsed_ms: 1_100,
+      }),
+    );
+
+    const row = dashboardStore.getState().flows.get('api_spine');
+    // The new terminal fields landed…
+    expect(row?.status).toBe('completed');
+    expect(row?.stream_end_ms).toBe(1_700_000_001_000);
+    expect(row?.finalize_ms).toBe(1_700_000_001_100);
+    // …and the earlier-known fields were NOT erased by the omitting frame.
+    expect(row?.ingress_ms).toBe(1_700_000_000_000);
+    expect(row?.routing_decision_ms).toBe(1_700_000_000_090);
+    expect(row?.first_content_delta_ms).toBe(1_700_000_000_500);
+    expect(row?.first_upstream_byte_ms).toBe(1_700_000_000_350);
+    expect(row?.attempts).toEqual([SERVED]);
+  });
+
+  it('an absent phase stays ABSENT (never a fabricated 0)', () => {
+    dashboardStore.getState().patchFlowStatus(frame({ ingress_ms: 1_700_000_000_000 }));
+    const row = dashboardStore.getState().flows.get('api_spine');
+    // The unmeasured phases are absent/undefined — NOT `0` (the honesty invariant).
+    expect(row?.first_content_delta_ms ?? null).toBeNull();
+    expect(row?.finalize_ms ?? null).toBeNull();
+    expect(row?.first_upstream_byte_ms ?? null).toBeNull();
+    expect(row?.first_content_delta_ms).not.toBe(0);
+    expect(row?.attempts ?? null).toBeNull();
   });
 });

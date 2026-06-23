@@ -374,6 +374,27 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
         // roll-up). Keep any prior tag; default to `unavailable` (no confident claim live) —
         // never fabricate `confident`. The REST `/flows` row supplies the real tag.
         cost_confidence: prev?.cost_confidence ?? 'unavailable',
+        // Gap 02/03 (gap 10b) — thread the PROJECTED spine fields off the live `flow_status`
+        // frame onto the store row, so the measured latency waterfall (gap 10) + attempt trace
+        // (gap 11) light up for a LIVE flow (the FlowDetail spine reads them off this row).
+        //
+        // `p.field ?? prev?.field` is load-bearing for two reasons:
+        //  - PROGRESSIVE frames: a later `flow_status` frame may OMIT a phase/attempt field an
+        //    earlier frame already established (e.g. the terminal frame carries `finalize_ms`
+        //    but no longer repeats `first_content_delta_ms`). An omitted/`null` field falls back
+        //    to the prior known value — a present field updates. A later frame never ERASES an
+        //    earlier-known phase.
+        //  - HONESTY: an unmeasured phase is ABSENT on the wire (never `0` — `skip_serializing_if`),
+        //    so `??` (not `|| 0`) keeps "unavailable" as absent downstream — the breakdown renders
+        //    `—`, never a fabricated `0ms` segment.
+        ingress_ms: p.ingress_ms ?? prev?.ingress_ms,
+        normalization_done_ms: p.normalization_done_ms ?? prev?.normalization_done_ms,
+        routing_decision_ms: p.routing_decision_ms ?? prev?.routing_decision_ms,
+        first_content_delta_ms: p.first_content_delta_ms ?? prev?.first_content_delta_ms,
+        stream_end_ms: p.stream_end_ms ?? prev?.stream_end_ms,
+        finalize_ms: p.finalize_ms ?? prev?.finalize_ms,
+        attempts: p.attempts ?? prev?.attempts,
+        first_upstream_byte_ms: p.first_upstream_byte_ms ?? prev?.first_upstream_byte_ms,
       };
       flows.set(p.api_call_id, next);
       return {

@@ -210,6 +210,69 @@ describe('useFlowRows — a WS-created row backfills REST-authoritative fields (
   });
 });
 
+describe('useFlowRows — live row backfills REST-projected spine fields (gap 10b finding 2)', () => {
+  beforeEach(() => resetWorld());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const SERVED = {
+    provider: 'openai',
+    model: 'gpt-4o',
+    start_ms: 1_700_000_000_100,
+    end_ms: 1_700_000_000_400,
+    first_upstream_byte_ms: 1_700_000_000_350,
+    status: 'served' as const,
+  };
+
+  it('backfills the REST-projected phases/attempts onto a live row that lacks them (not discarded)', async () => {
+    // The REST `/flows` row now projects the gap-02/03 spine. The live store row (same id) was
+    // minted by a `flow_status` patch BEFORE the projection arrived, so it carries NO spine.
+    stubFlowsFetch([
+      makeFlow({
+        api_call_id: 'api_spine',
+        status: 'completed',
+        ingress_ms: 1_700_000_000_000,
+        first_content_delta_ms: 1_700_000_000_500,
+        finalize_ms: 1_700_000_001_100,
+        attempts: [SERVED],
+        first_upstream_byte_ms: 1_700_000_000_350,
+      }),
+    ]);
+    seedFlows([makeFlow({ api_call_id: 'api_spine', status: 'open' })]);
+
+    const { result } = renderRows();
+    // Once REST resolves, the merged row exposes the projected spine — if `shallowEqualSummary`
+    // ignored these fields the merge would have returned the live row UNCHANGED and discarded them.
+    await waitFor(() => {
+      const r = result.current.rows.find((row) => row.api_call_id === 'api_spine');
+      expect(r?.first_content_delta_ms).toBe(1_700_000_000_500);
+    });
+    const row = result.current.rows.find((r) => r.api_call_id === 'api_spine');
+    expect(row?.ingress_ms).toBe(1_700_000_000_000);
+    expect(row?.finalize_ms).toBe(1_700_000_001_100);
+    expect(row?.first_upstream_byte_ms).toBe(1_700_000_000_350);
+    expect(row?.attempts).toEqual([SERVED]);
+    // …while the LIVE 'open' status still wins over the completed REST row.
+    expect(row?.status).toBe('open');
+  });
+
+  it('a live spine value WINS over the REST projection (live-first)', async () => {
+    // REST projects one `first_content_delta_ms`; the live row carries a fresher (different) one.
+    stubFlowsFetch([
+      makeFlow({ api_call_id: 'api_spine2', status: 'completed', first_content_delta_ms: 1_700_000_000_500 }),
+    ]);
+    seedFlows([makeFlow({ api_call_id: 'api_spine2', status: 'open', first_content_delta_ms: 1_700_000_000_222 })]);
+    const { result } = renderRows();
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); });
+    const row = result.current.rows.find((r) => r.api_call_id === 'api_spine2');
+    expect(row?.first_content_delta_ms).toBe(1_700_000_000_222); // live wins
+  });
+});
+
 describe('useFlowRows — combined union is globally newest-on-top (finding 4)', () => {
   beforeEach(() => resetWorld());
   afterEach(() => {
