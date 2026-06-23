@@ -402,6 +402,13 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
         // still updates it. (Mirrors the scalar-field rule: a later frame never erases a known phase.)
         attempts: pickAttempts(p.attempts, prev?.attempts),
         first_upstream_byte_ms: p.first_upstream_byte_ms ?? prev?.first_upstream_byte_ms,
+        // Gap 04/15: the client attribution is an IMMUTABLE per-flow identity (derived ONCE at flow
+        // open, pre-redaction) and the live `flow_status` WS frame carries NONE (it's a gate-F field
+        // on `FlowRow`, not on the `FlowStatusPayload`). CARRY the prior value (from the snapshot /
+        // an earlier frame) so a live patch never DROPS the attribution off the store row — else the
+        // CLIENT cell + the "by client" roll-up would blank to `—` the instant a frame lands.
+        client_label: prev?.client_label ?? null,
+        client_source: prev?.client_source ?? null,
       };
       flows.set(p.api_call_id, next);
       return {

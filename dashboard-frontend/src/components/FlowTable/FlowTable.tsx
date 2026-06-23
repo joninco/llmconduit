@@ -21,6 +21,8 @@ import { CacheEconomics } from './CacheEconomics';
 import { ContextPressure } from './ContextPressure';
 import { fmtClock, fmtElapsed, fmtModelPair } from './format';
 import { costDisplay, elapsedMs, flowCost, isFailover, shortId, statusClass } from './flowModel';
+import { clientCell } from './clientAttribution';
+import { ClientRollup } from './ClientRollup';
 import { FilterBar } from './FilterBar';
 import { useFlowRows } from './useFlowRows';
 import { useCatalog } from './useCatalog';
@@ -29,24 +31,55 @@ const ROW_HEIGHT = 30;
 const OVERSCAN = 12;
 
 /**
- * HONEST client (user-agent) label for the row. The flow summary does NOT yet carry a
- * user-agent — surfacing one is a separate D13 backend task — so this renders a real
- * user-agent/client field IF the summary ever gains one, else the unavailable marker. It must
- * NOT mislabel the HTTP method (`POST`) as the client, which it previously did (finding 6).
+ * The CLIENT cell (gap 15): renders the flow's NON-SECRET `client_label` (a key-hash `key-<hex>`, a
+ * configured caller-id, or a WEAK User-Agent fallback) with a source-strength marker. The weak UA
+ * fallback is rendered VISIBLY weaker (dimmed/italic + a `ua` badge) so it never reads as a confirmed
+ * identity; a strong key-hash / configured-id carries its source badge. An UNATTRIBUTED flow renders
+ * `—` (don't-lie-with-zeros — never a fabricated id). A raw key never reaches here (gap 04 hashes it).
  */
-function clientLabel(flow: FlowSummary): string {
-  // Read defensively: the field is not on `FlowSummary` today, but if the backend adds one of
-  // these we surface it without a code change. Until then this honestly renders "—".
-  const f = flow as FlowSummary & { client?: string | null; user_agent?: string | null };
-  return f.client ?? f.user_agent ?? '—';
+function ClientCellView({ flow }: { flow: FlowSummary }) {
+  const cell = clientCell(flow);
+  return (
+    <span
+      className="flex min-w-0 items-center gap-1"
+      data-testid="flow-client"
+      data-quality={cell.quality}
+      data-strength={cell.strength}
+      data-attributed={cell.attributed ? 'true' : 'false'}
+      title={cell.detail}
+    >
+      <span className={cn('truncate', cell.weak ? 'italic text-text-muted/70' : 'text-text-muted')}>
+        {cell.label}
+      </span>
+      {cell.badge && (
+        <span
+          className={cn(
+            'shrink-0 rounded-sm px-1 text-[9px] uppercase tracking-wide',
+            // The WEAK UA fallback is visually distinct (cooling/amber) from a strong identity (neutral).
+            cell.weak
+              ? 'bg-status-cooling/15 text-status-cooling'
+              : 'bg-line/40 text-text-muted',
+          )}
+          data-testid="flow-client-source"
+          data-source={cell.source ?? undefined}
+          title={cell.weak ? `weak ${cell.sourceLabel} fallback — not a confirmed identity` : `${cell.sourceLabel} (strong identity)`}
+        >
+          {cell.badge}
+        </span>
+      )}
+    </span>
+  );
 }
 
 interface ColumnWidths {
   grid: string;
 }
-// 10-column dense grid. tabular-nums on numeric cells keeps columns aligned.
+// 10-column dense grid. tabular-nums on numeric cells keeps columns aligned. The CLIENT column (3rd)
+// is a responsive `minmax(120px,0.9fr)` — NOT a fixed 56px (which truncated `key-9f3a1c0b2d4e` /
+// `python-httpx/0.27` to a non-distinguishing prefix, defeating gap 15's purpose) — so seeded clients
+// are visually distinguishable; the endpoint flex is trimmed to keep the grid balanced.
 const COLS: ColumnWidths = {
-  grid: 'grid grid-cols-[88px_92px_56px_minmax(120px,1fr)_minmax(150px,1.4fr)_96px_84px_120px_72px_72px] gap-2 px-3',
+  grid: 'grid grid-cols-[88px_92px_minmax(120px,0.9fr)_minmax(110px,0.9fr)_minmax(150px,1.4fr)_96px_84px_120px_72px_72px] gap-2 px-3',
 };
 
 export function FlowTable({
@@ -60,7 +93,7 @@ export function FlowTable({
   // FilterBar below remains the in-table editor (its onChange writes the same store).
   const filters = useFlowFilter((s) => s.filters);
   const setFilters = flowFilterStore.getState().setFilters;
-  const { rows, total, models, upstreams } = useFlowRows(filters);
+  const { rows, total, models, upstreams, clients } = useFlowRows(filters);
   const priceTable = useDashboard((s) => s.priceTable);
   // Gap 09: the per-model context-window capacities (gap-06 nullable `context_limit`), for the
   // aggregate context-pressure stat. A `null`/absent window is UNKNOWN ⇒ that flow is excluded from
@@ -85,6 +118,7 @@ export function FlowTable({
         filters={filters}
         models={models}
         upstreams={upstreams}
+        clients={clients}
         total={total}
         shown={rows.length}
         onChange={setFilters}
@@ -134,6 +168,10 @@ export function FlowTable({
           rows the table shows. A collapsed secondary surface under the table (never inside the
           virtualized scroll container, so it does not affect row layout). */}
       <CacheEconomics rows={rows} priceTable={priceTable} />
+      {/* Gap 15: the AGGREGATE "by client" roll-up — cost / errors / latency per non-secret client
+          (key-hash / configured-id / weak-UA), over the SAME filtered rows. A collapsed secondary
+          surface under the table; its rows cross-link into the per-client filter. */}
+      <ClientRollup rows={rows} />
     </div>
   );
 }
@@ -200,7 +238,7 @@ function FlowRow({
     >
       <span className="tabular-nums text-text-muted">{fmtClock(flow.started_ms)}</span>
       <span className="truncate font-mono text-text-muted">{shortId(flow.api_call_id)}</span>
-      <span className="truncate text-text-muted">{clientLabel(flow)}</span>
+      <ClientCellView flow={flow} />
       <span className="truncate font-mono">{flow.uri || '—'}</span>
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="truncate">{fmtModelPair(flow.model_requested, flow.model_served)}</span>

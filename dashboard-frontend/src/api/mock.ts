@@ -78,9 +78,19 @@ const CATALOG: CatalogEntry[] = [
   { id: 'mystery-model', context_limit: null },
 ];
 
+/**
+ * Gap 15 review round 3 — a ~4 KiB User-Agent `client_label` injected ONLY when `?longclient=1` is in
+ * the URL (an opt-in e2e seam; absent for every other test so seeds + the flows screenshot are
+ * untouched). It proves the filter-bar chip BOUNDS an unbounded label in REAL layout (the long chip's
+ * label span clips — `scrollWidth > clientWidth` — while the chip button width stays bounded).
+ */
+function longClientEnabled(): boolean {
+  return typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('longclient') === '1';
+}
+
 function seedFlows(): FlowSummary[] {
   const now = Date.now();
-  return [
+  const flows: FlowSummary[] = [
     // Gap 07: llama has cached tokens (128) but NO configured cache rate ⇒ cost is ESTIMATED
     // (labelled as such in the UI), not confident.
     // Gap 10: FULL phase spine + a served attempt with a wire first byte (open, still streaming) ⇒
@@ -91,6 +101,9 @@ function seedFlows(): FlowSummary[] {
       usage: { prompt: 812, completion: 240, total: 1052, cached: 128, reasoning: 0 },
       started_ms: now - 2400, finished_ms: null, elapsed_ms: 2400, terminal_reason: null,
       cost: 0.0061, cost_confidence: 'estimated',
+      // Gap 15: a STRONG key-hash client (a non-reversible `key-<hex>` digest — NOT a raw key). Shared
+      // with api_002 below so the "by client" roll-up groups two flows under one stable identity.
+      client_label: 'key-9f3a1c0b2d4e', client_source: 'key_hash',
       // ingress → +30ms normalize → +20ms routing → +220ms wire TTFB → +180ms first content
       // (still streaming: no stream_end/finalize yet ⇒ generation/finalize segments unavailable).
       ingress_ms: now - 2400, normalization_done_ms: now - 2370, routing_decision_ms: now - 2350,
@@ -107,6 +120,9 @@ function seedFlows(): FlowSummary[] {
       usage: { prompt: 1500, completion: 980, total: 2480 },
       started_ms: now - 12000, finished_ms: now - 7800, elapsed_ms: 4200, terminal_reason: 'response.completed',
       cost: 0.0019, cost_confidence: 'estimated',
+      // Gap 15: SAME key-hash as api_001 ⇒ the roll-up rolls both flows up under one client (2 flows,
+      // priced cost summed, mean latency derived) — proving cost/latency aggregation by client.
+      client_label: 'key-9f3a1c0b2d4e', client_source: 'key_hash',
       ingress_ms: now - 12000, normalization_done_ms: now - 11960, routing_decision_ms: now - 11940,
       first_upstream_byte_ms: now - 11700, first_content_delta_ms: now - 11500,
       stream_end_ms: now - 7820, finalize_ms: now - 7800,
@@ -123,6 +139,10 @@ function seedFlows(): FlowSummary[] {
       model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai',
       usage: null, started_ms: now - 30000, finished_ms: now - 29200, elapsed_ms: 800,
       terminal_reason: 'upstream 503', cost: null, cost_confidence: 'unavailable',
+      // Gap 15: a STRONG configured caller-id (an operator-configured `x-client-id` header value) —
+      // an explicit, caller-asserted identity. This client's only flow FAILED ⇒ a derived 100% err rate
+      // in the roll-up, and an UNPRICED cost ⇒ `—` (don't-lie-with-zeros, never a fabricated `$0.00`).
+      client_label: 'svc-checkout', client_source: 'configured_header',
       ingress_ms: now - 30000, normalization_done_ms: now - 29970, routing_decision_ms: now - 29950,
       finalize_ms: now - 29200,
       attempts: [
@@ -141,6 +161,10 @@ function seedFlows(): FlowSummary[] {
       usage: { prompt: 4096, completion: 512, total: 4608 },
       started_ms: now - 18000, finished_ms: now - 16000, elapsed_ms: 2000, terminal_reason: 'response.completed',
       cost: null, cost_confidence: 'unavailable',
+      // Gap 15: the WEAK User-Agent fallback (no key, no configured id — just a spoofable UA). The
+      // CLIENT cell + roll-up render this visibly weaker (italic/dimmed + a `ua` badge, data-quality
+      // `derived`) and labelled — NEVER as a confirmed identity (a key-hash/configured-id is `measured`).
+      client_label: 'python-httpx/0.27', client_source: 'user_agent',
       ingress_ms: now - 18000, normalization_done_ms: now - 17960, routing_decision_ms: now - 17940,
       first_content_delta_ms: now - 17600, stream_end_ms: now - 16020, finalize_ms: now - 16000,
     },
@@ -154,6 +178,8 @@ function seedFlows(): FlowSummary[] {
       usage: { prompt: 640, completion: 320, total: 960, cached: 0, reasoning: 0 },
       started_ms: now - 9000, finished_ms: now - 6200, elapsed_ms: 2800, terminal_reason: 'response.completed',
       cost: 0.0080, cost_confidence: 'confident',
+      // Gap 15: a DISTINCT strong key-hash client (a different caller key) ⇒ a separate roll-up row.
+      client_label: 'key-deadbeef0012', client_source: 'key_hash',
       ingress_ms: now - 9000, normalization_done_ms: now - 8970, routing_decision_ms: now - 8950,
       first_upstream_byte_ms: now - 8050, first_content_delta_ms: now - 7900,
       stream_end_ms: now - 6220, finalize_ms: now - 6200,
@@ -168,6 +194,9 @@ function seedFlows(): FlowSummary[] {
     // (capture is OFF for it) — the ErrorTab must show an explicit "capture disabled" state, NOT a
     // blank implying "no error". Also feeds the aggregate taxonomy (vllm-b group, timeout reason).
     {
+      // Gap 15: NO client attribution (no key, no configured id, no UA) ⇒ `client_label`/`client_source`
+      // ABSENT ⇒ the CLIENT cell renders `—` (don't-lie-with-zeros, never a fabricated id) and the flow
+      // bumps the roll-up's explicit "unattributed" count rather than inventing a client.
       api_call_id: 'api_006', response_id: null, method: 'POST', uri: '/v1/chat/completions', status: 'failed',
       model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-b',
       usage: null, started_ms: now - 40000, finished_ms: now - 39000, elapsed_ms: 1000,
@@ -179,6 +208,19 @@ function seedFlows(): FlowSummary[] {
       ],
     },
   ];
+  if (longClientEnabled()) {
+    // Gap 15 review round 3 (opt-in e2e only): a ~4 KiB UA `client_label` — the worst case the
+    // filter-bar chip must bound. WEAK source so it also exercises the UA tagging on a huge label.
+    flows.push({
+      api_call_id: 'api_long', response_id: 'resp_long', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
+      model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'vllm-a',
+      usage: { prompt: 10, completion: 10, total: 20 },
+      started_ms: now - 5000, finished_ms: now - 4000, elapsed_ms: 1000, terminal_reason: 'response.completed',
+      cost: null, cost_confidence: 'unavailable',
+      client_label: `python-httpx/${'x'.repeat(4096)}`, client_source: 'user_agent',
+    });
+  }
+  return flows;
 }
 
 /**

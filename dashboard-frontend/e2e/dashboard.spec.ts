@@ -325,6 +325,118 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on the failure taxonomy').toEqual([]);
   });
 
+  // Gap 15: the CLIENT column renders the non-secret client attribution (a key-hash `key-<hex>` /
+  // configured caller-id / WEAK User-Agent fallback) with a source-strength tag, an UNATTRIBUTED flow
+  // reads `—` (don't-lie-with-zeros), and the per-client filter + the "by client" roll-up work. Rows
+  // are selected by stable `api_call_id` (gap-11 selector hygiene). This is an auth-gated DIAGNOSTIC
+  // surface: showing the key-HASH (not a raw key) to the operator is the INTENDED purpose.
+  test('client attribution: source-tagged CLIENT column + per-client filter + roll-up (gap 15)', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[0]!); // Flows
+    await page.waitForTimeout(400);
+
+    const rowClient = (id: string) =>
+      page.getByTestId('flow-row').filter({ hasText: id }).first().getByTestId('flow-client');
+
+    // api_001: a STRONG key-hash identity → `measured`, the hash prefix shown (NEVER a raw key), `key` badge.
+    const kh = rowClient('api_001');
+    await expect(kh).toContainText('key-9f3a1c0b2d4e');
+    await expect(kh).toHaveAttribute('data-quality', 'measured');
+    await expect(kh).toHaveAttribute('data-strength', 'strong');
+    await expect(rowClient('api_001').getByTestId('flow-client-source')).toHaveText('key');
+
+    // api_004: a WEAK User-Agent fallback → `derived` (NOT measured), visibly weaker, `ua` badge. The
+    // weak-UA distinction is the heart of the spec — a UA must never read as a confirmed identity.
+    const ua = rowClient('api_004');
+    await expect(ua).toContainText('python-httpx/0.27');
+    await expect(ua).toHaveAttribute('data-quality', 'derived');
+    await expect(ua).toHaveAttribute('data-strength', 'weak');
+    await expect(rowClient('api_004').getByTestId('flow-client-source')).toHaveText('ua');
+
+    // Review MEDIUM (column width): the CLIENT column must actually SHOW the label — not truncate two
+    // distinct clients to a non-distinguishing prefix. Assert the visible cell text renders the FULL
+    // labels AND the two clients are visually distinct (the widened minmax column fits them).
+    const khLabel = (await rowClient('api_001').locator('span').first().textContent())?.trim() ?? '';
+    const uaLabel = (await rowClient('api_004').locator('span').first().textContent())?.trim() ?? '';
+    expect(khLabel).toBe('key-9f3a1c0b2d4e'); // full label, not a clipped prefix
+    expect(uaLabel).toBe('python-httpx/0.27');
+    expect(khLabel).not.toBe(uaLabel); // two seeded clients are distinguishable in the column
+    // The rendered cell is wide enough that the text is not overflow-clipped (scrollWidth ≤ clientWidth).
+    const khBox = rowClient('api_001').locator('span').first();
+    const fits = await khBox.evaluate((el) => el.scrollWidth <= el.clientWidth + 1);
+    expect(fits, 'the key-hash label fits the CLIENT column without truncation').toBe(true);
+
+    // api_006: NO attribution → `—` (unavailable), NEVER a fabricated id / the HTTP method.
+    const none = rowClient('api_006');
+    await expect(none).toHaveText('—');
+    await expect(none).toHaveAttribute('data-quality', 'unavailable');
+    await expect(none).toHaveAttribute('data-attributed', 'false');
+
+    // The AGGREGATE "by client" roll-up: expand it; the heaviest client (key-9f3a1c0b2d4e, api_001+002)
+    // shows a derived 0% err, a measured summed cost, and a derived mean latency.
+    await page.getByTestId('client-rollup-toggle').click();
+    await expect(page.getByTestId('client-rollup-table')).toBeVisible();
+    const khRow = page.getByTestId('client-rollup-row').filter({ hasText: 'key-9f3a1c0b2d4e' }).first();
+    await expect(khRow).toHaveAttribute('data-strength', 'strong');
+    await expect(khRow.getByTestId('client-rollup-flows')).toHaveText('2');
+    await expect(khRow.getByTestId('client-rollup-err')).toHaveAttribute('data-quality', 'derived');
+    await expect(khRow.getByTestId('client-rollup-cost')).toHaveAttribute('data-quality', 'measured');
+    // The weak-UA client's roll-up source tag is `derived` (never `measured`).
+    const uaRow = page.getByTestId('client-rollup-row').filter({ hasText: 'python-httpx/0.27' }).first();
+    await expect(uaRow.getByTestId('client-rollup-source')).toHaveAttribute('data-quality', 'derived');
+
+    // Cross-link: clicking the key-hash client row SETS the per-client filter → the table narrows to
+    // that client's 2 flows (api_001 + api_002). The filter chip is then active + toggle-off-able.
+    await khRow.getByTestId('client-rollup-pick').click();
+    await expect(page.getByTestId('flow-count')).toContainText('2 / 6');
+    await expect(page.getByTestId('flow-row')).toHaveCount(2);
+    // The active client chip clears via the filter-bar clear control, restoring all rows.
+    await page.getByTestId('flow-filter-clear').click();
+    await expect(page.getByTestId('flow-count')).toContainText('6 flows');
+
+    expect(consoleErrors, 'console errors on the client attribution surface').toEqual([]);
+  });
+
+  // Gap 15 review round 3 (CSS correctness): a high-cardinality `client_label` can be ~4 KiB; the filter
+  // chip must BOUND it in REAL layout. `max-w`+`truncate` is a no-op on an inline span — the label span
+  // is `inline-block min-w-0 max-w-[160px] truncate`, so it must actually CLIP (scrollWidth > clientWidth)
+  // while the chip button width stays bounded (does NOT expand to ~4 KiB / overflow the bar). `?longclient=1`
+  // injects the long-label flow (opt-in — every other test is untouched).
+  test('a ~4 KiB client_label chip is BOUNDED in real layout — clipped span, bounded button (gap 15 R3)', async ({ page, consoleErrors }) => {
+    await installDeterminism(page);
+    await page.goto('/dashboard/?mock=1&longclient=1', { waitUntil: 'networkidle' });
+    await page.locator('input').first().fill('dev-token');
+    await page.getByRole('button', { name: /sign in/i }).click();
+    await expect(page.getByRole('button', { name: 'Flows', exact: true })).toBeVisible();
+    await openView(page, VIEWS[0]!); // Flows
+    await page.waitForTimeout(400);
+
+    // The long UA client renders a filter chip; its label is the bounded truncate span.
+    const filterBar = page.getByTestId('flow-filter-bar');
+    const longChipLabel = filterBar.getByTestId('flow-filter-chip-label').filter({ hasText: 'python-httpx/x' }).first();
+    await expect(longChipLabel).toBeVisible();
+
+    // REAL layout: the label CLIPS (content wider than its box) — the inline-block + max-width + overflow
+    // actually take effect (the inline-span bug would NOT clip, leaving scrollWidth == clientWidth).
+    const clipped = await longChipLabel.evaluate((el) => el.scrollWidth > el.clientWidth);
+    expect(clipped, 'the ~4 KiB label span is clipped (overflow constrained)').toBe(true);
+    // The label box itself is capped near max-w-[160px] (not ~4 KiB wide).
+    const labelWidth = await longChipLabel.evaluate((el) => el.clientWidth);
+    expect(labelWidth, 'label box is bounded near its max-width').toBeLessThanOrEqual(200);
+
+    // The CHIP BUTTON width stays bounded — it does NOT expand to the label's full ~4 KiB width nor
+    // overflow the filter bar (the whole point of the fix).
+    const longChipButton = filterBar.getByRole('button').filter({ hasText: 'python-httpx/x' }).first();
+    const chipWidth = await longChipButton.evaluate((el) => el.getBoundingClientRect().width);
+    expect(chipWidth, 'chip button width is bounded').toBeLessThanOrEqual(260);
+    const barWidth = await filterBar.evaluate((el) => el.getBoundingClientRect().width);
+    expect(chipWidth, 'chip never exceeds the filter bar width').toBeLessThanOrEqual(barWidth);
+    // The full value is still available on hover (the chip title carries it intact).
+    await expect(longChipButton).toHaveAttribute('title', /^python-httpx\/x{4096}$/);
+
+    expect(consoleErrors, 'console errors on the long-client chip').toEqual([]);
+  });
+
   for (const view of VIEWS) {
     test(`${view.name}: renders + no console errors + matches baseline`, async ({ page, consoleErrors }) => {
       await login(page);

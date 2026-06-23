@@ -152,16 +152,58 @@ describe('FlowTable — live WS update + interactions', () => {
     expect(queryByTestId('flow-cost-est')).toBeNull();
   });
 
-  it('the client column does NOT mislabel the HTTP method; renders "—" when absent (finding 6)', () => {
-    // The summary carries no user-agent yet, so the client cell must be the honest unavailable
-    // marker — NOT the request method (POST), which it previously showed.
-    seedFlows([makeFlow({ api_call_id: 'api_client', method: 'POST', status: 'completed' })]);
-    const { getAllByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
-    const row = getAllByTestId('flow-row')[0]!;
-    // The 3rd grid cell is the client column (time, id, client, …).
-    const cells = row.querySelector('button')!.children;
-    const clientCell = cells[2] as HTMLElement;
-    expect(clientCell.textContent).toBe('—');
-    expect(clientCell.textContent).not.toBe('POST');
+  it('the client column does NOT mislabel the HTTP method; renders "—" when absent (finding 6 / gap 15 don\'t-lie-with-zeros)', () => {
+    // No client attribution (no key/configured-id/UA) ⇒ the client cell is the honest unavailable
+    // marker — NOT the request method (POST), and NOT a fabricated id.
+    seedFlows([makeFlow({ api_call_id: 'api_client', method: 'POST', status: 'completed', client_label: null })]);
+    const { getByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    const cell = getByTestId('flow-client');
+    expect(cell.textContent).toBe('—');
+    expect(cell.textContent).not.toBe('POST');
+    expect(cell.getAttribute('data-quality')).toBe('unavailable');
+    expect(cell.getAttribute('data-attributed')).toBe('false');
+  });
+
+  // Gap 15: the CLIENT column renders the non-secret attribution label with a source-strength marker.
+  it('renders a key-hash client as a STRONG measured identity (label + key badge) — gap 15', () => {
+    seedFlows([makeFlow({ api_call_id: 'api_kh', status: 'completed', client_label: 'key-9f3a1c0b2d4e', client_source: 'key_hash' })]);
+    const { getByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    const cell = getByTestId('flow-client');
+    expect(cell.textContent).toContain('key-9f3a1c0b2d4e'); // the hash prefix — never a raw key
+    expect(cell.getAttribute('data-quality')).toBe('measured');
+    expect(cell.getAttribute('data-strength')).toBe('strong');
+    expect(getByTestId('flow-client-source').textContent).toBe('key');
+  });
+
+  it('renders a User-Agent client as a WEAK derived fallback (visibly weaker, ua badge) — gap 15', () => {
+    seedFlows([makeFlow({ api_call_id: 'api_ua', status: 'completed', client_label: 'python-httpx/0.27', client_source: 'user_agent' })]);
+    const { getByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    const cell = getByTestId('flow-client');
+    expect(cell.textContent).toContain('python-httpx/0.27');
+    // The KEY distinction: a UA fallback is `derived` (weak), NOT `measured` — never a confirmed identity.
+    expect(cell.getAttribute('data-quality')).toBe('derived');
+    expect(cell.getAttribute('data-strength')).toBe('weak');
+    const badge = getByTestId('flow-client-source');
+    expect(badge.textContent).toBe('ua');
+    expect(badge.getAttribute('data-source')).toBe('user_agent');
+  });
+
+  // Gap 15: the per-client filter chip narrows the table to one client_label.
+  it('a client filter chip narrows the rows to that client (gap 15)', () => {
+    seedFlows([
+      makeFlow({ api_call_id: 'api_x1', status: 'completed', client_label: 'key-A', client_source: 'key_hash' }),
+      makeFlow({ api_call_id: 'api_x2', status: 'completed', client_label: 'key-A', client_source: 'key_hash' }),
+      makeFlow({ api_call_id: 'api_y1', status: 'completed', client_label: 'svc-checkout', client_source: 'configured_header' }),
+    ]);
+    const { getAllByTestId, getByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    expect(getAllByTestId('flow-row')).toHaveLength(3);
+    // `key-A` appears as a client filter chip (its label is in a bounded truncate span); resolve the
+    // enclosing chip button via the filter-bar chip-label testid (the CLIENT cell also renders `key-A`).
+    const chip = getAllByTestId('flow-filter-chip-label')
+      .find((el) => el.textContent === 'key-A')!
+      .closest('button')!;
+    fireEvent.click(chip);
+    expect(getAllByTestId('flow-row')).toHaveLength(2);
+    expect(getByTestId('flow-count').textContent).toContain('2 / 3');
   });
 });

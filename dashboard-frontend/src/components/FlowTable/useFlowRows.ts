@@ -29,6 +29,8 @@ export interface FlowRowsResult {
   models: string[];
   /** Distinct upstream targets present for the filter chips. */
   upstreams: string[];
+  /** Gap 15 — distinct `client_label`s present, for the per-client filter chips. */
+  clients: string[];
 }
 
 /** Union the live store rows (authoritative) with REST-only rows, newest-on-top. */
@@ -135,6 +137,12 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
     // empties the merged trace.
     attempts: pickAttempts(live.attempts, rest.attempts),
     first_upstream_byte_ms: live.first_upstream_byte_ms ?? rest.first_upstream_byte_ms,
+    // Gap 04/15: the client attribution is an IMMUTABLE per-flow identity derived ONCE pre-redaction
+    // (it never changes over a flow's life). Live-first / REST-backfilled like the other scalars — so
+    // a WS-created row (which may not carry it) re-adopts the REST `/flows` projection. `client_source`
+    // follows `client_label`'s source so the label + its strength tag always agree.
+    client_label: live.client_label ?? rest.client_label ?? null,
+    client_source: live.client_label != null ? live.client_source : (rest.client_source ?? live.client_source ?? null),
   };
   return shallowEqualSummary(live, merged) ? live : merged;
 }
@@ -168,6 +176,11 @@ function shallowEqualSummary(a: FlowSummary, b: FlowSummary): boolean {
     (a.stream_end_ms ?? null) === (b.stream_end_ms ?? null) &&
     (a.finalize_ms ?? null) === (b.finalize_ms ?? null) &&
     (a.first_upstream_byte_ms ?? null) === (b.first_upstream_byte_ms ?? null) &&
+    // Gap 04/15: the client attribution is part of row identity — a REST backfill that adds the
+    // `client_label`/`client_source` (a WS-created row had none) MUST produce a new object so the
+    // CLIENT cell + the "by client" roll-up re-render with the attribution (else it's discarded).
+    (a.client_label ?? null) === (b.client_label ?? null) &&
+    (a.client_source ?? null) === (b.client_source ?? null) &&
     // `attempts` is compared via `sameAttempts`: EMPTY and ABSENT are the same "no trace" state
     // (a snapshot's `[]` vs the merge's normalized `undefined` must NOT churn a new object), but a
     // backfilled NON-EMPTY list is a new reference ⇒ unequal, so the row re-renders and the
@@ -181,6 +194,9 @@ function applyFilters(rows: FlowSummary[], f: FlowFilters): FlowSummary[] {
     if (f.status && row.status !== f.status) return false;
     if (f.model && row.model_requested !== f.model && row.model_served !== f.model) return false;
     if (f.upstream && row.upstream_target !== f.upstream) return false;
+    // Gap 15: the per-client facet matches the row's `client_label` exactly. An unattributed row
+    // (no label) never matches a client filter (it can't be claimed by a client).
+    if (f.client && row.client_label !== f.client) return false;
     return true;
   });
 }
@@ -189,6 +205,22 @@ function distinct(rows: FlowSummary[], pick: (r: FlowSummary) => (string | null 
   const set = new Set<string>();
   for (const r of rows) for (const v of pick(r)) if (v) set.add(v);
   return [...set].sort();
+}
+
+/**
+ * Distinct `client_label`s ordered by DESCENDING flow volume (gap 15 review MEDIUM). Client attribution
+ * is HIGH-CARDINALITY (unlike the bounded model/upstream sets) — thousands of distinct keys would render
+ * thousands of chips and wrap the filter bar unusable. The FilterBar caps to the top-N by volume off
+ * THIS order, so the busiest clients are the offered chips; first-seen order breaks ties for stability.
+ */
+function clientsByVolume(rows: FlowSummary[]): string[] {
+  const counts = new Map<string, number>();
+  for (const r of rows) {
+    const c = r.client_label;
+    if (c) counts.set(c, (counts.get(c) ?? 0) + 1);
+  }
+  // Descending count; insertion order (first-seen) is the stable tiebreak (Map preserves it).
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([label]) => label);
 }
 
 export function useFlowRows(filters: FlowFilters): FlowRowsResult {
@@ -224,6 +256,10 @@ export function useFlowRows(filters: FlowFilters): FlowRowsResult {
   const rows = useMemo(() => applyFilters(merged, filters), [merged, filters]);
   const models = useMemo(() => distinct(merged, (r) => [r.model_requested, r.model_served]), [merged]);
   const upstreams = useMemo(() => distinct(merged, (r) => [r.upstream_target]), [merged]);
+  // Gap 15: the distinct `client_label`s for the per-client filter, ordered by DESCENDING volume so the
+  // FilterBar can cap to the top-N busiest (high-cardinality defense — review MEDIUM). Unattributed rows
+  // have no label ⇒ contribute nothing (an absent attribution is never a filterable client).
+  const clients = useMemo(() => clientsByVolume(merged), [merged]);
 
-  return { rows, total: merged.length, models, upstreams };
+  return { rows, total: merged.length, models, upstreams, clients };
 }

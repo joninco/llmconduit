@@ -51,6 +51,25 @@ export const PROVIDER_STATUSES: readonly ProviderStatus[] = ['healthy', 'cooling
 export type CostConfidence = 'confident' | 'estimated' | 'unavailable';
 export const COST_CONFIDENCES: readonly CostConfidence[] = ['confident', 'estimated', 'unavailable'];
 
+/**
+ * Gap 04 — the PROVENANCE of a flow's `client_label` (Rust `ClientSource`, snake_case). It tags
+ * HOW the non-secret client identity was derived, so spec 15 can render the WEAK User-Agent
+ * fallback visibly DIFFERENTLY from a strong key-hash / configured-id (a `user_agent` label is
+ * NOT an identity claim — any caller can spoof it):
+ *  - `key_hash`          — a non-reversible `key-<12 hex>` digest of the inbound API key (the raw
+ *                          key is NEVER emitted — only the one-way hash prefix). The STRONGEST seam:
+ *                          the same caller key groups stably. Rendered `measured`.
+ *  - `configured_header` — an operator-configured non-secret caller-id header (e.g. `x-client-id`).
+ *                          An explicit caller-asserted (unverified) identity — strong, `measured`.
+ *  - `user_agent`        — the `User-Agent` header. A WEAK, labelled fallback only (spoofable, not
+ *                          an identity model). Rendered `derived` + visibly weaker, never as a
+ *                          confirmed identity.
+ * Absent (`client_label`/`client_source` both omitted) ⇒ no key, no configured-id, no UA ⇒ the cell
+ * renders `—` (`unavailable`), NEVER a fabricated id (don't-lie-with-zeros).
+ */
+export type ClientSource = 'key_hash' | 'configured_header' | 'user_agent';
+export const CLIENT_SOURCES: readonly ClientSource[] = ['key_hash', 'configured_header', 'user_agent'];
+
 // ---------------------------------------------------------------------------
 // Gap 02 / 03 spine — per-phase timestamps + the per-attempt failover trace.
 // These mirror the Rust `PhaseTimings` (`#[serde(flatten)]`) + `Attempt` /
@@ -634,6 +653,20 @@ export interface FlowSummary extends PhaseTimings {
    * ⇒ no upstream byte ever arrived (renders `—`, never `0`).
    */
   first_upstream_byte_ms?: number | null;
+  /**
+   * Gap 04 — the STABLE, NON-SECRET client attribution label (a key-hash `key-<hex>` display id, a
+   * configured caller-id, or a User-Agent fallback), projected onto the `/flows` + `/snapshot` row
+   * by the backend (gate F — already on the wire). The raw key is NEVER here (only the one-way hash
+   * prefix ever existed as a label). Absent ⇒ the flow carried no key, no configured-id, and no UA ⇒
+   * the CLIENT cell renders `—` (never a fabricated id). Consumed by spec 15.
+   */
+  client_label?: string | null;
+  /**
+   * Gap 04 — the {@link ClientSource} `client_label` was derived from, so the WEAK `user_agent`
+   * fallback renders visibly weaker/different from a strong key-hash / configured-id. Absent exactly
+   * when `client_label` is absent.
+   */
+  client_source?: ClientSource | null;
 }
 
 /** Body-free frozen summary in a snapshot — identical shape to `FlowSummary` (D1). */
@@ -1198,8 +1231,18 @@ function isFlowSummary(v: unknown): v is FlowSummary {
     isCostConfidence(v.cost_confidence) &&
     // Gap 02/03: the optional spine fields, when present, must be well-shaped (don't trust the
     // wire). Absent ⇒ the summary predates the spine projection / the phase didn't occur.
-    isOptPhaseTimings(v) && isOptAttempts(v.attempts) && isOptUint(v.first_upstream_byte_ms)
+    isOptPhaseTimings(v) && isOptAttempts(v.attempts) && isOptUint(v.first_upstream_byte_ms) &&
+    // Gap 04 (spec 15): the optional client attribution. `client_label` is a non-secret string;
+    // `client_source`, when present, must be a bounded `ClientSource` (don't trust the wire — a
+    // bogus source must not paint the weak-UA fallback as a strong identity). Both absent ⇒ the
+    // unattributed flow (renders `—`).
+    isOptStr(v.client_label) && isOptClientSource(v.client_source)
   );
+}
+
+/** Optional `ClientSource` (gap 04): absent, null, or one of the bounded snake_case sources. */
+function isOptClientSource(v: unknown): boolean {
+  return v === undefined || v === null || isOneOf(v, CLIENT_SOURCES);
 }
 
 function isMetricsResponse(v: unknown): v is MetricsResponse {

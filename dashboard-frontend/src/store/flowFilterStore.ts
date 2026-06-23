@@ -27,6 +27,8 @@ export interface FlowFilterState {
   setUpstream: (upstream: string) => void;
   /** Cross-link from a sankey band: SET the model filter to that model (deterministic — finding 10). */
   setModel: (model: string) => void;
+  /** Gap 15 — cross-link from the "by client" roll-up: SET the client filter to that `client_label`. */
+  setClient: (client: string) => void;
   /** Clear every facet. */
   clear: () => void;
 }
@@ -38,6 +40,9 @@ export const flowFilterStore = createStore<FlowFilterState>((set) => ({
   // lands filtered to what was clicked. (The FilterBar owns the toggle-off-on-repeat chip behavior.)
   setUpstream: (upstream) => set((s) => ({ filters: { ...s.filters, upstream } })),
   setModel: (model) => set((s) => ({ filters: { ...s.filters, model } })),
+  // Gap 15: a "by client" roll-up click SETS the client facet so the table lands scoped to that
+  // client (the FilterBar owns the toggle-off-on-repeat chip behavior, like the other facets).
+  setClient: (client) => set((s) => ({ filters: { ...s.filters, client } })),
   clear: () => set({ filters: EMPTY_FILTERS }),
 }));
 

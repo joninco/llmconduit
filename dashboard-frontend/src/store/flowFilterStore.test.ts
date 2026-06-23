@@ -25,12 +25,21 @@ describe('flowFilterStore — the shared FlowTable filter (D12 cross-link)', () 
   it('setModel / setUpstream set their facets independently', () => {
     flowFilterStore.getState().setModel('gpt-4o');
     flowFilterStore.getState().setUpstream('vllm-a');
-    expect(flowFilterStore.getState().filters).toEqual({ status: null, model: 'gpt-4o', upstream: 'vllm-a' });
+    expect(flowFilterStore.getState().filters).toEqual({ status: null, model: 'gpt-4o', upstream: 'vllm-a', client: null });
+  });
+
+  it('setClient SETS the client facet deterministically (gap 15 cross-link)', () => {
+    flowFilterStore.getState().setClient('key-9f3a1c0b2d4e');
+    expect(flowFilterStore.getState().filters.client).toBe('key-9f3a1c0b2d4e');
+    // Other facets untouched; a different client replaces it (deterministic SET, no toggle-off).
+    expect(flowFilterStore.getState().filters.upstream).toBeNull();
+    flowFilterStore.getState().setClient('svc-checkout');
+    expect(flowFilterStore.getState().filters.client).toBe('svc-checkout');
   });
 
   it('setFilters replaces the whole set; clear resets', () => {
-    flowFilterStore.getState().setFilters({ status: 'open', model: 'm', upstream: 'u' });
-    expect(flowFilterStore.getState().filters).toEqual({ status: 'open', model: 'm', upstream: 'u' });
+    flowFilterStore.getState().setFilters({ status: 'open', model: 'm', upstream: 'u', client: 'c' });
+    expect(flowFilterStore.getState().filters).toEqual({ status: 'open', model: 'm', upstream: 'u', client: 'c' });
     flowFilterStore.getState().clear();
     expect(flowFilterStore.getState().filters).toEqual(EMPTY_FILTERS);
   });
