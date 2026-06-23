@@ -62,6 +62,19 @@ describe('Sparkline — StrictMode-safe uPlot lifecycle', () => {
     expect(u.container.querySelector('canvas')).toBe(canvasBefore); // same node
   });
 
+  it('accepts a (number|null)[] series with GAPS (null + non-finite) — renders one canvas, no throw', () => {
+    // A `null` is an honest uPlot gap; a `NaN`/Infinity is NORMALIZED to `null` at the boundary
+    // (uPlot treats ONLY `null` as a gap — a NaN would poison the scale). Both must render cleanly.
+    const { container, rerender } = render(<Sparkline data={[1, null, 3, 2]} />);
+    expect(container.querySelectorAll('canvas').length).toBe(1);
+    // Pushing a non-finite value must not throw (it is coerced to a gap, not plotted as 0).
+    act(() => {
+      rerender(<Sparkline data={[1, Number.NaN, 3, Number.POSITIVE_INFINITY, 4]} />);
+    });
+    expect(container.querySelectorAll('canvas').length).toBe(1);
+    expect(sparklineCounters.creates).toBe(1); // setData path, not a recreate
+  });
+
   it('exposes an accessible label and fixed size', () => {
     const { getByTestId } = render(<Sparkline data={[1, 2]} label="req/s trend" width={120} height={30} />);
     const el = getByTestId('sparkline');

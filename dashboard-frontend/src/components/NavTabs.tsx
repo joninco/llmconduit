@@ -7,6 +7,7 @@ const LABELS: Record<RouteName, string> = {
   topology: 'Topology',
   sankey: 'Sankey',
   theater: 'Theater',
+  overview: 'Overview',
 };
 
 /** The Argus eye — the hundred-eyed watchman's iris, the brand mark. Keeps a slow watch. */

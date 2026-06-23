@@ -43,9 +43,9 @@ describe('ClientRollup — don\'t-lie-with-zeros', () => {
 describe('ClientRollup — aggregate by client with source-strength tags + cross-link', () => {
   it('rolls cost/err/latency up by client, tags strong (measured) vs weak-UA (derived), orders by flow count', () => {
     const { getByTestId, getAllByTestId } = rollupOf([
-      // key-A: 2 flows, both completed ⇒ 0% err; cost summed (priced), latency averaged.
-      makeFlow({ api_call_id: 'a1', client_label: 'key-A', client_source: 'key_hash', status: 'completed', cost: 0.006, elapsed_ms: 2000 }),
-      makeFlow({ api_call_id: 'a2', client_label: 'key-A', client_source: 'key_hash', status: 'completed', cost: 0.002, elapsed_ms: 4000 }),
+      // key-A: 2 flows, both completed ⇒ 0% err; cost summed (priced, confident), latency averaged.
+      makeFlow({ api_call_id: 'a1', client_label: 'key-A', client_source: 'key_hash', status: 'completed', cost: 0.006, cost_confidence: 'confident', elapsed_ms: 2000 }),
+      makeFlow({ api_call_id: 'a2', client_label: 'key-A', client_source: 'key_hash', status: 'completed', cost: 0.002, cost_confidence: 'confident', elapsed_ms: 4000 }),
       // ua-client: 1 flow, WEAK user-agent fallback.
       makeFlow({ api_call_id: 'b1', client_label: 'python-httpx/0.27', client_source: 'user_agent', status: 'completed', cost: null, elapsed_ms: 1000 }),
     ]);
@@ -61,9 +61,9 @@ describe('ClientRollup — aggregate by client with source-strength tags + cross
     expect(keyRow.querySelector('[data-testid="client-rollup-flows"]')!.textContent).toBe('2');
     expect(keyRow.querySelector('[data-testid="client-rollup-err"]')!.textContent).toBe('0%');
     expect(keyRow.querySelector('[data-testid="client-rollup-err"]')!.getAttribute('data-quality')).toBe('derived');
-    // cost summed + measured; latency mean + derived.
+    // cost summed (all-confident priced ⇒ derived); latency mean + derived.
     const cost = keyRow.querySelector('[data-testid="client-rollup-cost"]')!;
-    expect(cost.getAttribute('data-quality')).toBe('measured');
+    expect(cost.getAttribute('data-quality')).toBe('derived');
     expect(cost.textContent).toContain('$');
     const lat = keyRow.querySelector('[data-testid="client-rollup-latency"]')!;
     expect(lat.getAttribute('data-quality')).toBe('derived');

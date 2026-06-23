@@ -373,14 +373,16 @@ test.describe('Argus dashboard', () => {
     await expect(none).toHaveAttribute('data-attributed', 'false');
 
     // The AGGREGATE "by client" roll-up: expand it; the heaviest client (key-9f3a1c0b2d4e, api_001+002)
-    // shows a derived 0% err, a measured summed cost, and a derived mean latency.
+    // shows a derived 0% err, a derived mean latency, and a summed cost whose DQ tag is the WEAKEST of
+    // its priced flows — api_001/002 are both `estimated` (unconfigured cache rate) ⇒ the cost is
+    // `estimated` (labelled, never silently `measured`).
     await page.getByTestId('client-rollup-toggle').click();
     await expect(page.getByTestId('client-rollup-table')).toBeVisible();
     const khRow = page.getByTestId('client-rollup-row').filter({ hasText: 'key-9f3a1c0b2d4e' }).first();
     await expect(khRow).toHaveAttribute('data-strength', 'strong');
     await expect(khRow.getByTestId('client-rollup-flows')).toHaveText('2');
     await expect(khRow.getByTestId('client-rollup-err')).toHaveAttribute('data-quality', 'derived');
-    await expect(khRow.getByTestId('client-rollup-cost')).toHaveAttribute('data-quality', 'measured');
+    await expect(khRow.getByTestId('client-rollup-cost')).toHaveAttribute('data-quality', 'estimated');
     // The weak-UA client's roll-up source tag is `derived` (never `measured`).
     const uaRow = page.getByTestId('client-rollup-row').filter({ hasText: 'python-httpx/0.27' }).first();
     await expect(uaRow.getByTestId('client-rollup-source')).toHaveAttribute('data-quality', 'derived');
@@ -435,6 +437,91 @@ test.describe('Argus dashboard', () => {
     await expect(longChipButton).toHaveAttribute('title', /^python-httpx\/x{4096}$/);
 
     expect(consoleErrors, 'console errors on the long-client chip').toEqual([]);
+  });
+
+  // Gap 16: the CONTROL-ROOM overview (the 5th route) COMPOSES the gap-01–15 surfaces into one honest
+  // screen. Asserts: the route loads; the per-provider tiles read the REST/snapshot topology DTO (the
+  // gap-12/13 wire source — a degrading provider shows real derived percentiles, NOT a fabricated 0);
+  // a mixed-confidence cost leaderboard inherits the WEAKEST tag (estimated, labelled); an unpriced
+  // model's cost reads — (never $0.00); the failure + client tiles compose the gap-14/15 models; and
+  // an unreported token class reads — (don't-lie-with-zeros). Rows selected by stable identity.
+  test('control-room overview composes the surfaces with honest DQ tags (gap 16)', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[4]!); // Overview
+    await page.waitForTimeout(600);
+
+    // The view + headline render (the unified gap-01 metrics tile, with measured active streams).
+    await expect(page.getByTestId('overview-view')).toBeVisible();
+    await expect(page.getByTestId('overview-headline')).toBeVisible();
+    await expect(page.getByTestId('overview-hl-active')).toHaveAttribute('data-quality', 'measured');
+    // The mock's $/min is an ESTIMATE (unconfigured cache rate) ⇒ the headline labels it estimated.
+    await expect(page.getByTestId('overview-hl-cost')).toHaveAttribute('data-quality', 'estimated');
+
+    // PER-PROVIDER tiles (gap 12/13 — from the REST/snapshot topology node, NOT the WS frame). vllm-b
+    // is degrading: a real derived p50 (NOT —) + a measured error rate. This proves the wire source —
+    // the live WS topology_update frame carries per_provider ABSENT, so a WS-only read would be empty.
+    const providers = page.getByTestId('overview-providers');
+    await expect(providers).toHaveAttribute('data-available', 'true');
+    // `data-provider` is ON the tile element itself, so select by the attribute directly.
+    const vllmB = providers.locator('[data-testid="overview-provider"][data-provider="vllm-b"]').first();
+    await expect(vllmB.getByTestId('provider-p50')).toHaveAttribute('data-quality', 'derived');
+    await expect(vllmB.getByTestId('provider-p50')).not.toContainText('—');
+    await expect(vllmB.getByTestId('provider-error-rate')).toHaveAttribute('data-quality', 'measured');
+    // vllm-a is healthy/all-served: a MEASURED 0% (distinct from the unavailable —).
+    const vllmA = providers.locator('[data-testid="overview-provider"][data-provider="vllm-a"]').first();
+    await expect(vllmA.getByTestId('provider-error-rate')).toContainText('0%');
+
+    // TOP MODELS · COST: llama is priced via an UNCONFIGURED cache rate ⇒ estimated (labelled `est`),
+    // never silently confident. The cost board is available (some flows are priced).
+    const costBoard = page.getByTestId('overview-top-models-cost');
+    await expect(costBoard).toHaveAttribute('data-available', 'true');
+    const llamaCost = costBoard.getByTestId('overview-leaderboard-row').filter({ hasText: 'llama-3.1-70b' }).first();
+    await expect(llamaCost.getByTestId('overview-leaderboard-cost')).toHaveAttribute('data-quality', 'estimated');
+    await expect(llamaCost.getByTestId('overview-leaderboard-est')).toBeVisible();
+
+    // TOP MODELS · VOLUME: mystery-model has an UNPRICED flow ⇒ its cost reads — (never $0.00).
+    const volBoard = page.getByTestId('overview-top-models-volume');
+    await expect(volBoard).toHaveAttribute('data-available', 'true');
+    const mysteryRow = volBoard.getByTestId('overview-leaderboard-row').filter({ hasText: 'mystery-model' }).first();
+    const mysteryCost = mysteryRow.getByTestId('overview-leaderboard-cost');
+    await expect(mysteryCost).toHaveAttribute('data-quality', 'unavailable');
+    await expect(mysteryCost).toHaveText('—');
+
+    // TOP PROVIDERS · COST (review HIGH 1 — the spec requires providers by volume AND cost): vllm-a's
+    // priced flows (api_001/002) are estimated ⇒ its provider-cost is estimated (labelled). The board
+    // is available (some flows are priced).
+    const provCostBoard = page.getByTestId('overview-top-providers-cost');
+    await expect(provCostBoard).toHaveAttribute('data-available', 'true');
+    const vllmACost = provCostBoard.getByTestId('overview-leaderboard-row').filter({ hasText: 'vllm-a' }).first();
+    await expect(vllmACost.getByTestId('overview-leaderboard-cost')).toHaveAttribute('data-quality', 'estimated');
+
+    // FAILURES tile (gap 14 model): flows fail on openai (api_003) + vllm-b (api_006) ⇒ a derived
+    // overall rate (NOT —) + at least one failing group.
+    const failures = page.getByTestId('overview-failures');
+    await expect(failures).toHaveAttribute('data-available', 'true');
+    await expect(failures.getByTestId('overview-failures-rate')).toHaveAttribute('data-quality', 'derived');
+    expect(await failures.getByTestId('overview-failure-group').count()).toBeGreaterThanOrEqual(1);
+
+    // CLIENTS tile (gap 15 model): the heaviest client is the key-hash (api_001+002), shown as the
+    // one-way HASH (the auth-gated diagnostic purpose — never a raw key); api_006 is unattributed.
+    const clients = page.getByTestId('overview-clients');
+    await expect(clients).toHaveAttribute('data-available', 'true');
+    await expect(clients.getByTestId('overview-client-row').filter({ hasText: 'key-9f3a1c0b2d4e' }).first()).toBeVisible();
+    await expect(clients).toContainText(/unattributed/);
+    // The weak UA client is rendered with a `ua` badge (a fallback, not a confirmed identity).
+    await expect(clients.getByTestId('overview-client-row').filter({ hasText: 'python-httpx/0.27' }).first().getByTestId('overview-client-ua')).toBeVisible();
+
+    // TOKEN MIX: prompt is measured; the cached class is reported by some flows (api_001) so it is
+    // measured too — but reasoning, reported by none of the usage flows as > nothing, stays honest.
+    const mix = page.getByTestId('overview-token-mix');
+    await expect(mix).toHaveAttribute('data-available', 'true');
+    await expect(mix.getByTestId('overview-token-prompt')).toHaveAttribute('data-quality', 'measured');
+
+    // CONTEXT PRESSURE (gap 09 model): a derived peak (the known-window flows are measurable) with a
+    // measured/total coverage readout.
+    await expect(page.getByTestId('overview-context-coverage')).toContainText('measured');
+
+    expect(consoleErrors, 'console errors on the control-room overview').toEqual([]);
   });
 
   for (const view of VIEWS) {

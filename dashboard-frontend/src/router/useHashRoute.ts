@@ -1,13 +1,13 @@
 /**
- * Minimal hash router. The four views live at `#/flows`, `#/topology`, `#/sankey`,
- * `#/theater` (D9). No router dependency — a `hashchange` listener bridged into React
- * via useSyncExternalStore keeps it tear-free.
+ * Minimal hash router. The views live at `#/flows`, `#/topology`, `#/sankey`, `#/theater` (D9),
+ * and `#/overview` (gap 16 — the control-room overview that COMPOSES the other surfaces). No router
+ * dependency — a `hashchange` listener bridged into React via useSyncExternalStore keeps it tear-free.
  */
 import { useSyncExternalStore } from 'react';
 
-export type RouteName = 'flows' | 'topology' | 'sankey' | 'theater';
+export type RouteName = 'flows' | 'topology' | 'sankey' | 'theater' | 'overview';
 
-export const ROUTES: RouteName[] = ['flows', 'topology', 'sankey', 'theater'];
+export const ROUTES: RouteName[] = ['flows', 'topology', 'sankey', 'theater', 'overview'];
 
 const DEFAULT_ROUTE: RouteName = 'flows';
 

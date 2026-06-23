@@ -22,8 +22,13 @@ import { colors, prefersReducedMotion } from '../design/tokens';
 import { sparklineCounters } from './sparklineState';
 
 export interface SparklineProps {
-  /** The y series, oldest → newest. Empty/length<2 renders a flat baseline. */
-  data: number[];
+  /**
+   * The y series, oldest → newest. Empty/length<2 renders a flat baseline. A `null` (or any
+   * non-finite value — normalized to `null` at the boundary) is an HONEST GAP: uPlot breaks the
+   * path/fill across it and EXCLUDES it from the y-scale, so an unmeasurable point (e.g. an unpriced
+   * $/min tick) leaves a break, NEVER a fabricated `0` and never a poisoned scale.
+   */
+  data: (number | null)[];
   width?: number;
   height?: number;
   /** Stroke color (hex). Defaults to the accent token. */
@@ -53,12 +58,22 @@ function sparkOpts(width: number, height: number, stroke: string, reducedMotion:
   };
 }
 
-/** `number[]` (y, oldest→newest) → uPlot's `[x[], y[]]` aligned data with a synthetic index x. */
-function toAlignedData(data: number[]): uPlot.AlignedData {
+/**
+ * `(number|null)[]` (y, oldest→newest) → uPlot's `[x[], y[]]` aligned data with a synthetic index x.
+ * Any non-finite value (`NaN`/`Infinity`) is NORMALIZED to `null` here — uPlot treats ONLY `null` as
+ * a gap (a `NaN` would poison the y-scale/path), so this boundary keeps the gap semantics honest
+ * regardless of what the caller pushed.
+ */
+function toAlignedData(data: (number | null)[]): uPlot.AlignedData {
   const n = data.length;
   const xs = new Array<number>(n);
-  for (let i = 0; i < n; i++) xs[i] = i;
-  return [xs, data];
+  const ys = new Array<number | null>(n);
+  for (let i = 0; i < n; i++) {
+    xs[i] = i;
+    const v = data[i];
+    ys[i] = typeof v === 'number' && Number.isFinite(v) ? v : null;
+  }
+  return [xs, ys];
 }
 
 export function Sparkline({

@@ -26,7 +26,7 @@
  *  - NEVER a raw secret: the model only ever reads the already-hashed `client_label` (gap 04
  *    guarantees only the hash prefix exists); it never derives or surfaces a raw key.
  */
-import type { ClientSource, FlowSummary } from '../../api/types';
+import type { ClientSource, CostConfidence, FlowSummary } from '../../api/types';
 
 /** Provenance of a figure — mirrors the dashboard's measured/derived/estimated/unavailable tags. */
 export type Quality = 'measured' | 'derived' | 'estimated' | 'unavailable';
@@ -41,6 +41,30 @@ export const UNAVAILABLE = '—';
  *  - `unavailable` — no attribution at all (`—`; don't-lie-with-zeros).
  */
 export type ClientStrength = 'strong' | 'weak' | 'unavailable';
+
+/**
+ * The CONFIDENCE ORDER for the weakest-tag rule (cross-cutting acceptance 1): an aggregate that
+ * mixes confident + estimated priced inputs must surface the LOWER confidence (the floor is
+ * `unavailable` — no priced input). We only ever DOWNGRADE toward the floor as priced flows fold in.
+ */
+const CONFIDENCE_RANK: Record<CostConfidence, number> = { unavailable: 0, estimated: 1, confident: 2 };
+
+/** Fold a contributing priced flow's `cost_confidence` into a running aggregate, keeping the WEAKER. */
+function weakerConfidence(a: CostConfidence, b: CostConfidence): CostConfidence {
+  return CONFIDENCE_RANK[b] < CONFIDENCE_RANK[a] ? b : a;
+}
+
+/**
+ * Map an aggregate `cost_confidence` to its DQ tag (the SAME mapping the stats strip + the overview
+ * use): a `confident` summed cost is a real DERIVED figure; an `estimated` one (a contributing flow
+ * is priced via an unconfigured cache rate / unreported tokens) is a LABELLED estimate — NEVER
+ * silently shown as `measured`; `unavailable` ⇒ no priced flow (→ `—`).
+ */
+export function costConfidenceQuality(confidence: CostConfidence): Quality {
+  if (confidence === 'confident') return 'derived';
+  if (confidence === 'estimated') return 'estimated';
+  return 'unavailable';
+}
 
 /** Map a `ClientSource` to its display strength (the source-strength DQ tag). */
 export function sourceStrength(source: ClientSource | null | undefined): ClientStrength {
@@ -192,7 +216,13 @@ export interface ClientRollupRow {
   errorRateText: string;
   /** Summed cost across this client's PRICED flows (USD), or `null` when NONE were priced (→ `—`). */
   cost: number | null;
-  /** DQ tag for `cost`: `measured` when at least one flow was priced; `unavailable` when none (→ `—`). */
+  /** The AGGREGATE confidence of `cost` — the WEAKEST `cost_confidence` of the contributing priced flows. */
+  costConfidence: CostConfidence;
+  /**
+   * DQ tag for `cost`, from {@link costConfidence}: `derived` (all-confident priced), `estimated`
+   * (a contributing priced flow is an estimate — surfaced, never silently upgraded to `measured`),
+   * `unavailable` when none priced (→ `—`).
+   */
   costQuality: Quality;
   /** Count of this client's flows that carried a finite `cost` (the cost measurability denominator). */
   pricedFlows: number;
@@ -223,6 +253,8 @@ interface ClientAccum {
   failed: number;
   costSum: number;
   pricedFlows: number;
+  /** The running WEAKEST `cost_confidence` over this client's PRICED flows (starts at the ceiling). */
+  costConfidence: CostConfidence;
   latencySum: number;
   timedFlows: number;
 }
@@ -253,7 +285,8 @@ export function clientRollup(flows: readonly FlowSummary[] | null | undefined): 
     }
     let c = clients.get(key);
     if (!c) {
-      c = { label: key, source: null, total: 0, failed: 0, costSum: 0, pricedFlows: 0, latencySum: 0, timedFlows: 0 };
+      // Cost confidence starts at the CEILING (`confident`); each priced flow folds it to the weaker.
+      c = { label: key, source: null, total: 0, failed: 0, costSum: 0, pricedFlows: 0, costConfidence: 'confident', latencySum: 0, timedFlows: 0 };
       clients.set(key, c);
     }
     c.total += 1;
@@ -262,9 +295,12 @@ export function clientRollup(flows: readonly FlowSummary[] | null | undefined): 
     const src = flow.client_source ?? null;
     if (STRENGTH_RANK[sourceStrength(src)] > STRENGTH_RANK[sourceStrength(c.source)]) c.source = src;
     // Cost — only a finite priced flow contributes (an unpriced/`null` cost is NOT a measured `0`).
+    // The aggregate inherits the WEAKEST `cost_confidence` of those priced flows (don't silently
+    // upgrade an estimated client spend to a confident-looking total — cross-cutting rule 1).
     if (typeof flow.cost === 'number' && Number.isFinite(flow.cost)) {
       c.costSum += flow.cost;
       c.pricedFlows += 1;
+      c.costConfidence = weakerConfidence(c.costConfidence, flow.cost_confidence);
     }
     // Latency — only a finite duration contributes to the mean.
     if (typeof flow.elapsed_ms === 'number' && Number.isFinite(flow.elapsed_ms)) {
@@ -277,7 +313,11 @@ export function clientRollup(flows: readonly FlowSummary[] | null | undefined): 
   for (const c of clients.values()) {
     const strength = sourceStrength(c.source);
     const errorRatePct = c.total > 0 ? (c.failed / c.total) * 100 : 0;
-    const cost = c.pricedFlows > 0 ? c.costSum : null;
+    const priced = c.pricedFlows > 0;
+    const cost = priced ? c.costSum : null;
+    // No priced flow ⇒ the aggregate confidence collapses to `unavailable` (it never weakened from
+    // a priced flow); else the running WEAKEST priced-flow confidence drives the DQ tag.
+    const costConfidence: CostConfidence = priced ? c.costConfidence : 'unavailable';
     const avgLatencyMs = c.timedFlows > 0 ? c.latencySum / c.timedFlows : null;
     built.push({
       key: c.label,
@@ -291,7 +331,8 @@ export function clientRollup(flows: readonly FlowSummary[] | null | undefined): 
       errorRatePct,
       errorRateText: fmtRate(errorRatePct),
       cost,
-      costQuality: cost === null ? 'unavailable' : 'measured',
+      costConfidence,
+      costQuality: costConfidenceQuality(costConfidence),
       pricedFlows: c.pricedFlows,
       avgLatencyMs,
       latencyQuality: avgLatencyMs === null ? 'unavailable' : 'derived',

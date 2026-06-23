@@ -113,10 +113,10 @@ describe('clientRollup — aggregate cost / errors / latency by client', () => {
     expect(m.unattributedFlows).toBe(2); // counted explicitly, not invented as a client
   });
 
-  it('groups multiple flows under one client; sums priced cost + means timed latency (measured/derived)', () => {
+  it('groups multiple flows under one client; sums priced cost + means timed latency (confident ⇒ derived)', () => {
     const m = clientRollup([
-      flow({ client_label: 'key-A', client_source: 'key_hash', status: 'completed', cost: 0.006, elapsed_ms: 2400 }),
-      flow({ client_label: 'key-A', client_source: 'key_hash', status: 'completed', cost: 0.002, elapsed_ms: 4200 }),
+      flow({ client_label: 'key-A', client_source: 'key_hash', status: 'completed', cost: 0.006, cost_confidence: 'confident', elapsed_ms: 2400 }),
+      flow({ client_label: 'key-A', client_source: 'key_hash', status: 'completed', cost: 0.002, cost_confidence: 'confident', elapsed_ms: 4200 }),
     ]);
     expect(m.available).toBe(true);
     expect(m.rows.length).toBe(1);
@@ -125,13 +125,37 @@ describe('clientRollup — aggregate cost / errors / latency by client', () => {
     expect(row.total).toBe(2);
     expect(row.failed).toBe(0);
     expect(row.errorRateText).toBe('0%'); // measured-base zero, NOT —
-    // cost summed (priced), latency averaged (timed).
+    // cost summed (priced), latency averaged (timed). An all-confident priced client is `derived`.
     expect(row.cost).toBeCloseTo(0.008, 6);
-    expect(row.costQuality).toBe('measured');
+    expect(row.costConfidence).toBe('confident');
+    expect(row.costQuality).toBe('derived');
     expect(row.pricedFlows).toBe(2);
     expect(row.avgLatencyMs).toBe(3300);
     expect(row.latencyQuality).toBe('derived');
     expect(row.strength).toBe('strong');
+  });
+
+  it('a client mixing confident + estimated priced flows inherits the WEAKER (estimated) — never silently measured/confident', () => {
+    const m = clientRollup([
+      flow({ client_label: 'key-A', client_source: 'key_hash', status: 'completed', cost: 0.006, cost_confidence: 'confident' }),
+      flow({ client_label: 'key-A', client_source: 'key_hash', status: 'completed', cost: 0.002, cost_confidence: 'estimated' }),
+    ]);
+    const row = m.rows[0]!;
+    expect(row.cost).toBeCloseTo(0.008, 6);
+    expect(row.costConfidence).toBe('estimated'); // weakest wins
+    expect(row.costQuality).toBe('estimated'); // surfaced/labelled, NOT 'measured'
+  });
+
+  it('an unpriced flow does NOT weaken a priced client tag (only priced flows fold confidence)', () => {
+    const m = clientRollup([
+      flow({ client_label: 'key-A', client_source: 'key_hash', status: 'completed', cost: 0.05, cost_confidence: 'confident' }),
+      flow({ client_label: 'key-A', client_source: 'key_hash', status: 'failed', cost: null, cost_confidence: 'unavailable' }),
+    ]);
+    const row = m.rows[0]!;
+    expect(row.cost).toBeCloseTo(0.05, 6);
+    expect(row.pricedFlows).toBe(1);
+    expect(row.costConfidence).toBe('confident'); // the unpriced flow didn't drag it to unavailable
+    expect(row.costQuality).toBe('derived');
   });
 
   it('derives a per-client error rate; an unpriced/untimed client reads — (never a fabricated $0.00 / 0ms)', () => {
