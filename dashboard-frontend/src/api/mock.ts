@@ -164,8 +164,36 @@ function seedFlows(): FlowSummary[] {
         { provider: 'openai', model: 'gpt-4o', start_ms: now - 8350, end_ms: now - 6200, first_upstream_byte_ms: now - 8050, status: 'served' },
       ],
     },
+    // Gap 14: a FAILED flow on vllm-b/llama with a terminal_reason but NO captured upstream_response
+    // (capture is OFF for it) — the ErrorTab must show an explicit "capture disabled" state, NOT a
+    // blank implying "no error". Also feeds the aggregate taxonomy (vllm-b group, timeout reason).
+    {
+      api_call_id: 'api_006', response_id: null, method: 'POST', uri: '/v1/chat/completions', status: 'failed',
+      model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-b',
+      usage: null, started_ms: now - 40000, finished_ms: now - 39000, elapsed_ms: 1000,
+      terminal_reason: 'upstream timeout', cost: null, cost_confidence: 'unavailable',
+      ingress_ms: now - 40000, normalization_done_ms: now - 39970, routing_decision_ms: now - 39950,
+      finalize_ms: now - 39000,
+      attempts: [
+        { provider: 'vllm-b', model: 'llama-3.1-70b', start_ms: now - 39950, end_ms: now - 39000, status: 'failed', error_class: 'timeout', failover_reason: 'terminal_no_failover' },
+      ],
+    },
   ];
 }
+
+/**
+ * Gap 14 — the captured upstream RESPONSE/ERROR body the mock attaches to the LIVE `/flows/:id`
+ * detail (NEVER the list rows / snapshot summaries — body-free invariant), keyed by `api_call_id`,
+ * mirroring the Rust `FlowDetailBody.upstream_response`. ONLY `api_003` has capture ON (a real error
+ * body); every other id is ABSENT ⇒ the ErrorTab reads "capture disabled" (don't-lie-with-zeros). This
+ * proves both the capture-ON (body shown) and capture-OFF (explicit disabled) states in e2e.
+ */
+const UPSTREAM_RESPONSE_BY_ID: Record<string, FlowDetail['upstream_response']> = {
+  api_003: {
+    body: { error: { message: 'Service Unavailable: upstream pool exhausted', type: 'server_error', code: 503 } },
+    truncated: false,
+  },
+};
 
 function buildMetrics(): MetricsResponse {
   const win = (m: number) => {
@@ -371,6 +399,10 @@ function buildFlowDetail(id: string): FlowDetail | null {
     inbound_headers: { 'content-type': 'application/json', authorization: 'Bearer ***' },
     normalized: { model: base.model_served, input: [{ role: 'user', content: 'Hi' }] },
     upstream_body: { model: base.model_served, messages: [{ role: 'user', content: 'Hi' }], stream: true },
+    // Gap 14: project the captured upstream error body onto the LIVE detail (only for ids with
+    // capture ON; absent otherwise ⇒ the ErrorTab's "capture disabled" state). Mirrors the Rust
+    // `FlowDetailBody.upstream_response` (live-detail only, never the body-free summaries).
+    upstream_response: UPSTREAM_RESPONSE_BY_ID[base.api_call_id],
     model_requested: base.model_requested,
     model_served: base.model_served,
     upstream_target: base.upstream_target,

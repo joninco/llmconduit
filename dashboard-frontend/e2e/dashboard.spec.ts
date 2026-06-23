@@ -272,6 +272,59 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on the per-provider tooltip').toEqual([]);
   });
 
+  // Gap 14: the AGGREGATE failure taxonomy panel groups failures by reason × provider/model with a
+  // DERIVED error rate (+ an overall error-rate chip), and the inspector ErrorTab shows the captured
+  // upstream error body when capture is ON — and an explicit "capture disabled" state when OFF (NOT a
+  // blank implying "no error"). Rows are selected by stable `api_call_id` (gap-11 selector hygiene).
+  test('failure taxonomy panel + ErrorTab capture on/off (gap 14)', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[0]!); // Flows
+    await page.waitForTimeout(400);
+
+    // The aggregate panel renders (flows ARE observed). The overall error-rate chip is derived (not —).
+    const panel = page.getByTestId('failure-taxonomy');
+    await expect(panel).toBeVisible();
+    const chip = page.getByTestId('failure-error-rate');
+    await expect(chip).toHaveAttribute('data-quality', 'derived');
+    await expect(page.getByTestId('failure-error-rate-value')).not.toHaveText('—'); // a measured/derived rate
+    await expect(page.getByTestId('failure-grouping-quality')).toHaveAttribute('data-quality', 'measured');
+
+    // The mock has FAILED flows on openai/gpt-4o (api_003, 503) and vllm-b/llama (api_006, timeout) ⇒
+    // at least those two failure groups are listed, each with a derived rate + a reason chip.
+    const groups = panel.getByTestId('failure-group');
+    expect(await groups.count()).toBeGreaterThanOrEqual(2);
+    // The vllm-b group (api_006, timeout) is present with a derived rate. Its reason chip uses a
+    // BOUNDED gap-03 key (`class:timeout`), NOT the free-form terminal_reason string (review HIGH).
+    const vllmGroup = panel.getByTestId('failure-group').filter({ has: page.getByTestId('failure-group-provider').filter({ hasText: 'vllm-b' }) }).first();
+    await expect(vllmGroup.getByTestId('failure-group-rate')).toHaveAttribute('data-quality', 'derived');
+    const timeoutReason = vllmGroup.getByTestId('failure-reason').filter({ hasText: 'timeout' }).first();
+    await expect(timeoutReason).toBeVisible();
+    await expect(timeoutReason).toHaveAttribute('data-reason-key', 'class:timeout');
+    await expect(timeoutReason).toHaveAttribute('data-source', 'error_class');
+
+    // ErrorTab — capture ON: api_003 (failed, 503) has a CAPTURED upstream error body. Select by id.
+    await page.getByTestId('flow-row').filter({ hasText: 'api_003' }).first().click();
+    await expect(page.getByTestId('flow-detail')).toBeVisible();
+    await page.getByRole('tab', { name: 'Error' }).click();
+    const capture = page.getByTestId('error-capture');
+    await expect(capture).toHaveAttribute('data-state', 'captured');
+    await expect(capture).toHaveAttribute('data-quality', 'measured');
+    await expect(page.getByTestId('error-capture-body')).toContainText('Service Unavailable');
+
+    // ErrorTab — capture OFF: api_006 (failed, timeout) has NO captured body ⇒ explicit "capture
+    // disabled" state (unavailable), NOT a blank implying "no error".
+    await page.getByTestId('flow-row').filter({ hasText: 'api_006' }).first().click();
+    await page.getByRole('tab', { name: 'Error' }).click();
+    const capture2 = page.getByTestId('error-capture');
+    await expect(capture2).toHaveAttribute('data-state', 'unavailable');
+    await expect(page.getByTestId('error-capture-disabled')).toBeVisible();
+    await expect(page.getByTestId('error-capture-disabled')).toContainText(/capture disabled/i);
+    // The terminal reason is still shown — this IS an error; the capture-disabled note is additive.
+    await expect(page.getByTestId('error-tab')).toContainText('upstream timeout');
+
+    expect(consoleErrors, 'console errors on the failure taxonomy').toEqual([]);
+  });
+
   for (const view of VIEWS) {
     test(`${view.name}: renders + no console errors + matches baseline`, async ({ page, consoleErrors }) => {
       await login(page);

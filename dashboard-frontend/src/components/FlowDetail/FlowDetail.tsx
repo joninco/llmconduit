@@ -30,6 +30,7 @@ import { latencyBreakdown, type LatencyBreakdown as LatencyBreakdownModel, type 
 import { LatencyBreakdown } from './LatencyBreakdown';
 import { attemptTrace, type AttemptTrace as AttemptTraceModel } from './attemptTrace';
 import { AttemptTrace } from './AttemptTrace';
+import { capturedErrorBody } from '../FlowTable/failureTaxonomy';
 import { pickAttempts } from '../../api/attempts';
 import { useCatalog } from '../FlowTable/useCatalog';
 import { JsonPane } from '../viz/JsonPane';
@@ -288,7 +289,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
             leaks; Timeline reads the cut-bounded monitor join (finding 1). */}
         {tab === 'headers' && <HeadersTab headers={frozenDetail?.inbound_headers} />}
         {tab === 'timeline' && <Timeline events={join.events} />}
-        {tab === 'error' && <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} />}
+        {tab === 'error' && <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} seeking={seeking} />}
       </div>
 
       {/* deltas sub-panel */}
@@ -605,11 +606,42 @@ function HeadersTab({ headers }: { headers?: Record<string, string> }) {
   );
 }
 
-function ErrorTab({ detail, liveFlow, joinError }: { detail: FlowDetailDto | null; liveFlow: FlowSummary | null; joinError: string | null }) {
+/**
+ * The Error tab (gap 14 enriched): the terminal reason + monitor error, PLUS the captured upstream
+ * error BODY (gap 05's `upstream_response`, live-detail only) when present. The capture state is
+ * EXPLICIT (spec 14 don't-lie-with-zeros): a captured body is shown (`measured`, truncation flagged);
+ * when capture is OFF/no body, an ERROR flow shows an explicit `unavailable` line — NEVER a blank that
+ * implies "no error".
+ *
+ * The "No error." empty state depends ONLY on `!isError` (review round-3 HIGH): a FAILED/error flow
+ * must NEVER read "No error.", regardless of `seeking` or whether live-body capture is suppressed. So
+ * the capture block renders whenever `isError`. The captured body itself is live-detail only (`detail`
+ * is `frozenDetail`, `null` while seeking), so on a SEEKED historical flow it is honestly UNAVAILABLE
+ * and labelled as the HISTORICAL state ("capture unavailable on historical view"), DISTINCT from the
+ * live capture-disabled state — never "No error.".
+ */
+function ErrorTab({ detail, liveFlow, joinError, seeking }: { detail: FlowDetailDto | null; liveFlow: FlowSummary | null; joinError: string | null; seeking: boolean }) {
   const reason = liveFlow?.terminal_reason ?? detail?.terminal_reason ?? null;
-  if (!reason && !joinError) {
+  const status = liveFlow?.status ?? detail?.status ?? null;
+  // A GENUINE error/failure — the flow FAILED, or a monitor error was reported. This (NOT a benign
+  // `terminal_reason`, which a CLEAN completed flow also carries, e.g. `response.completed`) is what
+  // warrants the upstream error-body capture block. Decoupled from `seeking`/capture suppression
+  // (review round-3 HIGH): an error/failed flow ALWAYS renders the capture block + NEVER "No error.".
+  const isError = status === 'failed' || !!joinError;
+  const captured = capturedErrorBody(detail?.upstream_response);
+
+  // "No error." ONLY when there is genuinely nothing to show: NOT an error AND no terminal reason to
+  // display. A failed flow (`isError`) NEVER reaches here — regardless of `seeking` or whether the
+  // live body is suppressed (review round-3 HIGH). A clean completed flow with a benign
+  // `terminal_reason` shows that reason (below) but no capture block (it is not an error).
+  if (!isError && !reason) {
     return <div className="px-3 py-3 text-xs italic text-text-muted" data-testid="error-empty">No error.</div>;
   }
+
+  // The captured body is LIVE-detail only. While SEEKING a historical flow there is no live body, so
+  // the unavailable reason is the HISTORICAL view (not "capture disabled") — labelled honestly so the
+  // operator knows the body may exist live but is unavailable for this frozen cut.
+  const captureUnavailableHistorical = seeking;
   return (
     <div className="px-3 py-2 text-xs" data-testid="error-tab">
       {reason && (
@@ -619,11 +651,55 @@ function ErrorTab({ detail, liveFlow, joinError }: { detail: FlowDetailDto | nul
         </div>
       )}
       {joinError && (
-        <div>
+        <div className="mb-1">
           <span className="text-text-muted">monitor error: </span>
           <span className="font-mono text-status-down">{joinError}</span>
         </div>
       )}
+      {/* The upstream error-body capture block renders for a GENUINE error/failure ONLY (a benign
+          completed `terminal_reason` shows above but warrants no error body). It ALWAYS renders for an
+          error flow — captured (`measured`), the historical-view `unavailable` state while seeking, or
+          the live capture-disabled `unavailable` state — NEVER omitted into a blank "no error". */}
+      {isError && (
+        <div className="mt-1 border-t border-line/60 pt-1.5" data-testid="error-capture" data-state={captured.state} data-quality={captured.quality}>
+          <div className="mb-1 flex items-center gap-1.5">
+            <span className="text-[10px] uppercase tracking-wide text-text-muted">upstream error body</span>
+            {captured.state === 'captured' && captured.truncated && (
+              <span className="rounded-sm bg-status-cooling/15 px-1 text-[9px] uppercase text-status-cooling" data-testid="error-capture-truncated" title="truncated by the capture cap — a prefix of the full body">
+                truncated
+              </span>
+            )}
+          </div>
+          {captured.state === 'captured' ? (
+            // The captured upstream error body — shown to the operator (an auth-gated DIAGNOSTIC
+            // surface; showing the upstream error body is the WHOLE POINT of capturing it).
+            <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-words rounded-sm bg-bg/60 p-1.5 font-mono text-[10px] text-text" data-testid="error-capture-body" title={captured.detail}>
+              {fmtCapturedBody(captured.body)}
+            </pre>
+          ) : captureUnavailableHistorical ? (
+            // SEEKING a historical flow: the body is LIVE-only, so it is UNAVAILABLE for this frozen cut
+            // (NOT "capture disabled" — it may exist live). Explicit, never a blank implying "no error".
+            <div className="rounded-sm border border-dashed border-line/70 px-1.5 py-1 text-[10px] italic text-text-muted" data-testid="error-capture-historical" title="the captured upstream error body is live-detail only and is unavailable on a historical (seeked) view — not a claim that no error occurred">
+              capture unavailable on historical view — the upstream error body is live-only. Not "no error".
+            </div>
+          ) : (
+            // LIVE error flow, capture DISABLED / no body / evicted — explicit (NOT a blank).
+            <div className="rounded-sm border border-dashed border-line/70 px-1.5 py-1 text-[10px] italic text-text-muted" data-testid="error-capture-disabled" title={captured.detail}>
+              capture disabled — no upstream error body captured (set LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE=1). Not "no error".
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
+}
+
+/** Render a captured upstream error body (JSON value or string) as readable text for the tab. */
+function fmtCapturedBody(body: unknown): string {
+  if (typeof body === 'string') return body.length > 0 ? body : '(empty body)';
+  try {
+    return JSON.stringify(body, null, 2);
+  } catch {
+    return String(body);
+  }
 }

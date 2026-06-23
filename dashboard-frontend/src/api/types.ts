@@ -678,6 +678,15 @@ export interface FlowDetail extends PhaseTimings {
   inbound_headers?: Record<string, string>;
   normalized?: unknown;
   upstream_body?: unknown;
+  /**
+   * Gap 05 / 14 — the captured upstream RESPONSE/ERROR body (`{body, truncated}`), projected onto
+   * this LIVE detail path ONLY by the Rust side. ABSENT ⇒ capture disabled / no captured body
+   * (UNAVAILABLE — the ErrorTab shows an explicit "capture disabled" state, never a misleading
+   * blank); PRESENT ⇒ a real captured body. Like the three captured bodies above, it is live-only
+   * (the inspector reads it from the live detail, never the frozen snapshot cut). See
+   * {@link FlowUpstreamResponse}.
+   */
+  upstream_response?: FlowUpstreamResponse | null;
   model_requested?: string | null;
   model_served?: string | null;
   upstream_target?: string | null;
@@ -699,6 +708,29 @@ export interface FlowDetail extends PhaseTimings {
   attempts?: Attempt[];
   /** Gap 03 — flow-level wire TTFB (the served attempt's first on-wire byte); `null`/absent, never `0`. */
   first_upstream_byte_ms?: number | null;
+}
+
+/**
+ * Gap 05 / 14 — the captured upstream RESPONSE/ERROR body on the LIVE `/flows/:id` detail (the
+ * Rust `FlowUpstreamResponse`, projected from `FlowRecord.upstream_response` by gap 05 review F2).
+ * It is the redacted, capped upstream error body the gateway received, parsed back to a JSON value
+ * (or a STRING value for a non-JSON / `[redacted: unparseable body …]` marker), plus a `truncated`
+ * flag so the inspector shows a PARTIAL body honestly rather than as complete.
+ *
+ * PRESENCE is load-bearing for gap 14's don't-lie-with-zeros: the whole `upstream_response` field is
+ * ABSENT on `FlowDetail` unless capture is ARMED
+ * (`LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE=1`) AND the turn produced an upstream error body.
+ * So ABSENT ⇒ "capture disabled / no captured body" (UNAVAILABLE — the ErrorTab shows an explicit
+ * "capture disabled" state, NEVER a blank that implies "no error"); PRESENT ⇒ a real captured body
+ * (even an EMPTY upstream body parses to the string `""`, distinct from the field being absent).
+ * DELIBERATELY kept OFF the body-free `FlowSummary` list rows + `SnapshotFlowSummary` (the 135 GiB
+ * body-free-snapshot invariant) — it rides ONLY on the live detail, like the three captured bodies.
+ */
+export interface FlowUpstreamResponse {
+  /** The redacted/capped upstream error body, parsed to JSON (or a string for non-JSON/marker). */
+  body: unknown;
+  /** Whether the cap TRUNCATED the raw body (the retained bytes are a prefix) — flag it honestly. */
+  truncated: boolean;
 }
 
 /** `GET /dashboard/api/metrics` */
@@ -965,6 +997,19 @@ export function isProviderLatency(v: unknown): v is ProviderLatency {
 /** Optional per-provider metrics: absent, null, or a valid `ProviderLatency` (gap 12/13). */
 function isOptProviderLatency(v: unknown): boolean {
   return v === undefined || v === null || isProviderLatency(v);
+}
+
+/**
+ * Gap 05 / 14 — validates the captured upstream error body (`FlowUpstreamResponse`). The `/flows/:id`
+ * detail is fetched (not pushed through the strict WS pipe), but the captured body is OPERATOR-FACING
+ * and heterogeneous, so the gap-14 model re-checks the shape before rendering it: `truncated` MUST be
+ * a boolean and `body` MUST be present (it is `unknown` — any JSON value, incl. the string `""` for an
+ * empty/non-JSON body; only `undefined` is rejected, which would mean the field was malformed). A
+ * malformed object falls back to the "capture disabled / no body" UNAVAILABLE state — never a blank
+ * that implies "no error".
+ */
+export function isFlowUpstreamResponse(v: unknown): v is FlowUpstreamResponse {
+  return isObj(v) && typeof v.truncated === 'boolean' && 'body' in v && v.body !== undefined;
 }
 
 function isProviderHealth(v: unknown): v is ProviderHealth {

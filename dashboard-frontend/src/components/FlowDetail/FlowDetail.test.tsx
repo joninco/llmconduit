@@ -600,6 +600,114 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
   });
 });
 
+describe('FlowDetail — ErrorTab captured upstream body (gap 14)', () => {
+  beforeEach(() => {
+    // Mock mode: mockFetch serves /flows/:id incl. the gap-05 `upstream_response` (capture ON only
+    // for api_003). Seed the two FAILED flows so the inspector opens with their failed status.
+    resetWorld({ mock: true });
+    seedFlows([
+      makeFlow({ api_call_id: 'api_003', status: 'failed', model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai', terminal_reason: 'upstream 503', started_ms: 1_700_000_000_000 }),
+      makeFlow({ api_call_id: 'api_006', status: 'failed', model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-b', terminal_reason: 'upstream timeout', started_ms: 1_700_000_000_000 }),
+    ]);
+  });
+  afterEach(cleanup);
+
+  it('capture ON: shows the captured upstream error body (measured) when present', async () => {
+    const { getByTestId, getByRole } = renderWithQuery(<FlowDetail apiCallId="api_003" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    fireEvent.click(getByRole('tab', { name: 'Error' }));
+    // The captured-body section is present + measured, and renders the upstream error JSON.
+    await waitFor(() => expect(getByTestId('error-capture')).toBeTruthy());
+    const capture = getByTestId('error-capture');
+    expect(capture.getAttribute('data-state')).toBe('captured');
+    expect(capture.getAttribute('data-quality')).toBe('measured');
+    expect(getByTestId('error-capture-body').textContent).toContain('Service Unavailable');
+    // No "capture disabled" placeholder when a body IS present.
+    expect(within(capture).queryByTestId('error-capture-disabled')).toBeNull();
+  });
+
+  it('capture OFF: shows an explicit "capture disabled" state — NOT a blank implying "no error"', async () => {
+    const { getByTestId, getByRole } = renderWithQuery(<FlowDetail apiCallId="api_006" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    fireEvent.click(getByRole('tab', { name: 'Error' }));
+    await waitFor(() => expect(getByTestId('error-capture')).toBeTruthy());
+    const capture = getByTestId('error-capture');
+    // Unavailable state — explicit "capture disabled", tagged unavailable (don't-lie-with-zeros).
+    expect(capture.getAttribute('data-state')).toBe('unavailable');
+    expect(capture.getAttribute('data-quality')).toBe('unavailable');
+    const disabled = getByTestId('error-capture-disabled');
+    expect(disabled.textContent).toMatch(/capture disabled/i);
+    expect(disabled.textContent).toMatch(/Not "no error"/);
+    // The terminal reason still shows (this IS an error) — the capture-disabled is ADDITIVE, not "no error".
+    expect(getByTestId('error-tab').textContent).toContain('upstream timeout');
+    // And there is no captured body element.
+    expect(within(capture).queryByTestId('error-capture-body')).toBeNull();
+  });
+
+  it('FAILED flow + NO terminal_reason + NO monitor error + capture OFF ⇒ the unavailable capture block, NOT "No error." (review round-2 HIGH)', async () => {
+    // An id the mock does NOT know (so /flows/:id 404s and never overwrites our injected detail).
+    // The store row is FAILED; the injected detail has NO terminal_reason and NO upstream_response.
+    seedFlows([makeFlow({ api_call_id: 'api_bare_fail', status: 'failed', started_ms: 1_700_000_000_000 })]);
+    const bare: FlowDetailDto = {
+      flow_seq: 1, api_call_id: 'api_bare_fail', status: 'failed', cost_confidence: 'unavailable',
+      deltas: [], started_ms: 1_700_000_000_000,
+      // terminal_reason + upstream_response intentionally ABSENT.
+    };
+    const { getByTestId, getByRole, queryByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_bare_fail" onClose={noop} />);
+    act(() => queryClient.setQueryData(['flows', 'api_bare_fail'], bare));
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    fireEvent.click(getByRole('tab', { name: 'Error' }));
+    // It must NOT short-circuit to "No error." — the explicit capture-disabled/unavailable block renders.
+    await waitFor(() => expect(getByTestId('error-capture')).toBeTruthy());
+    expect(queryByTestId('error-empty')).toBeNull();
+    const capture = getByTestId('error-capture');
+    expect(capture.getAttribute('data-state')).toBe('unavailable');
+    expect(capture.getAttribute('data-quality')).toBe('unavailable');
+    expect(getByTestId('error-capture-disabled').textContent).toMatch(/capture disabled/i);
+  });
+
+  it('SEEKING a FAILED historical flow (no terminal_reason/monitor error) ⇒ the capture block (historical unavailable), NOT "No error." (review round-3 HIGH)', async () => {
+    // A historically-FAILED flow in the frozen snapshot, with NO terminal_reason. While seeking, the
+    // live body is suppressed (live-only) — so the capture block must render the HISTORICAL unavailable
+    // state, NOT fall through to "No error." (the round-3 seek-path violation).
+    seedFlows([makeFlow({ api_call_id: 'api_seek_fail', status: 'failed', terminal_reason: null, started_ms: 1_700_000_000_000 })]);
+    const { getByTestId, getByRole, queryByTestId } = renderWithQuery(<FlowDetail apiCallId="api_seek_fail" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    // Enter seek (D11 paused) — the connection flips to 'seeking'; the frozen row IS the failed flow.
+    act(() => dashboardStore.getState().setConnection('seeking'));
+    fireEvent.click(getByRole('tab', { name: 'Error' }));
+    // Must NOT read "No error." — the explicit historical-unavailable capture block renders instead.
+    await waitFor(() => expect(getByTestId('error-capture')).toBeTruthy());
+    expect(queryByTestId('error-empty')).toBeNull();
+    const capture = getByTestId('error-capture');
+    expect(capture.getAttribute('data-state')).toBe('unavailable');
+    expect(capture.getAttribute('data-quality')).toBe('unavailable');
+    // It is the HISTORICAL state (live-only), distinct from the live "capture disabled" wording.
+    const historical = getByTestId('error-capture-historical');
+    expect(historical.textContent).toMatch(/historical view/i);
+    expect(historical.textContent).toMatch(/Not "no error"/);
+    expect(queryByTestId('error-capture-disabled')).toBeNull();
+    expect(queryByTestId('error-capture-body')).toBeNull();
+  });
+
+  it('SUCCESSFUL flow with no error still reads "No error." (the distinction is preserved)', async () => {
+    // An id the mock does NOT know; a COMPLETED store row + an injected detail with no error/no body.
+    seedFlows([makeFlow({ api_call_id: 'api_ok_noerr', status: 'completed', started_ms: 1_700_000_000_000 })]);
+    const ok: FlowDetailDto = {
+      flow_seq: 1, api_call_id: 'api_ok_noerr', status: 'completed', cost_confidence: 'unavailable',
+      deltas: [], started_ms: 1_700_000_000_000,
+    };
+    const { getByTestId, getByRole, queryByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_ok_noerr" onClose={noop} />);
+    act(() => queryClient.setQueryData(['flows', 'api_ok_noerr'], ok));
+    await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
+    fireEvent.click(getByRole('tab', { name: 'Error' }));
+    // A clean success ⇒ "No error." (no capture-disabled nag on a non-error flow).
+    await waitFor(() => expect(getByTestId('error-empty')).toBeTruthy());
+    expect(getByTestId('error-empty').textContent).toContain('No error.');
+    expect(queryByTestId('error-capture')).toBeNull();
+  });
+});
+
 describe('FlowDetail — time-travel seek + body eviction', () => {
   beforeEach(() => {
     resetWorld({ mock: true });

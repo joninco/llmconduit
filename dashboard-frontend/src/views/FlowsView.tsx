@@ -17,6 +17,7 @@
 import { useState } from 'react';
 import { FlowTable } from '../components/FlowTable/FlowTable';
 import { FlowDetail } from '../components/FlowDetail/FlowDetail';
+import { FailureTaxonomy } from '../components/FlowTable/FailureTaxonomy';
 import { useDashboard } from '../store/hooks';
 
 export function FlowsView() {
@@ -30,7 +31,13 @@ export function FlowsView() {
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1" data-testid="flows-view">
-      <FlowTable selectedId={effectiveId} onSelect={setSelectedId} />
+      {/* Left column: the AGGREGATE failure taxonomy (gap 14) above the virtualized flow table — so
+          the operator sees "what is failing and why, in aggregate" before drilling one red row. The
+          panel renders only when flows are observed (else it's absent — don't-lie-with-zeros). */}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <FailureTaxonomy />
+        <FlowTable selectedId={effectiveId} onSelect={setSelectedId} />
+      </div>
       {effectiveId && <FlowDetail key={effectiveId} apiCallId={effectiveId} onClose={() => setSelectedId(null)} />}
     </div>
   );
