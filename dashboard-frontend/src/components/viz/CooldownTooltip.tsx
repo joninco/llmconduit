@@ -1,20 +1,26 @@
 /**
- * CooldownTooltip (D12) — the hover card for a topology provider node. Surfaces the D4
+ * CooldownTooltip (D12 · gap 13) — the hover card for a topology provider node. Surfaces the D4
  * `ProviderHealth` detail the radial map can't show inline: the cooldown countdown
- * (`cooling_until_ms`), last error, failover/consecutive-failure counters, served count, the p99
- * latency (finding 6), and the catalog size. Positioned as a fixed overlay at the hovered node's
- * screen coordinates (the topology reports them via `onHover`), so d3 keeps owning the SVG while
- * React owns the tooltip.
+ * (`cooling_until_ms`), last error, failover/consecutive-failure counters, served count, the
+ * catalog size — and (gap 13) THIS provider's per-provider p50/p95/p99 + error rate + per-class
+ * failure distribution. Positioned as a fixed overlay at the hovered node's screen coordinates (the
+ * topology reports them via `onHover`), so d3 keeps owning the SVG while React owns the tooltip.
  *
  * The countdown is computed against an EXPLICIT `nowMs` clock supplied by the view (finding 1): live
  * it is the wall clock (ticked once a second); while SEEKING it is FROZEN to `seekAtMs` so the
  * historical view never advances into the future (a cooldown that was 8 s out at the seeked instant
- * stays "cools in 8s", not a value that drifts as real time passes). The provider-level p99 is not
- * on the D4 DTO, so the view sources it from the metrics window (frozen cut while seeking) and
- * passes the overall-window value with a clear "window" label (finding 6).
+ * stays "cools in 8s", not a value that drifts as real time passes).
+ *
+ * Gap 13: the tooltip previously showed the GLOBAL metrics-window p99 (it could not tell an operator
+ * WHICH upstream was degrading). It now shows the PER-PROVIDER latency tile, sourced from the
+ * spec-12 `ProviderLatency` the view reads off the REST `/topology` (live) / `/snapshot` (seek) node
+ * — NOT the live WS topology frame, which carries `per_provider` ABSENT (it does not join the
+ * metrics window). An absent entry (a provider with no in-window samples) renders `—` honestly.
  */
-import type { ProviderHealth } from '../../api/types';
+import type { ProviderHealth, ProviderLatency } from '../../api/types';
 import { statusColor } from '../../design/tokens';
+import { ProviderLatencyTile } from './ProviderLatencyTile';
+import { buildProviderLatency } from './providerLatency';
 
 /** Format a future `cooling_until_ms` as a countdown ("cools in 8s") against `nowMs`, else "—". */
 function cooldownLabel(coolingUntilMs: number | null, nowMs: number): string {
@@ -22,12 +28,6 @@ function cooldownLabel(coolingUntilMs: number | null, nowMs: number): string {
   const remaining = coolingUntilMs - nowMs;
   if (remaining <= 0) return 'ready';
   return `cools in ${Math.ceil(remaining / 1000)}s`;
-}
-
-/** Format a p99 latency (ms) for the tooltip, or "—" when unavailable. */
-function p99Label(p99: number | null): string {
-  if (p99 == null) return '—';
-  return `${Math.round(p99)}ms`;
 }
 
 export interface CooldownTooltipProps {
@@ -38,16 +38,21 @@ export interface CooldownTooltipProps {
   y: number;
   /** The clock the countdown is measured against: wall clock live, FROZEN `seekAtMs` while seeking. */
   nowMs: number;
-  /** Overall metrics-window p99 (ms) — frozen while seeking; null when unavailable (finding 6). */
-  p99: number | null;
+  /**
+   * Gap 13 — THIS provider's per-provider latency/error metrics (spec-12 `ProviderLatency`), read
+   * by the view off the REST/snapshot topology node. `null`/`undefined` ⇒ no in-window samples ⇒
+   * the tile renders `—` (unavailable), never a fabricated `0`.
+   */
+  perProvider: ProviderLatency | null | undefined;
 }
 
-export function CooldownTooltip({ health: h, x, y, nowMs, p99 }: CooldownTooltipProps) {
+export function CooldownTooltip({ health: h, x, y, nowMs, perProvider }: CooldownTooltipProps) {
+  const providerModel = buildProviderLatency(perProvider, h.id);
   return (
     <div
       role="tooltip"
       data-testid="cooldown-tooltip"
-      className="pointer-events-none fixed z-50 w-60 -translate-x-1/2 translate-y-3 rounded-md border border-line bg-panel-raised p-2.5 text-xs shadow-lg"
+      className="pointer-events-none fixed z-50 w-64 -translate-x-1/2 translate-y-3 rounded-md border border-line bg-panel-raised p-2.5 text-xs shadow-lg"
       style={{ left: x, top: y }}
     >
       <div className="mb-1 flex items-center gap-2">
@@ -64,13 +69,12 @@ export function CooldownTooltip({ health: h, x, y, nowMs, p99 }: CooldownTooltip
         <dd className="text-right tabular-nums text-text">{h.failover_count}</dd>
         <dt>consec. fails</dt>
         <dd className="text-right tabular-nums text-text">{h.consecutive_failures}</dd>
-        {/* p99 is NOT per-provider on the D4 DTO — show the overall metrics-window p99, labeled as
-            such so it is not mistaken for this node's own latency (finding 6). */}
-        <dt>p99 (window)</dt>
-        <dd className="text-right tabular-nums text-text" data-testid="tooltip-p99">{p99Label(p99)}</dd>
         <dt>catalog</dt>
         <dd className="text-right tabular-nums text-text">{h.catalog_size}</dd>
       </dl>
+      {/* Gap 13: the per-provider latency tile — replaces the old global p99 with THIS provider's
+          p50/p95/p99 + error rate + failure distribution (from the REST/snapshot node). */}
+      <ProviderLatencyTile model={providerModel} />
       {h.last_error && (
         <p className="mt-1.5 truncate border-t border-line pt-1.5 text-status-down" title={h.last_error} data-testid="tooltip-error">
           {h.last_error}

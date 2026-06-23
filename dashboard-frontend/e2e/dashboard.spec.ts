@@ -217,6 +217,61 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on the failover trace').toEqual([]);
   });
 
+  // Gap 13: the topology tooltip shows PER-PROVIDER p50/p95/p99 + error rate (replacing the old
+  // GLOBAL p99), and nodes are sized/colored by per-provider latency/error. The per-provider data
+  // comes from the REST `/topology` node (the WS frame carries it ABSENT) — so the tooltip reads the
+  // REST path. Asserts the three states: a healthy provider (measured 0% — NOT —), a degrading one
+  // (real percentiles + an error distribution + a degrading node), and an unavailable one (`—`,
+  // never a fabricated 0ms/0%, neutral node).
+  test('topology per-provider tooltip + node states (gap 13)', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[1]!); // Topology
+    // Let d3-force settle so the nodes sit at stable, hoverable positions.
+    await page.waitForTimeout(800);
+
+    // vllm-a (healthy, all-served): the tile shows derived percentiles + a MEASURED 0% error rate
+    // (distinct from the unavailable `—`). Hover its node; the tooltip renders the per-provider tile.
+    await page.locator('[data-node-id="vllm-a"]').hover();
+    const tip = page.getByTestId('cooldown-tooltip');
+    await expect(tip).toBeVisible();
+    const tileA = tip.getByTestId('provider-latency-tile');
+    await expect(tileA).toHaveAttribute('data-available', 'true');
+    await expect(tip.getByTestId('provider-p50')).toHaveAttribute('data-quality', 'derived');
+    await expect(tip.getByTestId('provider-p50')).not.toContainText('—');
+    const errA = tip.getByTestId('provider-error-rate');
+    await expect(errA).toHaveAttribute('data-quality', 'measured');
+    await expect(errA).toContainText('0%'); // a real measured zero — NOT — and NOT absent
+    await expect(errA).not.toContainText('—');
+    // The healthy node is NEUTRAL (nominal emphasis, no error ring).
+    expect(await page.locator('[data-node-id="vllm-a"]').getAttribute('data-emphasis')).toBe('nominal');
+
+    // vllm-b (cooling, degrading): real derived percentiles + a per-class error distribution, and the
+    // node is emphasized `degrading`. Move the hover to it.
+    await page.locator('[data-node-id="vllm-b"]').hover();
+    const tileB = page.getByTestId('cooldown-tooltip').getByTestId('provider-latency-tile');
+    await expect(tileB).toHaveAttribute('data-available', 'true');
+    const errB = page.getByTestId('cooldown-tooltip').getByTestId('provider-error-rate');
+    await expect(errB).toHaveAttribute('data-quality', 'measured');
+    await expect(errB).not.toHaveText('—'); // a measured, elevated rate
+    // The error distribution lists the classes that occurred (connect + timeout in the mock).
+    await expect(page.getByTestId('cooldown-tooltip').getByTestId('provider-error-distribution')).toBeVisible();
+    await expect(page.getByTestId('cooldown-tooltip').getByTestId('provider-error-connect')).toBeVisible();
+    expect(await page.locator('[data-node-id="vllm-b"]').getAttribute('data-emphasis')).toBe('degrading');
+    await expect(page.locator('[data-node-id="vllm-b"] [data-testid="topo-error-ring"]')).toBeVisible();
+
+    // openai (down, ZERO in-window samples): per-provider is ABSENT → the tile reads `—`
+    // (unavailable), NEVER a fabricated 0ms/0%; the node stays NEUTRAL (not 0-sized / not healthy).
+    await page.locator('[data-node-id="openai"]').hover();
+    const tileC = page.getByTestId('cooldown-tooltip').getByTestId('provider-latency-tile');
+    await expect(tileC).toHaveAttribute('data-available', 'false');
+    const unavail = page.getByTestId('cooldown-tooltip').getByTestId('provider-latency-unavailable');
+    await expect(unavail).toHaveAttribute('data-quality', 'unavailable');
+    await expect(unavail).toContainText('—');
+    expect(await page.locator('[data-node-id="openai"]').getAttribute('data-emphasis')).toBe('unavailable');
+
+    expect(consoleErrors, 'console errors on the per-provider tooltip').toEqual([]);
+  });
+
   for (const view of VIEWS) {
     test(`${view.name}: renders + no console errors + matches baseline`, async ({ page, consoleErrors }) => {
       await login(page);

@@ -125,6 +125,13 @@ function invalidateForDomain(queryClient: QueryClient, domain: Domain): void {
       return;
     case 'metrics':
       void queryClient.invalidateQueries({ queryKey: queryKeys.metrics });
+      // Gap 13: the REST `/topology` node's per_provider tile (p50/p95/p99 + error rate) is JOINED
+      // from the SAME m1 metrics window (Rust `from_health_with_metrics`), but the live WS
+      // `topology_update` frame carries `per_provider` ABSENT — so without this the per-provider
+      // metrics would stay STALE until an UNRELATED topology change happened to refetch `/topology`
+      // (e.g. old values lingering after a provider drops to zero in-window samples). A metrics frame
+      // moves that window, so it must ALSO refresh the topology query that joins it.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.topology });
       return;
     case 'topology':
       void queryClient.invalidateQueries({ queryKey: queryKeys.topology });

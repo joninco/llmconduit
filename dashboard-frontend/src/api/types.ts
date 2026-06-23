@@ -121,6 +121,84 @@ export const ATTEMPT_FAILOVER_REASONS: readonly AttemptFailoverReason[] = [
   'terminal_no_failover',
 ];
 
+// ---------------------------------------------------------------------------
+// Gap 12 / 13 — per-provider latency + error distribution (the D4 topology node's
+// ADDITIVE `per_provider`). These mirror the Rust `ProviderLatency` /
+// `ProviderErrorDistribution` / `ProviderMetricQuality` (`src/metrics.rs`), exposed on
+// the REST `/topology` + `/snapshot` node ONLY — the LIVE WS `topology_update` frame
+// carries `per_provider` ABSENT (it does not join the metrics window, like its `0.0`
+// edge rates). Spec 13 consumes them: a per-provider tile (p50/p95/p99 + error rate +
+// per-class distribution) replacing the tooltip's global p99, and node sizing/color.
+//
+// DON'T-LIE-WITH-ZEROS: a provider with ZERO in-window attempt samples is ABSENT (no
+// `per_provider` entry — renders `—`, never `0ms`/`0%`); a PRESENT entry is always a
+// real `derived` measurement with `samples >= 1`, and an all-served provider reports a
+// genuine MEASURED `error_rate: 0.0` (distinct from absent).
+// ---------------------------------------------------------------------------
+
+/**
+ * Gap 12 — the DQ tag a per-provider metric carries (Rust `ProviderMetricQuality`,
+ * snake_case). Always `derived` for a PRESENT entry (the percentiles are computed off the
+ * provider's own attempt-latency histogram). The `unavailable` case (no in-window samples)
+ * is the ABSENCE of the whole `ProviderLatency`, not a variant here.
+ */
+export type ProviderMetricQuality = 'derived';
+export const PROVIDER_METRIC_QUALITIES: readonly ProviderMetricQuality[] = ['derived'];
+
+/**
+ * Gap 12 — the bounded per-error-class failure tally for one provider (Rust
+ * `ProviderErrorDistribution`). Keys are the FIXED gap-03 {@link AttemptErrorClass}
+ * taxonomy (never raw upstream text). Each class is OPTIONAL: the Rust side
+ * `skip_serializing_if`s a `0`, so an ABSENT class means "that class did not occur" — a
+ * present count is honest. (The don't-lie-with-zeros rule lives at the PROVIDER level — a
+ * no-sample provider is absent entirely, never a fabricated all-zero distribution.) Every
+ * present value is a non-negative integer count.
+ */
+export interface ProviderErrorDistribution {
+  connect?: number;
+  http_status?: number;
+  timeout?: number;
+  stream?: number;
+  terminal?: number;
+  other?: number;
+}
+
+/**
+ * Gap 12 — the public per-provider latency + error-distribution DTO (Rust `ProviderLatency`;
+ * additive on the D4 topology node, consumed by spec 13). Percentiles are `derived` ms over
+ * the provider's ATTEMPT-latency histogram (a FAILED primary's latency is INCLUDED — spec 12 —
+ * so a healthy-looking final-served latency cannot hide a degrading provider). `error_rate` is
+ * the percentage of the provider's attempts that FAILED (`failed / samples × 100`). A present
+ * entry always has `samples >= 1` (a zero-sample provider is ABSENT — don't-lie-with-zeros), so
+ * an all-served provider's `error_rate` is a genuine MEASURED `0.0`, distinct from absent. All
+ * floats are finite (the frozen finite-number wire contract). `provider` is the bounded
+ * provider/route id OR the `__other__` overflow bucket (per-slot cap exceeded) / the `unknown`
+ * sentinel (an attempt with no recorded provider) — spec 13 surfaces those overflow keys
+ * HONESTLY (labelled), it does not hide them.
+ */
+export interface ProviderLatency {
+  /** The provider label (a real id, or the `__other__` overflow / `unknown` sentinel key). */
+  provider: string;
+  /** DQ tag — always `derived` for a present entry (the `unavailable` case is absence). */
+  data_quality: ProviderMetricQuality;
+  /** Total ATTEMPTS in the window (served + failed); the measurability denominator. `>= 1`. */
+  samples: number;
+  /** Of `samples`, the count that SERVED (produced a first chunk). */
+  served: number;
+  /** Of `samples`, the count that FAILED before serving (failed primaries included). */
+  failed: number;
+  /** `derived` p50 attempt latency (ms). */
+  p50: number;
+  /** `derived` p95 attempt latency (ms). */
+  p95: number;
+  /** `derived` p99 attempt latency (ms). */
+  p99: number;
+  /** Percentage of attempts that failed (`failed / samples × 100`); a MEASURED `0.0` is real. */
+  error_rate: number;
+  /** Bounded per-class failure tally (gap 03 taxonomy); absent classes omitted. */
+  errors: ProviderErrorDistribution;
+}
+
 /**
  * Gap 03 — one upstream dispatch attempt's full provenance (Rust `Attempt`): WHICH provider,
  * WHAT model, WHEN it began/resolved, WHEN the first wire byte arrived, and the OUTCOME. The
@@ -441,6 +519,16 @@ export interface ProviderHealth {
   consecutive_failures: number;
   catalog_fetched_ms: number | null;
   catalog_size: number;
+  /**
+   * Gap 12/13 — this provider's per-provider latency + error distribution over the m1 window
+   * (the additive Rust `TopologyNode.per_provider`). PRESENT only on the REST `/topology` +
+   * `/snapshot` node (which join the metrics window); the LIVE WS `topology_update` frame
+   * carries it ABSENT (no metrics join). ABSENT/`null` ⇒ the provider had ZERO in-window attempt
+   * samples (don't-lie-with-zeros: the tile renders `—`, the node a neutral state — never a
+   * fabricated `0ms`/`0%`/`0`-sized node). Optional + `| null` so an omitted key (WS frame, or
+   * `skip_serializing_if` on a no-sample REST node) and a literal `null` both type.
+   */
+  per_provider?: ProviderLatency | null;
 }
 
 export interface TopologyUpdatePayload {
@@ -844,6 +932,41 @@ function isMetricWindows(v: unknown): boolean {
   return isObj(v) && isMetricWindow(v.m1) && isMetricWindow(v.m5) && isMetricWindow(v.h1);
 }
 
+/**
+ * Gap 12/13 — validates a `ProviderErrorDistribution` (the wire is not trusted): every present
+ * per-class key is a non-negative integer count; absent keys are fine (`skip_serializing_if` on a
+ * `0`). An object whose any present class is non-uint is rejected.
+ */
+function isProviderErrorDistribution(v: unknown): v is ProviderErrorDistribution {
+  return (
+    isObj(v) &&
+    isOptUint(v.connect) && isOptUint(v.http_status) && isOptUint(v.timeout) &&
+    isOptUint(v.stream) && isOptUint(v.terminal) && isOptUint(v.other)
+  );
+}
+
+/**
+ * Gap 12/13 — validates a `ProviderLatency` (the REST/snapshot node's additive `per_provider`).
+ * `data_quality` must be the bounded `derived` enum; `samples`/`served`/`failed` non-negative
+ * ints; the percentiles + `error_rate` FINITE numbers (rejects NaN/Inf); `errors` a valid bounded
+ * distribution. Exported so the consuming surface (spec 13) can re-validate if needed.
+ */
+export function isProviderLatency(v: unknown): v is ProviderLatency {
+  return (
+    isObj(v) &&
+    isStr(v.provider) &&
+    isOneOf(v.data_quality, PROVIDER_METRIC_QUALITIES) &&
+    isUint(v.samples) && isUint(v.served) && isUint(v.failed) &&
+    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.error_rate) &&
+    isProviderErrorDistribution(v.errors)
+  );
+}
+
+/** Optional per-provider metrics: absent, null, or a valid `ProviderLatency` (gap 12/13). */
+function isOptProviderLatency(v: unknown): boolean {
+  return v === undefined || v === null || isProviderLatency(v);
+}
+
 function isProviderHealth(v: unknown): v is ProviderHealth {
   return (
     isObj(v) &&
@@ -854,7 +977,11 @@ function isProviderHealth(v: unknown): v is ProviderHealth {
     isOneOf(v.status, PROVIDER_STATUSES) &&
     isNullableUint(v.cooling_until_ms) && isNullableStr(v.last_error) &&
     isUint(v.served_count) && isUint(v.failover_count) && isUint(v.consecutive_failures) &&
-    isNullableUint(v.catalog_fetched_ms) && isUint(v.catalog_size)
+    isNullableUint(v.catalog_fetched_ms) && isUint(v.catalog_size) &&
+    // Gap 12/13: `per_provider` is OPTIONAL — ABSENT on the WS `topology_update` frame (no metrics
+    // join) and on a zero-sample REST node (`skip_serializing_if`); validated when present so a
+    // populated REST/snapshot node's per-provider tile can trust it.
+    isOptProviderLatency(v.per_provider)
   );
 }
 function isTopologyEdge(v: unknown): v is TopologyEdge {

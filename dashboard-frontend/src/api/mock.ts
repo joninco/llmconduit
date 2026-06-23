@@ -19,6 +19,7 @@ import type {
   MetricsResponse,
   MonitorPayload,
   ProviderHealth,
+  ProviderLatency,
   SnapshotFrame,
   SnapshotResponse,
   TopologyResponse,
@@ -37,6 +38,28 @@ const NODES: ProviderHealth[] = [
   { id: 'vllm-b', name: 'vllm-b (8002)', route: null, base_url: 'http://localhost:8002', status: 'cooling', cooling_until_ms: Date.now() + 8000, last_error: 'connection refused', served_count: 610, failover_count: 3, consecutive_failures: 2, catalog_fetched_ms: Date.now() - 9000, catalog_size: 8 },
   { id: 'openai', name: 'openai-proxy', route: 'cloud', base_url: 'https://api.openai.com', status: 'down', cooling_until_ms: Date.now() + 30000, last_error: '503 upstream', served_count: 42, failover_count: 9, consecutive_failures: 7, catalog_fetched_ms: null, catalog_size: 0 },
 ];
+
+// Gap 12/13: per-provider latency + error distribution, keyed by node id. Present ONLY on the REST
+// `/topology` + `/snapshot` nodes (the WS `topology_update` frame STRIPS it — `topologyFrame`
+// below — mirroring the Rust `from_health` leaving `per_provider: None` on the live WS path).
+// Exercises the three node/tile states the gap-13 e2e asserts:
+//  - vllm-a (healthy): all-served ⇒ a MEASURED `error_rate: 0` (a real `0%`, DISTINCT from absent),
+//    no error distribution. Node emphasis: nominal (base size, no ring).
+//  - vllm-b (cooling): a DEGRADING provider — elevated error rate (16%) with a per-class
+//    distribution (connect + timeout). Node emphasis: degrading (enlarged + an error ring).
+//  - openai (down): ABSENT (no in-window samples) ⇒ the tile renders `—` and the node is NEUTRAL —
+//    NOT a 0-sized or falsely-healthy node (don't-lie-with-zeros). Omitted from this map.
+const PER_PROVIDER: Record<string, ProviderLatency> = {
+  'vllm-a': {
+    provider: 'vllm-a', data_quality: 'derived', samples: 248, served: 248, failed: 0,
+    p50: 88, p95: 210, p99: 320, error_rate: 0, errors: {},
+  },
+  'vllm-b': {
+    provider: 'vllm-b', data_quality: 'derived', samples: 75, served: 63, failed: 12,
+    p50: 240, p95: 1100, p99: 2400, error_rate: 16, errors: { connect: 7, timeout: 5 },
+  },
+  // openai: intentionally ABSENT (zero in-window samples → unavailable tile + neutral node).
+};
 
 const PRICE_TABLE: TopologyResponse['price_table'] = {
   // Gap 07: gpt-4o has a CONFIGURED cache rate (presence true) → cached charges are confident.
@@ -176,7 +199,10 @@ function buildMetrics(): MetricsResponse {
 function buildTopology(): TopologyResponse {
   return {
     topology_seq: 1,
-    nodes: NODES,
+    // Gap 12/13: the REST `/topology` (+ snapshot) node carries the additive `per_provider` when the
+    // provider had in-window samples; an absent entry (openai) leaves the field off (don't-lie-with
+    // -zeros). The WS `topology_update` frame strips it (see `topologyFrame`).
+    nodes: NODES.map((n) => (PER_PROVIDER[n.id] ? { ...n, per_provider: PER_PROVIDER[n.id] } : n)),
     edges: [
       { from: 'gateway', to: 'vllm-a', throughput: 4.2, tokens_per_sec: 142, cost_per_sec: 0.003 },
       { from: 'gateway', to: 'vllm-b', throughput: 1.0, tokens_per_sec: 61, cost_per_sec: 0.001 },
@@ -496,10 +522,15 @@ export class MockWebSocket implements WsLike {
 
   private topologyFrame(): DashboardFrame {
     const t = buildTopology();
+    // The LIVE WS `topology_update` frame does NOT join the metrics window (gap-12 discovery), so it
+    // carries `per_provider` ABSENT — strip it here to mirror the Rust `from_health` (the REST
+    // `/topology` + `/snapshot` are the per-provider source). Stripping (not just omitting) proves
+    // the frontend reads the REST path, not the WS frame, for the per-provider tile.
+    const nodes = t.nodes.map(({ per_provider: _omit, ...rest }) => rest);
     return {
       domain: 'topology',
       seq: ++this.seq.topology,
-      batch: [{ type: 'topology_update', nodes: t.nodes, edges: t.edges }],
+      batch: [{ type: 'topology_update', nodes, edges: t.edges }],
     };
   }
 

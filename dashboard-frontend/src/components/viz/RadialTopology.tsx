@@ -30,10 +30,11 @@ import {
   type SimulationNodeDatum,
   type SimulationLinkDatum,
 } from 'd3-force';
-import type { ProviderHealth, TopologyEdge } from '../../api/types';
+import type { ProviderHealth, ProviderLatency, TopologyEdge } from '../../api/types';
 import { colors, statusColor, prefersReducedMotion } from '../../design/tokens';
 import { useImperativeViz, type VizCleanup } from '../../viz/useImperativeViz';
 import { radialTopologyState } from './radialTopologyState';
+import { providerNodeEmphasis } from './providerLatency';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -65,6 +66,13 @@ export interface TopoHover {
 export interface RadialTopologyProps {
   nodes: ProviderHealth[];
   edges: TopologyEdge[];
+  /**
+   * Gap 13 — per-provider latency/error metrics keyed by provider id (the spec-12 `ProviderLatency`
+   * from the REST/snapshot topology node). Drives per-node SIZE + an error-rate ring so a degrading
+   * upstream stands out. A provider ABSENT from this map (no in-window samples) is NEUTRAL: base
+   * size, no ring, its health color unchanged — never a `0`-sized or falsely-healthy node.
+   */
+  perProvider?: Record<string, ProviderLatency>;
   width?: number;
   height?: number;
   /** Click a provider node → cross-link to the FlowTable filtered to its upstream target. */
@@ -126,6 +134,7 @@ function buildGraph(providers: ProviderHealth[], edges: TopologyEdge[]): { nodes
 export function RadialTopology({
   nodes,
   edges,
+  perProvider,
   width = DEFAULT_W,
   height = DEFAULT_H,
   onSelectUpstream,
@@ -134,9 +143,10 @@ export function RadialTopology({
   const ref = useRef<HTMLDivElement>(null);
   // Keep the latest data + callbacks reachable from the (size/motion-keyed) setup without
   // re-running it: a streaming TopologyUpdate updates these refs and the live re-render pass
-  // (the `dataRef` read on each frame) recolors nodes WITHOUT restarting the simulation.
-  const dataRef = useRef({ nodes, edges });
-  dataRef.current = { nodes, edges };
+  // (the `dataRef` read on each frame) recolors nodes WITHOUT restarting the simulation. The
+  // per-provider map rides here too (gap 13) so a refreshed metrics read re-sizes nodes in place.
+  const dataRef = useRef({ nodes, edges, perProvider });
+  dataRef.current = { nodes, edges, perProvider };
   const selectRef = useRef(onSelectUpstream);
   selectRef.current = onSelectUpstream;
   const hoverRef = useRef(onHover);
@@ -209,7 +219,10 @@ export function RadialTopology({
       // and its mouseenter closure reads the live (sim-mutated) `node.x/node.y`. The node SET is
       // fixed for a setup lifetime (an add/remove bumps `identity` → a fresh setup), so this map is
       // built once here and reused across all ticks/updates.
-      interface NodeEls { g: SVGGElement; circle: SVGCircleElement; }
+      // `ring` (provider nodes only) is the gap-13 error-rate ring — a concentric stroked circle
+      // shown ONLY for a `degrading` provider (elevated error rate). It is created up-front (hidden)
+      // and toggled in place so a metrics refresh never recreates the node (preserves the hover).
+      interface NodeEls { g: SVGGElement; circle: SVGCircleElement; ring?: SVGCircleElement; }
       const nodeEls = new Map<string, NodeEls>();
       const radiusOf = (node: TopoNode): number =>
         node.kind === 'gateway' ? HUB_R : node.kind === 'client' ? CLIENT_R : NODE_R;
@@ -220,11 +233,28 @@ export function RadialTopology({
         g.setAttribute('data-testid', node.kind === 'provider' ? 'topo-node' : `topo-${node.kind}`);
         g.setAttribute('data-node-id', node.id);
 
+        // The main status circle is appended FIRST so it is the node's primary `<circle>` (the
+        // status fill the topology colors by health — `querySelector('circle')` resolves to it).
         const circle = document.createElementNS(SVG_NS, 'circle');
         circle.setAttribute('r', String(r));
         circle.setAttribute('stroke', colors.bg);
         circle.setAttribute('stroke-width', '2');
         g.appendChild(circle);
+
+        // Error-rate ring (provider nodes only, gap 13) — a stroked outline drawn AROUND the status
+        // circle (`fill:none`, on top so it is a visible halo), shown ONLY for a `degrading`
+        // provider. Created up-front (hidden) + toggled in place so a metrics refresh never recreates
+        // the node (preserves the hover target — finding 5).
+        let ring: SVGCircleElement | undefined;
+        if (node.kind === 'provider') {
+          ring = document.createElementNS(SVG_NS, 'circle');
+          ring.setAttribute('fill', 'none');
+          ring.setAttribute('stroke', colors.statusDown);
+          ring.setAttribute('stroke-width', '2');
+          ring.setAttribute('data-testid', 'topo-error-ring');
+          ring.style.display = 'none';
+          g.appendChild(ring);
+        }
 
         const label = document.createElementNS(SVG_NS, 'text');
         label.textContent = node.label;
@@ -250,7 +280,7 @@ export function RadialTopology({
           g.addEventListener('mouseleave', () => hoverRef.current?.(null));
         }
         nodeLayer.appendChild(g);
-        return { g, circle };
+        return { g, circle, ring };
       };
 
       // Render the SVG from the current node/link positions + the latest health data. Called on
@@ -261,6 +291,7 @@ export function RadialTopology({
         const latest = dataRef.current;
         const healthById = new Map(latest.nodes.map((p) => [p.id, p]));
         const edgeById = new Map(latest.edges.map((e) => [`${e.from}->${e.to}`, e]));
+        const perProviderMap = latest.perProvider ?? {};
         edgeLayer.replaceChildren();
 
         for (const link of links) {
@@ -324,6 +355,34 @@ export function RadialTopology({
           // Cooling nodes pulse (CSS); toggle the class in place so a health change recolors without
           // recreating the element (and a no-longer-cooling node stops pulsing).
           els.circle.classList.toggle('topo-node-cooling', !reduced && health?.status === 'cooling');
+
+          // Gap 13: SIZE/ring the node by its per-provider LATENCY + error emphasis (the spec-12
+          // metrics, NOT the health status). An `unavailable` provider (no in-window samples) stays
+          // NEUTRAL — base radius, no ring — never `0`-sized or recolored healthy. A `degrading`
+          // provider (elevated error rate OR elevated p99 latency) is ENLARGED so it stands out; the
+          // red error ring shows only for ERROR-driven degradation (a slow-but-no-errors provider is
+          // enlarged + `data-latency-degraded` but carries no error ring — no failures to signal).
+          if (node.kind === 'provider') {
+            const emphasis = providerNodeEmphasis(perProviderMap[node.id]);
+            const baseR = radiusOf(node);
+            const scaledR = baseR * emphasis.sizeScale;
+            els.circle.setAttribute('r', String(scaledR));
+            els.g.setAttribute('data-emphasis', emphasis.state);
+            els.g.setAttribute(
+              'data-error-rate',
+              emphasis.errorRatePct === null ? '' : String(emphasis.errorRatePct),
+            );
+            els.g.setAttribute('data-p99', emphasis.p99Ms === null ? '' : String(emphasis.p99Ms));
+            els.g.setAttribute('data-latency-degraded', emphasis.latencyDegraded ? 'true' : 'false');
+            if (els.ring) {
+              if (emphasis.showErrorRing) {
+                els.ring.setAttribute('r', String(scaledR + 3));
+                els.ring.style.display = '';
+              } else {
+                els.ring.style.display = 'none';
+              }
+            }
+          }
         }
       };
 
@@ -356,13 +415,14 @@ export function RadialTopology({
     [width, height, reduced, identity],
   );
 
-  // Live recolor: a streaming TopologyUpdate (same node set, changed health/throughput) re-renders
-  // the existing SVG from `dataRef` WITHOUT recreating the simulation — the topology twin of the
-  // Sparkline `setData` push. `renderRef` is null on a StrictMode-discarded mount (already torn
-  // down), so it is guarded. Runs after the layout-effect setup on the same commit.
+  // Live recolor: a streaming TopologyUpdate (same node set, changed health/throughput) OR a
+  // refreshed per-provider metrics read (gap 13) re-renders the existing SVG from `dataRef` WITHOUT
+  // recreating the simulation — the topology twin of the Sparkline `setData` push. `renderRef` is
+  // null on a StrictMode-discarded mount (already torn down), so it is guarded. Runs after the
+  // layout-effect setup on the same commit.
   useEffect(() => {
     renderRef.current?.();
-  }, [nodes, edges]);
+  }, [nodes, edges, perProvider]);
 
   return <div ref={ref} data-testid="radial-topology" />;
 }

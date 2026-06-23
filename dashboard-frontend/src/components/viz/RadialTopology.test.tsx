@@ -4,7 +4,7 @@ import { render, cleanup, fireEvent } from '@testing-library/react';
 import { RadialTopology } from './RadialTopology';
 import { radialTopologyState, resetRadialTopologyState } from './radialTopologyState';
 import { colors } from '../../design/tokens';
-import type { ProviderHealth, TopologyEdge } from '../../api/types';
+import type { ProviderHealth, ProviderLatency, TopologyEdge } from '../../api/types';
 
 function provider(over: Partial<ProviderHealth>): ProviderHealth {
   return {
@@ -150,6 +150,87 @@ describe('RadialTopology — prefers-reduced-motion cuts particles', () => {
     expect(container.querySelectorAll('[data-testid="topo-particle"]').length).toBe(0);
     // The edge is still drawn (just not animated/flowing).
     expect(container.querySelectorAll('[data-testid="topo-edge"]').length).toBeGreaterThan(0);
+  });
+});
+
+describe('RadialTopology — per-provider emphasis: sizing + error ring (gap 13)', () => {
+  function per(over: Partial<ProviderLatency>): ProviderLatency {
+    return {
+      provider: 'p', data_quality: 'derived', samples: 50, served: 50, failed: 0,
+      p50: 80, p95: 100, p99: 120, error_rate: 0, errors: {}, ...over,
+    };
+  }
+  const radiusOf = (container: HTMLElement, id: string): number =>
+    Number(container.querySelector(`[data-node-id="${id}"] circle`)?.getAttribute('r'));
+
+  it('a provider ABSENT from the per-provider map is NEUTRAL: base size, no error ring, data-emphasis=unavailable', () => {
+    // No `perProvider` prop → every provider unavailable (no samples) → base radius, no ring.
+    const { container } = render(<RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} />);
+    const g = container.querySelector('[data-node-id="vllm-a"]')!;
+    expect(g.getAttribute('data-emphasis')).toBe('unavailable');
+    const ring = g.querySelector('[data-testid="topo-error-ring"]') as SVGElement;
+    expect(ring.style.display).toBe('none'); // no ring for an unavailable node
+    const baseR = radiusOf(container, 'vllm-a');
+
+    // A degrading provider (high error rate) is ENLARGED relative to the same base node — proving the
+    // absent one is not 0-sized, just neutral.
+    const { container: c2 } = render(
+      <RadialTopology nodes={NODES} edges={EDGES} perProvider={{ 'vllm-a': per({ failed: 30, error_rate: 60 }) }} onSelectUpstream={() => {}} />,
+    );
+    expect(radiusOf(c2, 'vllm-a')).toBeGreaterThan(baseR);
+  });
+
+  it('a degrading provider (elevated error rate) shows the error ring + data-emphasis=degrading + the measured error rate', () => {
+    const { container } = render(
+      <RadialTopology
+        nodes={NODES}
+        edges={EDGES}
+        perProvider={{ 'openai': per({ provider: 'openai', failed: 9, error_rate: 25 }) }}
+        onSelectUpstream={() => {}}
+      />,
+    );
+    const g = container.querySelector('[data-node-id="openai"]')!;
+    expect(g.getAttribute('data-emphasis')).toBe('degrading');
+    expect(g.getAttribute('data-error-rate')).toBe('25');
+    const ring = g.querySelector('[data-testid="topo-error-ring"]') as SVGElement;
+    expect(ring.style.display).toBe(''); // ring visible
+  });
+
+  it('an all-served provider (measured 0% error) is nominal: no ring, but data-error-rate is a real 0 (not absent)', () => {
+    const { container } = render(
+      <RadialTopology nodes={NODES} edges={EDGES} perProvider={{ 'vllm-a': per({ error_rate: 0 }) }} onSelectUpstream={() => {}} />,
+    );
+    const g = container.querySelector('[data-node-id="vllm-a"]')!;
+    expect(g.getAttribute('data-emphasis')).toBe('nominal');
+    expect(g.getAttribute('data-error-rate')).toBe('0'); // a measured 0, distinct from the absent ''
+    const ring = g.querySelector('[data-testid="topo-error-ring"]') as SVGElement;
+    expect(ring.style.display).toBe('none');
+  });
+
+  it('a slow-but-no-errors provider (high p99) is enlarged + data-latency-degraded=true, but NO error ring', () => {
+    const baseR = (() => {
+      const { container } = render(<RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} />);
+      const r = radiusOf(container, 'vllm-a');
+      cleanup();
+      return r;
+    })();
+    const { container } = render(
+      <RadialTopology
+        nodes={NODES}
+        edges={EDGES}
+        // 2500ms p99, 0% error — a latency-degraded provider.
+        perProvider={{ 'vllm-a': per({ error_rate: 0, p95: 1800, p99: 2500 }) }}
+        onSelectUpstream={() => {}}
+      />,
+    );
+    const g = container.querySelector('[data-node-id="vllm-a"]')!;
+    expect(g.getAttribute('data-emphasis')).toBe('degrading');
+    expect(g.getAttribute('data-latency-degraded')).toBe('true');
+    expect(g.getAttribute('data-p99')).toBe('2500');
+    expect(radiusOf(container, 'vllm-a')).toBeGreaterThan(baseR); // enlarged by latency
+    // No FAILURES → the red error ring stays hidden (latency-only degradation).
+    const ring = g.querySelector('[data-testid="topo-error-ring"]') as SVGElement;
+    expect(ring.style.display).toBe('none');
   });
 });
 

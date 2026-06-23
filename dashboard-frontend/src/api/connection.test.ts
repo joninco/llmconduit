@@ -63,6 +63,30 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.flows });
   });
 
+  it('a metrics frame invalidates BOTH /metrics AND /topology (gap 13: per_provider joins the m1 window)', () => {
+    const { socket, queryClient } = getConnection();
+    socket.handleParsed({
+      type: 'snapshot',
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [], metrics: null, topology: null,
+    });
+    const spy = vi.spyOn(queryClient, 'invalidateQueries');
+    // A minimal valid `metric_tick` (the per-domain validator requires the full shape).
+    const w = {
+      reqs_per_sec: 1, active_streams: 0, error_pct: 0, p50: 10, p95: 20, p99: 30,
+      tokens_per_sec: 5, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1,
+      cost_confidence: 'estimated' as const,
+    };
+    socket.applyFrame({
+      domain: 'metrics', seq: 1,
+      batch: [{ type: 'metric_tick', ...w, windows: { m1: w, m5: w, h1: w } }],
+    });
+    // The metrics tick must refresh the metrics tiles AND the REST /topology per_provider join —
+    // otherwise the per-provider tile/node emphasis stay STALE until an unrelated topology change.
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.metrics });
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.topology });
+  });
+
   it('a DROPPED (duplicate) frame does NOT invalidate', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
