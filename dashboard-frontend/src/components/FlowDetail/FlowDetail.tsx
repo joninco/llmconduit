@@ -28,6 +28,8 @@ import { contextLimitFor, contextUtilization, type ContextUtilization } from '..
 import { ContextGauge } from '../FlowTable/ContextGauge';
 import { latencyBreakdown, type LatencyBreakdown as LatencyBreakdownModel, type SpineFlow } from './latencyBreakdown';
 import { LatencyBreakdown } from './LatencyBreakdown';
+import { attemptTrace, type AttemptTrace as AttemptTraceModel } from './attemptTrace';
+import { AttemptTrace } from './AttemptTrace';
 import { pickAttempts } from '../../api/attempts';
 import { useCatalog } from '../FlowTable/useCatalog';
 import { JsonPane } from '../viz/JsonPane';
@@ -207,6 +209,16 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
     return latencyBreakdown(spine, outputs);
   }, [liveFlow, frozenDetail, usage, join.segments]);
 
+  // Gap 11 — the per-flow FAILOVER / attempt trace (the inspector-header stepper). Consumes the
+  // gap-03 `attempts[]` projected onto the row + detail + live frame (gap 10b). Merged with the SAME
+  // `pickAttempts` rule the latency model uses (a live/snapshot `attempts: []` is "no attempt yet"
+  // and must NOT suppress a populated REST detail trace; a non-empty list — either side — wins).
+  // A single attempt ⇒ a single node (no fake failover); ≥2 ⇒ the chain; absent ⇒ no stepper.
+  const attempts = useMemo<AttemptTraceModel>(
+    () => attemptTrace(pickAttempts(liveFlow?.attempts, frozenDetail?.attempts)),
+    [liveFlow?.attempts, frozenDetail?.attempts],
+  );
+
   return (
     <section className="flex min-h-0 w-[46%] min-w-[420px] flex-col border-l border-line bg-panel" data-testid="flow-detail" aria-label="flow detail">
       <DetailHeader
@@ -219,6 +231,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         econ={econ}
         contextUtil={contextUtil}
         latency={latency}
+        attempts={attempts}
         seeking={seeking}
         seekAtMs={seekAtMs}
         isActive={isActive}
@@ -350,6 +363,7 @@ function DetailHeader({
   econ,
   contextUtil,
   latency,
+  attempts,
   seeking,
   seekAtMs,
   isActive,
@@ -367,6 +381,7 @@ function DetailHeader({
   econ: ReturnType<typeof tokenEconomics>;
   contextUtil: ContextUtilization;
   latency: LatencyBreakdownModel;
+  attempts: AttemptTraceModel;
   seeking: boolean;
   seekAtMs: number | null;
   isActive: boolean;
@@ -496,6 +511,19 @@ function DetailHeader({
         <dd className="min-w-0">
           <LatencyBreakdown model={latency} />
         </dd>
+        {/* Gap 11: the failover / attempt-trace stepper — one node per recorded `attempts[]` entry
+            (provider, status/error_class, duration, first upstream byte, failover_reason), the served
+            node visually distinct. Rendered ONLY when an attempt was recorded: a single attempt is a
+            single node (no fake failover); ≥2 is the chain. A per-attempt unmeasured time reads `—`,
+            never `0`. Absent ⇒ the row is omitted entirely (no empty stepper). Spans the full row. */}
+        {attempts.hasTrace && (
+          <>
+            <dt className="self-start text-text-muted" title="failover trace: which provider failed, why, how long, and what served">failover</dt>
+            <dd className="min-w-0">
+              <AttemptTrace model={attempts} />
+            </dd>
+          </>
+        )}
       </dl>
     </header>
   );

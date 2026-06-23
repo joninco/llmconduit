@@ -121,6 +121,26 @@ function seedFlows(): FlowSummary[] {
       ingress_ms: now - 18000, normalization_done_ms: now - 17960, routing_decision_ms: now - 17940,
       first_content_delta_ms: now - 17600, stream_end_ms: now - 16020, finalize_ms: now - 16000,
     },
+    // Gap 11: a FAILOVER flow — the FIRST provider (vllm-b) FAILED (http_status, ~600ms before any
+    // header ⇒ no first_upstream_byte), then OpenAI SERVED. The attempt-trace stepper must render a
+    // 2-node chain (A failed → B served), the served node visually distinct, the failed node's
+    // first byte `—` (never 0). Routed via `/v1/responses` on `openai` (the served target).
+    {
+      api_call_id: 'api_005', response_id: 'resp_005', method: 'POST', uri: '/v1/responses', status: 'completed',
+      model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai',
+      usage: { prompt: 640, completion: 320, total: 960, cached: 0, reasoning: 0 },
+      started_ms: now - 9000, finished_ms: now - 6200, elapsed_ms: 2800, terminal_reason: 'response.completed',
+      cost: 0.0080, cost_confidence: 'confident',
+      ingress_ms: now - 9000, normalization_done_ms: now - 8970, routing_decision_ms: now - 8950,
+      first_upstream_byte_ms: now - 8050, first_content_delta_ms: now - 7900,
+      stream_end_ms: now - 6220, finalize_ms: now - 6200,
+      attempts: [
+        // A — vllm-b failed (HTTP 503), no first byte (failed pre-headers) ⇒ first byte `—`.
+        { provider: 'vllm-b', model: 'gpt-4o', start_ms: now - 8950, end_ms: now - 8350, status: 'failed', error_class: 'http_status', failover_reason: 'provider_failed' },
+        // B — openai served (first wire byte arrived 300ms into its attempt).
+        { provider: 'openai', model: 'gpt-4o', start_ms: now - 8350, end_ms: now - 6200, first_upstream_byte_ms: now - 8050, status: 'served' },
+      ],
+    },
   ];
 }
 

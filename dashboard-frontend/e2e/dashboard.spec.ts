@@ -147,8 +147,9 @@ test.describe('Argus dashboard', () => {
     await expect(page.getByTestId('latency-seg-finalize')).toBeVisible();
 
     // api_003 (failed before content): the prefill + generation segments are UNAVAILABLE — `—`, NOT
-    // 0ms — and have no bar fill. Select the failed row by its upstream (`openai`, unique to it).
-    const failed = page.getByTestId('flow-row').filter({ hasText: 'openai' }).first();
+    // 0ms — and have no bar fill. Select by its id (the row renders the short api_call_id verbatim;
+    // `openai` is no longer unique — the gap-11 `api_005` failover flow also serves it).
+    const failed = page.getByTestId('flow-row').filter({ hasText: 'api_003' }).first();
     await failed.click();
     await expect(page.getByTestId('latency-legend-prefill')).toHaveAttribute('data-quality', 'unavailable');
     await expect(page.getByTestId('latency-dur-prefill')).toHaveText('—');
@@ -174,6 +175,46 @@ test.describe('Argus dashboard', () => {
     await expect(page.getByTestId('latency-ttfb')).toHaveAttribute('data-quality', 'unavailable');
 
     expect(consoleErrors, 'console errors on the latency breakdown').toEqual([]);
+  });
+
+  // Gap 11: the FlowDetail inspector shows a FAILOVER / attempt-trace stepper from `attempts[]`.
+  // A multi-attempt flow renders the chain (failed → served), the served node visually distinct,
+  // and an UNMEASURED per-attempt time reads `—` (never 0). A single-attempt flow renders a single
+  // node with NO failover claim (no fake chain). Covers the spec's "single-attempt AND failover
+  // fixtures render correctly" acceptance.
+  test('failover trace: chain on a failover flow, single node + — on no first byte (gap 11)', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[0]!); // Flows
+    await page.waitForTimeout(400);
+
+    // api_005 is a FAILOVER flow (vllm-b failed → openai served). Rows render the (short) api_call_id
+    // verbatim (`api_005` is ≤10 chars), so select by it — unambiguous. The trace shows a 2-node chain.
+    await page.getByTestId('flow-row').filter({ hasText: 'api_005' }).first().click();
+    await expect(page.getByTestId('flow-detail')).toBeVisible();
+    const trace = page.getByTestId('attempt-trace');
+    await expect(trace).toBeVisible();
+    await expect(trace).toHaveAttribute('data-failover', 'true');
+    // The failover summary names the served handoff; the failed node carries its error class.
+    await expect(page.getByTestId('attempt-failover-label')).toContainText('served');
+    await expect(page.getByTestId('attempt-error-0')).toContainText('http status');
+    // The served node (B) is marked distinct.
+    await expect(page.getByTestId('attempt-node-1')).toHaveAttribute('data-served', 'true');
+    await expect(page.getByTestId('attempt-status-1')).toHaveText('served');
+
+    // Expand the FAILED node: its first byte is `—` (no header arrived) — NEVER 0 (spec 11 core).
+    await page.getByTestId('attempt-toggle-0').click();
+    const failedByte = page.getByTestId('attempt-firstbyte-0');
+    await expect(failedByte).toHaveAttribute('data-quality', 'unavailable');
+    await expect(failedByte).toHaveText('—');
+
+    // api_003 is a SINGLE FAILED attempt (no failover): one node, the "no failover" label, no chain.
+    await page.getByTestId('flow-row').filter({ hasText: 'api_003' }).first().click();
+    await expect(page.getByTestId('attempt-trace')).toHaveAttribute('data-failover', 'false');
+    await expect(page.getByTestId('attempt-single-label')).toBeVisible();
+    await expect(page.getByTestId('attempt-node-0')).toBeVisible();
+    await expect(page.getByTestId('attempt-node-1')).toHaveCount(0);
+
+    expect(consoleErrors, 'console errors on the failover trace').toEqual([]);
   });
 
   for (const view of VIEWS) {
