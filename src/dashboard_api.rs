@@ -751,10 +751,14 @@ pub fn topology_body(
     prices: &HashMap<String, ModelPrice>,
     window_1m: &WindowReport,
 ) -> TopologySnapshot {
+    // Gap 12: each node carries its per-provider latency/error metrics from the m1
+    // window (aggregated off the evict-safe per-attempt trace), looked up by provider id
+    // — absent when the provider had no in-window samples (don't-lie-with-zeros). Same
+    // m1 window the edge rates below roll up, so the tiles + edges share one metrics cut.
     let nodes: Vec<TopologyNode> = snapshot
         .providers
         .iter()
-        .map(TopologyNode::from_health)
+        .map(|provider| TopologyNode::from_health_with_metrics(provider, window_1m))
         .collect();
     let edges: Vec<TopologyEdge> = snapshot
         .providers
@@ -1351,6 +1355,7 @@ mod tests {
             Some("vllm-a"),
             1200,
             Some(usage(1000, 500, 0)),
+            &[],
         );
         let (view, seq) = metrics.view_with_seq();
         let mut prices = HashMap::new();
@@ -1439,6 +1444,7 @@ mod tests {
             Some("vllm-a"),
             900,
             Some(usage(1000, 500, 0)),
+            &[],
         );
         // (b) NO usage (e.g. an upstream that omitted it) → samples only.
         metrics.record_terminal(
@@ -1448,6 +1454,7 @@ mod tests {
             Some("vllm-a"),
             900,
             None,
+            &[],
         );
         // (c) usage on an UNPRICED model → samples + usage, but NOT priced.
         metrics.record_terminal(
@@ -1457,6 +1464,7 @@ mod tests {
             Some("vllm-a"),
             900,
             Some(usage(10, 5, 0)),
+            &[],
         );
         let (view, seq) = metrics.view_with_seq();
         let mut prices = HashMap::new();
@@ -1501,6 +1509,7 @@ mod tests {
             Some("vllm-a"),
             900,
             Some(usage(1000, 500, 0)),
+            &[],
         );
         let (view, seq) = metrics.view_with_seq();
         let mut prices = HashMap::new();
@@ -2056,6 +2065,7 @@ mod tests {
                 cached: None, // unreported
                 reasoning: Some(0),
             }),
+            &[],
         );
         let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
         assert_eq!(
@@ -2080,6 +2090,7 @@ mod tests {
                 cached: Some(0), // reported zero
                 reasoning: Some(0),
             }),
+            &[],
         );
         let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
         assert_eq!(
@@ -2097,6 +2108,7 @@ mod tests {
             Some("vllm-a"),
             900,
             Some(usage(10, 5, 0)),
+            &[],
         );
         let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
         assert_eq!(body.cost_confidence, CostConfidence::Unavailable);
@@ -2136,6 +2148,7 @@ mod tests {
                 cached: Some(0), // reported zero ⇒ this bucket alone is confident
                 reasoning: Some(0),
             }),
+            &[],
         );
         metrics.record_terminal(
             FS::Completed,
@@ -2144,6 +2157,7 @@ mod tests {
             Some("vllm-b"),
             500,
             Some(usage(800, 400, 0)),
+            &[],
         );
         let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
         assert_eq!(
@@ -2181,6 +2195,7 @@ mod tests {
                 cached: Some(0),
                 reasoning: Some(0),
             }),
+            &[],
         );
         // A terminal flow on an unpriced model that reported NO usage (usage_samples == 0
         // for its bucket): bumps the count but contributes no token throughput/cost.
@@ -2191,6 +2206,7 @@ mod tests {
             Some("vllm-b"),
             120,
             None,
+            &[],
         );
         let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
         assert_eq!(
@@ -2198,5 +2214,115 @@ mod tests {
             CostConfidence::Confident,
             "a usage-LESS unpriced bucket adds no missing cost ⇒ the window stays confident"
         );
+    }
+
+    /// Gap 12 — a minimal `ProviderHealth` for the topology DTO tests.
+    fn provider_health(id: &str) -> crate::upstream::ProviderHealth {
+        crate::upstream::ProviderHealth {
+            id: id.to_string(),
+            name: id.to_string(),
+            route: None,
+            base_url: "https://example.invalid/v1".to_string(),
+            status: crate::upstream::ProviderStatus::Healthy,
+            cooling_until_ms: None,
+            last_error: None,
+            served_count: 0,
+            failover_count: 0,
+            consecutive_failures: 0,
+            catalog_fetched_ms: None,
+            catalog_size: None,
+        }
+    }
+
+    /// Gap 12 (AGENTS.md changed-wire-field rule): the per-provider latency/error metrics
+    /// are projected onto the `/topology` node as an ADDITIVE `per_provider` field and
+    /// survive a JSON round-trip. A provider WITH in-window attempt samples carries a
+    /// `derived` tile (real p50/p95/p99 + error rate + the bounded error distribution); a
+    /// provider with NO samples OMITS the field entirely (don't-lie-with-zeros — absent,
+    /// never a fabricated `0ms`/`0%`), leaving the frozen `TopologyNode` contract intact.
+    #[test]
+    fn topology_body_projects_per_provider_metrics_and_omits_zero_sample_nodes() {
+        use crate::dashboard_flow::AttemptErrorClass;
+        use crate::dashboard_flow::AttemptStatus;
+        use crate::metrics::MetricsLayer;
+
+        let metrics = MetricsLayer::new();
+        // provider-a is hit by a failed primary then a served-elsewhere flow; provider-b
+        // never appears in any attempt (a configured-but-idle provider).
+        let attempts = vec![
+            Attempt {
+                provider: Some("provider-a".to_string()),
+                model: Some("m".to_string()),
+                start_ms: 1_000,
+                end_ms: 1_080,
+                first_upstream_byte_ms: None,
+                status: AttemptStatus::Failed,
+                error_class: Some(AttemptErrorClass::HttpStatus),
+                failover_reason: Some(crate::dashboard_flow::AttemptFailoverReason::ProviderFailed),
+            },
+            Attempt {
+                provider: Some("provider-c".to_string()),
+                model: Some("m".to_string()),
+                start_ms: 1_000,
+                end_ms: 1_040,
+                first_upstream_byte_ms: Some(1_040),
+                status: AttemptStatus::Served,
+                error_class: None,
+                failover_reason: None,
+            },
+        ];
+        metrics.record_terminal(
+            FlowStatus::Completed,
+            Some("m"),
+            "/v1/responses",
+            Some("provider-c"),
+            40,
+            None,
+            &attempts,
+        );
+
+        let snapshot = ProviderHealthSnapshot {
+            version: 7,
+            providers: vec![provider_health("provider-a"), provider_health("provider-b")],
+        };
+        let prices: HashMap<String, ModelPrice> = HashMap::new();
+        let body = topology_body(&snapshot, &prices, &metrics.view().window_1m);
+
+        let value = serde_json::to_value(&body).expect("serialize topology body");
+        let nodes = value["nodes"].as_array().expect("nodes array");
+        let node_a = nodes
+            .iter()
+            .find(|n| n["id"] == serde_json::json!("provider-a"))
+            .expect("provider-a node");
+        let node_b = nodes
+            .iter()
+            .find(|n| n["id"] == serde_json::json!("provider-b"))
+            .expect("provider-b node");
+
+        // provider-a has a sample → a `derived` per_provider tile with real values.
+        let per_a = &node_a["per_provider"];
+        assert_eq!(per_a["data_quality"], serde_json::json!("derived"));
+        assert_eq!(per_a["provider"], serde_json::json!("provider-a"));
+        assert_eq!(per_a["samples"], serde_json::json!(1));
+        assert_eq!(per_a["failed"], serde_json::json!(1));
+        assert_eq!(per_a["error_rate"], serde_json::json!(100.0));
+        assert_eq!(per_a["errors"]["http_status"], serde_json::json!(1));
+        assert!(
+            per_a["p99"].as_f64().expect("p99 number") > 0.0,
+            "the failed primary's latency feeds p99"
+        );
+
+        // provider-b has NO samples → the field is ABSENT (don't-lie-with-zeros).
+        assert!(
+            node_b.get("per_provider").is_none(),
+            "a zero-sample provider omits per_provider entirely (unavailable, not 0)"
+        );
+
+        // The per_provider tile round-trips back into the typed DTO.
+        let typed: crate::metrics::ProviderLatency =
+            serde_json::from_value(per_a.clone()).expect("deserialize ProviderLatency");
+        assert_eq!(typed.provider, "provider-a");
+        assert_eq!(typed.failed, 1);
+        assert_eq!(typed.errors.http_status, 1);
     }
 }

@@ -2905,6 +2905,7 @@ mod tests {
                 inputs.upstream.as_deref(),
                 guard.elapsed().as_millis(),
                 inputs.usage,
+                &[],
             );
             let view = metrics.view();
             assert_eq!(
@@ -2925,6 +2926,73 @@ mod tests {
             assert_eq!(key.upstream, "backend-b");
             assert_eq!(counts.prompt_tokens, 100);
             assert_eq!(counts.completion_tokens, 40);
+        }
+    }
+
+    /// Gap 12 acceptance: a flow whose FlowStore record is EVICTED before finalize still
+    /// counts its FAILED-PRIMARY provider in the per-provider metrics. The attempt trace
+    /// rides the SAME evict-safe terminal payload as `usage`/`upstream` (read off the
+    /// shared ServingToken at finalize, never the gone record), so per-provider aggregation
+    /// cannot undercount an unhealthy provider just because the flow aged out / was capped.
+    #[test]
+    fn per_provider_metrics_survive_record_eviction_before_finalize() {
+        for evict_via_ttl in [true, false] {
+            let store = DashboardFlowStore::new();
+            open_simple(&store, "api_1");
+            let token = serving();
+            token.set_model_served("served-m");
+            token.set_provider("backend-b");
+            // The failover layer records BOTH attempts on the token as it tries them: a
+            // failed primary A, then a served B. These ride the token, not the record.
+            token.record_attempt(failed_attempt("backend-a", AttemptErrorClass::HttpStatus));
+            token.record_attempt(served_attempt("backend-b", Some(200)));
+            let guard = store
+                .engine_guard("api_1", Arc::clone(&token), &AbortHub::new())
+                .expect("claim");
+
+            // EVICT the record before finalize (both mechanisms).
+            if evict_via_ttl {
+                store.force_started_ms("api_1", 0);
+                store.prune_at(FLOW_TTL_MS + 100);
+            } else {
+                for index in 0..(FLOW_CAP + 1) {
+                    open_simple(&store, &format!("filler_{index}"));
+                }
+            }
+            assert!(
+                store.detail("api_1").is_none(),
+                "record evicted before finalize"
+            );
+
+            guard.finalize(FlowStatus::Completed, None);
+            let inputs = guard.terminal_metrics().expect("terminal payload intact");
+            // The evict-safe payload carried BOTH attempts despite the gone record.
+            assert_eq!(inputs.attempts.len(), 2, "both attempts survive eviction");
+
+            let metrics = crate::metrics::MetricsLayer::new();
+            metrics.record_terminal(
+                FlowStatus::Completed,
+                inputs.model_served.as_deref(),
+                &inputs.endpoint,
+                inputs.upstream.as_deref(),
+                guard.elapsed().as_millis(),
+                inputs.usage,
+                &inputs.attempts,
+            );
+            // The FAILED PRIMARY is counted toward its own provider (backend-a), not lost
+            // behind the served backend-b — even though the record was evicted.
+            let view = metrics.view();
+            let primary = view
+                .window_1m
+                .provider_latency("backend-a")
+                .expect("the failed primary is counted despite record eviction");
+            assert_eq!(primary.failed, 1, "evict_via_ttl={evict_via_ttl}");
+            assert_eq!(primary.error_rate, 100.0);
+            assert_eq!(primary.errors.http_status, 1);
+            // The server is also tracked, as a served sample.
+            let served = view.window_1m.provider_latency("backend-b").unwrap();
+            assert_eq!(served.served, 1);
+            assert_eq!(served.error_rate, 0.0);
         }
     }
 

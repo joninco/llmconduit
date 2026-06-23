@@ -5941,6 +5941,7 @@ mod tests {
             finalized.upstream_target.as_deref(),
             finalized.elapsed_ms.unwrap_or(0),
             finalized.usage,
+            &[],
         );
 
         // The metrics bucket carries the REAL served model — NOT "unknown".
@@ -6234,6 +6235,7 @@ mod tests {
             inputs.upstream.as_deref(),
             guard.elapsed().as_millis(),
             inputs.usage,
+            &[],
         );
         let view = metrics.view();
         let (key, _counts) = view

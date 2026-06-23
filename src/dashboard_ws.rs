@@ -419,12 +419,27 @@ pub struct TopologyNode {
     /// Flattened from `ProviderHealth::catalog_size: Option<u64>` to a required
     /// non-null count (`None → 0`) per the frozen contract.
     pub catalog_size: u64,
+    /// Gap 12 — the ADDITIVE per-provider latency (p50/p95/p99) + error distribution for
+    /// this provider over the m1 window, aggregated off the evict-safe per-attempt trace
+    /// (spec 03), NOT the point-in-time `ProviderHealth` counters. `None`/ABSENT when the
+    /// provider had ZERO attempt samples in the window (don't-lie-with-zeros — the
+    /// frontend renders `—`, never a fabricated `0ms`/`0%`). `skip_serializing_if` keeps
+    /// the field off the wire entirely for a no-sample node, so the EXISTING frozen
+    /// `TopologyNode` contract (D9/D10/D12) is undisturbed; spec 13 reads this field. The
+    /// LIVE WS topology frame leaves it `None` (the WS frame does not join metrics, like
+    /// its `0.0` edge rates) — it is populated only on the REST `/topology` + `/snapshot`
+    /// reshape, which already join the m1 window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_provider: Option<crate::metrics::ProviderLatency>,
 }
 
 impl TopologyNode {
     /// Project a D4 [`ProviderHealth`](crate::upstream::ProviderHealth) into a
     /// topology node (`catalog_size` flattened `None → 0`). `pub(crate)` so D13's
-    /// REST `/topology` builds the SAME node shape as the WS topology frame.
+    /// REST `/topology` builds the SAME node shape as the WS topology frame. The gap-12
+    /// `per_provider` metrics are left `None` here (the live WS frame does not join the
+    /// metrics window); [`from_health_with_metrics`](Self::from_health_with_metrics)
+    /// populates them for the REST `/topology` + `/snapshot` reshape.
     pub(crate) fn from_health(health: &crate::upstream::ProviderHealth) -> Self {
         Self {
             id: health.id.clone(),
@@ -440,7 +455,25 @@ impl TopologyNode {
             catalog_fetched_ms: health.catalog_fetched_ms,
             // Contract: non-null required count; an unfetched catalog is 0, not null.
             catalog_size: health.catalog_size.unwrap_or(0),
+            // Gap 12: no metrics join on this path — populated only via
+            // `from_health_with_metrics` (REST `/topology` + `/snapshot`).
+            per_provider: None,
         }
+    }
+
+    /// Gap 12 — like [`from_health`](Self::from_health) but ALSO attaches this provider's
+    /// per-provider latency/error metrics from the m1 window, looked up by the provider's
+    /// `id` (the SAME key the per-attempt trace records under). `None`/absent when the
+    /// provider has no in-window attempt samples (don't-lie-with-zeros). Used by the REST
+    /// `/topology` handler + the `/snapshot` reshape (which already join the m1 window for
+    /// the edge rates), so the per-provider tiles ride the same metrics cut as the edges.
+    pub(crate) fn from_health_with_metrics(
+        health: &crate::upstream::ProviderHealth,
+        window_1m: &crate::metrics::WindowReport,
+    ) -> Self {
+        let mut node = Self::from_health(health);
+        node.per_provider = window_1m.provider_latency(&health.id);
+        node
     }
 }
 

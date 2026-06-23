@@ -677,6 +677,11 @@ impl Gateway {
             inputs.upstream.as_deref(),
             elapsed_ms,
             inputs.usage,
+            // Gap 12: the evict-safe per-attempt trace (spec 03) feeds the per-provider
+            // latency/error rings off the SAME terminal payload as `usage` — NOT a
+            // re-read of the evictable FlowStore record, so a failed primary on a flow
+            // whose record was pruned/evicted before finalize is still counted.
+            &inputs.attempts,
         );
     }
 

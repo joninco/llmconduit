@@ -30,6 +30,9 @@
 //!   recreates a 135 GiB worst case (AGENTS.md don't-rule). A snapshot-summary quota
 //!   bounds peak ring memory to ≤ ~400 MiB (720 cuts × 512 summaries × <1 KiB).
 
+use crate::dashboard_flow::Attempt;
+use crate::dashboard_flow::AttemptErrorClass;
+use crate::dashboard_flow::AttemptStatus;
 use crate::dashboard_flow::DashboardFlowStore;
 use crate::dashboard_flow::FlowStatus;
 use crate::dashboard_flow::FlowUsage;
@@ -60,6 +63,24 @@ const HISTOGRAM_MAX_MS: f64 = 120_000.0;
 
 /// Snapshot ring length: 720 body-free cuts = 12 per minute (one per 5 s) × 60 min.
 const SNAPSHOT_RING_SLOTS: usize = 720;
+
+/// Gap 12 — HARD cap on the number of DISTINCT providers tracked in the per-provider
+/// latency/error rings (PER SLOT). The provider key is derived from the attempt's
+/// `provider` label, which can be an attacker-influenceable routed/remapped alias, so
+/// an unbounded `BTreeMap` keyed by it would be a memory-growth vector (AGENTS.md:
+/// bounded structures only). Once a slot already tracks this many providers, a fresh
+/// provider's attempt is folded into the bounded [`OVERFLOW_PROVIDER`] catch-all bucket
+/// instead of spawning a new key — so the per-provider view stays useful (the known
+/// providers keep exact stats) while the key space can never exceed
+/// `MAX_TRACKED_PROVIDERS + 1` per slot. Samples-per-provider are bounded by the
+/// fixed-size 30-bucket [`Histogram`] (counts saturate; no per-sample retention).
+const MAX_TRACKED_PROVIDERS: usize = 64;
+
+/// Gap 12 — the bounded catch-all provider key a slot folds OVERFLOW providers into once
+/// it already tracks [`MAX_TRACKED_PROVIDERS`] distinct providers. A single fixed key, so
+/// the overflow can never itself grow the key space. Chosen to never collide with a real
+/// provider name (a configured provider/route id is never this sentinel).
+const OVERFLOW_PROVIDER: &str = "__other__";
 
 /// Default peak snapshot-ring memory quota (bytes). 720 cuts × 512 summaries ×
 /// <1 KiB ≈ 360 MiB; the 400 MiB quota is the HARD bound the ring cannot exceed —
@@ -280,16 +301,125 @@ impl Histogram {
     }
 }
 
+/// Gap 12 — the bounded per-error-class failure tally for one provider (a window, or a
+/// single slot). The key space is the FIXED [`AttemptErrorClass`] taxonomy (6 bounded
+/// snake_case codes from gap 03 — NEVER raw upstream text), so this is a fixed-size
+/// counter array, not an unbounded map. `skip_serializing_if` keeps a `0` class ABSENT
+/// on the wire — the distribution lists only the classes a provider actually hit. A
+/// per-class `0` here is honest (that class did not occur); the don't-lie-with-zeros
+/// rule lives at the PROVIDER level (a provider with NO samples in the window is absent
+/// from the per-provider report entirely, never a fabricated all-zero distribution).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ProviderErrorDistribution {
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub connect: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub http_status: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub timeout: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub stream: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub terminal: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub other: u64,
+}
+
+impl ProviderErrorDistribution {
+    /// Tally one failed attempt's bounded taxonomic [`AttemptErrorClass`]. An attempt with
+    /// no recorded class (a failed attempt whose class was somehow `None`) is counted as
+    /// `Other` so the per-class total always equals the provider's failed-attempt count.
+    fn record(&mut self, class: Option<AttemptErrorClass>) {
+        match class {
+            Some(AttemptErrorClass::Connect) => self.connect = self.connect.saturating_add(1),
+            Some(AttemptErrorClass::HttpStatus) => {
+                self.http_status = self.http_status.saturating_add(1)
+            }
+            Some(AttemptErrorClass::Timeout) => self.timeout = self.timeout.saturating_add(1),
+            Some(AttemptErrorClass::Stream) => self.stream = self.stream.saturating_add(1),
+            Some(AttemptErrorClass::Terminal) => self.terminal = self.terminal.saturating_add(1),
+            Some(AttemptErrorClass::Other) | None => self.other = self.other.saturating_add(1),
+        }
+    }
+
+    /// Merge another distribution into this one (collapsing a window's slots).
+    fn merge(&mut self, other: &ProviderErrorDistribution) {
+        self.connect = self.connect.saturating_add(other.connect);
+        self.http_status = self.http_status.saturating_add(other.http_status);
+        self.timeout = self.timeout.saturating_add(other.timeout);
+        self.stream = self.stream.saturating_add(other.stream);
+        self.terminal = self.terminal.saturating_add(other.terminal);
+        self.other = self.other.saturating_add(other.other);
+    }
+}
+
+/// Gap 12 — one provider's per-slot latency + outcome tally: a fixed 30-bucket latency
+/// [`Histogram`] (REUSED from the global ring — NOT a second percentile implementation)
+/// over the provider's ATTEMPT latencies, the served/failed attempt counts, and the
+/// bounded per-class error distribution. Fixed-size (the histogram is 30 `u64`s, the
+/// distribution 6 `u64`s) so a provider's per-slot footprint is O(1) regardless of
+/// traffic — samples-per-provider are bounded by the histogram, provider COUNT by
+/// [`MAX_TRACKED_PROVIDERS`].
+#[derive(Debug, Clone, Default)]
+struct ProviderSample {
+    histogram: Histogram,
+    served: u64,
+    failed: u64,
+    errors: ProviderErrorDistribution,
+}
+
+impl ProviderSample {
+    /// Record one upstream dispatch ATTEMPT for this provider: its latency lands in the
+    /// histogram (so a FAILED primary's latency counts toward its provider — final-served
+    /// latency alone would hide an unhealthy provider, spec 12) and its served/failed
+    /// outcome + taxonomic error class are tallied.
+    fn record(&mut self, latency_ms: f64, attempt: &Attempt) {
+        self.histogram.record(latency_ms);
+        match attempt.status {
+            AttemptStatus::Served => self.served = self.served.saturating_add(1),
+            AttemptStatus::Failed => {
+                self.failed = self.failed.saturating_add(1);
+                self.errors.record(attempt.error_class);
+            }
+        }
+    }
+
+    /// Merge another slot's sample for the SAME provider into this one (window collapse).
+    fn merge(&mut self, other: &ProviderSample) {
+        self.histogram.merge(&other.histogram);
+        self.served = self.served.saturating_add(other.served);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.errors.merge(&other.errors);
+    }
+
+    /// Approximate retained bytes of this per-provider sample for the snapshot-memory
+    /// quota (mirrors [`BucketCounts::approx_bytes`]). Every field is fixed-size and
+    /// heap-free — the `Histogram` is a `[u64; 30]` array, the served/failed counters are
+    /// `u64`, and the [`ProviderErrorDistribution`] is six `u64`s — so the full footprint
+    /// is the struct size; the provider KEY string bytes are charged at the map level (as
+    /// the global `buckets` charges its `BucketKey` strings separately).
+    fn approx_bytes(&self) -> usize {
+        std::mem::size_of::<ProviderSample>()
+    }
+}
+
 /// One 1-second slot of a window ring: the per-key counts, the latency histogram,
-/// and the epoch-second this slot currently represents. `epoch_s == 0` marks an
-/// unused slot. When wall-clock advances to a new second whose ring index maps to a
-/// slot still stamped with an OLDER epoch second, the slot is RESET before the new
-/// sample lands (circular reuse — the window only ever holds its own time span).
+/// the per-provider attempt tallies (gap 12), and the epoch-second this slot
+/// currently represents. `epoch_s == 0` marks an unused slot. When wall-clock
+/// advances to a new second whose ring index maps to a slot still stamped with an
+/// OLDER epoch second, the slot is RESET before the new sample lands (circular reuse
+/// — the window only ever holds its own time span).
 #[derive(Debug, Clone, Default)]
 struct Slot {
     epoch_s: u64,
     buckets: BTreeMap<BucketKey, BucketCounts>,
     histogram: Histogram,
+    /// Gap 12 — per-provider attempt tallies, keyed by the attempt's provider label.
+    /// BOUNDED to [`MAX_TRACKED_PROVIDERS`] (+1 overflow) distinct keys per slot: a
+    /// fresh provider beyond the cap folds into [`OVERFLOW_PROVIDER`], so an
+    /// attacker-influenceable provider alias can never grow this map without bound.
+    providers: BTreeMap<String, ProviderSample>,
 }
 
 impl Slot {
@@ -298,6 +428,42 @@ impl Slot {
         self.epoch_s = epoch_s;
         self.buckets.clear();
         self.histogram = Histogram::default();
+        self.providers.clear();
+    }
+
+    /// The mutable per-provider sample for `provider`, BOUNDING the map to
+    /// [`MAX_TRACKED_PROVIDERS`] distinct keys: an EXISTING provider is returned as-is;
+    /// a NEW provider is admitted only while there is room, otherwise its attempt is
+    /// folded into the fixed [`OVERFLOW_PROVIDER`] catch-all (created on demand, but a
+    /// SINGLE bounded key). So the slot can hold at most `MAX_TRACKED_PROVIDERS + 1`
+    /// keys regardless of how many distinct provider strings arrive.
+    fn provider_sample_mut(&mut self, provider: &str) -> &mut ProviderSample {
+        if self.providers.contains_key(provider) || self.providers.len() < MAX_TRACKED_PROVIDERS {
+            return self.providers.entry(provider.to_string()).or_default();
+        }
+        self.providers
+            .entry(OVERFLOW_PROVIDER.to_string())
+            .or_default()
+    }
+}
+
+/// Gap 12 — fold a flow's per-attempt trace into ONE ring slot's per-provider tallies.
+/// Each attempt contributes (provider, latency, served/failed, error_class). The latency
+/// is the attempt's own measured wall-clock span (`end_ms - start_ms`) — a per-ATTEMPT
+/// latency, so a failed primary's slow connect/timeout counts toward ITS provider, not
+/// the eventual server's (this is exactly what global per-flow latency cannot show). The
+/// provider key collapses to the bounded `"unknown"` sentinel when an attempt recorded no
+/// provider label, so a missing attribution never spawns a distinct empty key. The
+/// provider COUNT is bounded by `Slot::provider_sample_mut` (the [`MAX_TRACKED_PROVIDERS`]
+/// cap + overflow); samples-per-provider by the fixed-size histogram.
+fn record_attempts_into_slot(slot: &mut Slot, attempts: &[Attempt]) {
+    for attempt in attempts {
+        // `end_ms`/`start_ms` are measured epoch-ms (gap 03 always stamps them). A
+        // non-monotonic pair (clock skew) saturates to 0 ms rather than wrapping.
+        let latency_ms = attempt.end_ms.saturating_sub(attempt.start_ms) as f64;
+        let provider = attempt.provider.as_deref().unwrap_or("unknown");
+        slot.provider_sample_mut(provider)
+            .record(latency_ms, attempt);
     }
 }
 
@@ -338,9 +504,29 @@ impl WindowRing {
         let floor = now_epoch_s.saturating_sub(len - 1);
         let mut buckets: BTreeMap<BucketKey, BucketCounts> = BTreeMap::new();
         let mut histogram = Histogram::default();
+        let mut providers: BTreeMap<String, ProviderSample> = BTreeMap::new();
         for slot in &self.slots {
             if slot.epoch_s < floor || slot.epoch_s > now_epoch_s {
                 continue;
+            }
+            // Gap 12: merge each in-window slot's per-provider attempt tallies. Each slot
+            // is individually capped at `MAX_TRACKED_PROVIDERS + 1` keys, but DISTINCT
+            // slots can track DISTINCT provider sets (an attacker rotating provider aliases
+            // each second), so the naive UNION across up-to-`len` slots is NOT bounded by a
+            // single cap. Bound the merged map the SAME way a slot bounds itself: an
+            // already-tracked provider always merges; a NEW provider is admitted only while
+            // under the cap, otherwise it folds into the bounded overflow bucket. So the
+            // aggregated (retained-in-this-call + serialized) provider count is hard-capped
+            // at `MAX_TRACKED_PROVIDERS + 1` regardless of slot rotation.
+            for (provider, sample) in &slot.providers {
+                if providers.contains_key(provider) || providers.len() < MAX_TRACKED_PROVIDERS {
+                    providers.entry(provider.clone()).or_default().merge(sample);
+                } else {
+                    providers
+                        .entry(OVERFLOW_PROVIDER.to_string())
+                        .or_default()
+                        .merge(sample);
+                }
             }
             for (key, counts) in &slot.buckets {
                 let entry = buckets.entry(key.clone()).or_default();
@@ -360,7 +546,11 @@ impl WindowRing {
             }
             histogram.merge(&slot.histogram);
         }
-        WindowReport { buckets, histogram }
+        WindowReport {
+            buckets,
+            histogram,
+            providers,
+        }
     }
 }
 
@@ -370,6 +560,15 @@ impl WindowRing {
 pub struct WindowReport {
     pub buckets: BTreeMap<BucketKey, BucketCounts>,
     pub histogram: Histogram,
+    /// Gap 12 — the merged per-provider attempt tallies for the window, keyed by
+    /// provider label. NOT serialized on the wire (`#[serde(skip)]`): the public
+    /// per-provider DTO is COMPUTED at render time via [`WindowReport::per_provider`]
+    /// (in `dashboard_api`, where it joins the topology nodes), exactly like the
+    /// window `percentiles` are computed at render rather than stored. This keeps the
+    /// raw internal [`ProviderSample`] (with its private histogram) off the wire and
+    /// the snapshot payload unchanged.
+    #[serde(skip)]
+    providers: BTreeMap<String, ProviderSample>,
 }
 
 impl WindowReport {
@@ -415,6 +614,136 @@ impl WindowReport {
             .map(|(_, counts)| counts.usage_samples)
             .fold(0u64, u64::saturating_add)
     }
+
+    /// Gap 12 — the per-provider latency + error distribution for ONE provider over this
+    /// window, or `None` when the provider has ZERO attempt samples in the window. The
+    /// `None` IS the don't-lie-with-zeros signal (spec 12, mirroring spec 01): a provider
+    /// with no in-window samples must render `unavailable` (`—`), NEVER a fabricated `0`
+    /// or all-zero percentile — so the caller surfaces an ABSENT per-provider tile, not a
+    /// zeroed one. Percentiles are `derived` from the same log-spaced [`Histogram`] the
+    /// global ring uses (no second percentile implementation). `samples` counts EVERY
+    /// attempt to the provider (served + failed) so a failed primary is included.
+    pub fn provider_latency(&self, provider: &str) -> Option<ProviderLatency> {
+        self.providers
+            .get(provider)
+            .map(|sample| provider_latency_from_sample(provider, sample))
+    }
+
+    /// Gap 12 — the per-provider latency + error distribution for EVERY provider with at
+    /// least one attempt sample in this window. Providers with zero in-window samples are
+    /// simply absent from the map (don't-lie-with-zeros). The map is bounded by the ring's
+    /// per-slot [`MAX_TRACKED_PROVIDERS`] cap.
+    pub fn per_provider(&self) -> BTreeMap<String, ProviderLatency> {
+        self.providers
+            .iter()
+            .map(|(provider, sample)| {
+                (
+                    provider.clone(),
+                    provider_latency_from_sample(provider, sample),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Build the public [`ProviderLatency`] DTO from one provider's merged window
+/// [`ProviderSample`]. Only ever called for a provider that HAS samples (the callers
+/// gate on presence), so `samples >= 1` and the percentiles/error-rate are genuinely
+/// `derived` — never a fabricated zero. `error_rate` is failed / (served + failed).
+fn provider_latency_from_sample(provider: &str, sample: &ProviderSample) -> ProviderLatency {
+    let samples = sample.served.saturating_add(sample.failed);
+    let percentiles = ProviderPercentiles {
+        p50: sample.histogram.quantile(0.50),
+        p95: sample.histogram.quantile(0.95),
+        p99: sample.histogram.quantile(0.99),
+    };
+    // `samples >= 1` here (the provider only exists in the map because an attempt landed),
+    // so this division is never 0/0; an all-served provider reports `0.0` (a genuine
+    // MEASURED zero error rate, distinct from the `unavailable` no-samples case which is
+    // an ABSENT `ProviderLatency`, never this struct).
+    let error_rate = if samples > 0 {
+        (sample.failed as f64) / (samples as f64) * 100.0
+    } else {
+        0.0
+    };
+    ProviderLatency {
+        provider: provider.to_string(),
+        // Gap 12: every per-provider metric is `derived` (percentiles over the provider's
+        // own attempt histogram). The DQ tag travels with the data so the frontend (spec
+        // 13) labels it; a zero-sample provider never reaches here (it is absent).
+        data_quality: ProviderMetricQuality::Derived,
+        samples,
+        served: sample.served,
+        failed: sample.failed,
+        p50: finite_ms(percentiles.p50),
+        p95: finite_ms(percentiles.p95),
+        p99: finite_ms(percentiles.p99),
+        error_rate: finite_ms(error_rate),
+        errors: sample.errors,
+    }
+}
+
+/// Clamp a metrics float to a finite value (`0.0` for NaN/Inf) so the per-provider DTO
+/// never carries a non-finite number that would fail `serde_json::to_vec` and 500 the
+/// `/topology` read (mirrors `dashboard_api::finite`). Local to this module so the
+/// per-provider DTO is self-contained.
+fn finite_ms(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+/// Gap 12 — the data-quality tag for a per-provider metric. Every per-provider latency
+/// figure is `derived` (computed from the provider's own attempt-latency histogram). The
+/// `unavailable` case (a provider with no in-window samples) is represented by the
+/// ABSENCE of a [`ProviderLatency`] entirely, not by a variant here — so a present DTO is
+/// always a real `derived` measurement (don't-lie-with-zeros). Serializes snake_case to
+/// match the cross-cutting DQ-tag contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMetricQuality {
+    Derived,
+}
+
+/// Gap 12 — the public per-provider latency + error-distribution DTO (additive on the
+/// D4 topology node; consumed by spec 13). Percentiles are `derived` ms over the
+/// provider's ATTEMPT-latency histogram (a FAILED primary's latency is included — spec
+/// 12 — so final-served latency alone cannot hide an unhealthy provider). `error_rate`
+/// is the percentage of the provider's attempts that FAILED. A provider with zero
+/// in-window samples is ABSENT (don't-lie-with-zeros), so a present DTO always has
+/// `samples >= 1`. All floats are finite (the frozen finite-number wire contract).
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct ProviderLatency {
+    /// The provider label these metrics are for (the bounded provider/route id, or the
+    /// `__other__` overflow bucket once the per-slot provider cap is exceeded).
+    pub provider: String,
+    /// DQ tag — always `derived` for a present entry (the `unavailable` case is absence).
+    pub data_quality: ProviderMetricQuality,
+    /// Total ATTEMPTS to this provider in the window (served + failed) — the per-provider
+    /// measurability denominator. Always `>= 1` (a zero-sample provider is absent).
+    pub samples: u64,
+    /// Of `samples`, the count that SERVED (produced the first chunk).
+    pub served: u64,
+    /// Of `samples`, the count that FAILED before serving (failed primaries included).
+    pub failed: u64,
+    /// `derived` p50 attempt latency (ms).
+    pub p50: f64,
+    /// `derived` p95 attempt latency (ms).
+    pub p95: f64,
+    /// `derived` p99 attempt latency (ms).
+    pub p99: f64,
+    /// Percentage of attempts that failed (`failed / samples × 100`). A genuine MEASURED
+    /// `0.0` for an all-served provider (distinct from the `unavailable`/absent case).
+    pub error_rate: f64,
+    /// Bounded per-class failure tally (gap 03 taxonomy). Absent classes are omitted.
+    pub errors: ProviderErrorDistribution,
+}
+
+/// The reported p50/p95/p99 (ms) for a provider — a local triple used to assemble
+/// [`ProviderLatency`] (kept distinct from the window-wide [`Percentiles`] so the
+/// per-provider math is self-documenting).
+struct ProviderPercentiles {
+    p50: f64,
+    p95: f64,
+    p99: f64,
 }
 
 /// The reported p50/p95/p99 latency (ms) for a window.
@@ -441,7 +770,11 @@ pub struct MetricsView {
 
 impl MetricsView {
     /// Approximate retained bytes of this view (for the snapshot-memory quota):
-    /// per-window bucket key strings + counts + the fixed histograms.
+    /// per-window bucket key strings + counts + the fixed histograms, PLUS (gap 12) the
+    /// per-provider maps retained on `WindowReport.providers` — those are `#[serde(skip)]`
+    /// (kept off the wire) but STILL retained on every `DashboardSnapshot` cut, so the
+    /// quota must charge them or the snapshot ring would undercount the per-provider
+    /// keys/histograms and exceed its memory bound (the bounded-memory invariant).
     fn approx_bytes(&self) -> usize {
         let window_bytes = |report: &WindowReport| -> usize {
             let mut bytes = std::mem::size_of::<Histogram>();
@@ -451,6 +784,13 @@ impl MetricsView {
                     + key.upstream.len()
                     + std::mem::size_of::<BucketKey>()
                     + counts.approx_bytes();
+            }
+            // Gap 12: charge the per-provider map the SAME way — each entry's provider key
+            // string bytes + the `String` overhead + the fixed `ProviderSample`
+            // (histogram + counts + error distribution). Bounded by `MAX_TRACKED_PROVIDERS
+            // + 1` entries (the per-window union cap), so this is a bounded addend.
+            for (provider, sample) in &report.providers {
+                bytes += provider.len() + std::mem::size_of::<String>() + sample.approx_bytes();
             }
             bytes
         };
@@ -672,9 +1012,17 @@ impl MetricsState {
         key: &BucketKey,
         elapsed_ms: f64,
         usage: Option<FlowUsage>,
+        attempts: &[Attempt],
     ) {
         for ring in [&mut self.ring_1m, &mut self.ring_5m, &mut self.ring_1h] {
             let slot = ring.slot_mut(epoch_s);
+            // Gap 12: fold the per-attempt trace into the per-provider tallies in the SAME
+            // slot, under the SAME single metrics-lock hold as the count/tokens — so a
+            // concurrent 5 s snapshot can never observe the flow's terminal count without
+            // its per-provider attempt samples (they are co-located atomically). A FAILED
+            // primary that failed over IS counted toward its own provider (final-served
+            // latency alone would hide it — spec 12). Bounded by the per-slot provider cap.
+            record_attempts_into_slot(slot, attempts);
             let entry = slot.buckets.entry(key.clone()).or_default();
             entry.count = entry.count.saturating_add(1);
             if let Some(usage) = usage {
@@ -879,6 +1227,17 @@ impl MetricsLayer {
     /// boundary). The `served_model`/`endpoint`/`upstream` collapse to `"unknown"`
     /// when absent so the key space stays bounded. No-op (zero lock, zero work) when
     /// disabled.
+    ///
+    /// Gap 12: `attempts` is the flow's evict-safe per-attempt trace (spec 03, carried
+    /// on the SAME terminal payload as `usage`). Each attempt feeds the per-provider
+    /// latency/error rings in the SAME slot under the SAME lock hold — so a FAILED
+    /// primary is counted toward ITS provider (not hidden behind the final server) and
+    /// the per-provider samples can never be split from the flow's terminal count by a
+    /// concurrent snapshot. Pass `&[]` for a flow with no recorded attempt.
+    // The terminal seam threads distinct attribution + usage + the attempt trace; these
+    // are independent finalize-time facts, not a cohesive struct (mirrors the engine's
+    // own `#[allow]`ed terminal-finalize signatures).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_terminal(
         &self,
         status: FlowStatus,
@@ -887,6 +1246,7 @@ impl MetricsLayer {
         upstream: Option<&str>,
         elapsed_ms: u128,
         usage: Option<FlowUsage>,
+        attempts: &[Attempt],
     ) {
         if !self.enabled {
             return;
@@ -899,7 +1259,7 @@ impl MetricsLayer {
         };
         let epoch_s = now_epoch_s();
         self.lock()
-            .record_terminal(epoch_s, &key, elapsed_ms as f64, usage);
+            .record_terminal(epoch_s, &key, elapsed_ms as f64, usage, attempts);
     }
 
     /// The current metrics domain sequence (the per-domain cursor). `0` when
@@ -1139,6 +1499,12 @@ pub fn spawn_snapshot_task(
 /// spawns a distinct `None` bucket and the key space stays bounded.
 fn label_or_unknown(value: Option<&str>) -> String {
     value.unwrap_or("unknown").to_string()
+}
+
+/// `skip_serializing_if` predicate for the per-class error counters: a `0` class is
+/// ABSENT on the wire, so a provider's error distribution lists only the classes it hit.
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 fn now_ms() -> u128 {
@@ -1407,6 +1773,7 @@ mod tests {
                 cached: Some(10),
                 reasoning: Some(7),
             }),
+            &[],
         );
         // ONE atomic mutation ⇒ exactly one seq bump (not two).
         assert_eq!(metrics.metrics_seq(), 1, "atomic terminal bumps seq once");
@@ -1452,6 +1819,7 @@ mod tests {
             None,
             7,
             None,
+            &[],
         );
         assert_eq!(metrics.metrics_seq(), 1);
         let view = metrics.view();
@@ -1484,6 +1852,7 @@ mod tests {
                 cached: Some(0),
                 reasoning: Some(0),
             }),
+            &[],
         );
         // 2) unpriced model, usage present → usage sample, NOT priced.
         metrics.record_terminal(
@@ -1499,6 +1868,7 @@ mod tests {
                 cached: Some(0),
                 reasoning: Some(0),
             }),
+            &[],
         );
         // 3) priced model, NO usage → counted request, NOT a usage/priced sample.
         metrics.record_terminal(
@@ -1508,6 +1878,7 @@ mod tests {
             Some("p"),
             10,
             None,
+            &[],
         );
         let view = metrics.view();
         let window = &view.window_1m;
@@ -1523,6 +1894,405 @@ mod tests {
             priced, 1,
             "only the priced-model usage-bearing terminal is a priced sample"
         );
+    }
+
+    // -- Gap 12: per-provider latency + error distribution --------------------------
+
+    /// Build a failed attempt to `provider` spanning `latency_ms` with `class`.
+    fn failed_attempt(provider: &str, latency_ms: u128, class: AttemptErrorClass) -> Attempt {
+        Attempt {
+            provider: Some(provider.to_string()),
+            model: Some("m".to_string()),
+            start_ms: 1_000,
+            end_ms: 1_000 + latency_ms,
+            first_upstream_byte_ms: None,
+            status: AttemptStatus::Failed,
+            error_class: Some(class),
+            failover_reason: Some(crate::dashboard_flow::AttemptFailoverReason::ProviderFailed),
+        }
+    }
+
+    /// Build a served attempt to `provider` spanning `latency_ms`.
+    fn served_attempt(provider: &str, latency_ms: u128) -> Attempt {
+        Attempt {
+            provider: Some(provider.to_string()),
+            model: Some("m".to_string()),
+            start_ms: 1_000,
+            end_ms: 1_000 + latency_ms,
+            first_upstream_byte_ms: Some(1_000 + latency_ms),
+            status: AttemptStatus::Served,
+            error_class: None,
+            failover_reason: None,
+        }
+    }
+
+    #[test]
+    fn per_provider_aggregates_attempts_off_the_terminal_seam() {
+        // The per-provider ring is fed from the terminal payload's `attempts[]` (spec 03),
+        // NOT a FlowStore read. A flow that failed over A → B records BOTH attempts: A as a
+        // FAILED sample on provider A, B as a SERVED sample on provider B. Each provider's
+        // percentiles + error rate derive from its OWN attempt latencies.
+        let metrics = MetricsLayer::new();
+        let attempts = vec![
+            failed_attempt("provider-a", 80, AttemptErrorClass::HttpStatus),
+            served_attempt("provider-b", 40),
+        ];
+        // The flow ultimately SUCCEEDED on B (the terminal status/upstream is B), but A's
+        // failure still lands on provider A via the attempt trace.
+        metrics.record_terminal(
+            FlowStatus::Completed,
+            Some("m"),
+            "/v1/responses",
+            Some("provider-b"),
+            40,
+            None,
+            &attempts,
+        );
+        let view = metrics.view();
+        let per = view.window_1m.per_provider();
+        assert_eq!(per.len(), 2, "both attempted providers are tracked");
+
+        let a = view
+            .window_1m
+            .provider_latency("provider-a")
+            .expect("provider A has a failed sample");
+        assert_eq!(a.data_quality, ProviderMetricQuality::Derived);
+        assert_eq!(a.samples, 1);
+        assert_eq!(a.served, 0);
+        assert_eq!(a.failed, 1);
+        assert_eq!(a.error_rate, 100.0, "A's only attempt failed");
+        assert_eq!(a.errors.http_status, 1, "A's failure classed http_status");
+        assert_eq!(a.errors.connect, 0);
+        assert!(
+            a.p50 > 0.0,
+            "A's failed-attempt latency feeds its percentiles"
+        );
+
+        let b = view
+            .window_1m
+            .provider_latency("provider-b")
+            .expect("provider B has a served sample");
+        assert_eq!(b.samples, 1);
+        assert_eq!(b.served, 1);
+        assert_eq!(b.failed, 0);
+        assert_eq!(
+            b.error_rate, 0.0,
+            "B served — a MEASURED 0% (not unavailable)"
+        );
+    }
+
+    #[test]
+    fn per_provider_failed_primary_is_counted_even_when_flow_succeeds_elsewhere() {
+        // Spec 12 acceptance: a failed primary is counted (final-served latency alone hides
+        // an unhealthy provider). Three flows, EACH failed primary A then served on B. The
+        // per-flow terminal metrics attribute the served upstream B; only the attempt trace
+        // surfaces A's three failures.
+        let metrics = MetricsLayer::new();
+        for _ in 0..3 {
+            metrics.record_terminal(
+                FlowStatus::Completed,
+                Some("m"),
+                "/v1/responses",
+                Some("provider-b"),
+                40,
+                None,
+                &[
+                    failed_attempt("provider-a", 90, AttemptErrorClass::Timeout),
+                    served_attempt("provider-b", 40),
+                ],
+            );
+        }
+        let a = metrics
+            .view()
+            .window_1m
+            .provider_latency("provider-a")
+            .expect("the failed primary is tracked despite never serving");
+        assert_eq!(a.samples, 3, "all three failed primaries counted");
+        assert_eq!(a.failed, 3);
+        assert_eq!(a.served, 0);
+        assert_eq!(a.error_rate, 100.0);
+        assert_eq!(a.errors.timeout, 3, "all three classed timeout");
+    }
+
+    #[test]
+    fn per_provider_zero_sample_provider_is_unavailable_not_zero() {
+        // don't-lie-with-zeros (spec 12, mirrors spec 01): a provider with NO attempt
+        // samples in the window has NO `ProviderLatency` (absent → frontend renders `—`),
+        // NOT a fabricated all-zero percentile/0% error rate.
+        let metrics = MetricsLayer::new();
+        metrics.record_terminal(
+            FlowStatus::Completed,
+            Some("m"),
+            "/v1/responses",
+            Some("provider-a"),
+            40,
+            None,
+            &[served_attempt("provider-a", 40)],
+        );
+        let view = metrics.view();
+        // The provider that WAS attempted is present...
+        assert!(view.window_1m.provider_latency("provider-a").is_some());
+        // ...a provider that never appeared in any attempt is ABSENT (unavailable, not 0).
+        assert!(
+            view.window_1m.provider_latency("never-seen").is_none(),
+            "a zero-sample provider is absent (unavailable), never a fabricated zero"
+        );
+        assert!(
+            !view.window_1m.per_provider().contains_key("never-seen"),
+            "the per-provider map omits zero-sample providers entirely"
+        );
+    }
+
+    #[test]
+    fn per_provider_error_distribution_tallies_each_class() {
+        // The error distribution uses the BOUNDED gap-03 taxonomic classes (snake_case),
+        // never raw upstream text. A provider hit by several distinct failure classes
+        // tallies each one; an all-served provider has an empty distribution.
+        let metrics = MetricsLayer::new();
+        metrics.record_terminal(
+            FlowStatus::Failed,
+            None,
+            "/v1/responses",
+            Some("provider-a"),
+            10,
+            None,
+            &[
+                failed_attempt("provider-a", 10, AttemptErrorClass::Connect),
+                failed_attempt("provider-a", 20, AttemptErrorClass::Connect),
+                failed_attempt("provider-a", 30, AttemptErrorClass::Timeout),
+                failed_attempt("provider-a", 40, AttemptErrorClass::Stream),
+            ],
+        );
+        let a = metrics
+            .view()
+            .window_1m
+            .provider_latency("provider-a")
+            .unwrap();
+        assert_eq!(a.samples, 4);
+        assert_eq!(a.failed, 4);
+        assert_eq!(a.error_rate, 100.0);
+        assert_eq!(a.errors.connect, 2, "two connect failures");
+        assert_eq!(a.errors.timeout, 1);
+        assert_eq!(a.errors.stream, 1);
+        assert_eq!(a.errors.http_status, 0);
+        assert_eq!(a.errors.other, 0);
+        assert_eq!(a.errors.terminal, 0);
+        // The bounded distribution serializes only the non-zero classes (skip-if-zero).
+        let json = serde_json::to_value(a.errors).expect("serialize error distribution");
+        let obj = json.as_object().unwrap();
+        assert!(obj.contains_key("connect") && obj.contains_key("timeout"));
+        assert!(
+            !obj.contains_key("http_status") && !obj.contains_key("other"),
+            "zero classes are absent on the wire"
+        );
+    }
+
+    #[test]
+    fn per_provider_map_is_bounded_to_max_tracked_providers_plus_overflow() {
+        // MEMORY invariant (AGENTS.md): the per-provider key space is CAPPED. Feeding far
+        // more than MAX_TRACKED_PROVIDERS distinct (attacker-influenceable) provider
+        // strings must NOT grow the map without bound — providers beyond the cap fold into
+        // the single bounded overflow bucket, so the map holds at most cap + 1 keys.
+        let metrics = MetricsLayer::new();
+        let many = MAX_TRACKED_PROVIDERS + 50;
+        let attempts: Vec<Attempt> = (0..many)
+            .map(|index| failed_attempt(&format!("provider-{index}"), 10, AttemptErrorClass::Other))
+            .collect();
+        metrics.record_terminal(
+            FlowStatus::Failed,
+            None,
+            "/v1/responses",
+            None,
+            10,
+            None,
+            &attempts,
+        );
+        let per = metrics.view().window_1m.per_provider();
+        assert!(
+            per.len() <= MAX_TRACKED_PROVIDERS + 1,
+            "per-provider map bounded to {} keys, got {}",
+            MAX_TRACKED_PROVIDERS + 1,
+            per.len()
+        );
+        assert!(
+            per.contains_key(OVERFLOW_PROVIDER),
+            "overflow providers fold into the bounded catch-all bucket"
+        );
+        // Every overflow attempt is still accounted for (none silently dropped): the total
+        // attempts across all tracked keys equals the input count.
+        let total: u64 = per.values().map(|p| p.samples).sum();
+        assert_eq!(
+            total, many as u64,
+            "no attempt is dropped — overflow is folded"
+        );
+    }
+
+    #[test]
+    fn per_provider_aggregate_union_is_bounded_across_rotating_slots() {
+        // Defense in depth (AGENTS.md MEMORY): a single slot is capped at
+        // MAX_TRACKED_PROVIDERS, but distinct SLOTS can carry distinct provider sets (an
+        // attacker rotating provider aliases each second). The window AGGREGATE must still
+        // bound its merged/serialized provider count — else the union across up to 3600
+        // in-window slots would be unbounded. Place ONE distinct provider per epoch across
+        // far more than the cap of seconds, then aggregate the whole 1h window.
+        let metrics = MetricsLayer::new();
+        let base = 2_000_000u64;
+        let distinct = MAX_TRACKED_PROVIDERS + 100;
+        {
+            let mut state = metrics.lock();
+            for index in 0..distinct {
+                let epoch = base + index as u64; // one fresh provider per second
+                state.record_terminal(
+                    epoch,
+                    &BucketKey {
+                        status: StatusClass::Error,
+                        model: "m".to_string(),
+                        endpoint: "/v1/responses".to_string(),
+                        upstream: "u".to_string(),
+                    },
+                    10.0,
+                    None,
+                    &[failed_attempt(
+                        &format!("rot-{index}"),
+                        10,
+                        AttemptErrorClass::Other,
+                    )],
+                );
+            }
+            // Aggregate the full 1h window ending at the last-written second. The 1h ring
+            // (3600 slots) holds ALL `distinct` (> cap) one-per-second providers at once —
+            // exactly the cross-slot rotation the union bound must defend against (the 60-
+            // slot 1m ring could only ever surface ~60). Without the aggregate cap this
+            // union would be `distinct` keys; with it, at most `MAX_TRACKED_PROVIDERS + 1`.
+            let now = base + distinct as u64;
+            let per = state.view(now).window_1h.per_provider();
+            assert!(
+                per.len() <= MAX_TRACKED_PROVIDERS + 1,
+                "aggregate union bounded to {} keys across rotating slots, got {}",
+                MAX_TRACKED_PROVIDERS + 1,
+                per.len()
+            );
+            assert!(
+                per.contains_key(OVERFLOW_PROVIDER),
+                "rotated-out providers fold into the bounded overflow bucket"
+            );
+        }
+    }
+
+    #[test]
+    fn per_provider_maps_are_charged_to_the_snapshot_memory_quota() {
+        // The per-provider maps are `#[serde(skip)]` (off the wire) but RETAINED on every
+        // `DashboardSnapshot` cut, so `MetricsView::approx_bytes` — the snapshot-ring
+        // memory-quota accountant — MUST charge them, or the ring undercounts and can
+        // exceed its bound. Pin it: an identical window WITH per-provider samples estimates
+        // STRICTLY MORE retained bytes than one WITHOUT, by at least the populated maps'
+        // footprint (provider key strings + the fixed `ProviderSample` per entry).
+        let key = BucketKey {
+            status: StatusClass::Success,
+            model: "m".to_string(),
+            endpoint: "/v1/responses".to_string(),
+            upstream: "u".to_string(),
+        };
+        let epoch = 3_000_000u64;
+
+        // (a) a terminal with NO attempts → no per-provider entries.
+        let without = {
+            let mut state = MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES);
+            state.record_terminal(epoch, &key, 40.0, None, &[]);
+            state.view(epoch).approx_bytes()
+        };
+        // (b) the SAME terminal but WITH several distinct-provider attempts → populated
+        // per-provider maps (in all three window rings).
+        let with = {
+            let mut state = MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES);
+            let attempts = vec![
+                failed_attempt("provider-alpha", 80, AttemptErrorClass::HttpStatus),
+                failed_attempt("provider-beta", 70, AttemptErrorClass::Timeout),
+                served_attempt("provider-gamma", 40),
+            ];
+            state.record_terminal(epoch, &key, 40.0, None, &attempts);
+            state.view(epoch).approx_bytes()
+        };
+
+        assert!(
+            with > without,
+            "approx_bytes must charge the retained per-provider maps: with={with} without={without}"
+        );
+        // The delta must be at least the three providers' fixed `ProviderSample` size in
+        // EACH of the three window rings (a lower bound — key strings + String overhead add
+        // more), proving the maps are genuinely accounted, not a rounding artifact.
+        let min_delta = 3 * 3 * std::mem::size_of::<ProviderSample>();
+        assert!(
+            with - without >= min_delta,
+            "delta {} >= {} (3 providers × 3 windows × ProviderSample)",
+            with - without,
+            min_delta
+        );
+    }
+
+    #[test]
+    fn per_provider_unlabeled_attempt_folds_into_unknown() {
+        // An attempt with no provider label collapses to the bounded "unknown" sentinel
+        // (never an empty distinct key) — same rule as the global bucket key.
+        let metrics = MetricsLayer::new();
+        let mut attempt = served_attempt("ignored", 40);
+        attempt.provider = None;
+        metrics.record_terminal(
+            FlowStatus::Completed,
+            Some("m"),
+            "/v1/responses",
+            None,
+            40,
+            None,
+            &[attempt],
+        );
+        let per = metrics.view().window_1m.per_provider();
+        assert!(per.contains_key("unknown"), "unlabeled attempt → unknown");
+        assert_eq!(per["unknown"].samples, 1);
+    }
+
+    #[test]
+    fn per_provider_survives_window_eviction_to_empty() {
+        // The per-provider tallies live in the SAME ring slots as the global buckets, so a
+        // quiet window (no recent samples) reports an EMPTY per-provider map — not stale
+        // ancient samples. This pins the circular-reuse/eviction behavior for the new data.
+        let metrics = MetricsLayer::new();
+        {
+            // Record an attempt at a FIXED old epoch, then aggregate a full window past it.
+            let mut state = metrics.lock();
+            let old_epoch = 1_000_000u64;
+            state.record_terminal(
+                old_epoch,
+                &BucketKey {
+                    status: StatusClass::Success,
+                    model: "m".to_string(),
+                    endpoint: "/v1/responses".to_string(),
+                    upstream: "provider-a".to_string(),
+                },
+                40.0,
+                None,
+                &[served_attempt("provider-a", 40)],
+            );
+            // As of the SAME epoch the provider is present...
+            assert!(
+                state
+                    .view(old_epoch)
+                    .window_1m
+                    .provider_latency("provider-a")
+                    .is_some()
+            );
+            // ...but a full 1h-window later (epoch advanced beyond every ring), the slots
+            // are stale and the per-provider view is empty (no fabricated carry-over).
+            let far_future = old_epoch + WINDOW_1H_SLOTS as u64 + 10;
+            assert!(
+                state
+                    .view(far_future)
+                    .window_1m
+                    .provider_latency("provider-a")
+                    .is_none(),
+                "stale per-provider samples are evicted with the slot"
+            );
+        }
     }
 
     #[test]
