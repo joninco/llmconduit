@@ -222,6 +222,11 @@ pub struct ChatChunkChoice {
     pub index: usize,
     pub delta: ChatDelta,
     pub finish_reason: Option<String>,
+    /// vLLM extension: the stop token that ended generation. A string is the
+    /// matched stop *string*; an integer is a stop token id (incl. EOS). Only a
+    /// string is a real stop-sequence match we can surface to Anthropic.
+    #[serde(default)]
+    pub stop_reason: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

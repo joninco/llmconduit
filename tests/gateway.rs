@@ -2538,6 +2538,42 @@ async fn response_completed_includes_usage_from_upstream() {
 }
 
 #[tokio::test]
+async fn response_completed_carries_matched_stop_sequence() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "hello")),
+            Ok(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatDelta {
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: None,
+                        function_call: None,
+                        refusal: None,
+                        extra: Default::default(),
+                    },
+                    finish_reason: Some("stop".to_string()),
+                    stop_reason: Some(json!("</block>")),
+                }],
+                usage: None,
+            }),
+        ])
+        .await;
+    let gateway = test_gateway(upstream, MockSearch::default());
+    let request = base_request(vec![user_message("hi")]);
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let completed = events
+        .iter()
+        .find(|e| e["type"].as_str() == Some("response.completed"))
+        .expect("response.completed event");
+    assert_eq!(completed["response"]["stop_sequence"], "</block>");
+}
+
+#[tokio::test]
 async fn response_completed_accumulates_usage_across_web_search_rounds() {
     use llmconduit::models::chat::ChunkUsage;
 
@@ -2953,6 +2989,7 @@ fn content_chunk(id: &str, content: &str) -> ChatCompletionChunk {
                 extra: Default::default(),
             },
             finish_reason: None,
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -2972,6 +3009,7 @@ fn reasoning_chunk(id: &str, reasoning: &str) -> ChatCompletionChunk {
                 extra: Default::default(),
             },
             finish_reason: None,
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -2997,6 +3035,7 @@ fn nested_thinking_chunk(id: &str, thinking: &str, signature: &str) -> ChatCompl
                 )]),
             },
             finish_reason: None,
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -3024,6 +3063,7 @@ fn tool_call_chunk(id: &str, call_id: &str, name: &str, arguments: &str) -> Chat
                 extra: Default::default(),
             },
             finish_reason: Some("tool_calls".to_string()),
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -3046,6 +3086,7 @@ fn legacy_function_call_chunk(id: &str, name: &str, arguments: &str) -> ChatComp
                 extra: Default::default(),
             },
             finish_reason: Some("function_call".to_string()),
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -4488,6 +4529,80 @@ async fn anthropic_messages_streams_text_response() {
 }
 
 #[tokio::test]
+async fn anthropic_messages_surfaces_stop_sequence_reason_when_stop_string_matches() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "Hello")),
+            Ok(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatDelta {
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: None,
+                        function_call: None,
+                        refusal: None,
+                        extra: Default::default(),
+                    },
+                    finish_reason: Some("stop".to_string()),
+                    stop_reason: Some(json!("</block>")),
+                }],
+                usage: None,
+            }),
+        ])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": true,
+        "stop_sequences": ["</block>"],
+        "messages": [
+            { "role": "user", "content": "Hi" }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body_text = String::from_utf8(body_bytes.to_vec()).expect("utf8");
+    let anthropic_events = parse_anthropic_sse_events(&body_text);
+
+    let message_delta = anthropic_events
+        .iter()
+        .find(|event| {
+            event["type"] == "message_delta" && event["delta"]["stop_reason"] == "stop_sequence"
+        })
+        .expect("message_delta with stop_sequence reason");
+    assert_eq!(message_delta["delta"]["stop_sequence"], "</block>");
+
+    // The configured stop sequence is forwarded to the upstream chat request.
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].extra_body.get("stop"),
+        Some(&json!(["</block>"]))
+    );
+}
+
+#[tokio::test]
 async fn anthropic_messages_streams_nested_thinking_response() {
     let upstream = MockUpstream::default();
     upstream
@@ -4989,6 +5104,64 @@ async fn anthropic_messages_returns_non_streaming_json() {
     let json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("valid json");
     assert_eq!(json["type"], "message");
     assert_eq!(json["role"], "assistant");
+}
+
+#[tokio::test]
+async fn anthropic_messages_non_streaming_surfaces_stop_sequence_reason() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "Hello")),
+            Ok(ChatCompletionChunk {
+                id: "chat-1".to_string(),
+                choices: vec![ChatChunkChoice {
+                    index: 0,
+                    delta: ChatDelta {
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: None,
+                        function_call: None,
+                        refusal: None,
+                        extra: Default::default(),
+                    },
+                    finish_reason: Some("stop".to_string()),
+                    stop_reason: Some(json!("</block>")),
+                }],
+                usage: None,
+            }),
+        ])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": false,
+        "stop_sequences": ["</block>"],
+        "messages": [
+            { "role": "user", "content": "Hi" }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).expect("valid json");
+    assert_eq!(json["stop_reason"], "stop_sequence");
+    assert_eq!(json["stop_sequence"], "</block>");
 }
 
 #[tokio::test]

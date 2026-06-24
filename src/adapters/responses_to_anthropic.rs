@@ -383,17 +383,22 @@ impl AnthropicStreamConverter {
             .unwrap_or(self.last_output_tokens)
             .max(self.last_output_tokens);
         self.last_output_tokens = output_tokens;
-        let stop_reason = if let Some(reason) = response_stop_reason(data) {
-            reason
+        let (stop_reason, stop_sequence) = if let Some(reason) = response_stop_reason(data) {
+            (reason, None)
         } else if self.has_tool_calls {
-            "tool_use".to_string()
+            // Anthropic stop_reason precedence is tool_use > stop_sequence >
+            // end_turn: a turn with both tool calls and a matched stop string
+            // reports tool_use, so `stop_sequence` is dropped here.
+            ("tool_use".to_string(), None)
+        } else if let Some(stop) = response_stop_sequence(data) {
+            ("stop_sequence".to_string(), Some(Value::String(stop)))
         } else {
-            "end_turn".to_string()
+            ("end_turn".to_string(), None)
         };
         output.push(AnthropicStreamEvent::MessageDelta {
             delta: AnthropicMessageDeltaBody {
                 stop_reason: Some(stop_reason),
-                stop_sequence: None,
+                stop_sequence,
             },
             usage: AnthropicUsage {
                 input_tokens: usage.as_ref().map(|usage| usage.input_tokens),
@@ -638,6 +643,7 @@ pub struct AnthropicStreamCollector {
     message_id: Option<String>,
     model: Option<String>,
     stop_reason: Option<String>,
+    stop_sequence: Option<Value>,
     blocks: Vec<AccumulatedBlock>,
     current_block: Option<AccumulatedBlock>,
     input_tokens: u64,
@@ -652,6 +658,7 @@ impl AnthropicStreamCollector {
             message_id: None,
             model: Some(model),
             stop_reason: None,
+            stop_sequence: None,
             blocks: Vec::new(),
             current_block: None,
             input_tokens: 0,
@@ -746,6 +753,9 @@ impl AnthropicStreamCollector {
                     if let Some(stop_reason) = delta.stop_reason {
                         self.stop_reason = Some(stop_reason);
                     }
+                    if let Some(stop_sequence) = delta.stop_sequence {
+                        self.stop_sequence = Some(stop_sequence);
+                    }
                     if let Some(output_tokens) = usage.output_tokens {
                         self.output_tokens = output_tokens;
                     }
@@ -811,7 +821,7 @@ impl AnthropicStreamCollector {
             content,
             model: self.model.unwrap_or_default(),
             stop_reason: self.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
-            stop_sequence: None,
+            stop_sequence: self.stop_sequence,
             usage: AnthropicMessageUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
@@ -841,6 +851,18 @@ fn response_stop_reason(data: &Value) -> Option<String> {
         });
     }
     None
+}
+
+/// The stop string vLLM reported as matched, carried on the internal
+/// `response.completed` event by the engine. Present only when a stop
+/// *sequence* (not natural EOS) ended the turn; maps to Anthropic
+/// `stop_reason: "stop_sequence"`.
+fn response_stop_sequence(data: &Value) -> Option<String> {
+    data.get("response")
+        .and_then(|response| response.get("stop_sequence"))
+        .and_then(Value::as_str)
+        .filter(|stop| !stop.is_empty())
+        .map(|stop| stop.to_string())
 }
 
 #[cfg(test)]
@@ -962,6 +984,19 @@ mod tests {
                         "input_tokens": input_tokens,
                         "output_tokens": output_tokens,
                     }
+                }
+            }),
+        }
+    }
+
+    fn completed_event_with_stop_sequence(stop: &str) -> SseEvent {
+        SseEvent {
+            event: "response.completed".to_string(),
+            data: json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_123",
+                    "stop_sequence": stop,
                 }
             }),
         }
@@ -1363,6 +1398,36 @@ mod tests {
     }
 
     #[test]
+    fn converts_completed_stop_sequence_to_stop_sequence_reason() {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        let events: Vec<AnthropicStreamEvent> = [
+            created_event(),
+            item_added_event("message", "assistant"),
+            text_delta_event("Hello"),
+            item_done_event("message", json!({})),
+            completed_event_with_stop_sequence("</block>"),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect();
+
+        let message_delta = events
+            .iter()
+            .filter_map(|event| match event {
+                AnthropicStreamEvent::MessageDelta { delta, .. }
+                    if delta.stop_reason.is_some() =>
+                {
+                    Some(delta)
+                }
+                _ => None,
+            })
+            .next()
+            .expect("terminal message_delta");
+        assert_eq!(message_delta.stop_reason.as_deref(), Some("stop_sequence"));
+        assert_eq!(message_delta.stop_sequence, Some(json!("</block>")));
+    }
+
+    #[test]
     fn collector_returns_final_usage() {
         let mut collector = AnthropicStreamCollector::new("claude-3".to_string());
         for event in [
@@ -1378,6 +1443,24 @@ mod tests {
         let response = collector.into_response().expect("response");
         assert_eq!(response.usage.input_tokens, 12);
         assert_eq!(response.usage.output_tokens, 5);
+    }
+
+    #[test]
+    fn collector_surfaces_stop_sequence() {
+        let mut collector = AnthropicStreamCollector::new("claude-3".to_string());
+        for event in [
+            created_event(),
+            item_added_event("message", "assistant"),
+            text_delta_event("Hello"),
+            item_done_event("message", json!({})),
+            completed_event_with_stop_sequence("</block>"),
+        ] {
+            collector.process(&event);
+        }
+
+        let response = collector.into_response().expect("response");
+        assert_eq!(response.stop_reason, "stop_sequence");
+        assert_eq!(response.stop_sequence, Some(json!("</block>")));
     }
 
     #[test]

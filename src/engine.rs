@@ -713,6 +713,8 @@ impl Gateway {
         let mut current_tool_choice = request.tool_choice.clone();
         #[allow(unused_assignments)]
         let mut last_finish_reason: Option<String> = None;
+        #[allow(unused_assignments)]
+        let mut last_stop_sequence: Option<String> = None;
         let upstream_extra_body = build_upstream_extra_body(
             self.config
                 .resolve_upstream_chat_kwargs_for_resolved_model(&request.model, &upstream_model),
@@ -1012,6 +1014,7 @@ impl Gateway {
             }
             let finalized = state.finalize(&tool_registry)?;
             last_finish_reason = finalized.finish_reason.clone();
+            last_stop_sequence = finalized.stop_sequence.clone();
             current_messages = upstream_request.messages;
             self.emit_completed_public_items(
                 &response_id,
@@ -1110,6 +1113,7 @@ impl Gateway {
             } else {
                 None
             },
+            stop_sequence: last_stop_sequence,
         };
         if self.monitor.is_enabled() {
             let final_preview = preview_json_limited_with_images(&resource, 128 * 1024);

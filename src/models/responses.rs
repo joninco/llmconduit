@@ -507,6 +507,11 @@ pub struct ResponseResource {
     pub metadata: Option<HashMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
+    /// Conduit extension (not OpenAI Responses spec): the stop string vLLM
+    /// reported as matched, carried so the Anthropic adapter can emit
+    /// `stop_reason: "stop_sequence"`. Absent for natural EOS / max_tokens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequence: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
