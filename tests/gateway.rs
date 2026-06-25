@@ -218,7 +218,7 @@ async fn streams_function_call_turn() {
             }),
         }],
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: None,
         thinking: None,
         store: false,
@@ -263,8 +263,124 @@ async fn streams_function_call_turn() {
 
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].parallel_tool_calls, false);
+    assert_eq!(requests[0].parallel_tool_calls, Some(true));
     assert_eq!(requests[0].tools.as_ref().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn profile_parallel_tool_calls_applies_when_client_omits_true() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let mut config = test_config();
+    config.model_profiles = std::collections::BTreeMap::from_iter([(
+        "glm-5.1".to_string(),
+        llmconduit::config::ModelProfile {
+            upstream_chat_kwargs: JsonMap::from_iter([(
+                "parallel_tool_calls".to_string(),
+                json!(true),
+            )]),
+            ..Default::default()
+        },
+    )]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let mut request = base_request(vec![user_message("hi")]);
+    request.parallel_tool_calls = None;
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].parallel_tool_calls, Some(true));
+}
+
+#[tokio::test]
+async fn global_default_parallel_tool_calls_applies_when_client_omits_false() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let mut config = test_config();
+    config.upstream_chat_kwargs =
+        JsonMap::from_iter([("parallel_tool_calls".to_string(), json!(false))]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let mut request = base_request(vec![user_message("hi")]);
+    request.parallel_tool_calls = None;
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].parallel_tool_calls, Some(false));
+}
+
+#[tokio::test]
+async fn omits_parallel_tool_calls_when_no_profile_default() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let mut request = base_request(vec![user_message("hi")]);
+    request.parallel_tool_calls = None;
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].parallel_tool_calls, None);
+}
+
+#[tokio::test]
+async fn explicit_parallel_tool_calls_overrides_profile_default() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let mut config = test_config();
+    config.upstream_chat_kwargs =
+        JsonMap::from_iter([("parallel_tool_calls".to_string(), json!(true))]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let mut request = base_request(vec![user_message("hi")]);
+    request.parallel_tool_calls = Some(false);
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].parallel_tool_calls, Some(false));
+}
+
+#[tokio::test]
+async fn reserved_keys_in_extra_body_do_not_duplicate_named_fields() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let mut config = test_config();
+    config.upstream_chat_kwargs =
+        JsonMap::from_iter([("parallel_tool_calls".to_string(), json!(true))]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let mut request = base_request(vec![user_message("hi")]);
+    request.parallel_tool_calls = None;
+    // A client smuggles a conflicting value through extra_body instead of the
+    // named field. It must be dropped so the named field is the single source.
+    request.extra_body =
+        std::collections::BTreeMap::from_iter([("parallel_tool_calls".to_string(), json!(false))]);
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].parallel_tool_calls, Some(true));
+    assert_eq!(requests[0].extra_body.get("parallel_tool_calls"), None);
+    let json = serde_json::to_string(&requests[0]).expect("serialize");
+    assert_eq!(
+        json.matches("parallel_tool_calls").count(),
+        1,
+        "parallel_tool_calls must serialize once, got {json}"
+    );
 }
 
 #[tokio::test]
@@ -376,7 +492,7 @@ async fn flattens_namespace_tools_for_upstream_and_preserves_namespace_in_output
             }],
         }],
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: None,
         thinking: None,
         store: false,
@@ -2677,7 +2793,7 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
             }),
         }],
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: None,
         thinking: None,
         store: false,
@@ -2790,7 +2906,7 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
             },
         ],
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: None,
         thinking: None,
         store: false,
@@ -2917,7 +3033,7 @@ fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
         input,
         tools: Vec::new(),
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: Some(llmconduit::models::responses::ReasoningRequest {
             effort: Some("medium".to_string()),
             summary: None,
@@ -5839,7 +5955,7 @@ async fn sse_responses_include_connection_keep_alive() {
         input: vec![user_message("hi")],
         tools: Vec::new(),
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: None,
         thinking: None,
         store: false,

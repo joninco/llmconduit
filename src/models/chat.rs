@@ -16,8 +16,8 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Vec<ChatTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
-    #[serde(default)]
-    pub parallel_tool_calls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -542,7 +542,7 @@ mod tests {
             stream: true,
             tools: None,
             tool_choice: None,
-            parallel_tool_calls: false,
+            parallel_tool_calls: None,
             reasoning_effort: None,
             response_format: None,
             stream_options: None,
@@ -572,7 +572,7 @@ mod tests {
             stream: true,
             tools: None,
             tool_choice: None,
-            parallel_tool_calls: false,
+            parallel_tool_calls: None,
             reasoning_effort: None,
             response_format: None,
             stream_options: None,
@@ -596,6 +596,63 @@ mod tests {
         assert!(
             value.get("stop").is_none(),
             "stop must be omitted when None"
+        );
+    }
+
+    #[test]
+    fn serializes_parallel_tool_calls_once() {
+        let request = ChatCompletionRequest {
+            model: "glm-5.2".to_string(),
+            messages: Vec::new(),
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: Some(true),
+            reasoning_effort: None,
+            response_format: None,
+            stream_options: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            extra_body: Default::default(),
+        };
+
+        let json = serde_json::to_string(&request).expect("serialize");
+        let occurrences = json.matches("parallel_tool_calls").count();
+        assert_eq!(
+            occurrences, 1,
+            "parallel_tool_calls must appear exactly once, got {json}"
+        );
+    }
+
+    #[test]
+    fn omits_parallel_tool_calls_when_none() {
+        let request = ChatCompletionRequest {
+            model: "glm-5.2".to_string(),
+            messages: Vec::new(),
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning_effort: None,
+            response_format: None,
+            stream_options: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            extra_body: Default::default(),
+        };
+
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(
+            !json.contains("parallel_tool_calls"),
+            "parallel_tool_calls must be omitted when None, got {json}"
         );
     }
 

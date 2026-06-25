@@ -972,7 +972,7 @@ mod tests {
             stream: true,
             tools: None,
             tool_choice: None,
-            parallel_tool_calls: false,
+            parallel_tool_calls: None,
             reasoning_effort: None,
             response_format: None,
             stream_options: None,

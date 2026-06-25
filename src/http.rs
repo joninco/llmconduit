@@ -801,22 +801,22 @@ async fn handle_count_tokens(
         Vec::new(),
         reasoning_config,
     )?;
-    // Mirror the generation path: this is the Anthropic route, so inject the explicit thinking
-    // template kwarg (it changes the rendered template, hence the token count), and let a
-    // resolved effort of `none` force thinking off just as the streaming path does.
-    let thinking_on = crate::engine::anthropic_thinking_on(
-        responses_request.thinking.unwrap_or(false),
-        lowered.reasoning_effort.as_deref(),
+    // Mirror build_upstream_extra_body: start from the profile's resolved passthrough
+    // chat_template_kwargs (operator template kwargs affect rendering, so they must be counted).
+    // Typed defaults are folded into the named chat fields by the generation path and don't
+    // belong in the tokenize body, so only the passthrough map is carried over here.
+    let passthrough_kwargs = crate::engine::extract_passthrough_kwargs(
+        gateway
+            .config()
+            .resolve_upstream_chat_kwargs_for_resolved_model(&original_model, &resolved_model),
     );
-    let (thinking_name, thinking_value) =
-        crate::engine::resolve_thinking_kwarg(reasoning_config, thinking_on);
-    // Mirror build_upstream_extra_body: start from the profile's resolved
-    // chat_template_kwargs (operator template kwargs affect rendering, so they
-    // must be counted), then inject the thinking kwarg on top so it overrides
-    // any static default.
-    let mut chat_template_kwargs = match gateway
-        .config()
-        .resolve_upstream_chat_kwargs_for_resolved_model(&original_model, &resolved_model)
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), Value::String(resolved_model));
+    body.insert(
+        "messages".to_string(),
+        serde_json::to_value(&lowered.messages).unwrap_or(Value::Null),
+    );
+    let mut chat_template_kwargs = match passthrough_kwargs
         .get("chat_template_kwargs")
         .cloned()
         .unwrap_or(Value::Null)
@@ -824,12 +824,20 @@ async fn handle_count_tokens(
         Value::Object(map) => map,
         _ => serde_json::Map::new(),
     };
+    // This matches generation: state Anthropic thinking explicitly, including
+    // the `none` effort override, after profile defaults have been applied.
+    let thinking_on = crate::engine::anthropic_thinking_on(
+        responses_request.thinking.unwrap_or(false),
+        lowered.reasoning_effort.as_deref(),
+    );
+    let (thinking_name, thinking_value) =
+        crate::engine::resolve_thinking_kwarg(reasoning_config, thinking_on);
     chat_template_kwargs.insert(thinking_name, thinking_value);
-    let body = serde_json::json!({
-        "model": resolved_model,
-        "messages": lowered.messages,
-        "chat_template_kwargs": chat_template_kwargs,
-    });
+    body.insert(
+        "chat_template_kwargs".to_string(),
+        Value::Object(chat_template_kwargs),
+    );
+    let body = Value::Object(body);
 
     match gateway.upstream_client().count_tokens(&body).await {
         Ok(Some(count)) => {

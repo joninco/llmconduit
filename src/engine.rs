@@ -129,19 +129,16 @@ impl UpstreamModelCatalog {
 fn build_upstream_extra_body(
     defaults: serde_json::Map<String, Value>,
     request: &ResponsesRequest,
-    response_format: &Option<Value>,
-    reasoning_effort: &Option<String>,
     thinking_kwarg: Option<(String, Value)>,
 ) -> BTreeMap<String, Value> {
-    let mut extra_body = defaults.into_iter().collect();
-    remove_defaults_for_explicit_request_fields(
-        &mut extra_body,
-        request,
-        response_format,
-        reasoning_effort,
-    );
-    remove_defaults_shadowed_by_request_extra(&mut extra_body, &request.extra_body);
+    let mut extra_body: BTreeMap<String, Value> = defaults.into_iter().collect();
     for (key, value) in &request.extra_body {
+        // Reserved keys are serialized from the named ChatCompletionRequest fields
+        // (resolved in run_turn). Merging them from the client's extra_body would
+        // duplicate the key, so the named field stays the single source of truth.
+        if is_reserved_upstream_key(key) {
+            continue;
+        }
         merge_request_extra_value(&mut extra_body, key, value);
     }
     // Anthropic treats thinking as off unless the request enables it, but some upstreams
@@ -201,53 +198,85 @@ fn inject_chat_template_kwarg(
     }
 }
 
-fn remove_defaults_for_explicit_request_fields(
-    extra_body: &mut BTreeMap<String, Value>,
-    request: &ResponsesRequest,
-    response_format: &Option<Value>,
-    reasoning_effort: &Option<String>,
-) {
-    if request.temperature.is_some() {
-        remove_keys(extra_body, &["temperature"]);
-    }
-    if request.top_p.is_some() {
-        remove_keys(extra_body, &["top_p"]);
-    }
-    if request.max_output_tokens.is_some() {
-        remove_keys(
-            extra_body,
-            &["max_tokens", "max_output_tokens", "max_completion_tokens"],
-        );
-    }
-    if request.frequency_penalty.is_some() {
-        remove_keys(extra_body, &["frequency_penalty"]);
-    }
-    if request.presence_penalty.is_some() {
-        remove_keys(extra_body, &["presence_penalty"]);
-    }
-    if response_format.is_some() {
-        remove_keys(extra_body, &["response_format"]);
-    }
-    if reasoning_effort.is_some() {
-        remove_keys(extra_body, &["reasoning_effort"]);
-    }
+// Must stay in sync with the keys extracted in extract_typed_defaults. `thinking` is reserved
+// because it's the internal Anthropic-route kwarg name (set by the adapter onto the skip field);
+// a client-supplied `thinking` on /v1/responses falls through `extra_body` via flatten and must
+// not reach the upstream, so it's dropped here rather than forwarded.
+fn is_reserved_upstream_key(key: &str) -> bool {
+    matches!(
+        key,
+        "parallel_tool_calls"
+            | "reasoning_effort"
+            | "response_format"
+            | "temperature"
+            | "top_p"
+            | "max_tokens"
+            | "max_output_tokens"
+            | "max_completion_tokens"
+            | "frequency_penalty"
+            | "presence_penalty"
+            | "thinking"
+    )
 }
 
-fn remove_defaults_shadowed_by_request_extra(
-    extra_body: &mut BTreeMap<String, Value>,
-    request_extra: &BTreeMap<String, Value>,
-) {
-    for aliases in [&["max_tokens", "max_output_tokens", "max_completion_tokens"][..]] {
-        if aliases.iter().any(|key| request_extra.contains_key(*key)) {
-            remove_keys(extra_body, aliases);
+/// Typed defaults pulled out of `upstream_chat_kwargs` and resolved into the named
+/// `ChatCompletionRequest` fields. Keeping them out of the flattened `extra_body` map
+/// prevents a key serializing twice (named field plus map), which is how the duplicate
+/// `parallel_tool_calls` upstream key arose. Keys with no typed counterpart stay in the
+/// passthrough map. A default whose value has the wrong type is dropped rather than passed
+/// through raw, to preserve the single-key invariant.
+#[derive(Default)]
+struct UpstreamTypedDefaults {
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    max_output_tokens: Option<i64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    response_format: Option<Value>,
+    reasoning_effort: Option<String>,
+    parallel_tool_calls: Option<bool>,
+}
+
+/// Passthrough portion of `upstream_chat_kwargs` after typed defaults are extracted, for
+/// `/v1/messages/count_tokens` to mirror the generation path's `chat_template_kwargs` without
+/// exposing the typed-defaults struct.
+pub(crate) fn extract_passthrough_kwargs(
+    map: serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    extract_typed_defaults(map).1
+}
+
+fn extract_typed_defaults(
+    mut map: serde_json::Map<String, Value>,
+) -> (UpstreamTypedDefaults, serde_json::Map<String, Value>) {
+    let mut defaults = UpstreamTypedDefaults::default();
+    if let Some(v) = map.remove("temperature") {
+        defaults.temperature = serde_json::from_value(v).ok();
+    }
+    if let Some(v) = map.remove("top_p") {
+        defaults.top_p = serde_json::from_value(v).ok();
+    }
+    for alias in ["max_tokens", "max_output_tokens", "max_completion_tokens"] {
+        if let Some(v) = map.remove(alias) {
+            defaults.max_output_tokens = serde_json::from_value(v).ok();
         }
     }
-}
-
-fn remove_keys(extra_body: &mut BTreeMap<String, Value>, keys: &[&str]) {
-    for key in keys {
-        extra_body.remove(*key);
+    if let Some(v) = map.remove("frequency_penalty") {
+        defaults.frequency_penalty = serde_json::from_value(v).ok();
     }
+    if let Some(v) = map.remove("presence_penalty") {
+        defaults.presence_penalty = serde_json::from_value(v).ok();
+    }
+    if let Some(v) = map.remove("response_format") {
+        defaults.response_format = serde_json::from_value(v).ok();
+    }
+    if let Some(v) = map.remove("reasoning_effort") {
+        defaults.reasoning_effort = serde_json::from_value(v).ok();
+    }
+    if let Some(v) = map.remove("parallel_tool_calls") {
+        defaults.parallel_tool_calls = serde_json::from_value(v).ok();
+    }
+    (defaults, map)
 }
 
 fn merge_request_extra_value(extra_body: &mut BTreeMap<String, Value>, key: &str, value: &Value) {
@@ -782,14 +811,12 @@ impl Gateway {
         let mut last_finish_reason: Option<String> = None;
         #[allow(unused_assignments)]
         let mut last_stop_sequence: Option<String> = None;
-        let upstream_extra_body = build_upstream_extra_body(
+        let (typed_defaults, passthrough_kwargs) = extract_typed_defaults(
             self.config
                 .resolve_upstream_chat_kwargs_for_resolved_model(&request.model, &upstream_model),
-            &request,
-            &response_format,
-            &reasoning_effort,
-            thinking_kwarg,
         );
+        let upstream_extra_body =
+            build_upstream_extra_body(passthrough_kwargs, &request, thinking_kwarg);
         let normalized_stop = crate::models::chat::normalize_stop(request.stop.clone())?;
         loop {
             if tx.is_closed() {
@@ -803,17 +830,27 @@ impl Gateway {
                 stream: true,
                 tools: (!tools.is_empty()).then_some(tools.clone()),
                 tool_choice: Some(current_tool_choice.clone()),
-                parallel_tool_calls: false,
-                reasoning_effort: reasoning_effort.clone(),
-                response_format: response_format.clone(),
+                parallel_tool_calls: request
+                    .parallel_tool_calls
+                    .or(typed_defaults.parallel_tool_calls),
+                reasoning_effort: reasoning_effort
+                    .clone()
+                    .or(typed_defaults.reasoning_effort.clone()),
+                response_format: response_format
+                    .clone()
+                    .or(typed_defaults.response_format.clone()),
                 stream_options: Some(StreamOptions {
                     include_usage: true,
                 }),
-                temperature: request.temperature,
-                top_p: request.top_p,
-                max_output_tokens: request.max_output_tokens,
-                frequency_penalty: request.frequency_penalty,
-                presence_penalty: request.presence_penalty,
+                temperature: request.temperature.or(typed_defaults.temperature),
+                top_p: request.top_p.or(typed_defaults.top_p),
+                max_output_tokens: request
+                    .max_output_tokens
+                    .or(typed_defaults.max_output_tokens),
+                frequency_penalty: request
+                    .frequency_penalty
+                    .or(typed_defaults.frequency_penalty),
+                presence_penalty: request.presence_penalty.or(typed_defaults.presence_penalty),
                 stop: normalized_stop.clone(),
                 extra_body: upstream_extra_body.clone(),
             };
