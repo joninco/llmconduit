@@ -6721,6 +6721,62 @@ async fn anthropic_thinking_injection_overrides_static_chat_template_default() {
 }
 
 #[tokio::test]
+async fn count_tokens_carries_profile_chat_template_kwargs() {
+    // A profile's chat_template_kwargs must reach the /tokenize body (they
+    // affect rendering, hence the count), alongside the injected thinking kwarg.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/tokenize"))
+        .and(body_partial_json(json!({
+            "chat_template_kwargs": { "custom": "value", "enable_thinking": true }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "count": 42 })))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "claude-x".to_string(),
+        llmconduit::config::ModelProfile {
+            upstream_chat_kwargs: JsonMap::from_iter([(
+                "chat_template_kwargs".to_string(),
+                json!({ "custom": "value" }),
+            )]),
+            ..Default::default()
+        },
+    )]);
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-x",
+                        "thinking": { "type": "enabled", "budget_tokens": 1024 },
+                        "messages": [{ "role": "user", "content": "hi" }]
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // A 200 means the /tokenize body carried both the profile's `custom` kwarg
+    // and the injected `enable_thinking: true` kwarg.
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(body, json!({ "input_tokens": 42 }));
+}
+
+#[tokio::test]
 async fn count_tokens_injects_thinking_kwarg() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
