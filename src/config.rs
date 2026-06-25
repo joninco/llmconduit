@@ -11,6 +11,113 @@ use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 
+/// Per-profile reasoning-effort shaping (config key `reasoning_effort`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReasoningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub map: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "is_default_thinking_param_name")]
+    pub thinking_param_name: String,
+    #[serde(skip_serializing_if = "is_default_thinking_param_value_on")]
+    pub thinking_param_value_on: JsonValue,
+    #[serde(skip_serializing_if = "is_default_thinking_param_value_off")]
+    pub thinking_param_value_off: JsonValue,
+}
+
+const DEFAULT_THINKING_PARAM_NAME: &str = "enable_thinking";
+
+fn default_thinking_param_name() -> String {
+    DEFAULT_THINKING_PARAM_NAME.to_string()
+}
+fn default_thinking_param_value_on() -> JsonValue {
+    JsonValue::Bool(true)
+}
+fn default_thinking_param_value_off() -> JsonValue {
+    JsonValue::Bool(false)
+}
+fn is_default_thinking_param_name(name: &str) -> bool {
+    name == DEFAULT_THINKING_PARAM_NAME
+}
+fn is_default_thinking_param_value_on(value: &JsonValue) -> bool {
+    matches!(value, JsonValue::Bool(true))
+}
+fn is_default_thinking_param_value_off(value: &JsonValue) -> bool {
+    matches!(value, JsonValue::Bool(false))
+}
+
+impl Default for ReasoningConfig {
+    fn default() -> Self {
+        Self {
+            default: None,
+            map: BTreeMap::new(),
+            thinking_param_name: default_thinking_param_name(),
+            thinking_param_value_on: default_thinking_param_value_on(),
+            thinking_param_value_off: default_thinking_param_value_off(),
+        }
+    }
+}
+
+impl ReasoningConfig {
+    /// Value to inject for the thinking template kwarg given the request's thinking state.
+    pub fn thinking_param_value(&self, on: bool) -> &JsonValue {
+        if on {
+            &self.thinking_param_value_on
+        } else {
+            &self.thinking_param_value_off
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default)]
+            default: Option<String>,
+            #[serde(default)]
+            map: BTreeMap<String, String>,
+            #[serde(default = "default_thinking_param_name")]
+            thinking_param_name: String,
+            #[serde(default = "default_thinking_param_value_on")]
+            thinking_param_value_on: JsonValue,
+            #[serde(default = "default_thinking_param_value_off")]
+            thinking_param_value_off: JsonValue,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let map = raw
+            .map
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let key = key.trim().to_ascii_lowercase();
+                let value = value.trim().to_string();
+                (!key.is_empty() && !value.is_empty()).then_some((key, value))
+            })
+            .collect();
+        let default = raw.default.and_then(|value| {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        });
+        let thinking_param_name = if raw.thinking_param_name.trim().is_empty() {
+            default_thinking_param_name()
+        } else {
+            raw.thinking_param_name.trim().to_string()
+        };
+        Ok(Self {
+            default,
+            map,
+            thinking_param_name,
+            thinking_param_value_on: raw.thinking_param_value_on,
+            thinking_param_value_off: raw.thinking_param_value_off,
+        })
+    }
+}
+
 fn default_true() -> bool {
     true
 }
@@ -264,7 +371,6 @@ pub struct Config {
     pub upstream_base_url: Url,
     pub upstream_api_key: Option<String>,
     pub upstream_model: Option<String>,
-    pub default_reasoning_effort: String,
     pub system_prompt_prefix: Option<String>,
     pub upstream_request_log_path: Option<PathBuf>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
@@ -307,6 +413,8 @@ pub struct PersistedModelProfile {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<CapabilitiesConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningConfig>,
 }
 
 impl<'de> Deserialize<'de> for PersistedModelProfile {
@@ -328,6 +436,8 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             shorthand_upstream_chat_kwargs: JsonMap<String, JsonValue>,
             #[serde(default)]
             capabilities: Option<CapabilitiesConfig>,
+            #[serde(default)]
+            reasoning_effort: Option<ReasoningConfig>,
         }
 
         let raw = RawPersistedModelProfile::deserialize(deserializer)?;
@@ -339,6 +449,7 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             system_prompt_prefix: raw.system_prompt_prefix,
             upstream_chat_kwargs,
             capabilities: raw.capabilities,
+            reasoning_effort: raw.reasoning_effort,
         })
     }
 }
@@ -349,6 +460,7 @@ pub struct ModelProfile {
     pub system_prompt_prefix: Option<String>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub capabilities: Option<CapabilitiesConfig>,
+    pub reasoning_effort: Option<ReasoningConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -406,8 +518,8 @@ pub struct PersistedConfig {
     pub upstream_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
-    #[serde(default = "default_reasoning_effort")]
-    pub default_reasoning_effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -450,10 +562,6 @@ fn default_upstream_base_url() -> String {
     "http://127.0.0.1:8000/v1".to_string()
 }
 
-pub fn default_reasoning_effort() -> String {
-    "max".to_string()
-}
-
 fn default_brave_base_url() -> String {
     "https://api.search.brave.com/res/v1".to_string()
 }
@@ -493,7 +601,7 @@ impl Default for PersistedConfig {
             upstream_base_url: default_upstream_base_url(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -538,8 +646,18 @@ impl Config {
             .map_err(|err| format!("invalid upstream_base_url: {err}"))?;
         let brave_base_url = Url::parse(&config.brave_base_url)
             .map_err(|err| format!("invalid brave_base_url: {err}"))?;
-        let default_reasoning_effort =
-            normalize_default_reasoning_effort(&config.default_reasoning_effort);
+        if config.default_reasoning_effort.is_some() {
+            return Err(
+                "`default_reasoning_effort` was removed; set `reasoning_effort.default` on the reserved `*` model profile instead".to_string(),
+            );
+        }
+        if let Ok(value) = env::var("LLMCONDUIT_DEFAULT_REASONING_EFFORT")
+            && !value.trim().is_empty()
+        {
+            return Err(
+                "`LLMCONDUIT_DEFAULT_REASONING_EFFORT` was removed; set `reasoning_effort.default` on the reserved `*` model profile instead".to_string(),
+            );
+        }
         let fallback_upstreams = config
             .fallback_upstreams
             .iter()
@@ -567,7 +685,6 @@ impl Config {
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty()),
-            default_reasoning_effort,
             system_prompt_prefix: config
                 .system_prompt_prefix
                 .as_ref()
@@ -671,6 +788,16 @@ impl Config {
             .and_then(|p| p.capabilities.as_ref())
     }
 
+    /// Resolve reasoning shaping with the same request/resolved-model precedence
+    /// used for other per-profile request settings.
+    pub fn resolve_reasoning_config(&self, request_model: &str) -> Option<&ReasoningConfig> {
+        let resolved_model = self.resolve_upstream_model(request_model);
+        self.model_profiles_for_resolved_model(request_model, &resolved_model)
+            .into_iter()
+            .rev()
+            .find_map(|profile| profile.reasoning_effort.as_ref())
+    }
+
     /// Collect profiles matching the request model chain. `resolved_model` must be
     /// `resolve_upstream_model(request_model)` (callers pass the already-resolved upstream
     /// id); it is not re-resolved here. The resolved/upstream model is tried first, then the
@@ -711,19 +838,13 @@ impl Config {
     }
 }
 
-fn normalize_default_reasoning_effort(effort: &str) -> String {
-    match effort.trim().to_ascii_lowercase().as_str() {
-        "max" | "xhigh" => "max".to_string(),
-        _ => "high".to_string(),
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 struct ResolvedModelProfile {
     upstream_model: Option<String>,
     system_prompt_prefixes: Vec<String>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
     capabilities: Option<CapabilitiesConfig>,
+    reasoning_effort: Option<ReasoningConfig>,
 }
 
 impl ResolvedModelProfile {
@@ -733,6 +854,7 @@ impl ResolvedModelProfile {
             system_prompt_prefix: join_prompt_prefixes(self.system_prompt_prefixes),
             upstream_chat_kwargs: self.upstream_chat_kwargs,
             capabilities: self.capabilities,
+            reasoning_effort: self.reasoning_effort,
         }
     }
 }
@@ -803,6 +925,9 @@ fn merge_resolved_model_profile(
     if source.capabilities.is_some() {
         destination.capabilities = source.capabilities;
     }
+    if source.reasoning_effort.is_some() {
+        destination.reasoning_effort = source.reasoning_effort;
+    }
     destination
         .system_prompt_prefixes
         .extend(source.system_prompt_prefixes);
@@ -826,6 +951,9 @@ fn merge_persisted_model_profile(
     }
     if source.capabilities.is_some() {
         destination.capabilities = source.capabilities.clone();
+    }
+    if source.reasoning_effort.is_some() {
+        destination.reasoning_effort = source.reasoning_effort.clone();
     }
     merge_json_maps(
         &mut destination.upstream_chat_kwargs,
@@ -986,11 +1114,6 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.upstream_model = Some(value);
     }
-    if let Ok(value) = env::var("LLMCONDUIT_DEFAULT_REASONING_EFFORT")
-        && !value.trim().is_empty()
-    {
-        config.default_reasoning_effort = value;
-    }
     if let Ok(value) = env::var("LLMCONDUIT_SYSTEM_PROMPT_PREFIX")
         && !value.trim().is_empty()
     {
@@ -1086,7 +1209,6 @@ mod tests {
     use super::ThinkingCap;
     use super::apply_env_overrides;
     use super::default_config_path;
-    use super::default_reasoning_effort;
     use super::load_persisted_config;
     use super::merge_json_maps;
     use super::write_persisted_config;
@@ -1147,23 +1269,14 @@ mod tests {
     }
 
     #[test]
-    fn default_reasoning_effort_defaults_to_max_and_normalizes_to_two_levels() {
-        let result = Config::from_persisted(&PersistedConfig::default()).unwrap();
-        assert_eq!(result.default_reasoning_effort, "max");
-
-        let high_config = PersistedConfig {
-            default_reasoning_effort: " low ".to_string(),
+    fn default_reasoning_effort_is_rejected_with_migration_error() {
+        let config = PersistedConfig {
+            default_reasoning_effort: Some(json!("max")),
             ..PersistedConfig::default()
         };
-        let result = Config::from_persisted(&high_config).unwrap();
-        assert_eq!(result.default_reasoning_effort, "high");
-
-        let max_config = PersistedConfig {
-            default_reasoning_effort: " xhigh ".to_string(),
-            ..PersistedConfig::default()
-        };
-        let result = Config::from_persisted(&max_config).unwrap();
-        assert_eq!(result.default_reasoning_effort, "max");
+        let err = Config::from_persisted(&config).unwrap_err();
+        assert!(err.contains("default_reasoning_effort"));
+        assert!(err.contains("reasoning_effort.default"));
     }
 
     #[test]
@@ -1403,7 +1516,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: Some("upstream-secret".to_string()),
             upstream_model: Some("grok-4".to_string()),
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: Some("Global prefix.".to_string()),
             upstream_request_log_path: Some("/tmp/llmconduit-upstream.jsonl".to_string()),
             upstream_chat_kwargs: JsonMap::from_iter([(
@@ -1460,7 +1573,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1515,7 +1628,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1561,7 +1674,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1620,7 +1733,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1680,7 +1793,7 @@ mod tests {
             upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
             upstream_api_key: None,
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1740,7 +1853,7 @@ mod tests {
             upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
             upstream_api_key: None,
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -1813,7 +1926,7 @@ mod tests {
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -2175,7 +2288,7 @@ model_profiles:
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),
@@ -2212,7 +2325,7 @@ model_profiles:
             upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
             upstream_api_key: None,
             upstream_model: None,
-            default_reasoning_effort: default_reasoning_effort(),
+            default_reasoning_effort: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             upstream_chat_kwargs: JsonMap::new(),

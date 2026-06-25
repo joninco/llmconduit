@@ -43,6 +43,12 @@ pub struct ResponsesRequest {
     pub parallel_tool_calls: bool,
     #[serde(default)]
     pub reasoning: Option<ReasoningRequest>,
+    /// Anthropic-path explicit thinking on/off decision, used to inject the upstream thinking
+    /// template kwarg (e.g. `enable_thinking`). `None` on routes where the client controls that
+    /// kwarg directly (chat completions, native responses). `skip` keeps it internal: clients
+    /// cannot set it and it is never serialized.
+    #[serde(skip)]
+    pub thinking: Option<bool>,
     #[serde(default = "default_store_true")]
     pub store: bool,
     #[serde(default)]

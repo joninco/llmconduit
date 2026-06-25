@@ -35,7 +35,15 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
     );
     let input = converted_messages.input;
     let tools = convert_tools(&request.tools);
-    let (reasoning, mut extra_body) = convert_thinking(&request.thinking);
+    let reasoning = convert_thinking(&request.thinking);
+    let mut extra_body = BTreeMap::new();
+    // Anthropic treats thinking as off unless the request enables it. Carry that explicit on/off
+    // decision to the upstream-body builder, which injects the thinking template kwarg so an
+    // upstream that defaults thinking on cannot override Anthropic's intent. Omitted/disabled is off.
+    let thinking_on = matches!(
+        request.thinking,
+        Some(AnthropicThinking::Enabled { .. } | AnthropicThinking::Adaptive { .. })
+    );
     if let Some(stop_sequences) = request
         .stop_sequences
         .as_ref()
@@ -60,6 +68,7 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         tool_choice,
         parallel_tool_calls: false,
         reasoning,
+        thinking: Some(thinking_on),
         store: false,
         stream: true,
         include: Vec::new(),
@@ -162,7 +171,14 @@ fn convert_output_config_effort(effort: Option<&Value>) -> AppResult<Option<Stri
             "Anthropic output_config.effort must be a string",
         ));
     };
-    normalize_reasoning_effort(effort)
+    // Carry the effort verbatim: per-profile mapping happens later in
+    // `lower_request_with_reasoning_config` (responses_to_chat), where the resolved
+    // reasoning config is known.
+    let effort = effort.trim();
+    if effort.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(effort.to_string()))
 }
 
 fn apply_output_config_effort(
@@ -174,10 +190,12 @@ fn apply_output_config_effort(
             reasoning.effort = Some(effort);
             Some(reasoning)
         }
-        (None, Some(effort)) => Some(ReasoningRequest {
-            effort: Some(effort),
-            summary: None,
-        }),
+        // Thinking-off wins over a contradictory effort signal: in real CC traffic
+        // effort is always paired with thinking-on, so this only guards a malformed
+        // request. Returning None lets the chat layer emit the profile's
+        // `reasoning_effort.default` (a real level like "high"); with no profile it
+        // emits nothing.
+        (None, Some(_)) => None,
         (reasoning, None) => reasoning,
     }
 }
@@ -198,55 +216,19 @@ fn extract_system_text(system: &Option<AnthropicSystemContent>) -> String {
     }
 }
 
-fn convert_thinking(
-    thinking: &Option<AnthropicThinking>,
-) -> (Option<ReasoningRequest>, BTreeMap<String, Value>) {
-    let Some(thinking) = thinking else {
-        return (None, BTreeMap::new());
-    };
+fn convert_thinking(thinking: &Option<AnthropicThinking>) -> Option<ReasoningRequest> {
     match thinking {
-        AnthropicThinking::Disabled => (None, BTreeMap::new()),
-        AnthropicThinking::Adaptive { .. } => (
+        None | Some(AnthropicThinking::Disabled) => None,
+        // `budget_tokens` is ignored: vLLM cannot limit the thinking budget, and CC
+        // carries effort in `output_config.effort`, applied by
+        // `apply_output_config_effort` after this returns, not the budget.
+        Some(AnthropicThinking::Enabled { .. } | AnthropicThinking::Adaptive { .. }) => {
             Some(ReasoningRequest {
                 effort: None,
                 summary: None,
-            }),
-            BTreeMap::new(),
-        ),
-        AnthropicThinking::Enabled { budget_tokens } => {
-            let budget = budget_tokens.unwrap_or(10_000);
-            let effort = thinking_effort_for_budget(budget);
-            (
-                Some(ReasoningRequest {
-                    effort: Some(effort.to_string()),
-                    summary: None,
-                }),
-                BTreeMap::new(),
-            )
+            })
         }
     }
-}
-
-fn thinking_effort_for_budget(budget: u64) -> &'static str {
-    if budget <= 5_000 {
-        "low"
-    } else if budget <= 20_000 {
-        "medium"
-    } else {
-        "high"
-    }
-}
-
-fn normalize_reasoning_effort(effort: &str) -> AppResult<Option<String>> {
-    let effort = effort.trim();
-    if effort.is_empty() {
-        return Ok(None);
-    }
-    let normalized = match effort.to_ascii_lowercase().as_str() {
-        "max" | "xhigh" => "max",
-        _ => "high",
-    };
-    Ok(Some(normalized.to_string()))
 }
 
 struct ConvertedMessages {
@@ -1047,6 +1029,54 @@ mod tests {
     }
 
     #[test]
+    fn convert_request_records_explicit_thinking_decision() {
+        let with_thinking = |thinking| AnthropicRequest {
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            max_tokens: Some(64),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: AnthropicContent::Text("hi".to_string()),
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: false,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            metadata: None,
+            thinking,
+            output_config: None,
+        };
+
+        let convert_thinking = |thinking| {
+            convert_request(with_thinking(thinking))
+                .expect("convert")
+                .thinking
+        };
+
+        // Enabled/adaptive are on; disabled and omitted are off.
+        assert_eq!(
+            convert_thinking(Some(AnthropicThinking::Enabled {
+                budget_tokens: None
+            })),
+            Some(true)
+        );
+        assert_eq!(
+            convert_thinking(Some(AnthropicThinking::Adaptive {
+                budget_tokens: None
+            })),
+            Some(true)
+        );
+        assert_eq!(
+            convert_thinking(Some(AnthropicThinking::Disabled)),
+            Some(false)
+        );
+        assert_eq!(convert_thinking(None), Some(false));
+    }
+
+    #[test]
     fn converts_output_config_json_schema_to_text_format() {
         let schema = json!({
             "type": "object",
@@ -1098,7 +1128,9 @@ mod tests {
     }
 
     #[test]
-    fn converts_output_config_effort_to_reasoning() {
+    fn converts_output_config_effort_to_reasoning_verbatim() {
+        // output_config.effort is carried verbatim into the Responses reasoning.effort;
+        // profile-specific clamping happens later in the chat layer.
         let request = AnthropicRequest {
             model: "claude-opus-4-5-20251101".to_string(),
             max_tokens: Some(32000),
@@ -1126,7 +1158,7 @@ mod tests {
         let result = convert_request(request).expect("convert");
         assert_eq!(
             result.reasoning.as_ref().unwrap().effort.as_deref(),
-            Some("max")
+            Some("xhigh")
         );
     }
 
@@ -1382,9 +1414,11 @@ mod tests {
         assert!(matches!(&result.tools[0], ToolSpec::Function { name, .. } if name == "alpha"));
     }
 
-    #[test]
-    fn converts_thinking_enabled_to_reasoning() {
-        let request = AnthropicRequest {
+    fn thinking_request(
+        thinking: Option<AnthropicThinking>,
+        output_config: Option<Value>,
+    ) -> AnthropicRequest {
+        AnthropicRequest {
             model: "claude-3-5-sonnet-20241022".to_string(),
             max_tokens: Some(16000),
             system: None,
@@ -1400,19 +1434,143 @@ mod tests {
             top_k: None,
             stop_sequences: None,
             metadata: None,
-            thinking: Some(AnthropicThinking::Enabled {
+            thinking,
+            output_config,
+        }
+    }
+
+    #[test]
+    fn converts_thinking_enabled_to_reasoning_on_without_budget_effort() {
+        // budget_tokens is ignored; effort is read from output_config.effort. With no
+        // effort signal, reasoning is on with effort unset.
+        let request = thinking_request(
+            Some(AnthropicThinking::Enabled {
                 budget_tokens: Some(10000),
             }),
-            output_config: None,
-        };
+            None,
+        );
 
         let result = convert_request(request).expect("convert");
         assert!(result.reasoning.is_some());
+        assert_eq!(result.reasoning.as_ref().unwrap().effort.as_deref(), None);
+        assert!(result.extra_body.is_empty());
+    }
+
+    #[test]
+    fn converts_thinking_adaptive_to_reasoning_on() {
+        let request = thinking_request(
+            Some(AnthropicThinking::Adaptive {
+                budget_tokens: None,
+            }),
+            None,
+        );
+
+        let result = convert_request(request).expect("convert");
+        assert!(result.reasoning.is_some());
+        assert_eq!(result.reasoning.as_ref().unwrap().effort.as_deref(), None);
+    }
+
+    #[test]
+    fn converts_thinking_disabled_to_no_reasoning() {
+        let request = thinking_request(Some(AnthropicThinking::Disabled), None);
+
+        let result = convert_request(request).expect("convert");
+        assert!(result.reasoning.is_none());
+    }
+
+    #[test]
+    fn converts_thinking_absent_to_no_reasoning() {
+        let request = thinking_request(None, None);
+
+        let result = convert_request(request).expect("convert");
+        assert!(result.reasoning.is_none());
+    }
+
+    #[test]
+    fn output_config_effort_max_passed_through_verbatim() {
+        // output_config.effort is the primary effort signal; it is passed through
+        // verbatim (pre-clamp) into the Responses reasoning.effort field.
+        let request = thinking_request(
+            Some(AnthropicThinking::Adaptive {
+                budget_tokens: None,
+            }),
+            Some(json!({ "effort": "max" })),
+        );
+
+        let result = convert_request(request).expect("convert");
         assert_eq!(
             result.reasoning.as_ref().unwrap().effort.as_deref(),
-            Some("medium")
+            Some("max")
         );
-        assert!(result.extra_body.is_empty());
+    }
+
+    #[test]
+    fn output_config_effort_xhigh_passed_through_verbatim() {
+        let request = thinking_request(
+            Some(AnthropicThinking::Adaptive {
+                budget_tokens: None,
+            }),
+            Some(json!({ "effort": "xhigh" })),
+        );
+
+        let result = convert_request(request).expect("convert");
+        assert_eq!(
+            result.reasoning.as_ref().unwrap().effort.as_deref(),
+            Some("xhigh")
+        );
+    }
+
+    #[test]
+    fn output_config_effort_none_passed_through_verbatim() {
+        let request = thinking_request(
+            Some(AnthropicThinking::Adaptive {
+                budget_tokens: None,
+            }),
+            Some(json!({ "effort": "none" })),
+        );
+
+        let result = convert_request(request).expect("convert");
+        assert_eq!(
+            result.reasoning.as_ref().unwrap().effort.as_deref(),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn output_config_effort_with_thinking_disabled_drops_effort() {
+        // Thinking-off wins over a contradictory effort signal (effort is only
+        // observed paired with thinking-on in real CC traffic).
+        let request = thinking_request(
+            Some(AnthropicThinking::Disabled),
+            Some(json!({ "effort": "max" })),
+        );
+
+        let result = convert_request(request).expect("convert");
+        assert!(result.reasoning.is_none());
+    }
+
+    #[test]
+    fn output_config_format_without_effort_leaves_reasoning_effort_none() {
+        // A format-only output_config (json_schema) leaves effort unset; the format is
+        // still forwarded as text controls.
+        let request = thinking_request(
+            Some(AnthropicThinking::Enabled {
+                budget_tokens: Some(10000),
+            }),
+            Some(json!({
+                "format": {
+                    "type": "json_schema",
+                    "name": "result",
+                    "schema": { "type": "object" },
+                    "strict": true
+                }
+            })),
+        );
+
+        let result = convert_request(request).expect("convert");
+        assert!(result.reasoning.is_some());
+        assert_eq!(result.reasoning.as_ref().unwrap().effort.as_deref(), None);
+        assert!(result.text.is_some());
     }
 
     #[test]

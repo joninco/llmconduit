@@ -166,10 +166,10 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         upstream_base_url,
         upstream_api_key,
         upstream_model: (!upstream_model.trim().is_empty()).then_some(upstream_model),
+        default_reasoning_effort: None,
         system_prompt_prefix: existing.system_prompt_prefix.clone(),
         upstream_request_log_path: (!upstream_request_log_path.trim().is_empty())
             .then_some(upstream_request_log_path),
-        default_reasoning_effort: existing.default_reasoning_effort.clone(),
         upstream_chat_kwargs,
         upstreams: existing.upstreams.clone(),
         fallback_upstreams: existing.fallback_upstreams.clone(),

@@ -1,3 +1,4 @@
+use crate::config::ReasoningConfig;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatFunctionCall;
@@ -96,17 +97,13 @@ pub fn lower_request(
     request: &ResponsesRequest,
     baseline_messages: Vec<ChatMessage>,
 ) -> AppResult<LoweredTurn> {
-    lower_request_with_default_reasoning_effort(
-        request,
-        baseline_messages,
-        &crate::config::default_reasoning_effort(),
-    )
+    lower_request_with_reasoning_config(request, baseline_messages, None)
 }
 
-pub fn lower_request_with_default_reasoning_effort(
+pub fn lower_request_with_reasoning_config(
     request: &ResponsesRequest,
     baseline_messages: Vec<ChatMessage>,
-    default_reasoning_effort: &str,
+    reasoning_config: Option<&ReasoningConfig>,
 ) -> AppResult<LoweredTurn> {
     validate_request(request)?;
     let mut messages = baseline_messages;
@@ -322,12 +319,46 @@ pub fn lower_request_with_default_reasoning_effort(
                 }
             })
         });
-    let request_reasoning_effort = request
-        .reasoning
-        .as_ref()
-        .and_then(|reasoning| reasoning.effort.as_deref());
-    let reasoning_effort =
-        normalize_reasoning_effort(request_reasoning_effort.or(Some(default_reasoning_effort)))?;
+    // `request.reasoning` is `None` when the client disabled or omitted thinking; `Some` with
+    // no effort is thinking-on without a level. With no `reasoning_config` the client effort
+    // passes through verbatim (or is omitted). A `reasoning_config` maps listed client levels
+    // to upstream effort (an unlisted level is rewritten by a `*` catch-all if one exists,
+    // otherwise passes through verbatim) and supplies `default` as the fallback effort when no
+    // level is given; `default: None` omits the field. Thinking on/off is signaled separately
+    // by the injected thinking template kwarg (see `build_upstream_extra_body`), not by this
+    // effort value.
+    let reasoning_effort = match (request.reasoning.as_ref(), reasoning_config) {
+        (None, None) => None,
+        // Anthropic route: `thinking: Disabled` lands here. The profile default
+        // (e.g. "high") is carried as the effort field, but thinking is off - the
+        // upstream honors the `enable_thinking` template kwarg over the effort
+        // field (vLLM does), so thinking stays off despite the carried default.
+        (None, Some(rc)) => rc.default.clone(),
+        (Some(reasoning), None) => reasoning
+            .effort
+            .as_deref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        (Some(reasoning), Some(rc)) => match reasoning
+            .effort
+            .as_deref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            // Exact level wins; then the `*` catch-all; then verbatim passthrough.
+            // A listed level is matched case-insensitively (lowercased first); an
+            // unlisted level falls through verbatim in the client's original case,
+            // so callers must not assume the result is lowercase.
+            Some(effort) => Some(
+                rc.map
+                    .get(&effort.to_ascii_lowercase())
+                    .or_else(|| rc.map.get("*"))
+                    .cloned()
+                    .unwrap_or(effort),
+            ),
+            None => rc.default.clone(),
+        },
+    };
     Ok(LoweredTurn {
         messages,
         tools,
@@ -343,21 +374,6 @@ fn normalize_chat_role(role: &str) -> String {
     match role {
         "developer" => "system".to_string(),
         _ => role.to_string(),
-    }
-}
-
-fn normalize_reasoning_effort(effort: Option<&str>) -> AppResult<Option<String>> {
-    match effort.map(str::trim).filter(|value| !value.is_empty()) {
-        None => Ok(None),
-        Some(value) => {
-            let normalized = match value.to_ascii_lowercase().as_str() {
-                "max" | "xhigh" => "max",
-                // OSS reasoning models are converging on a smaller upstream
-                // vocabulary. Anything below max is sent as high.
-                _ => "high",
-            };
-            Ok(Some(normalized.to_string()))
-        }
     }
 }
 
@@ -896,6 +912,7 @@ pub fn tool_call_arguments_object(arguments: &Option<Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ReasoningConfig;
     use crate::models::responses::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -909,6 +926,7 @@ mod tests {
             tool_choice: serde_json::Value::String("auto".to_string()),
             parallel_tool_calls: false,
             reasoning: None,
+            thinking: None,
             store: false,
             stream: true,
             include: vec![],
@@ -1053,59 +1071,149 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_medium_reasoning_effort_for_upstream() {
-        let mut req = base_test_request();
-        req.reasoning = Some(ReasoningRequest {
-            effort: Some("medium".to_string()),
-            summary: None,
-        });
-
-        let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("high"));
+    fn no_config_passes_through_effort_verbatim() {
+        let result = lowered_with(reasoning_with_effort(Some("medium")), None);
+        assert_eq!(result.as_deref(), Some("medium"));
     }
 
     #[test]
-    fn defaults_missing_reasoning_effort_to_max_for_upstream() {
-        let req = base_test_request();
-
-        let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("max"));
+    fn no_config_passes_through_unknown_effort_verbatim() {
+        let result = lowered_with(reasoning_with_effort(Some("turbo")), None);
+        assert_eq!(result.as_deref(), Some("turbo"));
     }
 
     #[test]
-    fn preserves_max_reasoning_effort_for_upstream() {
-        let mut req = base_test_request();
-        req.reasoning = Some(ReasoningRequest {
-            effort: Some("max".to_string()),
-            summary: None,
-        });
-
-        let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("max"));
+    fn no_config_omits_when_thinking_off() {
+        let result = lowered_with(None, None);
+        assert_eq!(result.as_deref(), None);
     }
 
     #[test]
-    fn normalizes_xhigh_reasoning_effort_to_max_for_upstream() {
-        let mut req = base_test_request();
-        req.reasoning = Some(ReasoningRequest {
-            effort: Some("xhigh".to_string()),
-            summary: None,
-        });
-
-        let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("max"));
+    fn no_config_omits_when_thinking_on_without_effort() {
+        let result = lowered_with(reasoning_with_effort(None), None);
+        assert_eq!(result.as_deref(), None);
     }
 
     #[test]
-    fn normalizes_low_reasoning_effort_to_high_for_upstream() {
-        let mut req = base_test_request();
-        req.reasoning = Some(ReasoningRequest {
-            effort: Some("  LoW  ".to_string()),
-            summary: None,
-        });
+    fn map_overrides_listed_level() {
+        let config = glm_reasoning_config();
+        assert_eq!(
+            lowered_with(reasoning_with_effort(Some("medium")), Some(&config)).as_deref(),
+            Some("high")
+        );
+    }
 
-        let result = lower_request(&req, vec![]).expect("lower_request");
-        assert_eq!(result.reasoning_effort.as_deref(), Some("high"));
+    #[test]
+    fn map_passes_through_unlisted_level() {
+        let config = glm_reasoning_config();
+        assert_eq!(
+            lowered_with(reasoning_with_effort(Some("max")), Some(&config)).as_deref(),
+            Some("max")
+        );
+    }
+
+    #[test]
+    fn map_is_case_insensitive() {
+        let config = glm_reasoning_config();
+        assert_eq!(
+            lowered_with(reasoning_with_effort(Some("MeDiUm")), Some(&config)).as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn map_passes_through_unknown_verbatim() {
+        let config = glm_reasoning_config();
+        assert_eq!(
+            lowered_with(reasoning_with_effort(Some("turbo")), Some(&config)).as_deref(),
+            Some("turbo")
+        );
+    }
+
+    #[test]
+    fn map_minimal_to_none() {
+        let config = glm_reasoning_config();
+        assert_eq!(
+            lowered_with(reasoning_with_effort(Some("minimal")), Some(&config)).as_deref(),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn map_wildcard_rewrites_unlisted_level() {
+        let config: ReasoningConfig =
+            serde_json::from_value(json!({"map": {"low": "high", "*": "medium"}})).unwrap();
+        // Unlisted level falls through to the `*` catch-all instead of passing verbatim.
+        assert_eq!(
+            lowered_with(reasoning_with_effort(Some("turbo")), Some(&config)).as_deref(),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn map_explicit_level_wins_over_wildcard() {
+        let config: ReasoningConfig =
+            serde_json::from_value(json!({"map": {"low": "high", "*": "medium"}})).unwrap();
+        assert_eq!(
+            lowered_with(reasoning_with_effort(Some("low")), Some(&config)).as_deref(),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn map_wildcard_does_not_apply_to_default() {
+        // `*` rewrites a present-but-unlisted level; absent effort still uses `default`.
+        let config: ReasoningConfig =
+            serde_json::from_value(json!({"default": "none", "map": {"*": "high"}})).unwrap();
+        assert_eq!(lowered_with(None, Some(&config)).as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn default_emits_when_no_effort() {
+        let config = glm_reasoning_config();
+        assert_eq!(lowered_with(None, Some(&config)).as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn default_folds_thinking_on_without_effort() {
+        let config = glm_reasoning_config();
+        assert_eq!(
+            lowered_with(reasoning_with_effort(None), Some(&config)).as_deref(),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn default_none_omits_when_no_effort() {
+        let config: ReasoningConfig =
+            serde_json::from_value(json!({"map": {"low": "high"}})).unwrap();
+        assert_eq!(lowered_with(None, Some(&config)).as_deref(), None);
+    }
+
+    fn lowered_with(
+        reasoning: Option<ReasoningRequest>,
+        reasoning_config: Option<&ReasoningConfig>,
+    ) -> Option<String> {
+        let mut req = base_test_request();
+        req.reasoning = reasoning;
+        lower_request_with_reasoning_config(&req, vec![], reasoning_config)
+            .expect("lower_request")
+            .reasoning_effort
+    }
+
+    fn glm_reasoning_config() -> ReasoningConfig {
+        serde_json::from_value(json!({
+            "default": "none",
+            "map": {"low": "high", "medium": "high", "xhigh": "max", "minimal": "none"}
+        }))
+        .expect("parse glm reasoning config")
+    }
+
+    fn reasoning_with_effort(effort: Option<&str>) -> Option<ReasoningRequest> {
+        Some(ReasoningRequest {
+            effort: effort.map(|value| value.to_string()),
+            summary: None,
+        })
     }
 
     #[test]

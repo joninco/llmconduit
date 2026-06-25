@@ -793,14 +793,27 @@ async fn handle_count_tokens(
     // Mirror the generation path: the configured system-prompt prefix is part
     // of the real upstream prompt, so it must be counted here too.
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
-    let lowered = crate::adapters::responses_to_chat::lower_request_with_default_reasoning_effort(
+    let reasoning_config = gateway.config().resolve_reasoning_config(&original_model);
+    let lowered = crate::adapters::responses_to_chat::lower_request_with_reasoning_config(
         &responses_request,
         Vec::new(),
-        &gateway.config().default_reasoning_effort,
+        reasoning_config,
     )?;
+    // Mirror the generation path: this is the Anthropic route, so inject the explicit thinking
+    // template kwarg (it changes the rendered template, hence the token count), and let a
+    // resolved effort of `none` force thinking off just as the streaming path does.
+    let thinking_on = crate::engine::anthropic_thinking_on(
+        responses_request.thinking.unwrap_or(false),
+        lowered.reasoning_effort.as_deref(),
+    );
+    let (thinking_name, thinking_value) =
+        crate::engine::resolve_thinking_kwarg(reasoning_config, thinking_on);
+    let mut chat_template_kwargs = serde_json::Map::new();
+    chat_template_kwargs.insert(thinking_name, thinking_value);
     let body = serde_json::json!({
         "model": resolved_model,
         "messages": lowered.messages,
+        "chat_template_kwargs": chat_template_kwargs,
     });
 
     match gateway.upstream_client().count_tokens(&body).await {

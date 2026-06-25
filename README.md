@@ -196,6 +196,51 @@ model_profiles:
   profile. Caps resolve per upstream id: an id-keyed profile, else the first alias
   whose `upstream_model` targets the id, else the reserved `*` profile.
 
+### Reasoning effort
+
+A profile's `reasoning_effort` block shapes the upstream `reasoning_effort` field
+and controls the thinking template kwarg injected on Anthropic routes. Effort
+shaping applies on `/v1/messages`, `/v1/responses`, `/v1/chat/completions`, and
+`/v1/messages/count_tokens`; thinking-kwarg injection applies on the Anthropic
+routes.
+
+```yaml
+model_profiles:
+  "*":
+    reasoning_effort:
+      default: high
+      map:
+        low: high
+        xhigh: max
+        "*": high
+      thinking_param_name: enable_thinking
+      thinking_param_value_on: true
+      thinking_param_value_off: false
+```
+
+- `map` translates effort levels case-insensitively. An explicit key wins; `*`
+  rewrites any otherwise-unlisted effort.
+- `default` is emitted when the client does not send an effort. Omitting it sends
+  no `reasoning_effort` field.
+- Anthropic requests always state thinking on/off through the configured template
+  kwarg (default `enable_thinking: true`/`false`), overriding static defaults.
+  A resolved `none` effort forces the off value.
+- A matching profile without `reasoning_effort` is not back-filled from `*`.
+
+### Example: GLM-5.2 on vLLM
+
+```yaml
+model_profiles:
+  GLM-5.2:
+    reasoning_effort:
+      map:
+        none: none
+        minimal: none
+        low: high
+        medium: high
+        xhigh: max
+```
+
 Optional Brave Search:
 
 ```yaml

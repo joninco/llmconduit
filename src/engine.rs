@@ -3,8 +3,9 @@ use crate::adapters::chat_to_responses::ResolvedToolCall;
 use crate::adapters::chat_to_responses::StreamEmission;
 use crate::adapters::chat_to_responses::StreamState;
 use crate::adapters::responses_to_chat::ToolKind;
-use crate::adapters::responses_to_chat::lower_request_with_default_reasoning_effort;
+use crate::adapters::responses_to_chat::lower_request_with_reasoning_config;
 use crate::config::Config;
+use crate::config::ReasoningConfig;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatCompletionChunk;
@@ -130,6 +131,7 @@ fn build_upstream_extra_body(
     request: &ResponsesRequest,
     response_format: &Option<Value>,
     reasoning_effort: &Option<String>,
+    thinking_kwarg: Option<(String, Value)>,
 ) -> BTreeMap<String, Value> {
     let mut extra_body = defaults.into_iter().collect();
     remove_defaults_for_explicit_request_fields(
@@ -142,7 +144,61 @@ fn build_upstream_extra_body(
     for (key, value) in &request.extra_body {
         merge_request_extra_value(&mut extra_body, key, value);
     }
+    // Anthropic treats thinking as off unless the request enables it, but some upstreams
+    // default it on when the kwarg is absent. So state it explicitly here; injected last to
+    // override any static `chat_template_kwargs` default rather than relying on `reasoning_effort`.
+    if let Some((name, value)) = thinking_kwarg {
+        inject_chat_template_kwarg(&mut extra_body, name, value);
+    }
     extra_body
+}
+
+/// Whether to inject thinking-on on the Anthropic route. The request's thinking field is the
+/// primary signal, but a resolved effort of `none` (the canonical "skip thinking" level that the
+/// z.ai/GLM clamp maps `minimal`/`none` to) must turn thinking off even when the request enabled
+/// it - otherwise the clamp would be silently ineffective.
+pub(crate) fn anthropic_thinking_on(requested_on: bool, resolved_effort: Option<&str>) -> bool {
+    requested_on && !resolved_effort.is_some_and(|effort| effort.eq_ignore_ascii_case("none"))
+}
+
+/// Resolve the thinking template kwarg (name + value) to inject for the Anthropic path. Falls
+/// back to the built-in `enable_thinking` = true/false when the profile has no `reasoning_effort`
+/// block, so the intent is always stated explicitly to the upstream.
+pub(crate) fn resolve_thinking_kwarg(
+    reasoning_config: Option<&ReasoningConfig>,
+    on: bool,
+) -> (String, Value) {
+    // Borrow the resolved config when present; otherwise fall back to the config defaults so the
+    // injected name/value never drift from a profile that omits the `reasoning_effort` block.
+    let owned_defaults;
+    let rc = match reasoning_config {
+        Some(rc) => rc,
+        None => {
+            owned_defaults = ReasoningConfig::default();
+            &owned_defaults
+        }
+    };
+    (
+        rc.thinking_param_name.clone(),
+        rc.thinking_param_value(on).clone(),
+    )
+}
+
+fn inject_chat_template_kwarg(
+    extra_body: &mut BTreeMap<String, Value>,
+    name: String,
+    value: Value,
+) {
+    let entry = extra_body
+        .entry("chat_template_kwargs".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    // A non-object default would swallow the kwarg; replace it with a fresh object.
+    if !entry.is_object() {
+        *entry = Value::Object(serde_json::Map::new());
+    }
+    if let Value::Object(map) = entry {
+        map.insert(name, value);
+    }
 }
 
 fn remove_defaults_for_explicit_request_fields(
@@ -326,14 +382,21 @@ impl Gateway {
                 );
             }
         }
-        let lowered = lower_request_with_default_reasoning_effort(
+        let reasoning_config = self.config.resolve_reasoning_config(&tail_request.model);
+        let lowered = lower_request_with_reasoning_config(
             &tail_request,
             baseline_record
                 .as_ref()
                 .map(|record| record.internal_messages.clone())
                 .unwrap_or_default(),
-            &self.config.default_reasoning_effort,
+            reasoning_config,
         )?;
+        // Only the Anthropic path sets `thinking`; other routes leave the upstream thinking
+        // kwarg to the client. A resolved effort of `none` also forces thinking off.
+        let thinking_kwarg = request.thinking.map(|on| {
+            let on = anthropic_thinking_on(on, lowered.reasoning_effort.as_deref());
+            resolve_thinking_kwarg(reasoning_config, on)
+        });
 
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
@@ -348,6 +411,7 @@ impl Gateway {
                     lowered.tool_registry,
                     lowered.response_format,
                     lowered.reasoning_effort,
+                    thinking_kwarg,
                     resolved_model,
                     tx.clone(),
                 )
@@ -423,6 +487,7 @@ impl Gateway {
         tool_registry: crate::adapters::responses_to_chat::ToolRegistry,
         response_format: Option<Value>,
         reasoning_effort: Option<String>,
+        thinking_kwarg: Option<(String, Value)>,
         upstream_model: String,
         tx: mpsc::Sender<SseEvent>,
     ) -> AppResult<()> {
@@ -721,6 +786,7 @@ impl Gateway {
             &request,
             &response_format,
             &reasoning_effort,
+            thinking_kwarg,
         );
         let normalized_stop = crate::models::chat::normalize_stop(request.stop.clone())?;
         loop {

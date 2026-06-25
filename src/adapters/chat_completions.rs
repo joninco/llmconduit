@@ -37,6 +37,8 @@ pub fn convert_request(request: ChatCompletionRequest) -> AppResult<ResponsesReq
             effort: Some(effort),
             summary: None,
         }),
+        // Chat Completions clients control the upstream thinking kwarg directly via extra_body.
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
