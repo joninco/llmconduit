@@ -4,6 +4,7 @@ use crate::adapters::chat_completions::ChatCompletionCollector;
 use crate::adapters::chat_completions::ChatCompletionStreamConverter;
 use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
+use crate::config::Config;
 use crate::debug_ui::debug_index;
 use crate::debug_ui::debug_ws;
 use crate::engine::Gateway;
@@ -1072,7 +1073,7 @@ async fn get_models(
     let response = gateway.upstream_client().list_models().await?;
     let (status, body, etag) = collect_models_response(response).await?;
     let body = if anthropic_models {
-        transform_models_response_for_anthropic(body, &query)?
+        transform_models_response_for_anthropic(body, &query, gateway.config())?
     } else {
         body
     };
@@ -1094,6 +1095,7 @@ fn is_anthropic_models_request(headers: &HeaderMap) -> bool {
 fn transform_models_response_for_anthropic(
     body: Value,
     query: &ModelsListQuery,
+    config: &Config,
 ) -> AppResult<Value> {
     if query.after_id.is_some() && query.before_id.is_some() {
         return Err(AppError::bad_request(
@@ -1104,7 +1106,7 @@ fn transform_models_response_for_anthropic(
     let limit = parse_anthropic_models_limit(query.limit.as_deref())?;
     let models = extract_model_entries(&body)
         .into_iter()
-        .filter_map(|entry| anthropic_model_entry(&entry))
+        .filter_map(|entry| anthropic_model_entry(&entry, config))
         .collect::<Vec<_>>();
 
     let (page, has_more) = page_anthropic_models(&models, query, limit)?;
@@ -1155,10 +1157,11 @@ fn extract_model_entries(body: &Value) -> Vec<Value> {
     }
 }
 
-fn anthropic_model_entry(entry: &Value) -> Option<Value> {
+fn anthropic_model_entry(entry: &Value, config: &Config) -> Option<Value> {
     match entry {
         Value::String(id) => {
             let caps = infer_capabilities_from_model_id(id);
+            let caps = merge_configured_capabilities(config, id, caps);
             Some(build_anthropic_model_entry(
                 id,
                 id,
@@ -1192,6 +1195,7 @@ fn anthropic_model_entry(entry: &Value) -> Option<Value> {
                 .filter(|value| value.is_object())
                 .map(Value::clone)
                 .unwrap_or_else(|| infer_capabilities_from_model_id(id));
+            let capabilities = merge_configured_capabilities(config, id, capabilities);
 
             Some(build_anthropic_model_entry(
                 id,
@@ -1226,6 +1230,17 @@ fn parse_created_at(map: &serde_json::Map<String, Value>) -> Option<String> {
 
 fn infer_capabilities_from_model_id(_id: &str) -> Value {
     default_anthropic_model_capabilities()
+}
+
+/// Override the base capabilities with any `capabilities` block configured on the
+/// profile that resolves to this upstream id (id-keyed, else an alias whose
+/// `upstream_model` targets the id, else the reserved `*` profile). Unconfigured
+/// caps keep the base value; configured caps replace the base per cap key, wholesale.
+fn merge_configured_capabilities(config: &Config, id: &str, base: Value) -> Value {
+    match config.resolve_capabilities_for_upstream(id) {
+        Some(caps) => caps.merge_into(base),
+        None => base,
+    }
 }
 
 fn build_anthropic_model_entry(

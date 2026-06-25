@@ -167,6 +167,35 @@ With this config, a request for `GLM-5.2` uses only the `GLM-5.2` profile
 (`enable_thinking: false`); the `*` profile contributes nothing. A request for
 any other model (e.g. `Qwen-3`) falls back to `*` (`enable_thinking: true`).
 
+### Model capabilities
+
+A profile's `capabilities` block overrides the Anthropic model capabilities
+advertised on `/v1/models` for Anthropic clients.
+
+```yaml
+model_profiles:
+  "*":
+    capabilities:
+      thinking:
+        types: [adaptive, enabled]
+      effort:
+        levels: [max, xhigh, high, medium, low, minimal, none]
+      image_input: false
+```
+
+- `supported` is the only knob and defaults to `true`. The simple caps (`batch`,
+  `citations`, `code_execution`, `image_input`, `pdf_input`,
+  `structured_outputs`) accept a bare bool as shorthand for `{supported: <bool>}`.
+- `thinking.types`, `effort.levels`, and `context_management.features` list the
+  advertised sub-entries; each inherits the cap's `supported` flag.
+- Unknown cap keys, effort levels, thinking types, and context-management features
+  are rejected at load.
+- A configured cap replaces the base (upstream-supplied, else the default
+  capabilities) for that cap key, wholesale; unconfigured caps keep the base.
+  A matched profile without a `capabilities` block gets no fill-in from the `*`
+  profile. Caps resolve per upstream id: an id-keyed profile, else the first alias
+  whose `upstream_model` targets the id, else the reserved `*` profile.
+
 Optional Brave Search:
 
 ```yaml

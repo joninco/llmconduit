@@ -6026,3 +6026,128 @@ async fn count_tokens_malformed_body_returns_400() {
     let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(body["error"]["type"], "invalid_request_error");
 }
+
+#[tokio::test]
+async fn anthropic_models_advertise_thinking_capabilities_for_glm_profiles() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.2"}, {"id": "qwen3"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "glm-5.2".to_string(),
+        llmconduit::config::ModelProfile {
+            capabilities: Some(
+                serde_json::from_value::<llmconduit::config::CapabilitiesConfig>(json!({
+                    "thinking": {"types": ["enabled"]},
+                    "effort": {"levels": ["medium", "xhigh"]}
+                }))
+                .expect("caps"),
+            ),
+            ..Default::default()
+        },
+    )]);
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    let models = body["data"].as_array().expect("data array");
+    let glm = models
+        .iter()
+        .find(|model| model["id"] == "glm-5.2")
+        .expect("glm-5.2 entry");
+    assert_eq!(glm["capabilities"]["thinking"]["supported"], true);
+    assert_eq!(
+        glm["capabilities"]["thinking"]["types"]["enabled"]["supported"],
+        true
+    );
+    assert_eq!(glm["capabilities"]["effort"]["supported"], true);
+    assert_eq!(glm["capabilities"]["effort"]["medium"]["supported"], true);
+    assert_eq!(glm["capabilities"]["effort"]["xhigh"]["supported"], true);
+    let qwen = models
+        .iter()
+        .find(|model| model["id"] == "qwen3")
+        .expect("qwen3 entry");
+    assert_eq!(qwen["capabilities"]["thinking"]["supported"], false);
+    assert_eq!(qwen["capabilities"]["effort"]["supported"], false);
+}
+
+#[tokio::test]
+async fn anthropic_models_advertise_glm_capabilities_for_alias_targeting_upstream() {
+    // The GLM profile is keyed by a client alias that targets the upstream id;
+    // /v1/models lists the upstream id, not the alias. The advertised upstream
+    // entry must still show GLM capabilities because a profile resolves to it.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.2"}, {"id": "qwen3"}]
+        })))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "client-glm".to_string(),
+        llmconduit::config::ModelProfile {
+            upstream_model: Some("glm-5.2".to_string()),
+            capabilities: Some(
+                serde_json::from_value::<llmconduit::config::CapabilitiesConfig>(json!({
+                    "thinking": {"types": ["adaptive"]},
+                    "effort": {"levels": ["max"]}
+                }))
+                .expect("caps"),
+            ),
+            ..Default::default()
+        },
+    )]);
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+    let models = body["data"].as_array().expect("data array");
+    let glm = models
+        .iter()
+        .find(|model| model["id"] == "glm-5.2")
+        .expect("glm-5.2 entry");
+    assert_eq!(glm["capabilities"]["thinking"]["supported"], true);
+    assert_eq!(glm["capabilities"]["effort"]["supported"], true);
+    let qwen = models
+        .iter()
+        .find(|model| model["id"] == "qwen3")
+        .expect("qwen3 entry");
+    assert_eq!(qwen["capabilities"]["thinking"]["supported"], false);
+}
