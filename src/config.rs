@@ -1,5 +1,7 @@
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de::{Deserializer, Error as DeError};
+use serde::ser::{SerializeMap, Serializer};
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -409,6 +411,8 @@ pub struct PersistedModelProfile {
     pub upstream_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<RolesConfig>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -431,6 +435,8 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             #[serde(default)]
             system_prompt_prefix: Option<String>,
             #[serde(default)]
+            roles: Option<RolesConfig>,
+            #[serde(default)]
             upstream_chat_kwargs: JsonMap<String, JsonValue>,
             #[serde(default, flatten)]
             shorthand_upstream_chat_kwargs: JsonMap<String, JsonValue>,
@@ -447,6 +453,7 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             extends: raw.extends,
             upstream_model: raw.upstream_model,
             system_prompt_prefix: raw.system_prompt_prefix,
+            roles: raw.roles,
             upstream_chat_kwargs,
             capabilities: raw.capabilities,
             reasoning_effort: raw.reasoning_effort,
@@ -458,9 +465,178 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
 pub struct ModelProfile {
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
+    pub roles: Option<RolesConfig>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub capabilities: Option<CapabilitiesConfig>,
     pub reasoning_effort: Option<ReasoningConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    #[default]
+    Accept,
+    Reject,
+    Drop,
+    Rewrite,
+}
+
+impl Action {
+    fn is_accept(&self) -> bool {
+        *self == Action::Accept
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum When {
+    Leading,
+    Inline,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RoleRule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when: Option<When>,
+    #[serde(skip_serializing_if = "Action::is_accept")]
+    pub action: Action,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tag_attributes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoleRuleSet {
+    pub rules: Vec<RoleRule>,
+}
+
+impl<'de> Deserialize<'de> for RoleRuleSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let rules = if value.is_array() {
+            serde_json::from_value::<Vec<RoleRule>>(value).map_err(DeError::custom)?
+        } else {
+            vec![serde_json::from_value::<RoleRule>(value).map_err(DeError::custom)?]
+        };
+        Ok(RoleRuleSet { rules })
+    }
+}
+
+impl Serialize for RoleRuleSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.rules.len() == 1 {
+            self.rules[0].serialize(serializer)
+        } else {
+            self.rules.serialize(serializer)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RolesConfig {
+    pub merge_adjacent: Vec<String>,
+    pub rules: BTreeMap<String, RoleRuleSet>,
+}
+
+impl<'de> Deserialize<'de> for RolesConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let map = match value {
+            serde_json::Value::Object(map) => map,
+            _ => {
+                return Err(DeError::custom(
+                    "roles must be a map of role names to rules",
+                ));
+            }
+        };
+        let mut merge_adjacent = Vec::new();
+        let mut rules = BTreeMap::new();
+        for (key, val) in map {
+            if key == "merge_adjacent" {
+                merge_adjacent =
+                    serde_json::from_value::<Vec<String>>(val).map_err(DeError::custom)?;
+            } else {
+                rules.insert(
+                    key,
+                    serde_json::from_value::<RoleRuleSet>(val).map_err(DeError::custom)?,
+                );
+            }
+        }
+        Ok(RolesConfig {
+            merge_adjacent,
+            rules,
+        })
+    }
+}
+
+impl Serialize for RolesConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let len = self.rules.len() + if self.merge_adjacent.is_empty() { 0 } else { 1 };
+        let mut map = serializer.serialize_map(Some(len))?;
+        if !self.merge_adjacent.is_empty() {
+            map.serialize_entry("merge_adjacent", &self.merge_adjacent)?;
+        }
+        for (key, val) in &self.rules {
+            map.serialize_entry(key, val)?;
+        }
+        map.end()
+    }
+}
+
+impl RolesConfig {
+    /// Resolve the rule list for a role: explicit key first, then the `*` wildcard.
+    pub fn rules_for(&self, role: &str) -> Option<&[RoleRule]> {
+        self.rules
+            .get(role)
+            .map(|set| set.rules.as_slice())
+            .or_else(|| self.rules.get("*").map(|set| set.rules.as_slice()))
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, set) in &self.rules {
+            for rule in &set.rules {
+                let has_target = rule
+                    .target_role
+                    .as_deref()
+                    .map_or(false, |t| !t.trim().is_empty());
+                if rule.action == Action::Rewrite {
+                    if !has_target {
+                        return Err(format!(
+                            "roles[{name}]: action `rewrite` requires a non-empty `target_role`"
+                        ));
+                    }
+                } else if rule.target_role.is_some() {
+                    return Err(format!(
+                        "roles[{name}]: `target_role` is only valid with action `rewrite`"
+                    ));
+                }
+                if !rule.tag_attributes.is_empty()
+                    && rule.tag.as_deref().map_or(true, |t| t.trim().is_empty())
+                {
+                    return Err(format!(
+                        "roles[{name}]: `tag_attributes` requires a non-empty `tag`"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -817,6 +993,27 @@ impl Config {
     /// with pointer-dedup to keep precedence stable. The reserved `*` profile is a
     /// pure fallback: it is included only when no specific profile matches, so an
     /// explicit match never inherits unset fields from `*` (use profile
+    pub fn resolve_roles_config(&self, request_model: &str) -> Option<&RolesConfig> {
+        let upstream_model = self.resolve_upstream_model(request_model);
+        self.resolve_roles_config_for_resolved_model(request_model, &upstream_model)
+    }
+
+    pub(crate) fn resolve_roles_config_for_resolved_model(
+        &self,
+        request_model: &str,
+        resolved_model: &str,
+    ) -> Option<&RolesConfig> {
+        self.model_profiles_for_resolved_model(request_model, resolved_model)
+            .into_iter()
+            .find_map(|profile| profile.roles.as_ref())
+    }
+
+    /// Collect profiles matching the request model chain. `resolved_model` must be
+    /// `resolve_upstream_model(request_model)` (callers pass the already-resolved upstream
+    /// id); it is not re-resolved here. The resolved/upstream model is tried first, then the
+    /// request model itself, with pointer-dedup to keep the precedence order stable. The
+    /// reserved `*` profile is a pure fallback: it is included only when no specific profile
+    /// matches, so an explicit match never inherits unset fields from `*` (use profile
     /// templates to share fields between explicit profiles).
     fn model_profiles_for_resolved_model(
         &self,
@@ -856,6 +1053,7 @@ impl Config {
 struct ResolvedModelProfile {
     upstream_model: Option<String>,
     system_prompt_prefixes: Vec<String>,
+    roles: Option<RolesConfig>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
     capabilities: Option<CapabilitiesConfig>,
     reasoning_effort: Option<ReasoningConfig>,
@@ -866,6 +1064,7 @@ impl ResolvedModelProfile {
         ModelProfile {
             upstream_model: self.upstream_model,
             system_prompt_prefix: join_prompt_prefixes(self.system_prompt_prefixes),
+            roles: self.roles,
             upstream_chat_kwargs: self.upstream_chat_kwargs,
             capabilities: self.capabilities,
             reasoning_effort: self.reasoning_effort,
@@ -885,7 +1084,13 @@ fn resolve_model_profiles(
         }
         let profile = resolve_persisted_model_profile(profile, templates, &mut Vec::new())
             .map_err(|err| format!("model_profiles[{name}]: {err}"))?;
-        resolved.insert(name.to_string(), profile.into_model_profile());
+        let profile = profile.into_model_profile();
+        if let Some(roles) = &profile.roles {
+            roles
+                .validate()
+                .map_err(|err| format!("model_profiles[{name}]: {err}"))?;
+        }
+        resolved.insert(name.to_string(), profile);
     }
     Ok(resolved)
 }
@@ -942,6 +1147,9 @@ fn merge_resolved_model_profile(
     if source.reasoning_effort.is_some() {
         destination.reasoning_effort = source.reasoning_effort;
     }
+    if source.roles.is_some() {
+        destination.roles = source.roles;
+    }
     destination
         .system_prompt_prefixes
         .extend(source.system_prompt_prefixes);
@@ -968,6 +1176,9 @@ fn merge_persisted_model_profile(
     }
     if source.reasoning_effort.is_some() {
         destination.reasoning_effort = source.reasoning_effort.clone();
+    }
+    if let Some(roles) = &source.roles {
+        destination.roles = Some(roles.clone());
     }
     merge_json_maps(
         &mut destination.upstream_chat_kwargs,
@@ -1209,6 +1420,7 @@ pub fn merge_json_maps(
 
 #[cfg(test)]
 mod tests {
+    use super::Action;
     use super::CapabilitiesConfig;
     use super::Config;
     use super::ContextFeature;
@@ -1219,6 +1431,9 @@ mod tests {
     use super::PersistedFallbackUpstream;
     use super::PersistedModelProfile;
     use super::PersistedUpstream;
+    use super::RoleRule;
+    use super::RoleRuleSet;
+    use super::RolesConfig;
     use super::SimpleCap;
     use super::ThinkingCap;
     use super::apply_env_overrides;
@@ -2229,6 +2444,120 @@ model_profiles:
         .expect_err("template cycle should fail");
 
         assert!(error.contains("model_profiles[GLM-5.1]: template cycle: a -> b -> a"));
+    }
+
+    fn invalid_roles_profile(roles: RolesConfig) -> PersistedConfig {
+        PersistedConfig {
+            model_profiles: BTreeMap::from_iter([(
+                "GLM-5.1".to_string(),
+                PersistedModelProfile {
+                    roles: Some(roles),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn roles_config_rejects_rewrite_without_target_role() {
+        let config = invalid_roles_profile(RolesConfig {
+            merge_adjacent: vec![],
+            rules: BTreeMap::from_iter([(
+                "developer".to_string(),
+                RoleRuleSet {
+                    rules: vec![RoleRule {
+                        action: Action::Rewrite,
+                        target_role: None,
+                        ..Default::default()
+                    }],
+                },
+            )]),
+        });
+        let error =
+            Config::from_persisted(&config).expect_err("rewrite without target_role should fail");
+        assert!(error.contains(
+            "model_profiles[GLM-5.1]: roles[developer]: action `rewrite` requires a non-empty `target_role`"
+        ));
+    }
+
+    #[test]
+    fn roles_config_rejects_target_role_on_non_rewrite() {
+        let config = invalid_roles_profile(RolesConfig {
+            merge_adjacent: vec![],
+            rules: BTreeMap::from_iter([(
+                "user".to_string(),
+                RoleRuleSet {
+                    rules: vec![RoleRule {
+                        action: Action::Accept,
+                        target_role: Some("system".to_string()),
+                        ..Default::default()
+                    }],
+                },
+            )]),
+        });
+        let error =
+            Config::from_persisted(&config).expect_err("target_role on non-rewrite should fail");
+        assert!(error.contains(
+            "model_profiles[GLM-5.1]: roles[user]: `target_role` is only valid with action `rewrite`"
+        ));
+    }
+
+    #[test]
+    fn roles_config_rejects_tag_attributes_without_tag() {
+        let config = invalid_roles_profile(RolesConfig {
+            merge_adjacent: vec![],
+            rules: BTreeMap::from_iter([(
+                "tool".to_string(),
+                RoleRuleSet {
+                    rules: vec![RoleRule {
+                        action: Action::Accept,
+                        tag: None,
+                        tag_attributes: BTreeMap::from_iter([("k".to_string(), "v".to_string())]),
+                        ..Default::default()
+                    }],
+                },
+            )]),
+        });
+        let error =
+            Config::from_persisted(&config).expect_err("tag_attributes without tag should fail");
+        assert!(error.contains(
+            "model_profiles[GLM-5.1]: roles[tool]: `tag_attributes` requires a non-empty `tag`"
+        ));
+    }
+
+    #[test]
+    fn roles_config_rejects_unknown_rule_key() {
+        let yaml = "\
+roles:
+  user:
+    acton: accept
+";
+        let error = serde_yaml::from_str::<PersistedModelProfile>(yaml)
+            .expect_err("typo'd rule key should fail to deserialize");
+        assert!(
+            error.to_string().contains("acton"),
+            "expected error mentioning `acton`, got: {error}"
+        );
+    }
+
+    #[test]
+    fn roles_config_round_trips_through_yaml() {
+        let yaml = "\
+roles:
+  merge_adjacent: [system]
+  \"*\": { action: reject }
+  user: {}
+  developer: { action: rewrite, target_role: system }
+  tool:
+    - { when: inline, action: rewrite, target_role: user, tag: tool_result, tag_attributes: { a: \"1&2\", b: \"<x>\" } }
+    - {}
+";
+        let original = serde_yaml::from_str::<PersistedModelProfile>(yaml).expect("parse");
+        let reserialized = serde_yaml::to_string(&original).expect("serialize");
+        let roundtrip =
+            serde_yaml::from_str::<PersistedModelProfile>(&reserialized).expect("reparse");
+        assert_eq!(roundtrip.roles, original.roles);
     }
 
     #[test]
