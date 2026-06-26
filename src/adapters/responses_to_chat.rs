@@ -402,7 +402,7 @@ fn apply_role_rules(messages: &mut Vec<ChatMessage>, roles: Option<&RolesConfig>
             )));
         };
         let rule = rule_list.iter().find(|rule| match rule.when {
-            None => true,
+            None | Some(When::Always) => true,
             Some(When::Leading) => idx == 0,
             Some(When::Inline) => idx > 0,
         });

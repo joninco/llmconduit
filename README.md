@@ -259,9 +259,8 @@ parallel tool use.
 
 A per-profile `roles` block maps whole-message roles before the conversation is
 sent upstream. It is fail-closed: a role with no matching rule is rejected with
-HTTP 400. With no `roles` block configured, messages pass through **verbatim** -
-no `developer`->`system` rename, no system-message merging, no tag stripping.
-All role shaping is opt-in.
+HTTP 400. With no `roles` block configured, messages pass through **verbatim** - all
+role shaping is opt-in.
 
 `roles` holds an optional `merge_adjacent` list plus a map of role name to a
 rule, or an ordered list of rules. `*` is the wildcard role: it matches any role
@@ -271,15 +270,22 @@ matches, so put it last as the catch-all.
 
 Per-rule keys:
 
-- `when` (`leading` / `inline`, optional): `leading` matches index 0, `inline`
-  matches index > 0. Omitted matches any position.
+- `when` (`leading` / `inline` / `always`, default `always`): `leading` matches
+  index 0, `inline` matches index > 0, `always` matches any position. Omitting
+  `when` is equivalent to `always`; spell it out only to be explicit.
 - `action` (`accept` / `reject` / `drop` / `rewrite`, default `accept`):
   `accept` keeps the message in place; `reject` returns HTTP 400; `drop` removes
   the message; `rewrite` renames the role, staying its own turn in place.
-- `target_role` (string, required iff `action: rewrite`): the new role name.
+- `target_role` (string, required with `action: rewrite`): the new role name.
 - `tag` (string, optional): wrap the message content in `<tag>...</tag>`.
 - `tag_attributes` (map<string,string>, requires `tag`): render attributes on
   the opening tag, alphabetical by key, XML-escaped (`&` `"` `<`).
+
+Tagging gives the model extra context about a block. For example, rewriting a
+`developer` message to `system` with `tag: system-instruction` and
+`tag_attributes: {description: "IMPORTANT system message. You MUST follow this with high priority!"}`
+wraps the content as
+`<system-instruction description="IMPORTANT system message. You MUST follow this with high priority!">...</system-instruction>`.
 
 `merge_adjacent` is a post-pass keyed on the **final** role (after rewrites). It
 coalesces each maximal run of consecutive messages that share a final role in
@@ -289,13 +295,7 @@ end up as and whether they are adjacent. Folding system and tool into `user` is
 `rewrite` to `user` plus `merge_adjacent: [user]`, which preserves order.
 
 Resolution order for a message: the explicit role key, then the `*` wildcard,
-then fail-closed `reject`. Note the reserved **profile** `*` (a cross-model
-default profile, above) is distinct from the **role** `*` (a wildcard role
-inside a `roles` block).
-
-Injected content (`<system-reminder>`, skill listings, `<command-name>`, etc.)
-flows through **inline and untouched** in whatever role it arrived in; the
-gateway no longer lifts or demotes it.
+then fail-closed `reject`.
 
 ```yaml
 model_profiles:

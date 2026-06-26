@@ -3170,6 +3170,11 @@ fn role_when_leading(mut rule: llmconduit::config::RoleRule) -> llmconduit::conf
     rule
 }
 
+fn role_when_always(mut rule: llmconduit::config::RoleRule) -> llmconduit::config::RoleRule {
+    rule.when = Some(llmconduit::config::When::Always);
+    rule
+}
+
 #[tokio::test]
 async fn roles_pass_through_when_no_config() {
     let upstream = MockUpstream::default();
@@ -3486,6 +3491,40 @@ async fn roles_reject_when_no_rule_matches_position() {
         "error should name the role: {}",
         err.message
     );
+}
+
+#[tokio::test]
+async fn roles_when_always_matches_any_position() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let config = roles_config_with(
+        &[],
+        &[
+            ("*", vec![role_reject()]),
+            ("user", vec![role_accept()]),
+            ("system", vec![role_when_always(role_rewrite("user"))]),
+        ],
+    );
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let request = base_request(vec![
+        ResponseItem::message_text("system", "leading"),
+        user_message("hi"),
+        ResponseItem::message_text("system", "inline"),
+    ]);
+
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    let roles: Vec<&str> = requests[0]
+        .messages
+        .iter()
+        .map(|m| m.role.as_str())
+        .collect();
+    // when: always matches both index 0 and index > 0.
+    assert_eq!(roles, vec!["user", "user", "user"]);
 }
 
 fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
