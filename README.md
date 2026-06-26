@@ -255,6 +255,88 @@ resolved default is the only way to control it there. Setting it to `true` (as
 on `GLM-5.2` above) lets Claude Code fan out independent tool calls in one turn;
 setting it to `false` forces sequential calls for a model that mishandles
 parallel tool use.
+### Roles
+
+A per-profile `roles` block maps whole-message roles before the conversation is
+sent upstream. It is fail-closed: a role with no matching rule is rejected with
+HTTP 400. With no `roles` block configured, messages pass through **verbatim** -
+no `developer`->`system` rename, no system-message merging, no tag stripping.
+All role shaping is opt-in.
+
+`roles` holds an optional `merge_adjacent` list plus a map of role name to a
+rule, or an ordered list of rules. `*` is the wildcard role: it matches any role
+that has no explicit key. A single rule is shorthand for a one-element list. In
+a list, the first rule whose `when` matches wins; a rule with no `when` always
+matches, so put it last as the catch-all.
+
+Per-rule keys:
+
+- `when` (`leading` / `inline`, optional): `leading` matches index 0, `inline`
+  matches index > 0. Omitted matches any position.
+- `action` (`accept` / `reject` / `drop` / `rewrite`, default `accept`):
+  `accept` keeps the message in place; `reject` returns HTTP 400; `drop` removes
+  the message; `rewrite` renames the role, staying its own turn in place.
+- `target_role` (string, required iff `action: rewrite`): the new role name.
+- `tag` (string, optional): wrap the message content in `<tag>...</tag>`.
+- `tag_attributes` (map<string,string>, requires `tag`): render attributes on
+  the opening tag, alphabetical by key, XML-escaped (`&` `"` `<`).
+
+`merge_adjacent` is a post-pass keyed on the **final** role (after rewrites). It
+coalesces each maximal run of consecutive messages that share a final role in
+the list into one content-only message joined with `\n\n`. There is no
+inline/leading distinction at this level - it only looks at the role messages
+end up as and whether they are adjacent. Folding system and tool into `user` is
+`rewrite` to `user` plus `merge_adjacent: [user]`, which preserves order.
+
+Resolution order for a message: the explicit role key, then the `*` wildcard,
+then fail-closed `reject`. Note the reserved **profile** `*` (a cross-model
+default profile, above) is distinct from the **role** `*` (a wildcard role
+inside a `roles` block).
+
+Injected content (`<system-reminder>`, skill listings, `<command-name>`, etc.)
+flows through **inline and untouched** in whatever role it arrived in; the
+gateway no longer lifts or demotes it.
+
+```yaml
+model_profiles:
+  # Full-role, system inline ANYWHERE; tool role supported (GLM-5.2, Kimi K2.7).
+  # Both group tool runs in-template, so do NOT set merge_adjacent on `tool`.
+  GLM-5.2:
+    roles:
+      "*":       { action: reject }
+      user:      {}
+      assistant: {}
+      tool:      {}
+      system:    {}
+      developer: { action: rewrite, target_role: system }
+
+  # System-FIRST only (Qwen3.5 raises on a non-first system message). An INLINE
+  # system/developer message is rewritten to `user` in place; the index-0
+  # message stays system, so Qwen never sees a non-first system.
+  Qwen3.5:
+    roles:
+      "*":       { action: reject }
+      user:      {}
+      assistant: {}
+      tool:      {}
+      system:
+        - { when: inline, action: rewrite, target_role: user }
+        - {}
+      developer:
+        - { when: inline, action: rewrite, target_role: user }
+        - { action: rewrite, target_role: system }
+
+  # System-less model (Gemma): only `user`/`assistant` exist. Fold system and
+  # tool into `user` and coalesce the adjacent user runs.
+  Gemma:
+    roles:
+      merge_adjacent: [user]
+      "*":       { action: reject }
+      user:      {}
+      assistant: {}
+      system:    { action: rewrite, target_role: user }
+      tool:      { action: rewrite, target_role: user, tag: tool_result }
+```
 
 Optional Brave Search:
 
