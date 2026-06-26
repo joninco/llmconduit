@@ -3,7 +3,7 @@ use crate::adapters::chat_to_responses::ResolvedToolCall;
 use crate::adapters::chat_to_responses::StreamEmission;
 use crate::adapters::chat_to_responses::StreamState;
 use crate::adapters::responses_to_chat::ToolKind;
-use crate::adapters::responses_to_chat::lower_request_with_reasoning_config;
+use crate::adapters::responses_to_chat::lower_request_with_reasoning_config_and_roles;
 use crate::config::Config;
 use crate::config::ReasoningConfig;
 use crate::error::AppError;
@@ -421,13 +421,17 @@ impl Gateway {
         let reasoning_config = self
             .config
             .resolve_reasoning_config_for_resolved_model(&tail_request.model, &resolved_model);
-        let lowered = lower_request_with_reasoning_config(
+        let roles = self
+            .config
+            .resolve_roles_config_for_resolved_model(&request.model, &resolved_model);
+        let lowered = lower_request_with_reasoning_config_and_roles(
             &tail_request,
             baseline_record
                 .as_ref()
                 .map(|record| record.internal_messages.clone())
                 .unwrap_or_default(),
             reasoning_config,
+            roles,
         )?;
         // Only the Anthropic path sets `thinking`; other routes leave the upstream thinking
         // kwarg to the client. A resolved effort of `none` also forces thinking off.

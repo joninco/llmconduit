@@ -1,4 +1,5 @@
 use crate::config::ReasoningConfig;
+use crate::config::{Action, RolesConfig, When};
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatFunctionCall;
@@ -16,6 +17,7 @@ use crate::models::responses::ToolSpec;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -105,6 +107,20 @@ pub fn lower_request_with_reasoning_config(
     baseline_messages: Vec<ChatMessage>,
     reasoning_config: Option<&ReasoningConfig>,
 ) -> AppResult<LoweredTurn> {
+    lower_request_with_reasoning_config_and_roles(
+        request,
+        baseline_messages,
+        reasoning_config,
+        None,
+    )
+}
+
+pub fn lower_request_with_reasoning_config_and_roles(
+    request: &ResponsesRequest,
+    baseline_messages: Vec<ChatMessage>,
+    reasoning_config: Option<&ReasoningConfig>,
+    roles: Option<&RolesConfig>,
+) -> AppResult<LoweredTurn> {
     validate_request(request)?;
     let mut messages = baseline_messages;
     if messages.is_empty() && !request.instructions.is_empty() {
@@ -125,7 +141,7 @@ pub fn lower_request_with_reasoning_config(
         match item {
             ResponseItem::Message { role, content, .. } => {
                 let text = message_content_to_chat_value(content)?;
-                let normalized_role = normalize_chat_role(role);
+                let normalized_role = role.to_string();
                 let (reasoning_content, thinking) = if normalized_role == "assistant" {
                     pending_reasoning
                         .take()
@@ -304,7 +320,7 @@ pub fn lower_request_with_reasoning_config(
             tool_calls: None,
         });
     }
-    hoist_system_messages(&mut messages);
+    apply_role_rules(&mut messages, roles)?;
     let response_format = request
         .text
         .as_ref()
@@ -370,40 +386,132 @@ pub fn lower_request_with_reasoning_config(
     })
 }
 
-fn normalize_chat_role(role: &str) -> String {
-    match role {
-        "developer" => "system".to_string(),
-        _ => role.to_string(),
-    }
-}
-
-fn hoist_system_messages(messages: &mut Vec<ChatMessage>) {
-    // Find the end of the initial contiguous block of system messages.
-    let prefix_end = messages
-        .iter()
-        .position(|m| m.role != "system")
-        .unwrap_or(messages.len());
-    if prefix_end == 0 {
-        return;
-    }
-    let mut system_texts: Vec<String> = Vec::new();
-    for msg in &messages[..prefix_end] {
-        if let Some(content) = &msg.content {
-            let text = match content {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            if !text.is_empty() {
-                system_texts.push(text);
+fn apply_role_rules(messages: &mut Vec<ChatMessage>, roles: Option<&RolesConfig>) -> AppResult<()> {
+    let Some(roles) = roles else {
+        return Ok(());
+    };
+    // `when` is matched against the original input index. drain(..).enumerate()
+    // yields the original index in order; `drop` skips the push so later messages
+    // keep their index, keeping position matching stable.
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for (idx, mut msg) in messages.drain(..).enumerate() {
+        let Some(rule_list) = roles.rules_for(&msg.role) else {
+            return Err(AppError::bad_request(format!(
+                "role \"{}\" is not permitted by the model profile roles config",
+                msg.role
+            )));
+        };
+        let rule = rule_list.iter().find(|rule| match rule.when {
+            None => true,
+            Some(When::Leading) => idx == 0,
+            Some(When::Inline) => idx > 0,
+        });
+        let Some(rule) = rule else {
+            return Err(AppError::bad_request(format!(
+                "role \"{}\" at index {} matches no rule in the model profile roles config",
+                msg.role, idx
+            )));
+        };
+        match rule.action {
+            Action::Reject => {
+                return Err(AppError::bad_request(format!(
+                    "role \"{}\" is rejected by the model profile roles config",
+                    msg.role
+                )));
+            }
+            Action::Drop => continue,
+            Action::Accept => {
+                wrap_tag(&mut msg, &rule.tag, &rule.tag_attributes);
+                out.push(msg);
+            }
+            Action::Rewrite => {
+                if let Some(target) = &rule.target_role {
+                    msg.role = target.clone();
+                }
+                wrap_tag(&mut msg, &rule.tag, &rule.tag_attributes);
+                out.push(msg);
             }
         }
     }
-    let rest: Vec<ChatMessage> = messages.drain(prefix_end..).collect();
-    messages.clear();
-    if !system_texts.is_empty() {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(Value::String(system_texts.join("\n\n"))),
+    *messages = out;
+    if !roles.merge_adjacent.is_empty() {
+        merge_adjacent_runs(messages, &roles.merge_adjacent);
+    }
+    Ok(())
+}
+
+fn wrap_tag(msg: &mut ChatMessage, tag: &Option<String>, attrs: &BTreeMap<String, String>) {
+    let Some(tag) = tag else {
+        return;
+    };
+    let Some(content) = msg.content.take() else {
+        return;
+    };
+    let text = match content {
+        Value::String(s) => s,
+        other => other.to_string(),
+    };
+    let mut open = String::from("<");
+    open.push_str(tag);
+    for (key, value) in attrs {
+        open.push(' ');
+        open.push_str(key);
+        open.push_str("=\"");
+        open.push_str(&xml_escape_attr(value));
+        open.push('"');
+    }
+    open.push('>');
+    msg.content = Some(Value::String(format!("{open}{text}</{tag}>")));
+}
+
+fn xml_escape_attr(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+// Coalesce each maximal run of consecutive messages whose shared final role is
+// in `merge` into one fresh content-only ChatMessage (\n\n-joined), mirroring the
+// old hoist_system_messages content join. Keyed on the FINAL (post-rewrite) role.
+fn merge_adjacent_runs(messages: &mut Vec<ChatMessage>, merge: &[String]) {
+    if messages.is_empty() {
+        return;
+    }
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    let mut idx = 0;
+    while idx < messages.len() {
+        let role = messages[idx].role.clone();
+        if !merge.contains(&role) {
+            out.push(messages[idx].clone());
+            idx += 1;
+            continue;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        while idx < messages.len() && messages[idx].role == role {
+            if let Some(content) = &messages[idx].content {
+                let text = match content {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                if !text.is_empty() {
+                    parts.push(text);
+                }
+            }
+            idx += 1;
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        out.push(ChatMessage {
+            role,
+            content: Some(Value::String(parts.join("\n\n"))),
             tool_call_id: None,
             name: None,
             reasoning_content: None,
@@ -411,7 +519,7 @@ fn hoist_system_messages(messages: &mut Vec<ChatMessage>) {
             tool_calls: None,
         });
     }
-    messages.extend(rest);
+    *messages = out;
 }
 
 fn validate_request(request: &ResponsesRequest) -> AppResult<()> {
@@ -1377,35 +1485,6 @@ mod tests {
     }
 
     #[test]
-    fn hoist_system_messages_non_string_content() {
-        let mut messages = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: Some(json!({"key": "value"})),
-                tool_call_id: None,
-                name: None,
-                reasoning_content: None,
-                thinking: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: Some(json!("hello")),
-                tool_call_id: None,
-                name: None,
-                reasoning_content: None,
-                thinking: None,
-                tool_calls: None,
-            },
-        ];
-        hoist_system_messages(&mut messages);
-        assert_eq!(messages[0].role, "system");
-        let content = messages[0].content.as_ref().unwrap().as_str().unwrap();
-        assert!(content.contains("key"));
-        assert!(content.contains("value"));
-    }
-
-    #[test]
     fn reasoning_item_text_variants() {
         let summary = vec![ReasoningSummaryItem::SummaryText {
             text: "summary".to_string(),
@@ -1532,63 +1611,5 @@ mod tests {
         assert!(messages[0].tool_calls.is_none());
         assert!(messages[1].tool_calls.is_some());
         assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].index, Some(0));
-    }
-
-    // --- M2 test ---
-
-    #[test]
-    fn test_hoist_preserves_mid_conversation_system_messages() {
-        let mut messages = vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: Some(Value::String("top".to_string())),
-                tool_call_id: None,
-                name: None,
-                reasoning_content: None,
-                thinking: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: Some(Value::String("hello".to_string())),
-                tool_call_id: None,
-                name: None,
-                reasoning_content: None,
-                thinking: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: "system".to_string(),
-                content: Some(Value::String("mid".to_string())),
-                tool_call_id: None,
-                name: None,
-                reasoning_content: None,
-                thinking: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: Some(Value::String("hi".to_string())),
-                tool_call_id: None,
-                name: None,
-                reasoning_content: None,
-                thinking: None,
-                tool_calls: None,
-            },
-        ];
-        hoist_system_messages(&mut messages);
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].role, "system");
-        assert_eq!(
-            messages[0].content.as_ref().unwrap().as_str().unwrap(),
-            "top"
-        );
-        assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[2].role, "system");
-        assert_eq!(
-            messages[2].content.as_ref().unwrap().as_str().unwrap(),
-            "mid"
-        );
-        assert_eq!(messages[3].role, "assistant");
     }
 }

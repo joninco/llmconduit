@@ -796,11 +796,16 @@ async fn handle_count_tokens(
     let reasoning_config = gateway
         .config()
         .resolve_reasoning_config_for_resolved_model(&original_model, &resolved_model);
-    let lowered = crate::adapters::responses_to_chat::lower_request_with_reasoning_config(
-        &responses_request,
-        Vec::new(),
-        reasoning_config,
-    )?;
+    let roles = gateway
+        .config()
+        .resolve_roles_config_for_resolved_model(&original_model, &resolved_model);
+    let lowered =
+        crate::adapters::responses_to_chat::lower_request_with_reasoning_config_and_roles(
+            &responses_request,
+            Vec::new(),
+            reasoning_config,
+            roles,
+        )?;
     // Mirror build_upstream_extra_body: start from the profile's resolved passthrough
     // chat_template_kwargs (operator template kwargs affect rendering, so they must be counted).
     // Typed defaults are folded into the named chat fields by the generation path and don't

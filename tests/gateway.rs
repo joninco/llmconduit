@@ -869,7 +869,7 @@ async fn normalizes_developer_messages_to_system_for_upstream() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let request = base_request(vec![
         ResponseItem::Message {
@@ -1966,7 +1966,7 @@ async fn merges_instructions_and_developer_into_single_system_message() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("hello"),
@@ -2012,7 +2012,7 @@ async fn merges_multiple_developer_messages_scattered_in_history() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         ResponseItem::Message {
@@ -2097,7 +2097,7 @@ async fn developer_only_no_instructions_produces_single_system_message() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let request = base_request(vec![
         ResponseItem::Message {
@@ -2139,7 +2139,7 @@ async fn function_call_history_with_developer_message_produces_correct_ordering(
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "result is 555"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("what is 15 * 37?"),
@@ -2215,7 +2215,7 @@ async fn multiple_function_calls_interleaved_with_developer_messages() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "done"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("weather and time"),
@@ -2301,7 +2301,7 @@ async fn reasoning_with_developer_message_preserves_reasoning_content() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "5x^4"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("derivative of x^3?"),
@@ -2357,7 +2357,7 @@ async fn custom_tool_call_with_developer_message() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "result"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("run my script"),
@@ -2425,7 +2425,7 @@ async fn local_shell_call_in_history_with_developer_message() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("list files"),
@@ -2522,7 +2522,7 @@ async fn system_role_in_input_merged_with_instructions() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         ResponseItem::Message {
@@ -3023,6 +3023,73 @@ fn test_config() -> Config {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+    }
+}
+
+fn glm_roles_config() -> Config {
+    let mut config = test_config();
+    config.model_profiles.insert(
+        "glm-5.1".to_string(),
+        llmconduit::config::ModelProfile {
+            roles: Some(glm_roles()),
+            ..Default::default()
+        },
+    );
+    config
+}
+
+// GLM-5.2-style role shaping plus merge_adjacent:[system] so the leading system
+// block coalesces, reproducing the old hard-coded developer->system rename and
+// leading-system hoist these tests were written against.
+fn glm_roles() -> llmconduit::config::RolesConfig {
+    use llmconduit::config::{Action, RoleRule, RoleRuleSet, RolesConfig};
+    RolesConfig {
+        merge_adjacent: vec!["system".to_string()],
+        rules: std::collections::BTreeMap::from_iter([
+            (
+                "*".to_string(),
+                RoleRuleSet {
+                    rules: vec![RoleRule {
+                        action: Action::Reject,
+                        ..Default::default()
+                    }],
+                },
+            ),
+            (
+                "user".to_string(),
+                RoleRuleSet {
+                    rules: vec![RoleRule::default()],
+                },
+            ),
+            (
+                "assistant".to_string(),
+                RoleRuleSet {
+                    rules: vec![RoleRule::default()],
+                },
+            ),
+            (
+                "tool".to_string(),
+                RoleRuleSet {
+                    rules: vec![RoleRule::default()],
+                },
+            ),
+            (
+                "system".to_string(),
+                RoleRuleSet {
+                    rules: vec![RoleRule::default()],
+                },
+            ),
+            (
+                "developer".to_string(),
+                RoleRuleSet {
+                    rules: vec![RoleRule {
+                        action: Action::Rewrite,
+                        target_role: Some("system".to_string()),
+                        ..Default::default()
+                    }],
+                },
+            ),
+        ]),
     }
 }
 
@@ -4429,7 +4496,7 @@ async fn chat_completions_developer_messages_become_system_messages() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
@@ -4496,6 +4563,7 @@ async fn chat_completions_prepends_profile_system_prompt_prefix() {
         "glm-5.1".to_string(),
         llmconduit::config::ModelProfile {
             system_prompt_prefix: Some("Profile prefix.".to_string()),
+            roles: Some(glm_roles()),
             ..Default::default()
         },
     )]);
