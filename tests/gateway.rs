@@ -3093,6 +3093,401 @@ fn glm_roles() -> llmconduit::config::RolesConfig {
     }
 }
 
+fn roles_config_with(
+    merge_adjacent: &[&str],
+    rules: &[(&str, Vec<llmconduit::config::RoleRule>)],
+) -> Config {
+    let mut config = test_config();
+    config.model_profiles.insert(
+        "glm-5.1".to_string(),
+        llmconduit::config::ModelProfile {
+            roles: Some(llmconduit::config::RolesConfig {
+                merge_adjacent: merge_adjacent.iter().map(|s| s.to_string()).collect(),
+                rules: std::collections::BTreeMap::from_iter(
+                    rules.iter().map(|(role, list)| {
+                        (
+                            role.to_string(),
+                            llmconduit::config::RoleRuleSet { rules: list.clone() },
+                        )
+                    }),
+                ),
+            }),
+            ..Default::default()
+        },
+    );
+    config
+}
+
+fn role_accept() -> llmconduit::config::RoleRule {
+    llmconduit::config::RoleRule::default()
+}
+
+fn role_reject() -> llmconduit::config::RoleRule {
+    llmconduit::config::RoleRule {
+        action: llmconduit::config::Action::Reject,
+        ..Default::default()
+    }
+}
+
+fn role_drop() -> llmconduit::config::RoleRule {
+    llmconduit::config::RoleRule {
+        action: llmconduit::config::Action::Drop,
+        ..Default::default()
+    }
+}
+
+fn role_rewrite(target: &str) -> llmconduit::config::RoleRule {
+    llmconduit::config::RoleRule {
+        action: llmconduit::config::Action::Rewrite,
+        target_role: Some(target.to_string()),
+        ..Default::default()
+    }
+}
+
+fn role_rewrite_tagged(
+    target: &str,
+    tag: &str,
+    attrs: &[(&str, &str)],
+) -> llmconduit::config::RoleRule {
+    llmconduit::config::RoleRule {
+        action: llmconduit::config::Action::Rewrite,
+        target_role: Some(target.to_string()),
+        tag: Some(tag.to_string()),
+        tag_attributes: std::collections::BTreeMap::from_iter(
+            attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())),
+        ),
+        ..Default::default()
+    }
+}
+
+fn role_when_inline(mut rule: llmconduit::config::RoleRule) -> llmconduit::config::RoleRule {
+    rule.when = Some(llmconduit::config::When::Inline);
+    rule
+}
+
+fn role_when_leading(mut rule: llmconduit::config::RoleRule) -> llmconduit::config::RoleRule {
+    rule.when = Some(llmconduit::config::When::Leading);
+    rule
+}
+
+#[tokio::test]
+async fn roles_pass_through_when_no_config() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    // Empty profiles -> no roles config -> verbatim pass-through (the new default).
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let request = base_request(vec![
+        ResponseItem::message_text("developer", "instr"),
+        user_message("hi"),
+    ]);
+
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests[0].messages[0].role, "developer");
+    assert_eq!(
+        requests[0].messages[0]
+            .content
+            .as_ref()
+            .and_then(|v| v.as_str()),
+        Some("instr")
+    );
+    assert_eq!(requests[0].messages[1].role, "user");
+}
+
+#[tokio::test]
+async fn roles_reject_unmapped_role_when_star_rejects() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let config = roles_config_with(
+        &[],
+        &[("*", vec![role_reject()]), ("user", vec![role_accept()])],
+    );
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let request = base_request(vec![
+        ResponseItem::message_text("system", "sys"),
+        user_message("hi"),
+    ]);
+
+    let err = gateway
+        .stream_responses(request)
+        .await
+        .expect_err("unmapped system role should be rejected via *");
+    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(
+        err.message.contains("system"),
+        "error should name the rejected role: {}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn roles_rewrite_renames_role() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let config = roles_config_with(
+        &[],
+        &[
+            ("*", vec![role_reject()]),
+            ("user", vec![role_accept()]),
+            ("developer", vec![role_rewrite("system")]),
+        ],
+    );
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let request = base_request(vec![
+        ResponseItem::message_text("developer", "instr"),
+        user_message("hi"),
+    ]);
+
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests[0].messages[0].role, "system");
+    assert_eq!(
+        requests[0].messages[0]
+            .content
+            .as_ref()
+            .and_then(|v| v.as_str()),
+        Some("instr")
+    );
+    assert_eq!(requests[0].messages[1].role, "user");
+}
+
+#[tokio::test]
+async fn roles_drop_removes_matching_messages() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let config = roles_config_with(
+        &[],
+        &[
+            ("*", vec![role_reject()]),
+            ("user", vec![role_accept()]),
+            ("system", vec![role_drop()]),
+        ],
+    );
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let request = base_request(vec![
+        ResponseItem::message_text("system", "drop me"),
+        user_message("hi"),
+    ]);
+
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    let roles: Vec<&str> = requests[0]
+        .messages
+        .iter()
+        .map(|m| m.role.as_str())
+        .collect();
+    assert_eq!(roles, vec!["user"]);
+}
+
+#[tokio::test]
+async fn roles_tag_wraps_content_with_escaped_attributes() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    // tag_attributes: z and a (to prove alphabetical render), with & " < to prove escaping.
+    let config = roles_config_with(
+        &[],
+        &[
+            ("*", vec![role_reject()]),
+            ("user", vec![role_accept()]),
+            (
+                "developer",
+                vec![role_rewrite_tagged("system", "dev", &[("z", "1&2"), ("a", "x\"<y")])],
+            ),
+        ],
+    );
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let request = base_request(vec![
+        ResponseItem::message_text("developer", "instr"),
+        user_message("hi"),
+    ]);
+
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    let msg = &requests[0].messages[0];
+    assert_eq!(msg.role, "system");
+    let content = msg.content.as_ref().and_then(|v| v.as_str()).unwrap();
+    assert!(content.starts_with("<dev "), "content: {content}");
+    assert!(content.contains("a=\"x&quot;&lt;y\""), "a attr escaped+sorted: {content}");
+    assert!(content.contains("z=\"1&amp;2\""), "z attr escaped: {content}");
+    assert!(content.ends_with("instr</dev>"), "content: {content}");
+}
+
+#[tokio::test]
+async fn roles_merge_adjacent_user_run_after_rewrite() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let config = roles_config_with(
+        &["user"],
+        &[
+            ("*", vec![role_reject()]),
+            ("assistant", vec![role_accept()]),
+            ("system", vec![role_rewrite("user")]),
+            ("tool", vec![role_rewrite("user")]),
+            ("user", vec![role_accept()]),
+        ],
+    );
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let request = base_request(vec![
+        ResponseItem::message_text("system", "sys"),
+        ResponseItem::FunctionCallOutput {
+            call_id: "c1".to_string(),
+            output: serde_json::Value::String("toolout".to_string()),
+        },
+        user_message("hi"),
+    ]);
+
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    let roles: Vec<&str> = requests[0]
+        .messages
+        .iter()
+        .map(|m| m.role.as_str())
+        .collect();
+    // system->user, tool->user, user: the adjacent user run collapses to one user message.
+    assert_eq!(roles, vec!["user"]);
+    let content = requests[0].messages[0]
+        .content
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert!(content.contains("sys"), "content: {content}");
+    assert!(content.contains("hi"), "content: {content}");
+}
+
+#[tokio::test]
+async fn roles_merge_adjacent_preserves_unmerged_roles() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let config = roles_config_with(
+        &["user"],
+        &[
+            ("*", vec![role_reject()]),
+            ("assistant", vec![role_accept()]),
+            ("system", vec![role_rewrite("user")]),
+            ("tool", vec![role_accept()]),
+            ("user", vec![role_accept()]),
+        ],
+    );
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let request = base_request(vec![
+        ResponseItem::message_text("system", "sys"),
+        user_message("hi"),
+        ResponseItem::FunctionCallOutput {
+            call_id: "c1".to_string(),
+            output: serde_json::Value::String("toolout".to_string()),
+        },
+    ]);
+
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    let roles: Vec<&str> = requests[0]
+        .messages
+        .iter()
+        .map(|m| m.role.as_str())
+        .collect();
+    // system->user merges with the following user; tool is not in merge_adjacent, stays tool.
+    assert_eq!(roles, vec!["user", "tool"]);
+}
+
+#[tokio::test]
+async fn roles_when_inline_rewrites_only_inline_system() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let config = roles_config_with(
+        &[],
+        &[
+            ("*", vec![role_reject()]),
+            ("user", vec![role_accept()]),
+            ("assistant", vec![role_accept()]),
+            (
+                "system",
+                vec![role_when_inline(role_rewrite("user")), role_accept()],
+            ),
+        ],
+    );
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let request = base_request(vec![
+        ResponseItem::message_text("system", "leading"),
+        user_message("hi"),
+        ResponseItem::message_text("system", "inline"),
+        user_message("bye"),
+    ]);
+
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    let roles: Vec<&str> = requests[0]
+        .messages
+        .iter()
+        .map(|m| m.role.as_str())
+        .collect();
+    // index-0 system stays system (leading); the inline system rewrites to user.
+    assert_eq!(roles, vec!["system", "user", "user", "user"]);
+}
+
+#[tokio::test]
+async fn roles_reject_when_no_rule_matches_position() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let config = roles_config_with(
+        &[],
+        &[
+            ("*", vec![role_reject()]),
+            ("user", vec![role_accept()]),
+            ("system", vec![role_when_leading(role_accept())]),
+        ],
+    );
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+
+    let request = base_request(vec![
+        user_message("hi"),
+        ResponseItem::message_text("system", "inline"),
+    ]);
+
+    let err = gateway
+        .stream_responses(request)
+        .await
+        .expect_err("inline system with only a leading rule should be rejected");
+    assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+    assert!(
+        err.message.contains("system"),
+        "error should name the role: {}",
+        err.message
+    );
+}
+
 fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
     ResponsesRequest {
         model: "glm-5.1".to_string(),
