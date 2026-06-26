@@ -2543,23 +2543,7 @@ async fn response_completed_carries_matched_stop_sequence() {
     upstream
         .push_response(vec![
             Ok(content_chunk("chat-1", "hello")),
-            Ok(ChatCompletionChunk {
-                id: "chat-1".to_string(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        content: None,
-                        reasoning_content: None,
-                        tool_calls: None,
-                        function_call: None,
-                        refusal: None,
-                        extra: Default::default(),
-                    },
-                    finish_reason: Some("stop".to_string()),
-                    stop_reason: Some(json!("</block>")),
-                }],
-                usage: None,
-            }),
+            Ok(stop_sequence_chunk("chat-1", "</block>")),
         ])
         .await;
     let gateway = test_gateway(upstream, MockSearch::default());
@@ -3064,6 +3048,26 @@ fn tool_call_chunk(id: &str, call_id: &str, name: &str, arguments: &str) -> Chat
             },
             finish_reason: Some("tool_calls".to_string()),
             stop_reason: None,
+        }],
+        usage: None,
+    }
+}
+
+fn stop_sequence_chunk(id: &str, stop: &str) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatDelta {
+                content: None,
+                reasoning_content: None,
+                tool_calls: None,
+                function_call: None,
+                refusal: None,
+                extra: Default::default(),
+            },
+            finish_reason: Some("stop".to_string()),
+            stop_reason: Some(json!(stop)),
         }],
         usage: None,
     }
@@ -4534,23 +4538,7 @@ async fn anthropic_messages_surfaces_stop_sequence_reason_when_stop_string_match
     upstream
         .push_response(vec![
             Ok(content_chunk("chat-1", "Hello")),
-            Ok(ChatCompletionChunk {
-                id: "chat-1".to_string(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        content: None,
-                        reasoning_content: None,
-                        tool_calls: None,
-                        function_call: None,
-                        refusal: None,
-                        extra: Default::default(),
-                    },
-                    finish_reason: Some("stop".to_string()),
-                    stop_reason: Some(json!("</block>")),
-                }],
-                usage: None,
-            }),
+            Ok(stop_sequence_chunk("chat-1", "</block>")),
         ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
@@ -5112,23 +5100,7 @@ async fn anthropic_messages_non_streaming_surfaces_stop_sequence_reason() {
     upstream
         .push_response(vec![
             Ok(content_chunk("chat-1", "Hello")),
-            Ok(ChatCompletionChunk {
-                id: "chat-1".to_string(),
-                choices: vec![ChatChunkChoice {
-                    index: 0,
-                    delta: ChatDelta {
-                        content: None,
-                        reasoning_content: None,
-                        tool_calls: None,
-                        function_call: None,
-                        refusal: None,
-                        extra: Default::default(),
-                    },
-                    finish_reason: Some("stop".to_string()),
-                    stop_reason: Some(json!("</block>")),
-                }],
-                usage: None,
-            }),
+            Ok(stop_sequence_chunk("chat-1", "</block>")),
         ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());

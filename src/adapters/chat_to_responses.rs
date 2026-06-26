@@ -177,10 +177,10 @@ impl StreamState {
             // vLLM's `stop_reason` carries the matched stop token: a string when
             // a stop string fired, an integer token id (incl. EOS) otherwise.
             // Only a string is a real stop-sequence match we can surface.
-            if let Some(Value::String(stop)) = &choice.stop_reason {
-                if !stop.is_empty() {
-                    self.stop_sequence = Some(stop.clone());
-                }
+            if let Some(Value::String(stop)) = &choice.stop_reason
+                && !stop.is_empty()
+            {
+                self.stop_sequence = Some(stop.clone());
             }
             if let Some(tool_calls) = &choice.delta.tool_calls {
                 for tool_call in tool_calls {
