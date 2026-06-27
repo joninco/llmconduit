@@ -791,16 +791,30 @@ impl Config {
     /// Resolve reasoning shaping with the same request/resolved-model precedence
     /// used for other per-profile request settings.
     pub fn resolve_reasoning_config(&self, request_model: &str) -> Option<&ReasoningConfig> {
-        let resolved_model = self.resolve_upstream_model(request_model);
-        self.model_profiles_for_resolved_model(request_model, &resolved_model)
+        let upstream_model = self.resolve_upstream_model(request_model);
+        self.resolve_reasoning_config_for_resolved_model(request_model, &upstream_model)
+    }
+
+    /// Like `resolve_reasoning_config` but takes the already-resolved backend id
+    /// (the normalized model the generation and token-count paths use for
+    /// `upstream_chat_kwargs` and the system-prompt prefix) so reasoning profile
+    /// matching sees the same id those paths use, instead of re-resolving it here.
+    pub fn resolve_reasoning_config_for_resolved_model(
+        &self,
+        request_model: &str,
+        resolved_model: &str,
+    ) -> Option<&ReasoningConfig> {
+        self.model_profiles_for_resolved_model(request_model, resolved_model)
             .into_iter()
             .rev()
             .find_map(|profile| profile.reasoning_effort.as_ref())
     }
 
-    /// Collect profiles matching the request model chain. `resolved_model` must be
-    /// `resolve_upstream_model(request_model)` (callers pass the already-resolved upstream
-    /// id); it is not re-resolved here. The resolved/upstream model is tried first, then the
+    /// Collect profiles matching the request model chain. `resolved_model` is the
+    /// already-resolved backend id callers pass in (the normalized model used for
+    /// `upstream_chat_kwargs` and the prefix, or `resolve_upstream_model(request_model)`
+    /// when no catalog normalization applies); it is not re-resolved here. The resolved
+    /// model is tried first, then the
     /// request model itself, with pointer-dedup to keep the precedence order stable. The
     /// reserved `*` profile is a pure fallback: it is included only when no specific profile
     /// matches, so an explicit match never inherits unset fields from `*` (use profile
@@ -2603,5 +2617,25 @@ model_profiles:
                 .resolve_capabilities_for_upstream("glm-5.2")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn resolve_reasoning_config_for_resolved_model_uses_resolved_id() {
+        // The resolved backend id can differ from `resolve_upstream_model(request_model)`
+        // when the upstream catalog canonicalizes the name. A profile keyed by that
+        // resolved id must still drive reasoning selection, matching how
+        // `upstream_chat_kwargs` and the prefix resolve profiles off the normalized id.
+        let config = persisted_with_profiles(json!({
+            "model_profiles": {
+                "glm-5.2": {},
+                "glm-5.2-canonical": {"reasoning_effort": {"default": "low"}}
+            }
+        }));
+        let rc = config
+            .resolve_reasoning_config_for_resolved_model("glm-5.2", "glm-5.2-canonical")
+            .expect("reasoning");
+        assert_eq!(rc.default.as_deref(), Some("low"));
+        // Without the resolved id, the wrapper only sees `glm-5.2` (no reasoning block).
+        assert!(config.resolve_reasoning_config("glm-5.2").is_none());
     }
 }

@@ -382,7 +382,9 @@ impl Gateway {
                 );
             }
         }
-        let reasoning_config = self.config.resolve_reasoning_config(&tail_request.model);
+        let reasoning_config = self
+            .config
+            .resolve_reasoning_config_for_resolved_model(&tail_request.model, &resolved_model);
         let lowered = lower_request_with_reasoning_config(
             &tail_request,
             baseline_record
