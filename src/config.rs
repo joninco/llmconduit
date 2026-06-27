@@ -811,21 +811,21 @@ impl Config {
     }
 
     /// Collect profiles matching the request model chain. `resolved_model` is the
-    /// already-resolved backend id callers pass in (the normalized model used for
-    /// `upstream_chat_kwargs` and the prefix, or `resolve_upstream_model(request_model)`
-    /// when no catalog normalization applies); it is not re-resolved here. The resolved
-    /// model is tried first, then the
-    /// request model itself, with pointer-dedup to keep the precedence order stable. The
-    /// reserved `*` profile is a pure fallback: it is included only when no specific profile
-    /// matches, so an explicit match never inherits unset fields from `*` (use profile
+    /// catalog-normalized backend id. The pre-normalization upstream alias is also
+    /// tried because a profile may be keyed by that alias before normalization
+    /// collapses it to the backend id. Lookup order is [resolved, alias, request],
+    /// with pointer-dedup to keep precedence stable. The reserved `*` profile is a
+    /// pure fallback: it is included only when no specific profile matches, so an
+    /// explicit match never inherits unset fields from `*` (use profile
     /// templates to share fields between explicit profiles).
     fn model_profiles_for_resolved_model(
         &self,
         request_model: &str,
         resolved_model: &str,
     ) -> Vec<&ModelProfile> {
+        let upstream_alias = self.resolve_upstream_model(request_model);
         let mut profiles: Vec<&ModelProfile> = Vec::new();
-        for model in [resolved_model, request_model] {
+        for model in [resolved_model, upstream_alias.as_str(), request_model] {
             if let Some(profile) = self.model_profile(model)
                 && !profiles
                     .iter()
