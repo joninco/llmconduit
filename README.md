@@ -246,12 +246,15 @@ model_profiles:
         medium: high
         xhigh: max
 ```
-`parallel_tool_calls` is a typed default: when a client omits it, the profile
-default applies, and an explicit client value always wins. The Anthropic
-(`/v1/messages`) route has no client field for it, so the profile default is the
-only way to control it there. Setting it to `true` (as on `GLM-5.2` above) lets
-Claude Code fan out independent tool calls in one turn; setting it to `false`
-forces sequential calls for a model that mishandles parallel tool use.
+`parallel_tool_calls` is a typed default: when a client omits it, the resolved
+`upstream_chat_kwargs.parallel_tool_calls` default applies, and an explicit
+client value always wins. The default is the global `upstream_chat_kwargs`
+deep-merged with the matching profile, so a profile value overrides the global
+one. The Anthropic (`/v1/messages`) route has no client field for it, so that
+resolved default is the only way to control it there. Setting it to `true` (as
+on `GLM-5.2` above) lets Claude Code fan out independent tool calls in one turn;
+setting it to `false` forces sequential calls for a model that mishandles
+parallel tool use.
 
 Optional Brave Search:
 
