@@ -131,7 +131,14 @@ fn build_upstream_extra_body(
     request: &ResponsesRequest,
     thinking_kwarg: Option<(String, Value)>,
 ) -> BTreeMap<String, Value> {
-    let mut extra_body: BTreeMap<String, Value> = defaults.into_iter().collect();
+    // Defaults come from config `upstream_chat_kwargs` and bypass `extract_typed_defaults`,
+    // which only pulls the typed aliases, so a reserved key like `thinking` survives here. Filter
+    // it the same way as `request.extra_body` below to keep the named ChatCompletionRequest fields
+    // the single source of truth and avoid a duplicate upstream key.
+    let mut extra_body: BTreeMap<String, Value> = defaults
+        .into_iter()
+        .filter(|(key, _)| !is_reserved_upstream_key(key))
+        .collect();
     for (key, value) in &request.extra_body {
         // Reserved keys are serialized from the named ChatCompletionRequest fields
         // (resolved in run_turn). Merging them from the client's extra_body would
@@ -2056,6 +2063,63 @@ mod tests {
                 ..
             } if call_id == "search"
         ));
+    }
+
+    use super::build_upstream_extra_body;
+    use crate::models::responses::ResponsesRequest;
+
+    fn base_responses_request() -> ResponsesRequest {
+        ResponsesRequest {
+            model: "test".to_string(),
+            instructions: String::new(),
+            input: vec![],
+            tools: vec![],
+            tool_choice: serde_json::Value::String("auto".to_string()),
+            parallel_tool_calls: None,
+            reasoning: None,
+            store: false,
+            stream: true,
+            include: vec![],
+            service_tier: None,
+            prompt_cache_key: None,
+            text: None,
+            client_metadata: None,
+            previous_response_id: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            truncation: None,
+            metadata: None,
+            stop: None,
+            extra_body: Default::default(),
+        }
+    }
+
+    #[test]
+    fn build_upstream_extra_body_drops_reserved_defaults() {
+        // A reserved key like `thinking` slipped through `extract_typed_defaults` (it has no typed
+        // counterpart) and must not reach the upstream from config `upstream_chat_kwargs`.
+        let mut defaults = serde_json::Map::new();
+        defaults.insert("thinking".to_string(), json!({ "enabled": true }));
+        defaults.insert(
+            "chat_template_kwargs".to_string(),
+            json!({ "enable_thinking": false }),
+        );
+
+        let request = base_responses_request();
+        let extra_body = build_upstream_extra_body(defaults, &request);
+
+        assert!(
+            !extra_body.contains_key("thinking"),
+            "reserved `thinking` default must not leak to the upstream extra_body"
+        );
+        assert_eq!(
+            extra_body.get("chat_template_kwargs"),
+            Some(&json!({ "enable_thinking": false })),
+            "non-reserved defaults must be preserved"
+        );
     }
 
     use super::AccumulatedUsage;
