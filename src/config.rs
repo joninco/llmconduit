@@ -1004,8 +1004,12 @@ impl Config {
         request_model: &str,
         resolved_model: &str,
     ) -> Option<&RolesConfig> {
+        // Profiles are ordered [resolved, request]; scan in reverse so the
+        // request-model profile's `roles` overrides the resolved/upstream one,
+        // matching the merge precedence used for `upstream_chat_kwargs`.
         self.model_profiles_for_resolved_model(request_model, resolved_model)
             .into_iter()
+            .rev()
             .find_map(|profile| profile.roles.as_ref())
     }
 
