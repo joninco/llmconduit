@@ -292,7 +292,8 @@ coalesces each maximal run of consecutive messages that share a final role in
 the list into one content-only message joined with `\n\n`. There is no
 inline/leading distinction at this level - it only looks at the role messages
 end up as and whether they are adjacent. Folding system and tool into `user` is
-`rewrite` to `user` plus `merge_adjacent: [user]`, which preserves order.
+`rewrite` to `user` plus `merge_adjacent: [user]`, which coalesces the
+resulting adjacent user messages into one while keeping their relative order.
 
 Resolution order for a message: the explicit role key, then the `*` wildcard,
 then fail-closed `reject`.
@@ -311,8 +312,9 @@ model_profiles:
       developer: { action: rewrite, target_role: system }
 
   # System-FIRST only (Qwen3.5 raises on a non-first system message). An INLINE
-  # system/developer message is rewritten to `user` in place; the index-0
-  # message stays system, so Qwen never sees a non-first system.
+  # system or developer message is rewritten to `user` in place; the index-0
+  # system message stays system and a leading developer message is rewritten to
+  # system, so Qwen never sees a non-first system.
   Qwen3.5:
     roles:
       "*":       { action: reject }
