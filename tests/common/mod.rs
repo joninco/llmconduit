@@ -473,6 +473,7 @@ pub fn test_config() -> Config {
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
+        max_request_body_bytes: 10 * 1024 * 1024,
         image_agent_enabled: false,
         vision_url: None,
         vision_model: None,

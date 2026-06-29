@@ -60,6 +60,12 @@ pub struct Config {
     /// before unbounded accumulation. The inbound-request-body cap in `http.rs`
     /// does NOT cover this response-read path.
     pub max_sse_frame_bytes: usize,
+    /// Maximum inbound HTTP request body size in bytes, applied as axum's
+    /// `DefaultBodyLimit`. A request whose JSON body exceeds this is rejected
+    /// with HTTP 413 before model resolution or any upstream call. Defaults to
+    /// 10 MiB (raise for very large prompts). Distinct from `max_sse_frame_bytes`,
+    /// which bounds the UPSTREAM response read path, not the inbound request.
+    pub max_request_body_bytes: usize,
     /// Master switch for the G4 image agent (vision offload). When `false` the
     /// strip/cache seam and `analyzeImage` tool injection are skipped entirely
     /// and images flow to the upstream unchanged.
@@ -492,6 +498,10 @@ pub struct PersistedConfig {
     /// unterminated frame is rejected before unbounded buffer growth.
     #[serde(default = "default_max_sse_frame_bytes")]
     pub max_sse_frame_bytes: usize,
+    /// Maximum inbound HTTP request body size in bytes (axum `DefaultBodyLimit`).
+    /// Bodies larger than this are rejected with HTTP 413. Defaults to 10 MiB.
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
     /// Master switch for the G4 image agent (vision offload). Off by default so
     /// the gateway's text-first design is preserved unless explicitly opted in.
     #[serde(default)]
@@ -564,6 +574,12 @@ fn default_max_sse_frame_bytes() -> usize {
     crate::sse_guard::DEFAULT_MAX_SSE_FRAME_BYTES
 }
 
+/// Default inbound request-body cap: 10 MiB. Generous enough for very long
+/// prompts and multi-message conversations while bounding per-request memory.
+fn default_max_request_body_bytes() -> usize {
+    10 * 1024 * 1024
+}
+
 /// Default per-session image-cache capacity (G4). Generous enough for a normal
 /// multi-image turn while bounding memory.
 fn default_image_cache_max_size() -> usize {
@@ -604,6 +620,7 @@ impl Default for PersistedConfig {
             debug_log_max_age_hours: None,
             min_completion_tokens: default_min_completion_tokens(),
             max_sse_frame_bytes: default_max_sse_frame_bytes(),
+            max_request_body_bytes: default_max_request_body_bytes(),
             image_agent_enabled: false,
             vision_url: None,
             vision_model: None,
@@ -786,6 +803,9 @@ impl Config {
             // Floor at 1 KiB so a misconfigured tiny/zero cap cannot reject every
             // normal frame; the default is far larger.
             max_sse_frame_bytes: config.max_sse_frame_bytes.max(1024),
+            // Floor at 1 KiB so a misconfigured tiny/zero cap cannot reject every
+            // request; the default (10 MiB) is far larger.
+            max_request_body_bytes: config.max_request_body_bytes.max(1024),
             image_agent_enabled: config.image_agent_enabled,
             vision_url,
             vision_model: trim_nonempty(config.vision_model.as_deref()),
@@ -1508,6 +1528,12 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.max_sse_frame_bytes = parsed;
     }
+    if let Ok(value) = env::var("LLMCONDUIT_MAX_REQUEST_BODY_BYTES")
+        && let Ok(parsed) = value.trim().parse::<usize>()
+        && parsed >= 1
+    {
+        config.max_request_body_bytes = parsed;
+    }
     if let Ok(value) = env::var("LLMCONDUIT_IMAGE_AGENT_ENABLED")
         && let Ok(parsed) = value.trim().parse::<bool>()
     {
@@ -2043,6 +2069,7 @@ model_profiles:
             debug_log_max_age_hours: Some(48),
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            max_request_body_bytes: 10 * 1024 * 1024,
             image_agent_enabled: false,
             vision_url: None,
             vision_model: None,
@@ -2110,6 +2137,7 @@ model_profiles:
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            max_request_body_bytes: 10 * 1024 * 1024,
             image_agent_enabled: false,
             vision_url: None,
             vision_model: None,
@@ -2285,6 +2313,7 @@ model_profiles:
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            max_request_body_bytes: 10 * 1024 * 1024,
             image_agent_enabled: false,
             vision_url: None,
             vision_model: None,
@@ -2356,6 +2385,7 @@ model_profiles:
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            max_request_body_bytes: 10 * 1024 * 1024,
             image_agent_enabled: false,
             vision_url: None,
             vision_model: None,
@@ -2457,6 +2487,7 @@ model_profiles:
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            max_request_body_bytes: 10 * 1024 * 1024,
             image_agent_enabled: false,
             vision_url: None,
             vision_model: None,
@@ -2558,6 +2589,7 @@ model_profiles:
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            max_request_body_bytes: 10 * 1024 * 1024,
             image_agent_enabled: false,
             vision_url: None,
             vision_model: None,
@@ -2950,6 +2982,7 @@ model_profiles:
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            max_request_body_bytes: 10 * 1024 * 1024,
             image_agent_enabled: false,
             vision_url: None,
             vision_model: None,
@@ -3007,6 +3040,7 @@ model_profiles:
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
+            max_request_body_bytes: 10 * 1024 * 1024,
             image_agent_enabled: false,
             vision_url: None,
             vision_model: None,

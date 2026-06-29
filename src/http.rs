@@ -20,6 +20,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::body::to_bytes;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::Query;
 use axum::extract::Request;
 use axum::extract::State;
@@ -50,7 +51,6 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-const API_LOG_BODY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 const API_LOG_PAYLOAD_DUMP_LIMIT_BYTES: usize = 16 * 1024;
 const API_LOG_PREVIEW_CHARS: usize = 160;
 const UNKNOWN_MODEL_CREATED_AT: &str = "1970-01-01T00:00:00Z";
@@ -61,6 +61,11 @@ pub struct RouterOptions {
 }
 
 pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
+    // Read before `gateway` is moved into `.with_state(...)` below. Replaces
+    // axum's stock 2 MiB `DefaultBodyLimit` with the configured cap (default
+    // 10 MiB) so oversized inbound bodies are the operator's choice, not a
+    // silent framework default.
+    let max_request_body_bytes = gateway.config().max_request_body_bytes;
     let router = Router::new()
         .route("/v1/responses", post(post_responses))
         .route("/v1/messages", post(post_messages))
@@ -82,21 +87,109 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
 
     router
         .fallback(api_not_found)
-        .layer(middleware::from_fn(log_api_call))
+        // `log_api_call` enforces the inbound body cap as a HARD memory bound for
+        // EVERY route (Content-Length precheck + capped buffered read), so an
+        // oversized upload is rejected with 413 before it can be buffered. The
+        // `DefaultBodyLimit` makes the POST handlers' JSON/Bytes extractors agree
+        // on that same ceiling instead of axum's stock 2 MiB default. Both read
+        // the single configured value — there is no second, larger hidden limit.
+        .layer(middleware::from_fn_with_state(
+            max_request_body_bytes,
+            log_api_call,
+        ))
+        .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .with_state(gateway)
 }
 
-async fn log_api_call(request: Request, next: Next) -> Response {
+/// Parse the inbound `Content-Length` as a byte count, if present and valid.
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// 413 response for an inbound body that exceeds `limit_bytes`.
+fn payload_too_large(limit_bytes: usize) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        format!("request body exceeds the {limit_bytes}-byte limit"),
+    )
+        .into_response()
+}
+
+/// True when an `axum::body::to_bytes` error is an over-cap length-limit
+/// rejection (the inbound body exceeded the configured byte cap), as opposed to
+/// a truncated or otherwise broken stream. `to_bytes` collects the body through
+/// `http_body_util::Limited`, which surfaces a `LengthLimitError` in the error
+/// source chain on overflow — so the classification is exact and does not depend
+/// on whether a `Content-Length` was sent.
+fn is_length_limit_error(err: &axum::Error) -> bool {
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        if cause.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
+}
+
+async fn log_api_call(
+    State(max_request_body_bytes): State<usize>,
+    request: Request,
+    next: Next,
+) -> Response {
     let api_call_id = format!("api_{}", Uuid::new_v4().simple());
     let method = request.method().clone();
     let uri = request.uri().clone();
     let headers = request.headers().clone();
     let started_at = Instant::now();
 
+    // Reject before buffering when the declared Content-Length already exceeds
+    // the inbound cap: a hostile multi-hundred-MiB upload is refused with 413
+    // without reading a byte. `DefaultBodyLimit` (checked later by the JSON
+    // extractor) cannot bound memory here because this middleware buffers the
+    // whole body for logging FIRST — so the cap is also enforced at the read
+    // below for bodies that arrive without a (trustworthy) Content-Length.
+    let declared_length = content_length(&headers);
+    if let Some(declared) = declared_length
+        && declared > max_request_body_bytes as u64
+    {
+        tracing::warn!(
+            api_call_id = %api_call_id,
+            method = %method,
+            path = %uri.path(),
+            content_length = declared,
+            limit_bytes = max_request_body_bytes,
+            "rejected oversized inbound API request: Content-Length over limit"
+        );
+        return payload_too_large(max_request_body_bytes);
+    }
+
     let (parts, body) = request.into_parts();
-    let body_bytes = match to_bytes(body, API_LOG_BODY_LIMIT_BYTES).await {
+    // Cap the buffered read at the CONFIGURED limit (not a fixed ceiling) so a
+    // chunked / length-less body cannot grow memory past the cap. An over-cap
+    // body surfaces a `LengthLimitError` -> 413 oversize; any other read failure
+    // (truncated / broken stream) -> 400. The classification is exact, so it is
+    // correct even for length-less bodies that lacked the Content-Length precheck.
+    let body_bytes = match to_bytes(body, max_request_body_bytes).await {
         Ok(bytes) => bytes,
         Err(err) => {
+            if is_length_limit_error(&err) {
+                tracing::warn!(
+                    api_call_id = %api_call_id,
+                    method = %method,
+                    path = %uri.path(),
+                    limit_bytes = max_request_body_bytes,
+                    error = %err,
+                    "rejected inbound API request: body exceeded limit"
+                );
+                return payload_too_large(max_request_body_bytes);
+            }
             tracing::warn!(
                 api_call_id = %api_call_id,
                 method = %method,

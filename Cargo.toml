@@ -15,6 +15,10 @@ eventsource-stream = "0.2"
 futures = "0.3"
 hex = "0.4"
 http = "1"
+# `LengthLimitError` (re-exported by axum's `to_bytes`) so `http.rs` can tell an
+# over-cap inbound body (413) from a truncated/broken stream (400). Already in
+# the graph via axum; a normal (not dev) dep because it is used in `src/`.
+http-body-util = "0.1"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["charset", "http2", "json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
@@ -36,7 +40,6 @@ url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
-http-body-util = "0.1"
 pretty_assertions = "1"
 # `test-util` enables tokio's paused-clock test controls (`pause`/`advance`,
 # `#[tokio::test(start_paused = true)]`) used to deterministically exercise the

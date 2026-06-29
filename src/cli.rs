@@ -193,6 +193,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         debug_log_max_age_hours: existing.debug_log_max_age_hours,
         min_completion_tokens: existing.min_completion_tokens,
         max_sse_frame_bytes: existing.max_sse_frame_bytes,
+        max_request_body_bytes: existing.max_request_body_bytes,
         image_agent_enabled: existing.image_agent_enabled,
         vision_url: existing.vision_url.clone(),
         vision_model: existing.vision_model.clone(),
