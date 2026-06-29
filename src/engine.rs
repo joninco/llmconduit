@@ -1215,6 +1215,11 @@ impl Gateway {
         }
 
         let usage = accumulated_usage.into_response_usage();
+        // Snapshot the upstream-reported output token total for the debug UI
+        // before `usage` moves into the response resource. None when the
+        // upstream never sent a usage chunk (total_tokens == 0), which is the
+        // gate for showing a post-completion tokens/sec figure.
+        let final_output_tokens = usage.as_ref().map(|u| u.output_tokens);
         let is_incomplete = last_finish_reason.as_deref() == Some("length");
         let resource = ResponseResource {
             id: response_id.clone(),
@@ -1267,7 +1272,8 @@ impl Gateway {
             )
             .await?;
         }
-        self.monitor.emit(response_id, MonitorEventKind::Completed);
+        self.monitor
+            .emit(response_id, MonitorEventKind::Completed { output_tokens: final_output_tokens });
         Ok(())
     }
 

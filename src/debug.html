@@ -815,6 +815,67 @@
     return seconds < 10 ? `${seconds.toFixed(1)}s` : `${Math.round(seconds)}s`;
   };
 
+  // Reused for the live token estimate so we don't allocate an encoder on
+  // every segment append.
+  const _tokBytesEncoder = new TextEncoder();
+  // Mirrors ESTIMATED_OUTPUT_TOKEN_BYTES in adapters/responses_to_anthropic.rs.
+  // Upstream sends real output_tokens only on the final chunk, so mid-stream we
+  // estimate from generated text bytes with the same heuristic clients see.
+  const ESTIMATED_TOKEN_BYTES = 4;
+
+  // Generation window excludes prefill: from the first output/reasoning token
+  // to completion (or now, while streaming). Captured in the store on the first
+  // such segment because coalescing overwrites segment.timestamp_ms with the
+  // latest chunk's time.
+  const genDurationMs = (request) => {
+    const start = Number(request.first_gen_at_ms || 0);
+    if (!start) return 0;
+    const end = Number(request.completed_at_ms || Date.now());
+    return Math.max(0, end - start);
+  };
+
+  const estimatedOutputTokens = (request) => {
+    const segs = request.segments || [];
+    let bytes = 0;
+    // output + reasoning only: tool segments also carry annotation headers and
+    // phase lines that aren't generated tokens. The real total arrives at
+    // completion via output_tokens, so this is only the live placeholder.
+    for (const s of segs) {
+      if (s.kind === "output" || s.kind === "reasoning") {
+        bytes += _tokBytesEncoder.encode(s.text || "").length;
+      }
+    }
+    return Math.ceil(bytes / ESTIMATED_TOKEN_BYTES);
+  };
+
+  // Returns { value, estimate } or null. Measured value (estimate: false) only
+  // after completion when upstream reported output_tokens; otherwise a live
+  // byte-based estimate. Caller formats the ~ prefix.
+  const genSpeed = (request) => {
+    const durMs = genDurationMs(request);
+    if (!durMs) return null;
+    const seconds = durMs / 1000;
+    const status = request.status || "running";
+    if (status === "completed") {
+      const out = Number(request.stats?.output_tokens || 0);
+      if (out > 0) return { value: out / seconds, estimate: false };
+      return null;
+    }
+    // Live estimate only while streaming; failed requests never show a figure.
+    if (status !== "running") return null;
+    const est = estimatedOutputTokens(request);
+    if (est <= 0) return null;
+    return { value: est / seconds, estimate: true };
+  };
+
+  const formatTokPerSec = (request) => {
+    const speed = genSpeed(request);
+    if (!speed) return "";
+    const rounded = Math.round(speed.value);
+    if (!rounded) return "";
+    return `${speed.estimate ? "~" : ""}${rounded} tok/s`;
+  };
+
   const formatBytes = (value) => {
     const bytes = Number(value || 0);
     if (!bytes) return "unknown size";
@@ -1072,6 +1133,12 @@
           const id = message.response_id;
           const request = this.ensureRequest(id);
           request.updated_at_ms = message.segment.timestamp_ms || Date.now();
+          if (
+            !request.first_gen_at_ms &&
+            (message.segment.kind === "output" || message.segment.kind === "reasoning")
+          ) {
+            request.first_gen_at_ms = message.segment.timestamp_ms || Date.now();
+          }
           const last = request.segments[request.segments.length - 1];
           if (last && last.kind === message.segment.kind) {
             last.text += message.segment.text;
@@ -1103,6 +1170,8 @@
           request.completed_at_ms = message.completed_at_ms;
           request.updated_at_ms = message.completed_at_ms || Date.now();
           request.error = message.error;
+          request.stats = request.stats || {};
+          request.stats.output_tokens = message.output_tokens ?? null;
           if (this._snapshotLoading) return;
           this._emit("list-changed");
           this._emit("request-changed", { id });
@@ -1319,7 +1388,8 @@
       this._setText("tools", `${formatCount(request.stats?.tool_count)} tools`);
       this._setText("chars", `${formatCount(request.stats?.input_chars)} chars`);
       this._setText("started", formatTime(request.started_at_ms));
-      this._setText("duration", formatDuration(request));
+      const _tps = formatTokPerSec(request);
+      this._setText("duration", _tps ? `${formatDuration(request)} · ${_tps}` : formatDuration(request));
       this._setText("events", `${formatCount(request.events?.length)} events`);
     }
 
@@ -1861,7 +1931,8 @@
       const start = Number(request.started_at_ms || 0);
       const end = Number(request.completed_at_ms || Date.now());
       const seconds = start ? Math.max(0, (end - start) / 1000) : 0;
-      const mainText = `${id} · ${model}${temp} · ${seconds.toFixed(1)}s`;
+      const _tps = formatTokPerSec(request);
+      const mainText = `${id} · ${model}${temp} · ${seconds.toFixed(1)}s${_tps ? ` · ${_tps}` : ""}`;
 
       let lingerText = "";
       if (status !== "running" && request.completed_at_ms) {
@@ -2273,9 +2344,10 @@
 
     _renderHead(request) {
       const status = request.status || "running";
+      const _tps = formatTokPerSec(request);
       this._head.innerHTML = `
           <div class="title-row">
-            <div class="title">${escapeHtml(formatTime(request.started_at_ms))} ${escapeHtml(request.response_id)} ${escapeHtml(formatDuration(request))}</div>
+            <div class="title">${escapeHtml(formatTime(request.started_at_ms))} ${escapeHtml(request.response_id)} ${escapeHtml(formatDuration(request))}${_tps ? " " + escapeHtml(_tps) : ""}</div>
             <span class="title-model">${escapeHtml(request.model || "unknown model")}</span>
             <span class="badge status-icon ${escapeHtml(status)}" title="${escapeHtml(status)}">${statusIcon(status)}</span>
           </div>

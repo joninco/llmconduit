@@ -67,7 +67,7 @@ pub enum MonitorEventKind {
         phase: String,
         detail: String,
     },
-    Completed,
+    Completed { output_tokens: Option<i64> },
     Failed {
         message: String,
     },
@@ -117,6 +117,7 @@ pub enum DebugWsMessage {
         status: DebugRequestStatus,
         completed_at_ms: Option<u128>,
         error: Option<String>,
+        output_tokens: Option<i64>,
     },
     RequestRemove {
         response_id: String,
@@ -160,6 +161,9 @@ pub struct DebugRequestStats {
     pub tool_items: usize,
     pub input_chars: usize,
     pub instructions_chars: usize,
+    // None until the upstream returns a usage chunk; Some(total) once it does.
+    // Drives the post-completion tokens/sec display in the debug UI.
+    pub output_tokens: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -305,6 +309,7 @@ impl MonitorHub {
                 status: record.request.status,
                 completed_at_ms: record.request.completed_at_ms,
                 error: record.request.error.clone(),
+                output_tokens: record.request.stats.output_tokens,
             });
         }
         messages.push(DebugWsMessage::SnapshotDone);
@@ -348,6 +353,7 @@ impl MonitorState {
                     tool_items: *tool_items,
                     input_chars: *input_chars,
                     instructions_chars: *instructions_chars,
+                    output_tokens: None,
                 };
                 self.start_record(event, model.clone(), stats);
                 let mut messages = vec![DebugWsMessage::RequestUpsert {
@@ -531,7 +537,7 @@ impl MonitorState {
                 );
                 messages
             }
-            MonitorEventKind::Completed => {
+            MonitorEventKind::Completed { output_tokens } => {
                 let mut messages = Vec::new();
                 self.ensure_record_message(&event.response_id, event.timestamp_ms, &mut messages);
                 let record = self
@@ -547,11 +553,13 @@ impl MonitorState {
                 record.request.status = DebugRequestStatus::Completed;
                 record.request.completed_at_ms = Some(event.timestamp_ms);
                 record.request.updated_at_ms = event.timestamp_ms;
+                record.request.stats.output_tokens = *output_tokens;
                 messages.push(DebugWsMessage::RequestStatus {
                     response_id: event.response_id.clone(),
                     status: DebugRequestStatus::Completed,
                     completed_at_ms: Some(event.timestamp_ms),
                     error: None,
+                    output_tokens: *output_tokens,
                 });
                 self.push_timeline_event(
                     &event.response_id,
@@ -593,6 +601,7 @@ impl MonitorState {
                     status: DebugRequestStatus::Failed,
                     completed_at_ms: Some(event.timestamp_ms),
                     error: Some(message.clone()),
+                    output_tokens: None,
                 });
                 self.push_timeline_event(
                     &event.response_id,
@@ -1090,7 +1099,7 @@ mod tests {
                 delta: "hello".to_string(),
             },
         );
-        hub.emit("resp_1", MonitorEventKind::Completed);
+        hub.emit("resp_1", MonitorEventKind::Completed { output_tokens: None });
 
         let snapshot = hub.snapshot();
         assert!(snapshot.last_sequence >= 3);
@@ -1138,7 +1147,7 @@ mod tests {
                 delta: "nthird".to_string(),
             },
         );
-        hub.emit("resp_1", MonitorEventKind::Completed);
+        hub.emit("resp_1", MonitorEventKind::Completed { output_tokens: None });
 
         let text = hub
             .snapshot()
