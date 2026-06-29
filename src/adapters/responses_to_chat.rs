@@ -123,6 +123,7 @@ pub fn lower_request_with_reasoning_config_and_roles(
 ) -> AppResult<LoweredTurn> {
     validate_request(request)?;
     let mut messages = baseline_messages;
+    let baseline_len = messages.len();
     if messages.is_empty() && !request.instructions.is_empty() {
         messages.push(ChatMessage {
             role: "system".to_string(),
@@ -320,7 +321,12 @@ pub fn lower_request_with_reasoning_config_and_roles(
             tool_calls: None,
         });
     }
-    apply_role_rules(&mut messages, roles)?;
+    // Apply role rules only to the newly lowered input, not the replay baseline
+    // (`baseline_len`). Re-shaping pre-shaped history would double-apply rewrite/tag
+    // rules and skew `when: leading`/`inline` indices onto baseline positions.
+    let mut new_messages = messages.split_off(baseline_len);
+    apply_role_rules(&mut new_messages, roles)?;
+    messages.append(&mut new_messages);
     let response_format = request
         .text
         .as_ref()
@@ -386,7 +392,10 @@ pub fn lower_request_with_reasoning_config_and_roles(
     })
 }
 
-fn apply_role_rules(messages: &mut Vec<ChatMessage>, roles: Option<&RolesConfig>) -> AppResult<()> {
+pub(crate) fn apply_role_rules(
+    messages: &mut Vec<ChatMessage>,
+    roles: Option<&RolesConfig>,
+) -> AppResult<()> {
     let Some(roles) = roles else {
         return Ok(());
     };

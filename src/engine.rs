@@ -829,6 +829,9 @@ impl Gateway {
         let upstream_extra_body =
             build_upstream_extra_body(passthrough_kwargs, &request, thinking_kwarg);
         let normalized_stop = crate::models::chat::normalize_stop(request.stop.clone())?;
+        let roles = self
+            .config
+            .resolve_roles_config_for_resolved_model(&request.model, &upstream_model);
         loop {
             if tx.is_closed() {
                 return Err(AppError::cancelled());
@@ -1147,6 +1150,7 @@ impl Gateway {
             if let Some(message) = finalized.internal_assistant_message.clone() {
                 current_messages.push(message);
             }
+            let after_assistant_len = current_messages.len();
             if finalized.tool_calls.is_empty() {
                 break;
             }
@@ -1160,6 +1164,12 @@ impl Gateway {
                 &mut event_state,
             )
             .await?;
+            // Shape generated tool-result messages with the same role rules as the initial
+            // lowering, so they don't bypass rewriting/tag shaping on the next upstream
+            // request. The assistant turn itself is the model's output and is left as-is.
+            let mut new_tool_messages = current_messages.split_off(after_assistant_len);
+            crate::adapters::responses_to_chat::apply_role_rules(&mut new_tool_messages, roles)?;
+            current_messages.append(&mut new_tool_messages);
             if self.config.brave_api_key.is_some()
                 && finalized
                     .tool_calls
