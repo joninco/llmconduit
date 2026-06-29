@@ -627,9 +627,21 @@ impl RolesConfig {
                         "roles[{name}]: `target_role` is only valid with action `rewrite`"
                     ));
                 }
-                if !rule.tag_attributes.is_empty()
-                    && rule.tag.as_deref().map_or(true, |t| t.trim().is_empty())
+                if let Some(tag) = rule.tag.as_deref()
+                    && !valid_tag_name(tag)
                 {
+                    return Err(format!(
+                        "roles[{name}]: `tag` must be a non-empty name of letters, digits, '_', '-', ':', or '.'"
+                    ));
+                }
+                for key in rule.tag_attributes.keys() {
+                    if !valid_tag_name(key) {
+                        return Err(format!(
+                            "roles[{name}]: `tag_attributes` key `{key}` must be a non-empty name of letters, digits, '_', '-', ':', or '.'"
+                        ));
+                    }
+                }
+                if !rule.tag_attributes.is_empty() && rule.tag.is_none() {
                     return Err(format!(
                         "roles[{name}]: `tag_attributes` requires a non-empty `tag`"
                     ));
@@ -638,6 +650,17 @@ impl RolesConfig {
         }
         Ok(())
     }
+}
+
+/// A tag or attribute-key name that `wrap_tag` renders verbatim into `<tag ...>` and
+/// `key="..."`. Reject empty and any character that could close the tag or smuggle an
+/// extra attribute (`<`, `>`, `=`, `"`, space, etc.) so config can't craft broken markup.
+fn valid_tag_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':' | '.'))
 }
 
 #[derive(Debug, Clone)]
@@ -2528,6 +2551,72 @@ model_profiles:
             Config::from_persisted(&config).expect_err("tag_attributes without tag should fail");
         assert!(error.contains(
             "model_profiles[GLM-5.1]: roles[tool]: `tag_attributes` requires a non-empty `tag`"
+        ));
+    }
+
+    #[test]
+    fn roles_config_rejects_empty_tag() {
+        for tag in ["", "   "] {
+            let config = invalid_roles_profile(RolesConfig {
+                merge_adjacent: vec![],
+                rules: BTreeMap::from_iter([(
+                    "system".to_string(),
+                    RoleRuleSet {
+                        rules: vec![RoleRule {
+                            action: Action::Accept,
+                            tag: Some(tag.to_string()),
+                            ..Default::default()
+                        }],
+                    },
+                )]),
+            });
+            let error = Config::from_persisted(&config).expect_err("empty tag should fail");
+            let expected = "model_profiles[GLM-5.1]: roles[system]: `tag` must be a non-empty name";
+            assert!(error.contains(expected), "tag `{tag}`: {error}");
+        }
+    }
+
+    #[test]
+    fn roles_config_rejects_invalid_tag_name() {
+        for tag in ["a b", "a>", "a<b", "a\"b", "a=b", "a/b", "a&b"] {
+            let config = invalid_roles_profile(RolesConfig {
+                merge_adjacent: vec![],
+                rules: BTreeMap::from_iter([(
+                    "system".to_string(),
+                    RoleRuleSet {
+                        rules: vec![RoleRule {
+                            action: Action::Accept,
+                            tag: Some(tag.to_string()),
+                            ..Default::default()
+                        }],
+                    },
+                )]),
+            });
+            let error = Config::from_persisted(&config).expect_err("invalid tag should fail");
+            let expected = "model_profiles[GLM-5.1]: roles[system]: `tag` must be a non-empty name";
+            assert!(error.contains(expected), "tag `{tag}`: {error}");
+        }
+    }
+
+    #[test]
+    fn roles_config_rejects_invalid_tag_attribute_key() {
+        let config = invalid_roles_profile(RolesConfig {
+            merge_adjacent: vec![],
+            rules: BTreeMap::from_iter([(
+                "system".to_string(),
+                RoleRuleSet {
+                    rules: vec![RoleRule {
+                        action: Action::Accept,
+                        tag: Some("ctx".to_string()),
+                        tag_attributes: BTreeMap::from_iter([("a>b".to_string(), "v".to_string())]),
+                        ..Default::default()
+                    }],
+                },
+            )]),
+        });
+        let error = Config::from_persisted(&config).expect_err("invalid attribute key should fail");
+        assert!(error.contains(
+            "model_profiles[GLM-5.1]: roles[system]: `tag_attributes` key `a>b` must be a non-empty name"
         ));
     }
 
