@@ -7,9 +7,9 @@
 > **Branch:** `worktree-dashboard`. **Inherits:** `AGENTS.md` (commands + hard rules) + REVIEW_PROTOCOL.
 > **Run:** `/ralph-orchestrate --no-review --agents 1` (serial; per-gap Codex review is the gate).
 
-## Status: dashboard program 16/16 ✅ COMPLETE — **ACTIVE WORK = Topic E (engine robustness), Task E1 🔬 BUILT (gate B green) — PENDING Codex-xhigh review**
+## Status: dashboard program 16/16 ✅ COMPLETE · **Topic E (engine robustness) COMPLETE — Task E1 ✅ DONE (gate B green, Codex-xhigh APPROVED R2, commit 9590699)**
 > Dashboard gaps 01–16 done (01 ✅ … 16 ✅) + inserted **10b** ✅ — every gap built + gate-green + Codex-xhigh reviewed per REVIEW_PROTOCOL.md. FEATURES.md items 11–15 deferred (see "Out of scope").
-> **The current goal is NOT the dashboard gaps — it is `## Topic E` (bottom of this file): Task E1, hallucinated-tool-call repair (backend `src/*.rs`, gate B).** A fresh `/ralph-orchestrate` should pick up **E1** (the only ⬜ PENDING task). See `.ralph/GOAL.md` + `.ralph/specs/E1-hallucinated-tool-call-repair.md`.
+> **All planned work COMPLETE** — dashboard gaps 01–16 + **Topic E / Task E1** all done, gate-green, Codex-xhigh APPROVED. **No ⬜ PENDING tasks remain.** A fresh `/ralph-orchestrate` has nothing to pick up; extend with new specs via `/ralph-guide-update`. See `.ralph/GOAL.md` + `.ralph/specs/E1-hallucinated-tool-call-repair.md`.
 
 ## Resume notes (2026-06-22 handover — fresh session continues here)
 - **Orchestrator state:** `.ralph/orchestrate.wt-dash-0622-1322.state.md` (per-gap ledger: commits, review verdicts, rounds).
@@ -123,7 +123,7 @@ health-history (cooldown timeline); outlier / slow-request spotlight.
 > fmt` + Codex-xhigh APPROVED). Independent of the dashboard program; schedule anytime.
 
 ### Task E1 — Bounded soft-reject repair for hallucinated upstream tool calls
-**Spec:** `.ralph/specs/E1-hallucinated-tool-call-repair.md` · **Gate:** B · **Status:** 🔬 BUILT — gate B green, PENDING Codex-xhigh review · **Deps:** none
+**Spec:** `.ralph/specs/E1-hallucinated-tool-call-repair.md` · **Gate:** B · **Status:** ✅ DONE — gate B green, Codex-xhigh APPROVED (R2) · **Commit:** 9590699 (tag `E1-hallucinated-tool-call-repair`) · **Deps:** none
 **Incident:** a fallback model (DeepSeek-V4-Flash serving a requested `claude-opus-*`) emitted a
 tool_call named `Grep` — a canonical Claude Code tool that CC DEFERS behind `ToolSearch` and did NOT
 offer this turn. `finalize()` (`src/adapters/chat_to_responses.rs:263`) hard-errors
@@ -193,4 +193,15 @@ concern REFUTED, ONE must-fix MEDIUM. Fix: the Chat SSE terminal error frame dro
 `error.rs` `code`-field doc (Chat DOES render the code; only Anthropic's shape lacks a `code` slot).
 Verified end-to-end propagation (`unknown_tool_repair_exhausted` code `invalid_tool_call` → canonical
 `response.failed` → chat frame) and strengthened `e1_repair_ceiling_structured_terminal_chat_stream` to
-parse the frame and assert `error.code == invalid_tool_call`. Gate B re-run green. Pending R2 re-review.
+parse the frame and assert `error.code == invalid_tool_call`. Gate B re-run green. Amended → commit
+`9590699` (tag force-updated).
+
+**Codex-xhigh review R2 (APPROVED) — E1 DONE:** Codex `gpt-5.5` xhigh (account `will@bullpoint.org`)
+re-reviewed the fix delta + independently traced the chain; all 5 verification points confirmed
+(`response_error_code` reads `data.response.error.code`; `invalid_tool_call` propagates end-to-end to the
+Chat frame, not the default; the strengthened test strictly asserts `error.code`; corrected `error.rs`
+doc accurate; `code` additive, no regression). No new findings. **E1 ✅ DONE** at commit `9590699` —
+gate B green + Codex-xhigh APPROVED (2 rounds, within the ≤3 cap). **Topic E COMPLETE.** Recommended (NOT
+a gate, per `.ralph/GOAL.md`): optional live-verify on :5022 (release binary, `--with-debug-ui`) by
+forcing a fallback model to emit an unoffered tool name and confirming the repair round + structured
+terminal instead of a mid-stream abort.
