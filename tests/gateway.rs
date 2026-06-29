@@ -3379,6 +3379,7 @@ async fn roles_merge_adjacent_user_run_after_rewrite() {
         .and_then(|v| v.as_str())
         .unwrap();
     assert!(content.contains("sys"), "content: {content}");
+    assert!(content.contains("toolout"), "content: {content}");
     assert!(content.contains("hi"), "content: {content}");
 }
 
