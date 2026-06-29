@@ -22,6 +22,10 @@ base64 = "0.22"
 hmac = "0.12"
 subtle = "2"
 http = "1"
+# `LengthLimitError` (re-exported by axum's `to_bytes`) so `http.rs` can tell an
+# over-cap inbound body (413) from a truncated/broken stream (400). Already in
+# the graph via axum; a normal (not dev) dep because it is used in `src/`.
+http-body-util = "0.1"
 # Embed the dashboard SPA (`$OUT_DIR/dashboard_dist/`, materialized by build.rs)
 # into the binary at compile time (D8); the `static Dir<'static>` binding in
 # `dashboard_ui.rs` is what makes `include_dir!` type-check.
@@ -53,7 +57,6 @@ url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
-http-body-util = "0.1"
 pretty_assertions = "1"
 # `test-util` enables tokio's paused-clock test controls (`pause`/`advance`,
 # `#[tokio::test(start_paused = true)]`) used to deterministically exercise the

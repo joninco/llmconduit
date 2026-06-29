@@ -20,7 +20,7 @@
 //!   only ALLOCATES `claim` as `OpenL0`; D3 owns the transitions.
 //! - Bodies are owned, capped `Arc<[u8]>` produced by the redacting STREAMING JSON
 //!   serializer in `redaction`: peak serializer memory is O(CAP), not O(body), and
-//!   a `Bytes::slice` of the 256 MiB middleware buffer is NEVER retained (a slice
+//!   a `Bytes::slice` of the inbound middleware buffer bounded by `max_request_body_bytes` is NEVER retained (a slice
 //!   keeps the whole backing allocation alive — AGENTS.md don't-rule). Secrets are
 //!   redacted INLINE (sensitive keys, image URIs incl. `\uXXXX`-escaped forms,
 //!   over-long scalars + keys), so no secret persists even in a preview.
@@ -58,7 +58,7 @@ const DEFAULT_SUMMARY_QUOTA_BYTES: usize = 64 * 1024 * 1024;
 
 /// Hard cap on a single captured body (inbound/normalized/upstream). The streaming
 /// serializer stops writing once it has emitted this many bytes, so peak retained
-/// body memory is O(CAP) regardless of the 256 MiB inbound buffer size.
+/// body memory is O(CAP) regardless of the configured inbound request-body cap (default 10 MiB).
 const BODY_CAP: usize = 128 * 1024;
 /// Per-retained-scalar-string cap: bounds every dynamic string the record keeps
 /// (body scalars, headers, ids, method, uri, models, target, terminal reason).
@@ -724,7 +724,7 @@ pub struct FlowRecord {
     /// body captured; `Some(b)` with `b.bytes` empty ⇒ a genuinely captured EMPTY body;
     /// `Some(b)` with `b.truncated` ⇒ a partial (cap-truncated) body the dashboard must
     /// flag. Copied through the capped/redacting serializer (NEVER a `Bytes` slice of
-    /// the 256 MiB middleware buffer); evicted with the other bodies under the summary
+    /// the inbound middleware buffer bounded by `max_request_body_bytes`); evicted with the other bodies under the summary
     /// quota and NEVER projected onto the body-free [`SnapshotFlowSummary`]. Consumed by
     /// gap 14 (failure taxonomy); the React app ignores it until then.
     pub upstream_response: Option<UpstreamResponseBody>,
@@ -1300,7 +1300,7 @@ impl DashboardFlowStore {
     /// — so production and a dashboard-without-the-gate retain nothing here. `body` is a
     /// [`CapturedResponseBody`] (provably redacted + capped + truncation-flagged via the
     /// same capped/redacting serializer the request layers use), so a `Bytes` slice of
-    /// the 256 MiB middleware buffer is NEVER retained. `id` may be the flow's
+    /// the inbound middleware buffer bounded by `max_request_body_bytes` is NEVER retained. `id` may be the flow's
     /// `api_call_id` OR its `response_id` (the leaf only knows the latter); `update`
     /// joins by either via the link index, mirroring [`set_upstream`](Self::set_upstream).
     /// First-write-wins is NOT enforced: a shrink-and-retry whose retry also fails
@@ -2169,7 +2169,7 @@ pub fn capture_body(raw: &[u8]) -> CapturedBody {
 /// [`CapturedResponseBody`], plus a TRUNCATION flag. Same guarantees as
 /// [`capture_body`] (the body is redacted + capped via the shared O(CAP) primitive and
 /// NEVER retains a slice of `raw`), so the leaf can copy the upstream error body it
-/// already read (a `String`/`&[u8]`) without keeping the 256 MiB middleware buffer
+/// already read (a `String`/`&[u8]`) without keeping the inbound middleware buffer bounded by `max_request_body_bytes`
 /// alive. `truncated` is `raw.len() > BODY_CAP` — i.e. the RAW body exceeded the cap, so
 /// the retained bytes are a prefix the dashboard must flag (don't present a partial body
 /// as complete). Note the redacted output can be a fixed marker (`[redacted: unparseable
@@ -2190,7 +2190,7 @@ pub fn capture_response_body(raw: &[u8]) -> CapturedResponseBody {
 /// a writer bounded at `2 × BODY_CAP` and redacts the bounded bytes via the shared
 /// O(CAP) primitive — peak heap is O(`BODY_CAP`), never O(body). Same `CapturedBody`
 /// guarantees as [`capture_body`] (provably redacted + capped); the leaf uses THIS
-/// so a 256 MiB request body is never serialized in full just to be capped.
+/// so a max-size request body is never serialized in full just to be capped.
 pub fn capture_body_from_value<T: serde::Serialize>(value: &T) -> CapturedBody {
     let bytes = crate::redaction::capture_capped_redacted_value(value, BODY_CAP, SCALAR_CAP);
     CapturedBody(Arc::from(bytes.into_boxed_slice()))
@@ -3715,8 +3715,8 @@ mod tests {
     fn capture_body_from_value_peak_allocation_is_bounded_for_10mib_prompt() {
         // D2 R1 #1 — THE crux: serializing a typed request whose prompt is 10 MiB
         // must keep PEAK LIVE heap O(CAP), NOT O(body). The old leaf did
-        // `serde_json::to_vec` (a full ~10 MiB+ allocation, up to 256 MiB for a max
-        // body) THEN capped — defeating the guarantee. The Serialize-direct writer is
+        // `serde_json::to_vec` (a full ~10 MiB+ allocation, up to the configured
+        // inbound cap for a max body) THEN capped — defeating the guarantee. The Serialize-direct writer is
         // bounded at 2×BODY_CAP, so peak stays well under O(body). Build the input
         // OUTSIDE the armed region so only the capture's own allocations count.
         use serde::Serialize;

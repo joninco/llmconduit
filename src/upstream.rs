@@ -969,7 +969,7 @@ impl ReqwestUpstreamClient {
     /// (and, on the retry call, the shrunk) request — i.e. exactly the bytes
     /// `send_chat_request` serializes onto the wire, copied through the capped +
     /// redacting serializer so no oversized/secret body is retained (a slice of the
-    /// 256 MiB inbound buffer is NEVER taken — this is a fresh serialization of the
+    /// inbound middleware buffer bounded by `max_request_body_bytes` is NEVER taken — this is a fresh serialization of the
     /// already-parsed typed request).
     async fn logged_send_chat_request(
         &self,
@@ -994,8 +994,8 @@ impl ReqwestUpstreamClient {
     /// capped, redacting serializer. No-op when the store is `disabled()` or no
     /// `response_id` is threaded (tests / non-engine paths). Serializes the typed
     /// request DIRECTLY into a writer bounded at `2 × BODY_CAP` (D2 R1 #1 — never a
-    /// full `serde_json::to_vec`, which for a multi-MiB prompt would allocate up to
-    /// 256 MiB before capping); only the capped `Arc<[u8]>` (≤ `BODY_CAP`) is
+    /// full `serde_json::to_vec`, which for a multi-MiB prompt would allocate an
+    /// O(body) buffer before capping); only the capped `Arc<[u8]>` (≤ `BODY_CAP`) is
     /// retained. A request whose serialized form overflows the bound is recorded as
     /// the fixed `[redacted: unparseable body]` marker (observability-only).
     fn capture_upstream_body(&self, response_id: Option<&str>, request: &ChatCompletionRequest) {
@@ -1026,7 +1026,7 @@ impl ReqwestUpstreamClient {
     /// capture gate is off (debug UI off OR the `LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE`
     /// env flag unset) or no `serving` token is threaded — so production and a
     /// dashboard-without-the-gate do no work and retain nothing. `body` is the already-read
-    /// upstream error text (a `String`/`&str`, NOT the 256 MiB inbound middleware buffer); it
+    /// upstream error text (a `String`/`&str`, NOT the inbound middleware buffer bounded by `max_request_body_bytes`); it
     /// is COPIED through the capped serializer, so no `Bytes` slice of that buffer is retained.
     ///
     /// Round-1 review (F1): the body is STAGED on the token, NOT committed straight onto the
@@ -2981,7 +2981,7 @@ struct ServingInfo {
     /// A 500 → B 503 leaves B's (final) error body to commit; A 500 → B
     /// connect/timeout/no-first-chunk leaves it `None` (B's start-of-attempt clear wins and
     /// B stages nothing). Already a redacted + capped [`CapturedResponseBody`] (the leaf
-    /// passes the same capped/redacting capture), so no `Bytes` slice of the 256 MiB
+    /// passes the same capped/redacting capture), so no `Bytes` slice of the inbound
     /// middleware buffer is retained. Gated at the leaf (`is_response_capture_enabled`), so
     /// when capture is off nothing is staged.
     pending_response_body: Option<crate::dashboard_flow::CapturedResponseBody>,
@@ -3134,7 +3134,7 @@ impl ServingToken {
     /// cleared and commits `None`. Within ONE attempt this is still last-writer-wins (the
     /// shrink-and-retry's body overwrites the first send's). The slot is also CLEARED the
     /// instant a later provider serves. `body` is already redacted + capped, so no `Bytes`
-    /// slice of the 256 MiB middleware buffer is held.
+    /// slice of the inbound middleware buffer (bounded by `max_request_body_bytes`) is held.
     pub fn set_pending_response_body(&self, body: crate::dashboard_flow::CapturedResponseBody) {
         self.lock().pending_response_body = Some(body);
     }
@@ -3929,7 +3929,7 @@ async fn stream_success_response(
     // line); a hostile/buggy upstream streaming an oversized or never-terminated
     // frame would grow that buffer without bound (OOM). `bounded_sse_byte_stream`
     // caps the bytes accumulated since the last boundary and surfaces a clean
-    // `AppError` before the parser can over-accumulate. The 256 MiB request-body
+    // `AppError` before the parser can over-accumulate. The configured request-body
     // cap in `http.rs` is inbound-only and does NOT cover this response path.
     let bounded = bounded_sse_byte_stream(response.bytes_stream(), max_sse_frame_bytes);
     let stream = bounded.eventsource().filter_map(|result| async move {

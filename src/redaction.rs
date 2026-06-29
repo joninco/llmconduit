@@ -191,7 +191,7 @@ pub(crate) fn capture_capped_redacted(raw: &[u8], body_cap: usize, scalar_cap: u
 
 /// Capped + redacting capture of a `Serialize` value WITHOUT a full O(body)
 /// intermediate `Vec` (D2 R1 #1). The previous leaf path did `serde_json::to_vec`
-/// (up to a 256 MiB allocation for a huge prompt) and only THEN capped — defeating
+/// (a full O(body) allocation for a huge prompt) and only THEN capped — defeating
 /// the O(CAP) guarantee. Here the value is serialized via `serde_json::to_writer`
 /// into a [`BoundedSerializeWriter`] hard-bounded at `2 × body_cap`: serialization
 /// STOPS (errors) the instant it would exceed the bound, so peak heap stays

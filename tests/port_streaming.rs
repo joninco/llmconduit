@@ -6,7 +6,7 @@
 //! The `eventsource-stream` parser accumulates every byte it receives into an
 //! internal buffer and only flushes on an SSE event boundary (a blank line); it
 //! does NOT cap that buffer, so a hostile/buggy upstream streaming an oversized
-//! or never-terminated frame would grow memory without bound. The 256 MiB cap in
+//! or never-terminated frame would grow memory without bound. The configured inbound cap in
 //! `http.rs` is the INBOUND request-body limit and does not cover this
 //! response-read path. We therefore wrap the byte stream in a configurable
 //! per-frame ceiling (`sse_guard::SseFrameGuard`, default 8 MiB, env
