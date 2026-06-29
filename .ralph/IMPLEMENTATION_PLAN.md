@@ -7,7 +7,9 @@
 > **Branch:** `worktree-dashboard`. **Inherits:** `AGENTS.md` (commands + hard rules) + REVIEW_PROTOCOL.
 > **Run:** `/ralph-orchestrate --no-review --agents 1` (serial; per-gap Codex review is the gate).
 
-## Status: COMPLETE — 16/16 done (01 ✅, 02 ✅, 03 ✅, 04 ✅, 05 ✅, 06 ✅, 07 ✅, 08 ✅, 09 ✅, 10 ✅, 11 ✅, 12 ✅, 13 ✅, 14 ✅, 15 ✅, 16 ✅) + inserted **10b** ✅ (spine→wire-DTO projection). The Argus dashboard program (FEATURES.md items 1–10) is DONE — every gap built + gate-green; per-gap Codex-xhigh review of each commit is the remaining gate per REVIEW_PROTOCOL.md. (Items 11–15 remain deferred to a later `/ralph-guide-update` — see "Out of scope".)
+## Status: dashboard program 16/16 ✅ COMPLETE — **ACTIVE WORK = Topic E (engine robustness), Task E1 ⬜ PENDING**
+> Dashboard gaps 01–16 done (01 ✅ … 16 ✅) + inserted **10b** ✅ — every gap built + gate-green + Codex-xhigh reviewed per REVIEW_PROTOCOL.md. FEATURES.md items 11–15 deferred (see "Out of scope").
+> **The current goal is NOT the dashboard gaps — it is `## Topic E` (bottom of this file): Task E1, hallucinated-tool-call repair (backend `src/*.rs`, gate B).** A fresh `/ralph-orchestrate` should pick up **E1** (the only ⬜ PENDING task). See `.ralph/GOAL.md` + `.ralph/specs/E1-hallucinated-tool-call-repair.md`.
 
 ## Resume notes (2026-06-22 handover — fresh session continues here)
 - **Orchestrator state:** `.ralph/orchestrate.wt-dash-0622-1322.state.md` (per-gap ledger: commits, review verdicts, rounds).
@@ -17,7 +19,7 @@
 - **Deferred:** gap **04** R3 findings deferred as non-issues per the ruling (see state file). gap **07** took **4** review rounds (extended 1 past the nominal 3-round cap because findings were strictly converging with no judgment call — that's the bar for extending; otherwise halt-to-human at 3).
 - **Convention:** `.ralph/COMPLETED_TASKS.md` is GITIGNORED (full archive) — build/fix subagents WRITE it but must NOT `git add -f` it (one early subagent force-added it; untracked in `f52deec`). Each gap's plan line is compressed to `- [x]` with a 1-paragraph summary; full detail lives in COMPLETED_TASKS.md.
 - **Per-gap loop:** build subagent (B or B+F green → commit) → **Codex-xhigh review of the commit diff** (REVIEW_PROTOCOL.md, credit-rotation aware) → fix subagent if findings (≤3 rounds) → record in state → next gap. `--no-review` (orchestrator's built-in review off) + `--agents 1` (serial).
-- **Resume command:** `/ralph-orchestrate --no-review --agents 1` (it will read this plan + state and pick up at gap 11). Or `/ralph-orchestrate --no-review --agents 1 --session wt-dash-0622-1322` to continue the same ledger.
+- **Resume command:** `/ralph-orchestrate --no-review --agents 1` (it reads this plan + GOAL.md and picks up the only ⬜ PENDING task = **Topic E / E1**; gaps 01–16 are all done). The `wt-dash-0622-1322` ledger above is for the COMPLETED dashboard program — Topic E starts a fresh session/ledger.
 
 ## The discipline (cross-cutting acceptance — applies to EVERY gap)
 FEATURES.md hardened the framing from "pretty flow artifacts" to "can Argus answer the incident
