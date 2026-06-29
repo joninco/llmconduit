@@ -483,6 +483,10 @@ impl ChatCompletionStreamConverter {
                 output.push(ChatSseEvent::Data(json!({
                     "error": {
                         "message": response_error_message(&event.data),
+                        // The OpenAI Chat error object carries a structured `code`
+                        // — surface the canonical terminal's code (e.g. E1's
+                        // `invalid_tool_call`) rather than dropping it.
+                        "code": response_error_code(&event.data),
                     }
                 })));
                 output.push(ChatSseEvent::Done);
@@ -889,6 +893,20 @@ fn response_error_message(data: &Value) -> String {
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("upstream request failed")
+        .to_string()
+}
+
+/// Structured machine `code` from a canonical `response.failed` event, mirroring
+/// [`response_error_message`]. The OpenAI Chat error object HAS a `code` field, so
+/// a structured terminal (e.g. E1's `invalid_tool_call` on repair exhaustion) is
+/// surfaced to Chat clients, not just the human message. Defaults to
+/// `gateway_error` (matching the engine's `failure_event` default) when absent.
+fn response_error_code(data: &Value) -> String {
+    data.get("response")
+        .and_then(|response| response.get("error"))
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("gateway_error")
         .to_string()
 }
 

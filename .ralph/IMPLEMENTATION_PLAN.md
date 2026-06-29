@@ -7,7 +7,7 @@
 > **Branch:** `worktree-dashboard`. **Inherits:** `AGENTS.md` (commands + hard rules) + REVIEW_PROTOCOL.
 > **Run:** `/ralph-orchestrate --no-review --agents 1` (serial; per-gap Codex review is the gate).
 
-## Status: dashboard program 16/16 ✅ COMPLETE — **ACTIVE WORK = Topic E (engine robustness), Task E1 ⬜ PENDING**
+## Status: dashboard program 16/16 ✅ COMPLETE — **ACTIVE WORK = Topic E (engine robustness), Task E1 🔬 BUILT (gate B green) — PENDING Codex-xhigh review**
 > Dashboard gaps 01–16 done (01 ✅ … 16 ✅) + inserted **10b** ✅ — every gap built + gate-green + Codex-xhigh reviewed per REVIEW_PROTOCOL.md. FEATURES.md items 11–15 deferred (see "Out of scope").
 > **The current goal is NOT the dashboard gaps — it is `## Topic E` (bottom of this file): Task E1, hallucinated-tool-call repair (backend `src/*.rs`, gate B).** A fresh `/ralph-orchestrate` should pick up **E1** (the only ⬜ PENDING task). See `.ralph/GOAL.md` + `.ralph/specs/E1-hallucinated-tool-call-repair.md`.
 
@@ -123,7 +123,7 @@ health-history (cooldown timeline); outlier / slow-request spotlight.
 > fmt` + Codex-xhigh APPROVED). Independent of the dashboard program; schedule anytime.
 
 ### Task E1 — Bounded soft-reject repair for hallucinated upstream tool calls
-**Spec:** `.ralph/specs/E1-hallucinated-tool-call-repair.md` · **Gate:** B · **Status:** ⬜ PENDING · **Deps:** none
+**Spec:** `.ralph/specs/E1-hallucinated-tool-call-repair.md` · **Gate:** B · **Status:** 🔬 BUILT — gate B green, PENDING Codex-xhigh review · **Deps:** none
 **Incident:** a fallback model (DeepSeek-V4-Flash serving a requested `claude-opus-*`) emitted a
 tool_call named `Grep` — a canonical Claude Code tool that CC DEFERS behind `ToolSearch` and did NOT
 offer this turn. `finalize()` (`src/adapters/chat_to_responses.rs:263`) hard-errors
@@ -151,3 +151,46 @@ counter, no raw-name labels + `unknown_tool_rejected`/`unknown_tool_repair_exhau
 `cargo test`/clippy/fmt green; Codex-xhigh APPROVED.
 **Sequencing:** Independent — no deps on the dashboard gaps or other Topic-E tasks. Reuses ToolDeltaGate
 (U7/T3) caps + the web-search-round loop pattern + the MonitorHub `emit_with` choke-point.
+
+**Build summary (🔬 BUILT — gate B green, pending Codex-xhigh review):** Landed the full A2+C design.
+`finalize()` (`chat_to_responses.rs`) now classifies an unoffered tool name into a new
+`rejected_tool_calls: Vec<RejectedToolCall{call_id,name,raw_arguments,reason}>` (NO `Err`, NO JSON-parse
+of unknown args — raw capped via `cap_str`) and replays the attempted call into the assistant message so
+the repair tool result lines up by `call_id`; missing-name / bad known-tool args / invalid `local_shell`
+still hard-error. `ToolDeltaGate` (`tool_delta_gate.rs`) was generalized to a tri-state
+`hidden: Option<bool>` (engine classifies the resolved name via `is_hidden_tool_name` against the
+registry): leading deltas buffer until the name resolves, then DROP (hidden = unknown OR `analyzeImage`)
+or FLUSH (visible) — reusing the existing 256 KiB/1 MiB caps + O(1) accounting (no new caps); the old
+`vision_active` flag is gone (registry classification subsumes it). The engine tool-loop taints a batch
+with any rejected call (turn-end flush skipped, no `handle_tool_calls`), injects a synthetic `tool` result
+per call (`not_executed` for tainted-valid, `tool_unavailable` for unknown) + a closed-tool-set `system`
+note (prevention C), relaxes `tool_choice` to `auto`, and runs one bounded repair round
+(`UNKNOWN_TOOL_REPAIR_CEILING = 1`); on exhaustion it returns the new
+`AppError::unknown_tool_repair_exhausted()` (code `invalid_tool_call`) which the existing spawn-closure
+renders as the canonical `response.failed` → all 3 converters (canonical-Responses-only; already-streamed
+text preserved). Observability: always-on `tracing::warn!` (response_id/provider/served_model/unknown
+tool/offered count/repair round) + a bounded always-on `unknown_tool_call_counts` BTreeMap counter on
+`Gateway` keyed `{provider,served_model,outcome∈repaired|exhausted}` (cardinality-capped at 256 keys with
+`__other__` overflow; NO raw-name labels) + monitor phases `unknown_tool_rejected` /
+`unknown_tool_repair_exhausted` via `emit_with`. Files: `src/error.rs` (+`code`/`with_code`/exhausted
+ctor), `src/adapters/chat_to_responses.rs`, `src/tool_delta_gate.rs`, `src/engine.rs`, `tests/gateway.rs`
+(+10 E1 integration tests across all 3 formats incl. cancellation + observability), plus refreshed
+unit tests in the gate + adapter. Gate B: `cargo test` workspace ALL pass (lib 645, gateway 146, others),
+`cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean. Deviation: the prevention
+note is injected as a mid-conversation `system` message in the repair round (spec said "developer/system
+note") — `system` is the most broadly-compatible upstream role; the repair-only injection (vs every
+request) targets the recovery path without changing every prompt. Known limitation (matches the spec's
+literal acceptance — outside the criteria): in a MIXED batch where a VALID client tool's name resolves
+MID-stream (before the unknown tool), that valid tool's already-live-forwarded arg deltas cannot be
+recalled; the name-LAST sub-case (and the realistic single-unknown-tool incident) is fully hidden. This
+is rare under the forced `parallel_tool_calls=false`, and the repair round re-issues cleanly.
+
+**Codex-xhigh review R1 (CHANGES REQUESTED → fixed):** both deviations ACCEPTED (non-blocking), failover
+concern REFUTED, ONE must-fix MEDIUM. Fix: the Chat SSE terminal error frame dropped the structured
+`code` (acceptance #5 requires it — the OpenAI Chat error object HAS a `code` field). Added
+`response_error_code()` in `chat_completions.rs` (mirrors `response_error_message`, default
+`gateway_error`) and emit `error.code` on the `response.failed` chat frame; corrected the now-inaccurate
+`error.rs` `code`-field doc (Chat DOES render the code; only Anthropic's shape lacks a `code` slot).
+Verified end-to-end propagation (`unknown_tool_repair_exhausted` code `invalid_tool_call` → canonical
+`response.failed` → chat frame) and strengthened `e1_repair_ceiling_structured_terminal_chat_stream` to
+parse the frame and assert `error.code == invalid_tool_call`. Gate B re-run green. Pending R2 re-review.

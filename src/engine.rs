@@ -65,6 +65,61 @@ use uuid::Uuid;
 
 const UPSTREAM_MODEL_CATALOG_TTL_SECS: u64 = 300;
 
+/// E1: absolute ceiling on in-gateway repair rounds for hallucinated (unoffered)
+/// tool calls — mirrors `WEB_SEARCH_ROUNDS_HARD_CEILING`. Default 1 (one
+/// self-correction attempt); 2 is the practical maximum (a model that cannot
+/// recover in two rounds will not in ten). MUST NOT exceed 2.
+const UNKNOWN_TOOL_REPAIR_CEILING: usize = 1;
+
+/// E1: HARD cap on the distinct `{provider, served_model}` keys tracked by the
+/// always-on unknown-tool-call counter. The labels can be attacker-influenced
+/// (a request model name flows into `served_model`), so once the map is full a
+/// fresh key folds into the bounded [`UNKNOWN_TOOL_COUNTER_OVERFLOW_KEY`] catch-all
+/// instead of growing without bound (AGENTS.md: bounded structures only). The
+/// outcome dimension is already bounded ({repaired, exhausted}).
+const MAX_UNKNOWN_TOOL_COUNTER_KEYS: usize = 256;
+
+/// E1: the bounded catch-all `{provider, served_model}` a counter key folds into
+/// once [`MAX_UNKNOWN_TOOL_COUNTER_KEYS`] distinct keys are tracked.
+const UNKNOWN_TOOL_COUNTER_OVERFLOW_KEY: &str = "__other__";
+
+/// E1: synthetic tool result injected for a VALID call that was tainted (NOT run)
+/// because a sibling call in the same batch referenced an unoffered tool.
+const TAINTED_TOOL_RESULT: &str = "not_executed: another tool call in this turn referenced a tool that is not available, \
+     so no tool in this batch was executed. Re-issue only valid tool calls.";
+
+/// E1: closed-tool-set prevention note (option C) injected as a system message in
+/// the repair round so the model stops inventing tool names.
+const CLOSED_TOOL_SET_NOTE: &str = "You may only call tools that are explicitly provided in this request. Do not invent or \
+     guess tool names. If a `ToolSearch` tool is provided, call it to request any additional \
+     tools you need before using them.";
+
+/// E1: outcome of an unknown-tool soft-reject turn, for the always-on
+/// `unknown_tool_call_total{provider,served_model,outcome}` counter. Bounded by
+/// construction — exactly two variants, never labeled by raw tool name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnknownToolOutcome {
+    /// The model self-corrected within the repair ceiling (no rejected calls in a
+    /// subsequent round).
+    Repaired,
+    /// The repair ceiling was reached with rejected calls still present; the turn
+    /// ended in a structured terminal failure.
+    Exhausted,
+}
+
+impl UnknownToolOutcome {
+    /// Stable label for the counter key / observability.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnknownToolOutcome::Repaired => "repaired",
+            UnknownToolOutcome::Exhausted => "exhausted",
+        }
+    }
+}
+
+/// E1: key for the bounded unknown-tool-call counter.
+type UnknownToolCounterKey = (String, String, UnknownToolOutcome);
+
 #[derive(Clone)]
 pub struct Gateway {
     config: Config,
@@ -116,6 +171,15 @@ pub struct Gateway {
     /// twice per request forever. Keyed by requested model; fires once per
     /// catalog-TTL window, mirroring claude-relay's once-per-detection logging.
     model_fallback_warned: Arc<std::sync::Mutex<HashMap<String, std::time::Instant>>>,
+    /// E1: always-on (NOT dashboard-gated) bounded counter for hallucinated
+    /// unoffered tool calls, keyed `{provider, served_model, outcome}`. The
+    /// incident this guards was INVISIBLE in production logs, so unlike the
+    /// dashboard `MetricsLayer` (which is `disabled()` without `--with-debug-ui`)
+    /// this aggregate is always live; the `tracing::warn!` at the reject site is
+    /// the primary operator signal and this is the bounded count. Raw tool names
+    /// are NEVER labels (cardinality). `Arc<Mutex<..>>` so a cloned `Gateway`
+    /// shares one count, mirroring `model_fallback_warned`.
+    unknown_tool_call_counts: Arc<std::sync::Mutex<BTreeMap<UnknownToolCounterKey, u64>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -614,7 +678,44 @@ impl Gateway {
             // enabled layer via `with_metrics` in the `--with-debug-ui` branch.
             metrics: crate::metrics::MetricsLayer::disabled(),
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// E1: record one unknown-tool-call outcome into the bounded always-on
+    /// counter. Folds a fresh `{provider, served_model}` into the bounded
+    /// overflow key once the map is full, so the key space cannot grow without
+    /// bound under attacker-influenced labels.
+    fn record_unknown_tool_outcome(
+        &self,
+        provider: &str,
+        served_model: &str,
+        outcome: UnknownToolOutcome,
+    ) {
+        let mut counts = self
+            .unknown_tool_call_counts
+            .lock()
+            .expect("unknown tool counter lock poisoned");
+        let key = (provider.to_string(), served_model.to_string(), outcome);
+        if !counts.contains_key(&key) && counts.len() >= MAX_UNKNOWN_TOOL_COUNTER_KEYS {
+            let overflow = (
+                UNKNOWN_TOOL_COUNTER_OVERFLOW_KEY.to_string(),
+                UNKNOWN_TOOL_COUNTER_OVERFLOW_KEY.to_string(),
+                outcome,
+            );
+            *counts.entry(overflow).or_insert(0) += 1;
+            return;
+        }
+        *counts.entry(key).or_insert(0) += 1;
+    }
+
+    /// E1: snapshot of the unknown-tool-call counter (`{provider, served_model,
+    /// outcome} -> count`). Exposed for tests / introspection.
+    pub fn unknown_tool_call_counts(&self) -> BTreeMap<UnknownToolCounterKey, u64> {
+        self.unknown_tool_call_counts
+            .lock()
+            .expect("unknown tool counter lock poisoned")
+            .clone()
     }
 
     /// Attach the D5 enabled [`MetricsLayer`](crate::metrics::MetricsLayer) (built in
@@ -1827,6 +1928,14 @@ impl Gateway {
         // is SEPARATE from `web_search_rounds` and the web-search hard ceiling
         // (AGENTS.md: do not change `WEB_SEARCH_ROUNDS_HARD_CEILING`).
         let mut image_analysis_rounds = 0usize;
+        // E1: independent counter for in-gateway repair rounds triggered by a
+        // hallucinated (unoffered) tool call, bounded by
+        // `UNKNOWN_TOOL_REPAIR_CEILING`. SEPARATE from the web-search / image
+        // ceilings (a model can mix all three). `pending_repair` is set after a
+        // repair round is injected so a SUBSEQUENT clean round counts as a
+        // `Repaired` outcome exactly once.
+        let mut unknown_tool_repair_rounds = 0usize;
+        let mut pending_repair = false;
         // A forced `tool_choice` (e.g. an Anthropic `web_search` server tool,
         // which Claude Code always forces) must apply only to the first
         // upstream request. After a provider-side web search runs and its
@@ -2012,16 +2121,16 @@ impl Gateway {
             // single authoritative `accumulated_usage.add(turn_usage)` AFTER the inner
             // loop advances the base for the NEXT turn of a multi-turn tool loop.
             let turn_base = accumulated_usage.snapshot();
-            // G4 (review #1): per-upstream-turn gate over streamed tool-call
-            // argument deltas. When the image agent is active it buffers leading
-            // deltas (keyed by call_id) until the tool name resolves, then DROPS
-            // the internal `analyzeImage` ones or FLUSHES client-tool ones in
-            // order — so an `analyzeImage` arg fragment can never leak even when
-            // a sparse upstream streams arguments before the name. When inactive
-            // the gate passes every delta straight through. The gate is a pure
-            // decision machine; the engine forwards its emissions via
-            // `emit_function_call_delta`.
-            let mut tool_delta_gate = ToolDeltaGate::new(vision_session.is_some());
+            // G4 + E1: per-upstream-turn gate over streamed tool-call argument
+            // deltas. It buffers leading deltas (keyed by call_id) until the
+            // engine classifies the resolved tool name (`hidden` below), then
+            // DROPS hidden ones (internal `analyzeImage`, OR a hallucinated tool
+            // not in the offered set) or FLUSHES client-visible ones in order — so
+            // neither an `analyzeImage` arg fragment nor a hallucinated tool's
+            // arguments can ever leak even when a sparse upstream streams
+            // arguments before the name. The gate is a pure decision machine; the
+            // engine forwards its emissions via `emit_function_call_delta`.
+            let mut tool_delta_gate = ToolDeltaGate::new();
             loop {
                 let Some(chunk) = Self::next_upstream_chunk(&mut stream, &tx, &abort_token).await?
                 else {
@@ -2178,13 +2287,22 @@ impl Gateway {
                             name,
                             delta,
                         } => {
-                            // The gate hides internal `analyzeImage` arg deltas
-                            // (buffering leading fragments until the name resolves)
-                            // and passes client-tool deltas through. It returns the
-                            // (allocation-free) decision to forward; an overflow of
-                            // the pending-byte cap fails the turn cleanly.
-                            let decision =
-                                tool_delta_gate.on_delta(call_id, name, delta).map_err(|_| {
+                            // Classify the (possibly still-`None`) resolved tool
+                            // name against the offered registry: `None` while the
+                            // name is unknown (gate buffers), `Some(true)` for a
+                            // HIDDEN tool — internal `analyzeImage` OR a
+                            // hallucinated name not in the offered set (gate drops
+                            // its buffered + later deltas, so the client never sees
+                            // it), `Some(false)` for a client-visible tool (gate
+                            // flushes + forwards). The gate returns the
+                            // allocation-free decision; an overflow of the
+                            // pending-byte cap fails the turn cleanly.
+                            let hidden = name
+                                .as_deref()
+                                .map(|n| is_hidden_tool_name(n, &tool_registry));
+                            let decision = tool_delta_gate
+                                .on_delta(call_id, name, delta, hidden)
+                                .map_err(|_| {
                                     AppError::upstream(
                                         "upstream streamed too many tool-call argument bytes before a tool name",
                                     )
@@ -2261,18 +2379,26 @@ impl Gateway {
             // — so the client receives all of its tool-arg deltas. ONLY
             // `analyzeImage`/`ImageAnalysis` deltas are dropped; every other
             // (client) tool's buffer is forwarded.
-            for tool_call in &finalized.tool_calls {
-                if matches!(tool_call.kind, ToolKind::ImageAnalysis) {
-                    continue;
+            //
+            // E1: SKIP this flush entirely when the batch is TAINTED (any
+            // rejected/hallucinated call present). The whole batch is discarded —
+            // no tool is handed off — so a name-only valid tool's buffered deltas
+            // must be dropped too, not streamed to the client (the gate drops them
+            // when it is discarded at turn end). The repair round re-issues them.
+            if finalized.rejected_tool_calls.is_empty() {
+                for tool_call in &finalized.tool_calls {
+                    if matches!(tool_call.kind, ToolKind::ImageAnalysis) {
+                        continue;
+                    }
+                    // Borrow the id (no clone): the gate takes `&str` and mints the
+                    // single owned id it needs for the `Flush` decision.
+                    let Some(call_id) = tool_call.internal_call.id.as_deref() else {
+                        continue;
+                    };
+                    let decision = tool_delta_gate.flush_pending_client_tool(call_id);
+                    self.drive_delta_decision(&response_id, &tx, decision, &abort_token)
+                        .await?;
                 }
-                // Borrow the id (no clone): the gate takes `&str` and mints the
-                // single owned id it needs for the `Flush` decision.
-                let Some(call_id) = tool_call.internal_call.id.as_deref() else {
-                    continue;
-                };
-                let decision = tool_delta_gate.flush_pending_client_tool(call_id);
-                self.drive_delta_decision(&response_id, &tx, decision, &abort_token)
-                    .await?;
             }
             self.emit_completed_public_items(
                 &response_id,
@@ -2291,6 +2417,124 @@ impl Gateway {
             }
             if let Some(message) = finalized.internal_assistant_message.clone() {
                 current_messages.push(message);
+            }
+            // E1: bounded soft-reject repair for hallucinated (unoffered) tool
+            // calls. A TAINTED batch (any rejected call) executes NO server tool
+            // and hands off NO client tool; instead we inject a synthetic tool
+            // result per call + a closed-tool-set note and run ONE bounded
+            // in-gateway repair round (same loop, same provider — NOT a failover,
+            // NOT a token-duplicating retry) so the model can self-correct. Past
+            // the ceiling we end the turn with a STRUCTURED terminal failure (NOT
+            // a raw `?` abort); any already-streamed text was emitted by
+            // `emit_completed_public_items` above and is never retracted.
+            if !finalized.rejected_tool_calls.is_empty() {
+                // Provider attribution for the always-on observability (read
+                // lazily — this is a rare path). `served_model` is the resolved
+                // upstream model.
+                let provider = serving_token
+                    .snapshot()
+                    .1
+                    .unwrap_or_else(|| "unknown".to_string());
+                let unknown_tools: Vec<&str> = finalized
+                    .rejected_tool_calls
+                    .iter()
+                    .map(|rejected| rejected.name.as_str())
+                    .collect();
+                // Always-on WARN — the incident this guards was invisible in
+                // journalctl (the old hard-error surfaced only to the client).
+                tracing::warn!(
+                    response_id = %response_id,
+                    provider = %provider,
+                    served_model = %upstream_model,
+                    unknown_tools = ?unknown_tools,
+                    offered_tools = tools.len(),
+                    repair_round = unknown_tool_repair_rounds,
+                    "upstream returned tool call(s) not in the offered tool set; soft-rejecting (bounded repair)"
+                );
+                self.monitor
+                    .emit_with(response_id.as_str(), || MonitorEventKind::ToolPhase {
+                        phase: "unknown_tool_rejected".to_string(),
+                        detail: format!(
+                            "{} unoffered tool call(s) rejected; repair round {}",
+                            finalized.rejected_tool_calls.len(),
+                            unknown_tool_repair_rounds
+                        ),
+                    });
+
+                if unknown_tool_repair_rounds >= UNKNOWN_TOOL_REPAIR_CEILING {
+                    // Exhausted: emit a STRUCTURED terminal failure. The
+                    // spawn-closure renders the returned error as the canonical
+                    // `response.failed` (code `invalid_tool_call`), which the three
+                    // inbound converters render in their own format.
+                    self.record_unknown_tool_outcome(
+                        &provider,
+                        &upstream_model,
+                        UnknownToolOutcome::Exhausted,
+                    );
+                    self.monitor
+                        .emit_with(response_id.as_str(), || MonitorEventKind::ToolPhase {
+                            phase: "unknown_tool_repair_exhausted".to_string(),
+                            detail: format!(
+                                "unoffered tool calls persisted after {} repair round(s)",
+                                unknown_tool_repair_rounds
+                            ),
+                        });
+                    tracing::warn!(
+                        response_id = %response_id,
+                        provider = %provider,
+                        served_model = %upstream_model,
+                        repair_round = unknown_tool_repair_rounds,
+                        "unknown-tool repair exhausted; ending turn with a structured terminal failure"
+                    );
+                    return Err(AppError::unknown_tool_repair_exhausted());
+                }
+
+                // Under the ceiling: inject a synthetic tool result for EVERY call
+                // in the tainted batch (so the chat history stays well-formed —
+                // each replayed tool_call gets a matching tool result) + the
+                // closed-tool-set note, then run another round. The internal
+                // assistant message (attempted valid + rejected calls) was pushed
+                // above.
+                unknown_tool_repair_rounds += 1;
+                pending_repair = true;
+                for tool_call in &finalized.tool_calls {
+                    if let Some(call_id) = tool_call.internal_call.id.clone() {
+                        current_messages.push(synthetic_tool_result(
+                            call_id,
+                            TAINTED_TOOL_RESULT.to_string(),
+                        ));
+                    }
+                }
+                for rejected in &finalized.rejected_tool_calls {
+                    current_messages.push(synthetic_tool_result(
+                        rejected.call_id.clone(),
+                        format!(
+                            "tool_unavailable: the tool \"{}\" is not one of the tools provided in this request.",
+                            rejected.name
+                        ),
+                    ));
+                }
+                current_messages.push(closed_tool_set_note());
+                // Relax any forced `tool_choice` so the model can answer in prose
+                // or re-issue a VALID tool call rather than be forced back into a
+                // tool it may not actually have.
+                current_tool_choice = Value::String("auto".to_string());
+                continue;
+            }
+            // Reached here ⇒ this round had NO rejected tool calls. If a prior
+            // round triggered a repair, the model has now self-corrected — count
+            // the `Repaired` outcome exactly once.
+            if pending_repair {
+                pending_repair = false;
+                let provider = serving_token
+                    .snapshot()
+                    .1
+                    .unwrap_or_else(|| "unknown".to_string());
+                self.record_unknown_tool_outcome(
+                    &provider,
+                    &upstream_model,
+                    UnknownToolOutcome::Repaired,
+                );
             }
             if finalized.tool_calls.is_empty() {
                 break;
@@ -3119,6 +3363,54 @@ impl Gateway {
             tool_calls: None,
         });
         Ok(())
+    }
+}
+
+/// E1: classify a streamed tool name as HIDDEN from the client (the
+/// [`ToolDeltaGate`] drops its argument deltas) vs client-visible. A name NOT in
+/// the offered registry is hidden (a hallucinated/unoffered tool — the client
+/// must not see it before the engine soft-rejects it); the server-side
+/// `analyzeImage` tool is hidden (G4); every other offered tool is visible
+/// (forwarded — `web_search` rendering is decided downstream by the converters).
+fn is_hidden_tool_name(
+    name: &str,
+    registry: &crate::adapters::responses_to_chat::ToolRegistry,
+) -> bool {
+    let name_lc = name.to_ascii_lowercase();
+    match registry.get(&name_lc) {
+        None => true,
+        Some(ToolKind::ImageAnalysis) => true,
+        Some(_) => false,
+    }
+}
+
+/// E1: a synthetic `tool`-role chat message keyed to `call_id`, injected into the
+/// repair round so the upstream history stays well-formed (every replayed
+/// tool_call has a matching tool result). Mirrors the web-search/vision tool-result
+/// shape.
+fn synthetic_tool_result(call_id: String, content: String) -> ChatMessage {
+    ChatMessage {
+        role: "tool".to_string(),
+        content: Some(Value::String(content)),
+        tool_call_id: Some(call_id),
+        name: None,
+        reasoning_content: None,
+        thinking: None,
+        tool_calls: None,
+    }
+}
+
+/// E1: closed-tool-set prevention note (option C) injected as a `system` message
+/// in the repair round.
+fn closed_tool_set_note() -> ChatMessage {
+    ChatMessage {
+        role: "system".to_string(),
+        content: Some(Value::String(CLOSED_TOOL_SET_NOTE.to_string())),
+        tool_call_id: None,
+        name: None,
+        reasoning_content: None,
+        thinking: None,
+        tool_calls: None,
     }
 }
 
@@ -4192,7 +4484,13 @@ fn failure_event(error: &AppError) -> SseEvent {
             payload: FailedPayload {
                 response: FailedResponse {
                     error: FailedError {
-                        code: "gateway_error".to_string(),
+                        // E1: surface a structured machine code when the error
+                        // carries one (e.g. `invalid_tool_call` for an exhausted
+                        // unknown-tool repair); otherwise the historical default.
+                        code: error
+                            .code
+                            .clone()
+                            .unwrap_or_else(|| "gateway_error".to_string()),
                         message: error.client_message.clone(),
                     },
                 },

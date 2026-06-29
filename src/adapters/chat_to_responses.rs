@@ -17,6 +17,12 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+/// E1: cap on the unknown-tool argument text carried on a [`RejectedToolCall`].
+/// The args were never executable, so they are kept only for the operator log +
+/// the synthetic repair-round echo; cap them so a hostile/huge argument blob
+/// cannot bloat the log line or the repair prompt.
+const REJECTED_TOOL_ARGS_CAP_BYTES: usize = 2048;
+
 #[derive(Debug, Clone)]
 pub enum StreamEmission {
     OutputItemAdded(ResponseItem),
@@ -48,11 +54,41 @@ pub struct ResolvedToolCall {
     pub internal_call: ChatToolCall,
 }
 
+/// Why a streamed upstream tool call was soft-rejected instead of executed (E1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolRejectionReason {
+    /// The tool name was NOT in the offered tool set for this turn — a
+    /// hallucinated/unoffered tool (e.g. a Claude Code tool the client DEFERS
+    /// behind `ToolSearch` and did not offer). NOT executable, NOT handed off.
+    UnknownTool,
+}
+
+/// A streamed upstream tool call that [`StreamState::finalize`] classified as
+/// non-executable (E1). It is NOT in [`FinalizedAssistantTurn::tool_calls`] (so
+/// it is never executed or handed to the client); the engine taints the whole
+/// batch, injects a synthetic tool result for it, and runs a bounded in-gateway
+/// repair round so the model can self-correct.
+///
+/// `raw_arguments` carries the model's argument text capped for LOGGING ONLY —
+/// it is never JSON-parsed (the call was never executable, and parsing untrusted
+/// args of an unknown tool buys nothing but a second failure mode).
+#[derive(Debug, Clone)]
+pub struct RejectedToolCall {
+    pub call_id: String,
+    pub name: String,
+    pub raw_arguments: String,
+    pub reason: ToolRejectionReason,
+}
+
 #[derive(Debug, Clone)]
 pub struct FinalizedAssistantTurn {
     pub message_item: Option<ResponseItem>,
     pub reasoning_item: Option<ResponseItem>,
     pub tool_calls: Vec<ResolvedToolCall>,
+    /// E1: tool calls whose name was not in the offered set. Empty on a normal
+    /// turn; non-empty taints the WHOLE batch (no `tool_calls` are executed or
+    /// handed off) and triggers the engine's bounded repair round.
+    pub rejected_tool_calls: Vec<RejectedToolCall>,
     pub internal_assistant_message: Option<ChatMessage>,
     pub content_part_emitted: bool,
     pub reasoning_part_emitted: bool,
@@ -253,15 +289,45 @@ impl StreamState {
             None
         };
         let mut resolved_tool_calls = Vec::new();
+        let mut rejected_tool_calls = Vec::new();
         let mut internal_tool_calls = Vec::new();
         for accumulator in self.tool_calls.into_values() {
+            // A missing function name is still a HARD error: the chunk stream is
+            // malformed, not a recoverable unoffered-tool generation.
             let name = accumulator.name.ok_or_else(|| {
                 AppError::upstream("upstream tool call chunk missing function name")
             })?;
             let name_lc = name.to_ascii_lowercase();
-            let tool_kind = registry.get(&name_lc).cloned().ok_or_else(|| {
-                AppError::upstream(format!("unknown tool returned by upstream: {name}"))
-            })?;
+            let call_id = accumulator
+                .id
+                .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+            // E1: an unknown/unoffered tool name is a RECOVERABLE upstream
+            // generation error, NOT a hard error (the old `?` aborted the SSE
+            // stream mid-flight). Classify it into `rejected_tool_calls` WITHOUT
+            // JSON-parsing its arguments (never executable), and replay the
+            // attempted call into the assistant message so the engine's synthetic
+            // repair-round tool result lines up by `call_id`. Malformed KNOWN-tool
+            // args / invalid `local_shell` below STILL hard-error (unchanged).
+            let Some(tool_kind) = registry.get(&name_lc).cloned() else {
+                let raw_arguments =
+                    cap_str(&accumulator.arguments_text, REJECTED_TOOL_ARGS_CAP_BYTES);
+                internal_tool_calls.push(ChatToolCall {
+                    id: Some(call_id.clone()),
+                    index: Some(0),
+                    kind: "function".to_string(),
+                    function: crate::models::chat::ChatFunctionCall {
+                        name: Some(name.clone()),
+                        arguments: Some(Value::String(raw_arguments.clone())),
+                    },
+                });
+                rejected_tool_calls.push(RejectedToolCall {
+                    call_id,
+                    name,
+                    raw_arguments,
+                    reason: ToolRejectionReason::UnknownTool,
+                });
+                continue;
+            };
             let arguments = if accumulator.arguments_text.trim().is_empty() {
                 Value::Object(Default::default())
             } else {
@@ -272,9 +338,6 @@ impl StreamState {
                     ))
                 })?
             };
-            let call_id = accumulator
-                .id
-                .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
             let public_item = match &tool_kind {
                 ToolKind::Function {
                     public_name,
@@ -408,6 +471,7 @@ impl StreamState {
             message_item,
             reasoning_item,
             tool_calls: resolved_tool_calls,
+            rejected_tool_calls,
             internal_assistant_message,
             content_part_emitted: self.content_part_emitted,
             reasoning_part_emitted: self.reasoning_part_emitted,
@@ -415,6 +479,21 @@ impl StreamState {
             finish_reason: self.finish_reason,
         })
     }
+}
+
+/// Truncate `s` to at most `cap` bytes on a char boundary, appending a short
+/// elision marker when it was cut. Used to bound unknown-tool argument text on a
+/// [`RejectedToolCall`] (E1) — kept for logging / the synthetic repair echo, not
+/// for execution.
+fn cap_str(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…[truncated {} bytes]", &s[..end], s.len() - end)
 }
 
 fn append_argument_fragment(buffer: &mut String, value: &Value) {
@@ -735,19 +814,116 @@ mod tests {
     }
 
     #[test]
-    fn finalize_unknown_tool() {
+    fn finalize_unknown_tool_is_rejected_not_errored() {
+        // E1: an unoffered tool name no longer hard-errors (which aborted the SSE
+        // stream); it is classified into `rejected_tool_calls`, kept OUT of the
+        // executable `tool_calls`, and replayed into the assistant message so the
+        // repair round's synthetic tool result lines up by call_id.
         let mut state = StreamState::default();
         state.apply_chunk(&tool_call_chunk(
             "c1",
             Some("call_1"),
             0,
-            Some("unknown_fn"),
-            Some("{}"),
+            Some("Grep"),
+            Some(r#"{"pattern":"foo"}"#),
         ));
         let registry = simple_registry(vec![]);
-        let result = state.finalize(&registry);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown tool"));
+        let finalized = state
+            .finalize(&registry)
+            .expect("unknown tool must not error");
+        assert!(finalized.tool_calls.is_empty());
+        assert_eq!(finalized.rejected_tool_calls.len(), 1);
+        let rejected = &finalized.rejected_tool_calls[0];
+        assert_eq!(rejected.name, "Grep");
+        assert_eq!(rejected.call_id, "call_1");
+        assert_eq!(rejected.reason, ToolRejectionReason::UnknownTool);
+        assert_eq!(rejected.raw_arguments, r#"{"pattern":"foo"}"#);
+        // The attempted call is replayed into the assistant message verbatim.
+        let internal = finalized
+            .internal_assistant_message
+            .expect("assistant message present for a lone rejected call");
+        let tool_calls = internal.tool_calls.expect("rejected call replayed");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name.as_deref(), Some("Grep"));
+    }
+
+    #[test]
+    fn finalize_mixed_valid_and_unknown_splits_into_tool_calls_and_rejected() {
+        // A batch with one offered tool and one hallucinated tool: the valid call
+        // resolves into `tool_calls`, the unknown into `rejected_tool_calls`, and
+        // BOTH are replayed into the assistant message (so the engine can supply a
+        // synthetic result per call_id when it taints the batch).
+        let mut state = StreamState::default();
+        state.apply_chunk(&tool_call_chunk(
+            "c1",
+            Some("call_ok"),
+            0,
+            Some("echo"),
+            Some(r#"{"value":"hi"}"#),
+        ));
+        state.apply_chunk(&tool_call_chunk(
+            "c1",
+            Some("call_bad"),
+            1,
+            Some("Grep"),
+            Some(r#"{"pattern":"x"}"#),
+        ));
+        let registry = simple_registry(vec![(
+            "echo",
+            ToolKind::Function {
+                public_name: "echo".to_string(),
+                namespace: None,
+            },
+        )]);
+        let finalized = state
+            .finalize(&registry)
+            .expect("mixed batch must not error");
+        assert_eq!(finalized.tool_calls.len(), 1);
+        assert_eq!(finalized.rejected_tool_calls.len(), 1);
+        assert_eq!(finalized.rejected_tool_calls[0].name, "Grep");
+        // The assistant message carries BOTH attempted calls.
+        let tool_calls = finalized
+            .internal_assistant_message
+            .expect("assistant message present")
+            .tool_calls
+            .expect("both calls replayed");
+        assert_eq!(tool_calls.len(), 2);
+    }
+
+    #[test]
+    fn finalize_does_not_json_parse_unknown_tool_arguments() {
+        // E1: unknown-tool args are NEVER JSON-parsed (the call was never
+        // executable). Even syntactically-broken args must classify as rejected,
+        // not surface a parse error, and the raw text is carried as-is (capped).
+        let mut state = StreamState::default();
+        state.apply_chunk(&tool_call_chunk(
+            "c1",
+            Some("call_1"),
+            0,
+            Some("Grep"),
+            Some("not json at all {{{"),
+        ));
+        let registry = simple_registry(vec![]);
+        let finalized = state
+            .finalize(&registry)
+            .expect("must not parse / not error");
+        assert_eq!(finalized.rejected_tool_calls.len(), 1);
+        assert_eq!(
+            finalized.rejected_tool_calls[0].raw_arguments,
+            "not json at all {{{"
+        );
+    }
+
+    #[test]
+    fn cap_str_truncates_on_char_boundary() {
+        assert_eq!(cap_str("hello", 10), "hello");
+        let capped = cap_str("abcdefghij", 4);
+        assert!(capped.starts_with("abcd"));
+        assert!(capped.contains("truncated"));
+        // Multi-byte boundary: cap mid-char must not panic and stays valid UTF-8.
+        let s = "héllo wörld"; // non-ASCII at byte 1
+        let capped = cap_str(s, 2);
+        assert!(capped.is_char_boundary(0));
     }
 
     #[test]

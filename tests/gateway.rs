@@ -9848,3 +9848,740 @@ async fn sse_responses_include_connection_keep_alive() {
         .and_then(|v| v.to_str().ok());
     assert_eq!(connection, Some("keep-alive"));
 }
+
+// ===========================================================================
+// E1 — bounded soft-reject repair for hallucinated upstream tool calls.
+// ===========================================================================
+
+/// One streamed tool-call delta chunk with independent control over `id` / `name`
+/// / `arguments` / `index` / finish — lets E1 tests reproduce a tool whose name
+/// arrives BEFORE, WITH, or AFTER its argument fragments.
+fn e1_tool_chunk(
+    id: &str,
+    call_id: Option<&str>,
+    index: usize,
+    name: Option<&str>,
+    arguments: Option<&str>,
+    finish: bool,
+) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatDelta {
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![ChatToolCall {
+                    id: call_id.map(str::to_string),
+                    index: Some(index),
+                    kind: "function".to_string(),
+                    function: ChatFunctionCall {
+                        name: name.map(str::to_string),
+                        arguments: arguments.map(|s| serde_json::Value::String(s.to_string())),
+                    },
+                }]),
+                function_call: None,
+                refusal: None,
+                extra: Default::default(),
+            },
+            finish_reason: finish.then(|| "tool_calls".to_string()),
+        }],
+        usage: None,
+    }
+}
+
+/// Concatenate every collected Responses SSE event into one JSON blob so a test
+/// can assert that a hallucinated tool name / its arguments NEVER appear in the
+/// client-facing stream.
+fn e1_events_blob(events: &[serde_json::Value]) -> String {
+    events
+        .iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn e1_repaired_count(gateway: &Gateway) -> u64 {
+    gateway
+        .unknown_tool_call_counts()
+        .iter()
+        .filter(|((_, _, outcome), _)| *outcome == llmconduit::engine::UnknownToolOutcome::Repaired)
+        .map(|(_, count)| *count)
+        .sum()
+}
+
+fn e1_exhausted_count(gateway: &Gateway) -> u64 {
+    gateway
+        .unknown_tool_call_counts()
+        .iter()
+        .filter(|((_, _, outcome), _)| {
+            *outcome == llmconduit::engine::UnknownToolOutcome::Exhausted
+        })
+        .map(|(_, count)| *count)
+        .sum()
+}
+
+#[tokio::test]
+async fn e1_unknown_tool_self_corrects_via_repair_round_responses() {
+    // The incident, recovered: the model emits a tool NOT in the offered set
+    // (`Grep`), the gateway soft-rejects it (no `?` abort), runs ONE in-gateway
+    // repair round, and the model self-corrects with a text answer. The client
+    // stream COMPLETES (never `response.failed`), never sees the hallucinated tool
+    // or its argument deltas, and the `Repaired` outcome is counted.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(e1_tool_chunk(
+            "chat-0",
+            Some("call_bad"),
+            0,
+            Some("Grep"),
+            Some(r#"{"pattern":"needle"}"#),
+            true,
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "The answer is 42."))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let events = collect_stream(
+        gateway
+            .clone()
+            .stream_responses(base_request(vec![user_message("search the code")]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let names = event_names(&events);
+    assert!(
+        names.contains(&"response.completed"),
+        "the turn must recover and complete, not abort: {names:?}"
+    );
+    assert!(
+        !names.contains(&"response.failed"),
+        "a self-correcting turn must not emit response.failed: {names:?}"
+    );
+    // Exactly two upstream rounds: the original + one bounded repair round.
+    assert_eq!(upstream.requests().await.len(), 2, "one repair round ran");
+    // The hallucinated tool and its arguments are NEVER in the client stream.
+    let blob = e1_events_blob(&events);
+    assert!(
+        !blob.contains("Grep"),
+        "hallucinated tool name leaked: {blob}"
+    );
+    assert!(
+        !blob.contains("needle"),
+        "hallucinated tool arguments leaked: {blob}"
+    );
+    assert!(
+        !names.contains(&"response.function_call_arguments.delta"),
+        "no tool-arg deltas reach the client for the hidden call: {names:?}"
+    );
+    // The recovered answer is delivered.
+    assert!(blob.contains("The answer is 42."), "recovered text missing");
+    // Observability: a Repaired outcome was counted.
+    assert_eq!(e1_repaired_count(&gateway), 1, "repaired outcome counted");
+    assert_eq!(e1_exhausted_count(&gateway), 0);
+}
+
+#[tokio::test]
+async fn e1_malformed_unknown_tool_args_do_not_error_the_stream() {
+    // E1: unknown-tool arguments are NEVER JSON-parsed. Even syntactically broken
+    // args must NOT surface a parse error / abort — the call is soft-rejected and
+    // the turn recovers.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(e1_tool_chunk(
+            "chat-0",
+            Some("call_bad"),
+            0,
+            Some("Grep"),
+            Some("}{ not json at all"),
+            true,
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "done"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let events = collect_stream(
+        gateway
+            .stream_responses(base_request(vec![user_message("go")]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+    let names = event_names(&events);
+    assert!(names.contains(&"response.completed"));
+    assert!(!names.contains(&"response.failed"));
+    assert!(!e1_events_blob(&events).contains("not json"));
+}
+
+#[tokio::test]
+async fn e1_unknown_tool_deltas_hidden_chat_completions() {
+    // Deltas-hidden assertion on the CHAT inbound format: the hallucinated tool
+    // never appears in the chat response; the recovered text is returned.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(e1_tool_chunk(
+            "chat-0",
+            Some("call_bad"),
+            0,
+            Some("Grep"),
+            Some(r#"{"pattern":"x"}"#),
+            true,
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "recovered answer"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "messages": [{ "role": "user", "content": "search" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+    assert!(
+        !text.contains("Grep"),
+        "tool name leaked to chat client: {text}"
+    );
+    assert!(text.contains("recovered answer"), "recovered text missing");
+}
+
+#[tokio::test]
+async fn e1_unknown_tool_deltas_hidden_anthropic_stream() {
+    // Deltas-hidden assertion on the ANTHROPIC inbound format (streaming): the
+    // hallucinated tool never appears; the stream ends cleanly with the recovered
+    // text.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(e1_tool_chunk(
+            "chat-0",
+            Some("call_bad"),
+            0,
+            Some("Grep"),
+            Some(r#"{"pattern":"x"}"#),
+            true,
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "recovered text"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "search" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+    assert!(
+        text.contains("event: message_stop"),
+        "stream did not end cleanly"
+    );
+    assert!(
+        !text.contains("Grep"),
+        "tool name leaked to anthropic client: {text}"
+    );
+    assert!(text.contains("recovered text"), "recovered text missing");
+}
+
+#[tokio::test]
+async fn e1_mixed_batch_is_tainted_no_handoff_and_injects_repair_context() {
+    // Mixed valid+hallucinated in ONE batch: the whole batch is TAINTED. The
+    // valid `echo` (here streamed name-LAST so it is buffered) is NOT handed off,
+    // a synthetic `not_executed` result is supplied for it, a `tool_unavailable`
+    // result for the unknown `Grep`, and the closed-tool-set prevention note is
+    // added to the repair-round upstream request.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            // Grep (unknown), name-first → dropped by the gate.
+            Ok(e1_tool_chunk(
+                "chat-0",
+                Some("call_bad"),
+                0,
+                Some("Grep"),
+                Some(r#"{"pattern":"x"}"#),
+                false,
+            )),
+            // echo (valid) args BEFORE its name → buffered by the gate.
+            Ok(e1_tool_chunk(
+                "chat-0",
+                Some("call_ok"),
+                1,
+                None,
+                Some(r#"{"value":"hi"}"#),
+                false,
+            )),
+            // echo name arrives name-only (no delta) at the end.
+            Ok(e1_tool_chunk(
+                "chat-0",
+                Some("call_ok"),
+                1,
+                Some("echo"),
+                None,
+                true,
+            )),
+        ])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "recovered"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let mut request = base_request(vec![user_message("do it")]);
+    request.tools = vec![ToolSpec::Function {
+        name: "echo".to_string(),
+        description: "Echo a value".to_string(),
+        strict: false,
+        parameters: json!({
+            "type": "object",
+            "properties": { "value": { "type": "string" } }
+        }),
+    }];
+
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    let names = event_names(&events);
+    // The turn recovered.
+    assert!(names.contains(&"response.completed"), "{names:?}");
+    assert!(!names.contains(&"response.failed"), "{names:?}");
+    // NEITHER tool in the tainted batch was handed off / surfaced: no function
+    // call output item, and no hidden tool name leaked.
+    let done = done_items(&events);
+    assert!(
+        !done
+            .iter()
+            .any(|item| matches!(item, ResponseItem::FunctionCall { .. })),
+        "a tainted batch must hand off NO client tool"
+    );
+    let blob = e1_events_blob(&events);
+    assert!(!blob.contains("Grep"), "hidden tool leaked: {blob}");
+    assert!(
+        !blob.contains("\"hi\""),
+        "buffered valid-tool args leaked on taint: {blob}"
+    );
+
+    // The repair round (second upstream request) carries: a synthetic tool result
+    // for BOTH calls + the closed-tool-set prevention note.
+    let repair = &upstream.requests().await[1];
+    let tool_results: Vec<&str> = repair
+        .messages
+        .iter()
+        .filter(|m| m.role == "tool")
+        .filter_map(|m| m.content.as_ref().and_then(|c| c.as_str()))
+        .collect();
+    assert!(
+        tool_results.iter().any(|c| c.contains("not_executed")),
+        "valid tainted call needs a not_executed result: {tool_results:?}"
+    );
+    assert!(
+        tool_results.iter().any(|c| c.contains("tool_unavailable")),
+        "unknown call needs a tool_unavailable result: {tool_results:?}"
+    );
+    let has_closed_set_note = repair.messages.iter().any(|m| {
+        m.role == "system"
+            && m.content
+                .as_ref()
+                .and_then(|c| c.as_str())
+                .is_some_and(|c| c.contains("only call tools"))
+    });
+    assert!(
+        has_closed_set_note,
+        "prevention note (closed tool set) must be added to the repair request"
+    );
+}
+
+#[tokio::test]
+async fn e1_repair_ceiling_emits_structured_terminal_responses_with_observability() {
+    // A model that emits the bad tool EVERY round hits the repair ceiling and the
+    // turn ends with a STRUCTURED `response.failed` (code `invalid_tool_call`) —
+    // NOT a raw mid-stream abort. Bounded: original + ceiling(=1) repair = 2
+    // upstream rounds. Observability: Exhausted counted + both monitor phases.
+    let upstream = MockUpstream::default();
+    for n in 0..6 {
+        upstream
+            .push_response(vec![Ok(e1_tool_chunk(
+                &format!("chat-{n}"),
+                Some(&format!("call_bad_{n}")),
+                0,
+                Some("Grep"),
+                Some(r#"{"pattern":"x"}"#),
+                true,
+            ))])
+            .await;
+    }
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let mut monitor = gateway.subscribe_monitor();
+
+    let events = collect_stream(
+        gateway
+            .clone()
+            .stream_responses(base_request(vec![user_message("loop forever")]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+
+    let names = event_names(&events);
+    assert!(
+        names.contains(&"response.failed"),
+        "ceiling must end with a structured terminal failure: {names:?}"
+    );
+    // Structured: code is `invalid_tool_call`, message does not leak the tool name.
+    let failed = events
+        .iter()
+        .find(|e| e["_event"] == "response.failed")
+        .expect("response.failed present");
+    assert_eq!(
+        failed["response"]["error"]["code"], "invalid_tool_call",
+        "terminal failure must carry the structured code"
+    );
+    let blob = e1_events_blob(&events);
+    assert!(!blob.contains("Grep"), "tool name leaked: {blob}");
+    // Bounded: original + exactly one repair round.
+    assert_eq!(
+        upstream.requests().await.len(),
+        UNKNOWN_TOOL_REPAIR_CEILING_FOR_TEST + 1,
+        "repair is bounded by the ceiling"
+    );
+    // Observability: Exhausted counted, no Repaired.
+    assert_eq!(e1_exhausted_count(&gateway), 1);
+    assert_eq!(e1_repaired_count(&gateway), 0);
+    // Monitor phases emitted via emit_with.
+    let mut monitor_blob = String::new();
+    while let Ok(update) = monitor.try_recv() {
+        monitor_blob.push_str(&serde_json::to_string(&update).expect("serialize update"));
+    }
+    assert!(
+        monitor_blob.contains("unknown_tool_rejected"),
+        "missing unknown_tool_rejected phase"
+    );
+    assert!(
+        monitor_blob.contains("unknown_tool_repair_exhausted"),
+        "missing unknown_tool_repair_exhausted phase"
+    );
+}
+
+/// The engine's `UNKNOWN_TOOL_REPAIR_CEILING` (default 1) mirrored for test
+/// arithmetic — the engine const is private, so a drift here is caught by the
+/// bounded-round-count assertion above.
+const UNKNOWN_TOOL_REPAIR_CEILING_FOR_TEST: usize = 1;
+
+#[tokio::test]
+async fn e1_repair_ceiling_preserves_already_streamed_text() {
+    // Text the model emitted BEFORE the bad tool, across rounds, is preserved
+    // (never retracted) even though the turn ends in a terminal failure.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-0", "thinking out loud ")),
+            Ok(e1_tool_chunk(
+                "chat-0",
+                Some("call_bad_0"),
+                0,
+                Some("Grep"),
+                Some("{}"),
+                true,
+            )),
+        ])
+        .await;
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "still trying ")),
+            Ok(e1_tool_chunk(
+                "chat-1",
+                Some("call_bad_1"),
+                0,
+                Some("Grep"),
+                Some("{}"),
+                true,
+            )),
+        ])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let events = collect_stream(
+        gateway
+            .stream_responses(base_request(vec![user_message("go")]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+    let names = event_names(&events);
+    assert!(names.contains(&"response.failed"), "{names:?}");
+    let blob = e1_events_blob(&events);
+    // Both rounds' already-streamed text survived to the client.
+    assert!(blob.contains("thinking out loud"), "round-0 text retracted");
+    assert!(blob.contains("still trying"), "round-1 text retracted");
+    assert!(!blob.contains("Grep"), "tool name leaked: {blob}");
+}
+
+#[tokio::test]
+async fn e1_repair_ceiling_structured_terminal_chat_stream() {
+    // Ceiling terminal on the CHAT inbound format (streaming): a structured SSE
+    // error frame, not a raw abort, and no leaked tool name.
+    let upstream = MockUpstream::default();
+    for n in 0..4 {
+        upstream
+            .push_response(vec![Ok(e1_tool_chunk(
+                &format!("chat-{n}"),
+                Some(&format!("call_bad_{n}")),
+                0,
+                Some("Grep"),
+                Some("{}"),
+                true,
+            ))])
+            .await;
+    }
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "go" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+    // Parse the SSE error frame and assert it carries the STRUCTURED code
+    // (acceptance #5) — the OpenAI Chat error object has a `code` field, so the
+    // canonical terminal's `invalid_tool_call` must reach the chat client, not
+    // just the human message.
+    let error_frame = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .find(|value| value.get("error").is_some())
+        .expect("chat ceiling must emit a structured error frame");
+    assert_eq!(
+        error_frame["error"]["code"], "invalid_tool_call",
+        "chat SSE error must carry the structured code, not drop it: {text}"
+    );
+    assert!(
+        error_frame["error"]["message"].is_string(),
+        "chat error frame keeps the human message too: {text}"
+    );
+    assert!(
+        text.contains("[DONE]"),
+        "chat error frame must still close the stream"
+    );
+    assert!(
+        !text.contains("Grep"),
+        "tool name leaked to chat client: {text}"
+    );
+}
+
+#[tokio::test]
+async fn e1_repair_ceiling_structured_terminal_anthropic_stream() {
+    // Ceiling terminal on the ANTHROPIC inbound format (streaming): a structured
+    // `error` event, not a raw abort, and no leaked tool name.
+    let upstream = MockUpstream::default();
+    for n in 0..4 {
+        upstream
+            .push_response(vec![Ok(e1_tool_chunk(
+                &format!("chat-{n}"),
+                Some(&format!("call_bad_{n}")),
+                0,
+                Some("Grep"),
+                Some("{}"),
+                true,
+            ))])
+            .await;
+    }
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "go" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+    assert!(
+        text.contains("event: error"),
+        "anthropic ceiling needs an error event: {text}"
+    );
+    assert!(
+        !text.contains("Grep"),
+        "tool name leaked to anthropic client: {text}"
+    );
+}
+
+/// E1 cancellation harness: the FIRST upstream call yields a hallucinated tool
+/// call then ENDS (so the engine soft-rejects and starts a repair round); EVERY
+/// later call (the repair round) PARKS forever, so a client drop DURING the
+/// repair round must cancel the parked upstream stream.
+#[derive(Clone)]
+struct RepairRoundPendingUpstream {
+    calls: Arc<Mutex<usize>>,
+    repair_polled: Arc<Notify>,
+    repair_dropped: Arc<Notify>,
+}
+
+impl RepairRoundPendingUpstream {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(0)),
+            repair_polled: Arc::new(Notify::new()),
+            repair_dropped: Arc::new(Notify::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl UpstreamClient for RepairRoundPendingUpstream {
+    async fn stream_chat_completion(
+        &self,
+        _backend: &llmconduit::upstream::BackendChatRequest,
+    ) -> Result<UpstreamStream, llmconduit::error::AppError> {
+        let mut calls = self.calls.lock().await;
+        let call_index = *calls;
+        *calls += 1;
+        drop(calls);
+        if call_index == 0 {
+            // Round 0: a single hallucinated tool call, then the stream ENDS so
+            // the engine finalizes, soft-rejects, and begins a repair round.
+            let stream = async_stream::stream! {
+                yield Ok(e1_tool_chunk("chat-0", Some("call_bad"), 0, Some("Grep"), Some("{}"), true));
+            };
+            Ok(Box::pin(stream))
+        } else {
+            // Repair round: park forever so the client can cancel it.
+            let repair_polled = Arc::clone(&self.repair_polled);
+            let repair_dropped = Arc::clone(&self.repair_dropped);
+            let stream = async_stream::stream! {
+                let _drop_guard = NotifyOnDrop { notify: repair_dropped };
+                repair_polled.notify_waiters();
+                std::future::pending::<()>().await;
+                yield Ok(content_chunk("chat-1", "unreachable"));
+            };
+            Ok(Box::pin(stream))
+        }
+    }
+
+    async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
+        Err(llmconduit::error::AppError::internal("unused in this test"))
+    }
+
+    async fn supported_model_catalog(
+        &self,
+    ) -> Result<Vec<UpstreamModelEntry>, llmconduit::error::AppError> {
+        Ok(vec![UpstreamModelEntry {
+            id: "glm-5.1".to_string(),
+            context_limit: None,
+        }])
+    }
+}
+
+#[tokio::test]
+async fn e1_repair_round_is_cancellable_on_client_hangup() {
+    // Cancellation is preserved ACROSS the repair round: while the repair round's
+    // upstream is parked, a client hang-up (dropping the stream) cancels it — the
+    // parked upstream stream is dropped, exactly like the main loop.
+    let upstream = RepairRoundPendingUpstream::new();
+    // Clone the signal handles BEFORE moving the upstream into the gateway.
+    let repair_polled = Arc::clone(&upstream.repair_polled);
+    let repair_dropped = Arc::clone(&upstream.repair_dropped);
+    let gateway = test_gateway_with_flow_store_upstream(Arc::new(upstream));
+
+    let mut stream = gateway
+        .stream_responses(base_request(vec![user_message("go")]))
+        .await
+        .expect("stream");
+
+    // Drive the SSE stream until the repair round's upstream parks. Pin the
+    // `Notified` futures so they stay registered across the select loop (a fresh
+    // `notified()` each iteration would miss the `notify_waiters` wake).
+    let polled = repair_polled.notified();
+    let dropped = repair_dropped.notified();
+    tokio::pin!(polled);
+    tokio::pin!(dropped);
+    let pump = async {
+        loop {
+            tokio::select! {
+                _ = stream.next() => {}
+                _ = &mut polled => break,
+            }
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), pump)
+        .await
+        .expect("repair round reached and parked");
+
+    // Client hangs up mid-repair-round.
+    drop(stream);
+
+    // The parked repair-round upstream stream must be dropped (cancelled).
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut dropped)
+        .await
+        .expect("repair-round upstream cancelled on client hang-up");
+}
