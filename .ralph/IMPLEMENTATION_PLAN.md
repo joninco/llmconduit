@@ -109,3 +109,43 @@ Retention/privacy → full-text search + flow compare; export JSON/curl + effect
 theater depth; OTel/Prometheus + real alerting; web-search/tool observability + SLO + abuse scan; replay
 (gated+audited) + command palette. Also deferred: streaming-stall / inter-token health; provider
 health-history (cooldown timeline); outlier / slow-request spotlight.
+
+---
+
+## Topic E — Engine robustness (post-dashboard; independent of gaps 01–16)
+
+> **Source:** `/ralph-guide-update` 2026-06-29 — a field incident (`API Error: unknown tool returned by
+> upstream: Grep`) + `/askcodex` gpt-5.5 xhigh design review. These are BACKEND engine fixes, not
+> dashboard gaps — they ride the same REVIEW_PROTOCOL (Codex-xhigh per task) but touch `src/*.rs`, not
+> `dashboard-frontend/`. Gate = **B** (backend: `cargo test` + `cargo clippy --all-targets` + `cargo
+> fmt` + Codex-xhigh APPROVED). Independent of the dashboard program; schedule anytime.
+
+### Task E1 — Bounded soft-reject repair for hallucinated upstream tool calls
+**Spec:** `.ralph/specs/E1-hallucinated-tool-call-repair.md` · **Gate:** B · **Status:** ⬜ PENDING · **Deps:** none
+**Incident:** a fallback model (DeepSeek-V4-Flash serving a requested `claude-opus-*`) emitted a
+tool_call named `Grep` — a canonical Claude Code tool that CC DEFERS behind `ToolSearch` and did NOT
+offer this turn. `finalize()` (`src/adapters/chat_to_responses.rs:263`) hard-errors
+(`AppError::upstream("unknown tool returned by upstream: Grep")`); the engine tool-loop
+(`src/engine.rs:2253` `state.finalize(&tool_registry)?`) propagates `?` and ABORTS the SSE stream
+mid-flight (200 + headers already sent ⇒ can't be a clean 4xx ⇒ broken session; currently invisible in
+`journalctl`).
+**Fix (Codex xhigh: A2+C — bounded soft-reject REPAIR):** `finalize()` CLASSIFIES unknown tool names
+into a new `rejected_tool_calls` list (no `Err`; known-tool malformed-arg/missing-name/bad-local_shell
+hard errors stay); extend `ToolDeltaGate` (`src/tool_delta_gate.rs`) so unknown-tool argument deltas are
+buffered-until-name then DROPPED (never reach the client), reusing its existing 256 KiB/1 MiB caps; the
+engine taints the whole batch, injects synthetic `tool` results, and runs ONE extra in-gateway upstream
+round (same loop shape as web-search at `engine.rs:2253-2356`) bounded by a new
+`UNKNOWN_TOOL_REPAIR_CEILING` (default 1, max 2 — mirrors `WEB_SEARCH_ROUNDS_HARD_CEILING` at
+`engine.rs:2340`); on exhaustion emit a STRUCTURED terminal failure per inbound format (Responses
+`response.failed` / Anthropic `error` / Chat SSE error), never a raw `?` abort; add a closed-tool-set
+prevention note to the upstream request. Rejected: alias/auto-inject (B), pass-through (D), plain-skip
+(A1), hard-error (E).
+**Files:** src/adapters/chat_to_responses.rs, src/engine.rs, src/tool_delta_gate.rs, src/monitor.rs, tests/
+**Acceptance (full list in spec E1):** unknown→rejected not Err; deltas hidden on all 3 formats; tainted
+batch (no partial exec/handoff); bounded repair round self-corrects; ceiling→structured terminal per
+format with text preserved; no JSON-parse of unknown args; cancellation preserved across repair rounds;
+canonical-Responses-only; observability (warn + `unknown_tool_call_total{provider,served_model,outcome}`
+counter, no raw-name labels + `unknown_tool_rejected`/`unknown_tool_repair_exhausted` monitor phases);
+`cargo test`/clippy/fmt green; Codex-xhigh APPROVED.
+**Sequencing:** Independent — no deps on the dashboard gaps or other Topic-E tasks. Reuses ToolDeltaGate
+(U7/T3) caps + the web-search-round loop pattern + the MonitorHub `emit_with` choke-point.
