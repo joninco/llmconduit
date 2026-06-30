@@ -199,7 +199,7 @@ impl AnthropicStreamConverter {
                         text: delta.to_string(),
                     },
                 });
-                self.record_output_delta(delta, output);
+                self.record_output_delta(delta);
             }
             _ => {
                 self.flush_reasoning_as_thinking(output);
@@ -213,7 +213,7 @@ impl AnthropicStreamConverter {
                             text: delta.to_string(),
                         },
                     });
-                    self.record_output_delta(delta, output);
+                    self.record_output_delta(delta);
                 }
             }
         }
@@ -233,9 +233,10 @@ impl AnthropicStreamConverter {
         if self.reasoning.is_late_reasoning() {
             return;
         }
-        // Defer: buffer the reasoning, but keep progressive output-usage live so
-        // clients still see the token counter advance while the model thinks.
-        self.record_output_delta(delta, output);
+        // Defer: buffer the reasoning. Output-token bookkeeping still
+        // accumulates (record_output_delta), but it no longer pushes a
+        // progressive `message_delta` -- see that function's doc comment.
+        self.record_output_delta(delta);
         self.reasoning.push_reasoning(delta);
     }
 
@@ -298,7 +299,7 @@ impl AnthropicStreamConverter {
                     partial_json: delta.to_string(),
                 },
             });
-            self.record_output_delta(delta, output);
+            self.record_output_delta(delta);
         }
     }
 
@@ -356,7 +357,7 @@ impl AnthropicStreamConverter {
                     partial_json: arguments.to_string(),
                 },
             });
-            self.record_output_delta(arguments, output);
+            self.record_output_delta(arguments);
         }
         self.close_open_block(output);
         self.emitted_tool_call_ids.insert(call_id.to_string());
@@ -678,7 +679,20 @@ impl AnthropicStreamConverter {
         }
     }
 
-    fn record_output_delta(&mut self, delta: &str, output: &mut Vec<AnthropicStreamEvent>) {
+    /// Update output-token bookkeeping for a streamed delta chunk.
+    ///
+    /// Bookkeeping-ONLY (deviation #1 fix): this used to also push a progressive
+    /// `message_delta` onto the wire for every chunk, which produced a
+    /// `message_delta` storm (10+ events in a typical reasoning+text turn) --
+    /// real Anthropic streams (and strict client SDKs) expect exactly ONE
+    /// terminal `message_delta`. The byte-count estimate is still worth keeping,
+    /// though: `last_output_tokens` is the only source for the terminal delta's
+    /// `output_tokens` when upstream usage is absent, read by both the streaming
+    /// terminal paths (`handle_completed` / `finalize`) and the non-stream
+    /// collector (`collector.rs:150-156`). Dropping the bookkeeping alongside the
+    /// removed push would silently zero out `output_tokens` on every upstream
+    /// that doesn't report usage.
+    fn record_output_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
@@ -686,21 +700,7 @@ impl AnthropicStreamConverter {
         let estimated_tokens = self
             .estimated_output_bytes
             .div_ceil(ESTIMATED_OUTPUT_TOKEN_BYTES) as u64;
-        if estimated_tokens <= self.last_output_tokens {
-            return;
-        }
-        self.last_output_tokens = estimated_tokens;
-        output.push(AnthropicStreamEvent::MessageDelta {
-            delta: AnthropicMessageDeltaBody {
-                stop_reason: None,
-                stop_sequence: None,
-            },
-            usage: AnthropicUsage {
-                input_tokens: None,
-                output_tokens: Some(estimated_tokens),
-                server_tool_use: None,
-            },
-        });
+        self.last_output_tokens = self.last_output_tokens.max(estimated_tokens);
     }
 
     fn start_text_block(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
@@ -776,7 +776,7 @@ impl AnthropicStreamConverter {
                     partial_json: arguments.to_string(),
                 },
             });
-            self.record_output_delta(arguments, output);
+            self.record_output_delta(arguments);
         }
         self.close_open_block(output);
         self.emitted_tool_call_ids.insert(call_id.to_string());

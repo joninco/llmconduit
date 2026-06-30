@@ -178,11 +178,9 @@ fn converts_simple_text_response() {
             "message_start",
             "content_block_start",
             "content_block_delta",
-            "message_delta",
             "content_block_delta",
-            "message_delta",
             "content_block_stop",
-            "message_delta",
+            "message_delta", // terminal stop reason -- the ONLY message_delta (C1)
             "message_stop",
         ]
     );
@@ -205,24 +203,22 @@ fn converts_reasoning_then_text_response() {
     .flat_map(|e| converter.convert(e))
     .collect();
 
-    // Reasoning is deferred (G8): its progressive output-usage is emitted
-    // live as bytes arrive, but the `thinking` block itself is not opened
-    // until the following text forces a flush. So the progress `message_delta`
-    // for the reasoning bytes precedes the (contiguous) thinking block.
+    // Reasoning is deferred (G8): it is buffered (no progressive output-usage
+    // on the wire -- C1) until the following text forces a flush, so the
+    // `thinking` block opens contiguously with the reasoning it buffered.
+    // Exactly one terminal `message_delta` ends the stream (C1).
     assert_eq!(
         event_types(&events),
         vec![
             "ping",
             "message_start",
-            "message_delta",       // progressive usage for buffered reasoning
             "content_block_start", // thinking (flushed on text arrival)
             "content_block_delta", // thinking delta
             "content_block_stop",  // close thinking before text
             "content_block_start", // text
             "content_block_delta", // text delta
-            "message_delta",       // progressive usage
             "content_block_stop",  // close text
-            "message_delta",       // terminal stop reason
+            "message_delta",       // terminal stop reason -- the ONLY message_delta
             "message_stop",
         ]
     );
@@ -385,13 +381,11 @@ fn converts_function_call_response() {
             "message_start",
             "content_block_start", // text
             "content_block_delta", // text delta
-            "message_delta",       // progressive usage
             "content_block_stop",  // close text
             "content_block_start", // tool_use
             "content_block_delta", // input_json_delta
-            "message_delta",       // progressive usage
             "content_block_stop",  // close tool_use
-            "message_delta",       // terminal stop reason
+            "message_delta",       // terminal stop reason -- the ONLY message_delta
             "message_stop",
         ]
     );
@@ -432,11 +426,9 @@ fn streams_function_call_argument_deltas_progressively() {
             "message_start",
             "content_block_start",
             "content_block_delta",
-            "message_delta",
             "content_block_delta",
-            "message_delta",
             "content_block_stop",
-            "message_delta",
+            "message_delta", // terminal stop reason -- the ONLY message_delta
             "message_stop",
         ]
     );
@@ -536,9 +528,14 @@ fn emits_usage_from_completed_response() {
 }
 
 #[test]
-fn emits_progress_usage_for_reasoning_deltas() {
+fn terminal_delta_carries_reasoning_output_tokens() {
+    // C1: `record_output_delta` is bookkeeping-only now -- buffered reasoning
+    // must not emit any `message_delta` while the model is "thinking". The
+    // byte-count bookkeeping it still accumulates (`last_output_tokens`) must
+    // surface exactly once, on the terminal delta, so `output_tokens` is
+    // non-zero even though nothing was pushed to the wire mid-stream.
     let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
-    let events: Vec<AnthropicStreamEvent> = [
+    let reasoning_events: Vec<AnthropicStreamEvent> = [
         created_event(),
         item_added_event("reasoning", ""),
         reasoning_delta_event("abcd"),
@@ -547,29 +544,47 @@ fn emits_progress_usage_for_reasoning_deltas() {
     .iter()
     .flat_map(|e| converter.convert(e))
     .collect();
+    assert!(
+        !reasoning_events
+            .iter()
+            .any(|event| matches!(event, AnthropicStreamEvent::MessageDelta { .. })),
+        "no message_delta may appear while reasoning is buffered, got {:?}",
+        event_types(&reasoning_events)
+    );
 
-    let message_deltas: Vec<_> = events
+    let terminal_events = converter.convert(&completed_event());
+    let message_deltas: Vec<_> = terminal_events
         .iter()
         .filter_map(|event| match event {
             AnthropicStreamEvent::MessageDelta { delta, usage } => Some((delta, usage)),
             _ => None,
         })
         .collect();
-    let output_tokens: Vec<u64> = message_deltas
-        .iter()
-        .filter_map(|(_, usage)| usage.output_tokens)
-        .collect();
-    assert_eq!(output_tokens, vec![1, 2]);
+    assert_eq!(
+        message_deltas.len(),
+        1,
+        "exactly one terminal message_delta, got {:?}",
+        event_types(&terminal_events)
+    );
+    let (delta, usage) = message_deltas[0];
     assert!(
-        message_deltas
-            .iter()
-            .all(|(delta, _)| delta.stop_reason.is_none()),
-        "progress usage must not terminate the message"
+        delta.stop_reason.is_some(),
+        "the sole message_delta must carry a stop_reason"
+    );
+    assert!(
+        usage.output_tokens.is_some_and(|tokens| tokens > 0),
+        "terminal output_tokens must be non-zero from the kept bookkeeping, got {:?}",
+        usage.output_tokens
     );
 }
 
 #[test]
-fn completed_without_upstream_usage_preserves_progress_usage() {
+fn completed_without_upstream_usage_uses_bookkeeping_output_tokens() {
+    // When upstream never reports usage (no `response.usage` on the terminal
+    // event), the terminal `output_tokens` must still be non-zero -- sourced
+    // from the kept `last_output_tokens` byte-count bookkeeping (C1). There is
+    // no separate "progress" wire event anymore: this must be the ONE and
+    // ONLY message_delta in the stream.
     let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
     let events: Vec<AnthropicStreamEvent> = [
         created_event(),
@@ -582,18 +597,22 @@ fn completed_without_upstream_usage_preserves_progress_usage() {
     .flat_map(|e| converter.convert(e))
     .collect();
 
-    let terminal_delta = events
+    let message_deltas: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
-            AnthropicStreamEvent::MessageDelta { delta, usage } => {
-                delta.stop_reason.as_ref().map(|reason| (reason, usage))
-            }
+            AnthropicStreamEvent::MessageDelta { delta, usage } => Some((delta, usage)),
             _ => None,
         })
-        .next()
-        .expect("terminal message_delta");
-    assert_eq!(terminal_delta.0, "end_turn");
-    assert_eq!(terminal_delta.1.output_tokens, Some(1));
+        .collect();
+    assert_eq!(
+        message_deltas.len(),
+        1,
+        "exactly one (terminal) message_delta, no progressive deltas, got {:?}",
+        event_types(&events)
+    );
+    let (delta, usage) = message_deltas[0];
+    assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
+    assert_eq!(usage.output_tokens, Some(1));
 }
 
 #[test]
@@ -987,4 +1006,89 @@ fn finalize_terminates_stream_after_failure_event() {
         Some(&"message_stop"),
         "stream must still end with message_stop, got {names:?}"
     );
+}
+
+// -- C1 conformance proof: a REAL converter run, checked against the harness
+// from Task 0B1 (`super::conformance`), not a hand-built event vector. --
+
+#[test]
+fn real_converter_reasoning_text_stream_satisfies_ordering_invariants() {
+    // C1 win, proven via the harness: a real reasoning+text converter run now
+    // satisfies invariants 1-3 + 5 (exactly one terminal message_delta with a
+    // stop_reason, never before the first content_block_start, never inside an
+    // open block, stream ends message_delta -> message_stop).
+    //
+    // TODO(C2): this turn carries no upstream reasoning signature (the
+    // DeepSeek `reasoning_content` case), so the thinking block closes with NO
+    // signature_delta -- invariant 4 is not yet satisfied. C2 adds a synthetic
+    // signature for exactly this case; once it lands, replace the
+    // `check_stream_conformant` call below with a plain
+    // `conformance::assert_stream_conformant(&events, conformance::Surface::ReasoningText)`.
+    let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+    let events: Vec<AnthropicStreamEvent> = [
+        created_event(),
+        item_added_event("reasoning", ""),
+        reasoning_delta_event("Thinking..."),
+        item_added_event("message", "assistant"),
+        text_delta_event("Answer"),
+        item_done_event("reasoning", json!({})),
+        item_done_event("message", json!({})),
+        completed_event(),
+    ]
+    .iter()
+    .flat_map(|e| converter.convert(e))
+    .collect();
+
+    let failure =
+        conformance::check_stream_conformant(&events, conformance::Surface::ReasoningText)
+            .expect_err("invariant 4 (signature) is not yet satisfied pre-C2");
+    assert!(
+        failure.contains("invariant 4"),
+        "expected ONLY invariant 4 (signature, pending C2) to fail, got: {failure}"
+    );
+}
+
+#[test]
+fn client_tool_use_stream_is_fully_conformant() {
+    // C1 win, CLIENT tool_use surface (deliberately not web_search, which
+    // never calls `record_output_delta` -- see `conformance::Surface::ClientToolUse`
+    // doc comment). No thinking block is involved, so this surface is NOT
+    // blocked on C2: exactly zero progressive deltas, one terminal delta, full
+    // harness pass.
+    let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+    let events: Vec<AnthropicStreamEvent> = [
+        created_event(),
+        item_added_event("message", "assistant"),
+        text_delta_event("Let me check."),
+        item_done_event("message", json!({})),
+        item_done_event(
+            "function_call",
+            json!({
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{\"location\":\"Seattle\"}"
+            }),
+        ),
+        completed_event(),
+    ]
+    .iter()
+    .flat_map(|e| converter.convert(e))
+    .collect();
+
+    let message_deltas: Vec<bool> = events
+        .iter()
+        .filter_map(|event| match event {
+            AnthropicStreamEvent::MessageDelta { delta, .. } => Some(delta.stop_reason.is_some()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        message_deltas,
+        vec![true],
+        "expected zero progressive deltas and exactly one terminal delta \
+         (stop_reason set), got {:?}",
+        event_types(&events)
+    );
+
+    conformance::assert_stream_conformant(&events, conformance::Surface::ClientToolUse);
 }

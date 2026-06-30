@@ -5,7 +5,7 @@
 > **Branch:** `anthropic-sse-conformance`. **Run:** `/ralph-orchestrate --agents 2` (auto-review ON), Sonnet-5 subagents.
 
 ## Executive Summary
-**Status: 1/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
+**Status: 2/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
 one terminal `message_delta`, signed thinking, real `message_start.input_tokens`, correct ordering.
 
 ## Completed
@@ -13,6 +13,7 @@ one terminal `message_delta`, signed thinking, real `message_start.input_tokens`
 | Task | Description | Status |
 |-|-|-|
 | 0B1 | Strict conformance harness | ✅ |
+| C1 | One terminal message_delta | ✅ |
 
 **Ordering is strict and (mostly) serial** — tasks 0B1→C1→C2→C3→C4 all edit
 `src/adapters/responses_to_anthropic/mod.rs` and the shared test surface, so they cannot parallelize.
@@ -30,38 +31,6 @@ Source anchors verified against HEAD (`mod.rs` line numbers, current):
 push 691-701, call sites **200, 214, 236, 299, 357, 777** · `flush_reasoning_as_thinking`:588 (signature emit 612-617)
 · `handle_completed`:442 (terminal Δ 483) · `finalize`:410 (terminal Δ 422) · `handle_failed`:497 · web_search:534.
 Ingress strip: `anthropic_to_responses.rs:366` (Thinking → `encrypted_content`, currently filters empty at 377-380).
-
----
-
-## Task C1 — One terminal `message_delta` (deviation #1)
-**Files:** `src/adapters/responses_to_anthropic/mod.rs` (+ test surface).
-
-**Do:**
-1. `record_output_delta` (`mod.rs:679`): make it **bookkeeping-only** — keep `estimated_output_bytes` accumulation
-   and the `last_output_tokens` update; **remove the `output.push(MessageDelta{…})`** (lines 691-701). Drop the now-unused
-   `output: &mut Vec<AnthropicStreamEvent>` parameter and update its doc comment.
-2. Update ALL call sites to drop the `output` arg: `mod.rs` **200, 214, 236, 299, 357, 777**.
-3. Confirm the terminal `message_delta` still carries final `output_tokens`: `handle_completed:483` uses
-   `output_tokens = upstream_usage.output_tokens.unwrap_or(last_output_tokens).max(last_output_tokens)`;
-   `finalize:422` uses `last_output_tokens`. The bookkeeping you kept is what feeds these. The collector
-   (`collector.rs:150-156`) reads the terminal Δ's `output_tokens`.
-4. **Tests broken by removing progressive deltas — fix in THIS task:**
-   - `tests.rs` sequence cases ~**181-185, 217-225, 388-394, 432-440**: remove the intermediate `"message_delta"`
-     rows; keep exactly one terminal `"message_delta"` before `"message_stop"`.
-   - `tests.rs:539` `emits_progress_usage_for_reasoning_deltas`: REPURPOSE (rename e.g.
-     `terminal_delta_carries_reasoning_output_tokens`) — assert there are NO progressive `message_delta`s during
-     reasoning AND the single terminal Δ's `output_tokens` is non-zero (reflects the buffered reasoning byte-count
-     via the kept bookkeeping).
-   - `tests.rs:572` `completed_without_upstream_usage_preserves_progress_usage`: keep the core assertion (terminal
-     `output_tokens` non-zero from bookkeeping when upstream usage absent); drop the "progress" framing.
-   - `tests/gateway.rs:8567` and `:8654`: flip from `!progress_tokens.is_empty()` to "exactly one terminal
-     `message_delta` carrying `output_tokens`; zero progressive deltas".
-   - `tests/port_streaming_peek.rs:414`: update the comment + the "progressive usage `message_delta`s are allowed"
-     allowance — pre-terminal, only `message_start`/`ping` may appear, never a `message_delta`.
-5. Add a harness-backed conformance test (use T0B1) on a real reasoning+text converter run: exactly one terminal Δ.
-
-**DoD:** `cargo test` green; `assert_stream_conformant` passes invariants 1-3 + 6 on a real converter run;
-no `record_output_delta` call site still passes `output`.
 
 ---
 

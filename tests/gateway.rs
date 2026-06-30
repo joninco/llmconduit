@@ -8597,25 +8597,18 @@ async fn anthropic_messages_streams_text_response() {
     assert!(body_text.contains("Hello"), "missing text content");
     assert!(body_text.contains(" there"), "missing second text delta");
     let anthropic_events = parse_anthropic_sse_events(&body_text);
-    let progress_tokens: Vec<u64> = anthropic_events
+    // C1: exactly ONE terminal message_delta, never a progressive one.
+    let message_deltas: Vec<&serde_json::Value> = anthropic_events
         .iter()
-        .filter(|event| event["type"] == "message_delta" && event["delta"]["stop_reason"].is_null())
-        .filter_map(|event| event["usage"]["output_tokens"].as_u64())
+        .filter(|event| event["type"] == "message_delta")
         .collect();
-    assert!(
-        !progress_tokens.is_empty(),
-        "expected progressive output-token usage"
+    assert_eq!(
+        message_deltas.len(),
+        1,
+        "expected exactly one terminal message_delta, no progressive deltas: {message_deltas:?}"
     );
-    assert!(
-        progress_tokens.windows(2).all(|pair| pair[0] < pair[1]),
-        "progress output tokens must increase monotonically: {progress_tokens:?}"
-    );
-    let message_delta = anthropic_events
-        .iter()
-        .find(|event| {
-            event["type"] == "message_delta" && event["delta"]["stop_reason"] == "end_turn"
-        })
-        .expect("message_delta event");
+    let message_delta = message_deltas[0];
+    assert_eq!(message_delta["delta"]["stop_reason"], "end_turn");
     assert_eq!(message_delta["usage"]["input_tokens"], 12);
     assert_eq!(message_delta["usage"]["output_tokens"], 5);
 
@@ -8684,20 +8677,28 @@ async fn anthropic_messages_streams_nested_thinking_response() {
             && event["delta"]["type"] == "text_delta"
             && event["delta"]["text"] == "Answer"
     }));
-    let thinking_progress_tokens: Vec<u64> = anthropic_events
+    // C1: exactly ONE terminal message_delta, never a progressive one --
+    // including while thinking deltas were streaming.
+    let message_deltas: Vec<&serde_json::Value> = anthropic_events
         .iter()
-        .filter(|event| event["type"] == "message_delta" && event["delta"]["stop_reason"].is_null())
-        .filter_map(|event| event["usage"]["output_tokens"].as_u64())
+        .filter(|event| event["type"] == "message_delta")
         .collect();
-    assert!(
-        !thinking_progress_tokens.is_empty(),
-        "expected progressive output-token usage while thinking"
+    assert_eq!(
+        message_deltas.len(),
+        1,
+        "expected exactly one terminal message_delta, no progressive deltas: {message_deltas:?}"
     );
     assert!(
-        thinking_progress_tokens
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]),
-        "thinking progress output tokens must increase monotonically: {thinking_progress_tokens:?}"
+        message_deltas[0]["delta"]["stop_reason"].is_string(),
+        "the sole message_delta must carry a stop_reason: {:?}",
+        message_deltas[0]
+    );
+    assert!(
+        message_deltas[0]["usage"]["output_tokens"]
+            .as_u64()
+            .is_some(),
+        "terminal message_delta must carry output_tokens: {:?}",
+        message_deltas[0]
     );
 
     let requests = upstream.requests().await;

@@ -412,9 +412,10 @@ fn anthropic_reasoning_only_is_buffered_until_terminal_then_promoted_to_text() {
     let after_completed = converter.convert(&completed_event());
 
     // While only reasoning has been seen, the converter must NOT open any content
-    // block — the reasoning is buffered/deferred. (message_start/ping and the
-    // progressive usage `message_delta`s are allowed; a `content_block_start` is
-    // NOT.)
+    // block — the reasoning is buffered/deferred. (message_start/ping are
+    // allowed; a `content_block_start` is NOT. Nor is a `message_delta`: C1
+    // made `record_output_delta` bookkeeping-only, so the only `message_delta`
+    // in the whole stream is the terminal one emitted at `response.completed`.)
     let pre_terminal = [
         ("created", &after_created),
         ("reasoning_item_added", &after_item_added),
@@ -436,6 +437,13 @@ fn anthropic_reasoning_only_is_buffered_until_terminal_then_promoted_to_text() {
                 .any(|event| matches!(event, AnthropicStreamEvent::ContentBlockDelta { .. })),
             "no content_block_delta may be emitted before the terminal; \
              one was emitted at step `{label}`: {batch:?}"
+        );
+        assert!(
+            !batch
+                .iter()
+                .any(|event| matches!(event, AnthropicStreamEvent::MessageDelta { .. })),
+            "no message_delta may appear before the terminal (C1: bookkeeping-only \
+             progress, no wire event); one was emitted at step `{label}`: {batch:?}"
         );
     }
 
