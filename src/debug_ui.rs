@@ -244,7 +244,7 @@ async fn wait_for_session_expiry(session_exp: u64) {
 /// `session_exp == u64::MAX`; capping the computed remaining time keeps
 /// `tokio::time::sleep` from overflowing the underlying `Instant` arithmetic on
 /// an absurd duration (the socket has no real cookie expiry to honor there and
-/// closes on disconnect/lag regardless). A bounded real cookie `exp` (≤ 1 h) is
+/// closes on disconnect/lag regardless). A bounded real cookie `exp` (≤ 24 h) is
 /// always far below this cap.
 const MAX_EXPIRY_WAIT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 

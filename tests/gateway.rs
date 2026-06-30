@@ -2036,7 +2036,7 @@ async fn dashboard_login_rejects_bad_token_and_sets_signed_cookie_on_success() {
         session.contains("Secure"),
         "session (https origin): {session}"
     );
-    assert!(session.contains("Max-Age=3600"), "session: {session}");
+    assert!(session.contains("Max-Age=86400"), "session: {session}");
     let csrf = cookies
         .iter()
         .find(|c| c.starts_with("llmconduit_csrf="))

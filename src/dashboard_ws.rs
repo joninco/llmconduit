@@ -1349,7 +1349,7 @@ async fn send_snapshot_one(
 
 /// A far-future cap for the expiry timer (dev-open passes `u64::MAX`); keeps
 /// `tokio::time::sleep` from overflowing on an absurd duration. A real cookie
-/// `exp` (≤ 1 h) is always far below this.
+/// `exp` (≤ 24 h) is always far below this.
 const MAX_EXPIRY_WAIT: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Sleep until the session `exp` (unix secs), then return. Derived from the wall

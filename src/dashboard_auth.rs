@@ -21,7 +21,7 @@
 //! The session cookie is `base64url(HMAC-SHA256(key, "{exp}:{nonce}")) +
 //! "." + "{exp}:{nonce}"`. Verification recomputes the MAC and compares it in
 //! constant time, then checks `exp` has not passed. There is no server-side
-//! session table, so: (a) a leaked cookie is valid until its `exp` (≤ 1 h);
+//! session table, so: (a) a leaked cookie is valid until its `exp` (≤ 24 h);
 //! (b) rotating `LLMCONDUIT_DASHBOARD_SESSION_KEY` invalidates ALL live
 //! sessions. Both are documented trade-offs; revocable sessions are future
 //! work.
@@ -61,9 +61,9 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<Sha256>;
 
 /// Session lifetime: the cookie `Max-Age` AND the signed-payload `exp` window.
-/// 1 hour bounds how long a copied/leaked cookie stays valid (stateless — no
+/// 24 hours bound how long a copied/leaked cookie stays valid (stateless — no
 /// server-side revocation).
-pub const SESSION_TTL_SECS: u64 = 3600;
+pub const SESSION_TTL_SECS: u64 = 86_400;
 
 /// Session cookie name (signed, `HttpOnly`).
 pub const SESSION_COOKIE: &str = "llmconduit_session";
@@ -842,7 +842,7 @@ pub struct LoginRequest {
 }
 
 /// `POST /dashboard/login` — constant-time token check; on success set the
-/// signed `HttpOnly; SameSite=Strict[; Secure]; Path=/; Max-Age=3600` session
+/// signed `HttpOnly; SameSite=Strict[; Secure]; Path=/; Max-Age=86400` session
 /// cookie plus the non-`HttpOnly` double-submit CSRF cookie. Response is always
 /// `no-store`.
 pub async fn dashboard_login(
@@ -981,7 +981,7 @@ where
 
 /// Build the `Set-Cookie` value for the signed session cookie. `HttpOnly`
 /// (no JS access), `SameSite=Strict` (no cross-site send), `Path=/` (so the
-/// SAME cookie authorizes `/dashboard` AND `/debug`), `Max-Age=3600`, and
+/// SAME cookie authorizes `/dashboard` AND `/debug`), `Max-Age=86400`, and
 /// `Secure` only when a public https origin is configured.
 fn session_cookie(value: &str, secure: bool) -> String {
     let mut cookie = format!(
