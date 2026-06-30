@@ -7256,6 +7256,39 @@ fn chat_completion_sse_body(chunks: &[serde_json::Value]) -> String {
     body
 }
 
+/// Task 0B1: prove the conformance harness is reachable from THIS integration
+/// crate at the public path `llmconduit::adapters::responses_to_anthropic::
+/// conformance` -- the same path later phases (C1-T5) will use together with
+/// `parse_anthropic_sse_events` to assert real `/v1/messages` SSE output.
+/// Hand-built JSON, NOT real converter output (the converter is not wired to
+/// the harness yet -- see `.ralph/IMPLEMENTATION_PLAN.md` Task 0B1).
+#[test]
+fn conformance_harness_is_reachable_from_gateway_integration_crate() {
+    use llmconduit::adapters::responses_to_anthropic::conformance::Surface;
+    use llmconduit::adapters::responses_to_anthropic::conformance::assert_sse_conformant;
+
+    let events: Vec<serde_json::Value> = vec![
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_1", "type": "message", "role": "assistant", "content": [],
+                "model": "m", "stop_reason": null, "stop_sequence": null,
+                "usage": {"input_tokens": 1, "output_tokens": 0}
+            }
+        }),
+        json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hi"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": {"output_tokens": 1}
+        }),
+        json!({"type": "message_stop"}),
+    ];
+    assert_sse_conformant(&events, Surface::TextOnly);
+}
+
 #[tokio::test]
 async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fallbacks() {
     let first = MockServer::start().await;

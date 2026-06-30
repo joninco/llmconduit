@@ -512,3 +512,63 @@ fn anthropic_reasoning_only_is_buffered_until_terminal_then_promoted_to_text() {
         "stream must end with message_stop: {all:?}"
     );
 }
+
+/// Task 0B1: prove the conformance harness is reachable from THIS integration
+/// crate at the public path `llmconduit::adapters::responses_to_anthropic::
+/// conformance`, operating on real `AnthropicStreamEvent`s the way the other
+/// tests in this file construct `AnthropicStreamConverter` output. Hand-built
+/// events, NOT real converter output (the converter is not wired to the
+/// harness yet -- see `.ralph/IMPLEMENTATION_PLAN.md` Task 0B1).
+#[test]
+fn conformance_harness_is_reachable_from_port_streaming_peek_crate() {
+    use llmconduit::adapters::responses_to_anthropic::conformance::Surface;
+    use llmconduit::adapters::responses_to_anthropic::conformance::assert_stream_conformant;
+    use llmconduit::models::anthropic::AnthropicMessageDeltaBody;
+    use llmconduit::models::anthropic::AnthropicMessageStart;
+    use llmconduit::models::anthropic::AnthropicUsage;
+
+    let events = vec![
+        AnthropicStreamEvent::MessageStart {
+            message: AnthropicMessageStart {
+                id: "msg_1".to_string(),
+                kind: "message".to_string(),
+                role: "assistant".to_string(),
+                content: Vec::new(),
+                model: "m".to_string(),
+                stop_reason: None,
+                stop_sequence: None,
+                usage: AnthropicUsage {
+                    input_tokens: Some(1),
+                    output_tokens: Some(0),
+                    server_tool_use: None,
+                },
+            },
+        },
+        AnthropicStreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: AnthropicContentBlockStart::Text {
+                text: String::new(),
+            },
+        },
+        AnthropicStreamEvent::ContentBlockDelta {
+            index: 0,
+            delta: AnthropicDelta::TextDelta {
+                text: "hi".to_string(),
+            },
+        },
+        AnthropicStreamEvent::ContentBlockStop { index: 0 },
+        AnthropicStreamEvent::MessageDelta {
+            delta: AnthropicMessageDeltaBody {
+                stop_reason: Some("end_turn".to_string()),
+                stop_sequence: None,
+            },
+            usage: AnthropicUsage {
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                server_tool_use: None,
+            },
+        },
+        AnthropicStreamEvent::MessageStop,
+    ];
+    assert_stream_conformant(&events, Surface::TextOnly);
+}

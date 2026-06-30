@@ -16,6 +16,8 @@ mod reasoning;
 
 mod collector;
 
+pub mod conformance;
+
 #[cfg(test)]
 mod tests;
 

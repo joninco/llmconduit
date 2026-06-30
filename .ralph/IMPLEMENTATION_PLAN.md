@@ -5,8 +5,14 @@
 > **Branch:** `anthropic-sse-conformance`. **Run:** `/ralph-orchestrate --agents 2` (auto-review ON), Sonnet-5 subagents.
 
 ## Executive Summary
-**Status: 0/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
+**Status: 1/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
 one terminal `message_delta`, signed thinking, real `message_start.input_tokens`, correct ordering.
+
+## Completed
+
+| Task | Description | Status |
+|-|-|-|
+| 0B1 | Strict conformance harness | ✅ |
 
 **Ordering is strict and (mostly) serial** — tasks 0B1→C1→C2→C3→C4 all edit
 `src/adapters/responses_to_anthropic/mod.rs` and the shared test surface, so they cannot parallelize.
@@ -24,38 +30,6 @@ Source anchors verified against HEAD (`mod.rs` line numbers, current):
 push 691-701, call sites **200, 214, 236, 299, 357, 777** · `flush_reasoning_as_thinking`:588 (signature emit 612-617)
 · `handle_completed`:442 (terminal Δ 483) · `finalize`:410 (terminal Δ 422) · `handle_failed`:497 · web_search:534.
 Ingress strip: `anthropic_to_responses.rs:366` (Thinking → `encrypted_content`, currently filters empty at 377-380).
-
----
-
-## Task 0B1 — Strict conformance harness (FIRST; defines "done")
-**Why first:** the harness encodes the target invariants so every later phase has an objective pass/fail gate.
-**Files:** new conformance assertion helpers reusable from BOTH unit tests (`AnthropicStreamEvent` form) AND the two
-integration test crates (`tests/gateway.rs` JSON-SSE form, `tests/port_streaming_peek.rs` event form).
-
-**Do:**
-1. Add a reusable assertion library exposing two entry points:
-   - `assert_stream_conformant(events: &[AnthropicStreamEvent], surface: Surface)` — operates on the converter's
-     public output enum (used by `tests.rs` unit tests + `port_streaming_peek.rs`).
-   - `assert_sse_conformant(events: &[serde_json::Value], surface: Surface)` — operates on parsed JSON SSE
-     (used by `tests/gateway.rs`).
-   Recommended placement: `tests/common/mod.rs` for the integration-crate-visible JSON form; for the event form,
-   either a small `pub`/`#[cfg(any(test, feature=...))]` module in `src/adapters/responses_to_anthropic/` or a
-   mirrored helper in `tests/common`. Subagent picks the cleanest structure that all three test files can import.
-2. The assertions (ALL invariants from the spec):
-   - exactly ONE `message_delta`, and it carries a non-null `stop_reason`;
-   - NO `message_delta` appears before the first `content_block_start`;
-   - NO `message_delta` appears between a `content_block_delta` and the matching `content_block_stop` (open block);
-   - if a `thinking` block exists, it emits a NON-EMPTY `signature_delta`;
-   - the LAST two events are `message_delta` then `message_stop`;
-   - `Surface` lets a caller relax block-shape expectations (text-only has no thinking block; error surface ends
-     with `error` — assert that variant explicitly).
-3. **Self-validation test (this is what keeps T0B1 green):** feed the harness a hand-built CONFORMANT event vector
-   (mirrors the golden: message_start → thinking(+sig) → text → ONE message_delta → message_stop) and assert it
-   PASSES; feed a NON-CONFORMANT vector (progressive deltas + empty sig, i.e. today's shape) and assert it is
-   REJECTED (use `#[should_panic]` or a `Result`-returning variant). This proves the harness discriminates without
-   yet touching the real converter (that is T-C1..C4).
-
-**DoD:** `cargo test` green; harness self-tests prove accept-good / reject-bad. No production code changed yet.
 
 ---
 
