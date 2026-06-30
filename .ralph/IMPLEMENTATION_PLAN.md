@@ -1,207 +1,204 @@
-# IMPLEMENTATION_PLAN.md — Argus dashboard phase 2 (FEATURES.md items 1–10)
+# IMPLEMENTATION_PLAN.md — Anthropic SSE stream conformance
 
-> **Source:** `/ralph-guide` on 2026-06-22, scoped to `FEATURES.md` PROPOSED (🔭) features, build-order
-> **items 1–10**. Items 11–15 (retention/search/compare, export, OTel/Prometheus, alerts, replay,
-> command palette) are deferred to a later `/ralph-guide-update`.
-> **Specs:** `.ralph/specs/01..16`. **Review gate:** `.ralph/REVIEW_PROTOCOL.md` (Codex-xhigh, per-gap).
-> **Branch:** `worktree-dashboard`. **Inherits:** `AGENTS.md` (commands + hard rules) + REVIEW_PROTOCOL.
-> **Run:** `/ralph-orchestrate --no-review --agents 1` (serial; per-gap Codex review is the gate).
+> **Spec:** `.ralph/specs/anthropic-sse-conformance.md` + authoritative `ANTHROPIC_STREAM_CONFORMANCE_PLAN.md` (root).
+> **Golden:** `.ralph/golden_8001_native_messages.sse`. **Conventions:** `AGENTS.md`. **G8:** `GAPS.md`.
+> **Branch:** `anthropic-sse-conformance`. **Run:** `/ralph-orchestrate --agents 2` (auto-review ON), Sonnet-5 subagents.
 
-## Status: dashboard program 16/16 ✅ COMPLETE · **Topic E (engine robustness) COMPLETE — Task E1 ✅ DONE (gate B green, Codex-xhigh APPROVED R2, commit 9590699)**
-> Dashboard gaps 01–16 done (01 ✅ … 16 ✅) + inserted **10b** ✅ — every gap built + gate-green + Codex-xhigh reviewed per REVIEW_PROTOCOL.md. FEATURES.md items 11–15 deferred (see "Out of scope").
-> **All planned work COMPLETE** — dashboard gaps 01–16 + **Topic E / Task E1** all done, gate-green, Codex-xhigh APPROVED. **No ⬜ PENDING tasks remain.** A fresh `/ralph-orchestrate` has nothing to pick up; extend with new specs via `/ralph-guide-update`. See `.ralph/GOAL.md` + `.ralph/specs/E1-hallucinated-tool-call-repair.md`.
+## Executive Summary
+**Status: 0/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
+one terminal `message_delta`, signed thinking, real `message_start.input_tokens`, correct ordering.
 
-## Resume notes (2026-06-22 handover — fresh session continues here)
-- **Orchestrator state:** `.ralph/orchestrate.wt-dash-0622-1322.state.md` (per-gap ledger: commits, review verdicts, rounds).
-- **Done:** 01–12 + **10b**, all Codex-xhigh APPROVED (12 pending its Codex-xhigh review per REVIEW_PROTOCOL). One descriptive `git tag` per gap/fix. Tree clean.
-- **Next (numeric order is dependency-safe):** **15** (dep 04) → **16** (dep 02,03,04,07,**12**; LAST). 14 done (gate STAYED F — the gap-05 `upstream_response` error body was already projected onto the LIVE `/flows/:id` `FlowDetailBody` by gap-05 review F2; only the TS `FlowDetail` type needed the additive field). 14's pure `failureTaxonomy(rows)` (groups failures by reason × provider/model with a derived rate) is reusable by the gap-16 control-room failure tiles directly (no fetch). 12's per-provider metrics also feed the 16 control-room provider tiles.
-- **THREAT MODEL (critical):** Argus is a DIAGNOSTIC dashboard — operator visibility of headers/keys/bodies is INTENDED, not a leak. See the new **REVIEW_PROTOCOL.md "Scope note"**; do NOT let Codex re-raise operator-exposure "leaks" (gap 04 burned 3 rounds on that before it was ruled a non-issue). Memory/perf/correctness/don't-lie-with-zeros invariants ARE still load-bearing.
-- **Deferred:** gap **04** R3 findings deferred as non-issues per the ruling (see state file). gap **07** took **4** review rounds (extended 1 past the nominal 3-round cap because findings were strictly converging with no judgment call — that's the bar for extending; otherwise halt-to-human at 3).
-- **Convention:** `.ralph/COMPLETED_TASKS.md` is GITIGNORED (full archive) — build/fix subagents WRITE it but must NOT `git add -f` it (one early subagent force-added it; untracked in `f52deec`). Each gap's plan line is compressed to `- [x]` with a 1-paragraph summary; full detail lives in COMPLETED_TASKS.md.
-- **Per-gap loop:** build subagent (B or B+F green → commit) → **Codex-xhigh review of the commit diff** (REVIEW_PROTOCOL.md, credit-rotation aware) → fix subagent if findings (≤3 rounds) → record in state → next gap. `--no-review` (orchestrator's built-in review off) + `--agents 1` (serial).
-- **Resume command:** `/ralph-orchestrate --no-review --agents 1` (it reads this plan + GOAL.md and picks up the only ⬜ PENDING task = **Topic E / E1**; gaps 01–16 are all done). The `wt-dash-0622-1322` ledger above is for the COMPLETED dashboard program — Topic E starts a fresh session/ledger.
+**Ordering is strict and (mostly) serial** — tasks 0B1→C1→C2→C3→C4 all edit
+`src/adapters/responses_to_anthropic/mod.rs` and the shared test surface, so they cannot parallelize.
+Run one phase per iteration in order. **Every task must leave `cargo test` GREEN** (update the tests that
+the behavior change breaks within the SAME task — do not defer all test churn to T5).
 
-## The discipline (cross-cutting acceptance — applies to EVERY gap)
-FEATURES.md hardened the framing from "pretty flow artifacts" to "can Argus answer the incident
-question?" Two rules are acceptance criteria on every gap, not nice-to-haves:
-1. **Data-quality tags** — every rendered metric is tagged `measured` / `derived` / `estimated` /
-   `unavailable`. `estimated` must be labelled as such in the UI.
-2. **Don't lie with zeros** — a value that can't be measured renders `unavailable` / `—`, NEVER `0`.
-   A confident wrong number is worse than an honest gap; this is an instrument operators trust during
-   incidents. The CLIENT column already does this — make it the rule everywhere. Distinguish a genuine
-   measured `0` from `unavailable`.
+Hard constraints (verbatim from spec — re-read before editing):
+- Keep replay / system-prefix / web_search injection / dashboard working. NOT native passthrough.
+- KEEP `estimated_output_bytes` + `last_output_tokens` bookkeeping (collector relies on it: `collector.rs:68/150/154`).
+- `web_search` does NOT call `record_output_delta` (`mod.rs:534`) — cover CLIENT `tool_use` in no-progressive-delta tests.
+- Do NOT touch the dashboard usage path (`engine.rs:2139/2170`).
 
-## Why this order
-Don't ship UI polish on a weak data model. **Foundation → data-contract pass (the spine) → surfaces.**
-The spine's backend seams (02–07) must land BEFORE the UI surfaces (08–16) that read them, or the
-surfaces stay dishonest.
-
-## Sequencing
-- **Phase 0 — Foundation:** 01 (stats-strip 🐞). FIRST — every gauge reads off it.
-- **Phase 1 — Data-contract pass / the spine (backend, before ANY UI):** 02, 03, 04, 05, 06, 07.
-  Mutually independent; any order within the phase; ALL before Phase 2.
-- **Phase 2 — Insight surfaces (ride the spine):** 08→16, each gated on its backend dep below.
-
-## Verified current state (code-searched 2026-06-22 — do NOT re-derive; confirm, then extend)
-Several "missing" seams already partly exist. Builders: confirm against current code, then extend.
-| seam | verified state | implication |
-|-|-|-|
-| FlowRecord timing | has `started_ms`/`elapsed_ms`/`finished_ms` only (`dashboard_flow.rs`) | 02 ADDS phase ts + `first_content_delta_ms`; 03 ADDS `attempts[]` + `first_upstream_byte_ms` |
-| metrics feed | fed ONLY at the D3 terminal finalize CAS (`metrics.rs:798`) — live flows never count; ALSO the live WS path `dashboard_ws.rs:665 window_tile()` hard-codes `active_streams`/`cost_per_min` to `0.0` | 01 must fix BOTH (REST feed + live WS tile), not just REST |
-| per-model max-context | parse exists (`context_limit_by_id`, incl. `max_model_len`), BUT the dashboard DTO `CatalogEntry.context_limit: i64` collapses missing→`0` (`dashboard_api.rs:778 unwrap_or(0)`) — lies-with-zero | 06 makes it **nullable end-to-end (B+F)**; reuse the parser, don't add one |
-| cached-input price | `ModelPrice.cached_per_1k` exists but is `f64` default `0.0` (`config.rs:104`) — **presence unknowable** | 07 adds a cached-price **presence** seam (`Option`/flag); 08 consumes presence, not the numeric |
-| price null-not-zero | `price_for()→Option`, cost null when unpriced ("never a fabricated zero", `dashboard_api.rs:99`) | 07 adds the `estimated` tier + unreported-token distinction |
-| attempts | failover loop → `ProviderHealth` counters, NOT the flow (`upstream.rs:1409`); metrics are evict-safe terminal (`ServingToken`/`metrics.rs:798`), NOT `FlowStore` reads | 03 threads attempts into the flow AND the evict-safe terminal payload (12's source) |
-| per-provider percentiles | GLOBAL only (`metrics.rs:351`); `ProviderHealth` point-in-time (`upstream.rs:198`) | 12 adds a per-provider ring |
-| upstream response body | NOT captured — only the 3 REQUEST layers | 05 is a genuine new gated seam |
-| client_label / UA | UA logged to trace + present in redacted `FlowRecord.headers`; NO `client_label` field; raw key hashable pre-redaction (`http.rs:386–449`) | 04 derives + emits; confirms the archived D1/D13 client TODO (key-hash = stronger seam) |
-
-## Backend↔frontend contract rule (Codex review — the biggest risk to the run)
-A backend-only gap that changes a dashboard JSON contract passes `cargo` + per-gap review but leaves the
-React app stale/dishonest. Spine specs are therefore two kinds:
-- **Additive** (02 phase-ts · 03 attempts · 04 client_label · 05 response-body) — new OPTIONAL fields the
-  app ignores until a surface consumes them → **backend-only** gate is fine.
-- **Contract migration** (06 `context_limit` i64→nullable · 07 `FlowUsage` i64→`Option` + cached-price
-  presence) — these CHANGE existing JSON the frontend already reads → the gap is **B+F atomic** (Rust +
-  TS types/guards/mocks/WS in one commit), never backend-only.
-
-## Gaps
-Checklist; `[ ]` = not started. Gate: **B** = backend (`cargo test`/`clippy`/`fmt`), **F** = frontend
-(`npm run typecheck`/`lint`/`test`/`e2e`). All → Codex-xhigh per REVIEW_PROTOCOL.
-
-### Phase 0 — Foundation
-- [x] **01** stats-strip accuracy 🐞⭐ · gate **B+F** · `01-stats-strip-accuracy.md` · investigation-first. Root cause: live WS `window_tile` hard-coded `active_streams`/`tok-s`/`cost` to `0.0` (+ raw counts as `req/s`); REST-only fix would have left it. Fix: unified WS tick + snapshot onto the REST `metrics_body`; added `samples` u64 (terminal-flow count) end-to-end so zero-sample windows render `—` not `0`.
-
-### Phase 1 — Data-contract pass (the spine; backend; before any UI)
-- [x] **02** spine: per-phase timestamps + `first_content_delta_ms` 🔭⚙️⭐ · gate **B** · feeds 10, 16. Added `PhaseTimings{ingress_ms, normalization_done_ms, routing_decision_ms, first_content_delta_ms, stream_end_ms, finalize_ms}` (all `Option<u128>`, first-write-wins + monotonic-clamp) on `FlowRecord` + flattened onto body-free `SnapshotFlowSummary` (so it reaches the WS/snapshot wire). Seams: open→ingress, `set_normalized`→normalization, engine pre-spawn (post-lower)→routing, `OutputTextDelta` arm→TTFT (content-only), end of `run_turn`→stream_end, `finalize`→finalize. Missing phase = `None` ⇒ absent JSON (don't-lie-with-zeros). `routing` lives at the engine seam (not the leaf) so it fires for mock + real upstreams.
-- [x] **03** spine: `attempts[]` + `first_upstream_byte_ms` · gate **B** · feeds 11, 12. Added `Attempt{provider,model,start_ms,end_ms,first_upstream_byte_ms,status,error_class,failover_reason}` (bounded snake_case taxonomic codes, NOT raw upstream text) on `FlowRecord` + body-free `SnapshotFlowSummary` + the evict-safe `TerminalMetricsInputs` (spec-12 source). Attempts ride the shared `ServingToken` (same evict-safe seam as usage): the failover loop records one per provider (failed+served), the bare leaf records exactly one (served via a first-byte stream wrap / failed via dispatch error). The L1 guard threads them into BOTH the record AND the terminal payload at finalize. `first_upstream_byte_ms` = wire TTFB (distinct from gap-02's content TTFT), measured at the prefetch point. Mid-stream failure appends NO attempt (failover-pre-first-chunk untouched); routing-mode attempts come only from the selected provider's failover loop. don't-lie-with-zeros: unmeasured times are `None`→absent, never `0`.
-- [x] **04** spine: `client_label` / key-hash · gate **B** · feeds 15. Added `ClientSource{key_hash, configured_header, user_agent}` (snake_case wire enum, Serialize+Deserialize) + `ClientAttribution{label, source}` on `FlowRecord` + body-free `SnapshotFlowSummary` (so it rides the WS/snapshot wire). `ClientAttribution::derive(headers, configured_header)` runs ONCE in `log_api_call` at the PRE-redaction seam (`http.rs` — the only point the raw key is readable): priority `KeyHash → ConfiguredHeader → UserAgent → None`. Key-hash = `key-<first 12 hex of SHA-256(key)>` from the `Authorization` bearer (scheme-stripped) or `x-api-key`; the raw key is hashed in-place + dropped, NEVER stored/logged/emitted. The configured caller-id header NAME is read env-only (`LLMCONDUIT_DASHBOARD_CLIENT_HEADER`) — never on the `Debug`/`Clone` persisted `Config` (mirrors dashboard-auth env-only posture); the name is non-secret, only the key VALUE is. UA is a labelled WEAK fallback (tagged so spec 15 renders it differently), not an identity claim. don't-lie-with-zeros: no key + no configured id + no UA (incl. blank/whitespace) ⇒ `None`/`None` ⇒ absent JSON ⇒ renders `—`, never a fabricated id. `open()` gained a `ClientAttribution` param; label is `cap_scalar`-bounded + counted in `summary_bytes`. Frontend untouched (ignores the new optional fields until spec 15).
-- [x] **05** spine: gated upstream response/error-body capture · gate **B** · feeds 14. Added `upstream_response: Option<UpstreamResponseBody{bytes: Arc<[u8]>, truncated: bool}>` on the LIVE `FlowRecord` only (NOT on body-free `SnapshotFlowSummary` — the 135 GiB guard holds; verified by `upstream_response_body_not_on_snapshot_summary`). Captured at the leaf's `dispatch_chat_stream` terminal-error sites (first-attempt non-2xx + the shrink-and-retry's final body, last-writer-wins) via new `set_upstream_response` + `capture_response_body` — COPIED through the SAME capped/redacting serializer as the request layers (`capture_capped_redacted`, BODY_CAP 128 KiB), so NO `Bytes` slice of the 256 MiB middleware buffer is retained; `truncated = raw.len() > BODY_CAP`. SEPARATELY gated: OFF by default, armed only when `LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE=1/true/yes` (env-only, never on persisted `Config`; distinct from the debug-UI gate that arms request capture) — `is_response_capture_enabled() = enabled && response_capture_enabled`. don't-lie-with-zeros tri-state: `None` = capture disabled OR no body; `Some(_)` = captured (an empty upstream body is honestly recorded as the `[redacted: unparseable body 0 bytes]` marker, never a fabricated body); `truncated` flags a partial body. Counted in `summary_bytes`/`body_bytes` + shed in eviction phase 1 (record survives body-free). `/v1/completions` still NOT instrumented (whitelist unchanged). Frontend untouched (ignored until spec 14). Secrets in the error body redacted (`upstream_response_body_is_redacted`).
-- [x] **06** spine: surface per-model max-context (nullable `context_limit`) · gate **B+F** (contract migration) · feeds 09. Made `CatalogEntry.context_limit` NULLABLE end-to-end (`Option<i64>`, `skip_serializing_if`) and DELETED the `.unwrap_or(0)` lie-with-zeros collapse at the `/dashboard/api/catalog` handler — a model WITH an advertised window serializes the integer, a model WITHOUT serializes ABSENT/null (NEVER `0`). REUSED the existing `context_limit_by_id` parse (`UpstreamModelEntry.context_limit: Option<i64>` already threaded from upstream `/v1/models` incl. `max_model_len`) — NO second max-context parser added. Backend round-trip test (`d13_catalog_entry_context_limit_round_trips_nullable`, AGENTS.md changed-wire-field rule) + updated `d13_catalog_is_a_bare_array_no_cursor` (model-a 32k integer / model-b absent, asserts `!= 0`); gave `tests/gateway.rs`'s local `MockUpstream` a `set_context_limits` seam. Frontend: TS `CatalogEntry.context_limit?: number | null`; mock gained a `null`-window entry (`mystery-model`); `fmtTokens` (existing token formatter — already renders `—` on null/undefined, never `0`) is the catalog renderer, pinned by new `format.test.ts` (null⇒`—`, real⇒number, measured `0`⇒`"0"` distinct from unavailable); `client.test.ts` asserts the nullable round-trip. The utilization gauge UI is spec 09 (consumes this honest field). Gate: B (cargo test/clippy/fmt) + F (typecheck/lint/test 348/e2e 6) all green.
-- [x] **07** spine: cost + usage confidence (`FlowUsage` Option + cached-price presence) · gate **B+F** (contract migration) · feeds 08, 16. `FlowUsage.{cached,reasoning}` i64→`Option<i64>` (`skip_serializing_if` ⇒ unreported is ABSENT, distinct from a reported `0`; provenance via `AccumulatedUsage` Option + `accumulate_optional`); ADDITIVE `ModelPrice.cached_price_configured: bool` via custom `Deserialize` (presence distinct from a configured `0.0`, `cached_per_1k` stays `number` — no second migration); `CostConfidence{confident,estimated,unavailable}` on `FlowRow`/`FlowDetailBody` (priced + `cached==Some(0)`/configured ⇒ confident; `cached>0`/unreported + no cache rate ⇒ estimated; unpriced ⇒ unavailable, never `0`) + AGGREGATE on `MetricWindow`/headline (`window_cost_confidence` + new `BucketCounts.unreported_cached_samples` so a summed-`cached==0` window is still estimated — no silently-confident totals). Frontend mirrored in-commit: TS `Usage.{cached,reasoning}: number|null`, `CostConfidence`, `ModelPrice.cached_price_configured`, all guards/mocks/WS; `FlowDetail` renders `—` for unreported cached/reasoning + labels `est`. B: cargo test 932/clippy 0/fmt. F: typecheck/lint/test 355/e2e 6.
-- [x] **10b** spine→wire-DTO projection (FlowDetailBody/FlowRow/FlowStatusPayload) · gate B+F · feeds 10,11,16. Closes gap 10's production DISCOVERY: gaps 02/03 landed the spine on the INTERNAL `FlowRecord`/`SnapshotFlowSummary` but it was DROPPED on the wire-facing DTOs the React app deserializes. Projected (additive, `skip_serializing_if`): FULL set onto `FlowDetailBody` (`/flows/:id` — phases flattened + `attempts[]` + `first_upstream_byte_ms`; populated in `dashboard_flow_detail`), onto `FlowRow` (`/flows` + `/snapshot` — same set, populated in `from_record`/`from_summary`; `from_summary` reads the already-spined `SnapshotFlowSummary`), and onto the live `DashboardPayload::FlowStatus` (populated in `flow_status_payload` off the live record — progressive: a not-yet-reached phase / not-yet-recorded attempt stays absent). No recompute — threads the gap-02/03 measured fields through; attempts stay capped (gap 03); body-free invariant holds (scalar `u128` epochs + bounded attempts, NOT bodies); per-domain cursors + bare `/debug/ws` contract untouched. don't-lie-with-zeros: absent phase/attempt ⇒ omitted key ⇒ `—`, never `0`. Round-trip test per changed DTO (present emits + flattened-phase/`Attempt` deserialize back; absent omits). Frontend: the gap-10 TS bindings/guards ALREADY matched the now-real shape (verified — no change needed); enriched the WS `flowFrame()` mock to carry the live spine so the e2e exercises the REAL projected wire shape. Gate B: cargo test 628 lib (+3)/clippy 0/fmt. F: typecheck/lint/test 475/e2e 9 — gap-10 MEASURED waterfall now lights up against the real projection (was mock-only); gap-11 attempts reachable on row+detail+live.
-
-### Phase 2 — Insight surfaces
-- [x] **08** token economics ⭐ · gate **F** · dep 07. Built the token-economics surface that CONSUMES the gap-07 honest cost/usage contract. Pure `tokenEconomics.ts` (DOM-free, sibling of `flowModel.ts`): per-flow cached/reasoning split (`measured`; unreported→`—`, reported `0`→`0`), cache-hit rate `cached/prompt` (`derived`; `—` when cached unreported — NOT a 0% miss), and "$ saved by cache" (`derived` = `(cached/1000)·(input−cached)/1k`, shown ONLY when gap-07 `cached_price_configured` PRESENCE is true + cached reported — never the numeric `0.0` default), plus `aggregateCacheByKey` (by-model roll-up: excludes unreported flows from the rate, sums savings only for configured-price flows, marks a group `estimated` when ANY contributing flow's `cost_confidence !== 'confident'`). Surfaces: `TokensCell` popover on the table tokens cell (fixed overlay like `CooldownTooltip`, no FLIP), the FlowDetail inspector "cache hit / $ saved" line MIRRORING it (derived saving labelled), and a collapsed `CacheEconomics` per-model aggregate strip under the table (est-labelled rows). Gate F: typecheck/lint/test 409 (+25)/e2e 7 (+1, hover popover asserts split + `—` on unreported). Backend untouched (no `.rs` changed; cargo test/clippy/fmt confirmed green).
-- [x] **09** context-window utilization · gate **F** · dep 06. Built the surface showing how much of each model's context window a flow used, CONSUMING the gap-06 nullable `context_limit` + gap-07 optional usage. Pure `contextUtilization.ts` (DOM-free, sibling of `tokenEconomics.ts`): `% = Usage.prompt ÷ context_limit` (spec 09 / FEATURES item 4 — the PROMPT/input tokens that must fit the window; completion/total/cached/reasoning are NOT counted — **review round 1 (Codex-xhigh on `2fe35ca8`) fixed a HIGH where the numerator was `total`/`prompt+completion`, inflating the gauge + aggregate**), remaining headroom, a near(≥85%)/over(≥100%) risk band. `derived` ONLY when BOTH a finite prompt + a known POSITIVE limit exist — `context_limit` null/≤0 (UNKNOWN capacity, gap-06) OR unreported/non-finite prompt ⇒ `unavailable` (`—`), NEVER a fabricated 0%/100% and no /0; a genuine 0% (measured 0 prompt / known limit) stays DERIVED (`0.0%`), distinct from `—`; over-budget % is honest (>100%, not clamped) while the bar fill clamps to 100%. Surfaces: `ContextGauge` (inspector-header bar + % + headroom + near/over badge; unavailable ⇒ dashed empty rail, no fill) wired into `FlowDetail`'s header `dl`; `ContextPressure` aggregate stat under the table (peak utilization + near/over counts + measured/total coverage over the filtered rows; excludes unmeasurable flows, peak `—` when none measurable). Catalog read via new `useCatalog` (TanStack `queryKeys.catalog`, gap-06 nullable `context_limit` → `ContextLimitMap`). Mock gained `api_004` (served `mystery-model`, null window, usage reported ⇒ gauge `—`). Gate F: typecheck/lint/test 447 (+33)/e2e 8 (+1: gauge WITH known limit ⇒ derived, WITHOUT ⇒ `—`) + flows screenshot baseline regenerated. Backend untouched (no `.rs` changed; cargo fmt/clippy confirmed green).
-- [x] **10** per-flow latency breakdown ⭐ · gate **F** · dep 02 (03 enriches). Built the per-flow latency waterfall + "Timing" line in the FlowDetail inspector header, CONSUMING the gap-02 phase epochs + gap-03 served-attempt wire TTFB. Pure `latencyBreakdown.ts` (DOM-free, sibling of `contextUtilization.ts`): decomposes the turn's wall-clock into 6 phase segments (queue/normalize → routing → upstream-wait/TTFB → prefill → generation → finalize), each derived from a PAIR of known epoch timestamps; TTFT is `measured` from `first_content_delta_ms − ingress`, else an `estimated` first-visible-activity fallback from the monitor `output` segments' `timestamp_ms − started_ms` (labelled, never claimed as upstream TTFB); stream tok/s is `derived` (completion ÷ stream duration). DQ core (all asserted): a phase with a missing endpoint ⇒ that segment is UNAVAILABLE (`—`, no bar width), DISTINCT from a real ~0ms phase (`0ms`, a hairline segment); disordered clocks (end<start) clamp to 0 + flag `skew`, never negative; total derives from ingress→latest-known edge (never fabricated); a `0`/non-positive epoch is treated as unmeasured (don't-lie-with-zeros). TS bindings added (FRONTEND-ONLY — the Rust side already emits these as `Option`/`skip_serializing_if`): `PhaseTimings` (flattened siblings) + `Attempt`/`AttemptStatus`/`AttemptErrorClass`/`AttemptFailoverReason` + `first_upstream_byte_ms` on `FlowSummary`/`FlowDetail`/`FlowStatusPayload`, with `isAttempt` guard + optional validators wired into `isFlowSummary`/`flow_status`. **DISCOVERY:** the spine fields land on the INTERNAL `SnapshotFlowSummary`/`FlowRecord` but are NOT re-projected onto the wire-facing `FlowRow`/`FlowDetailBody`/`FlowStatusPayload` DTOs the frontend consumes — so the MEASURED path is wired + tested via mock fixtures but will only light up in production once a backend projection lands (the spec's documented monitor-segment derived fallback is the always-available source today; kept gate F by NOT touching `.rs`). Mock: full spine on `api_001`/`api_002` (measured), errored-before-content on `api_003` (prefill/generation `—`), no-attempt on `api_004` (no-TTFB anchor path). Gate F: typecheck/lint/test 473 (+26)/e2e 9 (+1: measured TTFT + waterfall, `—` on missing phases). Backend untouched (0 `.rs` changed; `cargo fmt --check` clean).
-- [x] **11** failover / attempt trace UI · gate **F** · dep 03 (+10b). Built the per-flow FAILOVER / attempt-trace STEPPER in the FlowDetail inspector header, CONSUMING the gap-03 `attempts[]` already projected onto the row/detail/live frame (gap 10b) — PURE FRONTEND (0 `.rs`; deps confirmed by code search, the gap-10 `Attempt` TS bindings + `isAttempt` guard REUSED, not duplicated). Pure `attemptTrace.ts` (DOM-free, sibling of `latencyBreakdown.ts`): one `AttemptNode` per recorded attempt (provider/model/status/`error_class`/`failover_reason` = `measured` from the wire), `isFailover` only at ≥2 attempts (a single attempt → a single node, NO fake failover), `servedIndex` finds the served node (null when all failed); per-node duration = `end_ms−start_ms` (disordered clamps to 0 + `disordered` flag, never negative; missing endpoint ⇒ `unavailable`), per-node `firstByte` (wire TTFB vs the attempt's own start) `measured` when present (a real `0` reads `0ms`) else `unavailable` (`—`, NEVER `0` — sentinel/non-positive epochs treated as unmeasured); a first byte BEFORE the attempt start clamps to 0 + `disordered` flag (renders `skew`), kept distinct from a real measured `0` (Codex-xhigh MEDIUM fix). `AttemptTrace.tsx` renders the `node → node` chain (mirrors `LatencyBreakdown` idioms + Night Watch traffic-lights): served node visually distinct (mint border + `data-served`), failed node shows its taxonomic `error_class`, each node EXPANDABLE to model/first-byte/failover_reason detail; a one-line summary names the failover handoff or reads "single attempt — no failover"; every figure tagged `data-quality`. Wired into `FlowDetail` via `attemptTrace(pickAttempts(live, frozen))` (the same non-empty-wins merge the latency model uses — a snapshot `[]` never suppresses a populated detail trace), rendered as a `failover` `dl` row ONLY when `hasTrace` (absent ⇒ omitted, no empty stepper). Mock gained `api_005` (a vllm-b-failed→openai-served failover fixture); fixed a pre-existing gap-10 e2e selector that `api_005` exposed (selected the failed row by a no-longer-unique `openai` text → switched to the stable `api_003` id) + regenerated the flows screenshot baseline. Gate F: typecheck/lint/test 519 (+24: 16 model + 8 component)/e2e 10 (+1: failover chain + single-attempt + `—` on no first byte). Codex-xhigh review (1 MEDIUM: disordered per-attempt first byte was a silent `measured 0ms`) FIXED + amended.
-- [x] **12** per-provider latency + error distribution (backend) · gate **B** · dep 03; feeds 13, 16. ADDED a per-provider latency ring + error distribution to `MetricsLayer`, fed from the EVICT-SAFE terminal `attempts[]` payload (gap 03's `TerminalMetricsInputs`, read off the shared `ServingToken` at the D3 finalize CAS — the SAME seam as `usage`/`upstream`), NOT a `FlowStore` read — so a FAILED PRIMARY on a flow whose record was pruned/evicted before finalize is still counted toward its provider (final-served latency alone hides an unhealthy upstream). REUSES the existing 30-bucket log-spaced `Histogram` + the window-ring/slot/eviction machinery (no second percentile impl): each `Slot` gained a `providers: BTreeMap<provider, ProviderSample>` (per-provider `Histogram` over ATTEMPT latencies + served/failed counts + a bounded per-class `ProviderErrorDistribution`), folded in atomically inside the SAME single-lock `record_terminal` hold (engine passes `&inputs.attempts`) so a concurrent 5 s snapshot can't split the count from its per-provider samples. MEMORY: bounded BOTH ways — provider COUNT capped at `MAX_TRACKED_PROVIDERS=64` per slot AND at the aggregate-union level (rotating-alias defense — distinct slots can carry distinct sets, so the merged map re-caps + folds overflow into a single `__other__` key), samples-per-provider bounded by the fixed histogram; error keys are the BOUNDED gap-03 snake_case `AttemptErrorClass` taxonomy (never raw upstream text). EXPOSED additively on the D4 `/topology` + `/snapshot` node as `per_provider: Option<ProviderLatency>` (p50/p95/p99 + error_rate + error distribution), populated via `TopologyNode::from_health_with_metrics` off the SAME m1 window the edge rates use (live WS `topology_frame` leaves it `None`, like its `0.0` edges) — frozen `TopologyNode` contract intact (`skip_serializing_if`). DQ + don't-lie-with-zeros: a present tile is always `data_quality:"derived"` with `samples>=1`; a provider with ZERO in-window attempts is ABSENT (renders `—`), never a fabricated `0ms`/`0%`; an all-served provider reports a MEASURED `0.0` error rate (distinct from absent). Frontend untouched (additive shape spec 13 reads). Codex-xhigh review (1 HIGH: `MetricsView::approx_bytes` — the snapshot-ring memory-quota accountant — didn't charge the retained `#[serde(skip)]` `WindowReport.providers` maps, so the ring could undercount per-provider keys/histograms + exceed its bound) FIXED: charge each window's provider map the SAME way as `buckets` (provider key string + `String` overhead + fixed `ProviderSample` size), bounded by the union cap. Gate B: cargo test 949 (+11: per-provider aggregation off the terminal seam, failed-primary counted, evict-safety survives TTL+cap eviction, zero-sample⇒absent, error-distribution by class, per-slot + cross-slot-union bound, snapshot-quota charges per-provider maps, topology round-trip)/clippy 0/fmt.
-- [x] **13** per-provider latency UI · gate **F** · dep 12. Built the per-provider latency + error-distribution surface on the topology screen, CONSUMING the gap-12 `TopologyNode.per_provider` (p50/p95/p99 + error_rate + bounded per-class distribution) — PURE FRONTEND (0 `.rs`). Added the TS bindings (`ProviderLatency`/`ProviderErrorDistribution`/`ProviderMetricQuality` + `per_provider?` on `ProviderHealth`) with an `isProviderLatency` guard wired OPTIONALLY into `isProviderHealth` (the WS `topology_update` frame carries `per_provider` ABSENT — validated only when present; populated round-trips). **DATA SOURCE (the gap-12 discovery, confirmed by code search):** the per-provider tile reads the REST `/topology` (live) / `/snapshot`-node (seek) path, NOT the live WS topology frame (which carries `per_provider: None` — does not join the metrics window). `useTopologyQuery` now also returns a `perProviderById` map derived off the LIVE REST data (stable across WS `topology_update` frames that would otherwise clobber the store node's `per_provider`); `TopologyView` resolves a node's metrics as `perProviderById[id] ?? storeNode.per_provider` (REST live → frozen-snapshot node while seeking) so it never reads the WS frame. Pure `providerLatency.ts` (DOM-free, sibling of `latencyBreakdown.ts`): `buildProviderLatency` tags percentiles `derived` + error_rate `measured`, and `providerNodeEmphasis` classifies a node neutral(`unavailable`)/`nominal`/`degrading` for sizing. DQ + don't-lie-with-zeros: an ABSENT `per_provider` (zero in-window samples) ⇒ tile renders `—` + node stays NEUTRAL (base size, no ring — never 0-sized / falsely-healthy); a present tile is `derived` with real percentiles; an all-served provider shows a MEASURED `0%` (distinct from `—`); the bounded `__other__` overflow + `unknown` sentinel keys are LABELLED honestly ("other providers (overflow)" / "unknown provider"), not hidden. Surfaces: `ProviderLatencyTile` (the per-provider block) REPLACES the old GLOBAL-p99 line in `CooldownTooltip`; `RadialTopology` sizes nodes by per-provider error-rate emphasis + draws a red error ring on a `degrading` provider (kept click-to-filter + the keyed-`<g>` hover-preservation intact — the status circle stays the primary `<circle>`, ring appended after). Mock: `per_provider` on the REST/snapshot nodes (all-served 0% on `vllm-a`, degrading 16% w/ connect+timeout distribution on `vllm-b`, ABSENT on `openai`), STRIPPED on the WS `topologyFrame` (mirrors Rust `from_health`). Gate F: typecheck/lint/test 548 (+29: model + tile component + node-emphasis + latency-emphasis + invalidation)/e2e 11 (+1: tooltip per-provider values + healthy/degrading/unavailable node states). Backend untouched (0 `.rs` changed). Codex-xhigh review round 1 (1 HIGH + 1 MEDIUM) FIXED + amended: HIGH — a `metrics` WS frame now ALSO invalidates `queryKeys.topology` (the REST `/topology` per_provider join rides the m1 window, so it would otherwise stay STALE until an unrelated topology change); MEDIUM — `providerNodeEmphasis` now folds p99 latency (`DEGRADING_P99_MS=2000`) into the classification so a slow-but-no-errors provider is flagged `degrading`/enlarged (`data-latency-degraded`, no error ring), keeping don't-lie-with-zeros (absent ⇒ neutral, no fabricated latency emphasis).
-- [x] **14** failure taxonomy · gate **F** · dep 05. Built the AGGREGATE failure deep-dive + the enriched inspector `ErrorTab`, answering "what is failing and why, in aggregate — not one red row at a time?" — PURE FRONTEND (0 `.rs`). **GATE STAYED F (dep-context's open question RESOLVED by code search):** the gap-05 `upstream_response` error body is NOT dark — the Rust `FlowDetailBody.upstream_response: Option<FlowUpstreamResponse{body,truncated}>` was ALREADY projected onto the LIVE `/flows/:id` detail by gap-05 review F2 (`dashboard_api.rs:320`+`:1046`, round-trip test at `:1644`, annotated "Consumed by gap 14"; no-Bytes-retention + body-free-snapshot invariants held there), and all taxonomic codes (`error_class`/`failover_reason`/`status` on `attempts[]`, `terminal_reason`) were already on the wire (03/10/10b). The TS `FlowDetail` simply hadn't DECLARED the field — additive TS type + `isFlowUpstreamResponse` guard closed the dark-at-TS-layer gap, no backend change. Pure `failureTaxonomy.ts` (DOM-free, sibling of `providerLatency.ts`): `failureTaxonomy(flows)` groups OBSERVED flows by `<provider>|<model>` × failure REASON — ALWAYS a BOUNDED taxonomic key (the LAST failed attempt's gap-03 `error_class` FIRST, else a WHITELISTED `TerminalReason` code, else `__unclassified__`; a free-form `terminal_reason` can NEVER be a key — review-round 1 HIGH) — with a DERIVED per-group + overall error rate (`failed/total×100`); only `status==='failed'` flows contribute reasons, every flow counts toward the rate denominator. `capturedErrorBody(upstream)` is the ErrorTab model. DQ + don't-lie-with-zeros (all asserted): empty/no-flows ⇒ `available:false`, every rate `—` (`unavailable`), NEVER `0%`; an observed all-SUCCESS window ⇒ a MEASURED-base `derived 0%` (distinct from `—`); grouping=`measured`, rate=`derived`; a captured body present ⇒ `measured` (truncation flagged), ABSENT/malformed ⇒ explicit "capture disabled" (`unavailable`) — NOT a blank implying "no error" (the capture-disabled-vs-no-body distinction); an empty `""` body is `captured` (distinct from absent). Surfaces: `FailureTaxonomy.tsx` aggregate panel (overall error-rate chip — red above threshold, `—` on zero-sample — + grouped failures with reason chips) mounted above the `FlowTable` in `FlowsView`, reading the SAME `useFlowRows(filters)` population; the enriched `ErrorTab` in `FlowDetail` (for a GENUINE error/failure) shows the captured upstream error body (`<pre>`, redacted; THREAT MODEL: showing it to the auth-gated operator is INTENDED) or an explicit `unavailable` state — live capture-disabled, or, while SEEKING, a HISTORICAL "capture unavailable on historical view (live-only)" — reading `frozenDetail` (live-detail only); an error/failed flow NEVER reads "No error." (see round 3 below). `Panel` now forwards arbitrary `<div>` props (`data-testid`/`data-*`) — were previously dropped. Mock: `api_006` (failed, capture-OFF) + `UPSTREAM_RESPONSE_BY_ID` (`api_003` captured 503 body, capture-ON), projected onto the live detail only. Gate F: typecheck/lint/test **575** (model + panel + ErrorTab)/e2e **12** (+1: aggregate groups + derived error-rate chip + bounded-reason-key + ErrorTab capture on/off, rows selected by stable `api_call_id`; 4 view baselines incl. `flows.png` still matched — no regeneration; run at `--workers=4` to avoid a pre-existing login-page contention flake under 12 workers). Backend untouched (0 `.rs` changed). **Codex-xhigh review round 1 (2 findings) FIXED + amended:** HIGH — `reasonOf` yields a BOUNDED key ALWAYS (gap-03 `error_class` first → WHITELISTED `TerminalReason` code → `__unclassified__`); a free-form `terminal_reason` (the `finalize` seam stamps arbitrary capped-but-unbounded strings) can NEVER become a group key (cardinality guard / gap-03 bounded-taxonomy contract), distinct free-form strings collapse into `__unclassified__`. MEDIUM — the panel now ALWAYS renders: a zero-sample window shows an EXPLICIT `unavailable` `—` (chip `data-quality="unavailable"` + a `failure-unavailable` line), DISTINCT from an observed all-success window's MEASURED-base derived `0%`. **Review round 2 (1 NEW HIGH) FIXED + amended:** the ErrorTab empty-guard returned `No error.` for a FAILED flow with no `terminal_reason`/monitor error + capture OFF; first fix tied the guard to `showCapture` (superseded in round 3). **Review round 3 (R2 fix INCOMPLETE on the seek path) FIXED definitively:** R2's `showCapture = !seeking && isError` still fell through to `No error.` while SEEKING a failed flow. Decoupled the concerns — `isError = status==='failed' || !!joinError` (a GENUINE error, not a benign `terminal_reason`); the "No error." guard is now `!isError && !reason` (a failed flow NEVER reaches it, regardless of `seeking`/capture suppression); the capture block renders whenever `isError` and ALWAYS shows an explicit state — captured `measured`, the live capture-disabled `unavailable` (`error-capture-disabled`), or, while SEEKING, the HISTORICAL `unavailable` state (`error-capture-historical`, "capture unavailable on historical view — live-only") labelled DISTINCTLY from "capture disabled". Tests cover all three paths (live-disabled / seeking-historical / success).
-- [x] **15** client / key attribution UI ⭐ · gate **F** · dep 04. Built the client/key attribution surface — PURE FRONTEND (0 `.rs`). **GATE STAYED F (the dep-context's DARK-on-wire question RESOLVED by code search BEFORE coding):** the gap-04 `client_label`/`client_source` (key-hash `key-<hex>` / configured caller-id / weak-UA) is NOT dark — it was ALREADY projected onto the consumed `FlowRow` (`/flows` + `/snapshot`, via `from_record`/`from_summary` with `skip_serializing_if`) by gap-04 review F3 (round-trip-tested; `ClientSource` serializes snake_case). The spec's scope (CLIENT-column roll-up + per-client filter + per-client cost/err/latency) reads the FLOW LIST (`FlowRow`), which is fully on the wire — so NO backend projection was needed (the live WS `FlowStatus`/`FlowDetailBody` lack the fields, but the surface doesn't read them; extending them would be a NEW backend gap, out of scope). No-raw-key invariant holds by consumption (gap 04 hashes the key in place pre-redaction; only the one-way hash prefix ever exists as a label — the frontend consumes the hash, NEVER a raw key); body-free-snapshot invariant untouched (bounded scalars on `FlowRow`, not bodies). Pure `clientAttribution.ts` (DOM-free, sibling of `failureTaxonomy.ts`): `clientCell(flow)` tags the cell by SOURCE STRENGTH — key-hash/configured-id ⇒ `strong`/`measured`, user-agent ⇒ `weak`/`derived` (rendered visibly weaker/italic + amber `ua` badge, NEVER a confirmed identity), ABSENT ⇒ `—`/`unavailable` (don't-lie-with-zeros, never a fabricated id / the HTTP method); `clientRollup(rows)` groups attributed flows BY `client_label` with a DERIVED per-client error rate (measured-base `0%` distinct from `—`), SUMMED priced cost (`measured`; `—` when none priced — never `$0.00`), MEAN timed latency (`derived`; `—` when none timed), the STRONGEST source a client ever presented winning its tag, and unattributed flows bumping an explicit count (never invented). Surfaces: the CLIENT column (replacing the DEAD `clientLabel()` finding-6 placeholder that always rendered `—`) now renders `ClientCellView` (`data-quality`/`data-strength`/`data-attributed`); a collapsible `ClientRollup` panel (cost/err/latency per client, weak-UA distinct, ALWAYS renders — a zero-attributed window is an explicit `unavailable` `—`) mounted under `FlowTable`, its rows CROSS-LINKING into a NEW per-client filter facet (`FlowFilters.client` + `flowFilterStore.setClient` + a `FilterBar` client chip group + `useFlowRows` distinct `clients[]`/filter). TS: `ClientSource` + `client_label?`/`client_source?` on `FlowSummary` + `isOptClientSource` guard in `isFlowSummary`; `useFlowRows` merge threads the IMMUTABLE attribution live-first/REST-backfilled. **BUG FIX (`patchFlowStatus`):** the live `flow_status` WS frame carries NO client fields, and `patchFlowStatus` rebuilds the row fresh — so it DROPPED the snapshot-seeded `client_label` on the first live frame (blanking the cell/roll-up to `—`); fixed by carrying `client_label`/`client_source` from `prev` (gap-10b immutable-field pattern). Mock: seeded attribution on the flows (shared key-hash on api_001+002 for multi-flow grouping, a configured-id with a failure, a weak-UA, a distinct key-hash, and api_006 ABSENT for the `—`/unattributed path). Gate F: typecheck/lint clean · vitest **597** (+18: model 15 + ClientRollup 3 + FlowTable gap-15 5 + flowFilterStore 1, less the FilterBar/store literal updates) · e2e **13** at `--workers=4` (+1: source-tagged CLIENT column + weak-UA distinction + unattributed `—` + by-client roll-up DQ tags + cross-link filter `2/6`→clear; 4 view baselines stayed within the 2% pixel tolerance — CLIENT is a 56px strip << 2% of 1600px — no regen). 0 `.rs` changed. NOTE: a lone login-screenshot failure surfaces only at the higher DEFAULT worker count (pre-existing login-page-load contention flake — green in isolation + at `--workers=4`); unrelated to gap 15. **For gap 16:** `clientRollup(rows)` is reusable for the control-room "top clients" tiles directly off `useFlowRows(filters)` (no fetch); client attribution is on `FlowRow` (`/flows`+`/snapshot`) ONLY — read the flow-list population, not the live `flow_status` frame. **Codex-xhigh review round 1 (amended): 3 MEDIUM fixed** — (1) `ClientRollup.tsx` null-source row no longer masquerades as a strong configured-id + `ua` badge: a new `rowSourceTag` switch renders a source-`unavailable` `?` badge + honest title for `source === null` (the CLIENT cell was already correct); (2) the CLIENT column widened from a fixed `56px` to `minmax(120px,0.9fr)` (endpoint trimmed to keep the grid balanced) so real labels are visually distinguishable — not truncated to a non-distinguishing prefix; (3) the high-cardinality client filter is bounded — `useFlowRows` returns `clients` volume-ordered and `FilterBar` caps to the top-N busiest (`CLIENT_CHIP_CAP=8`) via `capWithSelected`, ALWAYS keeping the active selection visible/toggle-off-able even when out-of-top-N (never silently dropped) + a `+N more` hint. Gate F re-run: vitest **601** (+4), e2e **13** at `--workers=4` (4 view baselines incl. `flows.png` still matched within the 2% tolerance despite the widened column — no regen). 0 `.rs` changed. Re-tagged `gap-15-client-attribution-ui`. **Codex-xhigh review round 2 (amended): round-1 fixes CONFIRMED + 1 follow-on MEDIUM fixed** — capped client chips still rendered the `client_label` at UNBOUNDED length (~4 KiB UA/configured-header values could blow up the bar despite the top-8 cap); the `FilterBar` `Chip` gained a `truncateLabel` mode wrapping the label in a bounded `max-w-[160px] truncate` span with the full value in the chip `title` (applied to every client chip incl. the folded-in active selection; stays toggle-off-able). Gate F: vitest **602** (+1 truncation case), e2e **13** at `--workers=4` (baselines unchanged). 0 `.rs` changed. Re-tagged `gap-15-client-attribution-ui`. **Codex-xhigh review round 3 (amended): round-2 truncation had a CSS-correctness bug, FIXED definitively** — the label span was a bare INLINE `<span>` with `max-w-[160px] truncate`, but `max-width`/`truncate` are NO-OPs on an inline box (it could still expand to ~4 KiB); the span is now `inline-block min-w-0 max-w-[160px] truncate` (a block formatting context so the cap + ellipsis apply; `min-w-0` lets it shrink in the flex button). Assertions hardened: vitest asserts the real constraining-class contract (`inline-block`/`block` + `min-w-0` + `max-w-*` + `truncate`, not the no-op `truncate` alone); a NEW Playwright test (opt-in `?longclient=1` mock flow with a 4 KiB UA label — absent from all other tests/screenshots) proves REAL layout — the label span CLIPS (`scrollWidth > clientWidth`), the label box ≤200px, the chip button ≤260px AND ≤ the bar width, title intact. Gate F: vitest **602**, e2e **14** at `--workers=4` (+1 real-layout long-chip check; baselines unchanged). 0 `.rs` changed. Re-tagged `gap-15-client-attribution-ui`.
-- [x] **16** control-room overview ⭐ · gate **F** · dep 02, 03, 04, 07, **12** (12 REQUIRED for provider tiles). **LAST — program DONE.** Built the CONTROL-ROOM overview — the single screen an operator watches DURING an incident (what's failing · which provider/client · how bad · cost · context) — as a 5th hash route `#/overview` (the existing four undisturbed, `flows` stays default). PURE FRONTEND (0 `.rs`). It COMPOSES the gap-01–15 surfaces; it does NOT invent data or re-fetch. NEW pure model `views/overview/overviewModel.ts` (DOM-free, sibling of `failureTaxonomy.ts`): `topByVolume`/`topByCost(rows, model|provider)` leaderboards (VOLUME = `measured` flow count; COST inherits the WEAKEST `cost_confidence` of its priced flows — mixed confident+estimated ⇒ `estimated`, never silently upgraded; no priced flow ⇒ `null`/`—`, never `$0.00`; `topByCost` ranks only priced groups, a none-priced window ⇒ the cost-board empty-state `—`), and `tokenMix(rows)` (prompt/completion `measured` incl. a real `0`; an UNREPORTED optional cached/reasoning ⇒ `unavailable`/`—`, never a fabricated `0`; partial reporting sums the reported value). NEW thin-composer view `OverviewView.tsx` (honesty lives in the models): a headline strip echoing the gap-01 unified metrics tile (samples-gated err%/tok-s/$/min ⇒ `—` when their denominator is 0; $/min DQ = aggregate `cost_confidence`) + a LIVE-only cost-over-time `$/min` Sparkline (`useMetricStream`); per-provider latency/error tiles via `buildProviderLatency`+`ProviderLatencyTile`; top-models/providers leaderboards (estimated cost `est`-labelled); the gap-14 `failureTaxonomy(rows)` failures tile; the gap-15 `clientRollup(rows)` top-clients tile (weak UA visibly weaker, unattributed counted, the key-`<hex>` HASH shown — never a raw key); the gap-09 `aggregateContextPressure` tile; the token-mix tile. **WIRE-SOURCE CORRECTNESS (spec's core):** per-provider ⇒ REST `/topology`+`/snapshot` DTO via `useTopologyQuery().perProviderById ?? storeNode.per_provider` (NEVER the WS frame, which carries `per_provider` absent — deriving from flows would hide failed primaries); volume/cost/failures/clients/context/token-mix ⇒ the `useFlowRows(filters)` FLOW-LIST population (carries per-flow `cost`/`cost_confidence`/`usage`/`client_label`, NOT the live `flow_status` frame); filters re-scope the whole control room consistently. EVERY tile/figure `measured`/`derived`/`estimated`/`unavailable`-tagged; empty window ⇒ the `—` empty-state, not an all-`0` dashboard. Gate F: typecheck/lint clean · vitest **627** (+25: overviewModel + OverviewView) · e2e **16** at `--workers=4` (+2: the gap-16 functional test composing the surfaces with honest DQ tags + the new per-view `overview` screenshot — its `overview-chromium-linux.png` baseline generated intentionally for the new view; the 4 existing view baselines + login still matched, no regen). **Codex-xhigh review round 1 (amended): 4 HIGH + 1 MEDIUM fixed** — (1) added the missing `top providers · cost` tile (`topByCost(rows,'provider')`, same weakest-tag/unpriced rules); (2) the cost-over-time trend pushes `NaN` (a gap, never a fabricated flat `0`) for an unpriced tick + tags the trend with the latest cost quality; (3) `clientRollup` now folds the WEAKEST `cost_confidence` per client (was always `measured`, silently upgrading estimated client spend — benefits gap 15 too); (4) context near/over renders `— / —` (`unavailable`) when no flow is measurable (was `0 / 0`, faking measured zero-risk — a real measured `0 / 0` stays distinct); (5) `tokenMix` adds EXCLUSIVE `barSegments` (cached carved out of prompt, reasoning out of completion) so the stacked bar sums ≤100% (cached ⊆ prompt, reasoning ⊆ completion). Gate F re-run: vitest **633** (+6), e2e **16** at `--workers=4` (overview baseline MATCHED unchanged — the new provider-cost tile renders within the 2% pixel tolerance / below the captured fold, so no regen was needed; the other 4 + login matched too). 0 `.rs` changed. Re-tagged `gap-16-control-room-overview`. **Codex-xhigh review round 2 (amended): round-1 fixes CONFIRMED + 3 follow-through gaps (1 HIGH + 2 MEDIUM) fixed** — (HIGH) `NaN` is NOT a uPlot gap sentinel (round-1 fix #2 was ineffective + could poison the y-scale) ⇒ `Sparkline` now takes `(number|null)[]` and normalizes non-finite→`null` at the boundary, `foldCost` pushes `null` for an unpriced tick (an honest BREAK, not a flat 0); (MEDIUM) the token-class READOUT shares now use the SAME parent-clamped subset amounts as the bar (a malformed `cached>prompt`/`reasoning>completion` can't show a per-class share >100%; raw counts preserved); (MEDIUM) the top-clients cost tooltip is built from the folded `costConfidence`/`costQuality` (`clientCostTitle`) — estimated client spend is labelled estimated, NOT the hardcoded "measured". Gate F re-run: vitest **637** (+4), e2e **16** at `--workers=4` (all 5 view baselines incl. `overview` MATCHED unchanged). 0 `.rs` changed. Re-tagged `gap-16-control-room-overview`.
-
-## Per-gap Definition of Done
-1. Read the gap's `.ralph/specs/<NN>-*.md` — acceptance criteria are the oracle.
-2. Confirm with code search before assuming anything is missing (see verified-state table).
-3. Obey AGENTS.md "Hard rules in the engine" + the dashboard Don'ts.
-4. Gate green (B or F per the gap).
-5. Data-quality tags + don't-lie-with-zeros satisfied (every gap).
-6. Commit → **Codex-xhigh review** of that commit (REVIEW_PROTOCOL.md) before the next gap. ≤3 rounds;
-   unresolved findings recorded here + halt.
-
-## Live-verify (recommended; mirrors the prior program's T1 live-verify)
-01 + the spine touch the live data path. After 01, and after the spine (02–07) lands, verify against the
-live vLLM run (release binary on :5022, `--with-debug-ui`, `/dashboard`): the strip is honest under real
-streaming traffic; the inspector shows real phase/attempt data; nothing renders a fabricated `0`.
-
-## Out of scope (later /ralph-guide-update — FEATURES.md items 11–15)
-Retention/privacy → full-text search + flow compare; export JSON/curl + effective-changes summary +
-theater depth; OTel/Prometheus + real alerting; web-search/tool observability + SLO + abuse scan; replay
-(gated+audited) + command palette. Also deferred: streaming-stall / inter-token health; provider
-health-history (cooldown timeline); outlier / slow-request spotlight.
+Source anchors verified against HEAD (`mod.rs` line numbers, current):
+`ensure_started`:141 (ping 144, message_start 145, input_tokens 155) · `record_output_delta` def 679, offending
+push 691-701, call sites **200, 214, 236, 299, 357, 777** · `flush_reasoning_as_thinking`:588 (signature emit 612-617)
+· `handle_completed`:442 (terminal Δ 483) · `finalize`:410 (terminal Δ 422) · `handle_failed`:497 · web_search:534.
+Ingress strip: `anthropic_to_responses.rs:366` (Thinking → `encrypted_content`, currently filters empty at 377-380).
 
 ---
 
-## Topic E — Engine robustness (post-dashboard; independent of gaps 01–16)
+## Task 0B1 — Strict conformance harness (FIRST; defines "done")
+**Why first:** the harness encodes the target invariants so every later phase has an objective pass/fail gate.
+**Files:** new conformance assertion helpers reusable from BOTH unit tests (`AnthropicStreamEvent` form) AND the two
+integration test crates (`tests/gateway.rs` JSON-SSE form, `tests/port_streaming_peek.rs` event form).
 
-> **Source:** `/ralph-guide-update` 2026-06-29 — a field incident (`API Error: unknown tool returned by
-> upstream: Grep`) + `/askcodex` gpt-5.5 xhigh design review. These are BACKEND engine fixes, not
-> dashboard gaps — they ride the same REVIEW_PROTOCOL (Codex-xhigh per task) but touch `src/*.rs`, not
-> `dashboard-frontend/`. Gate = **B** (backend: `cargo test` + `cargo clippy --all-targets` + `cargo
-> fmt` + Codex-xhigh APPROVED). Independent of the dashboard program; schedule anytime.
+**Do:**
+1. Add a reusable assertion library exposing two entry points:
+   - `assert_stream_conformant(events: &[AnthropicStreamEvent], surface: Surface)` — operates on the converter's
+     public output enum (used by `tests.rs` unit tests + `port_streaming_peek.rs`).
+   - `assert_sse_conformant(events: &[serde_json::Value], surface: Surface)` — operates on parsed JSON SSE
+     (used by `tests/gateway.rs`).
+   Recommended placement: `tests/common/mod.rs` for the integration-crate-visible JSON form; for the event form,
+   either a small `pub`/`#[cfg(any(test, feature=...))]` module in `src/adapters/responses_to_anthropic/` or a
+   mirrored helper in `tests/common`. Subagent picks the cleanest structure that all three test files can import.
+2. The assertions (ALL invariants from the spec):
+   - exactly ONE `message_delta`, and it carries a non-null `stop_reason`;
+   - NO `message_delta` appears before the first `content_block_start`;
+   - NO `message_delta` appears between a `content_block_delta` and the matching `content_block_stop` (open block);
+   - if a `thinking` block exists, it emits a NON-EMPTY `signature_delta`;
+   - the LAST two events are `message_delta` then `message_stop`;
+   - `Surface` lets a caller relax block-shape expectations (text-only has no thinking block; error surface ends
+     with `error` — assert that variant explicitly).
+3. **Self-validation test (this is what keeps T0B1 green):** feed the harness a hand-built CONFORMANT event vector
+   (mirrors the golden: message_start → thinking(+sig) → text → ONE message_delta → message_stop) and assert it
+   PASSES; feed a NON-CONFORMANT vector (progressive deltas + empty sig, i.e. today's shape) and assert it is
+   REJECTED (use `#[should_panic]` or a `Result`-returning variant). This proves the harness discriminates without
+   yet touching the real converter (that is T-C1..C4).
 
-### Task E1 — Bounded soft-reject repair for hallucinated upstream tool calls
-**Spec:** `.ralph/specs/E1-hallucinated-tool-call-repair.md` · **Gate:** B · **Status:** ✅ DONE — gate B green, Codex-xhigh APPROVED (R2) · **Commit:** 9590699 (tag `E1-hallucinated-tool-call-repair`) · **Deps:** none
-**Incident:** a fallback model (DeepSeek-V4-Flash serving a requested `claude-opus-*`) emitted a
-tool_call named `Grep` — a canonical Claude Code tool that CC DEFERS behind `ToolSearch` and did NOT
-offer this turn. `finalize()` (`src/adapters/chat_to_responses.rs:263`) hard-errors
-(`AppError::upstream("unknown tool returned by upstream: Grep")`); the engine tool-loop
-(`src/engine.rs:2253` `state.finalize(&tool_registry)?`) propagates `?` and ABORTS the SSE stream
-mid-flight (200 + headers already sent ⇒ can't be a clean 4xx ⇒ broken session; currently invisible in
-`journalctl`).
-**Fix (Codex xhigh: A2+C — bounded soft-reject REPAIR):** `finalize()` CLASSIFIES unknown tool names
-into a new `rejected_tool_calls` list (no `Err`; known-tool malformed-arg/missing-name/bad-local_shell
-hard errors stay); extend `ToolDeltaGate` (`src/tool_delta_gate.rs`) so unknown-tool argument deltas are
-buffered-until-name then DROPPED (never reach the client), reusing its existing 256 KiB/1 MiB caps; the
-engine taints the whole batch, injects synthetic `tool` results, and runs ONE extra in-gateway upstream
-round (same loop shape as web-search at `engine.rs:2253-2356`) bounded by a new
-`UNKNOWN_TOOL_REPAIR_CEILING` (default 1, max 2 — mirrors `WEB_SEARCH_ROUNDS_HARD_CEILING` at
-`engine.rs:2340`); on exhaustion emit a STRUCTURED terminal failure per inbound format (Responses
-`response.failed` / Anthropic `error` / Chat SSE error), never a raw `?` abort; add a closed-tool-set
-prevention note to the upstream request. Rejected: alias/auto-inject (B), pass-through (D), plain-skip
-(A1), hard-error (E).
-**Files:** src/adapters/chat_to_responses.rs, src/engine.rs, src/tool_delta_gate.rs, src/monitor.rs, tests/
-**Acceptance (full list in spec E1):** unknown→rejected not Err; deltas hidden on all 3 formats; tainted
-batch (no partial exec/handoff); bounded repair round self-corrects; ceiling→structured terminal per
-format with text preserved; no JSON-parse of unknown args; cancellation preserved across repair rounds;
-canonical-Responses-only; observability (warn + `unknown_tool_call_total{provider,served_model,outcome}`
-counter, no raw-name labels + `unknown_tool_rejected`/`unknown_tool_repair_exhausted` monitor phases);
-`cargo test`/clippy/fmt green; Codex-xhigh APPROVED.
-**Sequencing:** Independent — no deps on the dashboard gaps or other Topic-E tasks. Reuses ToolDeltaGate
-(U7/T3) caps + the web-search-round loop pattern + the MonitorHub `emit_with` choke-point.
+**DoD:** `cargo test` green; harness self-tests prove accept-good / reject-bad. No production code changed yet.
 
-**Build summary (🔬 BUILT — gate B green, pending Codex-xhigh review):** Landed the full A2+C design.
-`finalize()` (`chat_to_responses.rs`) now classifies an unoffered tool name into a new
-`rejected_tool_calls: Vec<RejectedToolCall{call_id,name,raw_arguments,reason}>` (NO `Err`, NO JSON-parse
-of unknown args — raw capped via `cap_str`) and replays the attempted call into the assistant message so
-the repair tool result lines up by `call_id`; missing-name / bad known-tool args / invalid `local_shell`
-still hard-error. `ToolDeltaGate` (`tool_delta_gate.rs`) was generalized to a tri-state
-`hidden: Option<bool>` (engine classifies the resolved name via `is_hidden_tool_name` against the
-registry): leading deltas buffer until the name resolves, then DROP (hidden = unknown OR `analyzeImage`)
-or FLUSH (visible) — reusing the existing 256 KiB/1 MiB caps + O(1) accounting (no new caps); the old
-`vision_active` flag is gone (registry classification subsumes it). The engine tool-loop taints a batch
-with any rejected call (turn-end flush skipped, no `handle_tool_calls`), injects a synthetic `tool` result
-per call (`not_executed` for tainted-valid, `tool_unavailable` for unknown) + a closed-tool-set `system`
-note (prevention C), relaxes `tool_choice` to `auto`, and runs one bounded repair round
-(`UNKNOWN_TOOL_REPAIR_CEILING = 1`); on exhaustion it returns the new
-`AppError::unknown_tool_repair_exhausted()` (code `invalid_tool_call`) which the existing spawn-closure
-renders as the canonical `response.failed` → all 3 converters (canonical-Responses-only; already-streamed
-text preserved). Observability: always-on `tracing::warn!` (response_id/provider/served_model/unknown
-tool/offered count/repair round) + a bounded always-on `unknown_tool_call_counts` BTreeMap counter on
-`Gateway` keyed `{provider,served_model,outcome∈repaired|exhausted}` (cardinality-capped at 256 keys with
-`__other__` overflow; NO raw-name labels) + monitor phases `unknown_tool_rejected` /
-`unknown_tool_repair_exhausted` via `emit_with`. Files: `src/error.rs` (+`code`/`with_code`/exhausted
-ctor), `src/adapters/chat_to_responses.rs`, `src/tool_delta_gate.rs`, `src/engine.rs`, `tests/gateway.rs`
-(+10 E1 integration tests across all 3 formats incl. cancellation + observability), plus refreshed
-unit tests in the gate + adapter. Gate B: `cargo test` workspace ALL pass (lib 645, gateway 146, others),
-`cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean. Deviation: the prevention
-note is injected as a mid-conversation `system` message in the repair round (spec said "developer/system
-note") — `system` is the most broadly-compatible upstream role; the repair-only injection (vs every
-request) targets the recovery path without changing every prompt. Known limitation (matches the spec's
-literal acceptance — outside the criteria): in a MIXED batch where a VALID client tool's name resolves
-MID-stream (before the unknown tool), that valid tool's already-live-forwarded arg deltas cannot be
-recalled; the name-LAST sub-case (and the realistic single-unknown-tool incident) is fully hidden. This
-is rare under the forced `parallel_tool_calls=false`, and the repair round re-issues cleanly.
+---
 
-**Codex-xhigh review R1 (CHANGES REQUESTED → fixed):** both deviations ACCEPTED (non-blocking), failover
-concern REFUTED, ONE must-fix MEDIUM. Fix: the Chat SSE terminal error frame dropped the structured
-`code` (acceptance #5 requires it — the OpenAI Chat error object HAS a `code` field). Added
-`response_error_code()` in `chat_completions.rs` (mirrors `response_error_message`, default
-`gateway_error`) and emit `error.code` on the `response.failed` chat frame; corrected the now-inaccurate
-`error.rs` `code`-field doc (Chat DOES render the code; only Anthropic's shape lacks a `code` slot).
-Verified end-to-end propagation (`unknown_tool_repair_exhausted` code `invalid_tool_call` → canonical
-`response.failed` → chat frame) and strengthened `e1_repair_ceiling_structured_terminal_chat_stream` to
-parse the frame and assert `error.code == invalid_tool_call`. Gate B re-run green. Amended → commit
-`9590699` (tag force-updated).
+## Task C1 — One terminal `message_delta` (deviation #1)
+**Files:** `src/adapters/responses_to_anthropic/mod.rs` (+ test surface).
 
-**Codex-xhigh review R2 (APPROVED) — E1 DONE:** Codex `gpt-5.5` xhigh (account `will@bullpoint.org`)
-re-reviewed the fix delta + independently traced the chain; all 5 verification points confirmed
-(`response_error_code` reads `data.response.error.code`; `invalid_tool_call` propagates end-to-end to the
-Chat frame, not the default; the strengthened test strictly asserts `error.code`; corrected `error.rs`
-doc accurate; `code` additive, no regression). No new findings. **E1 ✅ DONE** at commit `9590699` —
-gate B green + Codex-xhigh APPROVED (2 rounds, within the ≤3 cap). **Topic E COMPLETE.** Recommended (NOT
-a gate, per `.ralph/GOAL.md`): optional live-verify on :5022 (release binary, `--with-debug-ui`) by
-forcing a fallback model to emit an unoffered tool name and confirming the repair round + structured
-terminal instead of a mid-stream abort.
+**Do:**
+1. `record_output_delta` (`mod.rs:679`): make it **bookkeeping-only** — keep `estimated_output_bytes` accumulation
+   and the `last_output_tokens` update; **remove the `output.push(MessageDelta{…})`** (lines 691-701). Drop the now-unused
+   `output: &mut Vec<AnthropicStreamEvent>` parameter and update its doc comment.
+2. Update ALL call sites to drop the `output` arg: `mod.rs` **200, 214, 236, 299, 357, 777**.
+3. Confirm the terminal `message_delta` still carries final `output_tokens`: `handle_completed:483` uses
+   `output_tokens = upstream_usage.output_tokens.unwrap_or(last_output_tokens).max(last_output_tokens)`;
+   `finalize:422` uses `last_output_tokens`. The bookkeeping you kept is what feeds these. The collector
+   (`collector.rs:150-156`) reads the terminal Δ's `output_tokens`.
+4. **Tests broken by removing progressive deltas — fix in THIS task:**
+   - `tests.rs` sequence cases ~**181-185, 217-225, 388-394, 432-440**: remove the intermediate `"message_delta"`
+     rows; keep exactly one terminal `"message_delta"` before `"message_stop"`.
+   - `tests.rs:539` `emits_progress_usage_for_reasoning_deltas`: REPURPOSE (rename e.g.
+     `terminal_delta_carries_reasoning_output_tokens`) — assert there are NO progressive `message_delta`s during
+     reasoning AND the single terminal Δ's `output_tokens` is non-zero (reflects the buffered reasoning byte-count
+     via the kept bookkeeping).
+   - `tests.rs:572` `completed_without_upstream_usage_preserves_progress_usage`: keep the core assertion (terminal
+     `output_tokens` non-zero from bookkeeping when upstream usage absent); drop the "progress" framing.
+   - `tests/gateway.rs:8567` and `:8654`: flip from `!progress_tokens.is_empty()` to "exactly one terminal
+     `message_delta` carrying `output_tokens`; zero progressive deltas".
+   - `tests/port_streaming_peek.rs:414`: update the comment + the "progressive usage `message_delta`s are allowed"
+     allowance — pre-terminal, only `message_start`/`ping` may appear, never a `message_delta`.
+5. Add a harness-backed conformance test (use T0B1) on a real reasoning+text converter run: exactly one terminal Δ.
+
+**DoD:** `cargo test` green; `assert_stream_conformant` passes invariants 1-3 + 6 on a real converter run;
+no `record_output_delta` call site still passes `output`.
+
+---
+
+## Task C2 — Sign the thinking block + ingress strip (deviation #2)
+**Files:** `mod.rs` (`flush_reasoning_as_thinking`), `anthropic_to_responses.rs` (ingress), a shared const.
+
+**Do:**
+1. Define `const SYNTHETIC_SIGNATURE_PREFIX: &str` — a clearly-synthetic recognizable marker (e.g.
+   `"llmconduit-synthetic-v1:"`). Place it so BOTH the converter and the Anthropic ingress adapter can reference it
+   (e.g. a `pub(crate)` const in `models/anthropic.rs` or a shared adapters module).
+2. `flush_reasoning_as_thinking` (`mod.rs:588`): after emitting the buffered thinking deltas, when
+   `take_signature()` is `None` (no real upstream signature — the DeepSeek `reasoning_content` case), synthesize a
+   non-empty `signature_delta` = `SYNTHETIC_SIGNATURE_PREFIX` + a deterministic suffix (e.g. the message id or a
+   hash of the buffered text — must NOT use wall-clock/RNG). Emit it as the LAST delta in the block (matches the
+   golden ordering). When a REAL signature IS present, forward it unchanged (preserve current behavior).
+   - This path also covers the terminal "keep as thinking" case (`flush_reasoning_terminal` → `flush_reasoning_as_thinking`
+     when `!promote`). The PROMOTE-to-text path (`mod.rs:646-663`) emits a `text` block, no signature — leave it.
+3. Anthropic ingress (`anthropic_to_responses.rs:366-382`, the `Thinking { thinking, signature }` arm): when
+   `signature` starts with `SYNTHETIC_SIGNATURE_PREFIX`, map `encrypted_content` to `None` (strip) so a client
+   echo-back of our synthetic marker is never re-forwarded upstream as a real `thinking.signature`. Keep the existing
+   empty-filter; keep forwarding genuine (non-synthetic, non-empty) signatures.
+4. **Tests:**
+   - Unchanged (real-sig forwarding still works): `tests.rs:232` `converts_reasoning_signature_delta` (sig "sig_123"),
+     `:323` `accumulates_multi_part_signature_deltas`, `:639` `collector_preserves_thinking_signature`,
+     `gateway.rs:8654` (asserts `signature == "sig_123"` when upstream provides one).
+   - NEW: reasoning-only / reasoning+text turn with NO upstream signature → emitted thinking block has a NON-EMPTY
+     `signature_delta` whose value starts with `SYNTHETIC_SIGNATURE_PREFIX`.
+   - NEW (round-trip, AGENTS.md "no new wire field without round-trip test"): an Anthropic request whose assistant
+     `thinking` block carries a synthetic-prefixed signature → canonical `Reasoning.encrypted_content` is `None`
+     (stripped); a real signature → forwarded as `encrypted_content`.
+
+**DoD:** `cargo test` green; every emitted thinking block is signed; synthetic stripped on ingress; real forwarded;
+`assert_stream_conformant` invariant #4 passes.
+
+---
+
+## Task C3 — Real `message_start.input_tokens` (deviation #3; the hard one — do NOT block)
+**Files:** likely `engine.rs` (carry the early estimate onto the created/started signal) + `mod.rs`
+(`ensure_started`) + converter construction; or document residual.
+
+**Timing facts (verified):** `response.created` (`engine.rs:4090`) fires BEFORE the upstream responds, so the REAL
+`prompt_tokens` (arrives late via `chunk.usage`, `engine.rs:2139`) is NOT available at `message_start`. An EARLY
+ESTIMATE exists: `estimate_input_tokens` (`engine.rs:445`, computed at `engine.rs:1289`). vLLM native carries the
+real count at `message_start` (golden: `input_tokens: 20`) because it has the tokenizer; llmconduit does not.
+
+**Decision tree (per 0a-2 — pick the first that is CLEAN):**
+1. **Probe** the live 8001 chat stream: does `prompt_tokens` arrive in an EARLY chunk? If yes, thread the real value
+   into `message_start`.
+2. **(Recommended middle path)** Thread the early ESTIMATE into `message_start`: carry `estimate_input_tokens` onto
+   the `response.created` event payload (or pass it to `AnthropicStreamConverter::new`) so `ensure_started`
+   (`mod.rs:155`) emits a non-zero, plausible `input_tokens` instead of `0`. Tag it as an estimate (DQ). This is
+   non-architectural (no stream buffering) and closes the visible `0` deviation.
+3. **Residual:** if neither is clean without an architectural change, LEAVE `0` and DOCUMENT it (in the spec + this
+   plan) as the single accepted residual deviation. Do NOT block the rest of the work.
+   - Do NOT buffer `message_start` until the late usage arrives — that defers stream start (bad UX, architectural).
+
+**Tests:** update `tests.rs:524` `assert_eq!(message_start.usage.input_tokens, Some(0))` to match the chosen
+behavior (`Some(<estimate>)` or keep `Some(0)` with a comment citing the documented residual). Confirm NO regression
+in the FINAL non-stream `input_tokens` (`tests.rs:634` expects the real `12` from completed usage — that overrides at
+`handle_completed:468` → `collector.rs:70`, so it must stay `12`). Confirm `gateway.rs` completed-usage input_tokens
+asserts (e.g. `:858`, `:3934`) unaffected.
+
+**DoD:** `cargo test` green; `message_start.input_tokens` is real/estimated/documented-residual; final usage unchanged.
+
+---
+
+## Task C4 — ping + error-terminal shape (deviations #4; cosmetic — never block)
+**Files:** `mod.rs` (`ensure_started`, `handle_failed`), tests.
+
+**Do:**
+1. **ping:** golden vLLM native emits **NO `ping`**. `ensure_started` (`mod.rs:144`) currently pushes `Ping` then
+   `MessageStart`. To byte-match, the cleanest is to DROP the `Ping` emission (or, if a ping is desired for client
+   keep-alive, move it AFTER `message_start` to at least not precede it). Pick the option that matches the golden; if
+   dropping has wider implications (e.g. SSE keep-alive elsewhere), keep + document. Update `tests.rs:747`
+   (`vec!["ping","message_start","message_delta","message_stop"]`) to the chosen order/shape.
+2. **error terminal:** `handle_failed` (`mod.rs:497`) emits only `error`; HTTP streaming then calls `finalize()`
+   (`http.rs:1305`) → `error → message_delta → message_stop`. Check Anthropic's real error-stream shape; decide
+   whether to keep the trailing `Δ + message_stop` or end at `error`. Low priority — keep current behavior +
+   document if unclear. Ensure the conformance harness's error surface asserts whichever shape is chosen.
+
+**DoD:** `cargo test` green; ping/error shape matches golden where cheap, else documented; harness error-surface green.
+
+---
+
+## Task T5 — Comprehensive conformance sweep + docs
+**Files:** `tests.rs`, `tests/gateway.rs`, `tests/port_streaming_peek.rs`, `tests/common`, docs.
+
+**Do:**
+1. Route REAL converter/collector output through `assert_stream_conformant` / `assert_sse_conformant` for EVERY
+   surface: text-only, reasoning+text, **client `tool_use`**, web_search/server-tool, finalize/error.
+2. Add (if not already in C1) a collector/converter test proving the terminal `output_tokens` stays non-zero when
+   upstream usage is ABSENT (the kept bookkeeping path, `collector.rs:150-156`).
+3. Ensure CLIENT `tool_use` (NOT web_search) is the subject of the no-progressive-delta assertions.
+4. Sweep the full surface for any remaining stale progressive-usage expectation; `cargo test` fully green.
+5. Docs: mark `ANTHROPIC_STREAM_CONFORMANCE_PLAN.md` phases done; record any residual (input_tokens) explicitly in
+   the spec. Keep `AGENTS.md` operational only (no status text there).
+
+**DoD:** full `cargo test` green; conformance harness applied to all five surfaces.
+
+---
+
+## Task T6 — Verify (live + SDK) — ORCHESTRATOR GATE (not a code-change task)
+Run by the orchestrator / a verify subagent after C1-T5 + review are green. Prereq: 5022 (rebuilt) + 8001 running.
+1. `cargo test` (adapter + `tests/gateway.rs` + `tests/port_streaming_peek.rs`) green.
+2. **Rebuild + restart 5022** on the new binary (the running 5022 is the OLD build).
+3. Live byte-shape parity: capture streaming `/v1/messages` SSE from 5022 AND 8001 native
+   (`DeepSeek-V4-Flash-DSpark`) for a reasoning+text prompt. Assert 5022 matches the golden: ONE terminal
+   `message_delta`, no `message_delta` before the first `content_block_start` or inside an open block, non-empty
+   thinking signature, ends `message_delta → message_stop`.
+4. Strict-client probe: venv + `pip install anthropic`; `client.messages.stream()` against 5022 (model
+   `claude-sonnet-5`) and 8001 — both parse with NO exception + return the correct final message. TS SDK
+   (`@anthropic-ai/sdk`) if time permits.
+
+**DoD = overall DoD:** harness green; live 5022 byte-shape matches 8001 native; Python (ideally TS) SDK parse cleanly.
