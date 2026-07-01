@@ -1,6 +1,6 @@
 # Anthropic Stream Conformance Plan (v4 — target: full wire-shape conformance)
 
-## Status (Phases 0a–5 DONE; Phase 6 remaining)
+## Status (ALL PHASES DONE — conformance achieved + live-verified 2026-06-30)
 Deviations #1 (`message_delta` storm), #2 (unsigned thinking), #4 (`ping` / error-terminal
 shape) are fully closed — byte-identical to the golden. Deviation #3 (`message_start.input_tokens`)
 is closed **as ESTIMATED, not exact**: `message_start.usage.input_tokens` carries the
@@ -16,7 +16,7 @@ converter/collector/gateway output — not just hand-built vectors — on all 5 
 (`src/adapters/responses_to_anthropic/tests.rs`) and integration (`tests/gateway.rs`,
 `tests/port_streaming_peek.rs`) levels. `cargo test` is fully green. **Phase 6 (live
 5022-vs-8001 byte-shape parity + Python/TypeScript SDK strictness probe) is the only
-remaining gate** — an orchestrator/verify-subagent task, not a code change.
+remaining gate** — DONE: see Phase 6 below.
 
 ## Goal
 Make llmconduit's Anthropic `/v1/messages` **streaming** output **fully wire-conformant** —
@@ -132,12 +132,19 @@ the full surface-to-test map — plus a collector-level test proving the non-str
 `output_tokens` stays non-zero when upstream usage is absent
 (`collector_output_tokens_nonzero_without_upstream_usage`).
 
-## Phase 6 — Verify — REMAINING (Task T6, orchestrator gate)
-`cargo test` (adapter + `tests/gateway.rs` + `tests/port_streaming_peek.rs`). Live:
-capture the 5022 stream for each surface; assert byte-shape parity with the 8001 native
-golden. Re-run the SDK strictness probe — now also against the **TypeScript** SDK
-(`@anthropic-ai/sdk`, Claude Code's client) — and confirm clean parse + correct final
-message.
+## Phase 6 — Verify — DONE (Task T6, 2026-06-30)
+- `cargo test --release` GREEN: 671 lib + 149 `tests/gateway.rs` + `tests/port_streaming_peek.rs` + every
+  integration binary; 0 failed / 0 ignored.
+- **Live byte-shape parity**: the running `:5022` is the systemd service on the installed binary, so the NEW
+  release binary was run on alt port `:5055` (copied config, same `localhost:8001/v1` upstream) to verify
+  non-invasively. A reasoning+text `/v1/messages` stream from `:5055` passes all 6 harness invariants and is
+  structurally identical to the 8001 native golden (`message_start → thinking[δ×N + signature_delta] →
+  text[δ×M] → ONE message_delta(end_turn) → message_stop`, NO ping). Thinking signature =
+  `llmconduit-synthetic-v1:<sha256>`; `message_start.input_tokens` non-zero (estimate), terminal + final usage
+  carry the real upstream count.
+- **SDK strictness**: `anthropic` (Python 0.115.0, `messages.stream()`) AND `@anthropic-ai/sdk` (TypeScript,
+  `messages.stream()` + `finalMessage()`) both parse `:5055` and `:8001` with no exception and return the
+  correct final message (blocks `[thinking, text]`, `stop_reason=end_turn`, answer "42").
 
 ## Definition of Done
 Strict conformance harness green for all surfaces; live 5022 stream byte-shape matches
