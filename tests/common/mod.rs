@@ -733,6 +733,21 @@ pub fn parse_chat_sse_events(body: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Parse a raw `/v1/responses` streaming SSE body into its `data:` JSON
+/// payloads, one per event (each payload's own `"type"` field mirrors the
+/// SSE `event:` line, so callers filter on `event["type"]` rather than
+/// needing the frame's `event:` line separately).
+pub fn parse_responses_sse_events(body: &str) -> Vec<Value> {
+    body.split("\n\n")
+        .filter_map(|block| {
+            block.lines().find_map(|line| {
+                line.strip_prefix("data: ")
+                    .map(|data| serde_json::from_str(data).expect("valid Responses SSE JSON"))
+            })
+        })
+        .collect()
+}
+
 /// Serialize raw chunk JSON values into an OpenAI chat-completions SSE body
 /// (`data: {...}` frames terminated by `data: [DONE]`), the wire shape a wiremock
 /// upstream returns. Inverse of [`parse_chat_sse_events`].

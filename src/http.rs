@@ -1374,12 +1374,39 @@ fn should_proxy_response_header(name: &HeaderName) -> bool {
     !is_hop_by_hop_header(name) && !header_name_eq(name, "content-length")
 }
 
+/// CR1.1: `engine.rs::created_event` stamps `estimated_input_tokens` onto the
+/// canonical `response.created` event as an INTERNAL transport hint -- its
+/// only reader is `AnthropicStreamConverter::handle_created`, which seeds
+/// `message_start.usage.input_tokens` from it (the real upstream count isn't
+/// known until `response.completed`, much later). Every OTHER egress
+/// CONVERTS `response.created` into its own wire shape and never copies the
+/// field across (Chat's `ChatCompletionStreamConverter` reads only `id`); but
+/// this fn is a raw byte-forward of `event.data`, so without this strip a
+/// `/v1/responses` streaming client would see a non-standard field OpenAI's
+/// Responses API has no concept of, breaking the "Responses wire shape
+/// unchanged" contract (a `deny_unknown_fields` consumer or exact-bytes
+/// snapshot). Scoped to `response.created` only -- the only event that can
+/// ever carry the field (`response.in_progress` reuses the same `ResponseStub`
+/// struct but always passes `None`, which `skip_serializing_if` already
+/// omits) -- so every other event is serialized untouched with no clone.
+fn responses_wire_event_data(event: &crate::engine::SseEvent) -> String {
+    if event.event != "response.created" {
+        return event.data.to_string();
+    }
+    let mut data = event.data.clone();
+    if let Some(response) = data.get_mut("response").and_then(Value::as_object_mut) {
+        response.remove("estimated_input_tokens");
+    }
+    data.to_string()
+}
+
 fn stream_responses_response(stream: ReceiverStream<crate::engine::SseEvent>) -> Response {
     let mapped = stream.map(|event| {
+        let data = responses_wire_event_data(&event);
         Ok::<_, Infallible>(
             axum::response::sse::Event::default()
                 .event(event.event)
-                .data(event.data.to_string()),
+                .data(data),
         )
     });
     let mut response = Sse::new(mapped)
@@ -1747,6 +1774,7 @@ fn model_id_from_value(model: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::body_log_fields;
+    use super::responses_wire_event_data;
     use super::should_proxy_response_header;
     use axum::body::Bytes;
     use axum::http::HeaderName;
@@ -1818,5 +1846,56 @@ mod tests {
     fn response_direction_passes_representative_passthrough_header() {
         let name = HeaderName::from_static("content-type");
         assert!(should_proxy_response_header(&name));
+    }
+
+    /// CR1.1: `response.created` is the only event that can carry the
+    /// internal `estimated_input_tokens` hint (`engine.rs::created_event`
+    /// stamps it there for the Anthropic egress's `handle_created` to read);
+    /// the raw-forward `/v1/responses` egress must strip it before it reaches
+    /// the wire. The rest of the `response` object survives untouched, and a
+    /// different event carrying an incidentally-named field is passed through
+    /// byte-identical -- the strip is scoped to `response.created` only, not
+    /// a blanket key filter.
+    #[test]
+    fn responses_wire_event_data_strips_estimate_from_created_only() {
+        let created = crate::engine::SseEvent {
+            event: "response.created".to_string(),
+            data: serde_json::json!({
+                "type": "response.created",
+                "response": { "id": "resp_1", "estimated_input_tokens": 42 }
+            }),
+        };
+        let stripped: serde_json::Value =
+            serde_json::from_str(&responses_wire_event_data(&created)).expect("valid json");
+        assert_eq!(stripped["response"]["id"], "resp_1");
+        assert!(
+            stripped["response"].get("estimated_input_tokens").is_none(),
+            "estimated_input_tokens must be stripped from response.created: {stripped}"
+        );
+
+        let other = crate::engine::SseEvent {
+            event: "response.in_progress".to_string(),
+            data: serde_json::json!({
+                "type": "response.in_progress",
+                "response": { "id": "resp_1" }
+            }),
+        };
+        assert_eq!(
+            responses_wire_event_data(&other),
+            other.data.to_string(),
+            "non-created events must pass through untouched"
+        );
+    }
+
+    /// Defensive: a `response.created` event with no `response` object at all
+    /// (malformed/unexpected shape) must not panic -- it just serializes
+    /// through unchanged.
+    #[test]
+    fn responses_wire_event_data_tolerates_missing_response_object() {
+        let event = crate::engine::SseEvent {
+            event: "response.created".to_string(),
+            data: serde_json::json!({ "type": "response.created" }),
+        };
+        assert_eq!(responses_wire_event_data(&event), event.data.to_string());
     }
 }

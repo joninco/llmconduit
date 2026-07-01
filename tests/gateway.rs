@@ -7232,6 +7232,20 @@ fn parse_anthropic_sse_events(body: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Parse a raw `/v1/responses` streaming SSE body into its `data:` JSON
+/// payloads (each payload's own `"type"` field mirrors the frame's `event:`
+/// line, so callers filter on `event["type"]`).
+fn parse_responses_sse_events(body: &str) -> Vec<serde_json::Value> {
+    body.split("\n\n")
+        .filter_map(|block| {
+            block.lines().find_map(|line| {
+                line.strip_prefix("data: ")
+                    .map(|data| serde_json::from_str(data).expect("valid Responses SSE JSON"))
+            })
+        })
+        .collect()
+}
+
 fn parse_chat_sse_events(body: &str) -> Vec<serde_json::Value> {
     body.split("\n\n")
         .filter_map(|block| {
@@ -9301,6 +9315,89 @@ async fn responses_returns_non_streaming_json_while_streaming_upstream() {
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].stream, true);
+}
+
+/// CR1.1 (code review, Round 1): `engine.rs::created_event` stamps
+/// `estimated_input_tokens` onto the CANONICAL `response.created` event as an
+/// internal transport hint solely for the Anthropic streaming egress
+/// (`AnthropicStreamConverter::handle_created` seeds `message_start` from
+/// it). `http.rs::stream_responses_response` is a RAW byte-forward of
+/// `event.data` for `/v1/responses` streaming clients, so without stripping
+/// the hint at that boundary it would leak a non-standard field onto the
+/// OpenAI-compatible wire, breaking the "Responses wire shape unchanged"
+/// contract (a `deny_unknown_fields` consumer or exact-bytes snapshot would
+/// fail). Drives a REAL streaming `/v1/responses` turn through the actual
+/// HTTP router (not a hand-built `SseEvent`) and asserts the wire-level
+/// `response.created` frame carries no `estimated_input_tokens` key at all —
+/// proving `responses_wire_event_data`'s strip is actually wired into the
+/// egress, not just unit-tested in isolation.
+#[tokio::test]
+async fn responses_streaming_response_created_omits_internal_estimate_hint() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "glm-5.1",
+        "stream": true,
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "Hi" }
+                ]
+            }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), 200);
+
+    let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read body");
+    let body_text = String::from_utf8(body_bytes.to_vec()).expect("utf8");
+    let events = parse_responses_sse_events(&body_text);
+
+    let created = events
+        .iter()
+        .find(|event| event["type"] == "response.created")
+        .expect("response.created frame present on the wire");
+    // The rest of the stub must still be intact -- this proves the strip
+    // removed exactly one key, not the whole `response` object.
+    assert!(
+        created["response"]["id"].as_str().is_some(),
+        "response.created must still carry its id after the strip: {created}"
+    );
+    assert!(
+        created["response"].get("estimated_input_tokens").is_none(),
+        "internal estimate hint leaked onto the /v1/responses wire: {created}"
+    );
+
+    // Sweep every frame, not just `response.created`: the hint must never
+    // appear anywhere on this raw-forwarding egress.
+    for event in &events {
+        assert!(
+            event
+                .get("response")
+                .is_none_or(|response| response.get("estimated_input_tokens").is_none()),
+            "internal estimate hint leaked on a /v1/responses frame: {event}"
+        );
+    }
 }
 
 #[tokio::test]

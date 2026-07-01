@@ -1295,8 +1295,29 @@ impl Gateway {
         // (`run_turn` below) so the Anthropic streaming converter can seed
         // `message_start.usage.input_tokens` with a plausible non-zero value
         // instead of a hardcoded `0` (the real upstream tokenizer count isn't
-        // known this early). Cheap (one serialize + byte count), so computing
-        // it even when budgeting no-ops costs nothing meaningful.
+        // known this early).
+        //
+        // CR1.2 (reviewed, accepted as-is): this is NOT free -- it's a
+        // `messages.to_vec()` + `tools.to_vec()` clone of the lowered payload
+        // (incl. any multimodal content) plus a `serde_json` serialize, and it
+        // now runs even for requests where `limit` is `None` (routing/
+        // multi-provider configs, or a single provider whose context window
+        // could not be resolved) and whose egress never reads the field
+        // (Chat/Responses egress convert/strip it away -- see
+        // `http.rs::responses_wire_event_data`, CR1.1). We cannot skip the
+        // compute for that combination: `stream_responses_with_api_call_id` is
+        // the single funnel for all three egress surfaces (Anthropic/Chat/
+        // Responses) and has no visibility into which one the caller
+        // (`http.rs`, one layer up) will use to drain the returned stream --
+        // that would require threading an egress hint down through this fn,
+        // `run_turn`, and `created_event`, which is a bigger, riskier change
+        // than a LOW-priority finding justifies (see CR1.1's rejected
+        // "out-of-band threading" alternative in `.ralph/COMPLETED_TASKS.md`).
+        // The common case (plain single-provider, `limit` resolved) already
+        // paid this cost pre-C3 for budgeting, so the incremental cost is
+        // bounded to the `limit.is_none()` minority, once per top-level turn
+        // (not per streamed chunk) -- accepted rather than churned for a LOW
+        // finding.
         let estimated_input_tokens =
             estimate_input_tokens(&lowered, self.config.flatten_content, &resolved_model);
         if let Some(limit) = limit {

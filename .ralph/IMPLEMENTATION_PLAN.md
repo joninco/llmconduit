@@ -5,7 +5,7 @@
 > **Branch:** `anthropic-sse-conformance`. **Run:** `/ralph-orchestrate --agents 2` (auto-review ON), Sonnet-5 subagents.
 
 ## Executive Summary
-**Status: 6/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
+**Status: 8/9 tasks completed. 1 pending** (T6 verify gate, see end). Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
 one terminal `message_delta`, signed thinking, real `message_start.input_tokens`, correct ordering.
 
 ## Completed
@@ -18,6 +18,8 @@ one terminal `message_delta`, signed thinking, real `message_start.input_tokens`
 | C3 | Real message_start.input_tokens | ✅ (estimated — see below) |
 | C4 | ping + error-terminal shape | ✅ |
 | T5 | Conformance sweep + docs | ✅ |
+| CR1.1 | Round-1 review: strip C3 estimate at `/v1/responses` raw-forward boundary | ✅ |
+| CR1.2 | Round-1 review: document unconditional-estimate-compute tradeoff (accepted, LOW) | ✅ |
 
 **Ordering is strict and (mostly) serial** — tasks 0B1→C1→C2→C3→C4 all edit
 `src/adapters/responses_to_anthropic/mod.rs` and the shared test surface, so they cannot parallelize.
@@ -55,3 +57,28 @@ Run by the orchestrator / a verify subagent after C1-T5 + review are green. Prer
    (`@anthropic-ai/sdk`) if time permits.
 
 **DoD = overall DoD:** harness green; live 5022 byte-shape matches 8001 native; Python (ideally TS) SDK parse cleanly.
+
+---
+
+## Code Review Fixes (Round 1) — DONE
+
+> **Source**: Multi-model code review (Codex `gpt-5.5`, Opus) on 2026-06-30. Both findings were in **C3** (the early
+> input-token estimate stamped onto canonical `response.created`), sharing one root cause: the estimate is
+> computed/stamped unconditionally, decoupled from the Anthropic streaming egress that is its only consumer.
+> C1/C2/C4 reviewed clean — no defect found.
+
+- **CR1.1** (MEDIUM, leak): `stream_responses_response` (`http.rs:1377`) raw-forwards `event.data`, so the
+  estimate leaked onto the `/v1/responses` streaming wire. Fixed with a boundary strip — new
+  `responses_wire_event_data` helper removes `estimated_input_tokens` from `response.created` only, before
+  serializing; zero-cost for every other event. Chose this over out-of-band-threading the estimate into
+  `AnthropicStreamConverter` (would have rippled `Gateway::stream_responses*`'s signature through `http.rs` +
+  all of `tests/gateway.rs`) — disproportionate for a MEDIUM, single-file fix.
+- **CR1.2** (LOW, redundant compute): accepted + documented rather than churned. Full laziness needs the same
+  egress-awareness CR1.1's rejected alternative would have threaded down; without it `run_turn` cannot know
+  whether the caller is Anthropic (needs the estimate) or Chat/Responses (doesn't) at compute time. Rewrote the
+  `engine.rs` comment at the compute site to state the real (non-trivial) cost accurately and why it's bounded/
+  accepted, per the task's own "document the decision, don't over-engineer a LOW finding" fallback.
+
+Full detail (topology verification, decision rationale, tests added, regression-proof of the new test): `.ralph/COMPLETED_TASKS.md` → "Task CR1.1 + CR1.2".
+
+---
