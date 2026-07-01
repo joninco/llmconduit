@@ -424,7 +424,12 @@ fn estimate_request_from_lowered(
 }
 
 /// Coarse, deterministic, CONSERVATIVE lower-bound estimate of the input tokens
-/// the FIRST upstream turn will consume, for G3 pre-flight budgeting only.
+/// the FIRST upstream turn will consume. Originally G3 pre-flight budgeting
+/// only; C3 additionally rides this value onto `response.created`
+/// (`created_event`) so the Anthropic streaming converter can seed
+/// `message_start.usage.input_tokens` with a plausible non-zero number instead
+/// of a hardcoded `0` (the real upstream tokenizer count is not known until
+/// `response.completed`'s usage arrives, well after `message_start` is sent).
 ///
 /// Option B, terminal layer: the estimate counts the EXACT serialized bytes the
 /// leaf POSTs — the lowered payload after `sanitize_chat_request`
@@ -1285,9 +1290,16 @@ impl Gateway {
         if limit.is_none() && self.config.is_plain_single_provider() {
             limit = self.upstream_model_context_limit(&resolved_model).await;
         }
+        // C3: compute the estimate UNCONDITIONALLY now, not only when a context
+        // `limit` is known -- it also rides the `response.created` SSE event
+        // (`run_turn` below) so the Anthropic streaming converter can seed
+        // `message_start.usage.input_tokens` with a plausible non-zero value
+        // instead of a hardcoded `0` (the real upstream tokenizer count isn't
+        // known this early). Cheap (one serialize + byte count), so computing
+        // it even when budgeting no-ops costs nothing meaningful.
+        let estimated_input_tokens =
+            estimate_input_tokens(&lowered, self.config.flatten_content, &resolved_model);
         if let Some(limit) = limit {
-            let estimated_input_tokens =
-                estimate_input_tokens(&lowered, self.config.flatten_content, &resolved_model);
             match budget_explicit_max_output_tokens(
                 request.max_output_tokens,
                 limit,
@@ -1328,6 +1340,9 @@ impl Gateway {
                     lowered.tool_registry,
                     lowered.response_format,
                     lowered.reasoning_effort,
+                    // C3: the early G3 estimate, threaded through so `run_turn` can
+                    // stamp it onto `response.created` (see `created_event` below).
+                    estimated_input_tokens,
                     resolved_model,
                     vision_session,
                     // D1 (R1 #9): the engine binds `response_id → api_call_id` at
@@ -1604,6 +1619,13 @@ impl Gateway {
         tool_registry: crate::adapters::responses_to_chat::ToolRegistry,
         response_format: Option<Value>,
         reasoning_effort: Option<String>,
+        // C3: the pre-spawn G3 estimate (`estimate_input_tokens`) for THIS turn's
+        // lowered payload, computed once by the caller (`stream_responses_with_api_call_id`).
+        // Stamped onto `response.created` (`created_event`, below) so the Anthropic
+        // streaming converter can seed a non-zero `message_start.usage.input_tokens`
+        // instead of a hardcoded `0` — see that fn's doc comment for why the REAL
+        // upstream count can't be used this early.
+        estimated_input_tokens: i64,
         upstream_model: String,
         // G4: `Some(session_id)` when the image agent is active for this turn —
         // the key into `self.image_cache` the `analyzeImage` executor resolves
@@ -1911,8 +1933,12 @@ impl Gateway {
                     });
             }
         }
-        self.send_event(&tx, created_event(&response_id), &abort_token)
-            .await?;
+        self.send_event(
+            &tx,
+            created_event(&response_id, estimated_input_tokens),
+            &abort_token,
+        )
+        .await?;
         self.send_event(&tx, in_progress_event(&response_id), &abort_token)
             .await?;
 
@@ -4087,7 +4113,7 @@ fn extract_web_search_query(
     }
 }
 
-fn created_event(response_id: &str) -> SseEvent {
+fn created_event(response_id: &str, estimated_input_tokens: i64) -> SseEvent {
     json_event(
         "response.created",
         ResponsesEnvelope {
@@ -4095,6 +4121,15 @@ fn created_event(response_id: &str) -> SseEvent {
             payload: ResponseCreatedPayload {
                 response: ResponseStub {
                     id: response_id.to_string(),
+                    // C3: ride the early G3 estimate onto `response.created` so the
+                    // Anthropic streaming converter can seed `message_start` with a
+                    // non-zero `input_tokens` instead of a hardcoded `0` -- the real
+                    // upstream tokenizer count arrives LATE (`response.completed`'s
+                    // `usage`, after `message_start` has already gone out) and
+                    // always overrides this estimate at the terminal event. `try_into`
+                    // never actually fails (`estimate_input_tokens` is a non-negative
+                    // byte count) but stays total rather than panicking.
+                    estimated_input_tokens: estimated_input_tokens.try_into().ok(),
                 },
             },
         },
@@ -4507,6 +4542,9 @@ fn in_progress_event(response_id: &str) -> SseEvent {
             payload: ResponseCreatedPayload {
                 response: ResponseStub {
                     id: response_id.to_string(),
+                    // Not carried on `response.in_progress` -- the Anthropic converter
+                    // only reads this field off `response.created` (`handle_created`).
+                    estimated_input_tokens: None,
                 },
             },
         },

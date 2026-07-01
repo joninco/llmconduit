@@ -483,9 +483,23 @@ pub struct ResponseCreatedPayload {
     pub response: ResponseStub,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponseStub {
     pub id: String,
+    /// C3 (`.ralph/specs/anthropic-sse-conformance.md` invariant 5): an EARLY,
+    /// coarse ESTIMATE of prompt input tokens (`engine::estimate_input_tokens`,
+    /// ~4 bytes/token over the lowered upstream payload), threaded onto
+    /// `response.created` ONLY -- never `response.in_progress`, which reuses
+    /// this same struct via `ResponseCreatedPayload` -- so the Anthropic
+    /// streaming converter can seed `message_start.usage.input_tokens` with a
+    /// plausible non-zero value instead of a hardcoded `0`. The REAL upstream
+    /// tokenizer count is not known this early; it arrives later on
+    /// `response.completed`'s `usage` and always overrides this estimate at
+    /// the terminal event. `skip_serializing_if` keeps the OpenAI/Responses
+    /// wire shape byte-unchanged for any consumer that never reads this
+    /// additive, canonical-protocol-internal field.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub estimated_input_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -753,6 +767,41 @@ mod tests {
                 "round-trip for {variant:?}",
             );
         }
+    }
+
+    /// C3 (AGENTS.md: no new wire field without a round-trip test): `ResponseStub`
+    /// gained `estimated_input_tokens` (the early G3 estimate the engine threads
+    /// onto `response.created` so the Anthropic converter can seed a non-zero
+    /// `message_start.usage.input_tokens`). PRESENT survives a
+    /// serialize -> deserialize round-trip; ABSENT (`None`) is OMITTED from the
+    /// wire entirely (not serialized as `null`), so the OpenAI/Responses shape
+    /// stays byte-unchanged for any caller that never reads this field.
+    #[test]
+    fn response_stub_estimated_input_tokens_round_trips_present_and_absent() {
+        let present = ResponseStub {
+            id: "resp_123".to_string(),
+            estimated_input_tokens: Some(20),
+        };
+        let value = serde_json::to_value(&present).expect("serialize present");
+        assert_eq!(value["estimated_input_tokens"], serde_json::json!(20));
+        let roundtripped: ResponseStub =
+            serde_json::from_value(value).expect("deserialize present");
+        assert_eq!(present, roundtripped);
+
+        let absent = ResponseStub {
+            id: "resp_456".to_string(),
+            estimated_input_tokens: None,
+        };
+        let value = serde_json::to_value(&absent).expect("serialize absent");
+        assert!(
+            !value
+                .as_object()
+                .unwrap()
+                .contains_key("estimated_input_tokens"),
+            "None must be OMITTED, not serialized as null: {value}"
+        );
+        let roundtripped: ResponseStub = serde_json::from_value(value).expect("deserialize absent");
+        assert_eq!(absent, roundtripped);
     }
 
     #[test]

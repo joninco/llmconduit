@@ -5,7 +5,7 @@
 > **Branch:** `anthropic-sse-conformance`. **Run:** `/ralph-orchestrate --agents 2` (auto-review ON), Sonnet-5 subagents.
 
 ## Executive Summary
-**Status: 3/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
+**Status: 4/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
 one terminal `message_delta`, signed thinking, real `message_start.input_tokens`, correct ordering.
 
 ## Completed
@@ -15,6 +15,7 @@ one terminal `message_delta`, signed thinking, real `message_start.input_tokens`
 | 0B1 | Strict conformance harness | ✅ |
 | C1 | One terminal message_delta | ✅ |
 | C2 | Sign thinking + ingress strip | ✅ |
+| C3 | Real message_start.input_tokens | ✅ (estimated — see below) |
 
 **Ordering is strict and (mostly) serial** — tasks 0B1→C1→C2→C3→C4 all edit
 `src/adapters/responses_to_anthropic/mod.rs` and the shared test surface, so they cannot parallelize.
@@ -34,36 +35,6 @@ Source anchors verified against HEAD (`mod.rs` line numbers, current):
 428) · `handle_failed`:503 · web_search:540. Ingress strip: `anthropic_to_responses.rs:367` (Thinking →
 `encrypted_content`, filters empty AND `SYNTHETIC_SIGNATURE_PREFIX`-prefixed at 386-392).
 `SYNTHETIC_SIGNATURE_PREFIX` const: `models/anthropic.rs` "Shared constants" section.
-
----
-
-## Task C3 — Real `message_start.input_tokens` (deviation #3; the hard one — do NOT block)
-**Files:** likely `engine.rs` (carry the early estimate onto the created/started signal) + `mod.rs`
-(`ensure_started`) + converter construction; or document residual.
-
-**Timing facts (verified):** `response.created` (`engine.rs:4090`) fires BEFORE the upstream responds, so the REAL
-`prompt_tokens` (arrives late via `chunk.usage`, `engine.rs:2139`) is NOT available at `message_start`. An EARLY
-ESTIMATE exists: `estimate_input_tokens` (`engine.rs:445`, computed at `engine.rs:1289`). vLLM native carries the
-real count at `message_start` (golden: `input_tokens: 20`) because it has the tokenizer; llmconduit does not.
-
-**Decision tree (per 0a-2 — pick the first that is CLEAN):**
-1. **Probe** the live 8001 chat stream: does `prompt_tokens` arrive in an EARLY chunk? If yes, thread the real value
-   into `message_start`.
-2. **(Recommended middle path)** Thread the early ESTIMATE into `message_start`: carry `estimate_input_tokens` onto
-   the `response.created` event payload (or pass it to `AnthropicStreamConverter::new`) so `ensure_started`
-   (`mod.rs:160`) emits a non-zero, plausible `input_tokens` instead of `0`. Tag it as an estimate (DQ). This is
-   non-architectural (no stream buffering) and closes the visible `0` deviation.
-3. **Residual:** if neither is clean without an architectural change, LEAVE `0` and DOCUMENT it (in the spec + this
-   plan) as the single accepted residual deviation. Do NOT block the rest of the work.
-   - Do NOT buffer `message_start` until the late usage arrives — that defers stream start (bad UX, architectural).
-
-**Tests:** update `tests.rs:584` `assert_eq!(message_start.usage.input_tokens, Some(0))` to match the chosen
-behavior (`Some(<estimate>)` or keep `Some(0)` with a comment citing the documented residual). Confirm NO regression
-in the FINAL non-stream `input_tokens` (`tests.rs:721` expects the real `12` from completed usage — that overrides at
-`handle_completed:468` → `collector.rs:70`, so it must stay `12`). Confirm `gateway.rs` completed-usage input_tokens
-asserts (e.g. `:858`, `:3934`) unaffected.
-
-**DoD:** `cargo test` green; `message_start.input_tokens` is real/estimated/documented-residual; final usage unchanged.
 
 ---
 

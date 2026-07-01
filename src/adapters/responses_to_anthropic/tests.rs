@@ -13,6 +13,21 @@ fn created_event() -> SseEvent {
     }
 }
 
+/// C3: `response.created` carrying the engine's early G3 estimate
+/// (`ResponseStub::estimated_input_tokens`), as `created_event` (`engine.rs`)
+/// produces once wired. The bare `created_event()` above deliberately omits
+/// the field, exercising the "no estimate available" fallback the vast
+/// majority of these fixtures don't care about.
+fn created_event_with_estimate(estimate: u64) -> SseEvent {
+    SseEvent {
+        event: "response.created".to_string(),
+        data: json!({
+            "type": "response.created",
+            "response": { "id": "resp_123", "estimated_input_tokens": estimate }
+        }),
+    }
+}
+
 fn item_added_event(item_type: &str, role: &str) -> SseEvent {
     SseEvent {
         event: "response.output_item.added".to_string(),
@@ -568,11 +583,19 @@ fn converts_failure_event() {
 
 #[test]
 fn emits_usage_from_completed_response() {
+    // C3: `response.created` carries the engine's early estimate (20) --
+    // `message_start.usage.input_tokens` must reflect it instead of the old
+    // hardcoded `0`. The terminal `message_delta` must still carry the REAL
+    // upstream count (12) from `response.completed`'s usage -- the estimate
+    // is a message_start-only stand-in, never a substitute for real usage.
     let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
-    let events: Vec<AnthropicStreamEvent> = [created_event(), completed_event_with_usage(12, 5)]
-        .iter()
-        .flat_map(|e| converter.convert(e))
-        .collect();
+    let events: Vec<AnthropicStreamEvent> = [
+        created_event_with_estimate(20),
+        completed_event_with_usage(12, 5),
+    ]
+    .iter()
+    .flat_map(|e| converter.convert(e))
+    .collect();
 
     let message_start = events
         .iter()
@@ -581,7 +604,7 @@ fn emits_usage_from_completed_response() {
             _ => None,
         })
         .expect("message_start");
-    assert_eq!(message_start.usage.input_tokens, Some(0));
+    assert_eq!(message_start.usage.input_tokens, Some(20));
     assert_eq!(message_start.usage.output_tokens, Some(0));
 
     let message_delta = events
@@ -593,6 +616,26 @@ fn emits_usage_from_completed_response() {
         .expect("message_delta");
     assert_eq!(message_delta.input_tokens, Some(12));
     assert_eq!(message_delta.output_tokens, Some(5));
+}
+
+#[test]
+fn message_start_defaults_to_zero_input_tokens_when_no_estimate() {
+    // Residual/default path: a `response.created` that carries no
+    // `estimated_input_tokens` (the bare `created_event()` fixture, matching
+    // an engine event that predates C3 or otherwise omits it) must keep the
+    // pre-C3 behavior -- `message_start.usage.input_tokens` stays `Some(0)`,
+    // never `None` or a panic.
+    let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+    let events = converter.convert(&created_event());
+
+    let message_start = events
+        .iter()
+        .find_map(|event| match event {
+            AnthropicStreamEvent::MessageStart { message } => Some(message),
+            _ => None,
+        })
+        .expect("message_start");
+    assert_eq!(message_start.usage.input_tokens, Some(0));
 }
 
 #[test]

@@ -70,6 +70,11 @@ pub struct AnthropicStreamConverter {
     open_block: Option<ContentBlockState>,
     started: bool,
     completed: bool,
+    // C3: seeded from the EARLY `response.created` estimate (`handle_created`)
+    // so `message_start` carries a plausible non-zero value, then OVERWRITTEN
+    // with the REAL upstream count once `response.completed`/`response.incomplete`
+    // arrives (`handle_completed`). Also the fallback terminal usage `finalize`
+    // sends when no clean terminal event ever arrives.
     pending_input_tokens: Option<u64>,
     estimated_output_bytes: usize,
     last_output_tokens: u64,
@@ -115,7 +120,7 @@ impl AnthropicStreamConverter {
     pub fn convert(&mut self, event: &SseEvent) -> Vec<AnthropicStreamEvent> {
         let mut output = Vec::new();
         match event.event.as_str() {
-            "response.created" => self.handle_created(&mut output),
+            "response.created" => self.handle_created(&event.data, &mut output),
             "response.output_item.added" => self.handle_item_added(&event.data, &mut output),
             "response.output_text.delta" => self.handle_text_delta(&event.data, &mut output),
             "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
@@ -166,7 +171,22 @@ impl AnthropicStreamConverter {
         }
     }
 
-    fn handle_created(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
+    fn handle_created(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
+        // C3: seed `pending_input_tokens` from the engine's EARLY estimate
+        // (`response.created.response.estimated_input_tokens`, threaded by
+        // `engine.rs::created_event`) BEFORE `ensure_started` reads it, so
+        // `message_start.usage.input_tokens` is a plausible non-zero value
+        // instead of the previous hardcoded `0`. Guarded on `is_none()` so a
+        // real upstream count is never clobbered by a stale estimate --
+        // `response.created` fires once, at the very start of the turn, so
+        // this guard is defensive rather than load-bearing today. This is an
+        // ESTIMATE (~4 bytes/token, see `estimate_input_tokens`), NOT the exact
+        // tokenizer count -- the terminal `message_delta` / non-stream usage
+        // always overrides it with the REAL upstream count once
+        // `response.completed` arrives (`handle_completed`, below).
+        if self.pending_input_tokens.is_none() {
+            self.pending_input_tokens = response_estimated_input_tokens(data);
+        }
         self.ensure_started(output);
     }
 
@@ -814,6 +834,17 @@ impl AnthropicStreamConverter {
 fn synthetic_signature(thinking_text: &str) -> String {
     let digest = Sha256::digest(thinking_text.as_bytes());
     format!("{SYNTHETIC_SIGNATURE_PREFIX}{}", hex::encode(digest))
+}
+
+/// C3: the EARLY estimate the engine threads onto `response.created`
+/// (`ResponseStub::estimated_input_tokens`) -- `None` when the event doesn't
+/// carry one (e.g. the bare `created_event()` fixture most converter tests
+/// use), in which case `message_start.usage.input_tokens` stays the prior
+/// hardcoded `Some(0)` fallback via `ensure_started`.
+fn response_estimated_input_tokens(data: &Value) -> Option<u64> {
+    data.get("response")?
+        .get("estimated_input_tokens")?
+        .as_u64()
 }
 
 pub(super) fn response_usage(data: &Value) -> Option<AnthropicMessageUsage> {
