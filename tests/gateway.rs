@@ -11223,3 +11223,323 @@ async fn build_app_with_gateway_wires_disabled_turn_capture_by_default() {
     assert!(!gateway.turn_capture().is_enabled());
     assert!(gateway.turn_capture().dir().is_none());
 }
+
+// ---------------------------------------------------------------------------
+// F1b — turn-capture own gate + inbound capture + served-body wrapper.
+// ---------------------------------------------------------------------------
+
+/// A gateway with a `MockUpstream` and an ENABLED `TurnCapture` writing under
+/// `dir`, but the dashboard FlowStore DISABLED — i.e. `--with-debug-ui` OFF. Proves
+/// turn capture's own gate fires independent of the debug UI (spec Design #1).
+fn test_gateway_with_turn_capture(upstream: MockUpstream, dir: std::path::PathBuf) -> Arc<Gateway> {
+    let config = test_config();
+    upstream.set_finalization_policies(
+        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
+    );
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    Arc::new(
+        Gateway::new(
+            config,
+            ReplayStore::new(1000),
+            Arc::new(upstream),
+            Arc::new(MockSearch::default()),
+            vision,
+            image_cache,
+            MonitorHub::new(128),
+            None,
+            // Dashboard OFF: turn capture must still fire off its own gate.
+            llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
+        )
+        .with_turn_capture(llmconduit::turn_capture::TurnCapture::enabled(dir)),
+    )
+}
+
+fn turn_capture_temp_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("llmconduit-f1b-{}", uuid::Uuid::new_v4().simple()))
+}
+
+/// Poll `<dir>/.work` for the SINGLE captured turn's state (the work dir is created
+/// asynchronously by the section writer), then look it up in the registry by id.
+async fn sole_capture_state(
+    gateway: &Arc<Gateway>,
+    dir: &std::path::Path,
+) -> Arc<llmconduit::turn_capture::TurnCaptureState> {
+    let work_root = dir.join(".work");
+    for _ in 0..300 {
+        if let Ok(entries) = std::fs::read_dir(&work_root) {
+            let ids: Vec<String> = entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .collect();
+            if let [id] = ids.as_slice()
+                && let Some(state) = gateway.turn_capture().state(id)
+            {
+                return state;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no sole capture work dir under {}", work_root.display());
+}
+
+/// AC-4 (+ AC-6a): with the dashboard OFF (FlowStore disabled) and
+/// `turn_capture_dir` set, a streaming `/v1/messages` turn still runs the
+/// turn-capture own gate — writing BOTH the `inbound_request` and `served_response`
+/// sections under `.work/<api_call_id>/`, and the served section is the EXACT
+/// streaming SSE bytes the client received.
+#[tokio::test]
+async fn f1b_turn_capture_writes_sections_with_dashboard_off() {
+    let dir = turn_capture_temp_dir();
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "Hello")),
+            Ok(content_chunk("chat-1", " world")),
+            Ok(usage_chunk("chat-1", 12, 5, 17, Some(3), None)),
+        ])
+        .await;
+    let gateway = test_gateway_with_turn_capture(upstream, dir.clone());
+    assert!(
+        !gateway.flow_store().is_enabled(),
+        "dashboard FlowStore must be OFF (own-gate proof)"
+    );
+    assert!(gateway.turn_capture().is_enabled());
+    let app = llmconduit::build_app_from_gateway(Arc::clone(&gateway));
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let served = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+
+    let state = sole_capture_state(&gateway, &dir).await;
+    state.await_inbound_closed().await;
+    state.await_served_closed().await;
+
+    // Both sections exist under `.work/<id>/` with content.
+    assert!(state.work_dir().starts_with(dir.join(".work")));
+    let inbound = std::fs::read(state.inbound_request_path()).expect("inbound section");
+    assert!(
+        String::from_utf8_lossy(&inbound).contains("claude-3-5-sonnet-20241022"),
+        "inbound section holds the request body"
+    );
+    // The served section is byte-for-byte what the client received (AC-6a).
+    let served_file = std::fs::read(state.served_response_path()).expect("served section");
+    assert_eq!(
+        served_file,
+        served.to_vec(),
+        "served section == exact bytes returned to the client"
+    );
+    let served_text = String::from_utf8_lossy(&served_file);
+    assert!(served_text.contains("event: message_start"));
+    assert!(served_text.contains("event: message_stop"));
+    assert!(served_text.contains("Hello"));
+    assert!(!state.served_partial(), "a completed stream is not partial");
+    assert_eq!(state.served_bytes(), served_file.len() as u64);
+}
+
+/// AC-5: the `inbound_request` section is redacted — a secret-bearing field AND an
+/// image `data:`/URL URI are BOTH stripped, and NO raw image bytes survive (AGENTS.md
+/// line 137/144). Redaction happens in the middleware (pre-parse), so it holds
+/// regardless of the turn outcome.
+#[tokio::test]
+async fn f1b_inbound_section_redacts_secrets_and_image_uris() {
+    let dir = turn_capture_temp_dir();
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway_with_turn_capture(upstream, dir.clone());
+    let app = llmconduit::build_app_from_gateway(Arc::clone(&gateway));
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 128,
+        "stream": false,
+        // Non-standard field, but proves the shared secret-key redactor runs.
+        "api_key": "sk-LEAKED-SECRET-VALUE",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "describe" },
+                { "type": "image", "source": { "type": "url",
+                    "url": "https://secret.example.com/img.png?sig=IMGTOKEN123" } },
+                { "type": "image", "source": { "type": "url",
+                    "url": "data:image/png;base64,RAWIMGBYTES9999" } }
+            ]
+        }]
+    });
+    let _ = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let state = sole_capture_state(&gateway, &dir).await;
+    state.await_inbound_closed().await;
+    let text =
+        String::from_utf8(std::fs::read(state.inbound_request_path()).expect("inbound section"))
+            .expect("utf8");
+
+    assert!(
+        !text.contains("sk-LEAKED-SECRET-VALUE"),
+        "secret api_key value must be redacted"
+    );
+    assert!(
+        text.contains("[redacted]"),
+        "secret redaction marker present"
+    );
+    assert!(
+        !text.contains("secret.example.com"),
+        "image URL host must be redacted"
+    );
+    assert!(
+        !text.contains("IMGTOKEN123"),
+        "signed-URL token must be redacted"
+    );
+    assert!(
+        !text.contains("RAWIMGBYTES9999"),
+        "no raw image (data: URI) bytes may survive"
+    );
+    assert!(
+        text.contains("<redacted uri>"),
+        "image URI redaction marker present"
+    );
+    // Sanity: a non-secret field survived, so this is the real captured body.
+    assert!(text.contains("claude-3-5-sonnet-20241022"));
+}
+
+/// AC-6b: served bytes are captured for a NON-streaming turn
+/// (`collect_anthropic_response` → single JSON body).
+#[tokio::test]
+async fn f1b_captures_served_bytes_for_non_streaming_turn() {
+    let dir = turn_capture_temp_dir();
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "Hello non-stream"))])
+        .await;
+    let gateway = test_gateway_with_turn_capture(upstream, dir.clone());
+    let app = llmconduit::build_app_from_gateway(Arc::clone(&gateway));
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 128,
+        "stream": false,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let served = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+
+    let state = sole_capture_state(&gateway, &dir).await;
+    state.await_served_closed().await;
+    let served_file = std::fs::read(state.served_response_path()).expect("served section");
+    assert_eq!(
+        served_file,
+        served.to_vec(),
+        "served section == the non-streaming JSON body"
+    );
+    let served_text = String::from_utf8_lossy(&served_file);
+    assert!(served_text.contains("\"type\":\"message\""));
+    assert!(served_text.contains("Hello non-stream"));
+    assert!(
+        !state.served_partial(),
+        "a complete non-streaming response is not partial"
+    );
+}
+
+/// AC-6c: a mid-stream client disconnect (drop the response body after one frame)
+/// closes `served_response` with `partial = true`, and finalization does NOT hang.
+#[tokio::test]
+async fn f1b_mid_stream_disconnect_marks_served_partial() {
+    let dir = turn_capture_temp_dir();
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "one")),
+            Ok(content_chunk("chat-1", "two")),
+            Ok(content_chunk("chat-1", "three")),
+            Ok(usage_chunk("chat-1", 12, 5, 17, Some(3), None)),
+        ])
+        .await;
+    let gateway = test_gateway_with_turn_capture(upstream, dir.clone());
+    let app = llmconduit::build_app_from_gateway(Arc::clone(&gateway));
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+
+    // Read ONE frame, then drop the body → client disconnect mid-stream.
+    let mut stream = response.into_body().into_data_stream();
+    let first = stream.next().await;
+    assert!(
+        first.is_some(),
+        "at least one served frame arrived before the disconnect"
+    );
+    drop(stream);
+
+    let state = sole_capture_state(&gateway, &dir).await;
+    // Finalization must be bounded (no hang) even though the stream was cut short.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.await_served_closed(),
+    )
+    .await
+    .expect("served section closes within bounded time (no hang)");
+    assert!(
+        state.served_partial(),
+        "a mid-stream disconnect marks served_response partial"
+    );
+}

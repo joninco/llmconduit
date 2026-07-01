@@ -57,13 +57,18 @@ use axum::routing::get;
 use axum::routing::on;
 use axum::routing::post;
 use futures::StreamExt;
+use http_body::Frame;
+use http_body::SizeHint;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -518,55 +523,93 @@ async fn log_api_call(
         );
     }
 
-    // D1 (incl. R1 #1/#6): only when the FlowStore is ENABLED AND this is an
-    // instrumented inference flow (POST + whitelisted path) do we (a) stash the
-    // `api_call_id` extension the engine reads to link `response_id → api_call_id`,
-    // and (b) capture the inbound body + headers and open the record. Gating BOTH on
-    // the same condition keeps the disabled production path zero-cost (no clone, no
-    // extension insert) and prevents HEAD/OPTIONS probes or non-whitelisted paths
-    // from opening an orphan record. Secrets (auth headers, `api_key`, image URIs)
-    // are redacted INLINE by the serializer/header redactor — none persist here.
-    // D3 L0: the RAII middleware guard. `None` for disabled-store / non-whitelisted
-    // requests (zero overhead). When `Some`, it is held across `next.run`: if the
-    // request never reaches the engine (an extractor/`Json` rejection, a layer panic
-    // above the handler) the record is still `OpenL0` at the guard's `Drop`, which
-    // CASes it to `Finalized` + `Failed("unhandled")` — no orphan stuck `Open`. If
-    // the engine claimed it (`ClaimedL1`), the L0 `Drop` is inert and L1 owns
-    // finalization.
-    let _l0_guard =
-        if gateway.flow_store().is_enabled() && is_flow_capture_request(&method, uri.path()) {
-            parts
-                .extensions
-                .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
-            let inbound_body = Some(crate::dashboard_flow::capture_body(&body_bytes));
-            // Gap 04: derive the client attribution from the RAW headers BEFORE they are
-            // redacted — this is the only point the raw API key is still readable, and
-            // `derive` hashes it in-place (a one-way SHA-256 prefix becomes the label; the
-            // raw key is dropped, never stored/logged). The optional configured caller-id
-            // header NAME is read env-only (`LLMCONDUIT_DASHBOARD_CLIENT_HEADER`) so no
-            // secret/identity config lands in the `Debug`/`Clone` persisted `Config`
-            // struct — mirroring the dashboard auth env-only posture. The header name is
-            // non-secret; only the api-key VALUE is, and it is never persisted.
-            let client = crate::dashboard_flow::ClientAttribution::derive(
-                &headers,
-                dashboard_client_header().as_deref(),
-            );
-            let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
-            gateway.flow_store().open(
-                api_call_id.clone(),
-                method.to_string(),
-                uri.path().to_string(),
-                headers_redacted,
-                inbound_body,
-                client,
-            );
-            gateway.flow_store().middleware_guard(&api_call_id)
-        } else {
-            None
-        };
+    // Shared "instrument this request?" predicate (POST + whitelisted inference
+    // path). Both the dashboard FlowStore gate and the F1 turn-capture gate hang
+    // off it, so a HEAD/OPTIONS probe or a non-whitelisted path opens neither.
+    let instrument = is_flow_capture_request(&method, uri.path());
+    // D1: dashboard FlowStore capture is gated on the debug UI (`flow_store()` is
+    // `disabled()` off `--with-debug-ui`).
+    let flow_gate = instrument && gateway.flow_store().is_enabled();
+    // F1b (spec Design #1): turn capture has its OWN gate on the SAME paths but
+    // keyed on `turn_capture().is_enabled()` INDEPENDENT of the flow store / debug
+    // UI — so `api_call_id` reaches the engine and the artifact is written with the
+    // dashboard OFF.
+    let capture_gate = instrument && gateway.turn_capture().is_enabled();
+
+    // The `api_call_id` extension the engine reads to link `response_id →
+    // api_call_id` (D1) and to reach the per-turn capture state (F1c) is inserted
+    // ONCE if EITHER gate wants it — never double-inserted when both fire.
+    if flow_gate || capture_gate {
+        parts
+            .extensions
+            .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
+    }
+
+    // D1 (incl. R1 #1/#6): capture the inbound body + headers and open the record.
+    // Secrets (auth headers, `api_key`, image URIs) are redacted INLINE by the
+    // serializer/header redactor — none persist here. D3 L0: the RAII middleware
+    // guard. `None` for disabled-store / non-whitelisted requests (zero overhead).
+    // When `Some`, it is held across `next.run`: if the request never reaches the
+    // engine (an extractor/`Json` rejection, a layer panic above the handler) the
+    // record is still `OpenL0` at the guard's `Drop`, which CASes it to `Finalized`
+    // + `Failed("unhandled")` — no orphan stuck `Open`. If the engine claimed it
+    // (`ClaimedL1`), the L0 `Drop` is inert and L1 owns finalization.
+    let _l0_guard = if flow_gate {
+        let inbound_body = Some(crate::dashboard_flow::capture_body(&body_bytes));
+        // Gap 04: derive the client attribution from the RAW headers BEFORE they are
+        // redacted — this is the only point the raw API key is still readable, and
+        // `derive` hashes it in-place (a one-way SHA-256 prefix becomes the label; the
+        // raw key is dropped, never stored/logged). The optional configured caller-id
+        // header NAME is read env-only (`LLMCONDUIT_DASHBOARD_CLIENT_HEADER`) so no
+        // secret/identity config lands in the `Debug`/`Clone` persisted `Config`
+        // struct — mirroring the dashboard auth env-only posture. The header name is
+        // non-secret; only the api-key VALUE is, and it is never persisted.
+        let client = crate::dashboard_flow::ClientAttribution::derive(
+            &headers,
+            dashboard_client_header().as_deref(),
+        );
+        let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
+        gateway.flow_store().open(
+            api_call_id.clone(),
+            method.to_string(),
+            uri.path().to_string(),
+            headers_redacted,
+            inbound_body,
+            client,
+        );
+        gateway.flow_store().middleware_guard(&api_call_id)
+    } else {
+        None
+    };
+
+    // F1b: start the per-turn artifact and write the redacted inbound-request
+    // section. `redacted_inbound_section` COPIES + redacts the body (secret keys +
+    // image URIs, the SAME path `payload_for_log` uses — AGENTS.md line 137/144),
+    // never retaining a slice of the 256 MiB buffer.
+    let turn_capture_state = if capture_gate {
+        let (model_requested, inbound_section) = redacted_inbound_section(&body_bytes);
+        let state = gateway
+            .turn_capture()
+            .start(&api_call_id, model_requested, epoch_millis());
+        if let Some(state) = &state {
+            state.write_inbound_request(&inbound_section);
+        }
+        state
+    } else {
+        None
+    };
 
     let request = Request::from_parts(parts, Body::from(body_bytes));
     let response = next.run(request).await;
+    // F1b served-body tee (spec Design #4): wrap the outbound response `Body` so
+    // every served byte — streaming SSE, non-streaming JSON, or a handler error
+    // body — is copied to the `served_response` section; its `Drop` marks
+    // `served_done(partial)` when the stream did not reach a clean end (a client
+    // disconnect drops the body mid-stream). One wrapper covers all served shapes.
+    let response = match turn_capture_state {
+        Some(state) => tee_served_body(response, state),
+        None => response,
+    };
     // Per-request model-resolution audit: the handler tags the response with the
     // served model (and the requested model when it differs) via
     // `with_model_headers`; echo both here so every response record shows whether
@@ -700,6 +743,45 @@ fn redact_payload_secrets(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+/// F1b: the redacted bytes for the turn-capture `inbound_request` section, plus
+/// the requested `model` (outcome metadata). Redaction MIRRORS `payload_for_log`
+/// EXACTLY — secret keys via [`redact_payload_secrets`], image/data URIs via
+/// [`crate::redaction::redact_image_uris_in_value`] — so the on-disk artifact is a
+/// NEW logged surface that does NOT bypass `redact_payload_secrets` (AGENTS.md
+/// line 137) and never carries raw image bytes. Parses/serializes a fresh owned
+/// `Value`, so it COPIES out of `body` and never retains a slice of the 256 MiB
+/// middleware buffer (AGENTS.md line 144).
+fn redacted_inbound_section(body: &Bytes) -> (Option<String>, Vec<u8>) {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(mut value) => {
+            let model = value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            redact_payload_secrets(&mut value);
+            crate::redaction::redact_image_uris_in_value(&mut value);
+            let bytes = serde_json::to_vec(&value)
+                .unwrap_or_else(|_| b"<failed to serialize json>".to_vec());
+            (model, bytes)
+        }
+        Err(_) => {
+            // Non-JSON body: still strip image URIs from the raw text so a
+            // `data:`/signed URL in a malformed/odd payload is not captured raw.
+            let redacted = crate::redaction::redact_image_uris(&String::from_utf8_lossy(body));
+            (None, redacted.into_bytes())
+        }
+    }
+}
+
+/// Current wall-clock time as epoch milliseconds (the `started_ms` clock the
+/// dashboard FlowStore's `started_ms` also uses, for a consistent turn timestamp).
+fn epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
 }
 
 fn summarize_json_api_body(path: &str, value: &Value) -> String {
@@ -1250,6 +1332,98 @@ fn with_model_headers(mut response: Response, requested: &str, served: &str) -> 
         headers.insert(HeaderName::from_static("x-llmconduit-requested"), value);
     }
     response
+}
+
+/// F1b served-response tee: an `http_body::Body` that mirrors `inner` frame for
+/// frame, COPYING each DATA frame's bytes into the turn-capture `served_response`
+/// section (never retaining the frame's backing allocation) and passing every
+/// frame through UNCHANGED — so SSE framing, keep-alive comments, and trailers are
+/// preserved byte-for-byte. Its `Drop` reports `served_done`: `partial` unless the
+/// stream reached a clean end (a `Ready(None)` poll, or delivering its full
+/// promised length). A client disconnect drops the body mid-stream → partial.
+struct TeeBody {
+    inner: Body,
+    state: Arc<crate::turn_capture::TurnCaptureState>,
+    /// Set once `inner` yields `Poll::Ready(None)` (clean end-of-stream).
+    clean_eos: bool,
+    /// Total DATA bytes forwarded so far (for the exact-length clean check).
+    forwarded: u64,
+    /// The inner body's exact promised length at construction (a non-streaming JSON
+    /// body has `Some`; a chunked SSE stream has `None`). When `Some`, delivering
+    /// that many bytes is a clean end even if hyper stops polling the
+    /// Content-Length body before it yields `Ready(None)`.
+    exact_len: Option<u64>,
+}
+
+impl http_body::Body for TeeBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // `axum::body::Body` is `Unpin`, so the fields can be reached by `&mut`.
+        let this = self.get_mut();
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref()
+                    && !data.is_empty()
+                {
+                    this.forwarded = this.forwarded.saturating_add(data.len() as u64);
+                    // COPY the frame bytes to the section; the frame passes through
+                    // to the client UNCHANGED (never a retained slice — AGENTS.md).
+                    this.state.write_served_response(data);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(None) => {
+                this.clean_eos = true;
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for TeeBody {
+    fn drop(&mut self) {
+        // Clean when we observed end-of-stream, OR forwarded the full promised
+        // length (hyper can stop polling a Content-Length body before it ever
+        // yields `Ready(None)`, so a complete non-streaming response would else be
+        // mis-flagged partial). Otherwise the served stream was cut short (client
+        // disconnect / mid-stream error) → partial.
+        let clean = self.clean_eos || self.exact_len.is_some_and(|len| self.forwarded >= len);
+        self.state.served_done(!clean);
+    }
+}
+
+/// Wrap `response`'s body in a [`TeeBody`] so its served bytes are captured to the
+/// turn's `served_response` section. Status/headers are preserved; only the body
+/// is wrapped, and `size_hint`/`is_end_stream` are forwarded so a non-streaming
+/// response keeps its `Content-Length` and framing.
+fn tee_served_body(
+    response: Response,
+    state: Arc<crate::turn_capture::TurnCaptureState>,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let exact_len = http_body::Body::size_hint(&body).exact();
+    let tee = TeeBody {
+        inner: body,
+        state,
+        clean_eos: false,
+        forwarded: 0,
+        exact_len,
+    };
+    Response::from_parts(parts, Body::new(tee))
 }
 
 fn stream_chat_completions_response(

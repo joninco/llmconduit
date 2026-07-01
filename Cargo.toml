@@ -26,6 +26,12 @@ http = "1"
 # over-cap inbound body (413) from a truncated/broken stream (400). Already in
 # the graph via axum; a normal (not dev) dep because it is used in `src/`.
 http-body-util = "0.1"
+# `http_body::Body`/`Frame`/`SizeHint` for the F1 turn-capture served-body tee
+# (`http.rs`): one `poll_frame` wrapper mirrors the outbound response body,
+# copying each DATA frame to the `served_response` capture section and passing
+# frames through unchanged (SSE framing/keep-alive/trailers preserved). Already
+# in the graph via axum 0.8 (http-body 1.x); a normal dep since it is used in `src/`.
+http-body = "1"
 # Embed the dashboard SPA (`$OUT_DIR/dashboard_dist/`, materialized by build.rs)
 # into the binary at compile time (D8); the `static Dir<'static>` binding in
 # `dashboard_ui.rs` is what makes `include_dir!` type-check.

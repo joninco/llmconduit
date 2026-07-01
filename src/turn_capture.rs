@@ -16,20 +16,36 @@
 //! has its OWN gate independent of `--with-debug-ui` (spec Design overview
 //! #1); that gate lives in `http.rs` (F1b), not here.
 //!
-//! **F1a scope.** This task lands the config plumbing, the module skeleton,
-//! and a REAL (not stubbed) `start()` -- but the ENABLED path is in-memory
-//! only: no section file is written yet. `engine_done` and the per-turn
-//! section writers are no-op forward declarations so the crate compiles and
-//! later tasks have a stable surface to fill:
-//! - F1b: HTTP own-gate + inbound-request capture + served-response wrapper.
-//! - F1c: engine terminal integration (`engine_done`) + RAII finalize.
+//! **Bounded memory (Codex HIGH #2).** Each section (`inbound_request`,
+//! `served_response`, and -- in F1d/F1e -- `upstream_request`/
+//! `upstream_response`) streams incrementally to a per-turn temp file under
+//! `<dir>/.work/<api_call_id>/` via a background writer task fed over an
+//! ordered channel; only small metadata (`{bytes, partial, closed}`) lives in
+//! memory. NO `HashMap<_, full-body>` ever forms -- the bytes go to disk. The
+//! final single JSON is assembled later (F1f) by STREAMING those temp files, so
+//! a 256 MiB turn is never held in RAM at once.
+//!
+//! **Task boundaries.**
+//! - F1b (this task): HTTP own-gate + inbound-request capture + served-response
+//!   `Body` tee; real `start()` (work dir + section writers + registry).
+//! - F1c: engine terminal integration (`engine_done`) + RAII finalize + the
+//!   both-`done` assembly barrier (which also EVICTS the registry entry).
 //! - F1d: upstream-request capture (carrier on `BackendChatRequest`).
 //! - F1e: raw upstream-response capture + final failed HTTP body.
 //! - F1f: streaming JSON assembly, atomicity, rotation.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
 /// Handle to the turn-capture sink. Cheap to `Clone` (the enabled variant
 /// clones an inner `Arc`); threads through DI (`lib.rs`) into the `Gateway`
@@ -39,13 +55,20 @@ use std::sync::Arc;
 pub struct TurnCapture {
     /// `None` when disabled (no `turn_capture_dir` configured) -- every
     /// method below short-circuits before doing any work. `Some` carries the
-    /// resolved directory every enabled turn writes under.
+    /// resolved directory every enabled turn writes under plus the per-turn
+    /// registry F1c's `engine_done` looks a live turn up in.
     inner: Option<Arc<TurnCaptureInner>>,
 }
 
 #[derive(Debug)]
 struct TurnCaptureInner {
     dir: PathBuf,
+    /// Live per-turn states keyed by `api_call_id`, populated by [`start`] so a
+    /// later seam that only has the id (the engine terminal in F1c, the
+    /// upstream request/response taps in F1d/F1e) can reach the SAME state.
+    /// F1c evicts an entry on the both-`done` assembly barrier; until then a
+    /// started turn's entry lives for the turn's duration.
+    registry: Mutex<HashMap<String, Arc<TurnCaptureState>>>,
 }
 
 impl TurnCapture {
@@ -56,12 +79,15 @@ impl TurnCapture {
     }
 
     /// Enabled sink that will write artifacts under `dir` (the resolved
-    /// `turn_capture_dir`). F1a keeps this in-memory only -- constructing an
-    /// enabled sink does NOT create `dir`; section-file IO lands in F1c-F1e
-    /// and JSON assembly in F1f.
+    /// `turn_capture_dir`). Constructing an enabled sink does NOT touch the
+    /// filesystem -- only [`start`] (per turn) creates the work dir + section
+    /// files.
     pub fn enabled(dir: PathBuf) -> Self {
         Self {
-            inner: Some(Arc::new(TurnCaptureInner { dir })),
+            inner: Some(Arc::new(TurnCaptureInner {
+                dir,
+                registry: Mutex::new(HashMap::new()),
+            })),
         }
     }
 
@@ -75,87 +101,349 @@ impl TurnCapture {
         self.inner.as_ref().map(|inner| inner.dir.as_path())
     }
 
-    /// Starts capturing a turn. DISABLED ⇒ `None`, no allocation, no fs
-    /// touch, never panics. ENABLED ⇒ `Some(Arc::new(state))` -- in-memory
-    /// only for F1a; no section file is written yet (F1b+ wires the
-    /// HTTP/engine seams that call this and stream section bytes to disk).
+    /// Starts capturing a turn. DISABLED ⇒ `None`, no allocation, no fs touch,
+    /// never panics. ENABLED ⇒ opens the per-turn work dir
+    /// `<dir>/.work/<api_call_id>/`, spins up the `inbound_request` +
+    /// `served_response` section writers (background tasks streaming to temp
+    /// files -- so this must run inside a tokio runtime, which every caller
+    /// seam does), registers the state under `api_call_id`, and returns the
+    /// `Arc`. All filesystem IO (mkdir + file create/write/flush) happens on
+    /// the section writer tasks via `tokio::fs`, never synchronously here, so
+    /// `start` itself does no blocking IO on the runtime (AGENTS.md).
     pub fn start(
         &self,
         api_call_id: &str,
         model_requested: Option<String>,
         started_ms: u128,
     ) -> Option<Arc<TurnCaptureState>> {
-        self.inner.as_ref()?;
-        Some(Arc::new(TurnCaptureState {
-            api_call_id: api_call_id.to_string(),
+        let inner = self.inner.as_ref()?;
+        let work_dir = inner.dir.join(".work").join(api_call_id);
+        let state = Arc::new(TurnCaptureState::new(
+            work_dir,
+            api_call_id.to_string(),
             model_requested,
             started_ms,
-        }))
+        ));
+        inner
+            .registry
+            .lock()
+            .expect("turn-capture registry lock")
+            .insert(api_call_id.to_string(), Arc::clone(&state));
+        Some(state)
+    }
+
+    /// The live state for `api_call_id`, if a turn is currently captured. The
+    /// registry-lookup seam F1c's `engine_done` and F1d/F1e's upstream taps use
+    /// to reach the SAME per-turn state from the engine/upstream layers. `None`
+    /// when disabled or no such turn is live.
+    pub fn state(&self, api_call_id: &str) -> Option<Arc<TurnCaptureState>> {
+        self.inner
+            .as_ref()?
+            .registry
+            .lock()
+            .expect("turn-capture registry lock")
+            .get(api_call_id)
+            .cloned()
     }
 
     /// F1c fills this: the engine terminal seam (completed/incomplete/
     /// failed/cancelled, including the pre-spawn failure path) reports the
-    /// turn's outcome here, keyed by `api_call_id`. No-op stub so the crate
-    /// compiles; not yet wired into `engine.rs`.
+    /// turn's outcome here, keyed by `api_call_id`, then -- once BOTH the engine
+    /// and served sides have reported -- assembles the artifact and evicts the
+    /// registry entry. No-op stub so the crate compiles; not yet wired into
+    /// `engine.rs`.
     #[allow(unused_variables)]
     pub fn engine_done(&self, api_call_id: &str, status: &str, reason: Option<&str>) {
-        // F1b–F1e fill this.
+        // F1c fills this.
     }
 }
 
-/// Per-turn capture state. F1a carries only outcome metadata; section fields
-/// (temp-file handles for `inbound_request`/`upstream_request`/
-/// `upstream_response`/`served_response`) land in F1c–F1e. Held behind `Arc`
-/// so the failover/routing rebuild path (`BackendChatRequest`, Codex MED #5)
-/// can clone it for free instead of re-deriving it per attempt.
+/// Per-turn capture state. Owns the per-section incremental writers (temp files
+/// under `<dir>/.work/<api_call_id>/`) plus small outcome metadata. Held behind
+/// `Arc` so the HTTP served-body tee, the engine terminal (F1c), and the
+/// failover/routing rebuild path (`BackendChatRequest`, Codex MED #5) all share
+/// ONE state instead of re-deriving it per attempt.
 #[derive(Debug)]
 pub struct TurnCaptureState {
     pub api_call_id: String,
     pub model_requested: Option<String>,
     pub started_ms: u128,
+    work_dir: PathBuf,
+    /// The redacted inbound Anthropic/OpenAI request body (F1b).
+    inbound_request: Section,
+    /// The exact bytes served to the client, teed off the response `Body` (F1b).
+    served_response: Section,
+    /// Idempotency latch for [`served_done`] -- the tee's `Drop` is the only
+    /// F1b caller, but F1c makes `served_done`/`engine_done` idempotent so the
+    /// both-`done` barrier fires exactly once.
+    served_reported: AtomicBool,
 }
 
 impl TurnCaptureState {
-    // F1b–F1e fill these section writers. Each is a real, callable, no-op
-    // stub now -- no thread, no allocation, no filesystem access -- so
-    // callers can be wired up incrementally without ever breaking the build.
+    fn new(
+        work_dir: PathBuf,
+        api_call_id: String,
+        model_requested: Option<String>,
+        started_ms: u128,
+    ) -> Self {
+        let inbound_request = Section::new(work_dir.join("inbound_request"));
+        let served_response = Section::new(work_dir.join("served_response"));
+        Self {
+            api_call_id,
+            model_requested,
+            started_ms,
+            work_dir,
+            inbound_request,
+            served_response,
+            served_reported: AtomicBool::new(false),
+        }
+    }
 
-    /// F1b fills this: copy + redact the inbound request body into the
-    /// `inbound_request` section.
-    #[allow(unused_variables)]
+    /// The per-turn work directory (`<dir>/.work/<api_call_id>/`). F1f assembles
+    /// the final artifact from the section files under it, then removes it.
+    pub fn work_dir(&self) -> &Path {
+        &self.work_dir
+    }
+
+    /// Path of the `inbound_request` section temp file.
+    pub fn inbound_request_path(&self) -> &Path {
+        self.inbound_request.path()
+    }
+
+    /// Path of the `served_response` section temp file.
+    pub fn served_response_path(&self) -> &Path {
+        self.served_response.path()
+    }
+
+    /// Whether the `served_response` section closed `partial` (the served stream
+    /// did not reach a clean end -- client disconnect / mid-stream error / a
+    /// section write error). `false` for a cleanly-completed response.
+    pub fn served_partial(&self) -> bool {
+        self.served_response.partial()
+    }
+
+    /// Bytes appended to the `served_response` section so far.
+    pub fn served_bytes(&self) -> u64 {
+        self.served_response.bytes()
+    }
+
+    /// Await the `inbound_request` section writer draining + flushing to disk
+    /// (used by F1f's assembly barrier and by tests reading the file directly).
+    pub async fn await_inbound_closed(&self) {
+        self.inbound_request.await_closed().await;
+    }
+
+    /// Await the `served_response` section writer draining + flushing to disk.
+    pub async fn await_served_closed(&self) {
+        self.served_response.await_closed().await;
+    }
+
+    /// F1b: copy the redacted inbound request body into the `inbound_request`
+    /// section, then close it. The caller redacts (secret keys and image URIs)
+    /// BEFORE calling; `bytes` is a redacted COPY, never a slice of the 256 MiB
+    /// middleware buffer (AGENTS.md). Written once per turn.
     pub fn write_inbound_request(&self, bytes: &[u8]) {
-        // F1b–F1e fill this.
+        self.inbound_request.append(bytes);
+        // The whole (redacted) body is in hand, so the section is complete.
+        self.inbound_request.close(false);
     }
 
     /// F1d fills this: the final on-wire OpenAI request (redacted,
     /// last-writer-wins across shrink-retry/failover) into the
-    /// `upstream_request` section.
+    /// `upstream_request` section. No-op in F1b (that section is not created
+    /// until F1d).
     #[allow(unused_variables)]
     pub fn write_upstream_request(&self, bytes: &[u8]) {
-        // F1b–F1e fill this.
+        // F1d fills this.
     }
 
-    /// F1e fills this: raw upstream response bytes, streamed incrementally,
-    /// into the `upstream_response` section.
+    /// F1e fills this: raw upstream response bytes, streamed incrementally, into
+    /// the `upstream_response` section. No-op in F1b (that section is not created
+    /// until F1e).
     #[allow(unused_variables)]
     pub fn write_upstream_response(&self, bytes: &[u8]) {
-        // F1b–F1e fill this.
+        // F1e fills this.
     }
 
-    /// F1b fills this: served response bytes (via the response-`Body` tee)
-    /// into the `served_response` section.
-    #[allow(unused_variables)]
+    /// F1b: append served response bytes (called incrementally by the response
+    /// `Body` tee, once per DATA frame). Each call COPIES the frame to disk; no
+    /// slice of the frame's backing allocation is retained.
     pub fn write_served_response(&self, bytes: &[u8]) {
-        // F1b–F1e fill this.
+        self.served_response.append(bytes);
     }
 
-    /// F1b fills this: marks the `served_response` section closed (`partial`
-    /// when the stream did not reach a clean end -- client disconnect,
-    /// error).
-    #[allow(unused_variables)]
+    /// F1b: mark the `served_response` section closed. `partial` is `true` when
+    /// the served stream did NOT reach a clean end (client disconnect, mid-stream
+    /// error). Idempotent (F1c relies on that for the both-`done` barrier): only
+    /// the FIRST call closes the section.
     pub fn served_done(&self, partial: bool) {
-        // F1b–F1e fill this.
+        if self.served_reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.served_response.close(partial);
     }
+}
+
+/// One incremental capture section. Bytes stream to a per-turn temp file on a
+/// background writer task WITHOUT buffering the whole body: [`append`] copies the
+/// frame and hands it to the task over an ordered (FIFO) channel, so the caller
+/// (including the sync `poll_frame` tee) never blocks and no full-body map forms.
+/// Only small metadata lives in memory.
+///
+/// [`append`]: Section::append
+#[derive(Debug)]
+struct Section {
+    /// `None` once [`close`](Section::close)d -- the writer task then drains the
+    /// remaining queued chunks and flushes. A dropped `Section` (abandoned turn)
+    /// also drops the sender, so the task always terminates (no hang; AGENTS.md
+    /// cancellation rule).
+    tx: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    meta: Arc<SectionMeta>,
+}
+
+#[derive(Debug)]
+struct SectionMeta {
+    path: PathBuf,
+    bytes: AtomicU64,
+    partial: AtomicBool,
+    closed: AtomicBool,
+    /// Notified once, when the writer task has drained + flushed + set `closed`.
+    done: Notify,
+}
+
+impl Section {
+    fn new(path: PathBuf) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let meta = Arc::new(SectionMeta {
+            path,
+            bytes: AtomicU64::new(0),
+            partial: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            done: Notify::new(),
+        });
+        tokio::spawn(section_writer(rx, Arc::clone(&meta)));
+        Self {
+            tx: Mutex::new(Some(tx)),
+            meta,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.meta.path
+    }
+
+    fn bytes(&self) -> u64 {
+        self.meta.bytes.load(Ordering::Acquire)
+    }
+
+    fn partial(&self) -> bool {
+        self.meta.partial.load(Ordering::Acquire)
+    }
+
+    /// Append `bytes` to the section. COPIES into an owned `Vec` (never retains a
+    /// slice of the caller's buffer -- AGENTS.md) and hands it to the writer task.
+    /// Non-blocking + ordered; a no-op once closed or on an empty frame.
+    fn append(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        if let Ok(guard) = self.tx.lock()
+            && let Some(tx) = guard.as_ref()
+        {
+            // Send failure only if the writer task is already gone; nothing to do.
+            let _ = tx.send(bytes.to_vec());
+        }
+    }
+
+    /// Close the section. Records `partial` and drops the sender so the writer
+    /// task drains remaining chunks, flushes, and finishes. Idempotent.
+    fn close(&self, partial: bool) {
+        if partial {
+            self.meta.partial.store(true, Ordering::Release);
+        }
+        if let Ok(mut guard) = self.tx.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Await the writer task draining + flushing + setting `closed`. Uses the
+    /// register-before-check pattern so a `notify_waiters` racing the flag read
+    /// is never lost.
+    async fn await_closed(&self) {
+        loop {
+            let notified = self.meta.done.notified();
+            tokio::pin!(notified);
+            // Register the waiter NOW, before re-reading `closed`, so a wake that
+            // fires between the check and the await is not missed.
+            notified.as_mut().enable();
+            if self.meta.closed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// The background writer for one [`Section`]: creates the work dir + section file
+/// (all fs IO via `tokio::fs`, i.e. off the runtime threads), appends each queued
+/// chunk in order, and -- when the sender drops (section closed or turn dropped)
+/// -- flushes, fsyncs, and marks the section `closed`. A file-create/write error
+/// marks the section `partial` and is logged, never propagated (a diagnostic
+/// artifact must never fail or hang the turn).
+async fn section_writer(mut rx: mpsc::UnboundedReceiver<Vec<u8>>, meta: Arc<SectionMeta>) {
+    // Idempotent + race-tolerant across the turn's sibling sections both racing
+    // to create the shared work dir.
+    if let Some(parent) = meta.path.parent()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        tracing::warn!(
+            path = %meta.path.display(),
+            error = %err,
+            "turn-capture: failed to create section work dir"
+        );
+        meta.partial.store(true, Ordering::Release);
+    }
+
+    let mut file = match tokio::fs::File::create(&meta.path).await {
+        Ok(file) => Some(file),
+        Err(err) => {
+            tracing::warn!(
+                path = %meta.path.display(),
+                error = %err,
+                "turn-capture: failed to create section file"
+            );
+            meta.partial.store(true, Ordering::Release);
+            None
+        }
+    };
+
+    while let Some(chunk) = rx.recv().await {
+        let Some(file) = file.as_mut() else {
+            // File never opened: keep draining the channel so senders don't wedge,
+            // but the section is already flagged partial.
+            continue;
+        };
+        match file.write_all(&chunk).await {
+            Ok(()) => {
+                meta.bytes.fetch_add(chunk.len() as u64, Ordering::AcqRel);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %meta.path.display(),
+                    error = %err,
+                    "turn-capture: failed to append to section file"
+                );
+                meta.partial.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    if let Some(mut file) = file {
+        let _ = file.flush().await;
+        let _ = file.sync_all().await;
+    }
+    meta.closed.store(true, Ordering::Release);
+    meta.done.notify_waiters();
 }
 
 #[cfg(test)]
@@ -189,11 +477,10 @@ mod tests {
 
     #[test]
     fn disabled_start_creates_no_filesystem_entries() {
-        // The disabled sink has no configured directory at all; prove it
-        // never reaches the filesystem by round-tripping through a would-be
-        // capture directory and confirming it stays absent, even across
-        // repeated calls (including through the forward-declared
-        // `engine_done` stub).
+        // The disabled sink has no configured directory at all; prove it never
+        // reaches the filesystem (no runtime needed either -- it never spawns a
+        // writer task) even across repeated calls and the forward-declared
+        // `engine_done` stub.
         let probe_dir = temp_dir_path("disabled-probe");
         assert!(!probe_dir.exists());
 
@@ -202,6 +489,7 @@ mod tests {
             assert!(capture.start("api_xyz", None, 42).is_none());
         }
         capture.engine_done("api_xyz", "failed", Some("client_disconnect"));
+        assert!(capture.state("api_xyz").is_none());
 
         assert!(
             !probe_dir.exists(),
@@ -210,14 +498,22 @@ mod tests {
     }
 
     #[test]
-    fn enabled_start_returns_populated_state_in_memory_only() {
-        let dir = temp_dir_path("enabled");
-        // Constructing an enabled sink must not itself touch the filesystem.
+    fn enabled_constructor_does_no_filesystem_io() {
+        // Constructing an enabled sink must not itself touch the filesystem --
+        // only `start()` (per turn) creates the work dir. (Sync test: no runtime,
+        // and `enabled()`/`is_enabled()`/`dir()` never spawn.)
+        let dir = temp_dir_path("enabled-ctor");
         assert!(!dir.exists());
-
         let capture = TurnCapture::enabled(dir.clone());
         assert!(capture.is_enabled());
         assert_eq!(capture.dir(), Some(dir.as_path()));
+        assert!(!dir.exists(), "enabled() must not perform filesystem IO");
+    }
+
+    #[tokio::test]
+    async fn enabled_start_registers_state_and_writes_inbound_section() {
+        let dir = temp_dir_path("enabled-start");
+        let capture = TurnCapture::enabled(dir.clone());
 
         let state = capture
             .start("api_abc123", Some("claude-opus".to_string()), 1_000)
@@ -226,16 +522,23 @@ mod tests {
         assert_eq!(state.model_requested.as_deref(), Some("claude-opus"));
         assert_eq!(state.started_ms, 1_000);
 
-        // F1a is in-memory only -- starting a turn must not create the
-        // directory or any file under it yet (F1b+ wires real section IO).
-        assert!(
-            !dir.exists(),
-            "F1a must not perform any filesystem IO from start()"
+        // The registry lets a later seam (F1c/F1d) reach the SAME state by id.
+        let looked_up = capture.state("api_abc123").expect("state registered");
+        assert!(std::sync::Arc::ptr_eq(&state, &looked_up));
+
+        // The inbound section streams to `<dir>/.work/<id>/inbound_request`.
+        state.write_inbound_request(b"{\"model\":\"claude-opus\"}");
+        state.await_inbound_closed().await;
+        let contents = std::fs::read(state.inbound_request_path()).expect("inbound section file");
+        assert_eq!(contents, b"{\"model\":\"claude-opus\"}");
+        assert_eq!(
+            state.work_dir(),
+            dir.join(".work").join("api_abc123").as_path()
         );
     }
 
-    #[test]
-    fn enabled_start_with_no_model_requested_is_none() {
+    #[tokio::test]
+    async fn enabled_start_with_no_model_requested_is_none() {
         let capture = TurnCapture::enabled(temp_dir_path("no-model"));
         let state = capture
             .start("api_no_model", None, 7)
@@ -243,15 +546,56 @@ mod tests {
         assert_eq!(state.model_requested, None);
     }
 
-    #[test]
-    fn forward_declared_stubs_are_callable_and_never_panic() {
+    #[tokio::test]
+    async fn served_section_captures_bytes_and_marks_clean() {
+        let capture = TurnCapture::enabled(temp_dir_path("served-clean"));
+        let state = capture.start("api_served", None, 0).expect("state");
+
+        state.write_served_response(b"event: message_start\n\n");
+        state.write_served_response(b"event: message_stop\n\n");
+        state.served_done(false);
+        state.await_served_closed().await;
+
+        let contents = std::fs::read(state.served_response_path()).expect("served section file");
+        assert_eq!(contents, b"event: message_start\n\nevent: message_stop\n\n");
+        assert_eq!(state.served_bytes(), contents.len() as u64);
+        assert!(
+            !state.served_partial(),
+            "a cleanly-closed served section is not partial"
+        );
+    }
+
+    #[tokio::test]
+    async fn served_done_partial_is_recorded_and_idempotent() {
+        let capture = TurnCapture::enabled(temp_dir_path("served-partial"));
+        let state = capture.start("api_partial", None, 0).expect("state");
+
+        state.write_served_response(b"event: message_start\n\n");
+        // Mid-stream disconnect: partial close, then a duplicate close is a no-op.
+        state.served_done(true);
+        state.served_done(false);
+        state.await_served_closed().await;
+
+        assert!(
+            state.served_partial(),
+            "a partial close must stick even if a later served_done(false) races"
+        );
+        let contents = std::fs::read(state.served_response_path()).expect("served section file");
+        assert_eq!(contents, b"event: message_start\n\n");
+    }
+
+    #[tokio::test]
+    async fn forward_declared_stubs_are_callable_and_never_panic() {
         let capture = TurnCapture::enabled(temp_dir_path("stubs"));
         let state = capture.start("api_stub", None, 0).expect("state");
-        state.write_inbound_request(b"{}");
+        // F1d/F1e sections are not created yet -- these are no-ops.
         state.write_upstream_request(b"{}");
         state.write_upstream_response(b"data: [DONE]\n\n");
+        state.write_inbound_request(b"{}");
         state.write_served_response(b"event: message_stop\n\n");
         state.served_done(true);
         capture.engine_done("api_stub", "cancelled", Some("client_disconnect"));
+        state.await_inbound_closed().await;
+        state.await_served_closed().await;
     }
 }
