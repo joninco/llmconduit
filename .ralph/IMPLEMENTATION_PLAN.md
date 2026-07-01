@@ -5,7 +5,7 @@
 > **Branch:** `anthropic-sse-conformance`. **Run:** `/ralph-orchestrate --agents 2` (auto-review ON), Sonnet-5 subagents.
 
 ## Executive Summary
-**Status: 2/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
+**Status: 3/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
 one terminal `message_delta`, signed thinking, real `message_start.input_tokens`, correct ordering.
 
 ## Completed
@@ -14,6 +14,7 @@ one terminal `message_delta`, signed thinking, real `message_start.input_tokens`
 |-|-|-|
 | 0B1 | Strict conformance harness | ✅ |
 | C1 | One terminal message_delta | ✅ |
+| C2 | Sign thinking + ingress strip | ✅ |
 
 **Ordering is strict and (mostly) serial** — tasks 0B1→C1→C2→C3→C4 all edit
 `src/adapters/responses_to_anthropic/mod.rs` and the shared test surface, so they cannot parallelize.
@@ -23,47 +24,16 @@ the behavior change breaks within the SAME task — do not defer all test churn 
 Hard constraints (verbatim from spec — re-read before editing):
 - Keep replay / system-prefix / web_search injection / dashboard working. NOT native passthrough.
 - KEEP `estimated_output_bytes` + `last_output_tokens` bookkeeping (collector relies on it: `collector.rs:68/150/154`).
-- `web_search` does NOT call `record_output_delta` (`mod.rs:534`) — cover CLIENT `tool_use` in no-progressive-delta tests.
+- `web_search` does NOT call `record_output_delta` (`mod.rs:540`) — cover CLIENT `tool_use` in no-progressive-delta tests.
 - Do NOT touch the dashboard usage path (`engine.rs:2139/2170`).
 
 Source anchors verified against HEAD (`mod.rs` line numbers, current):
-`ensure_started`:141 (ping 144, message_start 145, input_tokens 155) · `record_output_delta` def 679, offending
-push 691-701, call sites **200, 214, 236, 299, 357, 777** · `flush_reasoning_as_thinking`:588 (signature emit 612-617)
-· `handle_completed`:442 (terminal Δ 483) · `finalize`:410 (terminal Δ 422) · `handle_failed`:497 · web_search:534.
-Ingress strip: `anthropic_to_responses.rs:366` (Thinking → `encrypted_content`, currently filters empty at 377-380).
-
----
-
-## Task C2 — Sign the thinking block + ingress strip (deviation #2)
-**Files:** `mod.rs` (`flush_reasoning_as_thinking`), `anthropic_to_responses.rs` (ingress), a shared const.
-
-**Do:**
-1. Define `const SYNTHETIC_SIGNATURE_PREFIX: &str` — a clearly-synthetic recognizable marker (e.g.
-   `"llmconduit-synthetic-v1:"`). Place it so BOTH the converter and the Anthropic ingress adapter can reference it
-   (e.g. a `pub(crate)` const in `models/anthropic.rs` or a shared adapters module).
-2. `flush_reasoning_as_thinking` (`mod.rs:588`): after emitting the buffered thinking deltas, when
-   `take_signature()` is `None` (no real upstream signature — the DeepSeek `reasoning_content` case), synthesize a
-   non-empty `signature_delta` = `SYNTHETIC_SIGNATURE_PREFIX` + a deterministic suffix (e.g. the message id or a
-   hash of the buffered text — must NOT use wall-clock/RNG). Emit it as the LAST delta in the block (matches the
-   golden ordering). When a REAL signature IS present, forward it unchanged (preserve current behavior).
-   - This path also covers the terminal "keep as thinking" case (`flush_reasoning_terminal` → `flush_reasoning_as_thinking`
-     when `!promote`). The PROMOTE-to-text path (`mod.rs:646-663`) emits a `text` block, no signature — leave it.
-3. Anthropic ingress (`anthropic_to_responses.rs:366-382`, the `Thinking { thinking, signature }` arm): when
-   `signature` starts with `SYNTHETIC_SIGNATURE_PREFIX`, map `encrypted_content` to `None` (strip) so a client
-   echo-back of our synthetic marker is never re-forwarded upstream as a real `thinking.signature`. Keep the existing
-   empty-filter; keep forwarding genuine (non-synthetic, non-empty) signatures.
-4. **Tests:**
-   - Unchanged (real-sig forwarding still works): `tests.rs:232` `converts_reasoning_signature_delta` (sig "sig_123"),
-     `:323` `accumulates_multi_part_signature_deltas`, `:639` `collector_preserves_thinking_signature`,
-     `gateway.rs:8654` (asserts `signature == "sig_123"` when upstream provides one).
-   - NEW: reasoning-only / reasoning+text turn with NO upstream signature → emitted thinking block has a NON-EMPTY
-     `signature_delta` whose value starts with `SYNTHETIC_SIGNATURE_PREFIX`.
-   - NEW (round-trip, AGENTS.md "no new wire field without round-trip test"): an Anthropic request whose assistant
-     `thinking` block carries a synthetic-prefixed signature → canonical `Reasoning.encrypted_content` is `None`
-     (stripped); a real signature → forwarded as `encrypted_content`.
-
-**DoD:** `cargo test` green; every emitted thinking block is signed; synthetic stripped on ingress; real forwarded;
-`assert_stream_conformant` invariant #4 passes.
+`ensure_started`:146 (ping 149, message_start 150, input_tokens 160) · `record_output_delta` def 713, call sites
+**205, 219, 242, 305, 363, 797** · `flush_reasoning_as_thinking`:594 (unconditional signature emit, real-or-synthetic,
+620-635; `synthetic_signature` helper 814) · `handle_completed`:448 (terminal Δ 489) · `finalize`:416 (terminal Δ
+428) · `handle_failed`:503 · web_search:540. Ingress strip: `anthropic_to_responses.rs:367` (Thinking →
+`encrypted_content`, filters empty AND `SYNTHETIC_SIGNATURE_PREFIX`-prefixed at 386-392).
+`SYNTHETIC_SIGNATURE_PREFIX` const: `models/anthropic.rs` "Shared constants" section.
 
 ---
 
@@ -81,15 +51,15 @@ real count at `message_start` (golden: `input_tokens: 20`) because it has the to
    into `message_start`.
 2. **(Recommended middle path)** Thread the early ESTIMATE into `message_start`: carry `estimate_input_tokens` onto
    the `response.created` event payload (or pass it to `AnthropicStreamConverter::new`) so `ensure_started`
-   (`mod.rs:155`) emits a non-zero, plausible `input_tokens` instead of `0`. Tag it as an estimate (DQ). This is
+   (`mod.rs:160`) emits a non-zero, plausible `input_tokens` instead of `0`. Tag it as an estimate (DQ). This is
    non-architectural (no stream buffering) and closes the visible `0` deviation.
 3. **Residual:** if neither is clean without an architectural change, LEAVE `0` and DOCUMENT it (in the spec + this
    plan) as the single accepted residual deviation. Do NOT block the rest of the work.
    - Do NOT buffer `message_start` until the late usage arrives — that defers stream start (bad UX, architectural).
 
-**Tests:** update `tests.rs:524` `assert_eq!(message_start.usage.input_tokens, Some(0))` to match the chosen
+**Tests:** update `tests.rs:584` `assert_eq!(message_start.usage.input_tokens, Some(0))` to match the chosen
 behavior (`Some(<estimate>)` or keep `Some(0)` with a comment citing the documented residual). Confirm NO regression
-in the FINAL non-stream `input_tokens` (`tests.rs:634` expects the real `12` from completed usage — that overrides at
+in the FINAL non-stream `input_tokens` (`tests.rs:721` expects the real `12` from completed usage — that overrides at
 `handle_completed:468` → `collector.rs:70`, so it must stay `12`). Confirm `gateway.rs` completed-usage input_tokens
 asserts (e.g. `:858`, `:3934`) unaffected.
 
@@ -101,12 +71,12 @@ asserts (e.g. `:858`, `:3934`) unaffected.
 **Files:** `mod.rs` (`ensure_started`, `handle_failed`), tests.
 
 **Do:**
-1. **ping:** golden vLLM native emits **NO `ping`**. `ensure_started` (`mod.rs:144`) currently pushes `Ping` then
+1. **ping:** golden vLLM native emits **NO `ping`**. `ensure_started` (`mod.rs:149`) currently pushes `Ping` then
    `MessageStart`. To byte-match, the cleanest is to DROP the `Ping` emission (or, if a ping is desired for client
    keep-alive, move it AFTER `message_start` to at least not precede it). Pick the option that matches the golden; if
-   dropping has wider implications (e.g. SSE keep-alive elsewhere), keep + document. Update `tests.rs:747`
+   dropping has wider implications (e.g. SSE keep-alive elsewhere), keep + document. Update `tests.rs:834`
    (`vec!["ping","message_start","message_delta","message_stop"]`) to the chosen order/shape.
-2. **error terminal:** `handle_failed` (`mod.rs:497`) emits only `error`; HTTP streaming then calls `finalize()`
+2. **error terminal:** `handle_failed` (`mod.rs:503`) emits only `error`; HTTP streaming then calls `finalize()`
    (`http.rs:1305`) → `error → message_delta → message_stop`. Check Anthropic's real error-stream shape; decide
    whether to keep the trailing `Δ + message_stop` or end at `error`. Low priority — keep current behavior +
    document if unclear. Ensure the conformance harness's error surface asserts whichever shape is chosen.

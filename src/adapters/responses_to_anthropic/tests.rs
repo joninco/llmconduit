@@ -206,7 +206,9 @@ fn converts_reasoning_then_text_response() {
     // Reasoning is deferred (G8): it is buffered (no progressive output-usage
     // on the wire -- C1) until the following text forces a flush, so the
     // `thinking` block opens contiguously with the reasoning it buffered.
-    // Exactly one terminal `message_delta` ends the stream (C1).
+    // Exactly one terminal `message_delta` ends the stream (C1). No upstream
+    // signature was provided, so the thinking block closes with a synthetic
+    // one (C2, invariant 4) before the text block opens.
     assert_eq!(
         event_types(&events),
         vec![
@@ -214,6 +216,7 @@ fn converts_reasoning_then_text_response() {
             "message_start",
             "content_block_start", // thinking (flushed on text arrival)
             "content_block_delta", // thinking delta
+            "content_block_delta", // synthetic signature delta (C2, no upstream sig)
             "content_block_stop",  // close thinking before text
             "content_block_start", // text
             "content_block_delta", // text delta
@@ -221,6 +224,71 @@ fn converts_reasoning_then_text_response() {
             "message_delta",       // terminal stop reason -- the ONLY message_delta
             "message_stop",
         ]
+    );
+}
+
+#[test]
+fn unsigned_reasoning_gets_a_synthetic_signature() {
+    // C2: when the upstream reasoning channel carries no signature (the
+    // DeepSeek `reasoning_content` case -- no `signature_delta` events at
+    // all), the emitted thinking block must still close signed (invariant 4)
+    // with a NON-EMPTY, clearly-synthetic marker.
+    fn run() -> Vec<AnthropicStreamEvent> {
+        let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+        [
+            created_event(),
+            item_added_event("reasoning", ""),
+            reasoning_delta_event("Thinking..."),
+            item_added_event("message", "assistant"),
+            text_delta_event("Answer"),
+            item_done_event("reasoning", json!({})),
+            item_done_event("message", json!({})),
+            completed_event(),
+        ]
+        .iter()
+        .flat_map(|e| converter.convert(e))
+        .collect()
+    }
+
+    let events = run();
+    let signatures: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            AnthropicStreamEvent::ContentBlockDelta {
+                delta: AnthropicDelta::SignatureDelta { signature },
+                ..
+            } => Some(signature.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(signatures.len(), 1, "expected exactly one signature_delta");
+    let signature = signatures[0];
+    assert!(
+        !signature.is_empty(),
+        "synthetic signature must be non-empty"
+    );
+    assert!(
+        signature.starts_with(SYNTHETIC_SIGNATURE_PREFIX),
+        "synthetic signature must carry the recognizable marker prefix, got {signature:?}"
+    );
+
+    // Determinism: the SAME canonical input run through a FRESH converter
+    // instance (a different, randomly-generated `message_id`) must produce
+    // the IDENTICAL synthetic signature -- no wall-clock/RNG involvement.
+    let events_again = run();
+    let signature_again = events_again
+        .iter()
+        .find_map(|event| match event {
+            AnthropicStreamEvent::ContentBlockDelta {
+                delta: AnthropicDelta::SignatureDelta { signature },
+                ..
+            } => Some(signature.as_str()),
+            _ => None,
+        })
+        .expect("second run must also emit a signature_delta");
+    assert_eq!(
+        signature, signature_again,
+        "same input must yield the same synthetic signature across independent converter runs"
     );
 }
 
@@ -1013,17 +1081,14 @@ fn finalize_terminates_stream_after_failure_event() {
 
 #[test]
 fn real_converter_reasoning_text_stream_satisfies_ordering_invariants() {
-    // C1 win, proven via the harness: a real reasoning+text converter run now
-    // satisfies invariants 1-3 + 5 (exactly one terminal message_delta with a
+    // C1 + C2 win, proven via the harness: a real reasoning+text converter run
+    // satisfies ALL invariants 1-5 (exactly one terminal message_delta with a
     // stop_reason, never before the first content_block_start, never inside an
-    // open block, stream ends message_delta -> message_stop).
-    //
-    // TODO(C2): this turn carries no upstream reasoning signature (the
-    // DeepSeek `reasoning_content` case), so the thinking block closes with NO
-    // signature_delta -- invariant 4 is not yet satisfied. C2 adds a synthetic
-    // signature for exactly this case; once it lands, replace the
-    // `check_stream_conformant` call below with a plain
-    // `conformance::assert_stream_conformant(&events, conformance::Surface::ReasoningText)`.
+    // open block, the thinking block is signed, stream ends message_delta ->
+    // message_stop). This turn carries no upstream reasoning signature (the
+    // DeepSeek `reasoning_content` case), so invariant 4 is satisfied by C2's
+    // synthesized signature, not a forwarded real one -- see
+    // `flush_reasoning_as_thinking` / `synthetic_signature`.
     let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
     let events: Vec<AnthropicStreamEvent> = [
         created_event(),
@@ -1039,13 +1104,7 @@ fn real_converter_reasoning_text_stream_satisfies_ordering_invariants() {
     .flat_map(|e| converter.convert(e))
     .collect();
 
-    let failure =
-        conformance::check_stream_conformant(&events, conformance::Surface::ReasoningText)
-            .expect_err("invariant 4 (signature) is not yet satisfied pre-C2");
-    assert!(
-        failure.contains("invariant 4"),
-        "expected ONLY invariant 4 (signature, pending C2) to fail, got: {failure}"
-    );
+    conformance::assert_stream_conformant(&events, conformance::Surface::ReasoningText);
 }
 
 #[test]

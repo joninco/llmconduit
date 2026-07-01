@@ -17,6 +17,27 @@ fn default_object() -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Shared constants
+// ---------------------------------------------------------------------------
+
+/// Marker prefix for a SYNTHETIC `thinking` block signature minted by this
+/// gateway when the upstream reasoning channel carried none (e.g. DeepSeek's
+/// `reasoning_content`, which has no signature field at all). Anthropic's real
+/// signatures are opaque values only Anthropic can mint -- a proxy can't
+/// produce a genuine one -- so this is a SHAPE-ONLY stand-in that satisfies
+/// clients expecting every `thinking` block to close with a non-empty
+/// `signature_delta` (invariant #4, `.ralph/specs/anthropic-sse-conformance.md`).
+///
+/// Referenced by BOTH sides of the wire:
+/// - egress (`adapters/responses_to_anthropic/mod.rs`): mints it when
+///   `flush_reasoning_as_thinking` has buffered text but no real signature.
+/// - ingress (`adapters/anthropic_to_responses.rs`): strips it back to `None`
+///   on the way to an upstream, so a client that echoes a `thinking` block
+///   with this marker back as history is never re-forwarded as if it were a
+///   genuine Anthropic signature.
+pub(crate) const SYNTHETIC_SIGNATURE_PREFIX: &str = "llmconduit-synthetic-v1:";
+
+// ---------------------------------------------------------------------------
 // Request types
 // ---------------------------------------------------------------------------
 

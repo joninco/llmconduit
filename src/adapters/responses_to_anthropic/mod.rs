@@ -8,7 +8,10 @@ use crate::models::anthropic::AnthropicMessageUsage;
 use crate::models::anthropic::AnthropicServerToolUse;
 use crate::models::anthropic::AnthropicStreamEvent;
 use crate::models::anthropic::AnthropicUsage;
+use crate::models::anthropic::SYNTHETIC_SIGNATURE_PREFIX;
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -604,20 +607,35 @@ impl AnthropicStreamConverter {
         // `take_buffer` returns the concatenated text; emit each ORIGINAL chunk
         // as its own delta to preserve the exact stream shape. Re-split by the
         // recorded chunks: take_buffer concatenates, so instead iterate the
-        // buffer's chunks directly via take_signature + per-chunk emit.
+        // buffer's chunks directly via take_signature + per-chunk emit. Also
+        // accumulate the concatenation as we go (one pass, no extra clone) so
+        // an unsigned block can derive a synthetic signature below.
         let buffer = std::mem::take(&mut self.reasoning.reasoning_buffer);
+        let mut thinking_text = String::new();
         for chunk in buffer {
+            thinking_text.push_str(&chunk);
             output.push(AnthropicStreamEvent::ContentBlockDelta {
                 index,
                 delta: AnthropicDelta::ThinkingDelta { thinking: chunk },
             });
         }
-        if let Some(signature) = self.reasoning.take_signature() {
-            output.push(AnthropicStreamEvent::ContentBlockDelta {
-                index,
-                delta: AnthropicDelta::SignatureDelta { signature },
-            });
-        }
+        // Invariant #4 (`.ralph/specs/anthropic-sse-conformance.md`): every
+        // emitted thinking block must close with a non-empty signature_delta.
+        // A real upstream signature (vLLM native, an Anthropic-history replay)
+        // forwards unchanged. When the reasoning channel carried none (e.g.
+        // DeepSeek's `reasoning_content`), synthesize a deterministic
+        // stand-in -- see `synthetic_signature` for why it must NOT depend on
+        // `message_id`. Stripped back out on Anthropic ingress
+        // (`anthropic_to_responses.rs`) so a client echo-back is never
+        // re-forwarded upstream as a genuine signature.
+        let signature = self
+            .reasoning
+            .take_signature()
+            .unwrap_or_else(|| synthetic_signature(&thinking_text));
+        output.push(AnthropicStreamEvent::ContentBlockDelta {
+            index,
+            delta: AnthropicDelta::SignatureDelta { signature },
+        });
         output.push(AnthropicStreamEvent::ContentBlockStop { index });
     }
 
@@ -781,6 +799,21 @@ impl AnthropicStreamConverter {
         self.close_open_block(output);
         self.emitted_tool_call_ids.insert(call_id.to_string());
     }
+}
+
+/// Deterministic synthetic signature for a `thinking` block whose upstream
+/// reasoning channel carried none (C2, deviation #2). Hashes ONLY the
+/// buffered thinking text -- deliberately NOT `self.message_id`, which is a
+/// fresh random UUID per `AnthropicStreamConverter::new` call and would make
+/// the identical canonical input produce a different signature on every
+/// converter instance. Hashing just the text keeps the "same input -> same
+/// synthetic signature" contract true across independent converter runs
+/// (what tests assert on), while still never touching wall-clock time or an
+/// RNG. This is a SHAPE-only marker, not a real Anthropic signature -- see
+/// `SYNTHETIC_SIGNATURE_PREFIX`.
+fn synthetic_signature(thinking_text: &str) -> String {
+    let digest = Sha256::digest(thinking_text.as_bytes());
+    format!("{SYNTHETIC_SIGNATURE_PREFIX}{}", hex::encode(digest))
 }
 
 pub(super) fn response_usage(data: &Value) -> Option<AnthropicMessageUsage> {

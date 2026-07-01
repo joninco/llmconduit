@@ -7,6 +7,7 @@ use crate::models::anthropic::AnthropicRequest;
 use crate::models::anthropic::AnthropicSystemContent;
 use crate::models::anthropic::AnthropicThinking;
 use crate::models::anthropic::AnthropicTool;
+use crate::models::anthropic::SYNTHETIC_SIGNATURE_PREFIX;
 use crate::models::responses::ContentItem;
 use crate::models::responses::ReasoningContentItem;
 use crate::models::responses::ReasoningRequest;
@@ -374,9 +375,20 @@ fn convert_message(
                             content: Some(vec![ReasoningContentItem::ReasoningText {
                                 text: thinking.clone(),
                             }]),
+                            // Strip empty AND our own synthetic marker (C2):
+                            // a client that round-trips a thinking block we
+                            // signed ourselves (no real upstream signature)
+                            // must never have it re-forwarded upstream as if
+                            // it were a genuine Anthropic signature -- a
+                            // proxy can't mint one, and it's meaningless
+                            // (possibly misleading) to any upstream. Genuine,
+                            // non-empty signatures still forward unchanged.
                             encrypted_content: signature
                                 .as_ref()
-                                .filter(|signature| !signature.is_empty())
+                                .filter(|signature| {
+                                    !signature.is_empty()
+                                        && !signature.starts_with(SYNTHETIC_SIGNATURE_PREFIX)
+                                })
                                 .cloned(),
                         });
                     }
@@ -1372,6 +1384,80 @@ mod tests {
                     ReasoningContentItem::ReasoningText { text } if text == "private chain"
             )
         ));
+    }
+
+    #[test]
+    fn ingress_strips_synthetic_thinking_signature_but_forwards_real_ones() {
+        // C2 round-trip (AGENTS.md "no new wire field without a round-trip
+        // test"): a client that echoes back one of OUR OWN synthetic-marked
+        // thinking signatures (minted by the egress converter when the
+        // upstream reasoning channel carried none, see
+        // `SYNTHETIC_SIGNATURE_PREFIX`) as history must never have it
+        // re-forwarded upstream as if it were a genuine Anthropic signature.
+        // A real signature must still forward unchanged.
+        let synthetic_signature = format!("{SYNTHETIC_SIGNATURE_PREFIX}deadbeef");
+        let request = AnthropicRequest {
+            model: "claude-3-5-sonnet-20241022".to_string(),
+            max_tokens: Some(1024),
+            system: None,
+            messages: vec![AnthropicMessage {
+                role: "assistant".to_string(),
+                content: AnthropicContent::Blocks(vec![
+                    AnthropicContentBlock::Thinking {
+                        thinking: "synthetic chain".to_string(),
+                        signature: Some(synthetic_signature),
+                    },
+                    AnthropicContentBlock::Thinking {
+                        thinking: "real chain".to_string(),
+                        signature: Some("abc123".to_string()),
+                    },
+                ]),
+            }],
+            tools: None,
+            tool_choice: None,
+            stream: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            stop_sequences: None,
+            metadata: None,
+            thinking: None,
+            output_config: None,
+        };
+
+        let result = convert_request(request).expect("convert");
+        assert_eq!(result.input.len(), 2);
+        assert!(
+            matches!(
+                &result.input[0],
+                ResponseItem::Reasoning {
+                    content: Some(content),
+                    encrypted_content: None,
+                    ..
+                } if matches!(
+                    &content[0],
+                    ReasoningContentItem::ReasoningText { text } if text == "synthetic chain"
+                )
+            ),
+            "a synthetic-prefixed signature must be stripped to None, got {:?}",
+            result.input[0]
+        );
+        assert!(
+            matches!(
+                &result.input[1],
+                ResponseItem::Reasoning {
+                    content: Some(content),
+                    encrypted_content: Some(signature),
+                    ..
+                } if signature == "abc123"
+                    && matches!(
+                        &content[0],
+                        ReasoningContentItem::ReasoningText { text } if text == "real chain"
+                    )
+            ),
+            "a genuine signature must still forward unchanged, got {:?}",
+            result.input[1]
+        );
     }
 
     #[test]
