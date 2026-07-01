@@ -157,6 +157,14 @@ pub struct Gateway {
     /// (NOT the middleware); the 5 s snapshot task reads it under the fixed
     /// FlowStore→Metrics lock order.
     metrics: crate::metrics::MetricsLayer,
+    /// F1 (Topic F) durable per-turn capture handle (see `turn_capture.rs`).
+    /// `TurnCapture::disabled()` when `turn_capture_dir` is unset -- every op
+    /// a no-op (no thread, no alloc, no fs). Unlike the FlowStore/metrics/
+    /// monitor triad above, this is NOT gated on `--with-debug-ui`: the DI
+    /// root (`lib.rs`) attaches it unconditionally via `with_turn_capture`,
+    /// keyed only on `config.turn_capture_dir` (spec Design overview #1 --
+    /// its own instrumentation gate, independent of the debug UI).
+    turn_capture: crate::turn_capture::TurnCapture,
     /// D6 AbortHub: the live-cancellation registry keyed by `api_call_id`, so the
     /// dashboard kill route can cancel a stuck server-side stream. Gated identically to
     /// the FlowStore (enabled iff `flow_store.is_enabled()`), because the D3 L1 guard —
@@ -683,6 +691,10 @@ impl Gateway {
             // D5: disabled by default (zero overhead); the DI root attaches an
             // enabled layer via `with_metrics` in the `--with-debug-ui` branch.
             metrics: crate::metrics::MetricsLayer::disabled(),
+            // F1: disabled by default (zero overhead); the DI root attaches an
+            // enabled sink via `with_turn_capture` when `turn_capture_dir` is
+            // configured -- independent of `--with-debug-ui`.
+            turn_capture: crate::turn_capture::TurnCapture::disabled(),
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
@@ -738,6 +750,24 @@ impl Gateway {
     /// off, in which case every metrics op is a no-op (zero lock, zero work).
     pub fn metrics(&self) -> &crate::metrics::MetricsLayer {
         &self.metrics
+    }
+
+    /// Attach the F1 [`TurnCapture`](crate::turn_capture::TurnCapture) sink (built in
+    /// the DI root from `config.turn_capture_dir`). Consuming builder so it threads
+    /// through the `Gateway::new(...)` → `Arc::new` construction WITHOUT widening the
+    /// constructor signature (every test that builds a bare `Gateway` keeps the
+    /// default `disabled()` sink -- zero overhead). Mirrors `with_metrics`.
+    pub fn with_turn_capture(mut self, turn_capture: crate::turn_capture::TurnCapture) -> Self {
+        self.turn_capture = turn_capture;
+        self
+    }
+
+    /// Access the F1 durable per-turn capture handle. `is_enabled()` is `false`
+    /// when `turn_capture_dir` is unset, in which case every capture op is a
+    /// no-op (no thread, no alloc, no fs). Independent of the debug UI --
+    /// see `.ralph/specs/F1-durable-turn-capture.md`.
+    pub fn turn_capture(&self) -> &crate::turn_capture::TurnCapture {
+        &self.turn_capture
     }
 
     /// D5: record a TERMINAL response into the metrics rings at the engine's D3

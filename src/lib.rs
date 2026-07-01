@@ -27,6 +27,7 @@ pub(crate) mod sse_guard;
 #[cfg(test)]
 pub(crate) mod test_alloc_probe;
 pub(crate) mod tool_delta_gate;
+pub mod turn_capture;
 pub mod upstream;
 pub mod vision;
 
@@ -119,6 +120,15 @@ pub fn build_app_with_gateway_and_options(
         crate::metrics::MetricsLayer::new()
     } else {
         crate::metrics::MetricsLayer::disabled()
+    };
+    // F1 (Topic F) durable per-turn capture: opt-in, config-only gate --
+    // constructed regardless of `--with-debug-ui` (works even when the debug
+    // UI/dashboard is off; see `.ralph/specs/F1-durable-turn-capture.md`
+    // Design overview #1). `disabled()` is a zero-op sink (no thread, no
+    // alloc, no fs) when `turn_capture_dir` is unset.
+    let turn_capture = match config.turn_capture_dir.clone() {
+        Some(dir) => crate::turn_capture::TurnCapture::enabled(dir),
+        None => crate::turn_capture::TurnCapture::disabled(),
     };
     // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
     // (G7); routes alone are enough to switch the gateway into the routing
@@ -296,7 +306,8 @@ pub fn build_app_with_gateway_and_options(
             flow_store,
         )
         .with_dashboard_auth(dashboard_auth)
-        .with_metrics(metrics),
+        .with_metrics(metrics)
+        .with_turn_capture(turn_capture),
     );
     // D4: spawn the topology-health publication task ONLY when the debug UI is on,
     // so production keeps the zero-overhead path (no 1 s tick). Guard on a live

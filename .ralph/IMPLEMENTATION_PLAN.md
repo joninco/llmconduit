@@ -10,7 +10,7 @@
 
 ## Executive summary
 
-**Status: 0/6 tasks — not started.** Opt-in `turn_capture_dir` writes ONE atomic JSON per turn
+**Status: 1/6 tasks completed.** Opt-in `turn_capture_dir` writes ONE atomic JSON per turn
 (`<dir>/<api_call_id>.json`) with the FULL inbound Anthropic request, translated OpenAI request, RAW vLLM
 response, and served Anthropic bytes + outcome — so an operator / fresh Claude session can debug weird CC
 output (stray `<think>` tags, malformed tool calls) that is otherwise a 200 OK with no durable trace.
@@ -26,7 +26,7 @@ response-`Body` wrapper owns served bytes); RAII drop-guard finalize; UTF-8/base
 
 | Task | Description | Status |
 |-|-|-|
-| F1a | `turn_capture.rs` module + disabled zero-op sink; `turn_capture_dir` on `Config`+`PersistedConfig`+default+env+`configure()`; `debug_log_dirs()` includes it; `lib.rs` DI. AC-1,2,3 | ☐ |
+| F1a | `turn_capture.rs` module (`TurnCapture`/`TurnCaptureState`, disabled zero-op sink) + `turn_capture_dir` on `Config`+`PersistedConfig`+default+env+`configure()`+`debug_log_dirs()` + `Gateway`/`lib.rs` DI. AC-1,2,3 | ✅ |
 | F1b | HTTP own-gate (thread `api_call_id` off debug-ui) + inbound capture (copy+redact) + served-body `Body` wrapper (streaming/non-streaming/error/disconnect). AC-4,5,6 | ☐ |
 | F1c | Engine terminal integration `engine_done(status,reason)` on all terminals incl pre-spawn (`engine.rs:1196`) + RAII drop finalize (mirror `dashboard_flow.rs:1794/1917`); both-done barrier. AC-7,8,9 | ☐ |
 | F1d | `capture: Option<Arc<TurnCaptureState>>` on `BackendChatRequest`; upstream_request capture in `dispatch_chat_stream`, last-writer-wins (shrink retry / failover final attempt). AC-10,11 | ☐ |

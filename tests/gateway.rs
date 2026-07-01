@@ -637,6 +637,7 @@ async fn uses_configured_upstream_model_override() {
             upstream_model: Some("grok-4".to_string()),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
@@ -725,6 +726,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             upstream_model: Some("alias-from-config".to_string()),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
@@ -1075,6 +1077,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             upstream_model: Some("GLM-5.1".to_string()),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::from_iter([(
                 "clear_thinking".to_string(),
                 json!(false),
@@ -1139,6 +1142,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
@@ -2864,6 +2868,7 @@ async fn proxies_models_endpoint_with_etag() {
         upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
+        turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
@@ -2941,6 +2946,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
+        turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
@@ -3024,6 +3030,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
+        turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
@@ -3110,6 +3117,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
+        turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
@@ -3201,6 +3209,7 @@ async fn proxies_completions_endpoint_passthrough() {
         upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
+        turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
@@ -6968,6 +6977,7 @@ fn test_config() -> Config {
         upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
+        turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
@@ -9962,6 +9972,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
         upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
+        turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
@@ -11160,4 +11171,55 @@ async fn e1_repair_round_is_cancellable_on_client_hangup() {
     tokio::time::timeout(std::time::Duration::from_secs(5), &mut dropped)
         .await
         .expect("repair-round upstream cancelled on client hang-up");
+}
+
+// -- F1a: turn_capture DI wiring (`lib.rs` -> `Gateway`) --------------------
+//
+// `test_gateway`/`test_gateway_with_config` above build a `Gateway` directly
+// via `Gateway::new(...)`, bypassing the `lib.rs` DI root entirely, so they
+// cannot exercise the real `config.turn_capture_dir -> TurnCapture -> Gateway`
+// wiring. These two tests go through the actual DI entry point
+// (`build_app_with_gateway`) instead.
+
+/// F1a: when `turn_capture_dir` is configured, `build_app_with_gateway` (the
+/// real DI root) attaches an ENABLED `TurnCapture` to the `Gateway`, reachable
+/// via `gateway.turn_capture()` -- confirming the handle threads into the
+/// gateway/HTTP router state, independent of `--with-debug-ui` (`build_app`/
+/// `build_app_with_gateway` never enable the debug UI). F1a is in-memory only:
+/// merely constructing the app must not create the directory.
+#[tokio::test]
+async fn build_app_with_gateway_wires_enabled_turn_capture_from_config() {
+    let dir = std::env::temp_dir().join(format!(
+        "llmconduit-gateway-turn-capture-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    assert!(!dir.exists());
+
+    let mut config = test_config();
+    config.turn_capture_dir = Some(dir.clone());
+    let (_app, gateway) = llmconduit::build_app_with_gateway(config);
+
+    assert!(
+        gateway.turn_capture().is_enabled(),
+        "a configured turn_capture_dir must produce an ENABLED TurnCapture on the Gateway"
+    );
+    assert_eq!(gateway.turn_capture().dir(), Some(dir.as_path()));
+    assert!(
+        !dir.exists(),
+        "F1a wiring must not itself perform any filesystem IO"
+    );
+}
+
+/// F1a: with no `turn_capture_dir` configured (the `test_config()` default),
+/// the DI root attaches a DISABLED `TurnCapture` -- the zero-overhead default
+/// every other test in this suite (built via `Gateway::new` directly) already
+/// gets implicitly.
+#[tokio::test]
+async fn build_app_with_gateway_wires_disabled_turn_capture_by_default() {
+    let config = test_config();
+    assert_eq!(config.turn_capture_dir, None);
+    let (_app, gateway) = llmconduit::build_app_with_gateway(config);
+
+    assert!(!gateway.turn_capture().is_enabled());
+    assert!(gateway.turn_capture().dir().is_none());
 }
