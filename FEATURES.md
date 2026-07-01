@@ -134,6 +134,25 @@ features below all hang off. Today a flow is a set of artifacts (bodies, deltas,
 - **Surface:** enriched inspector `ErrorTab` + an error-rate chip on the stats strip/topology.
 - **Backend:** error-body capture is the only new seam; grouping is frontend. **Effort:** M.
 
+### Graceful image degradation 🔭⚙️
+- **Answers:** "did this turn's images get placeholdered or rejected because the backend can't see
+  images, and why didn't a bad request take the whole provider down with it?"
+- **Data:** `measured`, engine-side only today (Topic E / E2 — field incident: a claude-cli
+  tool-result image hit a text-only vLLM upstream, which 400'd "not a multimodal model" and cooled
+  the provider for 30s, 502-ing every unrelated request for the whole window). Two invariants now
+  hold at the gateway: a **request-intrinsic 4xx** (`400`/`413`/`415`/`422`) is `Terminal` — it
+  never cools or fails over a healthy provider (`401`/`403`/`404`/`408`/`429`/5xx unchanged); and
+  any image still reaching a non-native-vision backend is swept at the engine canonical layer and
+  either replaced in place with an instructive text placeholder (the model is told to ask the user
+  or request text — never to guess) or the turn is rejected pre-dispatch with an HTTP `400` (never
+  `502`; the provider is never contacted) — per `unsupported_image_policy: placeholder|reject`
+  (default `placeholder`). A degraded turn emits a `WARN` log + a monitor `ToolPhase` event, but
+  neither reaches the dashboard yet.
+- **Surface:** a flag/badge on the flow row + inspector detail (`images degraded: {n}, policy: …`).
+- **Backend:** needs the same metadata-wrapper seam noted elsewhere in this doc (the engine returns
+  a bare `ReceiverStream`, so surfacing this needs a response header or a `FlowRecord` field) —
+  documented follow-up, not yet built. **Effort:** S once the wrapper seam exists.
+
 ### Provider health history (cooldown timeline) 🔭⚙️
 - **Answers:** "did failures line up with a provider cooling/recovering?"
 - **Data:** `measured` health transitions (healthy → cooling → down → recovered) over time — needs a

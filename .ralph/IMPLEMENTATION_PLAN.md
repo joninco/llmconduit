@@ -10,8 +10,8 @@
 
 ## Executive summary
 
-**Status: 2/3 tasks complete.** E2a ✅, E2b ✅ done — committed + Codex-xhigh APPROVED (full detail archived
-in `.ralph/COMPLETED_TASKS.md`). E2c ⬜ pending (docs only).
+**Status: 3/3 tasks complete — Topic E / E2 done.** E2a ✅, E2b ✅ (Codex-xhigh APPROVED), E2c ✅ — all
+committed (full detail archived in `.ralph/COMPLETED_TASKS.md`).
 
 Field incident: an image in a claude-cli tool chain hit the text-only upstream → **400 "not a multimodal
 model"** → the 400 tripped a **30 s provider cooldown** → every request **502**'d. Two independent fixes,
@@ -26,7 +26,7 @@ ON the existing G4 vision agent (unchanged); closes the residuals it misses.
 |-|-|-|
 | E2a | request-intrinsic 4xx {400,413,415,422} → `Terminal` (no failover/cooldown); 401/403/404/408/429 unchanged; dashboard class stays `HttpStatus` + `failover_reason=TerminalNoFailover` (`upstream.rs`, `error.rs`); shipped AC-1,2,3 | ✅ |
 | E2b | role-agnostic residual-image pass (`vision/strip.rs::degrade_residual_images`/`has_residual_images`) wired at `engine.rs` after `activate_image_agent`, gated on `!backend_is_native_vision`; `unsupported_image_policy` (`Placeholder`/`Reject`) on `Config`+`PersistedConfig`+env+`configure()`; `Reject`→400 (not 502) pre-dispatch; degraded turn forces `request.store=false` (bypasses replay lookup+store); shipped AC-4,5,7,8,9 (15 new integration tests + 14 unit tests) | ✅ |
-| E2c | docs only (`FEATURES.md`, `AGENTS.md` invariants + limitation, `config.yaml` comment) | ⬜ |
+| E2c | docs only: `FEATURES.md` "Graceful image degradation" entry; `AGENTS.md` invariants + limitation verified (already added by E2a/E2b, no dupe); README.md `unsupported_image_policy` example (no repo config template exists) | ✅ |
 
 **Ordering: serial E2a → E2b → E2c** (shared files force serial; `--agents 1`). E2a and E2b are logically
 independent, but E2a first establishes the 4xx-status handling that E2b's `Reject` path reuses, and it

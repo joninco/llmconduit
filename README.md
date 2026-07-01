@@ -130,6 +130,27 @@ Optional Brave Search:
 brave_api_key: "..."
 ```
 
+Optional vision offload — forward images to a separate vision-capable model instead
+of the primary upstream:
+
+```yaml
+image_agent_enabled: true
+vision_url: "http://127.0.0.1:8001/v1"
+vision_model: "Qwen3-VL"
+```
+
+Any image that still reaches a backend without native vision support (whether or not
+the agent above is active, e.g. no `vision_url` configured) is degraded instead of
+forwarded raw:
+
+```yaml
+# placeholder (default): replace the image in place with an instructive text note so
+#   the model asks the user to describe it / requests text, instead of guessing.
+# reject: fail the turn before dispatch with an HTTP 400 (the provider is never
+#   contacted, so it is never cooled down or failed over).
+unsupported_image_policy: placeholder
+```
+
 ## Run
 
 ```bash
