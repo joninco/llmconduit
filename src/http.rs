@@ -1359,6 +1359,11 @@ fn with_model_headers(mut response: Response, requested: &str, served: &str) -> 
 /// memory, AGENTS.md). Its `Drop` reports `served_done`: `partial` unless the
 /// stream reached a clean end (a `Ready(None)` poll, or delivering its full
 /// promised length). A client disconnect drops the body mid-stream → partial.
+/// F1b review r2: if `served_sink` ever closes early (writer gone mid-stream —
+/// see the field doc), that alone permanently marks the section `partial` via
+/// `mark_served_degraded`, REGARDLESS of how `Drop`'s own clean-end check comes
+/// out — a truncated capture must never be reported complete just because the
+/// client-facing stream itself still ended cleanly.
 struct TeeBody {
     inner: Body,
     state: Arc<crate::turn_capture::TurnCaptureState>,
@@ -1366,7 +1371,8 @@ struct TeeBody {
     /// channel (F1b review #1). `None` once the writer is gone (a section write
     /// error closed the channel) — capture then stops but the served stream
     /// continues byte-for-byte (a diagnostic failure must never break the served
-    /// bytes).
+    /// bytes). The transition to `None` also permanently marks the section
+    /// `partial` (F1b review r2) — see `poll_frame`.
     served_sink: Option<crate::turn_capture::ServedSink>,
     /// Set once `inner` yields `Poll::Ready(None)` (clean end-of-stream).
     clean_eos: bool,
@@ -1397,10 +1403,17 @@ impl http_body::Body for TeeBody {
         // writer's pace instead of piling the whole body into RAM. A closed channel
         // (writer gone) drops the sink; we then forward WITHOUT capture — a
         // diagnostic failure must never break or stall the served stream (AGENTS.md).
+        // F1b review r2 (don't-lie-with-zeros): that also means every byte from
+        // here on is missing the section, so mark the section degraded RIGHT NOW —
+        // sticky, so a later clean end-of-stream can never report this capture
+        // complete (`TurnCaptureState::mark_served_degraded`).
         if let Some(sink) = this.served_sink.as_mut() {
             match sink.poll_reserve(cx) {
                 Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(_)) => this.served_sink = None,
+                Poll::Ready(Err(_)) => {
+                    this.served_sink = None;
+                    this.state.mark_served_degraded();
+                }
                 Poll::Pending => return Poll::Pending,
             }
         }
@@ -1413,11 +1426,13 @@ impl http_body::Body for TeeBody {
                     this.forwarded = this.forwarded.saturating_add(data.len() as u64);
                     // Send the COPY into the slot reserved above; the frame passes
                     // through to the client UNCHANGED (never a retained slice —
-                    // AGENTS.md). A failed send just means the writer went away.
+                    // AGENTS.md). A failed send just means the writer went away —
+                    // mark the section degraded (F1b review r2; see above).
                     if let Some(sink) = this.served_sink.as_mut()
                         && sink.send(data.to_vec()).is_err()
                     {
                         this.served_sink = None;
+                        this.state.mark_served_degraded();
                     }
                 }
                 Poll::Ready(Some(Ok(frame)))
@@ -1445,7 +1460,13 @@ impl Drop for TeeBody {
         // length (hyper can stop polling a Content-Length body before it ever
         // yields `Ready(None)`, so a complete non-streaming response would else be
         // mis-flagged partial). Otherwise the served stream was cut short (client
-        // disconnect / mid-stream error) → partial.
+        // disconnect / mid-stream error) → partial. F1b review r2: this `clean`
+        // check is about the CLIENT-facing stream only — if the section itself
+        // was marked degraded mid-stream (`poll_frame`'s `mark_served_degraded`
+        // calls, section write errors), `served_done`'s `close` cannot unset that
+        // sticky mark no matter what we pass here, so a `served_sink` failure can
+        // never be reported as a complete capture just because the client still
+        // saw a clean end.
         let clean = self.clean_eos || self.exact_len.is_some_and(|len| self.forwarded >= len);
         self.state.served_done(!clean);
     }

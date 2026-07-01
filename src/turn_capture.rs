@@ -230,9 +230,12 @@ impl TurnCaptureState {
         self.served_response.path()
     }
 
-    /// Whether the `served_response` section closed `partial` (the served stream
-    /// did not reach a clean end -- client disconnect / mid-stream error / a
-    /// section write error). `false` for a cleanly-completed response.
+    /// Whether the `served_response` section is `partial` (the served stream did
+    /// not reach a clean end -- client disconnect / mid-stream error / a section
+    /// write error / a [`mark_served_degraded`](Self::mark_served_degraded) mark).
+    /// `false` for a cleanly-completed response. STICKY: once set, no later call
+    /// (including a clean [`served_done`](Self::served_done)`(false)`) can ever
+    /// flip it back to `false` -- see [`mark_served_degraded`](Self::mark_served_degraded).
     pub fn served_partial(&self) -> bool {
         self.served_response.partial()
     }
@@ -296,6 +299,29 @@ impl TurnCaptureState {
             return;
         }
         self.served_response.close(partial);
+    }
+
+    /// F1b review r2 (don't-lie-with-zeros): mark the `served_response` section
+    /// `partial` immediately -- independent of, and possibly well BEFORE,
+    /// [`served_done`](Self::served_done). The HTTP served-body tee calls this
+    /// the instant its [`ServedSink`] closes early (`SinkClosed` on
+    /// `poll_reserve`, or a dropped [`send`](ServedSink::send)): from that point
+    /// on, served bytes are still being forwarded to the client (never
+    /// interrupted -- a diagnostic failure must never break the served stream)
+    /// but are no longer reaching this section, so the capture is truncated
+    /// regardless of how the outer response stream itself later ends. Without
+    /// this mark, a later clean end-of-stream would make
+    /// [`served_done`](Self::served_done)`(false)` the only recorded outcome,
+    /// falsely reporting a truncated capture as complete.
+    ///
+    /// STICKY by construction: [`Section::close`] only ever SETS `partial`,
+    /// never clears it, so a later `served_done(false)` cannot erase this mark
+    /// -- [`served_partial`](Self::served_partial) reflects it immediately and
+    /// permanently. Idempotent and cheap (a single atomic store); safe to call
+    /// any number of times, from any point in the stream, even after the
+    /// section has already closed.
+    pub fn mark_served_degraded(&self) {
+        self.served_response.mark_partial();
     }
 
     /// F1b: a bounded, back-pressured [`ServedSink`] over the `served_response`
@@ -492,7 +518,10 @@ impl Section {
     }
 
     /// Close the section. Records `partial` and drops the sender so the writer
-    /// task drains remaining chunks, flushes, and finishes. Idempotent.
+    /// task drains remaining chunks, flushes, and finishes. Idempotent. NOTE:
+    /// only ever SETS `partial` (never clears it back to `false`), which is what
+    /// makes [`mark_partial`](Section::mark_partial) sticky against a later
+    /// `close(false)`.
     fn close(&self, partial: bool) {
         if partial {
             self.meta.partial.store(true, Ordering::Release);
@@ -500,6 +529,14 @@ impl Section {
         if let Ok(mut guard) = self.tx.lock() {
             *guard = None;
         }
+    }
+
+    /// Mark the section `partial` right now, independent of [`close`](Section::close)
+    /// (the section stays open -- the sender is untouched). Backs
+    /// [`TurnCaptureState::mark_served_degraded`]; see there for the "why" and
+    /// the stickiness guarantee. A single atomic store.
+    fn mark_partial(&self) {
+        self.meta.partial.store(true, Ordering::Release);
     }
 
     /// Await the writer task draining + flushing + setting `closed`. Uses the
@@ -718,6 +755,48 @@ mod tests {
         );
         let contents = std::fs::read(state.served_response_path()).expect("served section file");
         assert_eq!(contents, b"event: message_start\n\n");
+    }
+
+    /// F1b review r2 (don't-lie-with-zeros): reproduces the HTTP tee's early-close
+    /// scenario -- the served sink's writer/receiver closes early mid-stream (the
+    /// `SinkClosed` path at `http.rs`'s `poll_frame`), which the tee handles by
+    /// calling `mark_served_degraded()` right there and then continuing to serve
+    /// the client byte-for-byte from `inner` WITHOUT capture. The outer response
+    /// stream can still reach a clean end-of-stream afterward (the client got the
+    /// full body), so the tee's `Drop` reports that as `served_done(false)`. Prove
+    /// the sticky latch wins over that later clean close: `served_partial()` is
+    /// true immediately after the mark (no need to wait for `served_done`), and
+    /// STAYS true through the subsequent `served_done(false)` -- a truncated
+    /// capture must never be reported complete.
+    #[tokio::test]
+    async fn served_sink_closed_early_marks_partial_sticky_through_clean_done() {
+        let capture = TurnCapture::enabled(temp_dir_path("served-degraded"));
+        let state = capture.start("api_degraded", None, 0).expect("state");
+
+        // Some bytes reached the section before the writer/receiver died.
+        state.write_served_response(b"event: message_start\n\n");
+
+        // Simulate the tee observing `SinkClosed` mid-stream (the section writer
+        // task died): it marks the section degraded immediately, well before the
+        // turn's `served_done` ever runs.
+        state.mark_served_degraded();
+        assert!(
+            state.served_partial(),
+            "mark_served_degraded must be visible immediately, before served_done runs"
+        );
+
+        // The client-facing stream still reaches a clean end (the tee kept
+        // forwarding `inner` unchanged after dropping its sink), so `Drop`
+        // reports a clean close -- exactly the buggy input that used to overwrite
+        // the truth.
+        state.served_done(false);
+        state.await_served_closed().await;
+
+        assert!(
+            state.served_partial(),
+            "a served capture marked degraded mid-stream must stay partial even \
+             though the outer stream later reported a clean served_done(false)"
+        );
     }
 
     #[tokio::test]
