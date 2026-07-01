@@ -7069,6 +7069,28 @@ fn content_chunk(id: &str, content: &str) -> ChatCompletionChunk {
     }
 }
 
+/// A terminal chunk carrying `finish_reason: "length"` (upstream max-output-token
+/// truncation) so the engine derives `response.incomplete` for the turn. Used by the
+/// F1c finding-#3 test to assert the capture artifact maps `length` → `incomplete`.
+fn length_finish_chunk(id: &str) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        id: id.to_string(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatDelta {
+                content: None,
+                reasoning_content: None,
+                tool_calls: None,
+                function_call: None,
+                refusal: None,
+                extra: Default::default(),
+            },
+            finish_reason: Some("length".to_string()),
+        }],
+        usage: None,
+    }
+}
+
 fn reasoning_chunk(id: &str, reasoning: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
@@ -10346,6 +10368,69 @@ async fn f1c_ac9_client_disconnect_writes_cancelled_partial_no_hang() {
         artifact["sections"]["served_response"]["partial"], true,
         "a mid-stream disconnect marks the served section partial: {artifact}"
     );
+}
+
+/// F1c review r1 (finding #3, don't-lie-with-zeros): a turn truncated by the upstream
+/// `finish_reason: length` (max-output-tokens) completes cleanly (`Ok`) but its
+/// response is CUT SHORT, so the capture artifact must record `status:"incomplete"`
+/// (`response.incomplete`), NOT `completed` — even though the served HTTP turn itself
+/// succeeded. Exercises the real engine terminal seam end to end.
+#[tokio::test]
+async fn f1c_length_truncated_turn_writes_incomplete_status() {
+    let capture_dir = unique_capture_dir("length");
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "Hello")),
+            // Terminal `finish_reason: length` → engine emits `response.incomplete`.
+            Ok(length_finish_chunk("chat-1")),
+            Ok(usage_chunk("chat-1", 12, 5, 17, None, None)),
+        ])
+        .await;
+    let mut config = test_config();
+    config.turn_capture_dir = Some(capture_dir.clone());
+    upstream.set_finalization_policies(
+        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
+    );
+    let gateway = gateway_with_capture_dir(Arc::new(upstream), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 4,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    // Drain the stream to completion so the tee closes cleanly (a length truncation
+    // is still a fully-served response to the client).
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read served stream");
+
+    let artifact = wait_for_only_artifact(&capture_dir).await;
+    assert_eq!(
+        artifact["status"], "incomplete",
+        "a `finish_reason: length` turn maps to the `incomplete` artifact status: {artifact}"
+    );
+    assert_eq!(
+        artifact["terminal_reason"], "response.incomplete",
+        "the terminal reason reflects the truncation"
+    );
+    // The served section is still present + clean (the client got the full truncated
+    // stream); only the STATUS reflects the truncation.
+    assert_eq!(artifact["sections"]["served_response"]["partial"], false);
 }
 
 #[tokio::test]

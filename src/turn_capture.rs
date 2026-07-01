@@ -143,7 +143,7 @@ impl TurnCapture {
         let capture_dir = inner.dir.clone();
         let inner_weak = Arc::downgrade(inner);
         // `new_cyclic` hands the state a `Weak` reference to ITSELF so the both-`done`
-        // barrier ([`maybe_assemble`]) can, from a plain `&self` method, upgrade to an
+        // barrier (`spawn_assembly`) can, from a plain `&self` method, upgrade to an
         // `Arc<Self>` and spawn the async flush/assemble/evict task -- without the tee
         // or the engine guard having to hand the `Arc` back in.
         let state = Arc::new_cyclic(|self_weak| {
@@ -221,7 +221,7 @@ pub struct TurnCaptureState {
     /// shutdown) just skips eviction (the whole map is going away anyway).
     inner: Weak<TurnCaptureInner>,
     /// A `Weak` to this very `Arc<TurnCaptureState>` (set via `Arc::new_cyclic`), so
-    /// [`maybe_assemble`](Self::maybe_assemble) can upgrade to an `Arc<Self>` and
+    /// [`spawn_assembly`](Self::spawn_assembly) can upgrade to an `Arc<Self>` and
     /// spawn the async assembly task from a synchronous `&self` latch method.
     self_weak: Weak<TurnCaptureState>,
     /// The served/backend model, stamped by the engine once resolution settles
@@ -232,15 +232,6 @@ pub struct TurnCaptureState {
     inbound_request: Section,
     /// The exact bytes served to the client, teed off the response `Body` (F1b).
     served_response: Section,
-    /// Idempotency latch for [`served_done`](Self::served_done): the tee's `Drop` is
-    /// the only caller, but the latch makes it idempotent so the both-`done` barrier
-    /// fires exactly once.
-    served_reported: AtomicBool,
-    /// Idempotency latch for [`engine_done`](Self::engine_done) (first-writer-wins):
-    /// the FIRST terminal (the engine seam, the [`CaptureGuard`] `Drop` fallback, or
-    /// the [`MiddlewareCaptureGuard`] backstop) records the outcome; later calls are
-    /// inert, so a `Drop` fallback never overwrites the engine's real status.
-    engine_reported: AtomicBool,
     /// Set synchronously by [`CaptureGuard::new`] the instant the engine takes
     /// ownership of the turn (before it returns the stream). The
     /// [`MiddlewareCaptureGuard`] backstop reads it at `Drop`: an UNCLAIMED turn
@@ -248,18 +239,29 @@ pub struct TurnCaptureState {
     /// error) so the backstop finalizes it `failed`; a claimed turn is left to the
     /// engine's own terminal / `Drop` fallback.
     engine_claimed: AtomicBool,
-    /// The terminal outcome recorded by the FIRST [`engine_done`](Self::engine_done).
-    /// Read by assembly; `status` is the artifact status
-    /// (`completed`/`incomplete`/`failed`/`cancelled`), mapped from the engine's
-    /// `FlowStatus` at the terminal seam (NEVER from the tee).
-    outcome: Mutex<Option<EngineOutcome>>,
+    /// Set by [`mark_served_tee_installed`](Self::mark_served_tee_installed) the
+    /// instant the HTTP served-body tee is installed over the response
+    /// (`tee_served_body`). The [`MiddlewareCaptureGuard`] SERVED backstop reads it at
+    /// `Drop`: if NO tee was ever installed -- `next.run` unwound/returned AFTER
+    /// [`start`](TurnCapture::start) but BEFORE the tee -- the served side would
+    /// otherwise never latch and the both-`done` barrier would hang forever, leaking
+    /// the registry entry and `.work` dir (finding #2). The backstop then fires a
+    /// partial [`served_done`](Self::served_done) itself; when the tee IS installed it
+    /// owns `served_done`, so the backstop stays inert.
+    served_tee_installed: AtomicBool,
+    /// The both-`done` assembly barrier, consolidated under ONE mutex (finding #1):
+    /// the two `done` latches, the engine `outcome`, and the exactly-once `finalized`
+    /// trigger all live here, so an observer that sees the engine side "done" ALSO
+    /// sees the stored outcome, and the "both done -> assemble" winner is decided
+    /// INSIDE this lock. Assembly (spawned OUTSIDE the lock) therefore always reads a
+    /// fully-stored outcome -- the publish-before-store race is eliminated. The mutex
+    /// is NEVER held across an await or blocking IO (only the small latch/outcome
+    /// bookkeeping runs under it; the flush + file assembly run after the lock drops).
+    barrier: Mutex<AssemblyBarrier>,
     /// Epoch-ms stamped when the both-`done` barrier resolves (the later of
     /// `engine_done`/`served_done`, plus the section flush) -- the turn's finish
     /// time for the `finished_ms` outcome field.
     finished_ms: AtomicU64,
-    /// Exactly-once latch for the assembly barrier: the second `done` swaps it and
-    /// spawns assembly; every other `maybe_assemble` call is inert.
-    assembly_started: AtomicBool,
 }
 
 impl TurnCaptureState {
@@ -286,12 +288,10 @@ impl TurnCaptureState {
             model_served: Mutex::new(None),
             inbound_request,
             served_response,
-            served_reported: AtomicBool::new(false),
-            engine_reported: AtomicBool::new(false),
             engine_claimed: AtomicBool::new(false),
-            outcome: Mutex::new(None),
+            served_tee_installed: AtomicBool::new(false),
+            barrier: Mutex::new(AssemblyBarrier::default()),
             finished_ms: AtomicU64::new(0),
-            assembly_started: AtomicBool::new(false),
         }
     }
 
@@ -375,13 +375,23 @@ impl TurnCaptureState {
     /// the served stream did NOT reach a clean end (client disconnect, mid-stream
     /// error). Idempotent (F1c relies on that for the both-`done` barrier): only
     /// the FIRST call closes the section, and only the FIRST call can complete the
-    /// both-`done` barrier ([`maybe_assemble`](Self::maybe_assemble)).
+    /// both-`done` barrier (`spawn_assembly`).
     pub fn served_done(&self, partial: bool) {
-        if self.served_reported.swap(true, Ordering::AcqRel) {
-            return;
-        }
+        let trigger = {
+            let mut barrier = self.barrier.lock().expect("turn-capture barrier lock");
+            if barrier.served_reported {
+                return;
+            }
+            barrier.served_reported = true;
+            barrier.take_trigger()
+        };
+        // Close the section OUTSIDE the barrier lock (this only drops the writer
+        // sender -- no IO under the mutex). The `served_reported` latch above
+        // guarantees the close + trigger run exactly once.
         self.served_response.close(partial);
-        self.maybe_assemble();
+        if trigger {
+            self.spawn_assembly();
+        }
     }
 
     /// F1b review r2 (don't-lie-with-zeros): mark the `served_response` section
@@ -448,6 +458,22 @@ impl TurnCaptureState {
         self.engine_claimed.load(Ordering::Acquire)
     }
 
+    /// F1c (finding #2): mark that the HTTP served-body tee has been installed over
+    /// the response. Called by `tee_served_body` (the ONLY installer) BEFORE the
+    /// middleware backstop can drop, so a claimed+teed turn leaves `served_done`
+    /// entirely to the tee's `Drop`. See [`served_tee_installed`](Self#field).
+    pub fn mark_served_tee_installed(&self) {
+        self.served_tee_installed.store(true, Ordering::Release);
+    }
+
+    /// F1c (finding #2): whether the served-body tee was installed (see
+    /// [`mark_served_tee_installed`](Self::mark_served_tee_installed)). Read by the
+    /// [`MiddlewareCaptureGuard`] served backstop to decide whether it must fire a
+    /// partial `served_done` itself (no tee ⇒ a pre-tee unwind ⇒ back it up).
+    fn is_served_tee_installed(&self) -> bool {
+        self.served_tee_installed.load(Ordering::Acquire)
+    }
+
     /// F1c: the ENGINE terminal seam reports the turn's outcome here. `status` is
     /// the artifact status (`completed`/`incomplete`/`failed`/`cancelled`) and
     /// `reason` the terminal reason -- BOTH sourced from the engine (never the tee).
@@ -457,32 +483,36 @@ impl TurnCaptureState {
     /// overwrite the real status. Completes the both-`done` barrier when the served
     /// side has also reported.
     pub fn engine_done(&self, status: &str, reason: Option<&str>) {
-        if self.engine_reported.swap(true, Ordering::AcqRel) {
-            return;
+        let trigger = {
+            let mut barrier = self.barrier.lock().expect("turn-capture barrier lock");
+            if barrier.engine_reported {
+                return;
+            }
+            // Store the outcome UNDER THE SAME LOCK that flips `engine_reported`, so
+            // any observer that later sees the engine side "done" is guaranteed to see
+            // the stored outcome too (finding #1: no publish-before-store window). The
+            // both-`done` winner is then chosen inside this same critical section.
+            barrier.engine_reported = true;
+            barrier.outcome = Some(EngineOutcome {
+                status: status.to_string(),
+                reason: reason.map(str::to_string),
+            });
+            barrier.take_trigger()
+        };
+        if trigger {
+            self.spawn_assembly();
         }
-        *self.outcome.lock().expect("turn-capture outcome lock") = Some(EngineOutcome {
-            status: status.to_string(),
-            reason: reason.map(str::to_string),
-        });
-        self.maybe_assemble();
     }
 
-    /// F1c both-`done` barrier. When BOTH the engine and served sides have latched
-    /// their `done`, spawn the flush → assemble → evict exactly once (guarded by
-    /// `assembly_started`). Called from the tail of each `done` latch, so it fires
-    /// on whichever side reports SECOND. A turn that never reached the engine still
-    /// resolves: the [`MiddlewareCaptureGuard`] backstop supplies the engine side,
-    /// and the tee's `Drop` always supplies the served side -- so the barrier can
-    /// never wait forever.
-    fn maybe_assemble(&self) {
-        if !self.engine_reported.load(Ordering::Acquire)
-            || !self.served_reported.load(Ordering::Acquire)
-        {
-            return;
-        }
-        if self.assembly_started.swap(true, Ordering::AcqRel) {
-            return;
-        }
+    /// F1c both-`done` barrier: spawn the flush → assemble → evict task exactly once.
+    /// The caller has already WON the trigger under the barrier lock
+    /// ([`AssemblyBarrier::take_trigger`]), so this runs OUTSIDE the lock -- the mutex
+    /// is never held across the await / blocking IO in
+    /// [`finalize_and_assemble`](Self::finalize_and_assemble). Fires on whichever side
+    /// reports SECOND. A turn that never reached the engine still resolves: the
+    /// [`MiddlewareCaptureGuard`] backstop supplies the engine side AND (finding #2)
+    /// the served side, so the barrier can never wait forever.
+    fn spawn_assembly(&self) {
         let Some(state) = self.self_weak.upgrade() else {
             return;
         };
@@ -551,9 +581,19 @@ impl TurnCaptureState {
             .join(format!("{}.json.tmp", self.api_call_id));
         let final_path = self.capture_dir.join(format!("{}.json", self.api_call_id));
         match self.write_artifact_file(&tmp) {
-            // Atomic publish: rename the fully-written tmp over the final name so a
-            // reader (or the orphan sweep) never sees a half-written `<id>.json`.
             Ok(()) => {
+                // The section temp files are now fully embedded in `tmp`, so clean up
+                // the work dir + evict the registry entry BEFORE the atomic publish.
+                // That makes the published `<id>.json` a definitive "turn fully
+                // finalized" signal -- a reader (test or operator) never sees the
+                // artifact while the work dir or registry entry still linger -- and
+                // removes the assemble-vs-evict race. A crash between here and the
+                // rename leaves only a sweepable `.json.tmp` (F1f orphan sweep), never
+                // a permanent leak.
+                self.cleanup_work_dir_and_registry();
+                // Atomic publish LAST: rename the fully-written tmp over the final
+                // name so a reader (or the orphan sweep) never sees a half-written
+                // `<id>.json`.
                 if let Err(err) = std::fs::rename(&tmp, &final_path) {
                     tracing::warn!(
                         path = %final_path.display(),
@@ -570,8 +610,19 @@ impl TurnCaptureState {
                     "turn-capture: failed to write artifact"
                 );
                 let _ = std::fs::remove_file(&tmp);
+                // Still clean up the work dir + registry on the write-error path so a
+                // failed artifact never leaks the turn either.
+                self.cleanup_work_dir_and_registry();
             }
         }
+    }
+
+    /// F1c: remove the per-turn `.work/<id>/` section dir and evict the registry
+    /// entry. Called from [`assemble_blocking`](Self::assemble_blocking) BEFORE the
+    /// artifact is published (so a published `<id>.json` implies the turn is fully
+    /// finalized) and also on the write-error path (no leak either way).
+    /// Diagnostic-only: fs / lock errors are logged, never propagated.
+    fn cleanup_work_dir_and_registry(&self) {
         // Delete the per-turn temp section dir (the artifact now embeds their bytes).
         if let Err(err) = std::fs::remove_dir_all(&self.work_dir)
             && err.kind() != std::io::ErrorKind::NotFound
@@ -623,14 +674,16 @@ impl TurnCaptureState {
             self.finished_ms.load(Ordering::Acquire)
         )?;
         let outcome = self
-            .outcome
+            .barrier
             .lock()
-            .expect("turn-capture outcome lock")
+            .expect("turn-capture barrier lock")
+            .outcome
             .clone();
         let (status, reason) = match outcome {
             Some(outcome) => (outcome.status, outcome.reason),
-            // The barrier only assembles after `engine_done` fired, so `outcome` is
-            // normally `Some`; default defensively rather than fabricate a success.
+            // Assembly is only ever triggered from inside the barrier lock AFTER
+            // `engine_done` stored the outcome (finding #1), so `outcome` is always
+            // `Some` here; default defensively rather than fabricate a success.
             None => ("failed".to_string(), Some("no_engine_outcome".to_string())),
         };
         w.write_all(b",\"status\":")?;
@@ -938,6 +991,50 @@ async fn section_writer(mut rx: mpsc::Receiver<Vec<u8>>, meta: Arc<SectionMeta>)
     meta.done.notify_waiters();
 }
 
+/// The both-`done` assembly barrier state, consolidated under ONE mutex on
+/// [`TurnCaptureState`] (finding #1). Holding the two `done` latches, the engine
+/// `outcome`, and the exactly-once `finalized` trigger together closes the
+/// publish-before-store race: [`TurnCaptureState::engine_done`] stores `outcome` in
+/// the SAME critical section that flips `engine_reported`, and the "both done ->
+/// assemble" winner is chosen inside the lock via [`take_trigger`](Self::take_trigger),
+/// so the spawned assembly always reads a fully-stored outcome. Cheap bookkeeping
+/// only; the lock is never held across a flush/await or file IO.
+#[derive(Debug, Default)]
+struct AssemblyBarrier {
+    /// The served side has latched its `done` (the tee's `Drop`, or the
+    /// [`MiddlewareCaptureGuard`] served backstop). First-writer-wins.
+    served_reported: bool,
+    /// The engine side has latched its terminal (the engine seam, the
+    /// [`CaptureGuard`] `Drop` fallback, or the [`MiddlewareCaptureGuard`] backstop).
+    /// First-writer-wins; whenever this is `true`, `outcome` is guaranteed `Some`
+    /// (both are written together under the barrier lock).
+    engine_reported: bool,
+    /// The terminal outcome recorded by the FIRST `engine_done`. `status` is the
+    /// artifact status (`completed`/`incomplete`/`failed`/`cancelled`), mapped from
+    /// the engine's `FlowStatus` at the terminal seam (NEVER from the tee).
+    outcome: Option<EngineOutcome>,
+    /// Exactly-once assembly trigger: set `true` by whichever `done` first observes
+    /// BOTH sides reported; every later [`take_trigger`](Self::take_trigger) is inert.
+    finalized: bool,
+}
+
+impl AssemblyBarrier {
+    /// Decide, UNDER the barrier lock, whether THIS `done` is the one that completes
+    /// the barrier: `true` for the single caller that observes BOTH sides reported
+    /// with assembly not yet triggered, flipping `finalized` so every later call is
+    /// inert. The caller spawns assembly OUTSIDE the lock. Because the winning caller
+    /// held the lock -- where `engine_reported == true` implies a stored `outcome` --
+    /// the spawned assembly is guaranteed to read a fully-stored outcome (finding #1).
+    fn take_trigger(&mut self) -> bool {
+        if self.engine_reported && self.served_reported && !self.finalized {
+            self.finalized = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// The terminal outcome the engine reports via [`TurnCaptureState::engine_done`].
 /// `status` is already the artifact status string (mapped from the engine's
 /// `FlowStatus` at the seam), so assembly never re-derives it.
@@ -1009,16 +1106,26 @@ impl Drop for CaptureGuard {
     }
 }
 
-/// F1c RAII **middleware** backstop: closes the "engine side never fired" hole in
-/// the both-`done` barrier. Held by `log_api_call` across `next.run` (mirroring the
-/// dashboard's `MiddlewareGuard`). If the turn NEVER reached the engine (a `Json`
-/// extractor / `convert_request` rejection returns before
-/// `stream_responses_with_api_call_id`), no [`CaptureGuard`] was built and the turn
-/// is UNCLAIMED at this guard's `Drop`, so it finalizes the engine side `failed`
-/// itself -- otherwise the served-tee's `served_done` would be the only latch to
-/// fire and the barrier would wait forever (registry + `.work` leak, no artifact).
-/// A CLAIMED turn (the engine took ownership) is left entirely to the engine's own
-/// terminal / `CaptureGuard` `Drop`.
+/// F1c RAII **middleware** backstop: closes BOTH "one side never fired" holes in the
+/// both-`done` barrier. Held by `log_api_call` across `next.run` (mirroring the
+/// dashboard's `MiddlewareGuard`), so its `Drop` fires when the middleware returns OR
+/// unwinds.
+///
+/// - **Engine side.** If the turn NEVER reached the engine (a `Json` extractor /
+///   `convert_request` rejection returns before `stream_responses_with_api_call_id`),
+///   no [`CaptureGuard`] was built and the turn is UNCLAIMED at `Drop`, so this
+///   finalizes the engine side `failed`/`"unhandled"`. A CLAIMED turn is left to the
+///   engine's own terminal / `CaptureGuard` `Drop`.
+/// - **Served side (finding #2).** If `next.run` unwinds (panics) or returns AFTER
+///   [`TurnCapture::start`] but BEFORE `tee_served_body` installs the served tee, the
+///   served side would otherwise never latch -- the barrier would wait forever and
+///   `.work/<id>/` + the registry entry would leak. So if NO tee was installed
+///   ([`is_served_tee_installed`](TurnCaptureState::is_served_tee_installed) is
+///   false), this fires a partial `served_done` itself. When the tee IS installed it
+///   owns `served_done`, so this served backstop stays inert on the normal path.
+///
+/// Both backstops are IDEMPOTENT (the barrier latches first-writer-wins), so on the
+/// normal path -- claimed engine + installed tee -- this whole `Drop` is inert.
 pub struct MiddlewareCaptureGuard {
     state: Arc<TurnCaptureState>,
 }
@@ -1032,8 +1139,19 @@ impl MiddlewareCaptureGuard {
 
 impl Drop for MiddlewareCaptureGuard {
     fn drop(&mut self) {
+        // Engine-side backstop: an UNCLAIMED turn never reached the engine, so no
+        // `CaptureGuard` will finalize it -- do it here.
         if !self.state.is_engine_claimed() {
             self.state.engine_done("failed", Some("unhandled"));
+        }
+        // Served-side backstop (finding #2): if no served tee was ever installed
+        // (`next.run` unwound/returned after `start()` but before `tee_served_body`),
+        // fire a partial `served_done` so the both-`done` barrier resolves instead of
+        // leaking the registry entry + `.work` dir forever. Idempotent: on the normal
+        // path the tee set `served_tee_installed` before this guard drops and owns
+        // `served_done`, so this is inert.
+        if !self.state.is_served_tee_installed() {
+            self.state.served_done(true);
         }
     }
 }
@@ -1604,11 +1722,15 @@ mod tests {
     #[tokio::test]
     async fn middleware_backstop_finalizes_unclaimed_but_is_inert_when_claimed() {
         // Unclaimed: engine never took ownership → backstop Drop finalizes failed.
+        // The rejection response IS teed in reality (the tee wraps the whole
+        // `next.run` result), so mark the tee installed and let the explicit
+        // `served_done` own the served side; this isolates the ENGINE-side backstop.
         let dir = temp_dir_path("backstop-unclaimed");
         let capture = TurnCapture::enabled(dir.clone());
         let state = capture.start("api_unclaimed", None, 0).expect("state");
         state.write_inbound_request(b"{\"bad\":true}");
         state.write_served_response(b"{\"error\":\"bad request\"}");
+        state.mark_served_tee_installed();
         drop(super::MiddlewareCaptureGuard::new(Arc::clone(&state)));
         state.served_done(false);
 
@@ -1625,6 +1747,7 @@ mod tests {
         let capture2 = TurnCapture::enabled(dir2.clone());
         let state2 = capture2.start("api_claimed", None, 0).expect("state");
         state2.write_inbound_request(b"{}");
+        state2.mark_served_tee_installed();
         let guard = super::CaptureGuard::new(Arc::clone(&state2), CancellationToken::new());
         drop(super::MiddlewareCaptureGuard::new(Arc::clone(&state2)));
         guard.finalize("completed", Some("response.completed"));
@@ -1638,6 +1761,43 @@ mod tests {
         );
         // The guard's own Drop fallback is idempotent (inert after the explicit terminal).
         drop(guard);
+    }
+
+    /// Finding #2 (pre-tee unwind backstop): `start()` ran, but `next.run` unwound /
+    /// returned BEFORE `tee_served_body` installed the served tee — so NO tee ever
+    /// fires `served_done`. Without the served-side backstop the both-`done` barrier
+    /// would wait forever and `.work/<id>/` + the registry entry would leak. Prove the
+    /// `MiddlewareCaptureGuard` `Drop` fires BOTH sides (engine `failed`/`unhandled`
+    /// AND a partial `served_done`), so the artifact is written + evicted + the work
+    /// dir deleted in bounded time — no leak, no hang.
+    #[tokio::test]
+    async fn middleware_backstop_fires_served_done_when_tee_never_installed() {
+        let dir = temp_dir_path("backstop-no-tee");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_no_tee", None, 0).expect("state");
+        state.write_inbound_request(b"{\"model\":\"m\"}");
+        // No `mark_served_tee_installed()`, no `served_done`, no tee — exactly the
+        // pre-tee unwind state. The ONLY thing that drops is the middleware backstop.
+        drop(super::MiddlewareCaptureGuard::new(Arc::clone(&state)));
+
+        let artifact = wait_for_artifact(&dir.join("api_no_tee.json")).await;
+        assert_eq!(artifact["status"], "failed");
+        assert_eq!(artifact["terminal_reason"], "unhandled");
+        // Served section present but partial (no tee ever captured any bytes).
+        assert_eq!(
+            artifact["sections"]["served_response"]["partial"], true,
+            "a turn whose tee never installed has a partial served section"
+        );
+        // Registry evicted + work dir deleted — the leak finding #2 describes is gone.
+        assert!(
+            capture.state("api_no_tee").is_none(),
+            "a pre-tee-unwind turn is still evicted — no registry leak"
+        );
+        assert!(
+            !state.work_dir().exists(),
+            ".work/<id>/ is deleted even when the tee never installed — no leak"
+        );
+        assert!(!dir.join("api_no_tee.json.tmp").exists());
     }
 
     /// The RAII `CaptureGuard` Drop finalizes an abandoned turn: `cancelled` when the

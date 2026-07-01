@@ -516,6 +516,22 @@ fn candidate_context_floor(plan: &crate::upstream::BackendCandidatePlan) -> Opti
         .min()
 }
 
+/// F1c (review r1, finding #3): the clean-completion shape `run_turn` reports up to
+/// the terminal seam so the turn-capture artifact status can distinguish a genuine
+/// stop from a max-token truncation. A `finish_reason: length` turn completes
+/// cleanly (`Ok`) at the HTTP/serving layer -- the dashboard `FlowStore` still counts
+/// it `Completed` -- but its response was CUT SHORT, so the capture artifact must not
+/// claim `completed` (don't-lie-with-zeros); it maps to `incomplete`. Failed /
+/// cancelled turns are the `Err` arm and never reach this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnCompletion {
+    /// The turn ended on a genuine stop (upstream `response.completed`).
+    Completed,
+    /// The turn was truncated by the upstream output-token cap (`finish_reason:
+    /// length` ⇒ `response.incomplete`).
+    Incomplete,
+}
+
 /// F1c: map the engine's terminal `FlowStatus` to the turn-capture artifact status
 /// string. `Open` never reaches a terminal seam; treat it as `failed` defensively
 /// rather than emit a non-terminal status into the artifact.
@@ -1531,7 +1547,10 @@ impl Gateway {
             // `is_cancelled()` (499 — client hung up) ⇒ Cancelled; any other error ⇒
             // Failed; `Ok` ⇒ Completed.
             let (status, reason) = match &result {
-                Ok(()) => (
+                // Both a genuine stop and a `length` truncation are `Ok` and count as
+                // `Completed` for the dashboard/metrics (a successful HTTP serve); the
+                // capture artifact splits them below (finding #3).
+                Ok(_) => (
                     crate::dashboard_flow::FlowStatus::Completed,
                     "response.completed".to_string(),
                 ),
@@ -1554,8 +1573,16 @@ impl Gateway {
             // reason come from the engine seam ONLY, never the served tee). Idempotent
             // first-writer-wins; the both-`done` barrier assembles + evicts once the
             // served tee's `served_done` has also fired.
+            // Finding #3 (don't-lie-with-zeros): a `length`-truncated turn is `Ok` but
+            // its response was cut short, so the ARTIFACT status is `incomplete`
+            // (`response.incomplete`) even though the dashboard `status` above stays
+            // `Completed`. Genuine stop / failed / cancelled map from the `FlowStatus`.
             if let Some(guard) = &capture_guard {
-                guard.finalize(flow_status_artifact_str(status), Some(reason.as_str()));
+                let (capture_status, capture_reason) = match &result {
+                    Ok(TurnCompletion::Incomplete) => ("incomplete", "response.incomplete"),
+                    _ => (flow_status_artifact_str(status), reason.as_str()),
+                };
+                guard.finalize(capture_status, Some(capture_reason));
             }
             if let Err(err) = &result {
                 if tx.is_closed() {
@@ -1811,7 +1838,7 @@ impl Gateway {
         // surfaces `AppError::cancelled()` (499) just like a hang-up, with no token
         // duplication. A fresh never-cancelled token off the dashboard path.
         abort_token: tokio_util::sync::CancellationToken,
-    ) -> AppResult<()> {
+    ) -> AppResult<TurnCompletion> {
         // D5 R3 (MEDIUM): record the resolved served model onto the shared serving
         // token so the L1 telemetry guard (which holds the token) can attribute the
         // metrics bucket's model at finalize WITHOUT re-reading the FlowStore record —
@@ -2876,7 +2903,15 @@ impl Gateway {
             self.flow_store().stamp_stream_end(api_call_id);
         }
         self.monitor.emit(response_id, MonitorEventKind::Completed);
-        Ok(())
+        // F1c (finding #3): carry the terminal shape to the seam so the capture
+        // artifact records `incomplete` for a max-token truncation. `is_incomplete`
+        // was already derived above from the upstream `finish_reason` (the same bit
+        // that chose `response.incomplete` vs `response.completed`).
+        Ok(if is_incomplete {
+            TurnCompletion::Incomplete
+        } else {
+            TurnCompletion::Completed
+        })
     }
 
     /// Resolve `model` against the upstream catalog, returning the served model

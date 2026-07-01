@@ -1496,6 +1496,13 @@ fn tee_served_body(
 ) -> Response {
     let (parts, body) = response.into_parts();
     let exact_len = http_body::Body::size_hint(&body).exact();
+    // F1c (finding #2): record that the served tee is now installed BEFORE the
+    // `MiddlewareCaptureGuard` served backstop can drop (it drops when `log_api_call`
+    // returns, AFTER this runs). With the tee installed, the tee's own `Drop` owns
+    // `served_done`; the backstop stays inert. Only a pre-tee unwind (this never
+    // runs) leaves the flag false, so the backstop fires `served_done` to resolve the
+    // barrier instead of leaking the turn.
+    state.mark_served_tee_installed();
     // Take the back-pressured served sink BEFORE moving `state` into the tee.
     let served_sink = state.served_sink();
     let tee = TeeBody {
