@@ -10041,6 +10041,313 @@ async fn cancels_mid_stream_when_client_disconnects() {
     assert_eq!(requests.len(), 1);
 }
 
+// ---------------------------------------------------------------------------
+// F1c — durable turn capture: engine terminal + RAII finalize + both-`done`
+// barrier + assembly. AC-7 (pre-spawn failure), AC-8 (completed streaming),
+// AC-9 (mid-stream disconnect). All go through the REAL HTTP router so the
+// middleware gate, served-body tee, and engine terminal seam are exercised end
+// to end. `turn_capture_dir` is set so `TurnCapture::enabled` arms capture
+// independent of the (disabled) dashboard flow store.
+// ---------------------------------------------------------------------------
+
+/// A fresh, process-unique capture dir under the system temp dir (no `tempfile`
+/// dev-dep). Each F1c test gets its own so `wait_for_only_artifact` sees exactly
+/// one `<id>.json`.
+fn unique_capture_dir(label: &str) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "llmconduit-f1c-{label}-{}-{nanos}-{n}",
+        std::process::id()
+    ))
+}
+
+/// Build a gateway with turn capture ENABLED from `config.turn_capture_dir`
+/// (mirrors `test_gateway_with_config_and_raw_output` but attaches the sink and
+/// takes an already-boxed upstream so the pending/streaming mocks work too).
+fn gateway_with_capture_dir(upstream: Arc<dyn UpstreamClient>, config: Config) -> Arc<Gateway> {
+    let capture = config
+        .turn_capture_dir
+        .clone()
+        .map(llmconduit::turn_capture::TurnCapture::enabled)
+        .unwrap_or_else(llmconduit::turn_capture::TurnCapture::disabled);
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    Arc::new(
+        Gateway::new(
+            config,
+            ReplayStore::new(1000),
+            upstream,
+            Arc::new(MockSearch::default()),
+            vision,
+            image_cache,
+            MonitorHub::new(128),
+            None,
+            llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
+        )
+        .with_turn_capture(capture),
+    )
+}
+
+/// Poll the capture dir for the SINGLE assembled `<id>.json` (assembly is spawned
+/// async after the both-`done` barrier). Bounded wait: a barrier that never
+/// resolves fails the test loudly instead of hanging, and a pass PROVES the
+/// artifact was produced in bounded time.
+async fn wait_for_only_artifact(dir: &std::path::Path) -> serde_json::Value {
+    for _ in 0..300 {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("json")
+                    && let Ok(bytes) = std::fs::read(&path)
+                    && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                {
+                    return value;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no turn-capture artifact appeared in {}", dir.display());
+}
+
+/// AC-7: a PRE-SPAWN validation failure (`previous_response_id`, rejected at
+/// canonical lowering — `engine.rs` pre-spawn seam) writes a `status:"failed"`
+/// artifact with the terminal reason and the served error body, with the upstream
+/// sections ABSENT (backend never contacted) — and it does NOT hang.
+#[tokio::test]
+async fn f1c_ac7_pre_spawn_failure_writes_failed_served_present_upstream_absent() {
+    let capture_dir = unique_capture_dir("ac7");
+    let upstream = MockUpstream::default();
+    let mut config = test_config();
+    config.turn_capture_dir = Some(capture_dir.clone());
+    upstream.set_finalization_policies(
+        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
+    );
+    let gateway = gateway_with_capture_dir(Arc::new(upstream.clone()), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    // `previous_response_id` is unsupported and rejected at lowering, BEFORE the
+    // engine spawns any upstream work.
+    let body = json!({
+        "model": "glm-5.1",
+        "input": "hi",
+        "previous_response_id": "resp_does_not_exist"
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert!(
+        response.status().is_client_error(),
+        "pre-spawn lowering error is a 4xx, got {}",
+        response.status()
+    );
+    let served_body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read served error body");
+    assert!(
+        !served_body.is_empty(),
+        "an error body was served to the client"
+    );
+
+    // The artifact must appear in bounded time (proves the barrier resolves even
+    // though the engine never spawned — no hang).
+    let artifact = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_only_artifact(&capture_dir),
+    )
+    .await
+    .expect("AC-7: pre-spawn failure artifact within bounded time (no hang)");
+
+    assert_eq!(artifact["status"], "failed");
+    assert!(
+        artifact["terminal_reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
+        "a terminal reason is recorded: {artifact}"
+    );
+    // served_response present (the error body the client received).
+    let served = &artifact["sections"]["served_response"];
+    assert!(
+        served["content"].is_string() || served["content"].is_object(),
+        "served_response section is present: {served}"
+    );
+    // upstream sections ABSENT — the backend was never contacted (never a
+    // fabricated empty-measured section).
+    assert!(artifact["sections"].get("upstream_request").is_none());
+    assert!(artifact["sections"].get("upstream_response").is_none());
+    assert!(
+        upstream.requests().await.is_empty(),
+        "no upstream request is made for a pre-spawn failure"
+    );
+}
+
+/// AC-8: a COMPLETED streaming `/v1/messages` turn writes `status:"completed"`
+/// with the currently-implemented sections (inbound + served) present and
+/// `finished_ms >= started_ms`.
+#[tokio::test]
+async fn f1c_ac8_completed_streaming_turn_writes_completed_with_sections() {
+    let capture_dir = unique_capture_dir("ac8");
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "Hello")),
+            Ok(content_chunk("chat-1", " there")),
+            Ok(usage_chunk("chat-1", 12, 5, 17, Some(3), None)),
+        ])
+        .await;
+    let mut config = test_config();
+    config.turn_capture_dir = Some(capture_dir.clone());
+    upstream.set_finalization_policies(
+        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
+    );
+    let gateway = gateway_with_capture_dir(Arc::new(upstream), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    // Draining the body to completion drops the tee → clean `served_done(false)`.
+    let served_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read served stream");
+    let served_text = String::from_utf8(served_bytes.to_vec()).expect("utf8");
+    assert!(served_text.contains("event: message_start"));
+    assert!(served_text.contains("Hello"));
+
+    let artifact = wait_for_only_artifact(&capture_dir).await;
+    assert_eq!(artifact["status"], "completed");
+    // inbound_request present, parsed as a JSON value (the redacted Anthropic body).
+    assert_eq!(
+        artifact["sections"]["inbound_request"]["content"]["model"],
+        "claude-3-5-sonnet-20241022"
+    );
+    // served_response present and byte-clean (not partial).
+    let served = &artifact["sections"]["served_response"];
+    assert_eq!(served["partial"], false);
+    assert!(
+        served["content"]
+            .as_str()
+            .is_some_and(|body| body.contains("message_start") && body.contains("Hello")),
+        "served_response captured the streamed Anthropic bytes: {served}"
+    );
+    // finished_ms is stamped and not before started_ms.
+    let started = artifact["started_ms"].as_u64().expect("started_ms");
+    let finished = artifact["finished_ms"].as_u64().expect("finished_ms");
+    assert!(
+        finished > 0 && finished >= started,
+        "finished_ms >= started_ms"
+    );
+    // Only the currently-implemented sections in F1c.
+    assert!(artifact["sections"].get("upstream_request").is_none());
+    assert!(artifact["sections"].get("upstream_response").is_none());
+}
+
+/// AC-9: a mid-stream client DISCONNECT writes `status:"cancelled"` with
+/// `served_response.partial = true`, produced within a bounded time (no hang).
+///
+/// Uses `/v1/responses` streaming, whose SSE body maps the engine's
+/// `ReceiverStream` DIRECTLY (no intermediate converter task), so dropping the
+/// response body propagates straight to the engine's `tx.closed()` cancel — a
+/// faithful mid-stream client hang-up. The `ChunkThenPendingUpstream` yields a
+/// prefix chunk then parks, so the client sees real served bytes before it
+/// disconnects.
+#[tokio::test]
+async fn f1c_ac9_client_disconnect_writes_cancelled_partial_no_hang() {
+    let capture_dir = unique_capture_dir("ac9");
+    let upstream = ChunkThenPendingUpstream::new(vec![content_chunk("chat-1", "Hello")]);
+    let stream_polled = upstream.stream_polled.notified();
+    let stream_dropped = upstream.stream_dropped.notified();
+    let mut config = test_config();
+    config.turn_capture_dir = Some(capture_dir.clone());
+    // Clone into the gateway (the `Notify` handles are shared `Arc`s) so the
+    // original stays alive to drive the `notified()` futures above.
+    let gateway = gateway_with_capture_dir(Arc::new(upstream.clone()), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": true,
+        "input": "count"
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let mut body_stream = response.into_body().into_data_stream();
+    // Let the prefix flow + the upstream park, then read one served frame so the
+    // `served_response` section captured real mid-stream bytes.
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_polled)
+        .await
+        .expect("upstream parked after the prefix");
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), body_stream.next())
+        .await
+        .expect("a served frame within bounded time");
+    assert!(
+        first.is_some(),
+        "at least one served frame before disconnect"
+    );
+
+    // Client disconnect mid-stream: drop the body → the tee's Drop fires
+    // `served_done(partial=true)` and the engine cancels the parked upstream.
+    drop(body_stream);
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_dropped)
+        .await
+        .expect("upstream dropped on client disconnect (engine cancelled)");
+
+    // The cancelled artifact is written in bounded time (the no-hang assertion).
+    let artifact = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_only_artifact(&capture_dir),
+    )
+    .await
+    .expect("AC-9: cancelled artifact within bounded time (no hang)");
+
+    assert_eq!(artifact["status"], "cancelled");
+    assert_eq!(
+        artifact["sections"]["served_response"]["partial"], true,
+        "a mid-stream disconnect marks the served section partial: {artifact}"
+    );
+}
+
 #[tokio::test]
 async fn head_and_options_probes_return_204_with_allow_header() {
     let config = test_config();

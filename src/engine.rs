@@ -516,6 +516,19 @@ fn candidate_context_floor(plan: &crate::upstream::BackendCandidatePlan) -> Opti
         .min()
 }
 
+/// F1c: map the engine's terminal `FlowStatus` to the turn-capture artifact status
+/// string. `Open` never reaches a terminal seam; treat it as `failed` defensively
+/// rather than emit a non-terminal status into the artifact.
+fn flow_status_artifact_str(status: crate::dashboard_flow::FlowStatus) -> &'static str {
+    match status {
+        crate::dashboard_flow::FlowStatus::Completed => "completed",
+        crate::dashboard_flow::FlowStatus::Cancelled => "cancelled",
+        crate::dashboard_flow::FlowStatus::Failed | crate::dashboard_flow::FlowStatus::Open => {
+            "failed"
+        }
+    }
+}
+
 /// Whether a Chat-Completions inbound request asked for reasoning, either via
 /// the top-level `reasoning_effort` field or an explicit thinking knob in
 /// `chat_template_kwargs` (`thinking` / `enable_thinking`). When true, forced
@@ -1180,6 +1193,21 @@ impl Gateway {
             .as_ref()
             .map(|guard| guard.abort_token())
             .unwrap_or_default();
+        // F1c: the turn-capture ENGINE guard. `state(id)` reaches the SAME per-turn
+        // state the HTTP layer's `start()` registered (F1b), so the engine terminal
+        // and the served-body tee share one state. `None` when capture is disabled or
+        // no `api_call_id` was threaded (the public wrapper / non-instrumented paths).
+        // Built HERE, BEFORE the pre-spawn `?` paths (so a lowering/budget failure
+        // finalizes it via `finalize_pre_spawn_err`), and moved into the terminal
+        // `tokio::spawn` below — mirroring `telemetry_guard`. `new` CLAIMS the turn so
+        // the middleware backstop stays inert; the guard's `Drop` is the
+        // abandoned/panicked-turn fallback (`failed`, or `cancelled` if the abort
+        // token fired).
+        let capture_guard = api_call_id.as_deref().and_then(|id| {
+            self.turn_capture()
+                .state(id)
+                .map(|state| crate::turn_capture::CaptureGuard::new(state, abort_token.clone()))
+        });
         // D2 (D13 R1 HIGH): the ORIGINAL request model, captured BEFORE resolution so
         // the flow record's `model_requested` reflects what the CLIENT asked for (an
         // alias / ad-hoc route / profile name), distinct from the resolved/served
@@ -1187,6 +1215,11 @@ impl Gateway {
         // `set_normalized` below alongside the normalized canonical body.
         let model_requested = request.model.clone();
         let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
+        // F1c: stamp the resolved/served model onto the capture outcome metadata now
+        // that resolution has settled (absent for a turn that fails before here).
+        if let Some(guard) = &capture_guard {
+            guard.set_model_served(&resolved_model);
+        }
         let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
 
         // D1/E2b: minted here rather than just before the `tokio::spawn` below
@@ -1239,6 +1272,14 @@ impl Gateway {
                     crate::dashboard_flow::FlowStatus::Failed,
                     guard.elapsed().as_millis(),
                 );
+            }
+            // F1c: a pre-spawn failure (bad request / lowering / budget) is always
+            // `failed`. Record it on the capture guard so the artifact carries the
+            // terminal reason; the served side is the error body the handler returns
+            // (teed by the HTTP layer), so the both-`done` barrier still resolves and
+            // writes a `status:"failed"` artifact — never a hang (AC-7). Idempotent.
+            if let Some(guard) = &capture_guard {
+                guard.finalize("failed", Some(&err.to_string()));
             }
             err
         };
@@ -1484,28 +1525,37 @@ impl Gateway {
             // — a panic INSIDE `run_turn` unwinds through this closure and drops the
             // guard, finalizing `Cancelled`. The CAS makes the explicit finalize win
             // and the drop then no-op (idempotent).
+            // Resolve the terminal status ONCE so the same value drives the FlowStore
+            // finalize, the D5 metrics record, AND the F1c capture terminal (all
+            // co-located at this single choke point → recorded exactly once).
+            // `is_cancelled()` (499 — client hung up) ⇒ Cancelled; any other error ⇒
+            // Failed; `Ok` ⇒ Completed.
+            let (status, reason) = match &result {
+                Ok(()) => (
+                    crate::dashboard_flow::FlowStatus::Completed,
+                    "response.completed".to_string(),
+                ),
+                Err(err) if err.is_cancelled() => (
+                    crate::dashboard_flow::FlowStatus::Cancelled,
+                    "client_disconnected".to_string(),
+                ),
+                Err(err) => (crate::dashboard_flow::FlowStatus::Failed, err.to_string()),
+            };
             if let Some(guard) = &telemetry_guard {
-                // Resolve the terminal status ONCE so the same value drives both the
-                // FlowStore finalize and the D5 metrics record (co-located at this
-                // single CAS-guarded choke point → recorded exactly once).
-                let (status, reason) = match &result {
-                    Ok(()) => (
-                        crate::dashboard_flow::FlowStatus::Completed,
-                        "response.completed".to_string(),
-                    ),
-                    Err(err) if err.is_cancelled() => (
-                        crate::dashboard_flow::FlowStatus::Cancelled,
-                        "client_disconnected".to_string(),
-                    ),
-                    Err(err) => (crate::dashboard_flow::FlowStatus::Failed, err.to_string()),
-                };
-                guard.finalize(status, Some(reason));
+                guard.finalize(status, Some(reason.clone()));
                 // D5: record the terminal into the metrics rings (sources served
                 // model + endpoint + upstream + final usage from the guard's own
                 // evict-safe inputs — no `detail()` re-read — + the guard's monotonic
                 // latency). No-op when the metrics layer is off. Runs AFTER
                 // `guard.finalize`, which assembled those inputs.
                 gateway.record_terminal_metrics(guard, status, guard.elapsed().as_millis());
+            }
+            // F1c: report the SAME engine terminal to the capture guard (status +
+            // reason come from the engine seam ONLY, never the served tee). Idempotent
+            // first-writer-wins; the both-`done` barrier assembles + evicts once the
+            // served tee's `served_done` has also fired.
+            if let Some(guard) = &capture_guard {
+                guard.finalize(flow_status_artifact_str(status), Some(reason.as_str()));
             }
             if let Err(err) = &result {
                 if tx.is_closed() {

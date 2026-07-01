@@ -30,28 +30,43 @@
 //! a 256 MiB turn is never held in RAM at once.
 //!
 //! **Task boundaries.**
-//! - F1b (this task): HTTP own-gate + inbound-request capture + served-response
-//!   `Body` tee; real `start()` (work dir + section writers + registry).
-//! - F1c: engine terminal integration (`engine_done`) + RAII finalize + the
-//!   both-`done` assembly barrier (which also EVICTS the registry entry).
-//! - F1d: upstream-request capture (carrier on `BackendChatRequest`).
-//! - F1e: raw upstream-response capture + final failed HTTP body.
-//! - F1f: streaming JSON assembly, atomicity, rotation.
+//! - F1b: HTTP own-gate + inbound-request capture + served-response `Body` tee;
+//!   real `start()` (work dir + section writers + registry).
+//! - F1c (this task): engine terminal integration ([`TurnCaptureState::engine_done`])
+//!   via the RAII [`CaptureGuard`] (+ the [`MiddlewareCaptureGuard`] backstop for a
+//!   turn that never reached the engine); the both-`done` assembly barrier
+//!   ([`TurnCaptureState::engine_done`] + [`TurnCaptureState::served_done`] are
+//!   idempotent latches → when BOTH have fired, FLUSH the section writers,
+//!   stream-assemble `<dir>/<api_call_id>.json`, then EVICT the registry entry +
+//!   delete the `.work/<id>/` dir). Assembly is BOUNDED: each section streams from
+//!   its temp file through a JSON escaper (never a whole-section RAM load).
+//! - F1d: upstream-request capture (carrier on `BackendChatRequest`), written into
+//!   the SAME [`TurnCaptureState`] via [`TurnCaptureState::write_upstream_request`].
+//! - F1e: raw upstream-response capture + final failed HTTP body, via
+//!   [`TurnCaptureState::write_upstream_response`].
+//! - F1f: rotation wiring, orphan `.work` sweep, docs, and the base64/atomicity
+//!   hardening tests (the streaming assembly + atomic tmp→rename land here in F1c).
 
 use std::collections::HashMap;
+use std::io::Read;
+use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::task::Context;
 use std::task::Poll;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tokio_util::sync::PollSender;
 
 /// Handle to the turn-capture sink. Cheap to `Clone` (the enabled variant
@@ -125,20 +140,28 @@ impl TurnCapture {
     ) -> Option<Arc<TurnCaptureState>> {
         let inner = self.inner.as_ref()?;
         let work_dir = inner.dir.join(".work").join(api_call_id);
-        let state = Arc::new(TurnCaptureState::new(
-            work_dir,
-            api_call_id.to_string(),
-            model_requested,
-            started_ms,
-        ));
-        // EVICTION IS OWNED BY F1c (finding #2, deferred): this entry lives for
-        // the turn's duration and is removed by F1c's both-`done` assembly barrier
-        // (`engine_done` + `served_done` → assemble → `registry.remove`). F1b has no
-        // engine terminal seam yet, so building the barrier here would half-implement
-        // F1c; until F1c lands, a long-lived process capturing many turns grows this
-        // map by one small `Arc` per turn (documented in `.ralph/IMPLEMENTATION_PLAN.md`
-        // "Known deferred (F1c)"). Not a leak of body bytes -- those stream to disk,
-        // not this map (bounded-memory invariant holds regardless).
+        let capture_dir = inner.dir.clone();
+        let inner_weak = Arc::downgrade(inner);
+        // `new_cyclic` hands the state a `Weak` reference to ITSELF so the both-`done`
+        // barrier ([`maybe_assemble`]) can, from a plain `&self` method, upgrade to an
+        // `Arc<Self>` and spawn the async flush/assemble/evict task -- without the tee
+        // or the engine guard having to hand the `Arc` back in.
+        let state = Arc::new_cyclic(|self_weak| {
+            TurnCaptureState::new(
+                work_dir,
+                capture_dir,
+                api_call_id.to_string(),
+                model_requested,
+                started_ms,
+                inner_weak,
+                self_weak.clone(),
+            )
+        });
+        // F1c eviction: the both-`done` barrier removes this entry once the artifact is
+        // assembled (`engine_done` + `served_done` → assemble → `registry.remove` +
+        // delete `.work/<id>/`). Until then a started turn's entry lives for its
+        // duration; body bytes never enter this map (they stream to disk), so the
+        // bounded-memory invariant holds regardless.
         inner
             .registry
             .lock()
@@ -161,15 +184,19 @@ impl TurnCapture {
             .cloned()
     }
 
-    /// F1c fills this: the engine terminal seam (completed/incomplete/
-    /// failed/cancelled, including the pre-spawn failure path) reports the
-    /// turn's outcome here, keyed by `api_call_id`, then -- once BOTH the engine
-    /// and served sides have reported -- assembles the artifact and evicts the
-    /// registry entry. No-op stub so the crate compiles; not yet wired into
-    /// `engine.rs`.
-    #[allow(unused_variables)]
+    /// F1c: the engine terminal seam (completed/incomplete/failed/cancelled,
+    /// including the pre-spawn failure path) reports the turn's outcome here,
+    /// keyed by `api_call_id`. Looks the live state up in the registry and
+    /// delegates to [`TurnCaptureState::engine_done`] (the idempotent latch that,
+    /// once BOTH the engine and served sides have reported, assembles the artifact
+    /// and evicts the registry entry). A no-op when disabled or when no such turn
+    /// is live -- the engine normally holds the state directly (via the
+    /// [`CaptureGuard`]) and calls the state method; this id-keyed convenience seam
+    /// exists for callers that only have the id.
     pub fn engine_done(&self, api_call_id: &str, status: &str, reason: Option<&str>) {
-        // F1c fills this.
+        if let Some(state) = self.state(api_call_id) {
+            state.engine_done(status, reason);
+        }
     }
 }
 
@@ -184,22 +211,67 @@ pub struct TurnCaptureState {
     pub model_requested: Option<String>,
     pub started_ms: u128,
     work_dir: PathBuf,
+    /// The base capture dir (`turn_capture_dir`) the final `<api_call_id>.json`
+    /// artifact is assembled into (distinct from `work_dir` =
+    /// `<capture_dir>/.work/<api_call_id>/`, which holds the temp section files).
+    capture_dir: PathBuf,
+    /// Back-reference to the owning `TurnCaptureInner` so the both-`done` barrier can
+    /// EVICT this turn's registry entry after assembly. `Weak` breaks the
+    /// `Inner → registry → Arc<State>` cycle; a failed upgrade (handle dropped at
+    /// shutdown) just skips eviction (the whole map is going away anyway).
+    inner: Weak<TurnCaptureInner>,
+    /// A `Weak` to this very `Arc<TurnCaptureState>` (set via `Arc::new_cyclic`), so
+    /// [`maybe_assemble`](Self::maybe_assemble) can upgrade to an `Arc<Self>` and
+    /// spawn the async assembly task from a synchronous `&self` latch method.
+    self_weak: Weak<TurnCaptureState>,
+    /// The served/backend model, stamped by the engine once resolution settles
+    /// (`set_model_served`). `None` until then / for a turn that failed before
+    /// resolution -- an absent field, never a fabricated empty (don't-lie-with-zeros).
+    model_served: Mutex<Option<String>>,
     /// The redacted inbound Anthropic/OpenAI request body (F1b).
     inbound_request: Section,
     /// The exact bytes served to the client, teed off the response `Body` (F1b).
     served_response: Section,
-    /// Idempotency latch for [`served_done`] -- the tee's `Drop` is the only
-    /// F1b caller, but F1c makes `served_done`/`engine_done` idempotent so the
-    /// both-`done` barrier fires exactly once.
+    /// Idempotency latch for [`served_done`](Self::served_done): the tee's `Drop` is
+    /// the only caller, but the latch makes it idempotent so the both-`done` barrier
+    /// fires exactly once.
     served_reported: AtomicBool,
+    /// Idempotency latch for [`engine_done`](Self::engine_done) (first-writer-wins):
+    /// the FIRST terminal (the engine seam, the [`CaptureGuard`] `Drop` fallback, or
+    /// the [`MiddlewareCaptureGuard`] backstop) records the outcome; later calls are
+    /// inert, so a `Drop` fallback never overwrites the engine's real status.
+    engine_reported: AtomicBool,
+    /// Set synchronously by [`CaptureGuard::new`] the instant the engine takes
+    /// ownership of the turn (before it returns the stream). The
+    /// [`MiddlewareCaptureGuard`] backstop reads it at `Drop`: an UNCLAIMED turn
+    /// never reached the engine (a `Json`/extractor rejection, a `convert_request`
+    /// error) so the backstop finalizes it `failed`; a claimed turn is left to the
+    /// engine's own terminal / `Drop` fallback.
+    engine_claimed: AtomicBool,
+    /// The terminal outcome recorded by the FIRST [`engine_done`](Self::engine_done).
+    /// Read by assembly; `status` is the artifact status
+    /// (`completed`/`incomplete`/`failed`/`cancelled`), mapped from the engine's
+    /// `FlowStatus` at the terminal seam (NEVER from the tee).
+    outcome: Mutex<Option<EngineOutcome>>,
+    /// Epoch-ms stamped when the both-`done` barrier resolves (the later of
+    /// `engine_done`/`served_done`, plus the section flush) -- the turn's finish
+    /// time for the `finished_ms` outcome field.
+    finished_ms: AtomicU64,
+    /// Exactly-once latch for the assembly barrier: the second `done` swaps it and
+    /// spawns assembly; every other `maybe_assemble` call is inert.
+    assembly_started: AtomicBool,
 }
 
 impl TurnCaptureState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         work_dir: PathBuf,
+        capture_dir: PathBuf,
         api_call_id: String,
         model_requested: Option<String>,
         started_ms: u128,
+        inner: Weak<TurnCaptureInner>,
+        self_weak: Weak<TurnCaptureState>,
     ) -> Self {
         let inbound_request = Section::new(work_dir.join("inbound_request"));
         let served_response = Section::new(work_dir.join("served_response"));
@@ -208,9 +280,18 @@ impl TurnCaptureState {
             model_requested,
             started_ms,
             work_dir,
+            capture_dir,
+            inner,
+            self_weak,
+            model_served: Mutex::new(None),
             inbound_request,
             served_response,
             served_reported: AtomicBool::new(false),
+            engine_reported: AtomicBool::new(false),
+            engine_claimed: AtomicBool::new(false),
+            outcome: Mutex::new(None),
+            finished_ms: AtomicU64::new(0),
+            assembly_started: AtomicBool::new(false),
         }
     }
 
@@ -293,12 +374,14 @@ impl TurnCaptureState {
     /// F1b: mark the `served_response` section closed. `partial` is `true` when
     /// the served stream did NOT reach a clean end (client disconnect, mid-stream
     /// error). Idempotent (F1c relies on that for the both-`done` barrier): only
-    /// the FIRST call closes the section.
+    /// the FIRST call closes the section, and only the FIRST call can complete the
+    /// both-`done` barrier ([`maybe_assemble`](Self::maybe_assemble)).
     pub fn served_done(&self, partial: bool) {
         if self.served_reported.swap(true, Ordering::AcqRel) {
             return;
         }
         self.served_response.close(partial);
+        self.maybe_assemble();
     }
 
     /// F1b review r2 (don't-lie-with-zeros): mark the `served_response` section
@@ -338,6 +421,242 @@ impl TurnCaptureState {
     /// [`write_served_response`]: TurnCaptureState::write_served_response
     pub fn served_sink(&self) -> Option<ServedSink> {
         self.served_response.poll_sender().map(ServedSink::new)
+    }
+
+    /// F1c: stamp the served/backend model onto the outcome metadata. The engine
+    /// calls this once model resolution settles (via [`CaptureGuard::set_model_served`]).
+    /// Last-writer-wins; a turn that fails before resolution simply never sets it,
+    /// so `model_served` is ABSENT from the artifact rather than a fabricated empty.
+    pub fn set_model_served(&self, model: &str) {
+        *self
+            .model_served
+            .lock()
+            .expect("turn-capture model_served lock") = Some(model.to_string());
+    }
+
+    /// F1c: mark that the engine has taken ownership of this turn. Called
+    /// synchronously by [`CaptureGuard::new`] BEFORE the engine returns the stream,
+    /// so the [`MiddlewareCaptureGuard`] backstop (which drops after `next.run`
+    /// returns) sees the claim and stays inert for any turn that reached the engine.
+    fn mark_engine_claimed(&self) {
+        self.engine_claimed.store(true, Ordering::Release);
+    }
+
+    /// F1c: whether the engine claimed this turn (see [`mark_engine_claimed`]).
+    /// Read by the [`MiddlewareCaptureGuard`] backstop.
+    fn is_engine_claimed(&self) -> bool {
+        self.engine_claimed.load(Ordering::Acquire)
+    }
+
+    /// F1c: the ENGINE terminal seam reports the turn's outcome here. `status` is
+    /// the artifact status (`completed`/`incomplete`/`failed`/`cancelled`) and
+    /// `reason` the terminal reason -- BOTH sourced from the engine (never the tee).
+    /// IDEMPOTENT (first-writer-wins): the FIRST call (the terminal seam, the
+    /// [`CaptureGuard`] `Drop` fallback, or the [`MiddlewareCaptureGuard`] backstop)
+    /// records the outcome; later calls are inert, so a `Drop` fallback can never
+    /// overwrite the real status. Completes the both-`done` barrier when the served
+    /// side has also reported.
+    pub fn engine_done(&self, status: &str, reason: Option<&str>) {
+        if self.engine_reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        *self.outcome.lock().expect("turn-capture outcome lock") = Some(EngineOutcome {
+            status: status.to_string(),
+            reason: reason.map(str::to_string),
+        });
+        self.maybe_assemble();
+    }
+
+    /// F1c both-`done` barrier. When BOTH the engine and served sides have latched
+    /// their `done`, spawn the flush → assemble → evict exactly once (guarded by
+    /// `assembly_started`). Called from the tail of each `done` latch, so it fires
+    /// on whichever side reports SECOND. A turn that never reached the engine still
+    /// resolves: the [`MiddlewareCaptureGuard`] backstop supplies the engine side,
+    /// and the tee's `Drop` always supplies the served side -- so the barrier can
+    /// never wait forever.
+    fn maybe_assemble(&self) {
+        if !self.engine_reported.load(Ordering::Acquire)
+            || !self.served_reported.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if self.assembly_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some(state) = self.self_weak.upgrade() else {
+            return;
+        };
+        // Assembly is async (await the section flushes) + does blocking file IO, so
+        // it must run on the runtime. `start()` only ever runs inside one (the HTTP
+        // seam), so `try_current` succeeds for every real turn; the guard keeps the
+        // latch total off-runtime rather than panicking.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    state.finalize_and_assemble().await;
+                });
+            }
+            Err(_) => {
+                tracing::warn!(
+                    api_call_id = %state.api_call_id,
+                    "turn-capture: no tokio runtime to assemble artifact; \
+                     leaving .work dir for the orphan sweep"
+                );
+            }
+        }
+    }
+
+    /// F1c: flush every section writer, then hand off to the blocking assembler
+    /// (streaming JSON escape + atomic rename + work-dir delete + registry evict).
+    /// Awaiting the `await_*_closed` barriers first guarantees the temp files are
+    /// fully drained + fsynced before the assembler reads them (queued disk writes
+    /// can lag the stream). Bounded-time: each barrier resolves as soon as its
+    /// writer drains its BOUNDED channel, so a cancelled/abandoned turn finalizes
+    /// without hanging.
+    async fn finalize_and_assemble(self: Arc<Self>) {
+        self.inbound_request.await_closed().await;
+        self.served_response.await_closed().await;
+        // F1d/F1e add their `upstream_request`/`upstream_response` section flushes
+        // here (mirror the two lines above) once those sections exist.
+        // Stamp `finished_ms` AFTER the flush barriers so it reflects the turn's true
+        // end (both `done`s + the section drain), and is `>= started_ms`.
+        self.finished_ms.store(now_ms(), Ordering::Release);
+        let state = Arc::clone(&self);
+        // The assembly reads the section temp files, JSON-escapes them, writes the
+        // artifact, renames, and deletes the work dir -- all synchronous std::fs, so
+        // it runs on the blocking pool (AGENTS.md: no blocking IO on the runtime).
+        if let Err(err) = tokio::task::spawn_blocking(move || state.assemble_blocking()).await {
+            tracing::warn!(
+                api_call_id = %self.api_call_id,
+                error = %err,
+                "turn-capture: assembly task panicked"
+            );
+        }
+    }
+
+    /// F1c (blocking): stream-assemble `<capture_dir>/<api_call_id>.json`, then
+    /// remove the `.work/<id>/` dir and evict the registry entry. Diagnostic-only:
+    /// every fs error is logged, never propagated (a capture artifact must never
+    /// fail or hang the turn it describes).
+    fn assemble_blocking(&self) {
+        if let Err(err) = std::fs::create_dir_all(&self.capture_dir) {
+            tracing::warn!(
+                dir = %self.capture_dir.display(),
+                error = %err,
+                "turn-capture: failed to create capture dir"
+            );
+        }
+        let tmp = self
+            .capture_dir
+            .join(format!("{}.json.tmp", self.api_call_id));
+        let final_path = self.capture_dir.join(format!("{}.json", self.api_call_id));
+        match self.write_artifact_file(&tmp) {
+            // Atomic publish: rename the fully-written tmp over the final name so a
+            // reader (or the orphan sweep) never sees a half-written `<id>.json`.
+            Ok(()) => {
+                if let Err(err) = std::fs::rename(&tmp, &final_path) {
+                    tracing::warn!(
+                        path = %final_path.display(),
+                        error = %err,
+                        "turn-capture: failed to publish artifact (rename)"
+                    );
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %tmp.display(),
+                    error = %err,
+                    "turn-capture: failed to write artifact"
+                );
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+        // Delete the per-turn temp section dir (the artifact now embeds their bytes).
+        if let Err(err) = std::fs::remove_dir_all(&self.work_dir)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                dir = %self.work_dir.display(),
+                error = %err,
+                "turn-capture: failed to remove work dir"
+            );
+        }
+        // Evict the registry entry (closes F1b's deferred leak). A failed upgrade
+        // means the capture handle is already gone (shutdown) -- nothing to evict.
+        if let Some(inner) = self.inner.upgrade()
+            && let Ok(mut registry) = inner.registry.lock()
+        {
+            registry.remove(&self.api_call_id);
+        }
+    }
+
+    /// F1c: write the single-JSON artifact to `tmp`, STREAMING each section from its
+    /// temp file through a bounded JSON escaper -- never loading a whole section into
+    /// RAM (spec Design #2/#5; AGENTS.md bounded-memory invariant). Outcome metadata
+    /// is small and written directly; each section embeds as a `{bytes, partial,
+    /// encoding, content}` object where `content` is a JSON value (a request that
+    /// parses), a JSON string (valid UTF-8), or a base64 string (non-UTF-8).
+    fn write_artifact_file(&self, tmp: &Path) -> std::io::Result<()> {
+        let file = std::fs::File::create(tmp)?;
+        let mut w = std::io::BufWriter::new(file);
+
+        w.write_all(b"{\"api_call_id\":")?;
+        write_json_string(&mut w, &self.api_call_id)?;
+        if let Some(model) = &self.model_requested {
+            w.write_all(b",\"model_requested\":")?;
+            write_json_string(&mut w, model)?;
+        }
+        if let Some(model) = self
+            .model_served
+            .lock()
+            .expect("turn-capture model_served lock")
+            .as_deref()
+        {
+            w.write_all(b",\"model_served\":")?;
+            write_json_string(&mut w, model)?;
+        }
+        write!(w, ",\"started_ms\":{}", self.started_ms)?;
+        write!(
+            w,
+            ",\"finished_ms\":{}",
+            self.finished_ms.load(Ordering::Acquire)
+        )?;
+        let outcome = self
+            .outcome
+            .lock()
+            .expect("turn-capture outcome lock")
+            .clone();
+        let (status, reason) = match outcome {
+            Some(outcome) => (outcome.status, outcome.reason),
+            // The barrier only assembles after `engine_done` fired, so `outcome` is
+            // normally `Some`; default defensively rather than fabricate a success.
+            None => ("failed".to_string(), Some("no_engine_outcome".to_string())),
+        };
+        w.write_all(b",\"status\":")?;
+        write_json_string(&mut w, &status)?;
+        if let Some(reason) = &reason {
+            w.write_all(b",\"terminal_reason\":")?;
+            write_json_string(&mut w, reason)?;
+        }
+
+        // Section-agnostic: F1d/F1e append their sections to this list once those
+        // `Section`s exist. An ABSENT section is simply omitted (never a fabricated
+        // empty measured value). Requests may embed as a JSON value; responses embed
+        // as strings.
+        w.write_all(b",\"sections\":{")?;
+        write_section(&mut w, "inbound_request", &self.inbound_request, true)?;
+        w.write_all(b",")?;
+        write_section(&mut w, "served_response", &self.served_response, false)?;
+        w.write_all(b"}}")?;
+
+        w.flush()?;
+        // fsync the artifact before the caller renames it into place (durability +
+        // a torn artifact is never published).
+        w.into_inner()
+            .map_err(std::io::IntoInnerError::into_error)?
+            .sync_all()?;
+        Ok(())
     }
 }
 
@@ -619,9 +938,279 @@ async fn section_writer(mut rx: mpsc::Receiver<Vec<u8>>, meta: Arc<SectionMeta>)
     meta.done.notify_waiters();
 }
 
+/// The terminal outcome the engine reports via [`TurnCaptureState::engine_done`].
+/// `status` is already the artifact status string (mapped from the engine's
+/// `FlowStatus` at the seam), so assembly never re-derives it.
+#[derive(Debug, Clone)]
+struct EngineOutcome {
+    status: String,
+    reason: Option<String>,
+}
+
+/// Current wall-clock time as epoch milliseconds (`u64`; epoch-ms fits until well
+/// past year 2100). Matches the `started_ms` clock the HTTP seam stamps.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// F1c RAII **engine** capture guard: owns the engine side of the both-`done`
+/// barrier for a turn whose capture is active. Constructed early in
+/// `stream_responses_with_api_call_id` (so it covers the pre-spawn `?` paths) and
+/// moved into the terminal `tokio::spawn`, mirroring the dashboard's
+/// `TelemetryGuard` (`dashboard_flow.rs`). `new` CLAIMS the turn synchronously so
+/// the [`MiddlewareCaptureGuard`] backstop stays inert for any turn that reached the
+/// engine. The engine calls [`finalize`](Self::finalize) on every terminal
+/// (completed/incomplete/failed/cancelled, incl. pre-spawn); its `Drop` is the
+/// fallback that finalizes an abandoned/panicked turn (`failed`, or `cancelled` if
+/// the abort token fired). All calls funnel through the idempotent
+/// [`TurnCaptureState::engine_done`], so the explicit terminal always wins and a
+/// later `Drop` is inert.
+pub struct CaptureGuard {
+    state: Arc<TurnCaptureState>,
+    abort_token: CancellationToken,
+}
+
+impl CaptureGuard {
+    /// Build the guard and CLAIM the turn (synchronously, before the engine returns
+    /// its stream) so the middleware backstop knows the engine took ownership.
+    pub fn new(state: Arc<TurnCaptureState>, abort_token: CancellationToken) -> Self {
+        state.mark_engine_claimed();
+        Self { state, abort_token }
+    }
+
+    /// Explicitly finalize with the engine's terminal `status` + `reason`. Idempotent
+    /// first-writer-wins (a later `Drop` fallback no-ops).
+    pub fn finalize(&self, status: &str, reason: Option<&str>) {
+        self.state.engine_done(status, reason);
+    }
+
+    /// Stamp the served/backend model onto the outcome metadata (once resolution
+    /// settles). Forwards to [`TurnCaptureState::set_model_served`].
+    pub fn set_model_served(&self, model: &str) {
+        self.state.set_model_served(model);
+    }
+}
+
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        // Fallback for a turn abandoned without an explicit terminal (a panic in
+        // `run_turn`, an early path that forgot to finalize): `cancelled` iff the
+        // abort token fired, else `failed`. Idempotent -- inert if the engine already
+        // finalized (the CAS-equivalent `engine_reported` latch).
+        let status = if self.abort_token.is_cancelled() {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        self.state.engine_done(status, Some("dropped"));
+    }
+}
+
+/// F1c RAII **middleware** backstop: closes the "engine side never fired" hole in
+/// the both-`done` barrier. Held by `log_api_call` across `next.run` (mirroring the
+/// dashboard's `MiddlewareGuard`). If the turn NEVER reached the engine (a `Json`
+/// extractor / `convert_request` rejection returns before
+/// `stream_responses_with_api_call_id`), no [`CaptureGuard`] was built and the turn
+/// is UNCLAIMED at this guard's `Drop`, so it finalizes the engine side `failed`
+/// itself -- otherwise the served-tee's `served_done` would be the only latch to
+/// fire and the barrier would wait forever (registry + `.work` leak, no artifact).
+/// A CLAIMED turn (the engine took ownership) is left entirely to the engine's own
+/// terminal / `CaptureGuard` `Drop`.
+pub struct MiddlewareCaptureGuard {
+    state: Arc<TurnCaptureState>,
+}
+
+impl MiddlewareCaptureGuard {
+    /// Build the backstop over the turn's shared state (a cheap `Arc` clone).
+    pub fn new(state: Arc<TurnCaptureState>) -> Self {
+        Self { state }
+    }
+}
+
+impl Drop for MiddlewareCaptureGuard {
+    fn drop(&mut self) {
+        if !self.state.is_engine_claimed() {
+            self.state.engine_done("failed", Some("unhandled"));
+        }
+    }
+}
+
+/// Write a JSON string literal for `value` (quotes + full escaping) via serde_json,
+/// so the small outcome-metadata strings are escaped exactly like any JSON string.
+fn write_json_string<W: std::io::Write>(w: &mut W, value: &str) -> std::io::Result<()> {
+    // serde_json escapes into an owned `String`; these are SMALL metadata values
+    // (ids/model names/reasons), never a section body -- the bounded-memory rule
+    // applies to the section streams below, which never go through here.
+    let encoded = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    w.write_all(encoded.as_bytes())
+}
+
+/// Embed one section as `"<name>":{"bytes":N,"partial":B,"encoding":E,"content":C}`,
+/// STREAMING the section temp file for `content` so a multi-MiB section is never
+/// held in RAM. `is_request` allows a request that parses to embed as a raw JSON
+/// VALUE; a response always embeds as a string. A missing/unreadable file yields
+/// `content:null` + `encoding:"absent"` (don't-lie-with-zeros -- never a fabricated
+/// empty string that reads as "measured empty").
+fn write_section<W: std::io::Write>(
+    w: &mut W,
+    name: &str,
+    section: &Section,
+    is_request: bool,
+) -> std::io::Result<()> {
+    let path = section.path();
+    let bytes = section.bytes();
+    let partial = section.partial();
+
+    w.write_all(b"\"")?;
+    w.write_all(name.as_bytes())?;
+    w.write_all(b"\":{\"bytes\":")?;
+    write!(w, "{bytes}")?;
+    w.write_all(b",\"partial\":")?;
+    w.write_all(if partial { b"true" } else { b"false" })?;
+
+    if !path.exists() {
+        w.write_all(b",\"encoding\":\"absent\",\"content\":null}")?;
+        return Ok(());
+    }
+
+    // Classify by STREAMING the file (bounded): a request that parses as one JSON
+    // value embeds raw; else valid UTF-8 embeds as a JSON string; else base64.
+    let encoding = if is_request && section_is_valid_json(path) {
+        "json"
+    } else if section_is_valid_utf8(path) {
+        "utf8"
+    } else {
+        "base64"
+    };
+    w.write_all(b",\"encoding\":\"")?;
+    w.write_all(encoding.as_bytes())?;
+    w.write_all(b"\",\"content\":")?;
+    match encoding {
+        // The file bytes ARE a valid JSON value -- copy them in verbatim (bounded).
+        "json" => stream_file_raw(path, w)?,
+        // Valid UTF-8: emit as a JSON string, escaping as we stream (bounded).
+        "utf8" => {
+            w.write_all(b"\"")?;
+            stream_file_json_escaped(path, w)?;
+            w.write_all(b"\"")?;
+        }
+        // Non-UTF-8: base64 string + the `base64` encoding marker (bounded stream).
+        _ => {
+            w.write_all(b"\"")?;
+            stream_file_base64(path, w)?;
+            w.write_all(b"\"")?;
+        }
+    }
+    w.write_all(b"}")?;
+    Ok(())
+}
+
+/// Streaming, BOUNDED check that the file at `path` is exactly one JSON value (only
+/// trailing whitespace after). `serde_json::from_reader` over `IgnoredAny` skips
+/// tokens without building a `Value`, so memory is O(nesting depth), not O(size);
+/// invalid UTF-8 surfaces as a parse error (returns `false`).
+fn section_is_valid_json(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file);
+    serde_json::from_reader::<_, serde::de::IgnoredAny>(reader).is_ok()
+}
+
+/// Streaming, BOUNDED UTF-8 validation: read in fixed chunks, validating with a
+/// carry of at most 3 bytes for a multibyte sequence split across a chunk boundary.
+/// Memory is O(chunk), never O(file size).
+fn section_is_valid_utf8(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut reader = std::io::BufReader::new(file);
+    let mut carry: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        carry.extend_from_slice(&buf[..n]);
+        match std::str::from_utf8(&carry) {
+            Ok(_) => carry.clear(),
+            Err(err) => {
+                // A genuine invalid sequence (has `error_len`) is a hard fail; an
+                // incomplete trailing sequence (no `error_len`) carries to the next
+                // chunk. Drain the valid prefix so `carry` stays bounded (<= 3 bytes).
+                if err.error_len().is_some() {
+                    return false;
+                }
+                let valid = err.valid_up_to();
+                carry.drain(..valid);
+            }
+        }
+    }
+    // Any leftover carry at EOF is a truncated multibyte sequence -> not valid UTF-8.
+    carry.is_empty()
+}
+
+/// Copy the section file verbatim into `w` (for the already-valid-JSON case), in
+/// bounded chunks via `std::io::copy`.
+fn stream_file_raw<W: std::io::Write>(path: &Path, w: &mut W) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    std::io::copy(&mut reader, w)?;
+    Ok(())
+}
+
+/// Stream the section file into `w` as the BODY of a JSON string (no surrounding
+/// quotes), escaping JSON-special bytes as we go. The caller has validated UTF-8, so
+/// high bytes (>= 0x80) pass through byte-for-byte to form the original multibyte
+/// UTF-8 -- only ASCII control chars / `"` / `\` are escaped. Bounded (chunked).
+fn stream_file_json_escaped<W: std::io::Write>(path: &Path, w: &mut W) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for &byte in &buf[..n] {
+            match byte {
+                b'"' => w.write_all(b"\\\"")?,
+                b'\\' => w.write_all(b"\\\\")?,
+                b'\n' => w.write_all(b"\\n")?,
+                b'\r' => w.write_all(b"\\r")?,
+                b'\t' => w.write_all(b"\\t")?,
+                0x08 => w.write_all(b"\\b")?,
+                0x0c => w.write_all(b"\\f")?,
+                0x00..=0x1f => write!(w, "\\u{byte:04x}")?,
+                other => w.write_all(&[other])?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stream the section file into `w` as a base64 string body (no surrounding quotes),
+/// via base64's incremental `EncoderWriter` -- bounded, never a whole-file load.
+fn stream_file_base64<W: std::io::Write>(path: &Path, w: &mut W) -> std::io::Result<()> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut encoder =
+        base64::write::EncoderWriter::new(w, &base64::engine::general_purpose::STANDARD);
+    std::io::copy(&mut reader, &mut encoder)?;
+    encoder.finish()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::TurnCapture;
+    use std::sync::Arc;
+    use tokio_util::sync::CancellationToken;
 
     fn temp_dir_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -881,5 +1470,195 @@ mod tests {
             &contents[contents.len() - FRAME_LEN..],
             vec![last; FRAME_LEN].as_slice()
         );
+    }
+
+    /// Poll for the assembled artifact (assembly is spawned async), failing after a
+    /// bounded wait -- so a test that "never assembles" fails loudly instead of
+    /// hanging, and a passing test PROVES the barrier resolved in bounded time.
+    async fn wait_for_artifact(path: &std::path::Path) -> serde_json::Value {
+        for _ in 0..300 {
+            if let Ok(bytes) = std::fs::read(path) {
+                return serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+                    panic!("artifact at {} is not valid JSON: {err}", path.display())
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("artifact never appeared at {}", path.display());
+    }
+
+    /// F1c both-`done` barrier: engine + served `done`s → assemble a single JSON
+    /// artifact (inbound as a JSON VALUE, served as a UTF-8 string), then EVICT the
+    /// registry entry + delete the `.work/<id>/` dir. Closes F1b's deferred leak.
+    #[tokio::test]
+    async fn both_done_barrier_assembles_evicts_and_cleans_up() {
+        let dir = temp_dir_path("barrier-assemble");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture
+            .start("api_barrier", Some("model-x".to_string()), 1_000)
+            .expect("state");
+        state.write_inbound_request(br#"{"model":"model-x","messages":[]}"#);
+        state.write_served_response(b"event: message_start\n\nevent: message_stop\n\n");
+        state.set_model_served("backend-y");
+
+        // Both sides report (order does not matter) → the SECOND fires assembly once.
+        state.served_done(false);
+        capture.engine_done("api_barrier", "completed", Some("response.completed"));
+
+        let artifact = wait_for_artifact(&dir.join("api_barrier.json")).await;
+        assert_eq!(artifact["api_call_id"], "api_barrier");
+        assert_eq!(artifact["status"], "completed");
+        assert_eq!(artifact["terminal_reason"], "response.completed");
+        assert_eq!(artifact["model_requested"], "model-x");
+        assert_eq!(artifact["model_served"], "backend-y");
+        // inbound_request PARSES → embeds as a JSON value (encoding "json").
+        assert_eq!(artifact["sections"]["inbound_request"]["encoding"], "json");
+        assert_eq!(
+            artifact["sections"]["inbound_request"]["content"]["model"],
+            "model-x"
+        );
+        assert_eq!(artifact["sections"]["inbound_request"]["partial"], false);
+        // served_response embeds as a UTF-8 string.
+        assert_eq!(artifact["sections"]["served_response"]["encoding"], "utf8");
+        assert!(
+            artifact["sections"]["served_response"]["content"]
+                .as_str()
+                .expect("served content string")
+                .contains("message_start")
+        );
+        assert_eq!(artifact["sections"]["served_response"]["partial"], false);
+        // Outcome timing is honest: finished stamped, and not before started.
+        let started = artifact["started_ms"].as_u64().expect("started_ms");
+        let finished = artifact["finished_ms"].as_u64().expect("finished_ms");
+        assert!(finished > 0, "finished_ms is stamped");
+        assert!(finished >= started, "finished_ms is not before started_ms");
+        // F1c has no upstream sections yet — ABSENT, not a fabricated empty-measured.
+        assert!(artifact["sections"].get("upstream_request").is_none());
+        assert!(artifact["sections"].get("upstream_response").is_none());
+        // Registry evicted + work dir deleted (no leak).
+        assert!(
+            capture.state("api_barrier").is_none(),
+            "registry entry is evicted after assembly"
+        );
+        assert!(
+            !state.work_dir().exists(),
+            ".work/<id>/ dir is deleted after assembly"
+        );
+        // No .tmp residue in the capture dir.
+        assert!(!dir.join("api_barrier.json.tmp").exists());
+    }
+
+    /// `engine_done` is a first-writer-wins latch: the engine's real terminal is
+    /// never overwritten by a later `Drop`-fallback `failed`.
+    #[tokio::test]
+    async fn engine_done_is_idempotent_first_writer_wins() {
+        let dir = temp_dir_path("engine-idempotent");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_idem", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        state.engine_done("completed", Some("response.completed"));
+        // A later (Drop-style) terminal must be inert.
+        state.engine_done("failed", Some("dropped"));
+        state.write_served_response(b"ok");
+        state.served_done(false);
+
+        let artifact = wait_for_artifact(&dir.join("api_idem.json")).await;
+        assert_eq!(artifact["status"], "completed", "first engine_done wins");
+        assert_eq!(artifact["terminal_reason"], "response.completed");
+    }
+
+    /// Encoding contract: a non-UTF-8 served section round-trips via base64 + the
+    /// `"encoding":"base64"` marker (bounded streaming base64 encoder).
+    #[tokio::test]
+    async fn assembly_embeds_non_utf8_served_as_base64() {
+        let dir = temp_dir_path("base64-served");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_b64", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        let raw = vec![0xff, 0xfe, 0x00, 0x01, 0x80, 0x7f];
+        state.write_served_response(&raw);
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_artifact(&dir.join("api_b64.json")).await;
+        assert_eq!(
+            artifact["sections"]["served_response"]["encoding"],
+            "base64"
+        );
+        // No `terminal_reason` key when the engine passed `None`.
+        assert!(artifact.get("terminal_reason").is_none());
+        let content = artifact["sections"]["served_response"]["content"]
+            .as_str()
+            .expect("base64 content string");
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .expect("valid base64");
+        assert_eq!(decoded, raw, "base64 round-trips the exact bytes");
+    }
+
+    /// The middleware backstop resolves the barrier for a turn that NEVER reached the
+    /// engine (unclaimed → `failed`/`unhandled`), and is INERT for a claimed turn (the
+    /// engine's status wins). This is the "served side is the only latch" case that
+    /// would otherwise wait forever + leak the registry entry.
+    #[tokio::test]
+    async fn middleware_backstop_finalizes_unclaimed_but_is_inert_when_claimed() {
+        // Unclaimed: engine never took ownership → backstop Drop finalizes failed.
+        let dir = temp_dir_path("backstop-unclaimed");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_unclaimed", None, 0).expect("state");
+        state.write_inbound_request(b"{\"bad\":true}");
+        state.write_served_response(b"{\"error\":\"bad request\"}");
+        drop(super::MiddlewareCaptureGuard::new(Arc::clone(&state)));
+        state.served_done(false);
+
+        let artifact = wait_for_artifact(&dir.join("api_unclaimed.json")).await;
+        assert_eq!(artifact["status"], "failed");
+        assert_eq!(artifact["terminal_reason"], "unhandled");
+        assert!(
+            capture.state("api_unclaimed").is_none(),
+            "an unhandled (never-reached-engine) turn is still evicted — no leak"
+        );
+
+        // Claimed: a CaptureGuard took ownership → backstop is inert, engine wins.
+        let dir2 = temp_dir_path("backstop-claimed");
+        let capture2 = TurnCapture::enabled(dir2.clone());
+        let state2 = capture2.start("api_claimed", None, 0).expect("state");
+        state2.write_inbound_request(b"{}");
+        let guard = super::CaptureGuard::new(Arc::clone(&state2), CancellationToken::new());
+        drop(super::MiddlewareCaptureGuard::new(Arc::clone(&state2)));
+        guard.finalize("completed", Some("response.completed"));
+        state2.write_served_response(b"ok");
+        state2.served_done(false);
+
+        let artifact2 = wait_for_artifact(&dir2.join("api_claimed.json")).await;
+        assert_eq!(
+            artifact2["status"], "completed",
+            "a claimed turn keeps the engine's status; the backstop is inert"
+        );
+        // The guard's own Drop fallback is idempotent (inert after the explicit terminal).
+        drop(guard);
+    }
+
+    /// The RAII `CaptureGuard` Drop finalizes an abandoned turn: `cancelled` when the
+    /// abort token fired, `failed` otherwise — with whatever sections closed.
+    #[tokio::test]
+    async fn capture_guard_drop_finalizes_cancelled_when_abort_fired() {
+        let dir = temp_dir_path("guard-drop-cancel");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_abort", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        state.write_served_response(b"partial");
+        // Served cut short (client gone) → partial; engine terminal only via Drop.
+        state.served_done(true);
+        let token = CancellationToken::new();
+        token.cancel();
+        let guard = super::CaptureGuard::new(Arc::clone(&state), token);
+        drop(guard); // no explicit finalize → Drop maps the fired abort to cancelled.
+
+        let artifact = wait_for_artifact(&dir.join("api_abort.json")).await;
+        assert_eq!(artifact["status"], "cancelled");
+        assert_eq!(artifact["terminal_reason"], "dropped");
+        assert_eq!(artifact["sections"]["served_response"]["partial"], true);
     }
 }

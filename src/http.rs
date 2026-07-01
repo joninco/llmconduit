@@ -609,6 +609,20 @@ async fn log_api_call(
         None
     };
 
+    // F1c: the turn-capture MIDDLEWARE backstop, held across `next.run`. If the
+    // request NEVER reaches the engine (a `Json`/extractor rejection, a
+    // `convert_request` error — so no engine `CaptureGuard` is ever built), the turn
+    // is UNCLAIMED at this guard's `Drop`, which then finalizes the engine side
+    // `failed`/`"unhandled"`. That closes the both-`done` barrier (the served tee
+    // below always fires `served_done`), so the registry entry + `.work` dir are
+    // evicted and a useful `status:"failed"` artifact is still written — no hang, no
+    // leak. A turn that reached the engine is CLAIMED synchronously (before
+    // `next.run` returns), so this backstop is inert for it. Mirrors the dashboard's
+    // L0 `MiddlewareGuard`.
+    let _capture_backstop = turn_capture_state
+        .as_ref()
+        .map(|state| crate::turn_capture::MiddlewareCaptureGuard::new(Arc::clone(state)));
+
     let request = Request::from_parts(parts, Body::from(body_bytes));
     let response = next.run(request).await;
     // F1b served-body tee (spec Design #4): wrap the outbound response `Body` so
