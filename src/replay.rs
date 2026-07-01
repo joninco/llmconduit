@@ -72,6 +72,19 @@ impl ReplayStore {
         }
         None
     }
+
+    /// Number of entries currently stored. Observability/testability accessor
+    /// (mirrors `ImageCache::session_len`) — e.g. E2b's integration tests use
+    /// this to prove a degraded turn wrote NOTHING to the cache, without
+    /// needing to reconstruct the exact stored key.
+    pub async fn len(&self) -> usize {
+        self.inner.read().await.map.len()
+    }
+
+    /// `true` when [`len`](Self::len) is `0`.
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
+    }
 }
 
 pub fn hash_visible_history(model: &str, instructions: &str, items: &[ResponseItem]) -> String {

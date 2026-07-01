@@ -199,6 +199,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         vision_model: existing.vision_model.clone(),
         image_cache_max_size: existing.image_cache_max_size,
         image_cache_ttl_secs: existing.image_cache_ttl_secs,
+        unsupported_image_policy: existing.unsupported_image_policy,
         price_table: existing.price_table.clone(),
     };
 

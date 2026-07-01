@@ -6,6 +6,7 @@ use crate::adapters::responses_to_chat::LoweredTurn;
 use crate::adapters::responses_to_chat::ToolKind;
 use crate::adapters::responses_to_chat::lower_request_with_image_agent;
 use crate::config::Config;
+use crate::config::UnsupportedImagePolicy;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatCompletionChunk;
@@ -1158,6 +1159,24 @@ impl Gateway {
         let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
         let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
 
+        // D1/E2b: minted here rather than just before the `tokio::spawn` below
+        // (its only prior use) so the E2b residual-image-degrade monitor
+        // emission further down can key off the SAME id every other event for
+        // this turn uses. Pure reordering: nothing between here and the spawn
+        // reads or depends on this value.
+        let response_id = format!("resp_{}", Uuid::new_v4().simple());
+
+        // G4/E2b: the resolved-backend native-vision decision, computed ONCE
+        // and shared between G4 gating (`activate_image_agent`, which used to
+        // recompute this itself) and the E2b residual-image pass below, so the
+        // two can never disagree about whether this backend is safe to receive
+        // raw images. Must be computed unconditionally (not just when G4's own
+        // earlier gates pass) because E2b runs regardless of whether the G4
+        // agent activated.
+        let native_vision = self
+            .backend_is_native_vision(&request.model, &resolved_model, request_genuine)
+            .await;
+
         // G4 image-agent strip/cache seam. This runs AFTER model/profile
         // resolution + system-prompt prefix but BEFORE replay lookup/lowering so
         // that (a) gating sees the resolved/profiled backend, not the raw request
@@ -1167,13 +1186,8 @@ impl Gateway {
         // (images → placeholders, inject one `analyzeImage` tool + system
         // instruction, dedup) and returns a per-turn session id; we then lower
         // with the image agent active so `analyzeImage` classifies as the
-        // server-side tool and thread the session id to the executor. T2: the
-        // `request_genuine` flag (byproduct of the one normalization walk) is
-        // threaded so the gate's request-override attaches ONLY when the request
-        // genuinely maps to the served backend (round-8 #1).
-        let vision_session = self
-            .activate_image_agent(&mut request, &resolved_model, request_genuine)
-            .await;
+        // server-side tool and thread the session id to the executor.
+        let vision_session = self.activate_image_agent(&mut request, native_vision).await;
 
         // D3: a pre-spawn early return (replay baseline lookup, lowering/validation,
         // or budgeting below) must finalize the record `Failed` with the correct
@@ -1198,6 +1212,60 @@ impl Gateway {
             }
             err
         };
+
+        // E2b residual-image safety pass: the TRUE choke point for "no raw
+        // image reaches a non-native-vision backend". `activate_image_agent`
+        // above only ever strips `role=="user"` + `image_url` in an ACTIVE
+        // turn (`vision/strip.rs:strip_and_cache_images`); this sweep is
+        // role-agnostic and runs regardless of whether that agent activated,
+        // so it also catches `file_id` images, images in a non-`user` message,
+        // `tool_choice=="none"` residuals, and old-history images the active
+        // strip never sees. It is a no-op — never even inspected — on
+        // native-vision passthrough, and never double-transforms what the
+        // active strip already rewrote to `InputText` (there is nothing left
+        // of type `InputImage` for it to find there).
+        if !native_vision {
+            if self.config.unsupported_image_policy == UnsupportedImagePolicy::Reject
+                && crate::vision::has_residual_images(&request.input)
+            {
+                // Reject BEFORE dispatch: a bad-request 4xx via `AppError::
+                // bad_request` (400), never `AppError::upstream` (502) — the
+                // provider is not contacted at all, so it is never cooled.
+                return Err(finalize_pre_spawn_err(AppError::bad_request(
+                    "upstream model is text-only; images are not supported",
+                )));
+            }
+            let degraded_images = crate::vision::degrade_residual_images(&mut request.input);
+            if degraded_images > 0 {
+                // MVP observability (AC-6): a WARN log plus a monitor phase via
+                // `emit_with` (no-op under `MonitorHub::disabled()`). The
+                // response header/dashboard flag are a documented follow-up —
+                // the engine returns a bare `ReceiverStream`, so surfacing this
+                // there needs a metadata wrapper, out of scope here.
+                tracing::warn!(
+                    count = degraded_images,
+                    model = %resolved_model,
+                    "residual image(s) degraded to text placeholders for a non-vision backend"
+                );
+                self.monitor
+                    .emit_with(response_id.as_str(), || MonitorEventKind::ToolPhase {
+                        phase: "residual_image_degraded".to_string(),
+                        detail: format!(
+                            "{degraded_images} image(s) replaced with a text placeholder"
+                        ),
+                    });
+                // Replay-safety (AC-5): bypass the cache entirely for this
+                // degraded turn, both the lookup just below AND the store
+                // insert in `run_turn` — reusing the SAME `request.store` flag
+                // both sides already gate on, rather than adding new plumbing.
+                // Required because `hash_visible_history` (`replay.rs`) hashes
+                // POST-transform items: two DIFFERENT images collapsing to
+                // byte-identical placeholder text at the same position would
+                // otherwise collide and serve the wrong cached response.
+                request.store = false;
+            }
+        }
+
         let (baseline_record, prefix_len) = self
             .find_replay_baseline(&request)
             .await
@@ -1350,7 +1418,6 @@ impl Gateway {
         }
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
-        let response_id = format!("resp_{}", Uuid::new_v4().simple());
         tokio::spawn(async move {
             let result = gateway
                 .run_turn(
@@ -1473,16 +1540,17 @@ impl Gateway {
     ///   endpoint ⇒ nothing to offload to),
     /// - the LATEST user message carries ≥1 image (old images in history must
     ///   not re-trigger the agent),
-    /// - the resolved/profiled backend is NOT native-vision (Kimi by name, or a
-    ///   profile `native_vision` override — checked AFTER model resolution so a
-    ///   routing/alias remap is honored),
+    /// - `native_vision` is `false` — the resolved/profiled backend is NOT
+    ///   native-vision (Kimi by name, or a profile `native_vision` override).
+    ///   Precomputed by the caller (`backend_is_native_vision`, see its
+    ///   decision table) and shared with the E2b residual-image pass that runs
+    ///   right after this returns, so the two never disagree,
     /// - `tool_choice` is not `"none"` (the caller forbade tools, so injecting a
     ///   mandatory tool would be a contradiction).
     async fn activate_image_agent(
         &self,
         request: &mut ResponsesRequest,
-        resolved_model: &str,
-        request_genuine: bool,
+        native_vision: bool,
     ) -> Option<String> {
         if !self.config.image_agent_enabled || self.config.vision_url.is_none() {
             return None;
@@ -1493,16 +1561,7 @@ impl Gateway {
         if !crate::vision::latest_user_message_has_images(&request.input) {
             return None;
         }
-        // Native-vision gating decides passthrough vs strip+offload. Candidates
-        // are enumerated from the RESOLVED model (where the request lands,
-        // round-4 #1); the raw `request.model` + `request_genuine` are threaded
-        // so a `native_vision` override on the request model/route can attach to
-        // the candidate it GENUINELY maps to (round-7 #1, corrected round-8 #1).
-        // See the decision table on `backend_is_native_vision`.
-        if self
-            .backend_is_native_vision(&request.model, resolved_model, request_genuine)
-            .await
-        {
+        if native_vision {
             return None;
         }
         // A per-turn session id keys the shared cache. It need only be unique for

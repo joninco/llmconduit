@@ -44,6 +44,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use axum::body::Body;
 use axum::http::Request;
 use llmconduit::config::Config;
+use llmconduit::config::UnsupportedImagePolicy;
 use llmconduit::models::chat::ChatCompletionRequest;
 use llmconduit::models::responses::ContentItem;
 use llmconduit::models::responses::ReasoningRequest;
@@ -385,6 +386,7 @@ fn config_for(server_uri: &str) -> Config {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     }
 }

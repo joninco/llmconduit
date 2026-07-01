@@ -10,8 +10,8 @@
 
 ## Executive summary
 
-**Status: 1/3 tasks complete.** E2a ✅ done — committed + Codex-xhigh APPROVED (full detail archived in
-`.ralph/COMPLETED_TASKS.md`). E2b/E2c ⬜ pending.
+**Status: 2/3 tasks complete.** E2a ✅, E2b ✅ done — committed + Codex-xhigh APPROVED (full detail archived
+in `.ralph/COMPLETED_TASKS.md`). E2c ⬜ pending (docs only).
 
 Field incident: an image in a claude-cli tool chain hit the text-only upstream → **400 "not a multimodal
 model"** → the 400 tripped a **30 s provider cooldown** → every request **502**'d. Two independent fixes,
@@ -25,7 +25,7 @@ ON the existing G4 vision agent (unchanged); closes the residuals it misses.
 | Task | Description | Status |
 |-|-|-|
 | E2a | request-intrinsic 4xx {400,413,415,422} → `Terminal` (no failover/cooldown); 401/403/404/408/429 unchanged; dashboard class stays `HttpStatus` + `failover_reason=TerminalNoFailover` (`upstream.rs`, `error.rs`); shipped AC-1,2,3 | ✅ |
-| E2b | role-agnostic residual-image pass AFTER `activate_image_agent` for non-native backends (covers non-user + `file_id` + old-history + `tool_choice=none`); `unsupported_image_policy` on `Config`+`PersistedConfig`; `Reject`→4xx (not 502); degraded turn bypasses replay — `engine.rs:1174`, `vision/strip.rs`, `config.rs` (`70-80`,`593`,`1604`), `error.rs`, `replay.rs`; ships AC-4,5,7,8,9 | ⬜ |
+| E2b | role-agnostic residual-image pass (`vision/strip.rs::degrade_residual_images`/`has_residual_images`) wired at `engine.rs` after `activate_image_agent`, gated on `!backend_is_native_vision`; `unsupported_image_policy` (`Placeholder`/`Reject`) on `Config`+`PersistedConfig`+env+`configure()`; `Reject`→400 (not 502) pre-dispatch; degraded turn forces `request.store=false` (bypasses replay lookup+store); shipped AC-4,5,7,8,9 (15 new integration tests + 14 unit tests) | ✅ |
 | E2c | docs only (`FEATURES.md`, `AGENTS.md` invariants + limitation, `config.yaml` comment) | ⬜ |
 
 **Ordering: serial E2a → E2b → E2c** (shared files force serial; `--agents 1`). E2a and E2b are logically

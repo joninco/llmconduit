@@ -19,7 +19,11 @@
 //! Module layout (grouped by concern):
 //! - [`cache`] — the per-session LRU+TTL [`ImageCache`] storage/eviction.
 //! - [`strip`] — request mutation: strip images to placeholders, inject the
-//!   `analyzeImage` tool + system prompt, and the activation predicate.
+//!   `analyzeImage` tool + system prompt, and the activation predicate. Also
+//!   home to the E2b role-agnostic residual-image pass
+//!   ([`degrade_residual_images`]/[`has_residual_images`]) that runs at the
+//!   engine layer regardless of whether the agent above activated, so no raw
+//!   `InputImage` reaches a non-native-vision backend.
 //! - [`client`] — the [`VisionClient`] seam, [`VisionRequest`]/[`VisionOutcome`],
 //!   and the production [`ReqwestVisionClient`].
 //!
@@ -43,6 +47,8 @@ pub use strip::ANALYZE_IMAGE_TOOL_NAME;
 pub use strip::IMAGE_AGENT_SYSTEM_PROMPT;
 pub use strip::analyze_image_tool_parameters;
 pub use strip::analyze_image_tool_spec;
+pub use strip::degrade_residual_images;
+pub use strip::has_residual_images;
 pub use strip::latest_user_message_has_images;
 pub use strip::tool_is_analyze_image;
 

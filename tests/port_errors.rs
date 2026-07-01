@@ -324,6 +324,7 @@ mod integration {
     use axum::http::Request;
     use llmconduit::config::Config;
     use llmconduit::config::FallbackUpstreamConfig;
+    use llmconduit::config::UnsupportedImagePolicy;
     use uuid::Uuid;
 
     fn config_for(server_uri: &str) -> Config {
@@ -358,6 +359,7 @@ mod integration {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
         }
     }

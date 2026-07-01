@@ -14,6 +14,7 @@ use futures::StreamExt;
 use futures::stream;
 use llmconduit::config::Config;
 use llmconduit::config::PersistedConfig;
+use llmconduit::config::UnsupportedImagePolicy;
 use llmconduit::engine::Gateway;
 use llmconduit::engine::SseEvent;
 use llmconduit::error::AppError;
@@ -290,6 +291,38 @@ pub fn test_gateway_with_config(
     ))
 }
 
+/// Like [`test_gateway_with_config`], but takes an EXTERNALLY-owned
+/// `ReplayStore` instead of minting a fresh one, so a test can retain its own
+/// clone (it wraps an `Arc<RwLock<..>>` internally, so cloning shares state)
+/// and inspect the store directly after a turn — e.g. proving a degraded turn
+/// (E2b) never wrote a replay entry, without needing to construct an
+/// observably-different second turn to detect a would-be cache hit.
+pub fn test_gateway_with_config_and_replay_store(
+    upstream: MockUpstream,
+    search: MockSearch,
+    config: Config,
+    replay_store: ReplayStore,
+) -> Arc<Gateway> {
+    upstream.set_finalization_policies(
+        llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
+    );
+    let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
+        llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
+    );
+    let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
+    Arc::new(Gateway::new(
+        config,
+        replay_store,
+        Arc::new(upstream),
+        Arc::new(search),
+        vision,
+        image_cache,
+        MonitorHub::new(128),
+        None,
+        llmconduit::dashboard_flow::DashboardFlowStore::disabled(),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // G4 image-agent fixtures: a recording mock vision backend plus the gateway /
 // config / request builders the `tests/image_agent.rs` suite shares.
@@ -481,6 +514,7 @@ pub fn test_config() -> Config {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     }
 }

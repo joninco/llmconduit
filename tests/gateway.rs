@@ -5,6 +5,7 @@ use futures::StreamExt;
 use futures::stream;
 use llmconduit::config::Config;
 use llmconduit::config::FallbackUpstreamConfig;
+use llmconduit::config::UnsupportedImagePolicy;
 use llmconduit::config::UpstreamConfig;
 use llmconduit::engine::Gateway;
 use llmconduit::models::chat::ChatChunkChoice;
@@ -660,6 +661,7 @@ async fn uses_configured_upstream_model_override() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
         },
     );
@@ -747,6 +749,7 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
         },
     );
@@ -1099,6 +1102,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
         },
     );
@@ -1174,6 +1178,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             price_table: std::collections::HashMap::new(),
         },
     );
@@ -2883,6 +2888,7 @@ async fn proxies_models_endpoint_with_etag() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     };
     let app = llmconduit::build_app(config);
@@ -2959,6 +2965,7 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     };
     let app = llmconduit::build_app(config);
@@ -3041,6 +3048,7 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     };
     let app = llmconduit::build_app(config);
@@ -3126,6 +3134,7 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     };
     let app = llmconduit::build_app(config);
@@ -3216,6 +3225,7 @@ async fn proxies_completions_endpoint_passthrough() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     };
     let app = llmconduit::build_app(config);
@@ -6982,6 +6992,7 @@ fn test_config() -> Config {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     }
 }
@@ -8113,7 +8124,21 @@ async fn chat_completions_preserves_multimodal_content_parts() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    // E2b: this test proves multimodal CONTENT-PART SHAPES survive canonical
+    // round-tripping unchanged (image_url/input_audio/file), which is only
+    // true when the backend is native-vision -- a non-native backend now
+    // degrades the image part to a text placeholder (the whole point of E2b;
+    // covered by its own dedicated tests). Force `native_vision: true` here so
+    // this test keeps proving adapter fidelity, not image-degradation policy.
+    let mut config = test_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "glm-5.1".to_string(),
+        llmconduit::config::ModelProfile {
+            native_vision: Some(true),
+            ..Default::default()
+        },
+    )]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
@@ -8738,7 +8763,22 @@ async fn anthropic_messages_preserves_image_content_parts() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    // E2b: this test proves Anthropic image-source SHAPES (base64/url/file)
+    // all survive canonical round-tripping to `image_url`/`file_id` chat
+    // parts, which is only true on a native-vision backend -- a non-native
+    // backend now degrades every one of these to a text placeholder (the
+    // whole point of E2b; covered by its own dedicated tests). Force
+    // `native_vision: true` so this test keeps proving adapter fidelity, not
+    // image-degradation policy.
+    let mut config = test_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "claude-3-5-sonnet-20241022".to_string(),
+        llmconduit::config::ModelProfile {
+            native_vision: Some(true),
+            ..Default::default()
+        },
+    )]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
@@ -9406,7 +9446,21 @@ async fn responses_preserves_multimodal_input_parts() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    // E2b: this test proves canonical `input_image`/`input_file`/`input_audio`
+    // parts survive lowering to the upstream chat payload unchanged, which is
+    // only true on a native-vision backend -- a non-native backend now
+    // degrades the image part to a text placeholder (the whole point of E2b;
+    // covered by its own dedicated tests). Force `native_vision: true` so this
+    // test keeps proving lowering fidelity, not image-degradation policy.
+    let mut config = test_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "glm-5.1".to_string(),
+        llmconduit::config::ModelProfile {
+            native_vision: Some(true),
+            ..Default::default()
+        },
+    )]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
@@ -9492,7 +9546,22 @@ async fn anthropic_messages_converts_tool_result_history() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-2", "It's 72°F in Seattle."))])
         .await;
-    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    // E2b: this test's tool_result carries an image (radar.png) and proves it
+    // converts to a `FunctionCallOutput` + separate image message, which is
+    // only forwarded byte-for-byte on a native-vision backend -- a non-native
+    // backend now degrades it to a text placeholder (the exact "tool-output
+    // image" shape E2b targets; covered by its own dedicated tests). Force
+    // `native_vision: true` so this test keeps proving the tool_result/image
+    // conversion shape, not image-degradation policy.
+    let mut config = test_config();
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "claude-3-5-sonnet-20241022".to_string(),
+        llmconduit::config::ModelProfile {
+            native_vision: Some(true),
+            ..Default::default()
+        },
+    )]);
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = serde_json::json!({
@@ -9917,6 +9986,7 @@ async fn cancels_mid_stream_when_client_disconnects() {
         vision_model: None,
         image_cache_max_size: 100,
         image_cache_ttl_secs: 300,
+        unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
         price_table: std::collections::HashMap::new(),
     };
     // The image agent is off here, so the vision client is inert; a real

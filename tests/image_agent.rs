@@ -21,6 +21,7 @@ use common::event_names;
 use common::image_agent_config;
 use common::test_config;
 use common::test_gateway_with_config;
+use common::test_gateway_with_config_and_replay_store;
 use common::test_gateway_with_vision;
 use common::tool_call_chunk;
 use common::user_message;
@@ -30,15 +31,19 @@ use axum::body::Body;
 use axum::http::Request;
 use futures::StreamExt;
 use llmconduit::config::FallbackUpstreamConfig;
+use llmconduit::config::UnsupportedImagePolicy;
 use llmconduit::config::UpstreamConfig;
 use llmconduit::models::chat::ChatChunkChoice;
 use llmconduit::models::chat::ChatCompletionChunk;
 use llmconduit::models::chat::ChatDelta;
 use llmconduit::models::chat::ChatFunctionCall;
+use llmconduit::models::chat::ChatMessage;
 use llmconduit::models::chat::ChatToolCall;
 use llmconduit::models::responses::ContentItem;
 use llmconduit::models::responses::ResponseItem;
 use llmconduit::models::responses::ToolSpec;
+use llmconduit::replay::ReplayRecord;
+use llmconduit::replay::ReplayStore;
 use pretty_assertions::assert_eq;
 use serde_json::Map as JsonMap;
 use serde_json::json;
@@ -1605,7 +1610,21 @@ async fn upstream_request_log_redacts_image_data_when_agent_disabled() {
 
     let mut config = test_config();
     config.brave_api_key = None;
-    config.image_agent_enabled = false; // agent OFF → raw image reaches upstream
+    config.image_agent_enabled = false; // agent OFF
+    // E2b: with the agent off AND a non-native backend, the engine's residual-
+    // image pass now degrades the image to a text placeholder BEFORE it ever
+    // reaches the upstream request/log — there would be no raw URI left to
+    // redact. Force `native_vision: true` so the raw image still reaches the
+    // wire (and thus the log), keeping this test's actual target intact: the
+    // JSONL log redaction for a raw image that DOES flow through (still a
+    // live path — native-vision passthrough is intentionally unstripped).
+    config.model_profiles = std::collections::BTreeMap::from([(
+        "text-model".to_string(),
+        llmconduit::config::ModelProfile {
+            native_vision: Some(true),
+            ..Default::default()
+        },
+    )]);
     config.upstream_base_url = format!("{}/v1", server.uri()).parse().expect("url");
     config.upstream_request_log_path = Some(log_path.clone());
     let app = llmconduit::build_app(config);
@@ -2263,7 +2282,12 @@ async fn upstream_chat_error_body_with_image_url_is_redacted_in_failed() {
 
     let mut config = test_config();
     config.brave_api_key = None;
-    config.image_agent_enabled = false; // raw image reaches upstream; error echoes it
+    // Agent OFF. E2b now degrades this request's own image to a text
+    // placeholder before dispatch (non-native backend), but that is orthogonal
+    // to what this test targets: the LEAKED text below comes from the MOCK's
+    // 400 error BODY, not from the request, so the placeholder swap does not
+    // affect these assertions.
+    config.image_agent_enabled = false;
     config.upstream_base_url = format!("{}/v1", server.uri()).parse().expect("url");
     let (_app, gateway) = llmconduit::build_app_with_gateway(config);
 
@@ -2294,5 +2318,743 @@ async fn upstream_chat_error_body_with_image_url_is_redacted_in_failed() {
     assert!(
         message.contains("<redacted uri>"),
         "image uris redacted in error body"
+    );
+}
+
+// ===========================================================================
+// E2b — residual-image safety pass: no raw image reaches a non-native-vision
+// backend, regardless of whether the G4 agent above activated. See
+// `.ralph/specs/E2-graceful-image-degradation.md` (Task E2b, AC-4/5/7/8/9).
+// ===========================================================================
+
+fn file_id_image(file_id: &str) -> ContentItem {
+    ContentItem::InputImage {
+        image_url: None,
+        file_id: Some(file_id.to_string()),
+        detail: None,
+    }
+}
+
+fn message_with_role_and_image(role: &str, image: ContentItem) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: role.to_string(),
+        content: vec![image],
+        phase: None,
+    }
+}
+
+// --- AC-4: policy=Placeholder, non-native backend, agent inactive ---
+
+#[tokio::test]
+async fn e2b_placeholder_degrades_user_image_url() {
+    // (a) image_url user image.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+
+    let request = base_request(vec![user_message_with_image(
+        "what is this?",
+        TEST_IMAGE_DATA_URL,
+    )]);
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    assert!(event_names(&events).contains(&"response.completed"));
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(!serialized.contains("iVBORw0KGgo"), "no raw image bytes");
+    assert!(!serialized.contains("image_url"), "no image part at all");
+    assert!(serialized.contains("this model is text-only and cannot view images"));
+    assert!(serialized.contains("1 image(s) were attached here"));
+}
+
+#[tokio::test]
+async fn e2b_placeholder_degrades_user_file_id_image() {
+    // (b) file_id user image -- the ACTIVE strip's own blind spot
+    // (`vision/strip.rs` only matches `image_url: Some`).
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+
+    let request = base_request(vec![message_with_role_and_image(
+        "user",
+        file_id_image("file-abc123"),
+    )]);
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    assert!(event_names(&events).contains(&"response.completed"));
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(!serialized.contains("file-abc123"), "no raw file_id");
+    assert!(!serialized.contains("\"file_id\""), "no image part at all");
+    assert!(serialized.contains("this model is text-only and cannot view images"));
+}
+
+#[tokio::test]
+async fn e2b_placeholder_degrades_tool_output_image_from_anthropic_tool_result() {
+    // (c) tool-output image: an Anthropic tool_result image lowers to a
+    // `FunctionCallOutput` + a following synthetic user-role image message
+    // (`adapters/anthropic_to_responses.rs:339`) -- exercised end-to-end
+    // through the REAL Anthropic HTTP ingress, mirroring
+    // `anthropic_messages_converts_tool_result_history` in `tests/gateway.rs`
+    // but WITHOUT a native-vision override, so the image must degrade.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "It's 72F in Seattle."))])
+        .await;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [
+            { "role": "user", "content": "What's the weather in Seattle?" },
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": { "location": "Seattle" } }
+            ]},
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                    { "type": "text", "text": "72F sunny" },
+                    { "type": "image", "source": { "type": "url", "url": "https://example.com/radar.png" } }
+                ]}
+            ]}
+        ],
+        "tools": [{
+            "name": "get_weather",
+            "description": "Get the weather",
+            "input_schema": {
+                "type": "object",
+                "properties": { "location": { "type": "string" } },
+                "required": ["location"]
+            }
+        }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(
+        !serialized.contains("radar.png"),
+        "no raw image URL upstream"
+    );
+    assert!(
+        serialized.contains("the tool returned an image"),
+        "tool-output wording expected: {serialized}"
+    );
+    // The DEFAULT wording must NOT be used for a tool-output continuation.
+    assert!(!serialized.contains("ask the user to describe"));
+}
+
+#[tokio::test]
+async fn e2b_placeholder_degrades_image_in_non_user_message() {
+    // (d) an image in a NON-user message -- role-agnostic sweep.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+
+    let request = base_request(vec![
+        message_with_role_and_image(
+            "assistant",
+            ContentItem::InputImage {
+                image_url: Some("data:image/png;base64,ASSISTANTRAW".to_string()),
+                file_id: None,
+                detail: None,
+            },
+        ),
+        user_message("what did you just show me?"),
+    ]);
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    assert!(event_names(&events).contains(&"response.completed"));
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(!serialized.contains("ASSISTANTRAW"));
+    assert!(serialized.contains("this model is text-only and cannot view images"));
+}
+
+// --- AC-5: determinism + replay bypass ---
+
+#[tokio::test]
+async fn e2b_lowering_same_request_twice_is_byte_identical() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "ok"))])
+        .await;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+
+    let request = base_request(vec![user_message_with_image(
+        "describe this",
+        TEST_IMAGE_DATA_URL,
+    )]);
+    let _ = collect_stream(
+        gateway
+            .clone()
+            .stream_responses(request.clone())
+            .await
+            .expect("stream"),
+    )
+    .await;
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        serde_json::to_value(&requests[0]).unwrap(),
+        serde_json::to_value(&requests[1]).unwrap(),
+        "the SAME inbound request lowered twice must produce byte-identical upstream JSON"
+    );
+    let serialized = serde_json::to_string(&requests[0]).unwrap();
+    assert!(!serialized.contains("iVBORw0KGgo"));
+}
+
+#[tokio::test]
+async fn e2b_multi_image_order_preserved_after_degrade() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+
+    let message = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "A".to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: Some("data:image/png;base64,IMAGEONE".to_string()),
+                file_id: None,
+                detail: None,
+            },
+            ContentItem::InputText {
+                text: "B".to_string(),
+            },
+            ContentItem::InputImage {
+                image_url: Some("data:image/png;base64,IMAGETWO".to_string()),
+                file_id: None,
+                detail: None,
+            },
+            ContentItem::InputText {
+                text: "C".to_string(),
+            },
+        ],
+        phase: None,
+    };
+    let request = base_request(vec![message]);
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    let content = serde_json::to_string(&requests[0].messages[0].content).expect("serialize");
+    assert!(!content.contains("IMAGEONE") && !content.contains("IMAGETWO"));
+    // Sequential search from the previous match proves the ORIGINAL relative
+    // order (text, placeholder, text, placeholder, text) survived, without
+    // assuming a specific flattened-vs-array JSON shape.
+    let pos_a = content.find('A').expect("A present");
+    let pos_ph1 = content[pos_a..]
+        .find("text-only")
+        .map(|p| p + pos_a)
+        .expect("first placeholder present");
+    let pos_b = content[pos_ph1..]
+        .find('B')
+        .map(|p| p + pos_ph1)
+        .expect("B present");
+    let pos_ph2 = content[pos_b..]
+        .find("text-only")
+        .map(|p| p + pos_b)
+        .expect("second placeholder present");
+    let pos_c = content[pos_ph2..]
+        .find('C')
+        .map(|p| p + pos_ph2)
+        .expect("C present");
+    assert!(
+        pos_a < pos_ph1 && pos_ph1 < pos_b && pos_b < pos_ph2 && pos_ph2 < pos_c,
+        "order not preserved: {content}"
+    );
+    assert!(content.contains("2 image(s) were attached here"));
+}
+
+#[tokio::test]
+async fn e2b_degraded_turn_does_not_write_to_replay_cache() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "42F"))])
+        .await;
+    let replay_store = ReplayStore::new(1000);
+    let gateway = test_gateway_with_config_and_replay_store(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        replay_store.clone(),
+    );
+
+    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    request.store = true; // caller opts in; the degrade must override this.
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    assert!(event_names(&events).contains(&"response.completed"));
+
+    assert!(
+        replay_store.is_empty().await,
+        "a degraded turn must never be written to the replay cache, \
+         even when the caller requested store=true"
+    );
+}
+
+#[tokio::test]
+async fn e2b_degraded_turn_does_not_read_from_replay_cache() {
+    // Prove two DISTINCT images at the same position do not collide: seed a
+    // baseline whose key is EXACTLY what this turn's degraded history would
+    // hash to (computed via the SAME public `degrade_residual_images` fn the
+    // engine calls, so this does not hardcode placeholder wording separately
+    // from the implementation), carrying a distinctive marker that must NOT
+    // leak into the dispatched request if the lookup is correctly bypassed.
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .await;
+    let replay_store = ReplayStore::new(1000);
+
+    let mut request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    request.store = true;
+    let mut would_be_degraded = request.input.clone();
+    llmconduit::vision::degrade_residual_images(&mut would_be_degraded);
+    replay_store
+        .insert(ReplayRecord {
+            model: request.model.clone(),
+            instructions: request.instructions.clone(),
+            visible_history: would_be_degraded,
+            internal_messages: vec![ChatMessage {
+                role: "system".to_string(),
+                content: Some(json!("POISONED_BASELINE_MARKER_ZZZ")),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                thinking: None,
+                tool_calls: None,
+            }],
+        })
+        .await;
+    assert_eq!(replay_store.len().await, 1);
+
+    let gateway = test_gateway_with_config_and_replay_store(
+        upstream.clone(),
+        MockSearch::default(),
+        test_config(),
+        replay_store.clone(),
+    );
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(
+        !serialized.contains("POISONED_BASELINE_MARKER_ZZZ"),
+        "a degraded turn must not read a pre-existing replay baseline, \
+         even an exactly-hash-matching one"
+    );
+}
+
+// --- AC-7: no regression to the active-agent path / native-vision passthrough ---
+
+#[tokio::test]
+async fn e2b_active_agent_degrades_residual_image_without_double_transform() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "cannot see"))])
+        .await;
+    let gateway = test_gateway_with_vision(
+        upstream.clone(),
+        MockVisionClient::default(),
+        image_agent_config(),
+    );
+
+    // History: an OLDER turn's file_id image (the ACTIVE strip's blind spot)
+    // plus the LATEST user turn's normal image_url image (what the active
+    // agent DOES strip+cache+offer analyzeImage for).
+    let request = base_request(vec![
+        message_with_role_and_image("user", file_id_image("file-old-residual")),
+        ResponseItem::message_text("assistant", "ok, what next?"),
+        user_message_with_image("look at this one", TEST_IMAGE_DATA_URL),
+    ]);
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    // The residual file_id image is degraded by E2b (no raw file_id leaked).
+    assert!(!serialized.contains("file-old-residual"));
+    assert!(serialized.contains("text-only and cannot view images"));
+    // The ACTIVE agent's own placeholder for the LATEST image survives
+    // untouched -- not double-transformed into the E2b wording.
+    assert!(serialized.contains("[Image #1]"));
+    assert!(serialized.contains("analyzeImage"));
+    assert!(
+        !serialized.contains("iVBORw0KGgo"),
+        "no raw bytes leaked either way"
+    );
+}
+
+#[tokio::test]
+async fn e2b_native_vision_passthrough_skips_residual_pass_entirely() {
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["Kimi-K2.6"]).await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "I see it"))])
+        .await;
+    let gateway = test_gateway_with_vision(
+        upstream.clone(),
+        MockVisionClient::default(),
+        image_agent_config(),
+    );
+
+    // A residual image in a NON-user message -- exactly what E2b would catch
+    // on a non-native backend. On native-vision passthrough the WHOLE
+    // residual pass must be skipped, so this must ALSO survive untouched.
+    let mut request = base_request(vec![
+        message_with_role_and_image(
+            "assistant",
+            ContentItem::InputImage {
+                image_url: Some("data:image/png;base64,ASSISTANTBYTES".to_string()),
+                file_id: None,
+                detail: None,
+            },
+        ),
+        user_message_with_image("look", TEST_IMAGE_DATA_URL),
+    ]);
+    request.model = "Kimi-K2.6".to_string();
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    let serialized = serde_json::to_string(&requests[0]).expect("serialize");
+    assert!(
+        serialized.contains("ASSISTANTBYTES"),
+        "native-vision must forward the non-user residual image untouched"
+    );
+    assert!(
+        serialized.contains("iVBORw0KGgo"),
+        "native-vision must forward the latest user image untouched"
+    );
+    assert!(
+        !serialized.contains("text-only and cannot view images"),
+        "residual pass must not fire on native-vision passthrough"
+    );
+}
+
+// --- AC-8: policy=Reject fails pre-dispatch with a 4xx, never 502 ---
+
+#[tokio::test]
+async fn e2b_reject_policy_anthropic_returns_4xx_not_502_and_skips_provider() {
+    let upstream = MockUpstream::default();
+    let mut config = test_config();
+    config.unsupported_image_policy = UnsupportedImagePolicy::Reject;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "text-model",
+        "max_tokens": 1024,
+        "stream": false,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "look" },
+                { "type": "image", "source": { "type": "url", "url": "https://example.com/x.png" } }
+            ]
+        }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("body");
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+
+    assert_eq!(
+        status, 400,
+        "Reject must fail pre-dispatch with a 4xx, never 502"
+    );
+    assert_eq!(parsed["type"], "error");
+    assert_eq!(parsed["error"]["type"], "invalid_request_error");
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("text-only"),
+        "structured Anthropic error body: {parsed}"
+    );
+    assert!(
+        upstream.requests().await.is_empty(),
+        "provider must never be contacted on Reject"
+    );
+}
+
+#[tokio::test]
+async fn e2b_reject_policy_chat_returns_4xx_not_502_and_skips_provider() {
+    let upstream = MockUpstream::default();
+    let mut config = test_config();
+    config.unsupported_image_policy = UnsupportedImagePolicy::Reject;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "look" },
+                { "type": "image_url", "image_url": { "url": "https://example.com/x.png" } }
+            ]
+        }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("body");
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+
+    assert_eq!(
+        status, 400,
+        "Reject must fail pre-dispatch with a 4xx, never 502"
+    );
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("text-only"),
+        "structured error body: {parsed}"
+    );
+    assert!(
+        upstream.requests().await.is_empty(),
+        "provider must never be contacted on Reject"
+    );
+}
+
+#[tokio::test]
+async fn e2b_reject_policy_responses_returns_4xx_not_502_and_skips_provider() {
+    let upstream = MockUpstream::default();
+    let mut config = test_config();
+    config.unsupported_image_policy = UnsupportedImagePolicy::Reject;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": false,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                { "type": "input_text", "text": "look" },
+                { "type": "input_image", "image_url": "https://example.com/x.png" }
+            ]
+        }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("body");
+    let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+
+    assert_eq!(
+        status, 400,
+        "Reject must fail pre-dispatch with a 4xx, never 502"
+    );
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("text-only"),
+        "structured error body: {parsed}"
+    );
+    assert!(
+        upstream.requests().await.is_empty(),
+        "provider must never be contacted on Reject"
+    );
+}
+
+// --- AC-9: no image bytes anywhere for a degraded turn ---
+
+#[tokio::test]
+async fn e2b_ac9_no_image_bytes_in_upstream_jsonl_log_for_degraded_turn() {
+    use std::io::Read;
+    let log_dir = std::env::temp_dir().join(format!(
+        "llmconduit-e2b-log-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&log_dir).expect("mkdir");
+    let log_path = log_dir.join("upstream.jsonl");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "object": "list",
+            "data": [{ "id": "text-model", "object": "model" }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-1",
+                    "choices": [{ "index": 0, "delta": { "content": "ok" }, "finish_reason": "stop" }]
+                })])),
+        )
+        .mount(&server)
+        .await;
+
+    // Default config: agent inactive, non-native backend -- the field
+    // incident's exact shape. Placeholder policy is the default.
+    let mut config = test_config();
+    config.brave_api_key = None;
+    config.upstream_base_url = format!("{}/v1", server.uri()).parse().expect("url");
+    config.upstream_request_log_path = Some(log_path.clone());
+    let app = llmconduit::build_app(config);
+
+    let body = json!({
+        "model": "text-model",
+        "stream": true,
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                { "type": "input_text", "text": "what is this?" },
+                { "type": "input_image", "image_url": TEST_IMAGE_DATA_URL }
+            ]
+        }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .expect("body");
+
+    let contents = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let mut contents = String::new();
+            if std::fs::File::open(&log_path)
+                .and_then(|mut f| f.read_to_string(&mut contents))
+                .is_ok()
+                && !contents.is_empty()
+            {
+                break contents;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upstream JSONL log should become non-empty");
+    let _ = std::fs::remove_dir_all(&log_dir);
+
+    assert!(!contents.is_empty(), "log should have an entry");
+    assert!(
+        !contents.contains("iVBORw0KGgo"),
+        "no raw image base64 in the degraded turn's upstream log"
+    );
+    assert!(
+        contents.contains("text-only and cannot view images"),
+        "the placeholder text (not the image) reached the wire: {contents}"
+    );
+}
+
+#[tokio::test]
+async fn e2b_ac9_no_image_bytes_in_failed_error_text_for_degraded_turn() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Err(llmconduit::error::AppError::upstream(
+            "upstream exploded before first token",
+        ))])
+        .await;
+    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), test_config());
+
+    let request = base_request(vec![user_message_with_image("look", TEST_IMAGE_DATA_URL)]);
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let failed = events
+        .iter()
+        .find(|e| e["_event"] == "response.failed")
+        .expect("expected a response.failed event");
+    let message = failed["response"]["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        !message.contains("iVBORw0KGgo"),
+        "no raw image bytes in the failed-turn error text"
+    );
+    assert!(
+        !message.contains("data:image"),
+        "no image data URI scheme in the failed-turn error text"
     );
 }

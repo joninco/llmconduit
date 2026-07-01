@@ -13,6 +13,23 @@ use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
 
+/// E2b: policy for a residual `InputImage` (one the G4 image agent did not
+/// strip — agent inactive/disabled, `tool_choice=="none"`, a `file_id` image,
+/// a non-`user`-role image, or old history) that would otherwise reach a
+/// non-native-vision backend. `Placeholder` (the default) replaces it with an
+/// instructive text placeholder so the model self-corrects instead of the
+/// upstream 400ing on raw image bytes (the field incident this closes);
+/// `Reject` fails the turn before dispatch with a 4xx instead. No `Drop`
+/// variant — silently discarding image content with no signal to the model or
+/// client is a defect, not a policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsupportedImagePolicy {
+    #[default]
+    Placeholder,
+    Reject,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -82,6 +99,9 @@ pub struct Config {
     pub image_cache_max_size: usize,
     /// Per-session image-cache TTL (seconds).
     pub image_cache_ttl_secs: u64,
+    /// E2b: policy applied to a residual image reaching a non-native-vision
+    /// backend after G4 gating. See [`UnsupportedImagePolicy`].
+    pub unsupported_image_policy: UnsupportedImagePolicy,
     /// Per-model price table (T13/D13), keyed by SERVED model id. Drives the
     /// dashboard's flow `cost` roll-up + the Sankey cost coloring + the
     /// `cost_per_min`/`cost_per_sec` rates. Loaded from the YAML `price_table:`
@@ -671,6 +691,11 @@ pub struct PersistedConfig {
     /// Per-session image-cache TTL (seconds).
     #[serde(default = "default_image_cache_ttl_secs")]
     pub image_cache_ttl_secs: u64,
+    /// E2b: policy for a residual image reaching a non-native-vision backend.
+    /// Defaults to `placeholder` (never a silent `drop`) — see
+    /// [`UnsupportedImagePolicy`].
+    #[serde(default = "default_unsupported_image_policy")]
+    pub unsupported_image_policy: UnsupportedImagePolicy,
     /// Per-model price table (T13/D13), keyed by served model id. A YAML map of
     /// `model: { input_per_1k, output_per_1k, cached_per_1k? }`. Wholesale-
     /// overridable by `LLMCONDUIT_PRICE_TABLE_JSON` (mirrors the
@@ -751,6 +776,14 @@ fn default_image_cache_ttl_secs() -> u64 {
     300
 }
 
+/// Default E2b residual-image policy: replace with an instructive placeholder
+/// rather than reject the turn, so an existing deployment that upgrades keeps
+/// serving `200`s (matching the pre-E2b common case) instead of newly 4xx-ing
+/// every image-bearing turn against a non-native-vision backend.
+fn default_unsupported_image_policy() -> UnsupportedImagePolicy {
+    UnsupportedImagePolicy::Placeholder
+}
+
 impl Default for PersistedConfig {
     fn default() -> Self {
         Self {
@@ -785,6 +818,7 @@ impl Default for PersistedConfig {
             vision_model: None,
             image_cache_max_size: default_image_cache_max_size(),
             image_cache_ttl_secs: default_image_cache_ttl_secs(),
+            unsupported_image_policy: default_unsupported_image_policy(),
             price_table: HashMap::new(),
         }
     }
@@ -973,6 +1007,7 @@ impl Config {
             // cache evict every image immediately and silently disable the agent.
             image_cache_max_size: config.image_cache_max_size.max(1),
             image_cache_ttl_secs: config.image_cache_ttl_secs,
+            unsupported_image_policy: config.unsupported_image_policy,
             price_table: {
                 // D13 R1 MED: reject any YAML price entry with a non-finite rate so
                 // the resolved table only holds finite prices (the topology price
@@ -1742,6 +1777,15 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.image_cache_ttl_secs = parsed;
     }
+    if let Ok(value) = env::var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY") {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "placeholder" => config.unsupported_image_policy = UnsupportedImagePolicy::Placeholder,
+            "reject" => config.unsupported_image_policy = UnsupportedImagePolicy::Reject,
+            // Unrecognized value: ignore rather than silently defaulting to a
+            // DIFFERENT policy than a typo'd env var probably intended.
+            _ => {}
+        }
+    }
     // T13/D13: the per-model price table can be supplied wholesale as a JSON map
     // via the environment (mirrors `LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON`). The
     // env value REPLACES the YAML `price_table:` map when it parses; a malformed
@@ -1784,6 +1828,7 @@ mod tests {
     use super::PersistedFallbackUpstream;
     use super::PersistedModelProfile;
     use super::PersistedUpstream;
+    use super::UnsupportedImagePolicy;
     use super::apply_env_overrides;
     use super::default_config_path;
     use super::load_persisted_config;
@@ -2190,6 +2235,77 @@ model_profiles:
     }
 
     #[test]
+    fn unsupported_image_policy_defaults_to_placeholder_when_omitted() {
+        // `#[serde(default = "default_unsupported_image_policy")]` must fill in
+        // `Placeholder` for a config file written before E2b existed.
+        let parsed: PersistedConfig =
+            serde_yaml::from_str("upstream_base_url: http://127.0.0.1:8000/v1\n").expect("yaml");
+        assert_eq!(
+            parsed.unsupported_image_policy,
+            UnsupportedImagePolicy::Placeholder
+        );
+        let resolved = Config::from_persisted(&parsed).expect("config");
+        assert_eq!(
+            resolved.unsupported_image_policy,
+            UnsupportedImagePolicy::Placeholder
+        );
+    }
+
+    #[test]
+    fn unsupported_image_policy_parses_and_serializes_snake_case() {
+        let parsed: PersistedConfig =
+            serde_yaml::from_str("unsupported_image_policy: reject\n").expect("yaml");
+        assert_eq!(
+            parsed.unsupported_image_policy,
+            UnsupportedImagePolicy::Reject
+        );
+        let yaml = serde_yaml::to_string(&parsed).expect("serialize");
+        assert!(
+            yaml.contains("unsupported_image_policy: reject"),
+            "expected snake_case `reject`, got: {yaml}"
+        );
+    }
+
+    #[test]
+    fn apply_env_overrides_unsupported_image_policy_reject() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY", "Reject");
+        }
+        let mut config = PersistedConfig::default();
+        apply_env_overrides(&mut config);
+        assert_eq!(
+            config.unsupported_image_policy,
+            UnsupportedImagePolicy::Reject
+        );
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY");
+        };
+    }
+
+    #[test]
+    fn apply_env_overrides_unsupported_image_policy_ignores_unrecognized_value() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY", "bogus");
+        }
+        let mut config = PersistedConfig {
+            unsupported_image_policy: UnsupportedImagePolicy::Reject,
+            ..PersistedConfig::default()
+        };
+        apply_env_overrides(&mut config);
+        // A typo'd value must not silently coerce to the OTHER policy — left
+        // unchanged rather than guessing which one was intended.
+        assert_eq!(
+            config.unsupported_image_policy,
+            UnsupportedImagePolicy::Reject
+        );
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY");
+        };
+    }
+
+    #[test]
     fn apply_env_overrides_upstream_failure_cooldown() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         unsafe {
@@ -2273,6 +2389,7 @@ model_profiles:
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
@@ -2342,6 +2459,7 @@ model_profiles:
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
@@ -2519,6 +2637,7 @@ model_profiles:
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
@@ -2592,6 +2711,7 @@ model_profiles:
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
@@ -2695,6 +2815,7 @@ model_profiles:
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
@@ -2798,6 +2919,7 @@ model_profiles:
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
@@ -3192,6 +3314,7 @@ model_profiles:
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
@@ -3251,6 +3374,7 @@ model_profiles:
             vision_model: None,
             image_cache_max_size: 100,
             image_cache_ttl_secs: 300,
+            unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             price_table: std::collections::HashMap::new(),
