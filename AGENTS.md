@@ -111,6 +111,7 @@ These are intentional and load-bearing. Do not change without strong reason + ma
 - **`response.web_search_results`** is a non-standard additive SSE event consumed only by the Anthropic converter. OpenAI clients ignore unknown events, so this stays compatible. See `engine.rs:1480-1485`.
 - **`previous_response_id` is unsupported** and must continue to return 400 from canonical lowering. Replay is internal SHA256-prefix state, not OpenAI hosted response retrieval.
 - **Image generation tools are stripped before upstream.** They remain accepted in Responses wire types but are not sent as chat tools.
+- **Request-intrinsic 4xx `{400,413,415,422}` never cools/fails over a provider.** The leaf tags these `FailoverDisposition::Terminal` (`upstream.rs` `dispatch_chat_stream`); `401/403/404/408/429`/5xx/connect/timeout keep failover + cooldown unchanged. Limitation: a request-intrinsic 400 is therefore NOT retried on a differently-capable provider — acceptable because E2b removes images before dispatch, and a non-image request-intrinsic 400 would reject identically elsewhere.
 
 ## Config resolution order
 

@@ -10734,6 +10734,254 @@ async fn e1_repair_ceiling_structured_terminal_anthropic_stream() {
     assert_sse_conformant(&anthropic_events, Surface::Error);
 }
 
+/// E2a AC-1 + AC-3 (Anthropic surface), full HTTP fidelity: reproduces the field
+/// incident almost exactly — an image reaching a text-only vLLM backend 400'd with
+/// "not a multimodal model", which used to trip a cooldown (`test_config()`'s
+/// `upstream_failure_cooldown_secs: 30` matches the incident's own window) and 502
+/// every unrelated request for its duration. This drives the REAL leaf
+/// (`ReqwestUpstreamClient`) over wiremock via `build_app_with_gateway_and_options`, so
+/// it exercises the ACTUAL E2a disposition logic in `dispatch_chat_stream`, not a
+/// hand-built `AppError`.
+#[tokio::test]
+async fn e2a_request_intrinsic_400_no_cooldown_structured_anthropic_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.1"}]
+        })))
+        .mount(&server)
+        .await;
+    // First call: the field incident's exact upstream body.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            "{\"error\":{\"message\":\"DeepSeek-V4-Flash-DSpark is not a multimodal \
+             model\",\"type\":\"BadRequestError\",\"code\":400}}",
+        ))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    // Every later call (the "second, unrelated request" below): a normal success.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-1",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": "hello again"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": null
+                })])),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
+        config,
+        None,
+        llmconduit::AppOptions::default(),
+    );
+
+    let first_body = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "describe this image" }]
+    });
+    let first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&first_body).expect("serialize"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        first.status().as_u16(),
+        200,
+        "a streaming response is 200 even when the turn fails — the error is an SSE frame"
+    );
+    let bytes = axum::body::to_bytes(first.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+    assert!(
+        text.contains("event: error"),
+        "a request-intrinsic 4xx must surface as a structured Anthropic error event, \
+         never a raw abort: {text}"
+    );
+    assert!(
+        !text.contains("502") && !text.contains("Bad Gateway"),
+        "the client-visible error must not leak the internal 502 upstream-error status: {text}"
+    );
+    use llmconduit::adapters::responses_to_anthropic::conformance::Surface;
+    use llmconduit::adapters::responses_to_anthropic::conformance::assert_sse_conformant;
+    let anthropic_events = parse_anthropic_sse_events(&text);
+    assert_sse_conformant(&anthropic_events, Surface::Error);
+
+    // AC-1 capstone: a SECOND, unrelated request must be served normally — the
+    // provider must NOT be cooling (the exact field-incident regression: every
+    // request 502'd for the cooldown window after one image 400).
+    let second_body = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "unrelated text-only question" }]
+    });
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&second_body).expect("serialize"),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        second.status().as_u16(),
+        200,
+        "the second, unrelated request must be served, not short-circuited by a cooldown"
+    );
+    let bytes2 = axum::body::to_bytes(second.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let text2 = String::from_utf8(bytes2.to_vec()).expect("utf8");
+    assert!(
+        text2.contains("hello again"),
+        "the second request must actually reach the upstream and stream real content, \
+         proving the provider was never cooled: {text2}"
+    );
+    assert!(
+        !text2.contains("event: error"),
+        "the second request must NOT fail: {text2}"
+    );
+}
+
+/// E2a AC-3 (Chat inbound format, streaming): a request-intrinsic 4xx must render as a
+/// structured SSE `error` data frame, never a raw abort or a masked 502 status on the
+/// overall (already-200) streaming response. The canonical `response.failed` -> Chat
+/// SSE `error` rendering (`adapters/chat_completions.rs`) never reads
+/// `FailoverDisposition` (grep-verified: that type only appears in `error.rs` /
+/// `upstream.rs`), so a plain `AppError::upstream(...)` shaped exactly like the real
+/// leaf's message reproduces the SAME rendering path a real Terminal-tagged
+/// request-intrinsic 4xx flows through — the wiremock-backed Anthropic test above
+/// covers the real leaf end-to-end; this covers the Chat egress converter.
+#[tokio::test]
+async fn e2a_request_intrinsic_4xx_structured_terminal_chat_stream() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Err(llmconduit::error::AppError::upstream(
+            "upstream chat failed with 400: {\"error\":{\"message\":\"model is not \
+             multimodal\"}}",
+        ))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "stream": true,
+        "messages": [{ "role": "user", "content": "go" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("body");
+    let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+    let error_frame = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|payload| *payload != "[DONE]")
+        .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .find(|value| value.get("error").is_some())
+        .expect("a request-intrinsic 4xx must emit a structured chat SSE error frame");
+    assert!(
+        error_frame["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("400"),
+        "chat error frame should surface the upstream status in the message: {text}"
+    );
+    assert!(
+        text.contains("[DONE]"),
+        "chat error frame must still close the stream: {text}"
+    );
+}
+
+/// E2a AC-3 (Responses inbound format, streaming): canonical Responses IS the wire
+/// format here — a request-intrinsic 4xx must surface as `response.failed`, never a
+/// raw stream abort. Same disposition-agnostic rendering argument as the Chat test
+/// above (canonical `response.failed` construction, `engine::failure_event`, never
+/// reads `FailoverDisposition` either).
+#[tokio::test]
+async fn e2a_request_intrinsic_4xx_structured_terminal_responses_stream() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Err(llmconduit::error::AppError::upstream(
+            "upstream chat failed with 400: {\"error\":{\"message\":\"model is not \
+             multimodal\"}}",
+        ))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let events = collect_stream(
+        gateway
+            .stream_responses(base_request(vec![user_message("describe this image")]))
+            .await
+            .expect("stream"),
+    )
+    .await;
+    let names = event_names(&events);
+    assert!(
+        names.contains(&"response.failed"),
+        "a request-intrinsic 4xx must emit a structured response.failed event: {names:?}"
+    );
+    let failed = events
+        .iter()
+        .find(|event| event["_event"] == "response.failed")
+        .expect("response.failed event");
+    let message = failed["response"]["error"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        message.contains("400"),
+        "response.failed should surface the upstream status: {message}"
+    );
+    assert!(
+        !names.iter().any(|name| name.contains("output_text")),
+        "no content should have streamed before the terminal failure: {names:?}"
+    );
+}
+
 /// E1 cancellation harness: the FIRST upstream call yields a hallucinated tool
 /// call then ENDS (so the engine soft-rejects and starts a repair round); EVERY
 /// later call (the repair round) PARKS forever, so a client drop DURING the

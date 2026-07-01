@@ -10,6 +10,9 @@
 
 ## Executive summary
 
+**Status: 1/3 tasks complete.** E2a ✅ done — committed + Codex-xhigh APPROVED (full detail archived in
+`.ralph/COMPLETED_TASKS.md`). E2b/E2c ⬜ pending.
+
 Field incident: an image in a claude-cli tool chain hit the text-only upstream → **400 "not a multimodal
 model"** → the 400 tripped a **30 s provider cooldown** → every request **502**'d. Two independent fixes,
 each shippable with its own tests: (E2a) a *request-intrinsic* 4xx (400/413/415/422) must never cool down
@@ -19,11 +22,11 @@ ON the existing G4 vision agent (unchanged); closes the residuals it misses.
 
 ## Tasks
 
-| Task | Description | Key files | Ships tests |
-|-|-|-|-|
-| E2a | request-intrinsic 4xx {400,413,415,422} → `Terminal` (no failover/cooldown); 401/403/404/408/429 unchanged; keep dashboard class `HttpStatus` + `failover_reason=TerminalNoFailover` | `upstream.rs` (`1195-1267`,`1789`,`2818`,`114/143`), `error.rs` | AC-1,2,3 |
-| E2b | role-agnostic residual-image pass AFTER `activate_image_agent` for non-native backends (covers non-user + `file_id` + old-history + `tool_choice=none`); `unsupported_image_policy` on `Config`+`PersistedConfig`; `Reject`→4xx (not 502); degraded turn bypasses replay | `engine.rs:1174`, `vision/strip.rs`, `config.rs` (`70-80`,`593`,`1604`), `error.rs`, `replay.rs` | AC-4,5,7,8,9 |
-| E2c | docs only (`FEATURES.md`, `AGENTS.md` invariants + limitation, `config.yaml` comment) | docs | — |
+| Task | Description | Status |
+|-|-|-|
+| E2a | request-intrinsic 4xx {400,413,415,422} → `Terminal` (no failover/cooldown); 401/403/404/408/429 unchanged; dashboard class stays `HttpStatus` + `failover_reason=TerminalNoFailover` (`upstream.rs`, `error.rs`); shipped AC-1,2,3 | ✅ |
+| E2b | role-agnostic residual-image pass AFTER `activate_image_agent` for non-native backends (covers non-user + `file_id` + old-history + `tool_choice=none`); `unsupported_image_policy` on `Config`+`PersistedConfig`; `Reject`→4xx (not 502); degraded turn bypasses replay — `engine.rs:1174`, `vision/strip.rs`, `config.rs` (`70-80`,`593`,`1604`), `error.rs`, `replay.rs`; ships AC-4,5,7,8,9 | ⬜ |
+| E2c | docs only (`FEATURES.md`, `AGENTS.md` invariants + limitation, `config.yaml` comment) | ⬜ |
 
 **Ordering: serial E2a → E2b → E2c** (shared files force serial; `--agents 1`). E2a and E2b are logically
 independent, but E2a first establishes the 4xx-status handling that E2b's `Reject` path reuses, and it

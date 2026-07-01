@@ -98,8 +98,7 @@ fn stamp_header_byte(serving: Option<&Arc<ServingToken>>) {
 /// response body interpolated into `"upstream chat failed with {status}: {body}"`. A raw
 /// body containing the literal text `"timed out"` / `"request failed"` must NOT be able to
 /// flip the bounded code. So:
-///   - `Terminal` disposition (a context-overflow that survived shrink-and-retry) → `Terminal`.
-///   - Otherwise we match the gateway's OWN fixed leaf-error PREFIXES with `starts_with`
+///   - We match the gateway's OWN fixed leaf-error PREFIXES with `starts_with`
 ///     against the part of the message BEFORE any `{body}` is interpolated. Each
 ///     body-bearing gateway error is `"<fixed prefix> {status}: <body>"` or
 ///     `"<fixed prefix>: <reqwest err>"`, so a `starts_with` on the fixed prefix is
@@ -107,16 +106,31 @@ fn stamp_header_byte(serving: Option<&Arc<ServingToken>>) {
 ///     markers (timeout / stream-ended) match in full. First-chunk read/parse failures
 ///     from `stream_success_response` (`"failed to parse upstream chat chunk: …"` /
 ///     `"failed to read upstream SSE: …"`) match their fixed prefix → `Stream`.
-///   - Anything else falls back to the HTTP status class (4xx/5xx → `HttpStatus`).
+///   - Only once NONE of those fixed prefixes match do we fall back to `Terminal`
+///     disposition (E2a: this is now checked LAST, not first — see below) and finally
+///     `Other`.
+///
+/// E2a note: `Terminal` disposition is no longer a same-provider-terminal ⇒
+/// `AttemptErrorClass::Terminal` shortcut checked FIRST. E2a additionally tags a
+/// request-intrinsic 4xx (`{400,413,415,422}`, `dispatch_chat_stream`) `Terminal` so
+/// failover/cooldown skip it, but the DASHBOARD taxonomy must still show that case as
+/// `HttpStatus` (it IS a genuine upstream HTTP-status response) — `AttemptErrorClass::
+/// Terminal` stays reserved for a context-window overflow that survived shrink-and-retry,
+/// whose message (`"upstream context-window overflow persisted …"`) never matches the
+/// `"upstream chat failed with "` prefix below. Checking the fixed prefixes BEFORE the
+/// disposition fallback lets the SAME message-shape drive the SAME `HttpStatus` code
+/// regardless of disposition, while the two Terminal producers stay classified
+/// differently: request-intrinsic 4xx → `HttpStatus` (via the prefix match), persisted
+/// overflow → `Terminal` (via the fallback, nothing else matches its message). Only
+/// `failover_reason` (`AttemptFailoverReason::TerminalNoFailover`, set by the callers
+/// below) distinguishes "terminal, no failover" from an ordinary failover-eligible
+/// `HttpStatus` in the trace — `error_class` alone does not.
 ///
 /// Every prefix below is a constant string this module constructs in `dispatch_chat_stream`
 /// / `send_chat_request` / `prefetch_first_chunk` — none is reachable from upstream text.
 fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptErrorClass {
     use crate::dashboard_flow::AttemptErrorClass;
     use crate::error::FailoverDisposition;
-    if err.failover_disposition() == FailoverDisposition::Terminal {
-        return AttemptErrorClass::Terminal;
-    }
     let message = err.to_string();
     // Transport/connect failure BEFORE any HTTP response: `send_chat_request` /
     // `list_models` map a reqwest send error to this fixed prefix; the trailing
@@ -139,7 +153,9 @@ fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptError
     // is interpolated strictly AFTER this fixed prefix, so `starts_with` cannot be
     // influenced by body text (a body that itself contains "timed out" / "request failed"
     // is already excluded above because those branches require the message to START with /
-    // EQUAL their own markers, which this variant never does).
+    // EQUAL their own markers, which this variant never does). E2a: this ALSO catches a
+    // request-intrinsic 4xx tagged `Terminal` — same message shape, same bounded code,
+    // regardless of disposition (see the function doc comment).
     if message.starts_with("upstream chat failed with ") {
         return AttemptErrorClass::HttpStatus;
     }
@@ -154,6 +170,13 @@ fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptError
         || message.starts_with("failed to read upstream SSE:")
     {
         return AttemptErrorClass::Stream;
+    }
+    // Nothing above matched: a `Terminal` disposition reaching here is the OTHER
+    // Terminal producer — a context-window overflow that survived shrink-and-retry
+    // (its message never matches the `"upstream chat failed with "` prefix above, so it
+    // falls through to here rather than being caught as `HttpStatus`).
+    if err.failover_disposition() == FailoverDisposition::Terminal {
+        return AttemptErrorClass::Terminal;
     }
     // Anything else is a generic gateway-side failover-eligible condition (cooldown,
     // "no models available", "all providers failed before producing a response"). We do
@@ -1251,20 +1274,49 @@ impl ReqwestUpstreamClient {
                     FailoverDisposition::Terminal,
                 ));
             }
-            return Err(AppError::upstream(format!(
-                "upstream chat failed with {retry_status}: {}",
-                redact_and_truncate_error_body(&retry_body, 500)
-            )));
+            // E2a: the retry's status might not be an overflow at all (the shrink fixed
+            // the size but the request is unacceptable for another reason) — a
+            // request-intrinsic 4xx {400,413,415,422} still must not cool/failover a
+            // healthy provider. Every other status (401/403/404/408/429/5xx) keeps the
+            // default `Failover` disposition, unchanged (disposition matrix in
+            // `.ralph/specs/E2-graceful-image-degradation.md`, Task E2a).
+            let retry_disposition = if status_is_request_intrinsic_4xx(retry_status) {
+                FailoverDisposition::Terminal
+            } else {
+                FailoverDisposition::Failover
+            };
+            return Err(AppError::upstream_with_disposition(
+                format!(
+                    "upstream chat failed with {retry_status}: {}",
+                    redact_and_truncate_error_body(&retry_body, 500)
+                ),
+                retry_disposition,
+            ));
         }
 
         // Gap 05: a first-attempt non-2xx that did NOT trigger a context-overflow retry
         // — stage the upstream error body so the operator can see why the turn failed (it
         // is cleared if a later failover provider serves; committed at finalize otherwise).
         self.capture_upstream_response_body(serving, &body);
-        Err(AppError::upstream(format!(
-            "upstream chat failed with {status}: {}",
-            redact_and_truncate_error_body(&body, 500)
-        )))
+        // E2a: request-intrinsic 4xx {400,413,415,422} → `Terminal` (never cools or fails
+        // over a healthy provider — the request itself is unacceptable to any equivalent
+        // backend; e.g. an image reaching a text-only upstream). 401/403/404/408/429/5xx
+        // keep the default `Failover` disposition, unchanged (disposition matrix in
+        // `.ralph/specs/E2-graceful-image-degradation.md`, Task E2a). The `== Terminal`
+        // gate in the failover loop (`stream_chat_completion_with_provider_indices`) then
+        // skips `mark_failure` for this case — no cooldown, no failover.
+        let disposition = if status_is_request_intrinsic_4xx(status) {
+            FailoverDisposition::Terminal
+        } else {
+            FailoverDisposition::Failover
+        };
+        Err(AppError::upstream_with_disposition(
+            format!(
+                "upstream chat failed with {status}: {}",
+                redact_and_truncate_error_body(&body, 500)
+            ),
+            disposition,
+        ))
     }
 }
 
@@ -1991,7 +2043,7 @@ impl FailoverUpstreamClient {
             {
                 Ok(response) => {
                     let status = response.status();
-                    if !should_failover_proxy_status(status) {
+                    if !status_is_failover_eligible(status) {
                         return Ok(response);
                     }
                     let body = response.text().await.unwrap_or_default();
@@ -2815,10 +2867,35 @@ fn timeout_upstream_stream(
     })
 }
 
-fn should_failover_proxy_status(status: StatusCode) -> bool {
+/// A provider-failure-shaped status: a server error, or a request-timeout/rate-limit
+/// another provider might succeed on. Used by the raw `/v1/completions` proxy failover
+/// (`proxy_completions_with_provider_indices`) and cross-referenced by
+/// [`status_is_request_intrinsic_4xx`]'s disjointness check below, so the two "which
+/// statuses trigger which behavior" predicates stay auditable side by side. Formerly
+/// `should_failover_proxy_status`; renamed because it is no longer proxy-path-only in
+/// spirit (still the only literal call site outside this module's tests, but the E2a
+/// leaf now reasons about the same status space via its sibling predicate).
+fn status_is_failover_eligible(status: StatusCode) -> bool {
     status.is_server_error()
         || status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
+}
+
+/// E2a: statuses where the REQUEST ITSELF (not the provider) is unacceptable to ANY
+/// equivalent backend — a malformed/oversized/unsupported-media request, or the more
+/// specific "unprocessable" reject. Retrying it on another provider would fail
+/// identically (e.g. an image reaching a text-only upstream), so these must never
+/// cool/failover a healthy provider — see the disposition matrix in
+/// `.ralph/specs/E2-graceful-image-degradation.md` (Task E2a). Disjoint BY CONSTRUCTION
+/// from [`status_is_failover_eligible`] (no server error, 408, or 429 is in this set);
+/// `debug_assert`ed so the two predicates can never silently start overlapping.
+fn status_is_request_intrinsic_4xx(status: StatusCode) -> bool {
+    let intrinsic = matches!(status.as_u16(), 400 | 413 | 415 | 422);
+    debug_assert!(
+        !intrinsic || !status_is_failover_eligible(status),
+        "status {status} cannot be both request-intrinsic-terminal and failover-eligible"
+    );
+    intrinsic
 }
 
 /// Resolved per-model finalization policies, built ONCE from config and shared
@@ -4264,6 +4341,7 @@ mod tests {
     use crate::models::chat::ChatCompletionRequest;
     use crate::models::chat::ChatMessage;
     use http::HeaderName;
+    use reqwest::StatusCode;
     use serde_json::Value;
     use std::collections::BTreeMap;
 
@@ -4352,6 +4430,7 @@ mod tests {
     use super::FailoverUpstreamClient;
     use super::FailoverUpstreamProvider;
     use super::ModelFamily;
+    use super::ProviderStatus;
     use super::UpstreamClient as _;
     use super::apply_family_chat_template_kwargs;
     use super::detect_model_family;
@@ -6353,6 +6432,88 @@ mod tests {
             )),
             AttemptErrorClass::Terminal
         );
+        // E2a (dashboard taxonomy): a request-intrinsic 4xx is ALSO tagged `Terminal`
+        // disposition (no failover/cooldown — `dispatch_chat_stream`), but it is a
+        // genuine upstream HTTP-status response, so it must classify as `HttpStatus`,
+        // NOT `AttemptErrorClass::Terminal` (which stays reserved for a context-window
+        // overflow that survived shrink-and-retry, asserted above with a message that
+        // does NOT share this prefix). Only `failover_reason` (tested separately via
+        // `record_attempt`/`failed_bare_attempt`) distinguishes the two Terminal
+        // producers in the trace — `error_class` alone must not collapse them.
+        assert_eq!(
+            classify_attempt_error(&AppError::upstream_with_disposition(
+                "upstream chat failed with 400: {\"error\":{\"message\":\"model is not \
+                 multimodal\"}}",
+                FailoverDisposition::Terminal
+            )),
+            AttemptErrorClass::HttpStatus,
+            "a Terminal-tagged request-intrinsic 4xx must still classify as HttpStatus"
+        );
+    }
+
+    /// E2a: the exact status set that is `Terminal` (never cools/fails over a healthy
+    /// provider) vs. the exact status set that keeps today's failover-eligible behavior.
+    /// The two predicates are disjoint by construction (`status_is_request_intrinsic_4xx`
+    /// asserts this internally too); this test pins the literal membership so a future
+    /// edit cannot silently widen/narrow either set without a red test.
+    #[test]
+    fn request_intrinsic_4xx_set_is_exactly_400_413_415_422() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            assert!(
+                super::status_is_request_intrinsic_4xx(status),
+                "{status} must be request-intrinsic (Terminal, no failover/cooldown)"
+            );
+            assert!(
+                !super::status_is_failover_eligible(status),
+                "{status} must NOT also be failover-eligible (the two sets are disjoint)"
+            );
+        }
+        // 401/403/404/408/429 and a representative 5xx MUST NOT be request-intrinsic —
+        // they keep today's failover + cooldown (disposition matrix, spec E2).
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                !super::status_is_request_intrinsic_4xx(status),
+                "{status} must NOT be request-intrinsic — it keeps failover + cooldown"
+            );
+        }
+        // And the failover-eligible set is exactly what it always was: 5xx/408/429.
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(
+                super::status_is_failover_eligible(status),
+                "{status} must stay failover-eligible (unchanged by E2a)"
+            );
+        }
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert!(
+                !super::status_is_failover_eligible(status),
+                "{status} is a provider-config 4xx, not server-error/408/429 — it fails \
+                 over via the generic error path, not `status_is_failover_eligible`"
+            );
+        }
     }
 
     /// F2 (round-1 review): the bounded code must be driven by the gateway's OWN fixed
@@ -7148,6 +7309,232 @@ mod tests {
             first_byte, last.first_upstream_byte_ms,
             "flow-level first byte is the SERVED attempt's wire first-byte, not the failed one's"
         );
+    }
+
+    /// AC-1 (E2a): a synthetic upstream returning 400 on a streaming turn does NOT cool
+    /// the provider — a SECOND, unrelated request to the SAME (single, non-failover-peer)
+    /// provider is still served, not short-circuited by `cooldown_error()`. Regression
+    /// test for the field incident: an image reaching a text-only vLLM backend 400'd with
+    /// "not a multimodal model", which used to trip a 30s cooldown and 502 every
+    /// unrelated request for its duration (`upstream.rs:1807` pre-E2a).
+    #[tokio::test]
+    async fn request_intrinsic_400_does_not_cool_provider_second_request_served() {
+        use crate::dashboard_flow::AttemptErrorClass;
+        use crate::dashboard_flow::AttemptFailoverReason;
+        use crate::dashboard_flow::AttemptStatus;
+        let server = MockServer::start().await;
+        // First call: a request-intrinsic 400 (the field incident's exact upstream body).
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "{\"error\":{\"message\":\"DeepSeek-V4-Flash-DSpark is not a multimodal \
+                 model\",\"type\":\"BadRequestError\",\"code\":400}}",
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        // Every later call (including the "second, unrelated request" below): 200.
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(d2_sse_ok_body()))
+            .mount(&server)
+            .await;
+
+        // A SINGLE provider — no failover peer, so a wrongly-cooled provider leaves
+        // `available_provider_indices()` empty and the second call fails via
+        // `cooldown_error()` (a 502) WITHOUT ever reaching the mock server. A generous
+        // cooldown window (30s, matching the field incident) makes the test meaningful:
+        // if the fix regressed, the second call below would fail immediately.
+        let failover = FailoverUpstreamClient::new(
+            vec![FailoverUpstreamProvider::new(
+                "primary",
+                d2_capturing_client(&server.uri(), DashboardFlowStore::disabled()),
+                None,
+                None,
+                JsonMap::new(),
+            )],
+            std::time::Duration::from_secs(30),
+        );
+
+        // First (failing) turn.
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some("resp_400".to_string()),
+            Some(Arc::clone(&token)),
+        );
+        let err = match failover.stream_chat_completion(&backend).await {
+            Ok(_) => panic!("a request-intrinsic 400 must surface as an error, not a stream"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("400"),
+            "error must carry the upstream status: {err}"
+        );
+
+        // Dashboard trace: HttpStatus (a genuine HTTP-status response), NOT
+        // `AttemptErrorClass::Terminal` (reserved for context-overflow) — and
+        // `failover_reason == TerminalNoFailover` (terminal, no failover attempted).
+        let (attempts, _) = token.attempts_snapshot();
+        assert_eq!(attempts.len(), 1, "one failed attempt recorded");
+        assert_eq!(attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(
+            attempts[0].error_class,
+            Some(AttemptErrorClass::HttpStatus),
+            "a request-intrinsic 4xx is a genuine HTTP-status failure, not Terminal-class"
+        );
+        assert_eq!(
+            attempts[0].failover_reason,
+            Some(AttemptFailoverReason::TerminalNoFailover),
+            "the trace must show failover did NOT advance for this attempt"
+        );
+
+        // The provider must NOT be cooling: no deadline, no failure counted.
+        let health = failover.provider_health();
+        assert_eq!(health.len(), 1);
+        assert_eq!(
+            health[0].status,
+            ProviderStatus::Healthy,
+            "a request-intrinsic 4xx must never cool a healthy provider"
+        );
+        assert!(
+            health[0].cooling_until_ms.is_none(),
+            "no cooldown deadline must be set"
+        );
+        assert_eq!(
+            health[0].failover_count, 0,
+            "mark_failure must be skipped for a Terminal disposition"
+        );
+        assert_eq!(health[0].consecutive_failures, 0);
+
+        // SECOND, unrelated request to the SAME provider: served 200, not 502 — this is
+        // the actual regression the field incident hit (every request 502'd for 30s).
+        let token2 = Arc::new(super::ServingToken::default());
+        let backend2 = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some("resp_unrelated".to_string()),
+            Some(Arc::clone(&token2)),
+        );
+        let mut stream = failover
+            .stream_chat_completion(&backend2)
+            .await
+            .expect("the second, unrelated request must be served — provider not cooling");
+        let mut served_any = false;
+        while let Some(item) = stream.next().await {
+            item.expect("second request must stream successfully, not 502");
+            served_any = true;
+        }
+        assert!(
+            served_any,
+            "the second request must actually stream content"
+        );
+    }
+
+    /// AC-2 (E2a): 5xx, 408, 429, AND 401/403/404 must STILL cool the provider down AND
+    /// fail over to the next one — E2a's new Terminal path is scoped EXACTLY to
+    /// `{400,413,415,422}` and must not leak onto any other status, including the other
+    /// 4xx codes (401/403/404 are provider/model/auth config problems another provider
+    /// may resolve, unlike a request-intrinsic 4xx). Each status gets its own explicit
+    /// assertion — they are not lumped into one "some 4xx" check.
+    #[tokio::test]
+    async fn failover_eligible_statuses_still_cool_and_fail_over_unchanged() {
+        use crate::dashboard_flow::AttemptErrorClass;
+        use crate::dashboard_flow::AttemptFailoverReason;
+        use crate::dashboard_flow::AttemptStatus;
+        for status in [500u16, 502, 503, 408, 429, 401, 403, 404] {
+            let down = MockServer::start().await;
+            Mock::given(wm_method("POST"))
+                .and(wm_path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("provider unavailable"))
+                .mount(&down)
+                .await;
+            let up = MockServer::start().await;
+            Mock::given(wm_method("POST"))
+                .and(wm_path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(d2_sse_ok_body()))
+                .mount(&up)
+                .await;
+
+            let failover = FailoverUpstreamClient::new(
+                vec![
+                    FailoverUpstreamProvider::new(
+                        "primary",
+                        d2_capturing_client(&down.uri(), DashboardFlowStore::disabled()),
+                        None,
+                        None,
+                        JsonMap::new(),
+                    ),
+                    FailoverUpstreamProvider::new(
+                        "backup",
+                        d2_capturing_client(&up.uri(), DashboardFlowStore::disabled()),
+                        None,
+                        None,
+                        JsonMap::new(),
+                    ),
+                ],
+                std::time::Duration::from_secs(30),
+            );
+
+            let token = Arc::new(super::ServingToken::default());
+            let backend = BackendChatRequest::new(
+                family_request("m"),
+                None,
+                Some(format!("resp_{status}")),
+                Some(Arc::clone(&token)),
+            );
+            let mut stream = failover
+                .stream_chat_completion(&backend)
+                .await
+                .unwrap_or_else(|err| panic!("status {status} must fail over to backup: {err}"));
+            while stream.next().await.is_some() {}
+
+            let (attempts, _) = token.attempts_snapshot();
+            assert!(
+                attempts.len() >= 2,
+                "status {status} must record the failed primary AND the served backup"
+            );
+            let first = &attempts[0];
+            assert_eq!(
+                first.status,
+                AttemptStatus::Failed,
+                "status {status}: primary must be recorded failed"
+            );
+            assert_eq!(
+                first.failover_reason,
+                Some(AttemptFailoverReason::ProviderFailed),
+                "status {status} must still fail over (unchanged) — not TerminalNoFailover"
+            );
+            assert_eq!(
+                first.error_class,
+                Some(AttemptErrorClass::HttpStatus),
+                "status {status} classifies HttpStatus same as a Terminal 4xx would"
+            );
+            let last = attempts.last().expect("served attempt");
+            assert_eq!(
+                last.status,
+                AttemptStatus::Served,
+                "status {status} must fail over onto a served backup"
+            );
+
+            // The primary provider must STILL be cooling — E2a must not suppress cooldown
+            // for these statuses.
+            let health = failover.provider_health();
+            assert_eq!(
+                health[0].status,
+                ProviderStatus::Cooling,
+                "status {status} must still cool the primary provider (unchanged by E2a)"
+            );
+            assert!(
+                health[0].cooling_until_ms.is_some(),
+                "status {status} must set a cooldown deadline"
+            );
+            assert_eq!(
+                health[0].failover_count, 1,
+                "status {status} must still count as a failover (mark_failure runs)"
+            );
+        }
     }
 
     /// F3 (round-1 review): an attempt's `provider`/`model` scalars are `cap_scalar`-bounded
