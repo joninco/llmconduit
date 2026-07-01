@@ -1272,8 +1272,12 @@ impl Gateway {
             )
             .await?;
         }
-        self.monitor
-            .emit(response_id, MonitorEventKind::Completed { output_tokens: final_output_tokens });
+        self.monitor.emit(
+            response_id,
+            MonitorEventKind::Completed {
+                output_tokens: final_output_tokens,
+            },
+        );
         Ok(())
     }
 

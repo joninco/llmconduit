@@ -67,7 +67,9 @@ pub enum MonitorEventKind {
         phase: String,
         detail: String,
     },
-    Completed { output_tokens: Option<i64> },
+    Completed {
+        output_tokens: Option<i64>,
+    },
     Failed {
         message: String,
     },
@@ -1099,7 +1101,12 @@ mod tests {
                 delta: "hello".to_string(),
             },
         );
-        hub.emit("resp_1", MonitorEventKind::Completed { output_tokens: None });
+        hub.emit(
+            "resp_1",
+            MonitorEventKind::Completed {
+                output_tokens: None,
+            },
+        );
 
         let snapshot = hub.snapshot();
         assert!(snapshot.last_sequence >= 3);
@@ -1147,7 +1154,12 @@ mod tests {
                 delta: "nthird".to_string(),
             },
         );
-        hub.emit("resp_1", MonitorEventKind::Completed { output_tokens: None });
+        hub.emit(
+            "resp_1",
+            MonitorEventKind::Completed {
+                output_tokens: None,
+            },
+        );
 
         let text = hub
             .snapshot()
