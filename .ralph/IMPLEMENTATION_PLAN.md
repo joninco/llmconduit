@@ -38,6 +38,18 @@ leaves `cargo test` GREEN within itself. F1a lands the sink+config every later t
 the HTTP+engine finalize spine (an artifact is produced end-to-end with inbound+served after F1c); F1d/F1e
 fill the two upstream sections; F1f makes the artifact atomic/rotated and documents it.
 
+## Known deferred (F1c)
+
+- **Turn-capture registry eviction (F1b review #2).** `TurnCapture::start` inserts the per-turn
+  `Arc<TurnCaptureState>` into `TurnCaptureInner.registry` (`turn_capture.rs`), but F1b has NO engine
+  terminal seam to remove it. Eviction is OWNED by F1c's both-`done` assembly barrier (`engine_done` +
+  `served_done` → assemble artifact → `registry.remove(api_call_id)`). Until F1c lands, a long-lived process
+  grows the registry by ONE small `Arc` per instrumented turn — a bounded per-process metadata leak, NOT a
+  body-bytes leak (section bytes stream to disk, never this map; the bounded-memory invariant holds). This is
+  intentional and tracked, not forgotten. (F1b review r1 also made the served-body tee bounded-memory via a
+  fixed-capacity section channel + `poll_reserve` back-pressure, and documented the pre-body-read 413/400
+  rejections as an F1b non-goal.)
+
 ## Review corrections baked into the spec (do not re-litigate — from Codex xhigh 2026-07-01)
 
 1. **Own gate, not the debug-ui gate.** The `ApiCallId` extension is inserted only inside

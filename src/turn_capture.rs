@@ -16,11 +16,15 @@
 //! has its OWN gate independent of `--with-debug-ui` (spec Design overview
 //! #1); that gate lives in `http.rs` (F1b), not here.
 //!
-//! **Bounded memory (Codex HIGH #2).** Each section (`inbound_request`,
-//! `served_response`, and -- in F1d/F1e -- `upstream_request`/
-//! `upstream_response`) streams incrementally to a per-turn temp file under
-//! `<dir>/.work/<api_call_id>/` via a background writer task fed over an
-//! ordered channel; only small metadata (`{bytes, partial, closed}`) lives in
+//! **Bounded memory (Codex HIGH #2 + F1b review #1).** Each section
+//! (`inbound_request`, `served_response`, and -- in F1d/F1e --
+//! `upstream_request`/`upstream_response`) streams incrementally to a per-turn
+//! temp file under `<dir>/.work/<api_call_id>/` via a background writer task fed
+//! over a BOUNDED, ordered channel ([`SECTION_CHANNEL_CAPACITY`] frames). The
+//! high-volume served-body tee reserves a channel slot BEFORE pulling each frame
+//! and yields `Poll::Pending` when the writer is behind, so a slow disk / large
+//! streamed body throttles the served stream to disk pace instead of piling the
+//! whole body into RAM. Only small metadata (`{bytes, partial, closed}`) lives in
 //! memory. NO `HashMap<_, full-body>` ever forms -- the bytes go to disk. The
 //! final single JSON is assembled later (F1f) by STREAMING those temp files, so
 //! a 256 MiB turn is never held in RAM at once.
@@ -42,10 +46,13 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
+use tokio_util::sync::PollSender;
 
 /// Handle to the turn-capture sink. Cheap to `Clone` (the enabled variant
 /// clones an inner `Arc`); threads through DI (`lib.rs`) into the `Gateway`
@@ -124,6 +131,14 @@ impl TurnCapture {
             model_requested,
             started_ms,
         ));
+        // EVICTION IS OWNED BY F1c (finding #2, deferred): this entry lives for
+        // the turn's duration and is removed by F1c's both-`done` assembly barrier
+        // (`engine_done` + `served_done` → assemble → `registry.remove`). F1b has no
+        // engine terminal seam yet, so building the barrier here would half-implement
+        // F1c; until F1c lands, a long-lived process capturing many turns grows this
+        // map by one small `Arc` per turn (documented in `.ralph/IMPLEMENTATION_PLAN.md`
+        // "Known deferred (F1c)"). Not a leak of body bytes -- those stream to disk,
+        // not this map (bounded-memory invariant holds regardless).
         inner
             .registry
             .lock()
@@ -282,22 +297,115 @@ impl TurnCaptureState {
         }
         self.served_response.close(partial);
     }
+
+    /// F1b: a bounded, back-pressured [`ServedSink`] over the `served_response`
+    /// section for the HTTP served-body tee. The tee reserves a channel slot
+    /// BEFORE pulling each served frame and yields `Poll::Pending` while the
+    /// writer is behind, so a slow disk / large streamed body throttles the
+    /// served stream instead of accumulating in RAM -- capture memory stays
+    /// bounded to [`SECTION_CHANNEL_CAPACITY`] frames regardless of body size
+    /// (finding #1; AGENTS.md bounded-memory invariant). This is the ONLY
+    /// high-volume served writer; [`write_served_response`] is the low-volume /
+    /// test path (its `try_send` would drop-on-full, unacceptable for a stream).
+    /// `None` once the served section is closed.
+    ///
+    /// [`write_served_response`]: TurnCaptureState::write_served_response
+    pub fn served_sink(&self) -> Option<ServedSink> {
+        self.served_response.poll_sender().map(ServedSink::new)
+    }
 }
 
+/// A bounded, back-pressured sink into the `served_response` section's writer
+/// channel, handed to the HTTP served-body tee by
+/// [`TurnCaptureState::served_sink`]. Wraps a [`PollSender`] so the tee can drive
+/// it from a synchronous `poll_frame`: [`poll_reserve`] a slot BEFORE pulling the
+/// next served frame, then [`send`] the copied frame into the reserved slot. When
+/// the writer is behind, `poll_reserve` yields `Poll::Pending` (registering the
+/// task's waker, re-woken as the writer drains) so the served stream is throttled
+/// to disk pace and capture memory stays bounded to [`SECTION_CHANNEL_CAPACITY`]
+/// frames -- never the whole body (finding #1). A closed channel (writer gone)
+/// surfaces as `Err`; the tee then stops capturing but keeps serving the client
+/// byte-for-byte unchanged (a diagnostic failure must never break the served
+/// stream -- AGENTS.md).
+///
+/// [`poll_reserve`]: ServedSink::poll_reserve
+/// [`send`]: ServedSink::send
+#[derive(Debug)]
+pub struct ServedSink {
+    inner: PollSender<Vec<u8>>,
+}
+
+/// The served-section writer is gone -- its bounded channel closed (typically
+/// after a section write error dropped the receiver). The tee drops the sink on
+/// this and keeps serving the client byte-for-byte WITHOUT capture (a diagnostic
+/// failure must never break the served stream -- AGENTS.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SinkClosed;
+
+impl ServedSink {
+    fn new(inner: PollSender<Vec<u8>>) -> Self {
+        Self { inner }
+    }
+
+    /// Reserve one slot for the next served frame. `Poll::Ready(Ok(()))` once a
+    /// slot is held (then call [`send`] exactly once); `Poll::Pending` applies
+    /// back-pressure (the whole tee yields, throttling the served stream to the
+    /// writer's pace -- bounded memory); `Poll::Ready(Err(SinkClosed))` once the
+    /// writer is gone. Must return `Ready(Ok(()))` before each [`send`] (the
+    /// `PollSender` contract).
+    ///
+    /// [`send`]: ServedSink::send
+    pub fn poll_reserve(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SinkClosed>> {
+        self.inner.poll_reserve(cx).map_err(|_| SinkClosed)
+    }
+
+    /// Send one copied served frame into the slot reserved by a preceding
+    /// successful [`poll_reserve`]. `Err(SinkClosed)` once the writer is gone.
+    ///
+    /// [`poll_reserve`]: ServedSink::poll_reserve
+    pub fn send(&mut self, bytes: Vec<u8>) -> Result<(), SinkClosed> {
+        self.inner.send_item(bytes).map_err(|_| SinkClosed)
+    }
+
+    /// The bounded capacity of the underlying writer channel: at most this many
+    /// frames are ever in flight, independent of the served body's total size.
+    /// Exposed so the bounded-memory invariant (finding #1) is asserted
+    /// STRUCTURALLY in tests (the channel cannot exceed this) rather than via a
+    /// heap probe.
+    pub fn max_capacity(&self) -> usize {
+        self.inner.get_ref().map_or(0, |tx| tx.max_capacity())
+    }
+}
+
+/// Bounded in-flight cap for a section's writer channel (finding #1: the served
+/// tee must NOT accumulate the whole body in RAM). At most this many frames (plus
+/// one reserved permit) are ever queued toward the background writer, independent
+/// of the served body's total size -- so capture memory stays O(CAP), not O(N).
+/// A small constant keeps a little pipelining without unbounding memory; the
+/// served tee back-pressures on `Poll::Pending` once the channel is full.
+const SECTION_CHANNEL_CAPACITY: usize = 16;
+
 /// One incremental capture section. Bytes stream to a per-turn temp file on a
-/// background writer task WITHOUT buffering the whole body: [`append`] copies the
-/// frame and hands it to the task over an ordered (FIFO) channel, so the caller
-/// (including the sync `poll_frame` tee) never blocks and no full-body map forms.
-/// Only small metadata lives in memory.
+/// background writer task WITHOUT buffering the whole body: they are handed to the
+/// task over a BOUNDED, ordered (FIFO) channel of at most
+/// [`SECTION_CHANNEL_CAPACITY`] frames. Two write paths feed it:
+/// - Low-volume, single-shot writers ([`append`], used for the inbound-request
+///   body and tests) `try_send` a copy -- they never fill the channel.
+/// - The high-volume served-body tee takes a back-pressured [`ServedSink`]
+///   ([`TurnCaptureState::served_sink`]): it reserves a slot before each frame and
+///   yields `Poll::Pending` when the writer lags, so a slow disk throttles the
+///   served stream rather than piling the whole body into RAM (finding #1).
+///
+/// Either way only small metadata lives in memory and no full-body map forms.
 ///
 /// [`append`]: Section::append
 #[derive(Debug)]
 struct Section {
     /// `None` once [`close`](Section::close)d -- the writer task then drains the
     /// remaining queued chunks and flushes. A dropped `Section` (abandoned turn)
-    /// also drops the sender, so the task always terminates (no hang; AGENTS.md
+    /// also drops the sender(s), so the task always terminates (no hang; AGENTS.md
     /// cancellation rule).
-    tx: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
+    tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     meta: Arc<SectionMeta>,
 }
 
@@ -313,7 +421,7 @@ struct SectionMeta {
 
 impl Section {
     fn new(path: PathBuf) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(SECTION_CHANNEL_CAPACITY);
         let meta = Arc::new(SectionMeta {
             path,
             bytes: AtomicU64::new(0),
@@ -342,7 +450,10 @@ impl Section {
 
     /// Append `bytes` to the section. COPIES into an owned `Vec` (never retains a
     /// slice of the caller's buffer -- AGENTS.md) and hands it to the writer task.
-    /// Non-blocking + ordered; a no-op once closed or on an empty frame.
+    /// This is the LOW-VOLUME, single-shot path (the inbound-request body + tests);
+    /// the high-volume served tee uses [`Section::poll_sender`] /
+    /// [`TurnCaptureState::served_sink`] for real back-pressure instead. Non-blocking
+    /// + ordered; a no-op once closed or on an empty frame.
     fn append(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -350,9 +461,34 @@ impl Section {
         if let Ok(guard) = self.tx.lock()
             && let Some(tx) = guard.as_ref()
         {
-            // Send failure only if the writer task is already gone; nothing to do.
-            let _ = tx.send(bytes.to_vec());
+            match tx.try_send(bytes.to_vec()) {
+                Ok(()) => {}
+                // Unreached by the single-shot callers (one item into a fresh
+                // bounded channel); if it ever were, record it honestly as partial
+                // rather than silently dropping bytes (don't-lie-with-zeros).
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.meta.partial.store(true, Ordering::Release);
+                }
+                // Writer task already gone; nothing to do.
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
         }
+    }
+
+    /// A back-pressured [`PollSender`] over this section's bounded writer channel,
+    /// for the HTTP served-body tee. Cloning the sender lets the tee `poll_reserve`
+    /// a slot from its synchronous `poll_frame` seam and yield `Poll::Pending` when
+    /// the writer is behind -- bounding capture memory to
+    /// [`SECTION_CHANNEL_CAPACITY`] frames regardless of body size (finding #1).
+    /// The tee's clone plus this section's retained sender both drop at turn end
+    /// (tee `Drop` → `served_done` → [`close`](Section::close)), so the writer
+    /// always terminates. `None` once the section is closed.
+    fn poll_sender(&self) -> Option<PollSender<Vec<u8>>> {
+        self.tx
+            .lock()
+            .ok()?
+            .as_ref()
+            .map(|tx| PollSender::new(tx.clone()))
     }
 
     /// Close the section. Records `partial` and drops the sender so the writer
@@ -390,7 +526,7 @@ impl Section {
 /// -- flushes, fsyncs, and marks the section `closed`. A file-create/write error
 /// marks the section `partial` and is logged, never propagated (a diagnostic
 /// artifact must never fail or hang the turn).
-async fn section_writer(mut rx: mpsc::UnboundedReceiver<Vec<u8>>, meta: Arc<SectionMeta>) {
+async fn section_writer(mut rx: mpsc::Receiver<Vec<u8>>, meta: Arc<SectionMeta>) {
     // Idempotent + race-tolerant across the turn's sibling sections both racing
     // to create the shared work dir.
     if let Some(parent) = meta.path.parent()
@@ -597,5 +733,74 @@ mod tests {
         capture.engine_done("api_stub", "cancelled", Some("client_disconnect"));
         state.await_inbound_closed().await;
         state.await_served_closed().await;
+    }
+
+    /// Finding #1 (bounded memory): streaming a large served body through the
+    /// back-pressured `ServedSink` keeps the in-flight footprint bounded to
+    /// `SECTION_CHANNEL_CAPACITY` frames -- O(CAP), not O(N) -- while EVERY byte
+    /// still reaches the section file. The sink is EXACTLY the mechanism the HTTP
+    /// tee drives (reserve-before-send from a `poll_frame` seam), so this exercises
+    /// the real back-pressure path: `poll_reserve` yields `Pending` whenever the
+    /// writer lags and is re-woken as it drains, so a slow disk throttles the
+    /// stream instead of accumulating the whole body in RAM.
+    #[tokio::test]
+    async fn served_sink_streams_large_body_with_bounded_memory() {
+        let capture = TurnCapture::enabled(temp_dir_path("bounded-served"));
+        let state = capture.start("api_bounded", None, 0).expect("state");
+        let mut sink = state.served_sink().expect("served sink");
+
+        // The bound is STRUCTURAL: the channel holds at most this many frames, so
+        // no matter how large the body, in-flight memory is O(CAP), not O(N)
+        // (assert via the bounded structure's capacity, not a heap probe).
+        assert_eq!(
+            sink.max_capacity(),
+            super::SECTION_CHANNEL_CAPACITY,
+            "the served sink is a fixed-capacity channel (bounded memory)"
+        );
+        // The in-flight cap is a small constant, not proportional to body size.
+        const { assert!(super::SECTION_CHANNEL_CAPACITY <= 64) };
+
+        // Stream far more frames than the channel can hold at once (2048 frames of
+        // 4 KiB = 8 MiB across many frames), driving the SAME reserve-before-send
+        // dance the tee uses. Because the channel is bounded, at most CAP frames are
+        // ever queued regardless of the 2048 total; `poll_reserve` back-pressures
+        // (Pending) whenever the writer is behind.
+        const FRAMES: usize = 2048;
+        const FRAME_LEN: usize = 4096;
+        let mut expected_len: u64 = 0;
+        for i in 0..FRAMES {
+            std::future::poll_fn(|cx| sink.poll_reserve(cx))
+                .await
+                .expect("writer alive");
+            let frame = vec![(i % 251) as u8; FRAME_LEN];
+            expected_len += frame.len() as u64;
+            sink.send(frame).expect("send frame into the reserved slot");
+        }
+        // Drop the tee's sink, then close the section (mirrors the tee `Drop` →
+        // `served_done` order) so the writer drains and terminates.
+        drop(sink);
+        state.served_done(false);
+        state.await_served_closed().await;
+
+        // Every streamed byte reached the section file -- back-pressure throttled,
+        // never dropped.
+        let contents = std::fs::read(state.served_response_path()).expect("served section file");
+        assert_eq!(
+            contents.len() as u64,
+            expected_len,
+            "all streamed bytes reached the section file despite back-pressure"
+        );
+        assert_eq!(state.served_bytes(), expected_len);
+        assert!(
+            !state.served_partial(),
+            "a cleanly-closed served stream is not partial"
+        );
+        // Content fidelity: first and last frame patterns survived byte-for-byte.
+        assert_eq!(&contents[..FRAME_LEN], vec![0u8; FRAME_LEN].as_slice());
+        let last = ((FRAMES - 1) % 251) as u8;
+        assert_eq!(
+            &contents[contents.len() - FRAME_LEN..],
+            vec![last; FRAME_LEN].as_slice()
+        );
     }
 }

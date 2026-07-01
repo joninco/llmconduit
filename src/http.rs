@@ -419,6 +419,16 @@ async fn log_api_call(
     // extractor) cannot bound memory here because this middleware buffers the
     // whole body for logging FIRST — so the cap is also enforced at the read
     // below for bodies that arrive without a (trustworthy) Content-Length.
+    //
+    // F1b turn-capture scope (review #3): these PRE-body-read rejections (the 413
+    // here, and the read-failure 413/400 just below) return BEFORE the capture
+    // gate runs and BEFORE any `api_call_id` turn/`inbound_request` section is
+    // minted — so they are intentionally NOT captured: there is no turn to attach
+    // a `served_response` to, and we do not mint one just to record a 413 (a
+    // documented non-goal in `.ralph/specs/F1-durable-turn-capture.md`, Task F1b).
+    // Every POST-gate response (an engine error, a `Reject`, any 4xx/5xx produced
+    // AFTER the gate) IS teed, because the tee wraps the WHOLE `next.run` result
+    // below regardless of status.
     let declared_length = content_length(&headers);
     if let Some(declared) = declared_length
         && declared > max_request_body_bytes as u64
@@ -606,6 +616,10 @@ async fn log_api_call(
     // body — is copied to the `served_response` section; its `Drop` marks
     // `served_done(partial)` when the stream did not reach a clean end (a client
     // disconnect drops the body mid-stream). One wrapper covers all served shapes.
+    // Review #3: this wraps the WHOLE `next.run` result unconditionally, so every
+    // POST-gate error response (an engine error, a `Reject`, any 4xx/5xx minted
+    // after the gate inserted the `ApiCallId` extension) is teed too — only the
+    // PRE-body-read 413/400 rejections above (no turn minted) are out of scope.
     let response = match turn_capture_state {
         Some(state) => tee_served_body(response, state),
         None => response,
@@ -1338,12 +1352,22 @@ fn with_model_headers(mut response: Response, requested: &str, served: &str) -> 
 /// frame, COPYING each DATA frame's bytes into the turn-capture `served_response`
 /// section (never retaining the frame's backing allocation) and passing every
 /// frame through UNCHANGED — so SSE framing, keep-alive comments, and trailers are
-/// preserved byte-for-byte. Its `Drop` reports `served_done`: `partial` unless the
+/// preserved byte-for-byte. Capture is BACK-PRESSURED (F1b review #1): before
+/// pulling each frame it reserves a slot in the section's BOUNDED writer channel
+/// and, when the writer is behind, returns `Poll::Pending` — throttling the served
+/// stream to disk pace rather than buffering the whole body in RAM (bounded
+/// memory, AGENTS.md). Its `Drop` reports `served_done`: `partial` unless the
 /// stream reached a clean end (a `Ready(None)` poll, or delivering its full
 /// promised length). A client disconnect drops the body mid-stream → partial.
 struct TeeBody {
     inner: Body,
     state: Arc<crate::turn_capture::TurnCaptureState>,
+    /// Back-pressured sink into the `served_response` section's BOUNDED writer
+    /// channel (F1b review #1). `None` once the writer is gone (a section write
+    /// error closed the channel) — capture then stops but the served stream
+    /// continues byte-for-byte (a diagnostic failure must never break the served
+    /// bytes).
+    served_sink: Option<crate::turn_capture::ServedSink>,
     /// Set once `inner` yields `Poll::Ready(None)` (clean end-of-stream).
     clean_eos: bool,
     /// Total DATA bytes forwarded so far (for the exact-length clean check).
@@ -1365,15 +1389,36 @@ impl http_body::Body for TeeBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         // `axum::body::Body` is `Unpin`, so the fields can be reached by `&mut`.
         let this = self.get_mut();
+
+        // Bounded-memory back-pressure (F1b review #1): reserve a slot in the
+        // served-section writer channel BEFORE pulling the next frame. If the disk
+        // writer is behind, the BOUNDED channel is full → `poll_reserve` returns
+        // `Pending` and we propagate it, throttling the served stream to the
+        // writer's pace instead of piling the whole body into RAM. A closed channel
+        // (writer gone) drops the sink; we then forward WITHOUT capture — a
+        // diagnostic failure must never break or stall the served stream (AGENTS.md).
+        if let Some(sink) = this.served_sink.as_mut() {
+            match sink.poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(_)) => this.served_sink = None,
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref()
                     && !data.is_empty()
                 {
                     this.forwarded = this.forwarded.saturating_add(data.len() as u64);
-                    // COPY the frame bytes to the section; the frame passes through
-                    // to the client UNCHANGED (never a retained slice — AGENTS.md).
-                    this.state.write_served_response(data);
+                    // Send the COPY into the slot reserved above; the frame passes
+                    // through to the client UNCHANGED (never a retained slice —
+                    // AGENTS.md). A failed send just means the writer went away.
+                    if let Some(sink) = this.served_sink.as_mut()
+                        && sink.send(data.to_vec()).is_err()
+                    {
+                        this.served_sink = None;
+                    }
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -1416,9 +1461,12 @@ fn tee_served_body(
 ) -> Response {
     let (parts, body) = response.into_parts();
     let exact_len = http_body::Body::size_hint(&body).exact();
+    // Take the back-pressured served sink BEFORE moving `state` into the tee.
+    let served_sink = state.served_sink();
     let tee = TeeBody {
         inner: body,
         state,
+        served_sink,
         clean_eos: false,
         forwarded: 0,
         exact_len,

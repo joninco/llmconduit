@@ -177,6 +177,16 @@ zero-op sink (no threads, no allocs, no extension). Age-rotated via the existing
   (`collect_anthropic_response`), and (c) a client disconnect mid-stream → `served_response` present with
   `partial: true`.
 
+**Non-goals (F1b, review r1).** *Pre-body-read rejections are not captured — no turn/inbound exists.* The
+over-limit `413` (Content-Length precheck) and the body-read-failure `413`/`400` in `log_api_call`
+(`http.rs`) return BEFORE the capture gate mints a turn, so there is no `api_call_id` /
+`inbound_request` / `served_response` to attach to; we do not mint a turn just to record a `413`. Every
+POST-gate response (an engine error, a `Reject`, any 4xx-5xx produced AFTER the gate) IS teed, because the
+tee wraps the whole `next.run` result regardless of status. The served-body tee is bounded-memory: it
+reserves a slot in a fixed-capacity section channel before each frame and back-pressures on `Poll::Pending`
+(no full-body buffering — AGENTS.md). Registry eviction is deferred to F1c's both-`done` barrier (see
+`.ralph/IMPLEMENTATION_PLAN.md` "Known deferred (F1c)").
+
 ## Task F1c — engine terminal integration (status/reason) + RAII finalize
 
 **Change.**
