@@ -10,7 +10,7 @@
 
 ## Executive summary
 
-**Status: 3/6 tasks completed.** Opt-in `turn_capture_dir` writes ONE atomic JSON per turn
+**Status: 2/6 Codex-approved (F1a, F1b); F1c implemented + Gate-B green but round-2 Codex-xhigh review PENDING (credits exhausted, resets ~19:40 EDT) — NOT done until APPROVED. F1d–F1f not started.** Opt-in `turn_capture_dir` writes ONE atomic JSON per turn
 (`<dir>/<api_call_id>.json`) with the FULL inbound Anthropic request, translated OpenAI request, RAW vLLM
 response, and served Anthropic bytes + outcome — so an operator / fresh Claude session can debug weird CC
 output (stray `<think>` tags, malformed tool calls) that is otherwise a 200 OK with no durable trace.
@@ -28,7 +28,7 @@ response-`Body` wrapper owns served bytes); RAII drop-guard finalize; UTF-8/base
 |-|-|-|
 | F1a | `turn_capture.rs` module (`TurnCapture`/`TurnCaptureState`, disabled zero-op sink) + `turn_capture_dir` on `Config`+`PersistedConfig`+default+env+`configure()`+`debug_log_dirs()` + `Gateway`/`lib.rs` DI. AC-1,2,3 | ✅ |
 | F1b | HTTP own-gate + inbound capture (copy+redact) + served-body `Body` tee (stream/non-stream/error/disconnect); per-turn temp-file sections + registry. AC-4,5,6 | ✅ |
-| F1c | Engine terminal `engine_done` (RAII `CaptureGuard` + middleware backstop) on all terminals incl pre-spawn; both-`done` barrier → bounded streaming assembly + atomic rename + registry evict + `.work` delete. AC-7,8,9 | ✅ |
+| F1c | Engine terminal `engine_done` (RAII `CaptureGuard` + middleware backstop) on all terminals incl pre-spawn; both-`done` barrier → bounded streaming assembly + atomic rename + registry evict + `.work` delete. AC-7,8,9 | ⏳ review r2 pending (commits 52b0daf+4103364; r1 fixed 2 HIGH race+leak) |
 | F1d | `capture: Option<Arc<TurnCaptureState>>` on `BackendChatRequest`; upstream_request capture in `dispatch_chat_stream`, last-writer-wins (shrink retry / failover final attempt). AC-10,11 | ☐ |
 | F1e | Raw upstream_response tap in `stream_success_response` (incremental, partial-on-error, no hang) + final failed HTTP body (gap-05 staged body) + UTF-8/base64 encoding. AC-12,13,14 | ☐ |
 | F1f | Streaming single-JSON assembly + atomic tmp→rename + work-dir cleanup + rotation (artifacts + orphan `.work`) + docs. AC-15,16,17 | ☐ |
