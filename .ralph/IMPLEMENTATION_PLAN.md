@@ -5,7 +5,7 @@
 > **Branch:** `anthropic-sse-conformance`. **Run:** `/ralph-orchestrate --agents 2` (auto-review ON), Sonnet-5 subagents.
 
 ## Executive Summary
-**Status: 4/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
+**Status: 5/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
 one terminal `message_delta`, signed thinking, real `message_start.input_tokens`, correct ordering.
 
 ## Completed
@@ -16,6 +16,7 @@ one terminal `message_delta`, signed thinking, real `message_start.input_tokens`
 | C1 | One terminal message_delta | ✅ |
 | C2 | Sign thinking + ingress strip | ✅ |
 | C3 | Real message_start.input_tokens | ✅ (estimated — see below) |
+| C4 | ping + error-terminal shape | ✅ |
 
 **Ordering is strict and (mostly) serial** — tasks 0B1→C1→C2→C3→C4 all edit
 `src/adapters/responses_to_anthropic/mod.rs` and the shared test surface, so they cannot parallelize.
@@ -28,31 +29,15 @@ Hard constraints (verbatim from spec — re-read before editing):
 - `web_search` does NOT call `record_output_delta` (`mod.rs:540`) — cover CLIENT `tool_use` in no-progressive-delta tests.
 - Do NOT touch the dashboard usage path (`engine.rs:2139/2170`).
 
-Source anchors verified against HEAD (`mod.rs` line numbers, current):
-`ensure_started`:146 (ping 149, message_start 150, input_tokens 160) · `record_output_delta` def 713, call sites
-**205, 219, 242, 305, 363, 797** · `flush_reasoning_as_thinking`:594 (unconditional signature emit, real-or-synthetic,
-620-635; `synthetic_signature` helper 814) · `handle_completed`:448 (terminal Δ 489) · `finalize`:416 (terminal Δ
-428) · `handle_failed`:503 · web_search:540. Ingress strip: `anthropic_to_responses.rs:367` (Thinking →
+Source anchors verified against HEAD (`mod.rs` line numbers, current, post-C4):
+`ensure_started`:151 (no ping — dropped in C4; message_start push, input_tokens read inline) ·
+`record_output_delta` def 767, call sites 235, 249, 272, 335, 393, 851 · `flush_reasoning_as_thinking`:648
+(unconditional signature emit, real-or-synthetic) · `handle_completed`:486 (terminal Δ, `completed=true` 492) ·
+`finalize`:454 (`completed` early-return, terminal Δ) · `handle_failed`:556 (C4: now also sets `completed=true`
+570, so the stream ends AT `error` — `finalize()` no-ops after a failure) · web_search:`WEB_SEARCH_TOOL_NAME`
+const 42 / `is_hidden_server_tool` 58. Ingress strip: `anthropic_to_responses.rs:367` (Thinking →
 `encrypted_content`, filters empty AND `SYNTHETIC_SIGNATURE_PREFIX`-prefixed at 386-392).
 `SYNTHETIC_SIGNATURE_PREFIX` const: `models/anthropic.rs` "Shared constants" section.
-
----
-
-## Task C4 — ping + error-terminal shape (deviations #4; cosmetic — never block)
-**Files:** `mod.rs` (`ensure_started`, `handle_failed`), tests.
-
-**Do:**
-1. **ping:** golden vLLM native emits **NO `ping`**. `ensure_started` (`mod.rs:149`) currently pushes `Ping` then
-   `MessageStart`. To byte-match, the cleanest is to DROP the `Ping` emission (or, if a ping is desired for client
-   keep-alive, move it AFTER `message_start` to at least not precede it). Pick the option that matches the golden; if
-   dropping has wider implications (e.g. SSE keep-alive elsewhere), keep + document. Update `tests.rs:834`
-   (`vec!["ping","message_start","message_delta","message_stop"]`) to the chosen order/shape.
-2. **error terminal:** `handle_failed` (`mod.rs:503`) emits only `error`; HTTP streaming then calls `finalize()`
-   (`http.rs:1305`) → `error → message_delta → message_stop`. Check Anthropic's real error-stream shape; decide
-   whether to keep the trailing `Δ + message_stop` or end at `error`. Low priority — keep current behavior +
-   document if unclear. Ensure the conformance harness's error surface asserts whichever shape is chosen.
-
-**DoD:** `cargo test` green; ping/error shape matches golden where cheap, else documented; harness error-surface green.
 
 ---
 

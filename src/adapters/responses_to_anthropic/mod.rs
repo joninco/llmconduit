@@ -151,7 +151,17 @@ impl AnthropicStreamConverter {
     fn ensure_started(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
         if !self.started {
             self.started = true;
-            output.push(AnthropicStreamEvent::Ping);
+            // C4 (deviation #4): vLLM native emits NO `ping` before
+            // `message_start` (golden: `.ralph/golden_8001_native_messages.sse`
+            // starts directly at `message_start`). Do not push
+            // `AnthropicStreamEvent::Ping` here to byte-match. This is safe for
+            // SSE keep-alive: `http.rs::stream_anthropic_response` (and the
+            // sibling Chat/Responses streamers) already wrap the response in
+            // `axum::response::sse::KeepAlive::new()`, which sends its own
+            // transport-level `: keep-alive` comment frames independent of the
+            // Anthropic event vocabulary -- so dropping this event does not
+            // remove keep-alive coverage. The `Ping` variant itself is kept
+            // (not deleted) as a still-valid representable wire shape.
             output.push(AnthropicStreamEvent::MessageStart {
                 message: AnthropicMessageStart {
                     id: self.message_id.clone(),
@@ -428,11 +438,19 @@ impl AnthropicStreamConverter {
     /// Guarantees the Anthropic stream is terminated.
     ///
     /// The converter only emits `message_delta` + `message_stop` when it sees a
-    /// `response.completed` event. If the upstream turn ends any other way (an
-    /// error, a dropped/stalled engine task, an aborted web-search round-trip),
-    /// the client would otherwise be left waiting forever behind the SSE
-    /// keep-alive. Callers MUST invoke this once the upstream event stream is
-    /// exhausted so every connection ends with a terminal event.
+    /// `response.completed` event. If the upstream turn ends any other way with
+    /// NO explicit terminal signal at all (a dropped/stalled engine task, an
+    /// aborted web-search round-trip), the client would otherwise be left
+    /// waiting on a connection that eventually just closes with no parseable
+    /// terminal event. Callers MUST invoke this once the upstream event stream
+    /// is exhausted so every connection ends with a terminal event.
+    ///
+    /// C4: an explicit `response.failed` is NOT one of those "no signal" cases
+    /// any more -- `handle_failed` now marks the turn `completed` itself, so
+    /// this becomes a no-op after a failure and the stream ends at `error`
+    /// (matching Anthropic's real error-stream shape: a mid-stream error is
+    /// terminal on its own, never followed by a synthetic `message_delta` +
+    /// `message_stop`). See `handle_failed` for the rationale.
     pub fn finalize(&mut self) -> Vec<AnthropicStreamEvent> {
         let mut output = Vec::new();
         if self.completed {
@@ -520,6 +538,21 @@ impl AnthropicStreamConverter {
         output.push(AnthropicStreamEvent::MessageStop);
     }
 
+    // C4 (deviation "error-terminal shape"): a real Anthropic stream ends AT
+    // the `error` event on a mid-stream failure -- there is no following
+    // `message_delta` / `message_stop` (see the SDKs' streaming error
+    // handling, and the standalone `event: error` example in Anthropic's
+    // streaming docs, which is never followed by a stop pair). Mark the turn
+    // `completed` here so the caller's unconditional trailing `finalize()`
+    // call (`http.rs::stream_anthropic_response`) becomes a no-op instead of
+    // appending a synthetic terminal delta + stop after the error. This does
+    // NOT reopen a hang risk: the SSE task in `http.rs` always finishes (and
+    // drops its `mpsc::Sender`) once the upstream event loop + `finalize()`
+    // both return, regardless of how many events `finalize()` emits, which is
+    // what actually closes the HTTP stream -- the trailing pair was never
+    // load-bearing for that. Also reconciles the conformance harness's
+    // `Surface::Error` contract (`conformance.rs` invariant 6: the stream must
+    // end WITH the `error` event), which this now satisfies for real.
     fn handle_failed(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
         let message = data
             .get("response")
@@ -534,6 +567,7 @@ impl AnthropicStreamConverter {
                 message,
             },
         });
+        self.completed = true;
     }
 
     /// Surface a server-side web search to the Anthropic client.

@@ -189,7 +189,6 @@ fn converts_simple_text_response() {
     assert_eq!(
         event_types(&events),
         vec![
-            "ping",
             "message_start",
             "content_block_start",
             "content_block_delta",
@@ -227,7 +226,6 @@ fn converts_reasoning_then_text_response() {
     assert_eq!(
         event_types(&events),
         vec![
-            "ping",
             "message_start",
             "content_block_start", // thinking (flushed on text arrival)
             "content_block_delta", // thinking delta
@@ -460,7 +458,6 @@ fn converts_function_call_response() {
     assert_eq!(
         event_types(&events),
         vec![
-            "ping",
             "message_start",
             "content_block_start", // text
             "content_block_delta", // text delta
@@ -505,7 +502,6 @@ fn streams_function_call_argument_deltas_progressively() {
     assert_eq!(
         event_types(&events),
         vec![
-            "ping",
             "message_start",
             "content_block_start",
             "content_block_delta",
@@ -874,7 +870,7 @@ fn finalize_terminates_stream_with_no_events_at_all() {
     let events = converter.finalize();
     assert_eq!(
         event_types(&events),
-        vec!["ping", "message_start", "message_delta", "message_stop"]
+        vec!["message_start", "message_delta", "message_stop"]
     );
 }
 
@@ -1102,21 +1098,32 @@ fn no_server_tool_use_usage_when_no_web_search() {
 }
 
 #[test]
-fn finalize_terminates_stream_after_failure_event() {
-    // handle_failed only emits `error`; the client still needs a terminal
-    // message_stop to stop waiting.
+fn finalize_is_noop_after_failure_event() {
+    // C4: `handle_failed` now marks the turn `completed`, so the stream ends
+    // AT `error` -- matching Anthropic's real mid-stream error shape (never
+    // followed by a synthetic `message_delta` + `message_stop`). The caller
+    // (`http.rs::stream_anthropic_response`) still unconditionally calls
+    // `finalize()` after the upstream loop ends; that call must be a no-op
+    // here, same as the already-completed-normally case below.
     let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
     let mut events = converter.convert(&created_event());
     events.extend(converter.convert(&failed_event("web search round limit exceeded")));
-    events.extend(converter.finalize());
 
     let names = event_types(&events);
-    assert!(names.contains(&"error"), "expected error event: {names:?}");
     assert_eq!(
         names.last(),
-        Some(&"message_stop"),
-        "stream must still end with message_stop, got {names:?}"
+        Some(&"error"),
+        "stream must end with error, got {names:?}"
     );
+    assert!(
+        converter.finalize().is_empty(),
+        "finalize() must be a no-op after a failure event"
+    );
+
+    // Full harness proof: this is exactly the `Surface::Error` contract
+    // (conformance.rs invariant 6) -- reconciles the harness with the real
+    // converter/http-layer behavior instead of leaving it self-tested only.
+    conformance::assert_stream_conformant(&events, conformance::Surface::Error);
 }
 
 // -- C1 conformance proof: a REAL converter run, checked against the harness
