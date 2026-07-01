@@ -5,7 +5,7 @@
 > **Branch:** `anthropic-sse-conformance`. **Run:** `/ralph-orchestrate --agents 2` (auto-review ON), Sonnet-5 subagents.
 
 ## Executive Summary
-**Status: 5/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
+**Status: 6/7 tasks completed.** Make `/v1/messages` streaming byte-shape-conformant with vLLM native:
 one terminal `message_delta`, signed thinking, real `message_start.input_tokens`, correct ordering.
 
 ## Completed
@@ -17,6 +17,7 @@ one terminal `message_delta`, signed thinking, real `message_start.input_tokens`
 | C2 | Sign thinking + ingress strip | ✅ |
 | C3 | Real message_start.input_tokens | ✅ (estimated — see below) |
 | C4 | ping + error-terminal shape | ✅ |
+| T5 | Conformance sweep + docs | ✅ |
 
 **Ordering is strict and (mostly) serial** — tasks 0B1→C1→C2→C3→C4 all edit
 `src/adapters/responses_to_anthropic/mod.rs` and the shared test surface, so they cannot parallelize.
@@ -38,23 +39,6 @@ Source anchors verified against HEAD (`mod.rs` line numbers, current, post-C4):
 const 42 / `is_hidden_server_tool` 58. Ingress strip: `anthropic_to_responses.rs:367` (Thinking →
 `encrypted_content`, filters empty AND `SYNTHETIC_SIGNATURE_PREFIX`-prefixed at 386-392).
 `SYNTHETIC_SIGNATURE_PREFIX` const: `models/anthropic.rs` "Shared constants" section.
-
----
-
-## Task T5 — Comprehensive conformance sweep + docs
-**Files:** `tests.rs`, `tests/gateway.rs`, `tests/port_streaming_peek.rs`, `tests/common`, docs.
-
-**Do:**
-1. Route REAL converter/collector output through `assert_stream_conformant` / `assert_sse_conformant` for EVERY
-   surface: text-only, reasoning+text, **client `tool_use`**, web_search/server-tool, finalize/error.
-2. Add (if not already in C1) a collector/converter test proving the terminal `output_tokens` stays non-zero when
-   upstream usage is ABSENT (the kept bookkeeping path, `collector.rs:150-156`).
-3. Ensure CLIENT `tool_use` (NOT web_search) is the subject of the no-progressive-delta assertions.
-4. Sweep the full surface for any remaining stale progressive-usage expectation; `cargo test` fully green.
-5. Docs: mark `ANTHROPIC_STREAM_CONFORMANCE_PLAN.md` phases done; record any residual (input_tokens) explicitly in
-   the spec. Keep `AGENTS.md` operational only (no status text there).
-
-**DoD:** full `cargo test` green; conformance harness applied to all five surfaces.
 
 ---
 

@@ -4,6 +4,17 @@
 **Golden reference:** `.ralph/golden_8001_native_messages.sse` (captured from vLLM native 8001).
 **Conventions:** `AGENTS.md` (canonical-Responses-only, comments-explain-why, no-new-wire-fields-without-round-trip-test). **G8 contract:** `GAPS.md` §G8 (reasoning promotion/suppression — preserve).
 
+## Status
+Phases 0a–5 done (see the root plan's own Status banner for phase-by-phase detail). All 4
+deviations are closed; #3 (`message_start.input_tokens`) is closed **as ESTIMATED**, not
+exact — see the Data-quality note below. The harness (invariants 1-6 below) is now
+exercised against REAL converter/collector/gateway output, not just its own hand-built
+self-tests, on all 5 surfaces: unit-level in
+`src/adapters/responses_to_anthropic/tests.rs`, HTTP/integration-level in `tests/gateway.rs`
+and `tests/port_streaming_peek.rs`. `cargo test` is fully green. Remaining: Phase 6 (live
+5022-vs-8001 byte-shape parity + Python/TypeScript SDK strictness probe) — an
+orchestrator/verify task, not a code change.
+
 ## Goal
 Make llmconduit's Anthropic `/v1/messages` **streaming** output **byte-shape conformant** with
 vLLM's native `/v1/messages`. Upgrade from *malformed-but-tolerated* to *strictly conforming*.

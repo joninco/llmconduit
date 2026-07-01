@@ -8612,6 +8612,11 @@ async fn anthropic_messages_streams_text_response() {
     assert_eq!(message_delta["usage"]["input_tokens"], 12);
     assert_eq!(message_delta["usage"]["output_tokens"], 5);
 
+    // T5: full harness proof, real gateway/HTTP output, TextOnly surface.
+    use llmconduit::adapters::responses_to_anthropic::conformance::Surface;
+    use llmconduit::adapters::responses_to_anthropic::conformance::assert_sse_conformant;
+    assert_sse_conformant(&anthropic_events, Surface::TextOnly);
+
     // Verify the upstream received a chat completions request
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
@@ -8700,6 +8705,11 @@ async fn anthropic_messages_streams_nested_thinking_response() {
         "terminal message_delta must carry output_tokens: {:?}",
         message_deltas[0]
     );
+
+    // T5: full harness proof, real gateway/HTTP output, ReasoningText surface.
+    use llmconduit::adapters::responses_to_anthropic::conformance::Surface;
+    use llmconduit::adapters::responses_to_anthropic::conformance::assert_sse_conformant;
+    assert_sse_conformant(&anthropic_events, Surface::ReasoningText);
 
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
@@ -8985,6 +8995,105 @@ async fn anthropic_messages_streams_tool_use_response() {
         .map(|event| event["delta"]["partial_json"].as_str().unwrap())
         .collect();
     assert_eq!(json_deltas, vec![r#"{"loc"#, r#"ation":"Seattle"}"#]);
+
+    // T5: full harness proof, real gateway/HTTP output, ClientToolUse surface
+    // (deliberately not web_search -- see `conformance::Surface::ClientToolUse`).
+    use llmconduit::adapters::responses_to_anthropic::conformance::Surface;
+    use llmconduit::adapters::responses_to_anthropic::conformance::assert_sse_conformant;
+    assert_sse_conformant(&anthropic_events, Surface::ClientToolUse);
+}
+
+#[tokio::test]
+async fn anthropic_messages_streams_web_search_response() {
+    // T5: WebSearch surface, full gateway/HTTP path -- a real server-side
+    // web-search round-trip (round 1: model calls `web_search`; the gateway
+    // executes it via `MockSearch` and re-invokes upstream; round 2: the text
+    // answer) through the actual `/v1/messages` streaming endpoint. Proves the
+    // Anthropic converter's `server_tool_use` + `web_search_tool_result` blocks
+    // are wire-conformant end to end, not just at the unit level (mirrors the
+    // engine-level `web_search_emits_structured_results_event_for_anthropic_clients`
+    // above, but through the HTTP/Anthropic-egress layer).
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_ws_1",
+            "web_search",
+            "{\"query\":\"weather seattle\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "It is rainy."))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [
+            { "role": "user", "content": "What's the weather in Seattle?" }
+        ],
+        "tools": [
+            { "type": "web_search_20250305", "name": "web_search" }
+        ]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    let body_text = String::from_utf8(body_bytes.to_vec()).expect("utf8");
+    let anthropic_events = parse_anthropic_sse_events(&body_text);
+
+    assert!(
+        anthropic_events.iter().any(|event| {
+            event["type"] == "content_block_start"
+                && event["content_block"]["type"] == "server_tool_use"
+                && event["content_block"]["name"] == "web_search"
+        }),
+        "missing server_tool_use block: {anthropic_events:?}"
+    );
+    assert!(
+        anthropic_events.iter().any(|event| {
+            event["type"] == "content_block_start"
+                && event["content_block"]["type"] == "web_search_tool_result"
+        }),
+        "missing web_search_tool_result block: {anthropic_events:?}"
+    );
+    assert!(
+        anthropic_events.iter().any(|event| {
+            event["type"] == "content_block_delta"
+                && event["delta"]["type"] == "text_delta"
+                && event["delta"]["text"] == "It is rainy."
+        }),
+        "missing the post-search text answer: {anthropic_events:?}"
+    );
+
+    // T5: full harness proof, real gateway/HTTP output, WebSearch surface.
+    use llmconduit::adapters::responses_to_anthropic::conformance::Surface;
+    use llmconduit::adapters::responses_to_anthropic::conformance::assert_sse_conformant;
+    assert_sse_conformant(&anthropic_events, Surface::WebSearch);
+
+    let requests = upstream.requests().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected one search round + one answer round"
+    );
 }
 
 #[tokio::test]
@@ -10519,6 +10628,13 @@ async fn e1_repair_ceiling_structured_terminal_anthropic_stream() {
         !text.contains("Grep"),
         "tool name leaked to anthropic client: {text}"
     );
+
+    // T5: full harness proof, real gateway/HTTP output, Error surface (C4:
+    // the stream ends AT `error`, no trailing message_delta/message_stop).
+    use llmconduit::adapters::responses_to_anthropic::conformance::Surface;
+    use llmconduit::adapters::responses_to_anthropic::conformance::assert_sse_conformant;
+    let anthropic_events = parse_anthropic_sse_events(&text);
+    assert_sse_conformant(&anthropic_events, Surface::Error);
 }
 
 /// E1 cancellation harness: the FIRST upstream call yields a hallucinated tool

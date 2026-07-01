@@ -519,6 +519,14 @@ fn anthropic_reasoning_only_is_buffered_until_terminal_then_promoted_to_text() {
             .any(|event| matches!(event, AnthropicStreamEvent::MessageStop)),
         "stream must end with message_stop: {all:?}"
     );
+
+    // T5: full harness proof on this REAL converter run. `Surface::TextOnly`
+    // fits -- the promoted block is `text`, never `thinking`, so invariant 4
+    // (signature requirement) is irrelevant here.
+    llmconduit::adapters::responses_to_anthropic::conformance::assert_stream_conformant(
+        &all,
+        llmconduit::adapters::responses_to_anthropic::conformance::Surface::TextOnly,
+    );
 }
 
 /// Task 0B1: prove the conformance harness is reachable from THIS integration

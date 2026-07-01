@@ -762,6 +762,38 @@ fn collector_returns_final_usage() {
 }
 
 #[test]
+fn collector_output_tokens_nonzero_without_upstream_usage() {
+    // Collector-level proof of the kept bookkeeping path (collector.rs:150-156,
+    // C1's doc comment): when the terminal upstream event carries NO `usage` at
+    // all (`completed_event()`, not `completed_event_with_usage`), the
+    // non-stream collector's final `output_tokens` must still be non-zero --
+    // sourced from the converter's `last_output_tokens` byte-count estimate,
+    // which rides the terminal `message_delta.usage.output_tokens` the
+    // collector reads at `AnthropicStreamEvent::MessageDelta` (collector.rs:154).
+    // A regression here (e.g. losing the bookkeeping, or the collector
+    // ignoring the terminal delta's usage) would silently zero out reported
+    // output_tokens for every upstream that doesn't report usage.
+    let mut collector = AnthropicStreamCollector::new("claude-3".to_string());
+    for event in [
+        created_event(),
+        item_added_event("message", "assistant"),
+        text_delta_event("Hello world"),
+        item_done_event("message", json!({})),
+        completed_event(), // no `response.usage` field
+    ] {
+        collector.process(&event);
+    }
+
+    let response = collector.into_response().expect("response");
+    assert!(
+        response.usage.output_tokens > 0,
+        "collector output_tokens must stay non-zero via bookkeeping when upstream \
+         usage is absent, got {}",
+        response.usage.output_tokens
+    );
+}
+
+#[test]
 fn collector_preserves_thinking_signature() {
     let mut collector = AnthropicStreamCollector::new("claude-3".to_string());
     for event in [
@@ -974,6 +1006,36 @@ fn web_search_results_emit_server_tool_use_then_result_block() {
 }
 
 #[test]
+fn web_search_stream_is_fully_conformant() {
+    // WebSearch surface, real converter run: server_tool_use +
+    // web_search_tool_result blocks are emitted directly (mod.rs:534) and never
+    // call `record_output_delta`, so this surface proves invariants 2/3/5
+    // hold even though NOTHING drives the progressive-usage bookkeeping the
+    // ClientToolUse/ReasoningText surfaces exercise -- C1 removed the
+    // progressive push globally, so the terminal message_delta is still the
+    // ONLY one in the stream. Neither block type is `thinking`, so invariant 4
+    // (signature requirement) never applies to them.
+    let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+    let results = json!([
+        {"type": "web_search_result", "url": "https://example.com/a", "title": "Site A"}
+    ]);
+    let events: Vec<AnthropicStreamEvent> = [
+        created_event(),
+        item_added_event("message", "assistant"),
+        text_delta_event("Let me search."),
+        web_search_results_event("srvtoolu_1", "current weather Boppard", results),
+        text_delta_event("It is 11C."),
+        item_done_event("message", json!({})),
+        completed_event(),
+    ]
+    .iter()
+    .flat_map(|e| converter.convert(e))
+    .collect();
+
+    conformance::assert_stream_conformant(&events, conformance::Surface::WebSearch);
+}
+
+#[test]
 fn post_web_search_reasoning_and_answer_are_preserved() {
     // Regression: a web-search turn is reasoning -> web_search_results ->
     // CONTINUATION reasoning -> text answer. The web_search_results block is
@@ -1155,6 +1217,27 @@ fn real_converter_reasoning_text_stream_satisfies_ordering_invariants() {
     .collect();
 
     conformance::assert_stream_conformant(&events, conformance::Surface::ReasoningText);
+}
+
+#[test]
+fn text_only_stream_is_fully_conformant() {
+    // C1 win, TextOnly surface: the simplest real converter run (no thinking
+    // block, no tool call) still satisfies every invariant -- zero progressive
+    // deltas, one terminal delta, correct start/stop ordering.
+    let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+    let events: Vec<AnthropicStreamEvent> = [
+        created_event(),
+        item_added_event("message", "assistant"),
+        text_delta_event("Hello"),
+        text_delta_event(" world"),
+        item_done_event("message", json!({})),
+        completed_event(),
+    ]
+    .iter()
+    .flat_map(|e| converter.convert(e))
+    .collect();
+
+    conformance::assert_stream_conformant(&events, conformance::Surface::TextOnly);
 }
 
 #[test]

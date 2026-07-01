@@ -1,5 +1,23 @@
 # Anthropic Stream Conformance Plan (v4 — target: full wire-shape conformance)
 
+## Status (Phases 0a–5 DONE; Phase 6 remaining)
+Deviations #1 (`message_delta` storm), #2 (unsigned thinking), #4 (`ping` / error-terminal
+shape) are fully closed — byte-identical to the golden. Deviation #3 (`message_start.input_tokens`)
+is closed **as ESTIMATED, not exact**: `message_start.usage.input_tokens` carries the
+engine's early G3 byte-based estimate (`estimate_input_tokens`, seeded via `response.created`),
+while the terminal `message_delta` — and the non-stream collector's final usage — always
+carry the REAL upstream `input_tokens` from `response.completed`. This is the plan's own
+documented acceptable residual (Phase 0a-2: "if none is clean, this is the single acceptable
+residual deviation — document it"); see `.ralph/specs/anthropic-sse-conformance.md`'s
+"Data-quality note" for the full mechanism. The conformance harness
+(`src/adapters/responses_to_anthropic/conformance.rs`) is now exercised with REAL
+converter/collector/gateway output — not just hand-built vectors — on all 5 surfaces
+(`TextOnly`, `ReasoningText`, `ClientToolUse`, `WebSearch`, `Error`), at both the unit
+(`src/adapters/responses_to_anthropic/tests.rs`) and integration (`tests/gateway.rs`,
+`tests/port_streaming_peek.rs`) levels. `cargo test` is fully green. **Phase 6 (live
+5022-vs-8001 byte-shape parity + Python/TypeScript SDK strictness probe) is the only
+remaining gate** — an orchestrator/verify-subagent task, not a code change.
+
 ## Goal
 Make llmconduit's Anthropic `/v1/messages` **streaming** output **fully wire-conformant** —
 byte-shape matching vLLM's native `/v1/messages`: exactly one terminal `message_delta`,
@@ -42,7 +60,7 @@ authentic* Anthropic signature is not (llmconduit isn't Anthropic) — the synth
 signature satisfies shape (field present, non-empty, `signature_delta` emitted), not
 real verification. That's the correct ceiling for a proxy.
 
-## Phase 0a — Decisions (resolve before coding)
+## Phase 0a — Decisions (resolve before coding) — DONE
 1. **Signature (REQUIRED for conformance).** Default: emit a **recognizable synthetic
    `signature_delta`** in `flush_reasoning_as_thinking` when no real upstream signature
    exists, AND **strip it on Anthropic ingress** so a client echo-back is never
@@ -63,7 +81,7 @@ real verification. That's the correct ceiling for a proxy.
    Check Anthropic's real error-stream shape and decide whether to keep the trailing
    `Δ`+`message_stop` or end at `error`.
 
-## Phase 0b — Strict conformance harness (locks DoD)
+## Phase 0b — Strict conformance harness (locks DoD) — DONE (Task 0B1)
 Per-surface assertions — text, reasoning+text, **client tool_use**, web_search/server-
 tool, finalize/error. (Note: web_search emits `server_tool_use`/`web_search_tool_result`
 directly at mod.rs:534 and does **not** call `record_output_delta`; client tool_use
@@ -73,31 +91,48 @@ and its `content_block_stop`**; thinking block has a **non-empty signature**;
 `message_start.input_tokens` reflects real prompt size (per 0a-2); stream ends
 `message_delta → message_stop`.
 
-## Phase 1 — One terminal `message_delta`
+## Phase 1 — One terminal `message_delta` — DONE (Task C1)
 Make `record_output_delta` bookkeeping-only: keep `estimated_output_bytes` /
 `last_output_tokens`; **remove the `output.push(MessageDelta)`** (mod.rs:691-701); drop
 the now-unused `output` param; update **all** call sites (200/214/236/299/357/777) and
 comments. Verify the terminal `Δ` still carries final `output_tokens` (collector relies
 on `last_output_tokens` when upstream usage is absent — `collector.rs:68/150`).
 
-## Phase 2 — Sign thinking (per 0a-1) + ingress strip
+## Phase 2 — Sign thinking (per 0a-1) + ingress strip — DONE (Task C2)
 Synthesize the `signature_delta` in `flush_reasoning_as_thinking`; add ingress stripping
 at `anthropic_to_responses.rs:366`. Preserve real-signature forwarding.
 
-## Phase 3 — Real `message_start.input_tokens` (per 0a-2)
-Implement the chosen approach; or document the residual deviation if none is clean.
+## Phase 3 — Real `message_start.input_tokens` (per 0a-2) — DONE (Task C3, ESTIMATED)
+Implemented as a hybrid not literally on the (a)/(b)/(c) menu: `message_start` is seeded
+from the engine's existing G3 byte-based estimate (`estimate_input_tokens`, threaded via
+the new `ResponseStub.estimated_input_tokens` field on `response.created`) instead of a
+hardcoded `0`, and the terminal `message_delta` (+ non-stream collector) always overwrites
+it with the REAL upstream count once `response.completed` arrives. Buffering `message_start`
+(option b) was rejected as bad UX (delays the client's first byte); a real tokenizer count
+up front (option c) was rejected as an added dependency/cost. This is the plan's own
+"single acceptable residual deviation" (see Status banner above and the spec's DQ note) —
+closed-as-estimated, not closed-as-exact, and never a substitute for the real terminal usage.
 
-## Phase 4 — ping + error-terminal shape (per 0a-3/4)
+## Phase 4 — ping + error-terminal shape (per 0a-3/4) — DONE (Task C4)
+Decision 3 (ping): DROPPED, not moved — vLLM native emits none, and axum's transport-level
+`KeepAlive` already covers SSE idle-keepalive independent of the Anthropic event vocabulary.
+Decision 4 (error terminal): a failed turn now ends AT `error` (`handle_failed` marks the
+turn `completed`), matching Anthropic's real mid-stream error shape — no trailing synthetic
+`message_delta` + `message_stop`.
 
-## Phase 5 — Tests & docs
-Update progressive-usage expectations everywhere — `tests.rs` sequence cases
-(~181-185, 217-225, 388-394, 432-440), **`:538` (`emits_progress_usage_for_reasoning_deltas`)**,
-**`:572` (`completed_without_upstream_usage_preserves_progress_usage`)**;
-**`tests/gateway.rs:8567` & `:8654`**; **`tests/port_streaming_peek.rs:414`**. Add a
-collector/converter test proving terminal `output_tokens` stays non-zero when upstream
-usage is absent. Fold in the Phase 0b conformance assertions.
+## Phase 5 — Tests & docs — DONE (Task T5)
+Progressive-usage expectations were already cleaned up incrementally by C1-C4 (each phase
+left `cargo test` green per `.ralph/IMPLEMENTATION_PLAN.md`'s ordering rule); T5's own repo-wide
+sweep found no remaining stale progressive-usage / leading-`ping` / unsigned-thinking /
+old-error-shape expectations. What T5 added: the conformance harness is now proven against
+REAL converter/collector/gateway output (not just hand-built vectors) on all 5 surfaces, at
+both the unit (`src/adapters/responses_to_anthropic/tests.rs`) and HTTP/integration
+(`tests/gateway.rs`, `tests/port_streaming_peek.rs`) levels — see the Status banner above for
+the full surface-to-test map — plus a collector-level test proving the non-stream
+`output_tokens` stays non-zero when upstream usage is absent
+(`collector_output_tokens_nonzero_without_upstream_usage`).
 
-## Phase 6 — Verify
+## Phase 6 — Verify — REMAINING (Task T6, orchestrator gate)
 `cargo test` (adapter + `tests/gateway.rs` + `tests/port_streaming_peek.rs`). Live:
 capture the 5022 stream for each surface; assert byte-shape parity with the 8001 native
 golden. Re-run the SDK strictness probe — now also against the **TypeScript** SDK
