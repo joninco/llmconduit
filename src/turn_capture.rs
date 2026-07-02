@@ -919,6 +919,30 @@ struct Section {
     meta: Arc<SectionMeta>,
 }
 
+/// The coalescing last-writer-wins slot for [`Section::replace`] PLUS its
+/// accept-gate, held together under ONE mutex ([`SectionMeta::pending_replace`])
+/// so "accept a replace" and the writer's close-side "take the final value +
+/// seal" are MUTUALLY EXCLUSIVE (F1d review r2 -- closes the accept-vs-close
+/// race). Without this atomicity a `replace` could pass its not-yet-closed
+/// check, `close` + the writer's final post-close slot-check could then run
+/// (observe an EMPTY slot) and mark the section `closed`, and only THEN would
+/// the racing `replace` store its bytes -- ORPHANED in a slot no one drains, yet
+/// reported as a successful write while `await_closed` resolved on a stale value.
+#[derive(Debug, Default)]
+struct ReplaceSlot {
+    /// The latest whole-body replace the writer has not yet applied, or `None`.
+    /// `replace` overwrites it (O(1), last-writer-wins -- a newer replace simply
+    /// supersedes an undrained older one); the writer takes it (truncate + write
+    /// exactly these bytes).
+    pending: Option<Vec<u8>>,
+    /// Set `true` by the writer's FINAL (close-side) take, ATOMICALLY with taking
+    /// the last `pending` value under this shared mutex. Once set, no further
+    /// `replace` is accepted -- the writer has committed the final value and is
+    /// about to flush + mark the section `closed`, so a later store would be
+    /// orphaned. This flag IS the accept-vs-close barrier (review r2).
+    sealed: bool,
+}
+
 #[derive(Debug)]
 struct SectionMeta {
     path: PathBuf,
@@ -927,15 +951,18 @@ struct SectionMeta {
     closed: AtomicBool,
     /// Notified once, when the writer task has drained + flushed + set `closed`.
     done: Notify,
-    /// F1d review r1: the coalescing "pending latest" slot for
-    /// [`Section::replace`]. `Some(bytes)` is a newer whole-body replace the
-    /// writer task has not yet applied; `replace` OVERWRITES it in O(1)
-    /// (last-writer-wins, never drops a write -- a newer replace simply
-    /// supersedes an undrained older one, so memory is bounded to exactly ONE
-    /// pending `Vec` regardless of how many attempts race ahead of the
-    /// writer). The writer applies it (a file truncate + write of exactly
-    /// these bytes) whenever it observes the slot set, then clears it.
-    pending_replace: Mutex<Option<Vec<u8>>>,
+    /// F1d review r1/r2: the coalescing last-writer-wins slot for
+    /// [`Section::replace`], PLUS the accept-gate (`sealed`) that makes accepting
+    /// a replace and the writer's final close-side take MUTUALLY EXCLUSIVE under
+    /// this ONE mutex (r2). `replace` OVERWRITES the pending value in O(1) (never
+    /// drops a write -- a newer replace supersedes an undrained older one, so
+    /// memory is bounded to exactly ONE pending `Vec` regardless of attempt
+    /// count) IFF the slot is not yet sealed; the writer applies the pending
+    /// value (file truncate + write of exactly those bytes) whenever it observes
+    /// it, and on close ATOMICALLY takes the FINAL value AND sets `sealed` so any
+    /// later `replace` is rejected (`false`) instead of orphaned. See
+    /// [`ReplaceSlot`].
+    pending_replace: Mutex<ReplaceSlot>,
     /// Wakes the writer task when `pending_replace` is freshly set. Purely a
     /// "go look" signal -- the DATA lives in `pending_replace`, so coalescing
     /// several `notify_one` calls (from several rapid `replace`s arriving
@@ -954,7 +981,7 @@ impl Section {
             partial: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             done: Notify::new(),
-            pending_replace: Mutex::new(None),
+            pending_replace: Mutex::new(ReplaceSlot::default()),
             replace_ready: Notify::new(),
         });
         tokio::spawn(section_writer(rx, Arc::clone(&meta)));
@@ -1020,25 +1047,44 @@ impl Section {
     /// COPIES `bytes` into an owned `Vec` (never retains a caller slice --
     /// AGENTS.md line 144).
     ///
-    /// A no-op once the section is closed (mirrors `append`), returning
-    /// `false`; `true` once the bytes are durably queued in the slot for the
-    /// writer to commit. The caller gates "written" bookkeeping on the return
-    /// value so a rejected write is never recorded as if it landed
-    /// (don't-lie-with-zeros).
+    /// ACCEPT vs CLOSE is ATOMIC (review r2): the sealed-check and the slot store
+    /// run under ONE lock -- the SAME [`ReplaceSlot`] mutex the writer's
+    /// close-side final take seals -- so a `replace` either lands before that take
+    /// (accepted, returns `true`, and its bytes are GUARANTEED the committed
+    /// content, flushed before [`await_closed`](Section::await_closed) resolves)
+    /// or arrives after the seal (rejected, returns `false`, bytes NEVER stored,
+    /// so they can't be orphaned in an already-drained slot). It is IMPOSSIBLE to
+    /// return `true` yet not be committed, or to be accepted after the section
+    /// sealed. The caller gates "written" bookkeeping on the return value so a
+    /// rejected write is never recorded as if it landed (don't-lie-with-zeros).
     fn replace(&self, bytes: &[u8]) -> bool {
-        let Ok(guard) = self.tx.lock() else {
-            return false;
-        };
-        if guard.is_none() {
-            // Closed: mirror `append`'s no-op-once-closed contract.
-            return false;
+        {
+            let mut slot = self
+                .meta
+                .pending_replace
+                .lock()
+                .expect("turn-capture pending-replace lock");
+            if slot.sealed {
+                // The writer's close-side final take has already SEALED the slot
+                // (it took the FINAL value and is flushing / has marked the
+                // section closed). Storing now would ORPHAN these bytes -- never
+                // committed, never awaited -- so reject honestly with `false`
+                // (the caller then never records a never-written attempt;
+                // don't-lie-with-zeros) rather than returning a false-true.
+                return false;
+            }
+            // Not sealed: overwrite the pending value (last-writer-wins, O(1)).
+            // Because this sealed-check + store share the slot lock with the
+            // writer's seal, an accepted store is GUARANTEED to be taken and
+            // committed before `await_closed` resolves -- it can never be
+            // orphaned by a close racing between the check and the store (the
+            // exact review-r2 bug this fixes). `tx` is intentionally untouched:
+            // the seal, not the sender, is the accept-gate.
+            slot.pending = Some(bytes.to_vec());
         }
-        drop(guard);
-        *self
-            .meta
-            .pending_replace
-            .lock()
-            .expect("turn-capture pending-replace lock") = Some(bytes.to_vec());
+        // Wake the writer OUTSIDE the slot lock: a pure "go look" signal (the
+        // DATA is already durably in the slot), so coalescing several notifies is
+        // correct -- the writer reads the LATEST value when it next looks.
         self.meta.replace_ready.notify_one();
         true
     }
@@ -1105,10 +1151,12 @@ impl Section {
 /// review r1's guaranteed last-writer-wins whole-body write -- applied by
 /// truncating the file and writing exactly the slot's bytes) ahead of draining
 /// the next queued [`SectionChunk::Append`] chunk. When the sender drops
-/// (section closed or turn dropped) it applies one final pending replace that
-/// raced the close, then flushes, fsyncs, and marks the section `closed` -- so
-/// [`Section::await_closed`] always observes the LAST replace's bytes, never a
-/// stale earlier one. A file-create/write error marks the section `partial`
+/// (section closed or turn dropped) it ATOMICALLY takes one final pending replace
+/// that raced the close AND seals the slot (so a `replace` racing after is
+/// rejected, never orphaned -- review r2), then flushes, fsyncs, and marks the
+/// section `closed` -- so [`Section::await_closed`] always observes the LAST
+/// accepted replace's bytes, never a stale earlier one. A file-create/write error
+/// marks the section `partial`
 /// and is logged, never propagated (a diagnostic artifact must never fail or
 /// hang the turn).
 async fn section_writer(mut rx: mpsc::Receiver<SectionChunk>, meta: Arc<SectionMeta>) {
@@ -1172,10 +1220,13 @@ async fn section_writer(mut rx: mpsc::Receiver<SectionChunk>, meta: Arc<SectionM
         }
     }
 
-    // Channel closed: apply one final pending replace that raced the close, so
-    // assembly -- which only reads the file AFTER `await_closed` resolves --
-    // always sees the FINAL replace's bytes, never a value stranded in the slot.
-    if let Some(bytes) = take_pending_replace(&meta) {
+    // Channel closed: ATOMICALLY take the FINAL pending replace that raced the
+    // close AND seal the slot (under one lock), so any `replace` arriving after
+    // this point is rejected (`false`) rather than orphaned in a slot no one
+    // drains. Take-under-lock, then write AFTER releasing the lock (never hold
+    // the mutex across the disk write). Assembly reads the file only AFTER
+    // `await_closed` resolves (below), so it always sees this FINAL value.
+    if let Some(bytes) = seal_and_take_pending_replace(&meta) {
         apply_replace(&mut file, &meta, bytes).await;
     }
 
@@ -1187,13 +1238,31 @@ async fn section_writer(mut rx: mpsc::Receiver<SectionChunk>, meta: Arc<SectionM
     meta.done.notify_waiters();
 }
 
-/// Take the [`SectionMeta::pending_replace`] slot's value, if set, clearing it
-/// back to `None` atomically (under the slot's own mutex).
+/// In-loop take: remove the [`SectionMeta::pending_replace`] slot's pending value
+/// (if any) WITHOUT sealing, so replaces arriving while the writer is still
+/// draining are still accepted. Under the slot's own mutex.
 fn take_pending_replace(meta: &SectionMeta) -> Option<Vec<u8>> {
     meta.pending_replace
         .lock()
         .expect("turn-capture pending-replace lock")
+        .pending
         .take()
+}
+
+/// Close-side final take + SEAL (review r2): under ONE lock, atomically take the
+/// LAST pending value AND set `sealed`, making ACCEPT ([`Section::replace`]) and
+/// this take mutually exclusive -- a racing replace either lands before this (its
+/// bytes are the value returned here, guaranteed committed before `meta.closed`
+/// is set) or after (rejected with `false`, never orphaned). Called exactly once,
+/// after the writer's channel closed. Returns the taken bytes; the caller writes
+/// them AFTER the lock is released (never holds the mutex across the disk write).
+fn seal_and_take_pending_replace(meta: &SectionMeta) -> Option<Vec<u8>> {
+    let mut slot = meta
+        .pending_replace
+        .lock()
+        .expect("turn-capture pending-replace lock");
+    slot.sealed = true;
+    slot.pending.take()
 }
 
 /// Write one queued `Append` chunk to the currently-open file. A no-op besides
@@ -1887,6 +1956,92 @@ mod tests {
             "guaranteed-delivery replace must never mark the section partial \
              just because many attempts raced ahead of the writer: {section}"
         );
+    }
+
+    /// F1d review r2 (BLOCKING fix): the ACCEPT-vs-CLOSE race. The OLD `replace`
+    /// released the tx-lock BEFORE storing into the pending slot, so a `close`
+    /// (and the writer's final post-close slot-check + flush + mark-closed) could
+    /// slot in between -- leaving the racing `replace`'s bytes ORPHANED in a slot
+    /// no one drains, yet `replace` still returned `true` and `await_closed`
+    /// resolved on a stale/missing value. The fix seals the slot ATOMICALLY with
+    /// the writer's final take, so accept and close are mutually exclusive.
+    ///
+    /// Stress the boundary: each iteration commits a baseline, then races a
+    /// `replace` against a `close` on the SAME section (both spawned so the
+    /// scheduler decides the winner). The invariant that must hold for EVERY
+    /// iteration, regardless of who wins: EITHER the replace was accepted
+    /// (returned `true`) and its bytes are EXACTLY the committed section content,
+    /// OR it was rejected (`false`) and the section reflects the PRIOR committed
+    /// baseline -- never an orphaned slot (true-but-not-committed), a torn value,
+    /// or a lost final.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replace_and_close_are_atomic_no_orphaned_slot() {
+        use super::Section;
+
+        // Each outer iteration drives a HOT LOOP of `replace`s that straddles a
+        // CONCURRENT `close`/seal, so a replace is guaranteed to be executing at
+        // the exact moment the writer seals -- precisely the accept-vs-close
+        // boundary. The invariant checked afterward: the committed section content
+        // MUST equal the LAST replace that returned `true` (last-writer-wins).
+        // On the buggy split-lock `replace`, the boundary replace can read
+        // `sealed == false`, the writer then seals + commits an EARLIER value, and
+        // the boundary replace stores its bytes into the sealed slot -- ORPHANED:
+        // it returned `true` yet is never committed, so `committed != last_accepted`
+        // and this asserts. The atomic fix makes accept + seal mutually exclusive,
+        // so an accepted replace is ALWAYS the committed value.
+        const OUTER: u32 = 1200;
+        const INNER_CAP: u32 = 20_000;
+        for iter in 0..OUTER {
+            let dir = temp_dir_path(&format!("replace-close-race-{iter}"));
+            let path = dir.join("upstream_request");
+            let section = Arc::new(Section::new(path.clone()));
+
+            // A committed baseline so `last_accepted` is well-defined even if the
+            // writer seals before the very first hot-loop replace is accepted.
+            let baseline = format!(r#"{{"which":"baseline-{iter}"}}"#).into_bytes();
+            assert!(
+                section.replace(&baseline),
+                "iter {iter}: the pre-race (unsealed) baseline replace must be accepted"
+            );
+
+            // Seal concurrently on another worker thread while the hot loop runs.
+            let s_close = Arc::clone(&section);
+            let close_task = tokio::spawn(async move { s_close.close(false) });
+
+            // Hot loop: keep replacing until the slot seals (`replace` -> false),
+            // tracking the LAST accepted bytes. `sealed` is monotonic, so the first
+            // `false` means sealed-for-good and we stop.
+            let mut last_accepted = baseline.clone();
+            let mut k = 0u32;
+            loop {
+                let candidate = format!(r#"{{"which":"racer-{iter}-{k}"}}"#).into_bytes();
+                if section.replace(&candidate) {
+                    last_accepted = candidate;
+                    k += 1;
+                    if k >= INNER_CAP {
+                        // Writer hasn't sealed yet (didn't straddle this round);
+                        // stop spinning -- the invariant still holds below.
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            close_task.await.expect("close task joined");
+            // Resolves only AFTER the writer drained + flushed the FINAL value.
+            section.await_closed().await;
+            let committed = std::fs::read(&path).expect("section file readable");
+
+            assert_eq!(
+                committed, last_accepted,
+                "iter {iter}: the committed section MUST equal the LAST `replace` \
+                 that returned true (last-writer-wins). A mismatch means a replace \
+                 returned true yet its bytes were orphaned in a sealed slot -- the \
+                 accept-vs-close race this fix closes."
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// F1d (don't-lie-with-zeros): a turn that never dispatches upstream (the
