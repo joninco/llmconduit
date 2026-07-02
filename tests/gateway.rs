@@ -10785,6 +10785,14 @@ async fn f1e_ac14_oversized_frame_partial_and_no_hang() {
 /// `served_response`/`upstream_response` sections are raw model OUTPUT (image redaction
 /// on the response stream is out of scope — F1e note), so this asserts the REQUEST
 /// sections. AGENTS.md line 137/144.
+///
+/// NON-VACUOUS upstream side (F1f review r1): the inbound `api_key` is dropped by
+/// `/v1/messages` pre-lowering and the images are degraded, so no inbound secret
+/// naturally survives into `upstream_request` — an upstream-only assertion on those
+/// would pass even with the upstream redaction deleted. To genuinely exercise the
+/// upstream secret pass, a sensitive-KEYED `upstream_chat_kwargs` value is seeded; it
+/// flattens into the on-wire `extra_body` and truly reaches `upstream_request`, where
+/// its value must be redacted (asserted below).
 #[tokio::test]
 async fn f1f_ac16_request_sections_redact_secret_and_image_end_to_end() {
     let capture_dir = unique_capture_dir("f1f-ac16");
@@ -10813,6 +10821,19 @@ async fn f1f_ac16_request_sections_redact_secret_and_image_end_to_end() {
     let mut config = test_config();
     config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
     config.turn_capture_dir = Some(capture_dir.clone());
+    // Non-vacuous `upstream_request` redaction (F1f review r1): the inbound top-level
+    // `api_key` below is DROPPED by `/v1/messages` before lowering (and the images are
+    // degraded), so nothing secret-bearing from the inbound body actually survives into
+    // `upstream_request` — deleting the upstream-side redaction would still pass. To
+    // genuinely EXERCISE the `redacted_upstream_request_bytes` secret pass, seed a
+    // sensitive-KEYED `upstream_chat_kwargs` value: it gap-fills into the on-wire
+    // ChatCompletionRequest's (flattened) `extra_body` — proven to reach the wire by
+    // `forwards_configured_upstream_chat_kwargs` — so it truly LANDS in the captured
+    // `upstream_request` section, where the redaction must strip its value.
+    config.upstream_chat_kwargs = JsonMap::from_iter([(
+        "client_secret".to_string(),
+        json!("sk-UPSTREAM-KWARG-DO-NOT-LEAK-8888"),
+    )]);
     let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
         config,
         None,
@@ -10899,6 +10920,25 @@ async fn f1f_ac16_request_sections_redact_secret_and_image_end_to_end() {
     assert!(
         inbound.contains("<redacted uri>"),
         "image URI redaction marker present in inbound_request: {inbound}"
+    );
+
+    // NON-VACUOUS upstream_request proof (F1f review r1): the sensitive-keyed
+    // `client_secret` kwarg FLATTENS into the on-wire request's `extra_body`, so its KEY
+    // genuinely reaches `upstream_request`. The KEY surviving while its VALUE is gone is
+    // a real redaction (not "the field never got here") — removing the
+    // `redact_payload_secrets_in_value` pass in `redacted_upstream_request_bytes` would
+    // make this section leak the raw `sk-UPSTREAM-KWARG-DO-NOT-LEAK-8888`.
+    assert!(
+        upstream.contains("client_secret"),
+        "the sensitive-keyed kwarg reached upstream_request (non-vacuous anchor): {upstream}"
+    );
+    assert!(
+        !upstream.contains("sk-UPSTREAM-KWARG-DO-NOT-LEAK-8888"),
+        "upstream_request redacts the sensitive-keyed kwarg VALUE: {upstream}"
+    );
+    assert!(
+        upstream.contains("[redacted]"),
+        "secret redaction marker present in upstream_request: {upstream}"
     );
 }
 

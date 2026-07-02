@@ -309,9 +309,11 @@ fn ac17_orphan_sweep_keeps_dir_with_a_fresh_section_file() {
     assert!(work.exists(), "the in-flight work dir survives");
 }
 
-/// AC-17 (safety): the sweep is a no-op when there is no `.work/` subtree at all
-/// (a request-log dir, or a capture dir before any turn), so wiring it into the
-/// shared `spawn_cleanup` pass over every `debug_log_dirs()` entry is harmless.
+/// AC-17 (safety): the sweep is a no-op when there is no `.work/` subtree at all —
+/// e.g. a `turn_capture_dir` before any turn has registered. Defense-in-depth: even
+/// though `spawn_cleanup` now scopes the destructive sweep to `turn_capture_dir` ALONE
+/// (F1f review r1 — never the request-log dirs), a capture dir with no crash residue
+/// still cleanly reclaims nothing.
 #[test]
 fn ac17_orphan_sweep_noop_without_work_subtree() {
     let dir = TempDir::new();

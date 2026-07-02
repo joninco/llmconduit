@@ -117,17 +117,22 @@ fn log_debug_ui_status(
     }
 }
 
-/// Spawn opt-in age-based cleanup of debug/request-log dump files for each
-/// configured log directory. No-op unless `debug_log_max_age_hours` is set.
-/// Cleanup runs on the blocking pool, never blocking serve startup.
+/// Spawn opt-in age-based cleanup of debug/request-log dump files. No-op unless
+/// `debug_log_max_age_hours` is set. Cleanup runs on the blocking pool, never
+/// blocking serve startup. The artifact/dump prune spans every configured log
+/// directory; the destructive orphan `.work/` sweep is scoped to `turn_capture_dir`
+/// ALONE (F1f review r1 — turn capture is the sole creator of `.work/<id>/` subdirs,
+/// so the sweep must never touch a request-log dir).
 fn run_debug_log_cleanup(config: &Config) {
     let max_age_hours = config.debug_log_max_age_hours;
     if max_age_hours.is_none() {
         return;
     }
-    for dir in config.debug_log_dirs() {
-        spawn_cleanup(Some(dir), max_age_hours);
-    }
+    spawn_cleanup(
+        config.debug_log_dirs(),
+        config.turn_capture_dir.clone(),
+        max_age_hours,
+    );
 }
 
 fn init_tracing(raw_active: bool) {

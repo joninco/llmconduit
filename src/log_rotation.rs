@@ -9,7 +9,11 @@
 //! `<api_call_id>.json` artifacts (top-level `*.json`), and
 //! [`cleanup_orphan_work_dirs`] sweeps orphaned per-turn `.work/<id>/` section dirs
 //! left behind when a process crashes before `TurnCaptureState::finalize_and_assemble`
-//! could delete them. Both run in the same [`spawn_cleanup`] pass; neither reclaims an
+//! could delete them. Both run in the same [`spawn_cleanup`] pass, but with DISTINCT
+//! scopes — the artifact/dump prune spans every `Config::debug_log_dirs()` entry, while
+//! the destructive `.work` sweep is scoped to `turn_capture_dir` ALONE (turn capture is
+//! the sole creator of `.work/<id>/` subdirs, and only under `turn_capture_dir`, so the
+//! sweep must never run over a request-log dir — F1f review r1). Neither reclaims an
 //! in-flight turn (its section files carry fresh mtimes, so it is younger than the
 //! window — and the production caller only runs cleanup at startup, before any turn is
 //! registered).
@@ -125,9 +129,12 @@ pub fn cleanup_dump_files_with_remover(
 /// coincide with a sweep in practice.
 ///
 /// A missing `<capture_dir>/.work/` (the common case — no crash residue) returns `0`
-/// with no error, so running this on every rotation dir (including request-log dirs
-/// with no `.work` subtree) is a cheap no-op. This is blocking IO; do not call it
-/// directly on the async runtime.
+/// with no error. The production caller ([`spawn_cleanup`]) runs this over
+/// `turn_capture_dir` ALONE — NEVER the request-log dirs — because turn capture is the
+/// sole creator of `.work/<api_call_id>/` subdirs and only under `turn_capture_dir`;
+/// sweeping a request-log dir could `remove_dir_all` an unrelated `.work/` subtree it
+/// does not own (F1f review r1, HIGH). This is blocking IO; do not call it directly on
+/// the async runtime.
 pub fn cleanup_orphan_work_dirs(capture_dir: &Path, max_age: Duration, now: SystemTime) -> usize {
     let work_root = capture_dir.join(".work");
     // Missing `.work/` (or a path that isn't a directory) -> no crash residue.
@@ -193,11 +200,26 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
 /// Run [`cleanup_dump_files`] AND [`cleanup_orphan_work_dirs`] on the blocking thread
 /// pool (one pass, one `now`) and log the outcome.
 ///
-/// Returns immediately if `max_age_hours` is `None` (the feature is opt-in) or
-/// if `dir` is `None`. The spawned task is detached: cleanup is best-effort and
-/// must never block startup or fail the server.
-pub fn spawn_cleanup(dir: Option<PathBuf>, max_age_hours: Option<u64>) {
-    let (Some(dir), Some(max_age_hours)) = (dir, max_age_hours) else {
+/// Two DISTINCT surfaces with DISTINCT scopes:
+/// - [`cleanup_dump_files`] age-rotates the published `<id>.json` artifacts + the
+///   request-log dump files across EVERY active dump dir (`dump_dirs` =
+///   `Config::debug_log_dirs()`).
+/// - [`cleanup_orphan_work_dirs`] sweeps orphaned per-turn `.work/<id>/` section dirs,
+///   which ONLY turn capture ever creates and ONLY under `turn_capture_dir`. The
+///   destructive `remove_dir_all` sweep is therefore scoped to `turn_capture_dir`
+///   ALONE — it must NEVER run over a request-log dir, where an unrelated `.work/`
+///   subtree the gateway does not own could be reclaimed (F1f review r1, HIGH). A
+///   `None` `turn_capture_dir` ⇒ the sweep does nothing.
+///
+/// Returns immediately if `max_age_hours` is `None` (the feature is opt-in) or `0`.
+/// The spawned task is detached: cleanup is best-effort and must never block startup
+/// or fail the server.
+pub fn spawn_cleanup(
+    dump_dirs: Vec<PathBuf>,
+    turn_capture_dir: Option<PathBuf>,
+    max_age_hours: Option<u64>,
+) {
+    let Some(max_age_hours) = max_age_hours else {
         return;
     };
     if max_age_hours == 0 {
@@ -210,24 +232,32 @@ pub fn spawn_cleanup(dir: Option<PathBuf>, max_age_hours: Option<u64>) {
         // One `now` for both surfaces so the artifact prune and the `.work` sweep
         // apply an identical cutoff.
         let now = SystemTime::now();
-        let deleted = cleanup_dump_files(&dir, max_age, now);
-        if deleted > 0 {
-            tracing::info!(
-                deleted,
-                dir = %dir.display(),
-                "cleaned up old debug/request-log dump file(s)"
-            );
+        // Age-rotate the published artifacts + request-log dump files across every
+        // active dump dir.
+        for dir in &dump_dirs {
+            let deleted = cleanup_dump_files(dir, max_age, now);
+            if deleted > 0 {
+                tracing::info!(
+                    deleted,
+                    dir = %dir.display(),
+                    "cleaned up old debug/request-log dump file(s)"
+                );
+            }
         }
-        // F1f: reclaim orphaned per-turn `.work/<id>/` dirs (crash residue) in the
-        // SAME rotation pass. A no-op for a dir without a `.work/` subtree (the
-        // request-log dirs), so it is safe to run on every rotation dir.
-        let swept = cleanup_orphan_work_dirs(&dir, max_age, now);
-        if swept > 0 {
-            tracing::info!(
-                swept,
-                dir = %dir.display(),
-                "swept orphaned turn-capture .work dir(s)"
-            );
+        // F1f: reclaim orphaned per-turn `.work/<id>/` dirs (crash residue). SCOPED to
+        // `turn_capture_dir` ALONE — turn capture is the sole creator of
+        // `.work/<api_call_id>/` subdirs, so running this destructive sweep over a
+        // request-log dir could `remove_dir_all` an unrelated `.work/` subtree it does
+        // not own (F1f review r1, HIGH).
+        if let Some(capture_dir) = turn_capture_dir.as_ref() {
+            let swept = cleanup_orphan_work_dirs(capture_dir, max_age, now);
+            if swept > 0 {
+                tracing::info!(
+                    swept,
+                    dir = %capture_dir.display(),
+                    "swept orphaned turn-capture .work dir(s)"
+                );
+            }
         }
     });
 }
