@@ -198,7 +198,10 @@ reserves a slot in a fixed-capacity section channel before each frame and back-p
   `engine_done`) as `failed` (or `cancelled` if the abort token fired) with whatever sections closed —
   mirror `TelemetryGuard`/`MiddlewareGuard` Drop (`dashboard_flow.rs:1794/1917/1991`). `engine_done` and
   `served_done` are IDEMPOTENT; artifact assembly fires exactly once, only after BOTH have reported (the
-  flush/close barrier — Codex "Ordering"), then removes the registry entry + work dir.
+  flush/close barrier — Codex "Ordering"), then EVICTS the registry entry (in-memory, infallible) and
+  BEST-EFFORT deletes the work dir. Invariant: a visible `<id>.json` ⇒ a complete valid artifact + the
+  registry entry evicted; a failed work-dir delete only leaves a sweepable orphan for F1f's `.work` sweep —
+  it never blocks publishing the artifact nor the eviction.
 
 **Acceptance criteria.**
 - **AC-7.** A pre-spawn validation failure (e.g. `previous_response_id`, or a lowering error at

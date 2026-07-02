@@ -37,8 +37,10 @@
 //!   turn that never reached the engine); the both-`done` assembly barrier
 //!   ([`TurnCaptureState::engine_done`] + [`TurnCaptureState::served_done`] are
 //!   idempotent latches → when BOTH have fired, FLUSH the section writers,
-//!   stream-assemble `<dir>/<api_call_id>.json`, then EVICT the registry entry +
-//!   delete the `.work/<id>/` dir). Assembly is BOUNDED: each section streams from
+//!   stream-assemble `<dir>/<api_call_id>.json`, then EVICT the registry entry
+//!   (infallible) + BEST-EFFORT delete the `.work/<id>/` dir -- a failed delete
+//!   leaves a sweepable orphan for F1f, never blocking the publish). Assembly is
+//!   BOUNDED: each section streams from
 //!   its temp file through a JSON escaper (never a whole-section RAM load).
 //! - F1d: upstream-request capture (carrier on `BackendChatRequest`), written into
 //!   the SAME [`TurnCaptureState`] via [`TurnCaptureState::write_upstream_request`].
@@ -158,8 +160,8 @@ impl TurnCapture {
             )
         });
         // F1c eviction: the both-`done` barrier removes this entry once the artifact is
-        // assembled (`engine_done` + `served_done` → assemble → `registry.remove` +
-        // delete `.work/<id>/`). Until then a started turn's entry lives for its
+        // assembled (`engine_done` + `served_done` → assemble → infallible `registry.remove`
+        // + best-effort delete `.work/<id>/`). Until then a started turn's entry lives for its
         // duration; body bytes never enter this map (they stream to disk), so the
         // bounded-memory invariant holds regardless.
         inner
@@ -564,10 +566,19 @@ impl TurnCaptureState {
         }
     }
 
-    /// F1c (blocking): stream-assemble `<capture_dir>/<api_call_id>.json`, then
-    /// remove the `.work/<id>/` dir and evict the registry entry. Diagnostic-only:
-    /// every fs error is logged, never propagated (a capture artifact must never
-    /// fail or hang the turn it describes).
+    /// F1c (blocking): fully build the tmp artifact by STREAMING every section into
+    /// `<capture_dir>/<api_call_id>.json.tmp`, then EVICT the registry entry
+    /// (in-memory, infallible), BEST-EFFORT delete the `.work/<id>/` dir, and
+    /// PUBLISH via atomic rename LAST. Diagnostic-only: every fs error is logged,
+    /// never propagated (a capture artifact must never fail or hang the turn it
+    /// describes).
+    ///
+    /// INVARIANT (F1c review r2): a visible `<id>.json` ⇒ a COMPLETE, valid
+    /// artifact AND the registry entry evicted. The `.work/<id>/` dir is deleted
+    /// BEST-EFFORT -- if that delete fails the orphan lingers and is reclaimed by
+    /// F1f's age-based `.work` sweep (the documented backstop). A work-dir-delete
+    /// failure NEVER blocks publishing a valid capture nor the registry eviction,
+    /// and a tmp-build failure NEVER publishes a partial/empty final.
     fn assemble_blocking(&self) {
         if let Err(err) = std::fs::create_dir_all(&self.capture_dir) {
             tracing::warn!(
@@ -580,20 +591,22 @@ impl TurnCaptureState {
             .capture_dir
             .join(format!("{}.json.tmp", self.api_call_id));
         let final_path = self.capture_dir.join(format!("{}.json", self.api_call_id));
+        // Ordering (see the INVARIANT above):
+        //   1. build the tmp artifact FULLY (all sections streamed in);
+        //   2. evict the registry (in-memory, infallible) -- ALWAYS, before publish;
+        //   3. best-effort remove the work dir (failure logged, non-blocking);
+        //   4. publish LAST via atomic rename tmp -> final.
         match self.write_artifact_file(&tmp) {
             Ok(()) => {
-                // The section temp files are now fully embedded in `tmp`, so clean up
-                // the work dir + evict the registry entry BEFORE the atomic publish.
-                // That makes the published `<id>.json` a definitive "turn fully
-                // finalized" signal -- a reader (test or operator) never sees the
-                // artifact while the work dir or registry entry still linger -- and
-                // removes the assemble-vs-evict race. A crash between here and the
-                // rename leaves only a sweepable `.json.tmp` (F1f orphan sweep), never
-                // a permanent leak.
-                self.cleanup_work_dir_and_registry();
-                // Atomic publish LAST: rename the fully-written tmp over the final
-                // name so a reader (or the orphan sweep) never sees a half-written
-                // `<id>.json`.
+                // (2) Registry eviction is in-memory and infallible; do it BEFORE the
+                // publish so a visible artifact ALWAYS implies an evicted entry.
+                self.evict_registry();
+                // (3) Best-effort work-dir delete: on the happy path the dir is gone
+                // before the artifact is visible; a failure is logged and the orphan
+                // left for F1f's `.work` sweep. It must NOT gate the publish below.
+                self.remove_work_dir_best_effort();
+                // (4) Publish LAST: atomic rename of the fully-written tmp over the
+                // final name so a reader (or the sweep) never sees a half-written file.
                 if let Err(err) = std::fs::rename(&tmp, &final_path) {
                     tracing::warn!(
                         path = %final_path.display(),
@@ -604,41 +617,53 @@ impl TurnCaptureState {
                 }
             }
             Err(err) => {
+                // (1) failed: NEVER publish a partial/empty final. Drop the tmp, but
+                // still evict (no memory leak) + best-effort clean the work dir.
                 tracing::warn!(
                     path = %tmp.display(),
                     error = %err,
                     "turn-capture: failed to write artifact"
                 );
                 let _ = std::fs::remove_file(&tmp);
-                // Still clean up the work dir + registry on the write-error path so a
-                // failed artifact never leaks the turn either.
-                self.cleanup_work_dir_and_registry();
+                self.evict_registry();
+                self.remove_work_dir_best_effort();
             }
         }
     }
 
-    /// F1c: remove the per-turn `.work/<id>/` section dir and evict the registry
-    /// entry. Called from [`assemble_blocking`](Self::assemble_blocking) BEFORE the
-    /// artifact is published (so a published `<id>.json` implies the turn is fully
-    /// finalized) and also on the write-error path (no leak either way).
-    /// Diagnostic-only: fs / lock errors are logged, never propagated.
-    fn cleanup_work_dir_and_registry(&self) {
-        // Delete the per-turn temp section dir (the artifact now embeds their bytes).
+    /// F1c: EVICT this turn's registry entry (closes F1b's deferred leak).
+    /// In-memory and INFALLIBLE -- a `HashMap` remove cannot fail -- so it is
+    /// performed UNCONDITIONALLY on every finalize path (success OR write-error),
+    /// gated on NOTHING external: there is never a registry (memory) leak
+    /// regardless of disk state. A failed `Weak` upgrade just means the capture
+    /// handle (and its whole registry) is already gone at shutdown -- nothing to
+    /// evict. A poisoned lock is recovered (a panic in an unrelated turn must not
+    /// strand this eviction), so eviction truly never fails.
+    fn evict_registry(&self) {
+        if let Some(inner) = self.inner.upgrade() {
+            inner
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.api_call_id);
+        }
+    }
+
+    /// F1c: BEST-EFFORT delete the per-turn `.work/<id>/` section dir (the artifact
+    /// now embeds its bytes). A failure is LOGGED, never propagated, and does NOT
+    /// gate publishing or eviction -- the orphan is reclaimed by F1f's age-based
+    /// `.work` sweep (the documented backstop). `NotFound` counts as success
+    /// (already gone). Diagnostic-only.
+    fn remove_work_dir_best_effort(&self) {
         if let Err(err) = std::fs::remove_dir_all(&self.work_dir)
             && err.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(
                 dir = %self.work_dir.display(),
                 error = %err,
-                "turn-capture: failed to remove work dir"
+                "turn-capture: failed to remove work dir (best-effort); \
+                 leaving orphan for the F1f .work sweep"
             );
-        }
-        // Evict the registry entry (closes F1b's deferred leak). A failed upgrade
-        // means the capture handle is already gone (shutdown) -- nothing to evict.
-        if let Some(inner) = self.inner.upgrade()
-            && let Ok(mut registry) = inner.registry.lock()
-        {
-            registry.remove(&self.api_call_id);
         }
     }
 
@@ -1664,6 +1689,68 @@ mod tests {
         );
         // No .tmp residue in the capture dir.
         assert!(!dir.join("api_barrier.json.tmp").exists());
+    }
+
+    /// F1c review r2 (robust cleanup ordering): a work-dir-delete FAILURE must
+    /// still (i) publish a valid artifact and (ii) evict the registry entry -- a
+    /// transient fs hiccup on the best-effort `.work/<id>/` delete can NEVER strand
+    /// a valid capture or leak the registry entry (the orphan is left for F1f's
+    /// `.work` sweep). Simulates the failure DETERMINISTICALLY (holds even as root)
+    /// by replacing the work dir with a plain FILE, so `remove_dir_all` fails with
+    /// `NotADirectory`. Drives `assemble_blocking` directly with ONLY the served
+    /// side reported, so the both-`done` barrier does not also auto-assemble.
+    #[tokio::test]
+    async fn work_dir_delete_failure_still_publishes_and_evicts() {
+        let dir = temp_dir_path("workdir-delete-fail");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture
+            .start("api_wdfail", Some("m".to_string()), 5)
+            .expect("state");
+        state.write_inbound_request(b"{\"model\":\"m\"}");
+        state.write_served_response(b"ok");
+        // Close + flush both sections; report ONLY the served side so the barrier
+        // does NOT auto-assemble -- we drive assembly manually after the sabotage.
+        state.served_done(false);
+        state.await_inbound_closed().await;
+        state.await_served_closed().await;
+
+        // Sabotage the work dir: replace it (+ its now-flushed section files) with a
+        // regular FILE, so the upcoming `remove_dir_all` fails deterministically with
+        // `NotADirectory` -- a simulated fs hiccup that holds even when tests run as
+        // root (a chmod-based read-only parent would simply be bypassed by root).
+        std::fs::remove_dir_all(state.work_dir()).expect("drop the real work dir");
+        std::fs::write(state.work_dir(), b"x").expect("place a file where the dir was");
+        assert!(
+            state.work_dir().is_file(),
+            "work dir path is now un-removable"
+        );
+
+        // Assemble on the blocking pool, mirroring `finalize_and_assemble`.
+        let assemble_state = Arc::clone(&state);
+        tokio::task::spawn_blocking(move || assemble_state.assemble_blocking())
+            .await
+            .expect("assemble task");
+
+        // (i) A valid artifact IS published despite the work-dir delete failure.
+        let bytes = std::fs::read(dir.join("api_wdfail.json")).expect("artifact published");
+        let artifact: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("published artifact is valid JSON");
+        assert_eq!(artifact["api_call_id"], "api_wdfail");
+        assert!(
+            !dir.join("api_wdfail.json.tmp").exists(),
+            "the tmp is renamed away -- no residue"
+        );
+
+        // (ii) Registry evicted -- NO leak -- even though the best-effort delete failed.
+        assert!(
+            capture.state("api_wdfail").is_none(),
+            "registry eviction is unconditional; a work-dir delete failure never leaks it"
+        );
+        // The best-effort delete failed, so the orphan survives for F1f's sweep.
+        assert!(
+            state.work_dir().exists(),
+            "a failed best-effort work-dir delete leaves a sweepable orphan (F1f)"
+        );
     }
 
     /// `engine_done` is a first-writer-wins latch: the engine's real terminal is

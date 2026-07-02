@@ -28,7 +28,7 @@ response-`Body` wrapper owns served bytes); RAII drop-guard finalize; UTF-8/base
 |-|-|-|
 | F1a | `turn_capture.rs` module (`TurnCapture`/`TurnCaptureState`, disabled zero-op sink) + `turn_capture_dir` on `Config`+`PersistedConfig`+default+env+`configure()`+`debug_log_dirs()` + `Gateway`/`lib.rs` DI. AC-1,2,3 | ✅ |
 | F1b | HTTP own-gate + inbound capture (copy+redact) + served-body `Body` tee (stream/non-stream/error/disconnect); per-turn temp-file sections + registry. AC-4,5,6 | ✅ |
-| F1c | Engine terminal `engine_done` (RAII `CaptureGuard` + middleware backstop) on all terminals incl pre-spawn; both-`done` barrier → bounded streaming assembly + atomic rename + registry evict + `.work` delete. AC-7,8,9 | ⏳ review r2 pending (commits 52b0daf+4103364; r1 fixed 2 HIGH race+leak) |
+| F1c | Engine terminal `engine_done` (RAII `CaptureGuard` + middleware backstop) on all terminals incl pre-spawn; both-`done` barrier → bounded streaming assembly + unconditional registry evict + best-effort `.work` delete (failed delete → F1f orphan sweep, never blocks publish/evict) + atomic rename. AC-7,8,9 | ⏳ review r2: HIGH fixed (robust assemble order: build tmp → infallible evict → best-effort work-dir delete → publish) |
 | F1d | `capture: Option<Arc<TurnCaptureState>>` on `BackendChatRequest`; upstream_request capture in `dispatch_chat_stream`, last-writer-wins (shrink retry / failover final attempt). AC-10,11 | ☐ |
 | F1e | Raw upstream_response tap in `stream_success_response` (incremental, partial-on-error, no hang) + final failed HTTP body (gap-05 staged body) + UTF-8/base64 encoding. AC-12,13,14 | ☐ |
 | F1f | Streaming single-JSON assembly + atomic tmp→rename + work-dir cleanup + rotation (artifacts + orphan `.work`) + docs. AC-15,16,17 | ☐ |
