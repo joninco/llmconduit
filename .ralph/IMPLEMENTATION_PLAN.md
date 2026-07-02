@@ -10,7 +10,7 @@
 
 ## Executive summary
 
-**Status: 6/6 Codex-xhigh APPROVED (F1a–F1f) — FEATURE COMPLETE + full-suite green (1101 tests, deterministic) + LIVE-VERIFIED on alt port :5099 (2026-07-02): artifact with all 4 sections written with --with-debug-ui OFF (own-gate); `<think>` localization confirmed (DeepSeek `delta.reasoning` in upstream_response → Anthropic `thinking` blocks in served_response); mid-stream disconnect → `served_partial:true` + no hang; no `.work`/`.tmp` residue; prod :5022 untouched. Pending: merge decision only.** Opt-in `turn_capture_dir` writes ONE atomic JSON per turn
+**Status: 6/6 Codex-xhigh APPROVED (F1a–F1f) — FEATURE COMPLETE + full-suite green (1112 tests, deterministic) + Fable independent second-lens review (3 findings — sync-redaction-on-worker, orphan-.tmp, panic-in-Drop — all fixed + Codex-verified, incl. an exhaustive Drop-lock poison audit) + LIVE-VERIFIED on alt port :5099 (2026-07-02): artifact with all 4 sections written with --with-debug-ui OFF (own-gate); `<think>` localization confirmed (DeepSeek `delta.reasoning` in upstream_response → Anthropic `thinking` blocks in served_response); mid-stream disconnect → `served_partial:true` + no hang; no `.work`/`.tmp` residue; prod :5022 untouched. Pending: merge decision only.** Opt-in `turn_capture_dir` writes ONE atomic JSON per turn
 (`<dir>/<api_call_id>.json`) with the FULL inbound Anthropic request, translated OpenAI request, RAW vLLM
 response, and served Anthropic bytes + outcome — so an operator / fresh Claude session can debug weird CC
 output (stray `<think>` tags, malformed tool calls) that is otherwise a 200 OK with no durable trace.
