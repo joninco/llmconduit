@@ -10772,6 +10772,136 @@ async fn f1e_ac14_oversized_frame_partial_and_no_hang() {
     );
 }
 
+/// AC-16 (end-to-end redaction): a turn carrying BOTH a secret AND images produces an
+/// artifact whose REQUEST sections — `inbound_request` and `upstream_request` — leak
+/// NEITHER the secret VALUE nor any image `data:`/URL bytes. Runs through the REAL
+/// `ReqwestUpstreamClient` leaf (wiremock) so `upstream_request` is actually captured
+/// (the in-process `MockUpstream` bypasses the dispatch tap, leaving that section
+/// absent — see AC-7/8). Two redaction paths converge here: the middleware redacts the
+/// raw inbound body (secret keys + image URIs) BEFORE `inbound_request` capture, and
+/// the on-wire OpenAI request is redacted by `redacted_upstream_request_bytes` AND its
+/// text-only-model images are degraded to a placeholder (`UnsupportedImagePolicy::
+/// Placeholder`), so no image bytes reach `upstream_request` either. The
+/// `served_response`/`upstream_response` sections are raw model OUTPUT (image redaction
+/// on the response stream is out of scope — F1e note), so this asserts the REQUEST
+/// sections. AGENTS.md line 137/144.
+#[tokio::test]
+async fn f1f_ac16_request_sections_redact_secret_and_image_end_to_end() {
+    let capture_dir = unique_capture_dir("f1f-ac16");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.1"}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-1",
+                    "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
+                })])),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.turn_capture_dir = Some(capture_dir.clone());
+    let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
+        config,
+        None,
+        llmconduit::AppOptions {
+            with_debug_ui: false,
+        },
+    );
+
+    // The turn carries a secret AND two images (an https signed URL + a data: URI) —
+    // the exact shapes `f1b_inbound_section_redacts_secrets_and_image_uris` proves the
+    // middleware redacts on the inbound side.
+    let body = json!({
+        "model": "glm-5.1",
+        "max_tokens": 1024,
+        "stream": true,
+        "api_key": "sk-LEAKED-SECRET-VALUE",
+        "messages": [{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "describe" },
+                { "type": "image", "source": { "type": "url",
+                    "url": "https://secret.example.com/img.png?sig=IMGTOKEN123" } },
+                { "type": "image", "source": { "type": "url",
+                    "url": "data:image/png;base64,RAWIMGBYTES9999" } }
+            ]
+        }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read served stream");
+
+    let artifact = wait_for_only_artifact(&capture_dir).await;
+    let sections = &artifact["sections"];
+
+    // upstream_request MUST be present (the real dispatch leaf captured it) so the
+    // assertion below is not vacuously satisfied by an absent section.
+    assert!(
+        sections.get("upstream_request").is_some(),
+        "upstream_request captured through the real dispatch leaf: {artifact}"
+    );
+    // Serialize each request section WHOLE (metadata + nested content) so any secret
+    // value or image bytes surviving ANYWHERE inside it is caught.
+    let inbound = serde_json::to_string(&sections["inbound_request"]).expect("inbound json");
+    let upstream = serde_json::to_string(&sections["upstream_request"]).expect("upstream json");
+    for (label, text) in [
+        ("inbound_request", &inbound),
+        ("upstream_request", &upstream),
+    ] {
+        assert!(
+            !text.contains("sk-LEAKED-SECRET-VALUE"),
+            "{label} leaks the secret api_key value: {text}"
+        );
+        assert!(
+            !text.contains("secret.example.com"),
+            "{label} leaks the signed image URL host: {text}"
+        );
+        assert!(
+            !text.contains("IMGTOKEN123"),
+            "{label} leaks the signed-URL token: {text}"
+        );
+        assert!(
+            !text.contains("RAWIMGBYTES9999"),
+            "{label} leaks raw data: image bytes: {text}"
+        );
+    }
+    // Meaningful (not vacuous): the inbound body DID carry the secret + images, and the
+    // redaction markers prove they were present-then-stripped (not merely absent).
+    assert!(
+        inbound.contains("[redacted]"),
+        "secret redaction marker present in inbound_request: {inbound}"
+    );
+    assert!(
+        inbound.contains("<redacted uri>"),
+        "image URI redaction marker present in inbound_request: {inbound}"
+    );
+}
+
 #[tokio::test]
 async fn head_and_options_probes_return_204_with_allow_header() {
     let config = test_config();
@@ -11992,29 +12122,16 @@ fn turn_capture_temp_dir() -> std::path::PathBuf {
     std::env::temp_dir().join(format!("llmconduit-f1b-{}", uuid::Uuid::new_v4().simple()))
 }
 
-/// Poll `<dir>/.work` for the SINGLE captured turn's state (the work dir is created
-/// asynchronously by the section writer), then look it up in the registry by id.
-async fn sole_capture_state(
-    gateway: &Arc<Gateway>,
-    dir: &std::path::Path,
-) -> Arc<llmconduit::turn_capture::TurnCaptureState> {
-    let work_root = dir.join(".work");
-    for _ in 0..300 {
-        if let Ok(entries) = std::fs::read_dir(&work_root) {
-            let ids: Vec<String> = entries
-                .flatten()
-                .filter_map(|entry| entry.file_name().into_string().ok())
-                .collect();
-            if let [id] = ids.as_slice()
-                && let Some(state) = gateway.turn_capture().state(id)
-            {
-                return state;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("no sole capture work dir under {}", work_root.display());
-}
+// NOTE (F1f flake fix): the pre-F1f `sole_capture_state` helper polled `<dir>/.work`
+// for the single turn's work dir and looked the state up in the registry — but F1c/F1e
+// assembly DELETES `.work/<id>/` and EVICTS the registry entry the instant the turn
+// finalizes, so a fast-finalizing turn emptied `.work` and the helper `panic!`ed under
+// parallel load (a harness timing race, not a product bug). The four tests below now
+// read the DURABLE published `<id>.json` artifact via `wait_for_only_artifact` (the
+// same helper the F1c/F1d/F1e tests use): the artifact is written exactly once and
+// persists (until rotation), so the assertions are deterministic regardless of how
+// fast the turn finalizes — and its appearance also proves finalize completed in
+// bounded time.
 
 /// AC-4 (+ AC-6a): with the dashboard OFF (FlowStore disabled) and
 /// `turn_capture_dir` set, a streaming `/v1/messages` turn still runs the
@@ -12062,30 +12179,33 @@ async fn f1b_turn_capture_writes_sections_with_dashboard_off() {
         .await
         .expect("read body");
 
-    let state = sole_capture_state(&gateway, &dir).await;
-    state.await_inbound_closed().await;
-    state.await_served_closed().await;
-
-    // Both sections exist under `.work/<id>/` with content.
-    assert!(state.work_dir().starts_with(dir.join(".work")));
-    let inbound = std::fs::read(state.inbound_request_path()).expect("inbound section");
-    assert!(
-        String::from_utf8_lossy(&inbound).contains("claude-3-5-sonnet-20241022"),
-        "inbound section holds the request body"
-    );
-    // The served section is byte-for-byte what the client received (AC-6a).
-    let served_file = std::fs::read(state.served_response_path()).expect("served section");
+    let artifact = wait_for_only_artifact(&dir).await;
+    let sections = &artifact["sections"];
+    // inbound_request embeds as a parsed JSON value (the redacted Anthropic body).
     assert_eq!(
-        served_file,
-        served.to_vec(),
+        sections["inbound_request"]["content"]["model"], "claude-3-5-sonnet-20241022",
+        "inbound section holds the request body: {}",
+        sections["inbound_request"]
+    );
+    // The served section is byte-for-byte what the client received (AC-6a): raw SSE
+    // is UTF-8, so it round-trips through the artifact's JSON string `content`.
+    let served_response = &sections["served_response"];
+    let served_content = served_response["content"]
+        .as_str()
+        .expect("served content is a UTF-8 string");
+    assert_eq!(
+        served_content.as_bytes(),
+        served.as_ref(),
         "served section == exact bytes returned to the client"
     );
-    let served_text = String::from_utf8_lossy(&served_file);
-    assert!(served_text.contains("event: message_start"));
-    assert!(served_text.contains("event: message_stop"));
-    assert!(served_text.contains("Hello"));
-    assert!(!state.served_partial(), "a completed stream is not partial");
-    assert_eq!(state.served_bytes(), served_file.len() as u64);
+    assert!(served_content.contains("event: message_start"));
+    assert!(served_content.contains("event: message_stop"));
+    assert!(served_content.contains("Hello"));
+    assert_eq!(
+        served_response["partial"], false,
+        "a completed stream is not partial"
+    );
+    assert_eq!(served_response["bytes"].as_u64(), Some(served.len() as u64));
 }
 
 /// AC-5: the `inbound_request` section is redacted — a secret-bearing field AND an
@@ -12131,11 +12251,11 @@ async fn f1b_inbound_section_redacts_secrets_and_image_uris() {
         .await
         .expect("response");
 
-    let state = sole_capture_state(&gateway, &dir).await;
-    state.await_inbound_closed().await;
-    let text =
-        String::from_utf8(std::fs::read(state.inbound_request_path()).expect("inbound section"))
-            .expect("utf8");
+    let artifact = wait_for_only_artifact(&dir).await;
+    // inbound_request embeds as a parsed JSON value; serialize it back to scan the
+    // whole redacted body for any surviving secret / image bytes.
+    let text = serde_json::to_string(&artifact["sections"]["inbound_request"]["content"])
+        .expect("serialize inbound content");
 
     assert!(
         !text.contains("sk-LEAKED-SECRET-VALUE"),
@@ -12199,19 +12319,20 @@ async fn f1b_captures_served_bytes_for_non_streaming_turn() {
         .await
         .expect("read body");
 
-    let state = sole_capture_state(&gateway, &dir).await;
-    state.await_served_closed().await;
-    let served_file = std::fs::read(state.served_response_path()).expect("served section");
+    let artifact = wait_for_only_artifact(&dir).await;
+    let served_response = &artifact["sections"]["served_response"];
+    let served_content = served_response["content"]
+        .as_str()
+        .expect("served content is a UTF-8 string");
     assert_eq!(
-        served_file,
-        served.to_vec(),
+        served_content.as_bytes(),
+        served.as_ref(),
         "served section == the non-streaming JSON body"
     );
-    let served_text = String::from_utf8_lossy(&served_file);
-    assert!(served_text.contains("\"type\":\"message\""));
-    assert!(served_text.contains("Hello non-stream"));
-    assert!(
-        !state.served_partial(),
+    assert!(served_content.contains("\"type\":\"message\""));
+    assert!(served_content.contains("Hello non-stream"));
+    assert_eq!(
+        served_response["partial"], false,
         "a complete non-streaming response is not partial"
     );
 }
@@ -12261,16 +12382,16 @@ async fn f1b_mid_stream_disconnect_marks_served_partial() {
     );
     drop(stream);
 
-    let state = sole_capture_state(&gateway, &dir).await;
-    // Finalization must be bounded (no hang) even though the stream was cut short.
-    tokio::time::timeout(
+    // The artifact appearing within a bounded time proves finalization did not hang
+    // even though the stream was cut short; `partial` records the truncated capture.
+    let artifact = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        state.await_served_closed(),
+        wait_for_only_artifact(&dir),
     )
     .await
-    .expect("served section closes within bounded time (no hang)");
-    assert!(
-        state.served_partial(),
-        "a mid-stream disconnect marks served_response partial"
+    .expect("turn finalizes + publishes within bounded time (no hang)");
+    assert_eq!(
+        artifact["sections"]["served_response"]["partial"], true,
+        "a mid-stream disconnect marks served_response partial: {artifact}"
     );
 }

@@ -4,10 +4,21 @@
 //! with no rotation, so the directory holding dump files can grow unbounded.
 //! This module deletes eligible dump files older than a configurable max age.
 //!
-//! The core [`cleanup_dump_files`] function is synchronous and takes an injected
-//! `now`, so tests can age files out by passing a cutoff rather than backdating
-//! mtimes. Callers on the tokio runtime must invoke it via `spawn_blocking`
-//! (see [`spawn_cleanup`]) because it performs blocking filesystem IO.
+//! F1f (durable turn capture) reuses the SAME age window for two surfaces under a
+//! `turn_capture_dir`: [`cleanup_dump_files`] prunes the published
+//! `<api_call_id>.json` artifacts (top-level `*.json`), and
+//! [`cleanup_orphan_work_dirs`] sweeps orphaned per-turn `.work/<id>/` section dirs
+//! left behind when a process crashes before `TurnCaptureState::finalize_and_assemble`
+//! could delete them. Both run in the same [`spawn_cleanup`] pass; neither reclaims an
+//! in-flight turn (its section files carry fresh mtimes, so it is younger than the
+//! window — and the production caller only runs cleanup at startup, before any turn is
+//! registered).
+//!
+//! The core [`cleanup_dump_files`] / [`cleanup_orphan_work_dirs`] functions are
+//! synchronous and take an injected `now`, so tests can age entries out by passing a
+//! cutoff rather than backdating mtimes. Callers on the tokio runtime must invoke them
+//! via `spawn_blocking` (see [`spawn_cleanup`]) because they perform blocking
+//! filesystem IO.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -98,7 +109,89 @@ pub fn cleanup_dump_files_with_remover(
     deleted
 }
 
-/// Run [`cleanup_dump_files`] on the blocking thread pool and log the outcome.
+/// F1f (durable turn capture): reclaim orphaned per-turn `.work/<id>/` section dirs
+/// under `<capture_dir>/.work/` that a crash left behind (the process died before
+/// `TurnCaptureState::finalize_and_assemble` could delete the dir). Returns the number
+/// of orphan dirs actually removed.
+///
+/// Mirrors [`cleanup_dump_files`]: the SAME injected-`now` seam, the SAME age policy
+/// (`now - max_age` cutoff), and the SAME best-effort per-entry tolerance (a removal
+/// race is logged and skipped, not fatal). Only a `.work/<id>/` whose MOST-RECENT
+/// activity — the newest mtime among the dir itself and its immediate section files —
+/// predates the cutoff is removed, so a turn still streaming to its section files
+/// (fresh file mtimes) is NEVER swept even if its dir mtime aged. In-flight protection
+/// is therefore mtime-based; the production caller ([`spawn_cleanup`]) additionally
+/// only runs cleanup at startup, before any turn is registered, so a live turn cannot
+/// coincide with a sweep in practice.
+///
+/// A missing `<capture_dir>/.work/` (the common case — no crash residue) returns `0`
+/// with no error, so running this on every rotation dir (including request-log dirs
+/// with no `.work` subtree) is a cheap no-op. This is blocking IO; do not call it
+/// directly on the async runtime.
+pub fn cleanup_orphan_work_dirs(capture_dir: &Path, max_age: Duration, now: SystemTime) -> usize {
+    let work_root = capture_dir.join(".work");
+    // Missing `.work/` (or a path that isn't a directory) -> no crash residue.
+    let entries = match fs::read_dir(&work_root) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    // `now - max_age` underflowed (max_age beyond the epoch): nothing can be older
+    // than the cutoff, so keep everything (mirrors `is_older_than_cutoff`).
+    let Some(cutoff) = now.checked_sub(max_age) else {
+        return 0;
+    };
+
+    let mut swept = 0usize;
+    for entry in entries {
+        // Tolerate a failing dir entry like a removal race.
+        let Ok(entry) = entry else {
+            continue;
+        };
+        // Only per-turn SUBDIRECTORIES are eligible; a stray file under `.work/` is
+        // left untouched (never removed).
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => {}
+            _ => continue,
+        }
+        let path = entry.path();
+        // Reclaim ONLY a work dir whose most-recent activity predates the cutoff, so
+        // an in-flight turn actively writing its section files is never swept. A dir
+        // with no readable mtime at all is kept (conservative).
+        if newest_mtime(&path).is_some_and(|activity| activity < cutoff) {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => swept += 1,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        %error,
+                        "skipping orphan turn-capture .work dir that could not be removed"
+                    );
+                }
+            }
+        }
+    }
+
+    swept
+}
+
+/// The most-recent activity time for a `.work/<id>/` dir: the LATER of the dir's own
+/// mtime and the newest mtime among its immediate entries (the per-section temp
+/// files). Any recent write anywhere inside protects the dir from the sweep. `None`
+/// when no mtime is readable at all (the caller then keeps the dir — conservative).
+fn newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest = fs::metadata(dir).and_then(|meta| meta.modified()).ok();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                newest = Some(newest.map_or(modified, |current| current.max(modified)));
+            }
+        }
+    }
+    newest
+}
+
+/// Run [`cleanup_dump_files`] AND [`cleanup_orphan_work_dirs`] on the blocking thread
+/// pool (one pass, one `now`) and log the outcome.
 ///
 /// Returns immediately if `max_age_hours` is `None` (the feature is opt-in) or
 /// if `dir` is `None`. The spawned task is detached: cleanup is best-effort and
@@ -114,12 +207,26 @@ pub fn spawn_cleanup(dir: Option<PathBuf>, max_age_hours: Option<u64>) {
     }
     let max_age = Duration::from_secs(max_age_hours.saturating_mul(3600));
     tokio::task::spawn_blocking(move || {
-        let deleted = cleanup_dump_files(&dir, max_age, SystemTime::now());
+        // One `now` for both surfaces so the artifact prune and the `.work` sweep
+        // apply an identical cutoff.
+        let now = SystemTime::now();
+        let deleted = cleanup_dump_files(&dir, max_age, now);
         if deleted > 0 {
             tracing::info!(
                 deleted,
                 dir = %dir.display(),
                 "cleaned up old debug/request-log dump file(s)"
+            );
+        }
+        // F1f: reclaim orphaned per-turn `.work/<id>/` dirs (crash residue) in the
+        // SAME rotation pass. A no-op for a dir without a `.work/` subtree (the
+        // request-log dirs), so it is safe to run on every rotation dir.
+        let swept = cleanup_orphan_work_dirs(&dir, max_age, now);
+        if swept > 0 {
+            tracing::info!(
+                swept,
+                dir = %dir.display(),
+                "swept orphaned turn-capture .work dir(s)"
             );
         }
     });

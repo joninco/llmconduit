@@ -223,6 +223,7 @@ LLMCONDUIT_CONNECT_TIMEOUT_SECS
 LLMCONDUIT_MAX_WEB_SEARCH_ROUNDS
 LLMCONDUIT_MAX_REPLAY_ENTRIES
 LLMCONDUIT_FLATTEN_CONTENT
+LLMCONDUIT_TURN_CAPTURE_DIR
 BRAVE_SEARCH_API_KEY
 OPENAI_API_KEY
 ```
@@ -242,6 +243,30 @@ Then inspect prefix stability:
 ```bash
 llmconduit analyze-log
 ```
+
+## Durable turn capture
+
+Set `turn_capture_dir` to persist ONE self-contained JSON artifact per inference
+turn — the full request+response chain, for debugging output that returned a plain
+`200 OK` (e.g. a stray `<think>` tag that leaked into text, a dropped tool call).
+It is opt-in and works independently of the `--with-debug-ui` dashboard:
+
+```yaml
+turn_capture_dir: "/tmp/llmconduit-turns"
+# Optional: age-rotate artifacts (and sweep crash-orphaned work dirs) after N hours.
+debug_log_max_age_hours: 48
+```
+
+Each instrumented turn writes `<turn_capture_dir>/<api_call_id>.json` with four
+sections — `inbound_request`, `upstream_request` (translated, on-wire),
+`upstream_response` (raw upstream bytes — the pre-parse ground truth), and
+`served_response` (the exact bytes returned to the client) — plus outcome metadata
+(`status`, `terminal_reason`, timings, per-section `{bytes, partial, encoding}`).
+Diff `upstream_response` against `served_response` to localize a `<think>` leak as
+upstream-emitted vs converter-introduced. Request sections are redacted (secret keys
++ image URIs); memory stays bounded (sections stream to per-turn temp files under
+`<dir>/.work/<id>/`, assembled atomically via tmp→fsync→rename). Leave
+`turn_capture_dir` unset to disable (zero overhead — no thread, no allocation).
 
 ## Test
 

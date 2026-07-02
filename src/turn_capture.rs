@@ -3322,4 +3322,99 @@ mod tests {
             work_dir.display()
         );
     }
+
+    /// AC-15 (atomicity + encoding + no residue): a completed turn writes exactly ONE
+    /// valid `<id>.json` carrying ALL FOUR sections plus the outcome metadata; a
+    /// NON-UTF-8 `upstream_response` round-trips via base64 with an
+    /// `encoding:"base64"` marker; and NO `.json.tmp` or `.work/<id>/` residue is left
+    /// once assembly's atomic tmp->rename + work-dir delete complete. Drives the REAL
+    /// `finalize_and_assemble` path (streaming JSON escape + fsync + rename), so the
+    /// base64 fallback and atomicity are exercised, not stubbed.
+    #[tokio::test]
+    async fn ac15_completed_turn_single_valid_json_all_sections_base64_no_residue() {
+        use base64::Engine as _;
+
+        let dir = temp_dir_path("ac15");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture
+            .start("api_ac15", Some("claude-opus".to_string()), 1_000)
+            .expect("state");
+        let work_dir = state.work_dir().to_path_buf();
+
+        // All four sections. `upstream_response` is deliberately NON-UTF-8 raw bytes
+        // (0xFF/0xFE can never begin a valid UTF-8 sequence) to exercise the base64
+        // fallback + encoding marker; the others are valid UTF-8/JSON.
+        let raw_upstream: &[u8] = &[0xff, 0xfe, 0x00, 0x9c, 0x80, 0x01, 0xfd];
+        state.write_inbound_request(br#"{"model":"claude-opus","stream":true}"#);
+        state.write_upstream_request(br#"{"model":"served-model","max_tokens":123}"#);
+        state.write_upstream_response(raw_upstream);
+        state.write_served_response(b"event: message_start\n\nevent: message_stop\n\n");
+        state.served_done(false);
+        state.engine_done("completed", Some("stop"));
+
+        // A single, valid JSON artifact (wait_for_artifact parses it or panics).
+        let artifact = wait_for_artifact(&dir.join("api_ac15.json")).await;
+
+        // Outcome metadata.
+        assert_eq!(artifact["api_call_id"], "api_ac15");
+        assert_eq!(artifact["model_requested"], "claude-opus");
+        assert_eq!(artifact["status"], "completed");
+        assert_eq!(artifact["terminal_reason"], "stop");
+        let started = artifact["started_ms"].as_u64().expect("started_ms");
+        let finished = artifact["finished_ms"].as_u64().expect("finished_ms");
+        assert_eq!(started, 1_000);
+        assert!(finished >= started, "finished_ms >= started_ms");
+
+        // ALL FOUR sections present.
+        let sections = &artifact["sections"];
+        for name in [
+            "inbound_request",
+            "upstream_request",
+            "upstream_response",
+            "served_response",
+        ] {
+            assert!(
+                sections.get(name).is_some(),
+                "section {name} present: {artifact}"
+            );
+        }
+
+        // The non-UTF-8 upstream_response round-trips via base64 + the encoding marker.
+        let upstream_response = &sections["upstream_response"];
+        assert_eq!(
+            upstream_response["encoding"], "base64",
+            "a non-UTF-8 upstream_response embeds as base64: {upstream_response}"
+        );
+        let encoded = upstream_response["content"]
+            .as_str()
+            .expect("base64 string content");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("content is valid base64");
+        assert_eq!(
+            decoded, raw_upstream,
+            "base64 round-trips the EXACT raw upstream bytes"
+        );
+
+        // Exactly ONE artifact, and NO residue (`.tmp` or `.work/<id>/`).
+        let json_files: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read capture dir")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        assert_eq!(
+            json_files.len(),
+            1,
+            "exactly one <id>.json artifact: {json_files:?}"
+        );
+        assert!(
+            !dir.join("api_ac15.json.tmp").exists(),
+            "no .json.tmp residue remains after the atomic rename"
+        );
+        assert!(
+            !work_dir.exists(),
+            "no .work/<id>/ residue remains after finalize"
+        );
+    }
 }
