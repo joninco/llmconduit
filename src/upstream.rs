@@ -1098,7 +1098,24 @@ impl ReqwestUpstreamClient {
     /// the first send's). The redaction is consistent with the existing request-capture
     /// surface; this is a diagnostic body shown to the authenticated operator, captured ONLY
     /// when explicitly opted in.
-    fn capture_upstream_response_body(&self, serving: Option<&Arc<ServingToken>>, body: &str) {
+    fn capture_upstream_response_body(
+        &self,
+        serving: Option<&Arc<ServingToken>>,
+        capture: Option<&Arc<TurnCaptureState>>,
+        body: &str,
+    ) {
+        // F1e: STAGE the failed HTTP body on the turn-capture handle -- gated ONLY
+        // on capture being enabled (independent of the dashboard response-capture
+        // flag, so durable capture works without the debug UI). Image-URI redaction
+        // only (responses carry no header secrets; keep it cheap + consistent, and
+        // it handles non-JSON error bodies). Last-writer-wins within an attempt; the
+        // per-attempt clear at dispatch start + the streamed-success discriminator
+        // make the committed body the FINAL attempt's (gap-05 semantics).
+        if let Some(capture) = capture {
+            let redacted = crate::redaction::redact_image_uris(body).into_bytes();
+            capture.stage_upstream_response_body(&redacted);
+        }
+        // gap-05 dashboard staging (separately gated on the response-capture flag).
         if !self.flow_store.is_response_capture_enabled() {
             return;
         }
@@ -1228,6 +1245,16 @@ impl ReqwestUpstreamClient {
         serving: Option<&Arc<ServingToken>>,
         capture: Option<&Arc<TurnCaptureState>>,
     ) -> AppResult<UpstreamStream> {
+        // F1e: per-attempt reset of the staged FINAL failed body (mirrors the
+        // gap-05 `serving.clear_pending_response_body()` seam) -- this dispatch is
+        // one provider attempt (its internal shrink-retry re-stages last-writer-wins),
+        // so clearing here makes the committed body the FINAL attempt's: an earlier
+        // failover provider's staged body never survives a later attempt that fails
+        // WITHOUT a body (connect/timeout/prefetch-stream-error). A success stream
+        // supersedes it anyway (the streamed section wins at assembly).
+        if let Some(capture) = capture {
+            capture.clear_pending_upstream_response_body();
+        }
         // First attempt. On a non-2xx whose body indicates a context/completion
         // token-limit overflow, shrink `max_completion_tokens` and retry ONCE.
         // This happens before any SSE chunk is parsed/yielded downstream, so it
@@ -1245,7 +1272,8 @@ impl ReqwestUpstreamClient {
         stamp_header_byte(serving);
         let status = response.status();
         if status.is_success() {
-            return stream_success_response(response, self.max_sse_frame_bytes).await;
+            return stream_success_response(response, self.max_sse_frame_bytes, capture.cloned())
+                .await;
         }
 
         let body = response.text().await.unwrap_or_default();
@@ -1282,7 +1310,12 @@ impl ReqwestUpstreamClient {
                 .await?;
             let retry_status = retry_response.status();
             if retry_status.is_success() {
-                return stream_success_response(retry_response, self.max_sse_frame_bytes).await;
+                return stream_success_response(
+                    retry_response,
+                    self.max_sse_frame_bytes,
+                    capture.cloned(),
+                )
+                .await;
             }
             // The retry ALSO failed. If it is again a context overflow, this is a
             // same-provider sizing problem, not a provider failure: surface a
@@ -1294,7 +1327,8 @@ impl ReqwestUpstreamClient {
             // Gap 05: the RETRY is the body that actually ended the turn on the
             // shrink-and-retry path — stage IT (last-writer-wins over the first
             // attempt's body) so the dashboard shows the upstream's final word.
-            self.capture_upstream_response_body(serving, &retry_body);
+            // F1e also stages it onto the turn-capture handle.
+            self.capture_upstream_response_body(serving, capture, &retry_body);
             if classify_context_overflow(
                 &retry_body,
                 self.min_completion_tokens,
@@ -1334,7 +1368,8 @@ impl ReqwestUpstreamClient {
         // Gap 05: a first-attempt non-2xx that did NOT trigger a context-overflow retry
         // — stage the upstream error body so the operator can see why the turn failed (it
         // is cleared if a later failover provider serves; committed at finalize otherwise).
-        self.capture_upstream_response_body(serving, &body);
+        // F1e also stages it onto the turn-capture handle (final failed HTTP body).
+        self.capture_upstream_response_body(serving, capture, &body);
         // E2a: request-intrinsic 4xx {400,413,415,422} → `Terminal` (never cools or fails
         // over a healthy provider — the request itself is unacceptable to any equivalent
         // backend; e.g. an image reaching a text-only upstream). 401/403/404/408/429/5xx
@@ -4090,7 +4125,26 @@ fn parse_token_count(group: &str) -> i64 {
 async fn stream_success_response(
     response: reqwest::Response,
     max_sse_frame_bytes: usize,
+    capture: Option<Arc<TurnCaptureState>>,
 ) -> AppResult<UpstreamStream> {
+    // F1e: tap the RAW pre-parse upstream bytes into the turn's `upstream_response`
+    // section BEFORE the G6 frame guard + SSE parser see them -- the raw bytes are
+    // the ground truth (a `<think>` leak is a 200 OK; nothing else persists it). The
+    // tap COPIES each chunk (no `Bytes`-slice retention, AGENTS.md line 144) and
+    // forwards it UNCHANGED, so the guard/parser see identical bytes; a bounded,
+    // back-pressured [`TurnCaptureState::upstream_response_sink`] throttles the read
+    // to disk pace so a slow disk can never accumulate the whole response in RAM
+    // (bounded memory -- NOT an unbounded channel). Only wrapped when capture is
+    // enabled, so a disabled turn pays nothing (the byte stream flows straight into
+    // the guard as before).
+    let byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
+        match capture {
+            Some(capture) => {
+                capture.mark_upstream_response_streamed();
+                Box::pin(tap_upstream_response(response.bytes_stream(), capture))
+            }
+            None => Box::pin(response.bytes_stream()),
+        };
     // Bound the upstream SSE read BEFORE `eventsource()` parses it (G6). The
     // `eventsource-stream` 0.2 parser accumulates bytes into an internal
     // `String`/`Vec` buffer and only flushes on an event boundary (a blank
@@ -4099,7 +4153,7 @@ async fn stream_success_response(
     // caps the bytes accumulated since the last boundary and surfaces a clean
     // `AppError` before the parser can over-accumulate. The configured request-body
     // cap in `http.rs` is inbound-only and does NOT cover this response path.
-    let bounded = bounded_sse_byte_stream(response.bytes_stream(), max_sse_frame_bytes);
+    let bounded = bounded_sse_byte_stream(byte_stream, max_sse_frame_bytes);
     let stream = bounded.eventsource().filter_map(|result| async move {
         match result {
             Ok(event) if event.data == "[DONE]" => None,
@@ -4120,6 +4174,106 @@ async fn stream_success_response(
         }
     });
     Ok(Box::pin(stream))
+}
+
+/// F1e: tee the RAW upstream byte stream into the turn's `upstream_response`
+/// capture section, forwarding every chunk UNCHANGED. Each chunk is COPIED
+/// (`to_vec` -- never a retained `Bytes` slice, AGENTS.md line 144) into the
+/// BOUNDED, back-pressured [`ServedSink`]: [`poll_reserve`](crate::turn_capture::ServedSink::poll_reserve)
+/// applies flow control BEFORE the copy, so a slow disk throttles the upstream
+/// read to disk pace instead of piling the whole response into RAM (bounded
+/// memory -- the SAME OOM class F1b's review caught; NO unbounded channel).
+///
+/// A diagnostic failure must NEVER break or stall the served turn: a sink close /
+/// send error, or a mid-stream transport error, drops the sink and marks the
+/// section sticky-`partial` -- forwarding continues byte-for-byte WITHOUT capture.
+/// The [`UpstreamTapGuard`] closes the section on drop so the assembly barrier
+/// resolves in BOUNDED time (no hang): a clean end (the raw stream reached `None`)
+/// closes it non-partial; a drop BEFORE that (a G6 frame-cap rejection downstream
+/// stops pulling, a client disconnect, an engine drop) closes it `partial`.
+fn tap_upstream_response<S>(
+    inner: S,
+    capture: Arc<TurnCaptureState>,
+) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    async_stream::stream! {
+        // `guard` declared FIRST so on an early drop (future dropped mid-await --
+        // G6 downstream / disconnect / engine drop) it drops LAST, after `sink`, so
+        // both the sink's sender clone and the section close land: the writer then
+        // sees all senders gone and terminates (no hang).
+        let mut guard = UpstreamTapGuard::new(Arc::clone(&capture));
+        let mut sink = capture.upstream_response_sink();
+        let mut inner = std::pin::pin!(inner);
+        while let Some(item) = inner.next().await {
+            match &item {
+                Ok(bytes) if !bytes.is_empty() => {
+                    if let Some(active) = sink.as_mut() {
+                        // Reserve a slot BEFORE copying (bounded memory / back-pressure).
+                        match std::future::poll_fn(|cx| active.poll_reserve(cx)).await {
+                            Ok(()) => {
+                                if active.send(bytes.to_vec()).is_err() {
+                                    capture.mark_upstream_response_degraded();
+                                    sink = None;
+                                }
+                            }
+                            Err(_) => {
+                                capture.mark_upstream_response_degraded();
+                                sink = None;
+                            }
+                        }
+                    }
+                }
+                // An empty frame carries nothing to capture -- forward as-is.
+                Ok(_) => {}
+                // A mid-stream transport error: the raw capture is truncated.
+                Err(_) => {
+                    capture.mark_upstream_response_degraded();
+                    sink = None;
+                }
+            }
+            // Forward the ORIGINAL chunk UNCHANGED (tee = copy + forward).
+            yield item;
+        }
+        // The raw upstream stream reached a clean end. Drop the sink so the writer
+        // sees its clone gone, then mark clean so the guard closes the section
+        // non-partial.
+        drop(sink);
+        guard.mark_clean();
+    }
+}
+
+/// F1e drop guard for [`tap_upstream_response`]: mirrors `http.rs`'s `TeeBody`
+/// `Drop`. Marks the `upstream_response` section sticky-`partial` unless the raw
+/// stream reached a clean end, and ALWAYS closes it so the assembly barrier's
+/// `await_upstream_response_closed` resolves in bounded time (no hang) -- for the
+/// clean end (via the block completing) AND for an early drop (G6 frame-cap
+/// rejection downstream, client disconnect, engine drop).
+struct UpstreamTapGuard {
+    capture: Arc<TurnCaptureState>,
+    clean: bool,
+}
+
+impl UpstreamTapGuard {
+    fn new(capture: Arc<TurnCaptureState>) -> Self {
+        Self {
+            capture,
+            clean: false,
+        }
+    }
+
+    fn mark_clean(&mut self) {
+        self.clean = true;
+    }
+}
+
+impl Drop for UpstreamTapGuard {
+    fn drop(&mut self) {
+        // Sticky `partial` for a truncated raw capture; close either way (idempotent
+        // with the barrier's own close) so the writer drains + finalize resolves.
+        self.capture.upstream_response_done(!self.clean);
+    }
 }
 
 fn parse_chat_completion_chunk(data: &str) -> Result<ChatCompletionChunk, serde_json::Error> {

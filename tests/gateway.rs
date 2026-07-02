@@ -10522,6 +10522,256 @@ async fn f1d_ac10_gateway_e2e_upstream_request_is_shrunk_final_request() {
     );
 }
 
+/// AC-12: a SUCCESSFUL streaming turn's `upstream_response` is the EXACT concatenated
+/// RAW vLLM SSE bytes -- byte-for-byte over a wiremock upstream emitting a KNOWN frame
+/// sequence INCLUDING a `<think>`-in-content chunk (the core debugging use case). Runs
+/// through the REAL `ReqwestUpstreamClient` leaf (the only path that hits the raw-bytes
+/// tap in `stream_success_response`); `--with-debug-ui` OFF (capture works off its OWN
+/// gate).
+#[tokio::test]
+async fn f1e_ac12_upstream_response_is_exact_raw_sse_bytes() {
+    let capture_dir = unique_capture_dir("f1e-ac12");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.1"}]
+        })))
+        .mount(&server)
+        .await;
+    // A known frame sequence INCLUDING a `<think>`-in-content chunk -- the exact
+    // shape the capture exists to persist (a `<think>` leak is a 200 OK).
+    let frames = vec![
+        json!({
+            "id": "chat-1",
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "<think>plan"}}]
+        }),
+        json!({
+            "id": "chat-1",
+            "choices": [{"index": 0, "delta": {"content": " done</think>hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
+        }),
+    ];
+    // Build the raw body ONCE and hand the SAME bytes to wiremock, so the expected
+    // value is exactly what the upstream puts on the wire.
+    let raw_sse = chat_completion_sse_body(&frames);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(raw_sse.clone()),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.turn_capture_dir = Some(capture_dir.clone());
+    let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
+        config,
+        None,
+        llmconduit::AppOptions {
+            with_debug_ui: false,
+        },
+    );
+
+    let body = json!({
+        "model": "glm-5.1",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read served stream");
+
+    let artifact = wait_for_only_artifact(&capture_dir).await;
+    let section = &artifact["sections"]["upstream_response"];
+    assert_eq!(
+        section["encoding"], "utf8",
+        "raw SSE is valid UTF-8: {section}"
+    );
+    assert_eq!(
+        section["partial"], false,
+        "a cleanly-streamed upstream response is not partial: {section}"
+    );
+    assert_eq!(
+        section["content"].as_str().expect("string content"),
+        raw_sse,
+        "upstream_response is the EXACT concatenated raw vLLM SSE bytes (byte-for-byte)"
+    );
+    assert!(
+        section["content"]
+            .as_str()
+            .expect("string")
+            .contains("<think>plan"),
+        "the raw `<think>` leak is persisted verbatim (the whole point of the capture)"
+    );
+}
+
+/// AC-13: a FINAL-attempt non-2xx (a 400 error body, NOT an SSE success stream) is
+/// captured as `upstream_response` (the error text) with artifact `status:"failed"`.
+/// The 400 body is request-intrinsic (Terminal) so no failover masks it; it is not a
+/// context-overflow, so no shrink-retry fires.
+#[tokio::test]
+async fn f1e_ac13_final_non_2xx_body_captured_status_failed() {
+    let capture_dir = unique_capture_dir("f1e-ac13");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.1"}]
+        })))
+        .mount(&server)
+        .await;
+    let error_body = "{\"error\":{\"message\":\"invalid request: unsupported parameter\",\"type\":\"invalid_request_error\"}}";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(error_body))
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.turn_capture_dir = Some(capture_dir.clone());
+    let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
+        config,
+        None,
+        llmconduit::AppOptions {
+            with_debug_ui: false,
+        },
+    );
+
+    let body = json!({
+        "model": "glm-5.1",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    // Whatever the client-facing framing, drain it so the tee closes.
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+
+    let artifact = wait_for_only_artifact(&capture_dir).await;
+    assert_eq!(
+        artifact["status"], "failed",
+        "a final-attempt non-2xx is a failed turn: {artifact}"
+    );
+    let section = &artifact["sections"]["upstream_response"];
+    assert_eq!(
+        section["content"].as_str().expect("string content"),
+        error_body,
+        "the final failed HTTP body is captured verbatim as upstream_response: {section}"
+    );
+    assert_eq!(
+        section["partial"], false,
+        "a whole failed body is not partial"
+    );
+}
+
+/// AC-14: a malformed/oversized-frame upstream (the G6 frame cap trips) closes
+/// `upstream_response` `partial:true` AND the artifact still finalizes in BOUNDED time
+/// (asserted via a timeout -- no hang). A single oversized SSE frame far above the
+/// 1024-byte cap floor is rejected mid-stream by the bounded guard downstream of the
+/// tap; the tap's drop guard then marks the raw capture partial and closes it.
+#[tokio::test]
+async fn f1e_ac14_oversized_frame_partial_and_no_hang() {
+    let capture_dir = unique_capture_dir("f1e-ac14");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.1"}]
+        })))
+        .mount(&server)
+        .await;
+    // 4 KiB single `data:` frame, no event boundary before it overflows the cap.
+    let oversized = format!("data: {}\n\n", "x".repeat(4096));
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(oversized),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.turn_capture_dir = Some(capture_dir.clone());
+    // Floored to 1024 by the leaf; the 4 KiB frame overflows it → the G6 cap trips.
+    config.max_sse_frame_bytes = 1024;
+    let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
+        config,
+        None,
+        llmconduit::AppOptions {
+            with_debug_ui: false,
+        },
+    );
+
+    let body = json!({
+        "model": "glm-5.1",
+        "max_tokens": 1024,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024).await;
+
+    // Bounded time (the no-hang assertion): the barrier resolves even though the raw
+    // stream was rejected mid-flight and the tap was dropped before a clean end.
+    let artifact = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        wait_for_only_artifact(&capture_dir),
+    )
+    .await
+    .expect("AC-14: artifact within bounded time (no hang)");
+
+    assert!(
+        artifact["sections"].get("upstream_response").is_some(),
+        "the streamed (then-truncated) upstream_response section is present: {artifact}"
+    );
+    let section = &artifact["sections"]["upstream_response"];
+    assert_eq!(
+        section["partial"], true,
+        "a G6 frame-cap rejection closes upstream_response partial: {section}"
+    );
+}
+
 #[tokio::test]
 async fn head_and_options_probes_return_204_with_allow_header() {
     let config = test_config();

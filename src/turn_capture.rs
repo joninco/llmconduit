@@ -257,6 +257,38 @@ pub struct TurnCaptureState {
     ///
     /// [`write_artifact_file`]: Self::write_artifact_file
     upstream_request_written: AtomicBool,
+    /// F1e: the RAW pre-parse upstream response bytes (vLLM SSE), the ground-truth
+    /// debugging surface (a `<think>` leak is a 200 OK -- nothing else persists it).
+    /// On a SUCCESS turn the streaming tap in `upstream.rs::stream_success_response`
+    /// COPIES each raw chunk here via the back-pressured [`ServedSink`] (bounded
+    /// memory) BEFORE the G6 frame guard + SSE parser see them; on a FAILED turn the
+    /// staged final HTTP error body ([`pending_upstream_body`](Self#field)) is
+    /// written WHOLE at the assembly barrier. Stays OPEN across the turn; closed by
+    /// the tap (clean vs sticky-`partial`) or at
+    /// [`finalize_and_assemble`](Self::finalize_and_assemble).
+    upstream_response: Section,
+    /// F1e (don't-lie-with-zeros): a SUCCESS stream was tapped into
+    /// `upstream_response` (the serving 2xx attempt reached
+    /// `stream_success_response`). Monotonic -- once a 2xx streamed, no failover
+    /// follows -- so when set, assembly embeds the streamed section and IGNORES any
+    /// staged failed body (the served stream wins; no stale earlier-attempt error).
+    upstream_response_streamed: AtomicBool,
+    /// F1e: whether the artifact embeds `upstream_response` at all -- resolved ONCE
+    /// at the assembly barrier ([`finalize_and_assemble`](Self::finalize_and_assemble)):
+    /// `true` if a success stream was tapped OR a staged final failed body was
+    /// committed; `false` (ABSENT) for a turn that never got a raw upstream response
+    /// (never contacted / a body-less transport failure) -- never a fabricated
+    /// `bytes:0` measured-empty section.
+    upstream_response_present: AtomicBool,
+    /// F1e: the staged FINAL failed HTTP body (whole, already image-URI-redacted),
+    /// mirroring the gap-05 `ServingToken` pending body but capture-local (so it
+    /// works WITHOUT the dashboard response-capture gate). The leaf stages it at its
+    /// terminal-error sites (last-writer-wins within an attempt) and CLEARS it at
+    /// each dispatch start, so at the assembly barrier it holds exactly the FINAL
+    /// attempt's error body -- committed to `upstream_response` ONLY when no success
+    /// stream was tapped (a served turn's stream wins; a body-less final failure
+    /// leaves it `None`, so the section is absent).
+    pending_upstream_body: Mutex<Option<Vec<u8>>>,
     /// The exact bytes served to the client, teed off the response `Body` (F1b).
     served_response: Section,
     /// Set synchronously by [`CaptureGuard::new`] the instant the engine takes
@@ -304,6 +336,7 @@ impl TurnCaptureState {
     ) -> Self {
         let inbound_request = Section::new(work_dir.join("inbound_request"));
         let upstream_request = Section::new(work_dir.join("upstream_request"));
+        let upstream_response = Section::new(work_dir.join("upstream_response"));
         let served_response = Section::new(work_dir.join("served_response"));
         Self {
             api_call_id,
@@ -317,6 +350,10 @@ impl TurnCaptureState {
             inbound_request,
             upstream_request,
             upstream_request_written: AtomicBool::new(false),
+            upstream_response,
+            upstream_response_streamed: AtomicBool::new(false),
+            upstream_response_present: AtomicBool::new(false),
+            pending_upstream_body: Mutex::new(None),
             served_response,
             engine_claimed: AtomicBool::new(false),
             served_tee_installed: AtomicBool::new(false),
@@ -339,6 +376,31 @@ impl TurnCaptureState {
     /// Path of the `upstream_request` section temp file (F1d).
     pub fn upstream_request_path(&self) -> &Path {
         self.upstream_request.path()
+    }
+
+    /// Path of the `upstream_response` section temp file (F1e).
+    pub fn upstream_response_path(&self) -> &Path {
+        self.upstream_response.path()
+    }
+
+    /// Whether the `upstream_response` section is `partial` -- the raw upstream
+    /// stream did not reach a clean end (client disconnect, a G6 frame-cap
+    /// rejection downstream, a mid-stream transport error, or a sink write error).
+    /// STICKY, like [`served_partial`](Self::served_partial). `false` for a cleanly
+    /// concatenated success stream or a whole final failed body.
+    pub fn upstream_response_partial(&self) -> bool {
+        self.upstream_response.partial()
+    }
+
+    /// Bytes captured into the `upstream_response` section so far (F1e).
+    pub fn upstream_response_bytes(&self) -> u64 {
+        self.upstream_response.bytes()
+    }
+
+    /// Await the `upstream_response` section writer draining + flushing to disk
+    /// (F1e; used by the assembly barrier and by tests reading the file directly).
+    pub async fn await_upstream_response_closed(&self) {
+        self.upstream_response.await_closed().await;
     }
 
     /// Path of the `served_response` section temp file.
@@ -402,12 +464,83 @@ impl TurnCaptureState {
         }
     }
 
-    /// F1e fills this: raw upstream response bytes, streamed incrementally, into
-    /// the `upstream_response` section. No-op in F1b (that section is not created
-    /// until F1e).
-    #[allow(unused_variables)]
+    /// F1e: append raw upstream-response bytes into the `upstream_response` section
+    /// -- the LOW-VOLUME / test path (a single-shot write), mirroring
+    /// [`write_served_response`](Self::write_served_response). The high-volume
+    /// streaming tap in `upstream.rs::stream_success_response` uses the
+    /// back-pressured [`upstream_response_sink`](Self::upstream_response_sink)
+    /// instead. Marks the section STREAMED (a raw upstream response WAS observed) so
+    /// assembly embeds it -- distinct from a never-contacted turn (whose section is
+    /// absent). COPIES `bytes`; no slice of the caller's buffer is retained.
     pub fn write_upstream_response(&self, bytes: &[u8]) {
-        // F1e fills this.
+        self.mark_upstream_response_streamed();
+        self.upstream_response.append(bytes);
+    }
+
+    /// F1e: a bounded, back-pressured [`ServedSink`] over the `upstream_response`
+    /// section for the streaming raw-upstream tap (`stream_success_response`). SAME
+    /// mechanism as [`served_sink`](Self::served_sink): the tap reserves a channel
+    /// slot BEFORE copying each raw upstream chunk and yields `Poll::Pending` while
+    /// the writer is behind, throttling the upstream read to disk pace so a slow
+    /// disk cannot accumulate the whole response in RAM (bounded memory --
+    /// [`SECTION_CHANNEL_CAPACITY`] frames, NOT an unbounded channel; the same OOM
+    /// class F1b's review caught). `None` once the section is closed.
+    pub fn upstream_response_sink(&self) -> Option<ServedSink> {
+        self.upstream_response.poll_sender().map(ServedSink::new)
+    }
+
+    /// F1e: mark that a 2xx success stream was tapped into `upstream_response` (the
+    /// serving attempt reached `stream_success_response`). Assembly then embeds the
+    /// streamed section and ignores any staged failed body. Monotonic.
+    pub fn mark_upstream_response_streamed(&self) {
+        self.upstream_response_streamed
+            .store(true, Ordering::Release);
+    }
+
+    /// F1e: mark the `upstream_response` section `partial` immediately (sticky),
+    /// independent of close -- mirrors [`mark_served_degraded`](Self::mark_served_degraded).
+    /// The tap calls this the instant its raw capture is truncated (a sink close /
+    /// send error, a mid-stream transport error) or when the stream is dropped
+    /// before a clean end (a G6 frame-cap rejection downstream, a client
+    /// disconnect). A single atomic store; safe to call any number of times.
+    pub fn mark_upstream_response_degraded(&self) {
+        self.upstream_response.mark_partial();
+    }
+
+    /// F1e: close the `upstream_response` section. Called by the tap's drop guard
+    /// (mirroring `TeeBody`'s `served_done`) so the writer drains + the assembly
+    /// barrier's [`await_upstream_response_closed`](Self::await_upstream_response_closed)
+    /// resolves in BOUNDED time (no hang), and ALSO by
+    /// [`finalize_and_assemble`](Self::finalize_and_assemble) for the failed-body
+    /// path (no tap). Idempotent (only the first close drops the sender); `partial`
+    /// is sticky (a later `close(false)` never clears an earlier degrade mark).
+    pub fn upstream_response_done(&self, partial: bool) {
+        self.upstream_response.close(partial);
+    }
+
+    /// F1e: STAGE the FINAL failed HTTP body (whole, already image-URI-redacted) for
+    /// this turn -- last-writer-wins, mirroring the gap-05 `ServingToken` pending
+    /// body but capture-local (gated on capture being enabled, NOT the dashboard
+    /// response-capture flag). Committed to `upstream_response` at the assembly
+    /// barrier ONLY when no success stream was tapped. `bytes` is an owned redacted
+    /// COPY; no caller slice is retained.
+    pub fn stage_upstream_response_body(&self, bytes: &[u8]) {
+        *self
+            .pending_upstream_body
+            .lock()
+            .expect("turn-capture pending-upstream-body lock") = Some(bytes.to_vec());
+    }
+
+    /// F1e: discard any staged failed HTTP body at the START of a dispatch attempt,
+    /// so the committed body reflects the FINAL attempt's outcome (mirrors gap-05's
+    /// per-attempt `clear_pending_response_body`): an earlier provider's staged body
+    /// never survives a later attempt that fails WITHOUT a body
+    /// (connect/timeout/prefetch-stream-error). Idempotent.
+    pub fn clear_pending_upstream_response_body(&self) {
+        *self
+            .pending_upstream_body
+            .lock()
+            .expect("turn-capture pending-upstream-body lock") = None;
     }
 
     /// F1b: append served response bytes (called incrementally by the response
@@ -597,9 +730,34 @@ impl TurnCaptureState {
         // attempt's bytes before assembly reads the file.
         self.upstream_request.close(false);
         self.upstream_request.await_closed().await;
+        // F1e: resolve `upstream_response`. A SUCCESS turn streamed the raw
+        // pre-parse upstream bytes into the section via the tap (the tap's drop
+        // guard already closed it -- close below is then an idempotent no-op); a
+        // FAILED turn never streamed, so commit the staged FINAL failed HTTP body
+        // (whole, last-writer-wins across attempts) IFF one was staged. Neither ⇒
+        // the section is ABSENT (don't-lie-with-zeros). The `replace` runs BEFORE
+        // `close` so the writer's close-side seal takes it.
+        if self.upstream_response_streamed.load(Ordering::Acquire) {
+            self.upstream_response_present
+                .store(true, Ordering::Release);
+        } else {
+            // Take the staged body FIRST (dropping the mutex guard at the `;`), then
+            // `replace` -- never hold the pending-body lock across the section write.
+            let staged = self
+                .pending_upstream_body
+                .lock()
+                .expect("turn-capture pending-upstream-body lock")
+                .take();
+            if let Some(body) = staged
+                && self.upstream_response.replace(&body)
+            {
+                self.upstream_response_present
+                    .store(true, Ordering::Release);
+            }
+        }
+        self.upstream_response.close(false);
+        self.upstream_response.await_closed().await;
         self.served_response.await_closed().await;
-        // F1e adds its `upstream_response` section flush here (mirror the lines
-        // above) once that section exists.
         // Stamp `finished_ms` AFTER the flush barriers so it reflects the turn's true
         // end (both `done`s + the section drain), and is `>= started_ms`.
         self.finished_ms.store(now_ms(), Ordering::Release);
@@ -780,6 +938,16 @@ impl TurnCaptureState {
         if self.upstream_request_written.load(Ordering::Acquire) {
             w.write_all(b",")?;
             write_section(&mut w, "upstream_request", &self.upstream_request, true)?;
+        }
+        // F1e: `upstream_response` is gated on `upstream_response_present` (resolved
+        // at the assembly barrier) -- a turn that never got a raw upstream response
+        // OR final failed body OMITS the key entirely (absent, not empty-measured).
+        // A response embeds as a STRING (`is_request = false`): valid UTF-8 → a JSON
+        // string; else → base64 + `"upstream_response_encoding":"base64"` (Design
+        // #5, handled generically by `write_section`).
+        if self.upstream_response_present.load(Ordering::Acquire) {
+            w.write_all(b",")?;
+            write_section(&mut w, "upstream_response", &self.upstream_response, false)?;
         }
         w.write_all(b",")?;
         write_section(&mut w, "served_response", &self.served_response, false)?;
@@ -1833,7 +2001,8 @@ mod tests {
     async fn forward_declared_stub_is_callable_and_never_panics() {
         let capture = TurnCapture::enabled(temp_dir_path("stubs"));
         let state = capture.start("api_stub", None, 0).expect("state");
-        // F1e's section is not created yet -- this is still a no-op.
+        // F1e: `write_upstream_response` is a real low-volume append now (marks the
+        // section streamed) -- still callable without panicking.
         state.write_upstream_response(b"data: [DONE]\n\n");
         state.write_inbound_request(b"{}");
         state.write_served_response(b"event: message_stop\n\n");
@@ -2426,5 +2595,149 @@ mod tests {
         assert_eq!(artifact["status"], "cancelled");
         assert_eq!(artifact["terminal_reason"], "dropped");
         assert_eq!(artifact["sections"]["served_response"]["partial"], true);
+    }
+
+    /// F1e: a streamed raw upstream response (the low-volume `write_upstream_response`
+    /// path marks the section streamed + appends) is concatenated byte-for-byte and
+    /// embedded as a UTF-8 string (a response embeds as a string, never a parsed
+    /// value -- Design #5), INCLUDING a `<think>`-in-content chunk (the debug case).
+    #[tokio::test]
+    async fn upstream_response_streamed_embeds_as_utf8_string() {
+        let dir = temp_dir_path("upstream-response-streamed");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_stream", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        state.write_upstream_response(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"<think>leak\"}}]}\n\n",
+        );
+        state.write_upstream_response(b"data: [DONE]\n\n");
+        state.write_served_response(b"ok");
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_artifact(&dir.join("api_ur_stream.json")).await;
+        let section = &artifact["sections"]["upstream_response"];
+        assert_eq!(
+            section["encoding"], "utf8",
+            "raw SSE embeds as a string: {section}"
+        );
+        assert_eq!(
+            section["content"].as_str().expect("string content"),
+            "data: {\"choices\":[{\"delta\":{\"content\":\"<think>leak\"}}]}\n\ndata: [DONE]\n\n",
+            "the raw upstream bytes are concatenated byte-for-byte (incl. the <think> chunk)"
+        );
+        assert_eq!(section["partial"], false);
+    }
+
+    /// F1e: a turn with NO success stream but a staged FINAL failed HTTP body commits
+    /// that body (whole) into `upstream_response`, with `status:"failed"`.
+    #[tokio::test]
+    async fn upstream_response_staged_failed_body_committed_when_no_stream() {
+        let dir = temp_dir_path("upstream-response-failed-body");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_fail", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        state.stage_upstream_response_body(b"{\"error\":{\"message\":\"bad request\"}}");
+        state.write_served_response(b"{\"error\":\"upstream failed\"}");
+        state.served_done(false);
+        state.engine_done("failed", Some("upstream_error"));
+
+        let artifact = wait_for_artifact(&dir.join("api_ur_fail.json")).await;
+        assert_eq!(artifact["status"], "failed");
+        let section = &artifact["sections"]["upstream_response"];
+        assert_eq!(
+            section["content"].as_str().expect("string"),
+            "{\"error\":{\"message\":\"bad request\"}}",
+            "the staged final failed HTTP body is committed whole: {section}"
+        );
+        assert_eq!(section["partial"], false);
+    }
+
+    /// F1e (no stale error body -- the failover A-fail→B-serve shape): an earlier
+    /// attempt staged a failed body, then a later attempt CLEARED it + SERVED
+    /// (streamed). The streamed section wins; the stale error body never appears.
+    #[tokio::test]
+    async fn upstream_response_stream_wins_over_stale_staged_body() {
+        let dir = temp_dir_path("upstream-response-stream-wins");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_wins", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        state.stage_upstream_response_body(b"{\"error\":\"A failed\"}");
+        // Attempt B: dispatch-start clear, then a served stream.
+        state.clear_pending_upstream_response_body();
+        state
+            .write_upstream_response(b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n");
+        state.write_served_response(b"ok");
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_artifact(&dir.join("api_ur_wins.json")).await;
+        let content = artifact["sections"]["upstream_response"]["content"]
+            .as_str()
+            .expect("string");
+        assert!(
+            content.contains("delta"),
+            "the served stream wins: {content}"
+        );
+        assert!(
+            !content.contains("A failed"),
+            "a served turn carries no stale earlier-attempt error body: {content}"
+        );
+    }
+
+    /// F1e (don't-lie-with-zeros): a turn that never got a raw upstream response and
+    /// never staged a failed body OMITS the `upstream_response` key entirely.
+    #[tokio::test]
+    async fn upstream_response_absent_when_never_contacted() {
+        let dir = temp_dir_path("upstream-response-absent");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_none", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        state.write_served_response(b"error body");
+        state.served_done(false);
+        state.engine_done("failed", Some("pre_spawn"));
+
+        let artifact = wait_for_artifact(&dir.join("api_ur_none.json")).await;
+        assert!(
+            artifact["sections"].get("upstream_response").is_none(),
+            "a never-contacted turn has NO upstream_response key: {artifact}"
+        );
+    }
+
+    /// F1e: the raw-upstream tap sink is the SAME bounded, back-pressured mechanism as
+    /// the served sink (reserve-before-send over a fixed-capacity channel -- bounded
+    /// memory, NO unbounded channel), and a mid-stream degrade mark is STICKY through a
+    /// later clean close (a truncated raw capture is never reported complete).
+    #[tokio::test]
+    async fn upstream_response_sink_is_bounded_and_degrade_is_sticky() {
+        let capture = TurnCapture::enabled(temp_dir_path("upstream-response-sink"));
+        let state = capture.start("api_ur_sink", None, 0).expect("state");
+        let mut sink = state.upstream_response_sink().expect("sink");
+        assert_eq!(
+            sink.max_capacity(),
+            super::SECTION_CHANNEL_CAPACITY,
+            "the upstream-response sink is a fixed-capacity channel (bounded memory)"
+        );
+
+        std::future::poll_fn(|cx| sink.poll_reserve(cx))
+            .await
+            .expect("writer alive");
+        sink.send(b"data: raw\n\n".to_vec())
+            .expect("send into the reserved slot");
+        // Mid-stream truncation (e.g. a G6 frame-cap rejection downstream): sticky partial.
+        state.mark_upstream_response_degraded();
+        assert!(state.upstream_response_partial());
+        drop(sink);
+        // A later clean close cannot un-stick the partial mark.
+        state.upstream_response_done(false);
+        state.await_upstream_response_closed().await;
+
+        let contents = std::fs::read(state.upstream_response_path()).expect("section file");
+        assert_eq!(contents, b"data: raw\n\n");
+        assert_eq!(state.upstream_response_bytes(), contents.len() as u64);
+        assert!(
+            state.upstream_response_partial(),
+            "a degrade mark stays partial through a later clean close"
+        );
     }
 }
