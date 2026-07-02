@@ -265,17 +265,31 @@ pub struct TurnCaptureState {
     /// staged final HTTP error body ([`pending_upstream_body`](Self#field)) is
     /// written WHOLE at the assembly barrier.
     ///
-    /// FINAL-ATTEMPT-ONLY (review r1). Behind a `Mutex<Arc<..>>` so
-    /// [`reset_upstream_response`](Self::reset_upstream_response) can SWAP in a fresh,
-    /// empty, re-writable section at the START of EACH dispatch attempt -- a
+    /// FINAL-ATTEMPT-ONLY (review r1/r2). Behind a `Mutex<Arc<..>>` so
+    /// [`reset_upstream_response`](Self::reset_upstream_response) can SYNCHRONOUSLY
+    /// SWAP in a fresh, empty section at the START of EACH dispatch attempt -- a
     /// SUPERSEDED earlier prefetch attempt (2xx headers → some raw bytes → its tap
     /// guard `close`d the section sticky-`partial`, then failover) has ALL of that
     /// DISCARDED so only the serving/final attempt's stream (or the final non-2xx
     /// staged body) is authoritative, mirroring gap-05's per-attempt staged-body
-    /// reset. Force-closed terminally at
-    /// [`finalize_and_assemble`](Self::finalize_and_assemble) (dispatch is done, so
-    /// no reset can reopen it -- the barrier always resolves in bounded time).
+    /// reset. The swap is AWAIT-FREE (review r2): the fresh section is minted on a
+    /// NEW `upstream_response.<gen>` path (never the superseded one) so the old
+    /// writer drains its OWN file in the BACKGROUND -- nothing is awaited before the
+    /// swap, so a cancel/hang-up at the dispatch seam can never drop the reset
+    /// mid-flight and leave the superseded section authoritative. Force-closed
+    /// terminally at [`finalize_and_assemble`](Self::finalize_and_assemble) (dispatch
+    /// is done, so no reset can reopen it -- the barrier always resolves in bounded
+    /// time).
     upstream_response: Mutex<Arc<Section>>,
+    /// F1e review r2 (cancel-safe reset): monotonic generation counter for the
+    /// `upstream_response` section's temp-file path. [`reset_upstream_response`]
+    /// bumps it and mints the fresh section on a NEW, UNIQUE
+    /// `upstream_response.<gen>` path (NEVER the superseded path), so the superseded
+    /// section's still-draining background writer and the fresh writer can never
+    /// `File::create`/write the SAME file -- removing the only reason the old design
+    /// had to AWAIT the old writer before swapping (the await that made the reset
+    /// droppable mid-flight).
+    upstream_response_gen: AtomicU64,
     /// F1e (don't-lie-with-zeros): a SUCCESS stream was tapped into the CURRENT
     /// `upstream_response` section (the serving 2xx attempt reached
     /// `stream_success_response`). Review r1: NO LONGER monotonic -- a superseded
@@ -365,6 +379,7 @@ impl TurnCaptureState {
             upstream_request,
             upstream_request_written: AtomicBool::new(false),
             upstream_response,
+            upstream_response_gen: AtomicU64::new(0),
             upstream_response_streamed: AtomicBool::new(false),
             upstream_response_present: AtomicBool::new(false),
             pending_upstream_body: Mutex::new(None),
@@ -394,8 +409,9 @@ impl TurnCaptureState {
 
     /// Path of the CURRENT `upstream_response` section temp file (F1e). Owned
     /// (`PathBuf`) because the section lives behind a `Mutex<Arc<..>>` (the
-    /// per-attempt reset SWAPS it), so no borrow can outlive the lock guard -- the
-    /// temp path itself is stable across resets (the swap reuses the same path).
+    /// per-attempt reset SWAPS it), so no borrow can outlive the lock guard -- and
+    /// each reset mints the fresh section on a NEW `upstream_response.<gen>` path
+    /// (review r2), so this returns the CURRENT (latest) attempt's path.
     pub fn upstream_response_path(&self) -> PathBuf {
         self.upstream_response
             .lock()
@@ -544,49 +560,76 @@ impl TurnCaptureState {
             .store(true, Ordering::Release);
     }
 
-    /// F1e review r1: RESET `upstream_response` to empty + re-writable at the START
-    /// of EACH dispatch attempt (the SAME per-attempt seam as
-    /// [`clear_pending_upstream_response_body`](Self::clear_pending_upstream_response_body)),
-    /// so the turn's raw response is FINAL-ATTEMPT-ONLY (last-writer-wins), mirroring
-    /// gap-05's staged-body semantics. A SUPERSEDED earlier prefetch attempt (2xx
-    /// headers → some raw bytes → its tap guard `close`d the section sticky-`partial`,
-    /// then a failover) must NOT leave its bytes / partial / close as the turn's
-    /// authoritative response; ONLY the serving/final attempt (its stream, or -- for a
-    /// final non-2xx -- its staged body) wins.
+    /// F1e review r1/r2: RESET `upstream_response` to a fresh, empty, re-writable
+    /// section at the START of EACH dispatch attempt, so the turn's raw response is
+    /// FINAL-ATTEMPT-ONLY (last-writer-wins), mirroring gap-05's staged-body
+    /// semantics. A SUPERSEDED earlier prefetch attempt (2xx headers → some raw bytes
+    /// → its tap guard `close`d the section sticky-`partial`, then a failover) must
+    /// NOT leave its bytes / partial / close as the turn's authoritative response;
+    /// ONLY the serving/final attempt (its stream, or -- for a final non-2xx -- its
+    /// staged body) wins.
     ///
-    /// A section a prior attempt `close`d is NOT re-writable (its sender is gone), so
-    /// we CLOSE + AWAIT the current section's writer to fully finish touching the temp
-    /// file, THEN swap in a FRESH section on the SAME path (a new bounded channel +
-    /// writer that `File::create`-truncates it to empty). Awaiting first guarantees
-    /// the old writer is done before the fresh one truncates -- no two writers ever
-    /// race the same file. On the FIRST attempt the "current" section is the
-    /// pristine one from the constructor (close+await drains nothing). Also clears the
-    /// [`upstream_response_streamed`](Self#field) discriminator so a final non-2xx
-    /// attempt (which never streams) falls through to the staged-body branch instead
-    /// of embedding a superseded earlier attempt's stream. Bounded memory is
-    /// preserved (the fresh section reuses the same bounded [`ServedSink`] channel);
-    /// no `Bytes` slice is retained.
-    pub async fn reset_upstream_response(&self) {
-        // Snapshot + close the current section (idempotent if the prior attempt's tap
-        // guard already closed it), then AWAIT its writer's drain+flush so the temp
-        // file is no longer being written before the fresh writer truncates it.
-        let current = self
-            .upstream_response
-            .lock()
-            .expect("turn-capture upstream-response lock")
-            .clone();
-        current.close(false);
-        current.await_closed().await;
-        drop(current);
-        // Swap in a fresh, empty, re-writable section on the SAME path.
-        let fresh = Arc::new(Section::new(self.work_dir.join("upstream_response")));
-        *self
-            .upstream_response
-            .lock()
-            .expect("turn-capture upstream-response lock") = fresh;
-        // A superseded attempt's stream-discriminator must not leak into this one.
+    /// CANCEL-SAFE, SYNCHRONOUS SWAP (review r2 BLOCKING). This runs at the
+    /// `dispatch_chat_stream` seam INSIDE the engine's cancellable per-round
+    /// `tokio::select!` (a client hang-up / abort can drop this future at any await).
+    /// The OLD async reset `close`d + `await_closed`ed the current section BEFORE
+    /// swapping (so it could safely REUSE the same temp path with one writer at a
+    /// time) -- but a cancel while parked at that `await_closed` DROPPED the reset, so
+    /// the swap + discriminator-clears never ran and the SUPERSEDED section stayed
+    /// authoritative (stale-attempt-wins). The fix removes ALL awaits from the reset:
+    /// the fresh section is minted on a NEW, UNIQUE `upstream_response.<gen>` path (so
+    /// the superseded writer and the fresh writer never touch the same file), and the
+    /// authoritative mutation -- swap the fresh `Arc<Section>` in + clear the
+    /// [`upstream_response_streamed`](Self#field) discriminator + drop any staged
+    /// failed body -- runs in ONE synchronous, await-free critical section. A
+    /// cancelled/dropped reset therefore either fully applied or never began; it can
+    /// never be interrupted mid-flight.
+    ///
+    /// The SUPERSEDED section is closed (signal) and DETACHED: its background writer
+    /// drains + flushes its own `upstream_response.<older-gen>` file and terminates
+    /// independently -- NOT awaited here, so the cancellable path never parks on the
+    /// old writer. Its temp file is bounded (one per attempt) and removed with the
+    /// work dir at finalize (no leak beyond the turn). Bounded memory holds (the fresh
+    /// section reuses the same bounded [`ServedSink`] channel); no `Bytes` slice is
+    /// retained. Also folds in
+    /// [`clear_pending_upstream_response_body`](Self::clear_pending_upstream_response_body)
+    /// so the whole per-attempt reset is atomic at this one seam.
+    pub fn reset_upstream_response(&self) {
+        // Mint the fresh section on a NEW, UNIQUE, generation-suffixed path FIRST
+        // (its writer runs over a fresh bounded channel -- same bounded-memory
+        // mechanism). A NEW path (never the superseded one) means the old section's
+        // still-draining background writer and this fresh writer never `File::create`
+        // / write the SAME temp file, so there is no reason to AWAIT the old writer
+        // before swapping -- and it is exactly that await the old reset could be
+        // DROPPED at, mid-swap.
+        let generation = self.upstream_response_gen.fetch_add(1, Ordering::AcqRel) + 1;
+        let fresh = Arc::new(Section::new(
+            self.work_dir
+                .join(format!("upstream_response.{generation}")),
+        ));
+        // SYNCHRONOUS, AWAIT-FREE authoritative mutation: swap the fresh section in
+        // and clear BOTH per-attempt discriminators (the streamed flag + any staged
+        // failed body). Nothing is awaited before or within this critical section, so
+        // a cancelled/dropped reset either fully applied the swap+clears or never
+        // began -- it can NEVER be interrupted mid-flight leaving the SUPERSEDED
+        // section as the turn's authoritative `upstream_response` (the r2 race).
+        let superseded = {
+            let mut guard = self
+                .upstream_response
+                .lock()
+                .expect("turn-capture upstream-response lock");
+            std::mem::replace(&mut *guard, fresh)
+        };
         self.upstream_response_streamed
             .store(false, Ordering::Release);
+        self.clear_pending_upstream_response_body();
+        // Close the SUPERSEDED section (idempotent if its tap already closed it), then
+        // DETACH it: its background writer drains + flushes its OWN temp file and
+        // terminates on its own. We do NOT `await_closed` it here, so the cancellable
+        // dispatch path never parks on the old writer. Finalize removes its temp file
+        // with the work dir (bounded to one file per attempt -- no leak beyond turn).
+        superseded.close(false);
+        drop(superseded);
     }
 
     /// F1e: mark the `upstream_response` section `partial` immediately (sticky),
@@ -2880,7 +2923,7 @@ mod tests {
 
         // Attempt A: dispatch-start reset, 2xx prefetch, some raw bytes, then
         // SUPERSEDED (prefetch first-chunk failed → its tap guard closes partial).
-        state.reset_upstream_response().await;
+        state.reset_upstream_response();
         state.mark_upstream_response_streamed(); // A dispatched 2xx
         {
             let mut sink = state.upstream_response_sink().expect("A sink");
@@ -2895,12 +2938,12 @@ mod tests {
         state.upstream_response_done(true); // A's tap guard closes the shared section
 
         // Attempt B: dispatch-start reset (DISCARDS A), 2xx serve, clean stream.
-        state.reset_upstream_response().await;
+        state.reset_upstream_response();
         state.mark_upstream_response_streamed(); // B dispatched 2xx
         {
             let mut sink = state
                 .upstream_response_sink()
-                .expect("B sink -- the reset RE-OPENED the section A had closed");
+                .expect("B sink -- the reset minted a FRESH section (A's was discarded)");
             std::future::poll_fn(|cx| sink.poll_reserve(cx))
                 .await
                 .expect("B writer alive");
@@ -2947,7 +2990,7 @@ mod tests {
         state.write_inbound_request(b"{}");
 
         // Attempt A: 2xx prefetch, some bytes, superseded partial (must be cleared).
-        state.reset_upstream_response().await;
+        state.reset_upstream_response();
         state.mark_upstream_response_streamed();
         {
             let mut sink = state.upstream_response_sink().expect("A sink");
@@ -2961,7 +3004,7 @@ mod tests {
         state.upstream_response_done(true);
 
         // Attempt B (final): 2xx serve, some bytes, then genuinely truncated (G6).
-        state.reset_upstream_response().await;
+        state.reset_upstream_response();
         state.mark_upstream_response_streamed();
         {
             let mut sink = state.upstream_response_sink().expect("B sink");
@@ -2990,5 +3033,98 @@ mod tests {
             section["partial"], true,
             "the FINAL attempt's genuine truncation stays partial (sticky)"
         );
+    }
+
+    /// F1e review r2 (cancel-safe reset -- the BLOCKING HIGH): the per-attempt
+    /// [`reset_upstream_response`] runs at the `dispatch_chat_stream` seam INSIDE the
+    /// engine's cancellable per-round `tokio::select!`, so a client hang-up / abort
+    /// can DROP that dispatch future mid-flight. The OLD async reset `close`d +
+    /// `await_closed`ed the superseded section BEFORE swapping, so a cancel parked at
+    /// that `await_closed` dropped the reset with the swap + discriminator-clears NOT
+    /// yet applied -- leaving the SUPERSEDED attempt (streamed + stale bytes) as the
+    /// turn's authoritative `upstream_response` (stale-attempt-wins). The fix makes
+    /// the authoritative mutation SYNCHRONOUS + await-free (fresh section on a new
+    /// `upstream_response.<gen>` path, old writer drained in the background), so it
+    /// can never be interrupted mid-swap.
+    ///
+    /// Models the exact failover race: attempt A opens a 2xx prefetch (some raw
+    /// bytes), is SUPERSEDED (its tap closes the section sticky-`partial`), then
+    /// attempt B's dispatch runs the reset and is CANCELLED (its future dropped)
+    /// right at the seam. The artifact's `upstream_response` MUST be COHERENT -- the
+    /// fresh (cleanly empty) final section, NEVER A's stale superseded bytes -- and
+    /// the turn MUST finalize in bounded time (`wait_for_artifact` caps its wait, so
+    /// a successful read PROVES no hang from the detached background writers).
+    #[tokio::test]
+    async fn reset_upstream_response_cancel_safe_no_stale_superseded() {
+        let dir = temp_dir_path("upstream-response-cancel-reset");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_cancel", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+
+        // Attempt A: dispatch-start reset, 2xx prefetch, some raw bytes, then
+        // SUPERSEDED (its tap guard closes the shared section sticky-`partial`).
+        state.reset_upstream_response();
+        state.mark_upstream_response_streamed(); // A dispatched 2xx
+        {
+            let mut sink = state.upstream_response_sink().expect("A sink");
+            std::future::poll_fn(|cx| sink.poll_reserve(cx))
+                .await
+                .expect("A writer alive");
+            sink.send(b"data: {\"choices\":[{\"delta\":{\"content\":\"A-STALE\"}}]}\n\n".to_vec())
+                .expect("A send");
+            state.mark_upstream_response_degraded(); // A truncated (superseded)
+            drop(sink);
+        }
+        state.upstream_response_done(true); // A's tap guard closes the shared section
+
+        // Attempt B's dispatch runs the SYNCHRONOUS reset, then is CANCELLED before it
+        // can open a sink / stream -- exactly the window where the OLD async reset
+        // would have been parked at `await_closed` on A's section with the swap NOT
+        // yet applied. Poll the dispatch future ONCE (so the await-free reset runs to
+        // completion: swap + clears), then DROP it mid-flight (client hang-up / abort).
+        {
+            let dispatch = async {
+                // The per-attempt reset -- synchronous + atomic in the fixed code.
+                state.reset_upstream_response();
+                // B would now open its sink and stream; model a cancel/hang-up by
+                // parking here forever, then dropping the whole dispatch future.
+                std::future::pending::<()>().await;
+            };
+            futures::pin_mut!(dispatch);
+            // One poll: the synchronous reset completes (fresh section swapped in,
+            // streamed flag + staged body cleared), THEN the future parks at `pending`.
+            assert!(
+                futures::poll!(dispatch.as_mut()).is_pending(),
+                "B's dispatch parks (cancel window) after the synchronous reset"
+            );
+            // Drop `dispatch` at the closing brace -- the cancellation the finding
+            // describes. On the OLD async reset a single poll would have parked at
+            // `await_closed` with the swap undone; here the swap already fully applied.
+        }
+
+        // Terminal: the turn is cancelled and finalizes.
+        state.write_served_response(b"partial");
+        state.served_done(true);
+        state.engine_done("cancelled", Some("client_disconnect"));
+
+        // A successful read PROVES no hang (the superseded/detached writers never
+        // block finalize, which only awaits the CURRENT final section).
+        let artifact = wait_for_artifact(&dir.join("api_ur_cancel.json")).await;
+        assert_eq!(artifact["status"], "cancelled");
+        // COHERENT: the swap was applied atomically before the drop and the streamed
+        // discriminator cleared, so the fresh (empty) final section has no
+        // bytes/stream/staged-body -> the key is ABSENT (cleanly empty). It is NEVER
+        // A's stale superseded section.
+        match artifact["sections"].get("upstream_response") {
+            None => {} // cleanly empty -- the coherent outcome after a post-reset cancel
+            Some(section) => {
+                let content = section["content"].as_str().unwrap_or("");
+                assert!(
+                    !content.contains("A-STALE"),
+                    "a cancelled reset must NEVER leave the SUPERSEDED attempt \
+                     authoritative: {section}"
+                );
+            }
+        }
     }
 }

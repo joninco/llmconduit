@@ -1245,24 +1245,20 @@ impl ReqwestUpstreamClient {
         serving: Option<&Arc<ServingToken>>,
         capture: Option<&Arc<TurnCaptureState>>,
     ) -> AppResult<UpstreamStream> {
-        // F1e: per-attempt reset of the staged FINAL failed body (mirrors the
-        // gap-05 `serving.clear_pending_response_body()` seam) -- this dispatch is
-        // one provider attempt (its internal shrink-retry re-stages last-writer-wins),
-        // so clearing here makes the committed body the FINAL attempt's: an earlier
-        // failover provider's staged body never survives a later attempt that fails
-        // WITHOUT a body (connect/timeout/prefetch-stream-error). A success stream
-        // supersedes it anyway (the streamed section wins at assembly).
+        // F1e review r1/r2: per-attempt reset of the `upstream_response` capture at
+        // the START of this dispatch attempt, so the turn's raw response is
+        // FINAL-ATTEMPT-ONLY (mirrors the gap-05 `clear_pending_response_body()`
+        // seam). ONE call now does BOTH: swap in a fresh, empty streamed-section AND
+        // drop any staged FINAL failed body -- so a SUPERSEDED earlier prefetch
+        // attempt (2xx headers → some raw bytes → its tap guard closed the section
+        // sticky-`partial`, then failover) and an earlier provider's staged error
+        // body both get DISCARDED; only the serving/final attempt wins (last-writer-
+        // wins). The reset is SYNCHRONOUS + await-free (review r2 BLOCKING): this seam
+        // runs inside the engine's cancellable per-round `select!`, so a cancel/hang-
+        // up must never drop the reset mid-swap and leave the superseded attempt
+        // authoritative -- the swap + clears are one atomic critical section.
         if let Some(capture) = capture {
-            // F1e review r1: the streamed `upstream_response` section is ALSO
-            // final-attempt-only. RESET it here (truncate to empty + re-open
-            // re-writable + clear the sticky `partial` + clear the streamed
-            // discriminator) at this SAME per-attempt seam, so a SUPERSEDED earlier
-            // prefetch attempt (2xx headers → some raw bytes → its tap guard closed
-            // the shared section sticky-`partial`, then failover) can never leave its
-            // bytes/partial/close as the turn's authoritative `upstream_response` --
-            // only the serving/final attempt wins (gap-05 last-writer-wins semantics).
-            capture.reset_upstream_response().await;
-            capture.clear_pending_upstream_response_body();
+            capture.reset_upstream_response();
         }
         // First attempt. On a non-2xx whose body indicates a context/completion
         // token-limit overflow, shrink `max_completion_tokens` and retry ONCE.
