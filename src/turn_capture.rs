@@ -19,15 +19,22 @@
 //! **Bounded memory (Codex HIGH #2 + F1b review #1).** Each section
 //! (`inbound_request`, `served_response`, and -- in F1d/F1e --
 //! `upstream_request`/`upstream_response`) streams incrementally to a per-turn
-//! temp file under `<dir>/.work/<api_call_id>/` via a background writer task fed
-//! over a BOUNDED, ordered channel ([`SECTION_CHANNEL_CAPACITY`] frames). The
-//! high-volume served-body tee reserves a channel slot BEFORE pulling each frame
-//! and yields `Poll::Pending` when the writer is behind, so a slow disk / large
-//! streamed body throttles the served stream to disk pace instead of piling the
-//! whole body into RAM. Only small metadata (`{bytes, partial, closed}`) lives in
-//! memory. NO `HashMap<_, full-body>` ever forms -- the bytes go to disk. The
-//! final single JSON is assembled later (F1f) by STREAMING those temp files, so
-//! a 256 MiB turn is never held in RAM at once.
+//! temp file under `<dir>/.work/<api_call_id>/` via a background writer task.
+//! Append-only sections (`inbound_request`, `served_response`, and the future
+//! `upstream_response`) are fed over a BOUNDED, ordered channel
+//! ([`SECTION_CHANNEL_CAPACITY`] frames); the high-volume served-body tee
+//! reserves a channel slot BEFORE pulling each frame and yields `Poll::Pending`
+//! when the writer is behind, so a slow disk / large streamed body throttles the
+//! served stream to disk pace instead of piling the whole body into RAM.
+//! `upstream_request`'s whole-body last-writer-wins write
+//! ([`Section::replace`]) instead OVERWRITES a single coalescing slot (never
+//! queued, so a full/slow channel can never drop the FINAL replace -- review
+//! r1); memory there is bounded to exactly ONE pending section-sized `Vec`, not
+//! a per-attempt queue. Only small metadata (`{bytes, partial, closed}`) plus
+//! that one optional pending `Vec` lives in memory. NO `HashMap<_, full-body>`
+//! ever forms -- the bytes go to disk. The final single JSON is assembled later
+//! (F1f) by STREAMING those temp files, so a 256 MiB turn is never held in RAM
+//! at once.
 //!
 //! **Task boundaries.**
 //! - F1b: HTTP own-gate + inbound-request capture + served-response `Body` tee;
@@ -380,15 +387,19 @@ impl TurnCaptureState {
     /// (post profile/lowering/sanitize). Called once per attempt
     /// (`upstream.rs::dispatch_chat_stream` → `logged_send_chat_request`), so a
     /// shrink-and-retry or a failover rebuild's later attempt REPLACES an earlier
-    /// attempt's bytes (last-writer-wins) rather than concatenating onto them --
-    /// the section is captured WHOLE per attempt, never streamed. `bytes` is an
-    /// owned, already-redacted COPY -- never a slice of a larger buffer (AGENTS.md
-    /// line 144); the caller redacts BEFORE calling (AGENTS.md line 137). A turn
-    /// that never calls this has the section OMITTED from the artifact entirely
-    /// (don't-lie-with-zeros) -- see `upstream_request_written`.
+    /// attempt's bytes (last-writer-wins, GUARANTEED even under backpressure --
+    /// review r1) rather than concatenating onto them -- the section is captured
+    /// WHOLE per attempt, never streamed. `bytes` is an owned, already-redacted
+    /// COPY -- never a slice of a larger buffer (AGENTS.md line 144); the caller
+    /// redacts BEFORE calling (AGENTS.md line 137). `upstream_request_written`
+    /// (gating whether the artifact embeds this section at all -- don't-lie-
+    /// with-zeros) is set ONLY once [`Section::replace`] confirms the bytes were
+    /// actually accepted, so a turn whose sole call raced an already-closed
+    /// section never fabricates the key.
     pub fn write_upstream_request(&self, bytes: &[u8]) {
-        self.upstream_request_written.store(true, Ordering::Release);
-        self.upstream_request.replace(bytes);
+        if self.upstream_request.replace(bytes) {
+            self.upstream_request_written.store(true, Ordering::Release);
+        }
     }
 
     /// F1e fills this: raw upstream response bytes, streamed incrementally, into
@@ -853,36 +864,47 @@ impl ServedSink {
 /// one reserved permit) are ever queued toward the background writer, independent
 /// of the served body's total size -- so capture memory stays O(CAP), not O(N).
 /// A small constant keeps a little pipelining without unbounding memory; the
-/// served tee back-pressures on `Poll::Pending` once the channel is full.
+/// served tee back-pressures on `Poll::Pending` once the channel is full. NOTE:
+/// [`Section::replace`]'s whole-body write does NOT use this channel (review
+/// r1) -- see [`SectionMeta::pending_replace`] -- so a full channel can never
+/// cause a dropped `replace`.
 const SECTION_CHANNEL_CAPACITY: usize = 16;
 
-/// One item queued to a section's background writer. [`Append`](Self::Append) is
-/// the streaming/incremental write (the served-body tee, the single-shot
-/// inbound-request write); [`Replace`](Self::Replace) is F1d's last-writer-wins
-/// whole-body write (`upstream_request`: the on-wire request is captured WHOLE
-/// per dispatch attempt, so a later attempt's write must DISCARD -- not
-/// concatenate onto -- an earlier attempt's bytes).
+/// One item queued to a section's background writer over the bounded, ordered
+/// channel: the streaming/incremental write (the served-body tee, the
+/// single-shot inbound-request write). F1d's last-writer-wins whole-body write
+/// (`upstream_request`, via [`Section::replace`]) does NOT flow through this
+/// channel or this type at all -- a bounded channel can silently DROP a queued
+/// item when full, which would leave a STALE attempt's bytes as the committed
+/// content instead of the final one (review r1's bug). See
+/// [`SectionMeta::pending_replace`] for the guaranteed-delivery mechanism it
+/// uses instead.
 #[derive(Debug)]
 enum SectionChunk {
     Append(Vec<u8>),
-    Replace(Vec<u8>),
 }
 
 /// One incremental capture section. Bytes stream to a per-turn temp file on a
-/// background writer task WITHOUT buffering the whole body: they are handed to the
-/// task over a BOUNDED, ordered (FIFO) channel of at most
-/// [`SECTION_CHANNEL_CAPACITY`] frames. Three write paths feed it:
+/// background writer task WITHOUT buffering the whole body. Two write paths feed
+/// it, with DIFFERENT delivery guarantees:
 /// - Low-volume, single-shot writers ([`append`], used for the inbound-request
-///   body and tests) `try_send` a copy -- they never fill the channel.
-/// - The high-volume served-body tee takes a back-pressured [`ServedSink`]
-///   ([`TurnCaptureState::served_sink`]): it reserves a slot before each frame and
-///   yields `Poll::Pending` when the writer lags, so a slow disk throttles the
-///   served stream rather than piling the whole body into RAM (finding #1).
+///   body and tests) `try_send` a copy over a BOUNDED, ordered (FIFO) channel of
+///   at most [`SECTION_CHANNEL_CAPACITY`] frames -- they never fill it. The
+///   high-volume served-body tee takes a back-pressured [`ServedSink`]
+///   ([`TurnCaptureState::served_sink`]) over the SAME channel: it reserves a
+///   slot before each frame and yields `Poll::Pending` when the writer lags, so
+///   a slow disk throttles the served stream rather than piling the whole body
+///   into RAM (finding #1).
 /// - F1d's whole-body last-writer-wins writer ([`replace`], used for
-///   `upstream_request`) `try_send`s a [`SectionChunk::Replace`] that tells the
-///   writer task to discard whatever it has written so far and start over.
+///   `upstream_request`) does NOT use that channel (review r1: a bounded
+///   channel can DROP a queued item when full, which would silently commit a
+///   STALE attempt's bytes instead of the final one). Instead it OVERWRITES the
+///   [`SectionMeta::pending_replace`] slot (O(1), never dropped -- a newer
+///   replace simply supersedes an undrained older one) and wakes the writer,
+///   which applies the LATEST slot value the next time it looks.
 ///
-/// Either way only small metadata lives in memory and no full-body map forms.
+/// Either way only small metadata (plus, for `replace`, at most one pending
+/// section-sized `Vec`) lives in memory and no full-body map forms.
 ///
 /// [`append`]: Section::append
 /// [`replace`]: Section::replace
@@ -891,7 +913,8 @@ struct Section {
     /// `None` once [`close`](Section::close)d -- the writer task then drains the
     /// remaining queued chunks and flushes. A dropped `Section` (abandoned turn)
     /// also drops the sender(s), so the task always terminates (no hang; AGENTS.md
-    /// cancellation rule).
+    /// cancellation rule). Also gates [`replace`](Section::replace): a closed
+    /// section rejects a late replace (mirrors `append`'s no-op-once-closed).
     tx: Mutex<Option<mpsc::Sender<SectionChunk>>>,
     meta: Arc<SectionMeta>,
 }
@@ -904,6 +927,22 @@ struct SectionMeta {
     closed: AtomicBool,
     /// Notified once, when the writer task has drained + flushed + set `closed`.
     done: Notify,
+    /// F1d review r1: the coalescing "pending latest" slot for
+    /// [`Section::replace`]. `Some(bytes)` is a newer whole-body replace the
+    /// writer task has not yet applied; `replace` OVERWRITES it in O(1)
+    /// (last-writer-wins, never drops a write -- a newer replace simply
+    /// supersedes an undrained older one, so memory is bounded to exactly ONE
+    /// pending `Vec` regardless of how many attempts race ahead of the
+    /// writer). The writer applies it (a file truncate + write of exactly
+    /// these bytes) whenever it observes the slot set, then clears it.
+    pending_replace: Mutex<Option<Vec<u8>>>,
+    /// Wakes the writer task when `pending_replace` is freshly set. Purely a
+    /// "go look" signal -- the DATA lives in `pending_replace`, so coalescing
+    /// several `notify_one` calls (from several rapid `replace`s arriving
+    /// before the writer catches up) into one wake is correct: whenever the
+    /// writer next looks, it reads whatever currently sits in the slot, which
+    /// is always the LATEST replace.
+    replace_ready: Notify,
 }
 
 impl Section {
@@ -915,6 +954,8 @@ impl Section {
             partial: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             done: Notify::new(),
+            pending_replace: Mutex::new(None),
+            replace_ready: Notify::new(),
         });
         tokio::spawn(section_writer(rx, Arc::clone(&meta)));
         Self {
@@ -962,27 +1003,44 @@ impl Section {
         }
     }
 
-    /// F1d: replace the section's ENTIRE content with `bytes` -- last-writer-wins.
-    /// Used by `upstream_request`: the on-wire request is captured WHOLE per
-    /// dispatch attempt (never streamed incrementally), so a shrink-retry or a
-    /// failover rebuild's later attempt must DISCARD an earlier attempt's bytes
-    /// rather than concatenate onto them (unlike [`append`](Section::append),
-    /// which is purely incremental). COPIES `bytes` into an owned `Vec` (never
-    /// retains a caller slice -- AGENTS.md line 144); non-blocking, ordered with
-    /// any other queued chunk on this section, a no-op once closed.
-    fn replace(&self, bytes: &[u8]) {
-        if let Ok(guard) = self.tx.lock()
-            && let Some(tx) = guard.as_ref()
-        {
-            match tx.try_send(SectionChunk::Replace(bytes.to_vec())) {
-                Ok(()) => {}
-                // Same honest-partial handling as `append`'s Full arm.
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.meta.partial.store(true, Ordering::Release);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {}
-            }
+    /// F1d review r1: replace the section's ENTIRE content with `bytes` --
+    /// GUARANTEED last-writer-wins, even under backpressure. Used by
+    /// `upstream_request`: the on-wire request is captured WHOLE per dispatch
+    /// attempt (never streamed incrementally), so a shrink-retry or a failover
+    /// rebuild's later attempt must DISCARD an earlier attempt's bytes rather
+    /// than concatenate onto them (unlike [`append`](Section::append)).
+    ///
+    /// Unlike the old `try_send`-onto-the-bounded-channel design (which could
+    /// silently DROP a replace when the channel was full, leaving a STALE
+    /// attempt's bytes as the committed content -- the exact bug this fixes),
+    /// this OVERWRITES the [`SectionMeta::pending_replace`] slot in O(1): a
+    /// newer `replace` simply supersedes an undrained older one, so no write is
+    /// EVER dropped and memory stays bounded to exactly one pending
+    /// section-sized `Vec` (never a queue that grows with attempt count).
+    /// COPIES `bytes` into an owned `Vec` (never retains a caller slice --
+    /// AGENTS.md line 144).
+    ///
+    /// A no-op once the section is closed (mirrors `append`), returning
+    /// `false`; `true` once the bytes are durably queued in the slot for the
+    /// writer to commit. The caller gates "written" bookkeeping on the return
+    /// value so a rejected write is never recorded as if it landed
+    /// (don't-lie-with-zeros).
+    fn replace(&self, bytes: &[u8]) -> bool {
+        let Ok(guard) = self.tx.lock() else {
+            return false;
+        };
+        if guard.is_none() {
+            // Closed: mirror `append`'s no-op-once-closed contract.
+            return false;
         }
+        drop(guard);
+        *self
+            .meta
+            .pending_replace
+            .lock()
+            .expect("turn-capture pending-replace lock") = Some(bytes.to_vec());
+        self.meta.replace_ready.notify_one();
+        true
     }
 
     /// A back-pressured [`PollSender`] over this section's bounded writer channel,
@@ -1042,13 +1100,17 @@ impl Section {
 }
 
 /// The background writer for one [`Section`]: creates the work dir + section file
-/// (all fs IO via `tokio::fs`, i.e. off the runtime threads), appends each queued
-/// chunk in order (or, on a [`SectionChunk::Replace`], discards whatever it has
-/// written so far and starts the file over -- F1d's last-writer-wins whole-body
-/// write), and -- when the sender drops (section closed or turn dropped) --
-/// flushes, fsyncs, and marks the section `closed`. A file-create/write error
-/// marks the section `partial` and is logged, never propagated (a diagnostic
-/// artifact must never fail or hang the turn).
+/// (all fs IO via `tokio::fs`, i.e. off the runtime threads), then loops,
+/// PRIORITIZING the coalescing [`SectionMeta::pending_replace`] slot (F1d
+/// review r1's guaranteed last-writer-wins whole-body write -- applied by
+/// truncating the file and writing exactly the slot's bytes) ahead of draining
+/// the next queued [`SectionChunk::Append`] chunk. When the sender drops
+/// (section closed or turn dropped) it applies one final pending replace that
+/// raced the close, then flushes, fsyncs, and marks the section `closed` -- so
+/// [`Section::await_closed`] always observes the LAST replace's bytes, never a
+/// stale earlier one. A file-create/write error marks the section `partial`
+/// and is logged, never propagated (a diagnostic artifact must never fail or
+/// hang the turn).
 async fn section_writer(mut rx: mpsc::Receiver<SectionChunk>, meta: Arc<SectionMeta>) {
     // Idempotent + race-tolerant across the turn's sibling sections both racing
     // to create the shared work dir.
@@ -1076,51 +1138,45 @@ async fn section_writer(mut rx: mpsc::Receiver<SectionChunk>, meta: Arc<SectionM
         }
     };
 
-    while let Some(chunk) = rx.recv().await {
-        let bytes = match chunk {
-            SectionChunk::Append(bytes) => bytes,
-            SectionChunk::Replace(bytes) => {
-                // F1d last-writer-wins: discard whatever this section holds so far
-                // by re-creating (truncating) the file fresh, so `bytes` below
-                // becomes the section's ENTIRE content, not a concatenation onto an
-                // earlier dispatch attempt's write.
-                match tokio::fs::File::create(&meta.path).await {
-                    Ok(new_file) => {
-                        file = Some(new_file);
-                        meta.bytes.store(0, Ordering::Release);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            path = %meta.path.display(),
-                            error = %err,
-                            "turn-capture: failed to re-create section file for replace"
-                        );
-                        meta.partial.store(true, Ordering::Release);
-                        file = None;
-                    }
-                }
-                bytes
-            }
-        };
-        let Some(open_file) = file.as_mut() else {
-            // File never opened (or a replace's re-create just failed above): keep
-            // draining the channel so senders don't wedge, but the section is
-            // already flagged partial.
+    loop {
+        // Register interest in the next replace-wake BEFORE checking the slot
+        // (register-before-check, mirroring `Section::await_closed`), so a
+        // `replace` landing concurrently with this check is never missed.
+        let notified = meta.replace_ready.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        // The coalescing slot always wins over the next queued `Append`: apply
+        // it in one shot -- truncate + write the LATEST bytes only, never a
+        // queue of superseded attempts -- then loop back around.
+        if let Some(bytes) = take_pending_replace(&meta) {
+            apply_replace(&mut file, &meta, bytes).await;
             continue;
-        };
-        match open_file.write_all(&bytes).await {
-            Ok(()) => {
-                meta.bytes.fetch_add(bytes.len() as u64, Ordering::AcqRel);
+        }
+
+        tokio::select! {
+            maybe_chunk = rx.recv() => {
+                match maybe_chunk {
+                    Some(SectionChunk::Append(bytes)) => {
+                        write_append(&mut file, &meta, bytes).await;
+                    }
+                    // Sender dropped (section closed or turn dropped): stop
+                    // draining the channel and fall through to the final
+                    // pending-replace check + flush below.
+                    None => break,
+                }
             }
-            Err(err) => {
-                tracing::warn!(
-                    path = %meta.path.display(),
-                    error = %err,
-                    "turn-capture: failed to write to section file"
-                );
-                meta.partial.store(true, Ordering::Release);
+            _ = notified.as_mut() => {
+                // Woken by a fresh replace; loop back to the top and apply it.
             }
         }
+    }
+
+    // Channel closed: apply one final pending replace that raced the close, so
+    // assembly -- which only reads the file AFTER `await_closed` resolves --
+    // always sees the FINAL replace's bytes, never a value stranded in the slot.
+    if let Some(bytes) = take_pending_replace(&meta) {
+        apply_replace(&mut file, &meta, bytes).await;
     }
 
     if let Some(mut file) = file {
@@ -1129,6 +1185,64 @@ async fn section_writer(mut rx: mpsc::Receiver<SectionChunk>, meta: Arc<SectionM
     }
     meta.closed.store(true, Ordering::Release);
     meta.done.notify_waiters();
+}
+
+/// Take the [`SectionMeta::pending_replace`] slot's value, if set, clearing it
+/// back to `None` atomically (under the slot's own mutex).
+fn take_pending_replace(meta: &SectionMeta) -> Option<Vec<u8>> {
+    meta.pending_replace
+        .lock()
+        .expect("turn-capture pending-replace lock")
+        .take()
+}
+
+/// Write one queued `Append` chunk to the currently-open file. A no-op besides
+/// draining if the file was never opened (or a prior replace's re-create just
+/// failed) -- the section is already flagged `partial` in that case.
+async fn write_append(file: &mut Option<tokio::fs::File>, meta: &SectionMeta, bytes: Vec<u8>) {
+    let Some(open_file) = file.as_mut() else {
+        return;
+    };
+    match open_file.write_all(&bytes).await {
+        Ok(()) => {
+            meta.bytes.fetch_add(bytes.len() as u64, Ordering::AcqRel);
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %meta.path.display(),
+                error = %err,
+                "turn-capture: failed to write to section file"
+            );
+            meta.partial.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// Apply one whole-body replace: truncate (re-create) the section file, reset
+/// the `bytes` counter to 0, then write `bytes` as its ENTIRE content -- F1d's
+/// last-writer-wins whole-body write, so the section reflects only THIS
+/// replacement's length, never a concatenation with an earlier attempt. On a
+/// re-create failure the bytes are dropped (nothing to write into) and the
+/// section is flagged `partial`, mirroring the original on-full-replace-error
+/// handling.
+async fn apply_replace(file: &mut Option<tokio::fs::File>, meta: &SectionMeta, bytes: Vec<u8>) {
+    match tokio::fs::File::create(&meta.path).await {
+        Ok(new_file) => {
+            *file = Some(new_file);
+            meta.bytes.store(0, Ordering::Release);
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %meta.path.display(),
+                error = %err,
+                "turn-capture: failed to re-create section file for replace"
+            );
+            meta.partial.store(true, Ordering::Release);
+            *file = None;
+            return;
+        }
+    }
+    write_append(file, meta, bytes).await;
 }
 
 /// The both-`done` assembly barrier state, consolidated under ONE mutex on
@@ -1713,6 +1827,65 @@ mod tests {
         assert_eq!(
             section["bytes"], expected_bytes,
             "bytes count is the replacement's length, not first+second: {section}"
+        );
+    }
+
+    /// F1d review r1 (BLOCKING fix): the OLD `replace` `try_send`d onto the
+    /// bounded channel and DROPPED the write when the channel was full, so a
+    /// burst of rapid attempts (shrink-retry + failover) racing ahead of a slow
+    /// writer could leave a STALE, non-final attempt as the committed section
+    /// instead of the truly LAST one -- silently recording the wrong on-wire
+    /// request. Proves the fix: issue far more rapid `write_upstream_request`
+    /// calls than `SECTION_CHANNEL_CAPACITY` with NO `.await` between them, so
+    /// on this current-thread test runtime the background writer task cannot
+    /// be scheduled to service ANY of them mid-burst -- every call must
+    /// coalesce into the pending-replace slot before the writer ever looks.
+    /// The committed artifact must equal the LAST attempt, never an earlier
+    /// one, and the section must never be marked `partial` just because many
+    /// attempts raced ahead of the writer (guaranteed delivery, not a dropped
+    /// write recorded as partial).
+    #[tokio::test]
+    async fn upstream_request_replace_survives_backpressure_last_writer_wins() {
+        let dir = temp_dir_path("upstream-request-backpressure");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture
+            .start("api_ur_backpressure", None, 0)
+            .expect("state");
+        state.write_inbound_request(b"{}");
+
+        // Far more than `SECTION_CHANNEL_CAPACITY` (16) rapid replaces, all
+        // issued synchronously with NO `.await` in between.
+        const ATTEMPTS: usize = 200;
+        const { assert!(ATTEMPTS > super::SECTION_CHANNEL_CAPACITY * 4) };
+        for i in 0..ATTEMPTS {
+            let body = format!(r#"{{"model":"m","attempt":{i}}}"#);
+            state.write_upstream_request(body.as_bytes());
+        }
+        let last_attempt = ATTEMPTS - 1;
+
+        state.write_served_response(b"ok");
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_artifact(&dir.join("api_ur_backpressure.json")).await;
+        let section = &artifact["sections"]["upstream_request"];
+        assert_eq!(
+            section["content"]["attempt"].as_u64(),
+            Some(last_attempt as u64),
+            "the FINAL replace must win even though {ATTEMPTS} rapid replaces \
+             raced a writer that could not service any of them until this task \
+             yielded: {section}"
+        );
+        let expected_bytes = format!(r#"{{"model":"m","attempt":{last_attempt}}}"#).len() as u64;
+        assert_eq!(
+            section["bytes"], expected_bytes,
+            "bytes reflect ONLY the final replacement's length, never an \
+             earlier attempt or a concatenation of several: {section}"
+        );
+        assert_eq!(
+            section["partial"], false,
+            "guaranteed-delivery replace must never mark the section partial \
+             just because many attempts raced ahead of the writer: {section}"
         );
     }
 
