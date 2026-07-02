@@ -1469,11 +1469,18 @@ impl Section {
     /// rejected write is never recorded as if it landed (don't-lie-with-zeros).
     fn replace(&self, bytes: &[u8]) -> bool {
         {
+            // Poison-tolerant (Fable review r2): `replace` is Drop-reachable via
+            // `finalize_and_assemble`'s staged-final-failed-body commit (which runs on
+            // a `Drop`-triggered assembly task), so a poisoned slot must recover
+            // (`PoisonError::into_inner`, mirroring the writer's `take_pending_replace`
+            // / `seal_and_take_pending_replace` siblings) rather than panic. A panic
+            // here would strand the finalize task -> the artifact is never published,
+            // the registry entry never evicted, and the `.work` dir never cleaned.
             let mut slot = self
                 .meta
                 .pending_replace
                 .lock()
-                .expect("turn-capture pending-replace lock");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if slot.sealed {
                 // The writer's close-side final take has already SEALED the slot
                 // (it took the FINAL value and is flushing / has marked the
@@ -2894,6 +2901,97 @@ mod tests {
         state.engine_done("cancelled", Some("client_disconnect"));
         let artifact = wait_for_artifact(&dir.join("api_poison_tx.json")).await;
         assert_eq!(artifact["api_call_id"], "api_poison_tx");
+    }
+
+    /// Fable-fix review r2 (MED BLOCKING): `Section::replace`'s `pending_replace`
+    /// mutex is Drop-reachable via `finalize_and_assemble`'s staged-final-failed-body
+    /// commit (the finalize runs on a task spawned from a `Drop`-triggered `*_done`).
+    /// A poisoned slot must recover (`PoisonError::into_inner`, mirroring the writer's
+    /// `take_pending_replace`/`seal_and_take_pending_replace` siblings) instead of
+    /// panicking the finalize task — a panic there would strand the artifact (never
+    /// published), leak the registry entry, and leave the `.work` dir uncleaned. Stage
+    /// a FINAL failed body with NO success stream (so finalize takes the else-branch
+    /// and commits it via `Section::replace`), poison the current `upstream_response`
+    /// section's `pending_replace`, then drive the both-`done` barrier and assert the
+    /// artifact still publishes + the recovered replace committed + registry evicted +
+    /// work dir cleaned (best-effort finalize completes; no panic/abort/hang).
+    #[tokio::test]
+    async fn poisoned_pending_replace_lock_is_drop_safe_and_still_finalizes() {
+        let dir = temp_dir_path("poison-pending-replace");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture
+            .start("api_poison_replace", Some("m".to_string()), 1)
+            .expect("state");
+        state.write_inbound_request(br#"{"model":"m"}"#);
+        state.write_served_response(b"served-bytes");
+        // A FAILED turn: no success stream is tapped, so `finalize_and_assemble` takes
+        // the else-branch and COMMITS the staged final failed body via
+        // `Section::replace` — the Drop-reachable use of the `pending_replace` lock.
+        const FAILED_BODY: &[u8] = b"upstream 400 error body";
+        state.stage_upstream_response_body(FAILED_BODY);
+
+        // Poison the CURRENT `upstream_response` section's `pending_replace` mutex: a
+        // thread panics WHILE HOLDING its guard. This is the exact lock
+        // `finalize_and_assemble`'s `.replace(&body)` acquires.
+        let poisoner = Arc::clone(&state);
+        let joined = std::thread::spawn(move || {
+            let section = poisoner
+                .upstream_response
+                .lock()
+                .expect("acquire section")
+                .clone();
+            let _guard = section
+                .meta
+                .pending_replace
+                .lock()
+                .expect("acquire to poison");
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(
+            joined.is_err(),
+            "the poisoning thread panicked under the pending_replace lock"
+        );
+        let section = state.upstream_response.lock().expect("section").clone();
+        assert!(
+            section.meta.pending_replace.is_poisoned(),
+            "pending_replace mutex is now poisoned"
+        );
+        drop(section);
+
+        // Drive the both-`done` barrier. The SECOND `done` spawns the finalize task,
+        // whose else-branch takes the staged body and calls `Section::replace` on the
+        // poisoned `pending_replace`. With a poison-INtolerant `.expect()` the finalize
+        // task would panic — artifact never published, registry leaked, `.work` kept.
+        state.served_done(true);
+        state.engine_done("failed", Some("upstream_error"));
+
+        // Best-effort finalize STILL published a valid artifact despite the poison, and
+        // the RECOVERED replace actually COMMITTED the staged body (proving the lock
+        // recovery did the real work, not just avoid the panic).
+        let artifact = wait_for_artifact(&dir.join("api_poison_replace.json")).await;
+        assert_eq!(artifact["api_call_id"], "api_poison_replace");
+        assert_eq!(artifact["status"], "failed");
+        assert_eq!(
+            artifact["sections"]["upstream_response"]["encoding"],
+            "utf8"
+        );
+        assert_eq!(
+            artifact["sections"]["upstream_response"]["content"]
+                .as_str()
+                .expect("upstream_response content string"),
+            "upstream 400 error body",
+            "the poison-recovered Section::replace committed the staged failed body"
+        );
+        // Registry evicted + work dir cleaned — no leak despite the poison.
+        assert!(
+            capture.state("api_poison_replace").is_none(),
+            "registry entry is evicted after best-effort finalize"
+        );
+        assert!(
+            !state.work_dir().exists(),
+            "best-effort finalize cleaned up the .work dir despite the poison"
+        );
     }
 
     /// F1c review r2 (robust cleanup ordering): a work-dir-delete FAILURE must
