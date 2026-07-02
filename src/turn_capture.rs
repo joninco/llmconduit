@@ -263,15 +263,28 @@ pub struct TurnCaptureState {
     /// COPIES each raw chunk here via the back-pressured [`ServedSink`] (bounded
     /// memory) BEFORE the G6 frame guard + SSE parser see them; on a FAILED turn the
     /// staged final HTTP error body ([`pending_upstream_body`](Self#field)) is
-    /// written WHOLE at the assembly barrier. Stays OPEN across the turn; closed by
-    /// the tap (clean vs sticky-`partial`) or at
-    /// [`finalize_and_assemble`](Self::finalize_and_assemble).
-    upstream_response: Section,
-    /// F1e (don't-lie-with-zeros): a SUCCESS stream was tapped into
-    /// `upstream_response` (the serving 2xx attempt reached
-    /// `stream_success_response`). Monotonic -- once a 2xx streamed, no failover
-    /// follows -- so when set, assembly embeds the streamed section and IGNORES any
-    /// staged failed body (the served stream wins; no stale earlier-attempt error).
+    /// written WHOLE at the assembly barrier.
+    ///
+    /// FINAL-ATTEMPT-ONLY (review r1). Behind a `Mutex<Arc<..>>` so
+    /// [`reset_upstream_response`](Self::reset_upstream_response) can SWAP in a fresh,
+    /// empty, re-writable section at the START of EACH dispatch attempt -- a
+    /// SUPERSEDED earlier prefetch attempt (2xx headers → some raw bytes → its tap
+    /// guard `close`d the section sticky-`partial`, then failover) has ALL of that
+    /// DISCARDED so only the serving/final attempt's stream (or the final non-2xx
+    /// staged body) is authoritative, mirroring gap-05's per-attempt staged-body
+    /// reset. Force-closed terminally at
+    /// [`finalize_and_assemble`](Self::finalize_and_assemble) (dispatch is done, so
+    /// no reset can reopen it -- the barrier always resolves in bounded time).
+    upstream_response: Mutex<Arc<Section>>,
+    /// F1e (don't-lie-with-zeros): a SUCCESS stream was tapped into the CURRENT
+    /// `upstream_response` section (the serving 2xx attempt reached
+    /// `stream_success_response`). Review r1: NO LONGER monotonic -- a superseded
+    /// earlier 2xx prefetch attempt sets it, so
+    /// [`reset_upstream_response`](Self::reset_upstream_response) CLEARS it at each
+    /// dispatch start; whatever the FINAL attempt leaves wins. When set at the
+    /// assembly barrier, assembly embeds the (freshly-reset, final-attempt) streamed
+    /// section and IGNORES any staged failed body; when clear, a final non-2xx
+    /// attempt's staged body is committed instead.
     upstream_response_streamed: AtomicBool,
     /// F1e: whether the artifact embeds `upstream_response` at all -- resolved ONCE
     /// at the assembly barrier ([`finalize_and_assemble`](Self::finalize_and_assemble)):
@@ -336,7 +349,8 @@ impl TurnCaptureState {
     ) -> Self {
         let inbound_request = Section::new(work_dir.join("inbound_request"));
         let upstream_request = Section::new(work_dir.join("upstream_request"));
-        let upstream_response = Section::new(work_dir.join("upstream_response"));
+        let upstream_response =
+            Mutex::new(Arc::new(Section::new(work_dir.join("upstream_response"))));
         let served_response = Section::new(work_dir.join("served_response"));
         Self {
             api_call_id,
@@ -378,9 +392,16 @@ impl TurnCaptureState {
         self.upstream_request.path()
     }
 
-    /// Path of the `upstream_response` section temp file (F1e).
-    pub fn upstream_response_path(&self) -> &Path {
-        self.upstream_response.path()
+    /// Path of the CURRENT `upstream_response` section temp file (F1e). Owned
+    /// (`PathBuf`) because the section lives behind a `Mutex<Arc<..>>` (the
+    /// per-attempt reset SWAPS it), so no borrow can outlive the lock guard -- the
+    /// temp path itself is stable across resets (the swap reuses the same path).
+    pub fn upstream_response_path(&self) -> PathBuf {
+        self.upstream_response
+            .lock()
+            .expect("turn-capture upstream-response lock")
+            .path()
+            .to_path_buf()
     }
 
     /// Whether the `upstream_response` section is `partial` -- the raw upstream
@@ -389,18 +410,32 @@ impl TurnCaptureState {
     /// STICKY, like [`served_partial`](Self::served_partial). `false` for a cleanly
     /// concatenated success stream or a whole final failed body.
     pub fn upstream_response_partial(&self) -> bool {
-        self.upstream_response.partial()
+        self.upstream_response
+            .lock()
+            .expect("turn-capture upstream-response lock")
+            .partial()
     }
 
     /// Bytes captured into the `upstream_response` section so far (F1e).
     pub fn upstream_response_bytes(&self) -> u64 {
-        self.upstream_response.bytes()
+        self.upstream_response
+            .lock()
+            .expect("turn-capture upstream-response lock")
+            .bytes()
     }
 
-    /// Await the `upstream_response` section writer draining + flushing to disk
-    /// (F1e; used by the assembly barrier and by tests reading the file directly).
+    /// Await the CURRENT `upstream_response` section writer draining + flushing to
+    /// disk (F1e; used by the assembly barrier and by tests reading the file
+    /// directly). Clones the `Arc<Section>` out of the lock BEFORE awaiting so the
+    /// std mutex is never held across the await (and a concurrent per-attempt reset
+    /// is not blocked).
     pub async fn await_upstream_response_closed(&self) {
-        self.upstream_response.await_closed().await;
+        let section = self
+            .upstream_response
+            .lock()
+            .expect("turn-capture upstream-response lock")
+            .clone();
+        section.await_closed().await;
     }
 
     /// Path of the `served_response` section temp file.
@@ -474,7 +509,10 @@ impl TurnCaptureState {
     /// absent). COPIES `bytes`; no slice of the caller's buffer is retained.
     pub fn write_upstream_response(&self, bytes: &[u8]) {
         self.mark_upstream_response_streamed();
-        self.upstream_response.append(bytes);
+        self.upstream_response
+            .lock()
+            .expect("turn-capture upstream-response lock")
+            .append(bytes);
     }
 
     /// F1e: a bounded, back-pressured [`ServedSink`] over the `upstream_response`
@@ -486,15 +524,69 @@ impl TurnCaptureState {
     /// [`SECTION_CHANNEL_CAPACITY`] frames, NOT an unbounded channel; the same OOM
     /// class F1b's review caught). `None` once the section is closed.
     pub fn upstream_response_sink(&self) -> Option<ServedSink> {
-        self.upstream_response.poll_sender().map(ServedSink::new)
+        self.upstream_response
+            .lock()
+            .expect("turn-capture upstream-response lock")
+            .poll_sender()
+            .map(ServedSink::new)
     }
 
-    /// F1e: mark that a 2xx success stream was tapped into `upstream_response` (the
-    /// serving attempt reached `stream_success_response`). Assembly then embeds the
-    /// streamed section and ignores any staged failed body. Monotonic.
+    /// F1e: mark that a 2xx success stream was tapped into the CURRENT
+    /// `upstream_response` section (the serving attempt reached
+    /// `stream_success_response`). Assembly then embeds the streamed section and
+    /// ignores any staged failed body. Review r1: NOT monotonic across attempts --
+    /// [`reset_upstream_response`](Self::reset_upstream_response) clears it at each
+    /// dispatch start, so a superseded earlier 2xx prefetch attempt never leaves this
+    /// set for the final attempt; whatever the FINAL attempt streams (or does not)
+    /// wins.
     pub fn mark_upstream_response_streamed(&self) {
         self.upstream_response_streamed
             .store(true, Ordering::Release);
+    }
+
+    /// F1e review r1: RESET `upstream_response` to empty + re-writable at the START
+    /// of EACH dispatch attempt (the SAME per-attempt seam as
+    /// [`clear_pending_upstream_response_body`](Self::clear_pending_upstream_response_body)),
+    /// so the turn's raw response is FINAL-ATTEMPT-ONLY (last-writer-wins), mirroring
+    /// gap-05's staged-body semantics. A SUPERSEDED earlier prefetch attempt (2xx
+    /// headers → some raw bytes → its tap guard `close`d the section sticky-`partial`,
+    /// then a failover) must NOT leave its bytes / partial / close as the turn's
+    /// authoritative response; ONLY the serving/final attempt (its stream, or -- for a
+    /// final non-2xx -- its staged body) wins.
+    ///
+    /// A section a prior attempt `close`d is NOT re-writable (its sender is gone), so
+    /// we CLOSE + AWAIT the current section's writer to fully finish touching the temp
+    /// file, THEN swap in a FRESH section on the SAME path (a new bounded channel +
+    /// writer that `File::create`-truncates it to empty). Awaiting first guarantees
+    /// the old writer is done before the fresh one truncates -- no two writers ever
+    /// race the same file. On the FIRST attempt the "current" section is the
+    /// pristine one from the constructor (close+await drains nothing). Also clears the
+    /// [`upstream_response_streamed`](Self#field) discriminator so a final non-2xx
+    /// attempt (which never streams) falls through to the staged-body branch instead
+    /// of embedding a superseded earlier attempt's stream. Bounded memory is
+    /// preserved (the fresh section reuses the same bounded [`ServedSink`] channel);
+    /// no `Bytes` slice is retained.
+    pub async fn reset_upstream_response(&self) {
+        // Snapshot + close the current section (idempotent if the prior attempt's tap
+        // guard already closed it), then AWAIT its writer's drain+flush so the temp
+        // file is no longer being written before the fresh writer truncates it.
+        let current = self
+            .upstream_response
+            .lock()
+            .expect("turn-capture upstream-response lock")
+            .clone();
+        current.close(false);
+        current.await_closed().await;
+        drop(current);
+        // Swap in a fresh, empty, re-writable section on the SAME path.
+        let fresh = Arc::new(Section::new(self.work_dir.join("upstream_response")));
+        *self
+            .upstream_response
+            .lock()
+            .expect("turn-capture upstream-response lock") = fresh;
+        // A superseded attempt's stream-discriminator must not leak into this one.
+        self.upstream_response_streamed
+            .store(false, Ordering::Release);
     }
 
     /// F1e: mark the `upstream_response` section `partial` immediately (sticky),
@@ -504,7 +596,10 @@ impl TurnCaptureState {
     /// before a clean end (a G6 frame-cap rejection downstream, a client
     /// disconnect). A single atomic store; safe to call any number of times.
     pub fn mark_upstream_response_degraded(&self) {
-        self.upstream_response.mark_partial();
+        self.upstream_response
+            .lock()
+            .expect("turn-capture upstream-response lock")
+            .mark_partial();
     }
 
     /// F1e: close the `upstream_response` section. Called by the tap's drop guard
@@ -515,7 +610,10 @@ impl TurnCaptureState {
     /// path (no tap). Idempotent (only the first close drops the sender); `partial`
     /// is sticky (a later `close(false)` never clears an earlier degrade mark).
     pub fn upstream_response_done(&self, partial: bool) {
-        self.upstream_response.close(partial);
+        self.upstream_response
+            .lock()
+            .expect("turn-capture upstream-response lock")
+            .close(partial);
     }
 
     /// F1e: STAGE the FINAL failed HTTP body (whole, already image-URI-redacted) for
@@ -749,14 +847,28 @@ impl TurnCaptureState {
                 .expect("turn-capture pending-upstream-body lock")
                 .take();
             if let Some(body) = staged
-                && self.upstream_response.replace(&body)
+                && self
+                    .upstream_response
+                    .lock()
+                    .expect("turn-capture upstream-response lock")
+                    .replace(&body)
             {
                 self.upstream_response_present
                     .store(true, Ordering::Release);
             }
         }
-        self.upstream_response.close(false);
-        self.upstream_response.await_closed().await;
+        // TERMINAL close (review r1): dispatch is complete, so no per-attempt
+        // `reset_upstream_response` can reopen this section -- force-close the FINAL
+        // section + await its writer so the both-`done` barrier ALWAYS resolves in
+        // bounded time, even when the final attempt was reset then left un-closed (a
+        // body-less failure) or wrote a staged error body without a stream close.
+        let upstream_response = self
+            .upstream_response
+            .lock()
+            .expect("turn-capture upstream-response lock")
+            .clone();
+        upstream_response.close(false);
+        upstream_response.await_closed().await;
         self.served_response.await_closed().await;
         // Stamp `finished_ms` AFTER the flush barriers so it reflects the turn's true
         // end (both `done`s + the section drain), and is `>= started_ms`.
@@ -947,7 +1059,15 @@ impl TurnCaptureState {
         // #5, handled generically by `write_section`).
         if self.upstream_response_present.load(Ordering::Acquire) {
             w.write_all(b",")?;
-            write_section(&mut w, "upstream_response", &self.upstream_response, false)?;
+            // The section lives behind a `Mutex<Arc<..>>` (per-attempt reset swaps
+            // it); assembly runs AFTER the terminal close, so this clone is the
+            // stable FINAL section. Clone the `Arc` out and deref to `&Section`.
+            let upstream_response = self
+                .upstream_response
+                .lock()
+                .expect("turn-capture upstream-response lock")
+                .clone();
+            write_section(&mut w, "upstream_response", &upstream_response, false)?;
         }
         w.write_all(b",")?;
         write_section(&mut w, "served_response", &self.served_response, false)?;
@@ -2738,6 +2858,137 @@ mod tests {
         assert!(
             state.upstream_response_partial(),
             "a degrade mark stays partial through a later clean close"
+        );
+    }
+
+    /// F1e review r1 (failover final-attempt-only -- the BLOCKING HIGH): attempt A
+    /// opens a 2xx prefetch stream (writes some raw bytes), then is SUPERSEDED (its
+    /// tap guard closes the shared section sticky-`partial`), and attempt B SERVES.
+    /// The per-attempt [`reset_upstream_response`] at B's dispatch start DISCARDS A's
+    /// bytes + partial + close and RE-OPENS the section, so the artifact's
+    /// `upstream_response` is B's EXACT bytes (never A's), and it is NOT `partial` (A's
+    /// abandoned partial was cleared). Without the reset, A's tap `close` would have
+    /// left the shared section closed + partial with A's stale bytes, and B's
+    /// `upstream_response_sink()` would return `None` (no re-open) -- committing the
+    /// wrong attempt.
+    #[tokio::test]
+    async fn upstream_response_superseded_prefetch_discarded_final_attempt_wins() {
+        let dir = temp_dir_path("upstream-response-failover-final");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_failover", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+
+        // Attempt A: dispatch-start reset, 2xx prefetch, some raw bytes, then
+        // SUPERSEDED (prefetch first-chunk failed → its tap guard closes partial).
+        state.reset_upstream_response().await;
+        state.mark_upstream_response_streamed(); // A dispatched 2xx
+        {
+            let mut sink = state.upstream_response_sink().expect("A sink");
+            std::future::poll_fn(|cx| sink.poll_reserve(cx))
+                .await
+                .expect("A writer alive");
+            sink.send(b"data: {\"choices\":[{\"delta\":{\"content\":\"A-STALE\"}}]}\n\n".to_vec())
+                .expect("A send");
+            state.mark_upstream_response_degraded(); // A truncated (superseded)
+            drop(sink);
+        }
+        state.upstream_response_done(true); // A's tap guard closes the shared section
+
+        // Attempt B: dispatch-start reset (DISCARDS A), 2xx serve, clean stream.
+        state.reset_upstream_response().await;
+        state.mark_upstream_response_streamed(); // B dispatched 2xx
+        {
+            let mut sink = state
+                .upstream_response_sink()
+                .expect("B sink -- the reset RE-OPENED the section A had closed");
+            std::future::poll_fn(|cx| sink.poll_reserve(cx))
+                .await
+                .expect("B writer alive");
+            sink.send(b"data: {\"choices\":[{\"delta\":{\"content\":\"B-SERVED\"}}]}\n\n".to_vec())
+                .expect("B send");
+            drop(sink);
+        }
+        state.upstream_response_done(false); // B clean close
+
+        state.write_served_response(b"ok");
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_artifact(&dir.join("api_ur_failover.json")).await;
+        let section = &artifact["sections"]["upstream_response"];
+        let content = section["content"].as_str().expect("string content");
+        assert_eq!(
+            content, "data: {\"choices\":[{\"delta\":{\"content\":\"B-SERVED\"}}]}\n\n",
+            "the FINAL (serving) attempt's bytes win; the superseded attempt A is discarded: {section}"
+        );
+        assert!(
+            !content.contains("A-STALE"),
+            "a superseded earlier prefetch attempt's bytes never survive: {content}"
+        );
+        assert_eq!(
+            section["partial"], false,
+            "attempt A's abandoned sticky-partial was cleared by the reset -- B served cleanly"
+        );
+    }
+
+    /// F1e review r1 (final-attempt partial still sticks + no hang): a superseded
+    /// earlier attempt A's partial is CLEARED by the reset, but the FINAL attempt B's
+    /// stream is genuinely truncated (a G6 frame-cap / mid-stream error) → the
+    /// artifact's `upstream_response` is B's partial bytes with `partial:true`, and
+    /// finalize still resolves in bounded time (`wait_for_artifact` caps its wait, so
+    /// a successful read PROVES no hang).
+    #[tokio::test]
+    async fn upstream_response_final_attempt_partial_sticks_after_superseded() {
+        let dir = temp_dir_path("upstream-response-final-partial");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture
+            .start("api_ur_final_partial", None, 0)
+            .expect("state");
+        state.write_inbound_request(b"{}");
+
+        // Attempt A: 2xx prefetch, some bytes, superseded partial (must be cleared).
+        state.reset_upstream_response().await;
+        state.mark_upstream_response_streamed();
+        {
+            let mut sink = state.upstream_response_sink().expect("A sink");
+            std::future::poll_fn(|cx| sink.poll_reserve(cx))
+                .await
+                .expect("A writer alive");
+            sink.send(b"A-STALE-PARTIAL".to_vec()).expect("A send");
+            state.mark_upstream_response_degraded();
+            drop(sink);
+        }
+        state.upstream_response_done(true);
+
+        // Attempt B (final): 2xx serve, some bytes, then genuinely truncated (G6).
+        state.reset_upstream_response().await;
+        state.mark_upstream_response_streamed();
+        {
+            let mut sink = state.upstream_response_sink().expect("B sink");
+            std::future::poll_fn(|cx| sink.poll_reserve(cx))
+                .await
+                .expect("B writer alive");
+            sink.send(b"data: {\"choices\":[{\"delta\":{\"content\":\"B-PART\"}}]}\n\n".to_vec())
+                .expect("B send");
+            state.mark_upstream_response_degraded(); // G6 truncation on the FINAL attempt
+            drop(sink);
+        }
+        state.upstream_response_done(true); // B's tap guard closes partial
+
+        state.write_served_response(b"partial");
+        state.served_done(true);
+        state.engine_done("failed", Some("upstream_error"));
+
+        let artifact = wait_for_artifact(&dir.join("api_ur_final_partial.json")).await;
+        let section = &artifact["sections"]["upstream_response"];
+        let content = section["content"].as_str().expect("string content");
+        assert!(
+            content.contains("B-PART") && !content.contains("A-STALE"),
+            "the FINAL attempt's (partial) bytes win; the superseded attempt is discarded: {content}"
+        );
+        assert_eq!(
+            section["partial"], true,
+            "the FINAL attempt's genuine truncation stays partial (sticky)"
         );
     }
 }

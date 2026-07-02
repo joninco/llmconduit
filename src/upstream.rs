@@ -1253,6 +1253,15 @@ impl ReqwestUpstreamClient {
         // WITHOUT a body (connect/timeout/prefetch-stream-error). A success stream
         // supersedes it anyway (the streamed section wins at assembly).
         if let Some(capture) = capture {
+            // F1e review r1: the streamed `upstream_response` section is ALSO
+            // final-attempt-only. RESET it here (truncate to empty + re-open
+            // re-writable + clear the sticky `partial` + clear the streamed
+            // discriminator) at this SAME per-attempt seam, so a SUPERSEDED earlier
+            // prefetch attempt (2xx headers → some raw bytes → its tap guard closed
+            // the shared section sticky-`partial`, then failover) can never leave its
+            // bytes/partial/close as the turn's authoritative `upstream_response` --
+            // only the serving/final attempt wins (gap-05 last-writer-wins semantics).
+            capture.reset_upstream_response().await;
             capture.clear_pending_upstream_response_body();
         }
         // First attempt. On a non-2xx whose body indicates a context/completion
