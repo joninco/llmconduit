@@ -4144,10 +4144,14 @@ async fn stream_success_response(
     // the guard as before).
     let byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
         match capture {
-            Some(capture) => {
-                capture.mark_upstream_response_streamed();
-                Box::pin(tap_upstream_response(response.bytes_stream(), capture))
-            }
+            // F1e review r3 (Finding 2 -- don't claim a complete empty response): the
+            // `upstream_response_streamed` discriminator is NO LONGER set here, at
+            // header time. If it were, a bare-leaf cancel AFTER 2xx headers but BEFORE
+            // the first `stream.next()` (the tap block never runs) would finalize an
+            // EMPTY `upstream_response` with `partial:false` -- lyingly "complete". The
+            // tap now marks streamed only once a real byte flows OR the stream reaches a
+            // CLEAN end, so a pre-first-byte cancel stays partial/absent (truthful).
+            Some(capture) => Box::pin(tap_upstream_response(response.bytes_stream(), capture)),
             None => Box::pin(response.bytes_stream()),
         };
     // Bound the upstream SSE read BEFORE `eventsource()` parses it (G6). The
@@ -4210,10 +4214,19 @@ where
         // sees all senders gone and terminates (no hang).
         let mut guard = UpstreamTapGuard::new(Arc::clone(&capture));
         let mut sink = capture.upstream_response_sink();
+        // F1e review r3 (Finding 2): the streamed discriminator is set on the FIRST
+        // real byte (below), NOT at header time -- so a 2xx-headers-then-cancel before
+        // any byte never claims a complete (empty) response. A local latch avoids a
+        // redundant atomic store per chunk.
+        let mut streamed_marked = false;
         let mut inner = std::pin::pin!(inner);
         while let Some(item) = inner.next().await {
             match &item {
                 Ok(bytes) if !bytes.is_empty() => {
+                    if !streamed_marked {
+                        capture.mark_upstream_response_streamed();
+                        streamed_marked = true;
+                    }
                     if let Some(active) = sink.as_mut() {
                         // Reserve a slot BEFORE copying (bounded memory / back-pressure).
                         match std::future::poll_fn(|cx| active.poll_reserve(cx)).await {
@@ -4241,9 +4254,14 @@ where
             // Forward the ORIGINAL chunk UNCHANGED (tee = copy + forward).
             yield item;
         }
-        // The raw upstream stream reached a clean end. Drop the sink so the writer
-        // sees its clone gone, then mark clean so the guard closes the section
-        // non-partial.
+        // The raw upstream stream reached a CLEAN end. Mark streamed (idempotent with
+        // the first-byte mark above) so that a genuinely empty-but-cleanly-closed
+        // upstream response (2xx headers + clean EOS + zero bytes) is a TRUTHFUL
+        // `partial:false` empty section -- distinct from a pre-first-byte cancel, which
+        // never reaches here and so stays partial/absent (Finding 2). Then drop the
+        // sink so the writer sees its clone gone, and mark clean so the guard closes
+        // the section non-partial.
+        capture.mark_upstream_response_streamed();
         drop(sink);
         guard.mark_clean();
     }
@@ -8410,5 +8428,146 @@ mod d4_provider_health_tests {
         assert_eq!(first.version, 1);
         assert!(first.providers.is_empty());
         assert_eq!(second.providers.len(), 1);
+    }
+}
+
+/// F1e review r3 (Finding 2 -- don't claim a complete empty upstream response): the
+/// `upstream_response_streamed` discriminator is set on the FIRST real byte / a CLEAN
+/// end-of-stream, never at 2xx-header time -- so a bare-leaf cancel after headers but
+/// before any byte leaves the section partial/absent (truthful), never an empty
+/// `partial:false` "complete" response. These tests drive the real
+/// [`tap_upstream_response`] / [`stream_success_response`] code paths.
+#[cfg(test)]
+mod f1e_upstream_response_truthful_tests {
+    use super::stream_success_response;
+    use super::tap_upstream_response;
+    use crate::turn_capture::TurnCapture;
+    use axum::body::Bytes;
+    use futures::StreamExt as _;
+    use std::sync::Arc;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "llmconduit-tap-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    /// Poll for the assembled artifact (assembly is spawned async); a bounded wait so a
+    /// turn that never assembles fails loudly rather than hanging.
+    async fn wait_for_artifact(path: &std::path::Path) -> serde_json::Value {
+        for _ in 0..300 {
+            if let Ok(bytes) = std::fs::read(path) {
+                return serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+                    panic!("artifact at {} not valid JSON: {err}", path.display())
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("artifact never appeared at {}", path.display());
+    }
+
+    /// Finding 2 (the exact scenario): a 2xx upstream response whose raw byte stream is
+    /// DROPPED before the first `stream.next()`. `stream_success_response` must NOT have
+    /// marked the response "streamed" at header time, so finalize OMITS
+    /// `upstream_response` entirely (absent) -- NEVER an empty `partial:false` complete
+    /// section. FAILS on the old code, which set the discriminator at header time.
+    #[tokio::test]
+    async fn stream_success_dropped_before_first_byte_is_absent_not_empty_complete() {
+        let dir = temp_dir("ssr-drop");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ssr_drop", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        {
+            let response = reqwest::Response::from(
+                http::Response::builder()
+                    .status(200)
+                    .body(b"data: {\"choices\":[]}\n\n".to_vec())
+                    .expect("build response"),
+            );
+            let stream = stream_success_response(response, 1024 * 1024, Some(Arc::clone(&state)))
+                .await
+                .expect("stream built");
+            // Dropped WITHOUT a single poll -> the tap block never runs, and (fix) there
+            // is no eager header-time streamed mark, so the discriminator stays clear.
+            drop(stream);
+        }
+        state.write_served_response(b"");
+        state.served_done(true);
+        state.engine_done("cancelled", Some("client_disconnect"));
+
+        let artifact = wait_for_artifact(&dir.join("api_ssr_drop.json")).await;
+        assert!(
+            artifact["sections"].get("upstream_response").is_none(),
+            "2xx headers then cancel before the first byte must leave upstream_response \
+             ABSENT, never an empty partial:false complete: {artifact}"
+        );
+    }
+
+    /// Finding 2 (truthful-empty case): a 2xx upstream response with a CLEAN end-of-
+    /// stream and ZERO bytes. The tap marks streamed at the clean end, so the section IS
+    /// present and `partial:false` with `bytes:0` -- a truthful empty response (allowed),
+    /// distinct from the pre-first-byte cancel above (absent).
+    #[tokio::test]
+    async fn tap_clean_eos_zero_bytes_is_truthful_empty_partial_false() {
+        let dir = temp_dir("clean-empty");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_tap_empty", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        {
+            let inner = futures::stream::empty::<Result<Bytes, reqwest::Error>>();
+            let mut tapped = Box::pin(tap_upstream_response(inner, Arc::clone(&state)));
+            while tapped.next().await.is_some() {}
+        }
+        state.write_served_response(b"");
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_artifact(&dir.join("api_tap_empty.json")).await;
+        let section = &artifact["sections"]["upstream_response"];
+        assert_eq!(
+            section["partial"], false,
+            "a clean EOS with zero bytes is a TRUTHFUL partial:false empty: {artifact}"
+        );
+        assert_eq!(section["bytes"], 0, "zero bytes streamed: {artifact}");
+    }
+
+    /// Finding 2 + AC-14: a real byte flows, THEN the stream is cancelled mid-flight. The
+    /// discriminator is marked on the FIRST byte (so the partial bytes are embedded), and
+    /// the tap guard's early drop keeps the section sticky-`partial:true`.
+    #[tokio::test]
+    async fn tap_first_byte_then_cancel_embeds_partial_bytes() {
+        let dir = temp_dir("byte-then-cancel");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_tap_partial", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        {
+            let inner = futures::stream::iter(vec![Ok::<Bytes, reqwest::Error>(
+                Bytes::from_static(b"data: hello\n\n"),
+            )])
+            .chain(futures::stream::pending::<Result<Bytes, reqwest::Error>>());
+            let mut tapped = Box::pin(tap_upstream_response(inner, Arc::clone(&state)));
+            // First byte flows -> streamed marked on the FIRST byte.
+            assert!(tapped.next().await.is_some());
+            // The next poll parks (pending); dropping `tapped` = cancel mid-stream.
+            let fut = tapped.next();
+            futures::pin_mut!(fut);
+            assert!(futures::poll!(fut.as_mut()).is_pending());
+        }
+        state.write_served_response(b"partial");
+        state.served_done(true);
+        state.engine_done("cancelled", Some("client_disconnect"));
+
+        let artifact = wait_for_artifact(&dir.join("api_tap_partial.json")).await;
+        let section = &artifact["sections"]["upstream_response"];
+        let content = section["content"].as_str().expect("content string");
+        assert!(
+            content.contains("hello"),
+            "the first byte's bytes are embedded (streamed marked on first byte): {artifact}"
+        );
+        assert_eq!(
+            section["partial"], true,
+            "a byte-then-cancel stays sticky-partial (AC-14): {artifact}"
+        );
     }
 }

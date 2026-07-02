@@ -58,6 +58,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::io::SeekFrom;
 use std::io::Write as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -72,6 +73,7 @@ use std::task::Poll;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
@@ -589,7 +591,12 @@ impl TurnCaptureState {
     /// drains + flushes its own `upstream_response.<older-gen>` file and terminates
     /// independently -- NOT awaited here, so the cancellable path never parks on the
     /// old writer. Its temp file is bounded (one per attempt) and removed with the
-    /// work dir at finalize (no leak beyond the turn). Bounded memory holds (the fresh
+    /// work dir at finalize (no leak beyond the turn). Review r3 (Finding 1): that
+    /// superseded file was created EAGERLY when its `Section` was constructed (before
+    /// any finalize), and its writer never calls `File::create`, so even if the
+    /// detached writer is scheduled AFTER `finalize_and_assemble` removed the work dir
+    /// it can only flush its already-open (now unlinked) fd -- it can NEVER recreate
+    /// `.work/<id>/` or the file post-finalize. Bounded memory holds (the fresh
     /// section reuses the same bounded [`ServedSink`] channel); no `Bytes` slice is
     /// retained. Also folds in
     /// [`clear_pending_upstream_response_body`](Self::clear_pending_upstream_response_body)
@@ -1315,7 +1322,22 @@ impl Section {
             pending_replace: Mutex::new(ReplaceSlot::default()),
             replace_ready: Notify::new(),
         });
-        tokio::spawn(section_writer(rx, Arc::clone(&meta)));
+        // F1e review r3 (Finding 1 -- no post-finalize file recreation): create the
+        // work dir + section file SYNCHRONOUSLY here, at CONSTRUCTION, and hand the
+        // open handle to the writer. Because a `Section` is only ever built during the
+        // turn's active phase (`start` / the per-attempt `reset_upstream_response`) and
+        // `finalize_and_assemble`/`remove_dir_all` only run AFTER both terminal `done`s,
+        // this `File::create` ALWAYS precedes any finalize for the turn. The writer task
+        // therefore never creates a dir/file itself, so a SUPERSEDED / detached writer
+        // (a failover-abandoned attempt whose section is not awaited by finalize)
+        // scheduled LATE can only flush its already-open -- and, after `remove_dir_all`,
+        // unlinked -- fd; it can NEVER recreate `.work/<id>/` or the section file after
+        // finalize. Synchronous (NOT `tokio::fs`) because `reset_upstream_response` mints
+        // its section on the cancel-safe, AWAIT-FREE swap path (r2): awaiting a create
+        // there would reintroduce the droppable-mid-swap race. A create is a single fast
+        // metadata syscall on this diagnostic, opt-in surface (not body IO).
+        let file = create_section_file(&meta);
+        tokio::spawn(section_writer(rx, Arc::clone(&meta), file));
         Self {
             tx: Mutex::new(Some(tx)),
             meta,
@@ -1476,25 +1498,22 @@ impl Section {
     }
 }
 
-/// The background writer for one [`Section`]: creates the work dir + section file
-/// (all fs IO via `tokio::fs`, i.e. off the runtime threads), then loops,
-/// PRIORITIZING the coalescing [`SectionMeta::pending_replace`] slot (F1d
-/// review r1's guaranteed last-writer-wins whole-body write -- applied by
-/// truncating the file and writing exactly the slot's bytes) ahead of draining
-/// the next queued [`SectionChunk::Append`] chunk. When the sender drops
-/// (section closed or turn dropped) it ATOMICALLY takes one final pending replace
-/// that raced the close AND seals the slot (so a `replace` racing after is
-/// rejected, never orphaned -- review r2), then flushes, fsyncs, and marks the
-/// section `closed` -- so [`Section::await_closed`] always observes the LAST
-/// accepted replace's bytes, never a stale earlier one. A file-create/write error
-/// marks the section `partial`
-/// and is logged, never propagated (a diagnostic artifact must never fail or
-/// hang the turn).
-async fn section_writer(mut rx: mpsc::Receiver<SectionChunk>, meta: Arc<SectionMeta>) {
-    // Idempotent + race-tolerant across the turn's sibling sections both racing
-    // to create the shared work dir.
+/// F1e review r3 (Finding 1): create a section's work dir + temp file EAGERLY at
+/// [`Section`] construction, SYNCHRONOUSLY, returning the open handle (wrapped for
+/// async use by the writer). Doing this at construction -- always BEFORE the turn's
+/// `finalize_and_assemble`/`remove_dir_all` -- means no writer ever needs to
+/// `File::create` later, so a superseded/detached writer scheduled after finalize can
+/// only flush an already-open (possibly unlinked) fd, never recreate the dir or file
+/// (no post-finalize leak). Uses `std::fs` (not `tokio::fs`) because the callers are
+/// synchronous and cancel-safe ([`Section::new`] via `reset_upstream_response`'s
+/// await-free swap); a single metadata create is fast and this is a diagnostic,
+/// opt-in surface. A failure is logged + flags the section `partial` (diagnostic-only:
+/// never propagated), mirroring the old in-writer handling.
+fn create_section_file(meta: &SectionMeta) -> Option<tokio::fs::File> {
+    // Idempotent + race-tolerant across the turn's sibling sections all racing to
+    // create the shared work dir.
     if let Some(parent) = meta.path.parent()
-        && let Err(err) = tokio::fs::create_dir_all(parent).await
+        && let Err(err) = std::fs::create_dir_all(parent)
     {
         tracing::warn!(
             path = %meta.path.display(),
@@ -1503,9 +1522,8 @@ async fn section_writer(mut rx: mpsc::Receiver<SectionChunk>, meta: Arc<SectionM
         );
         meta.partial.store(true, Ordering::Release);
     }
-
-    let mut file = match tokio::fs::File::create(&meta.path).await {
-        Ok(file) => Some(file),
+    match std::fs::File::create(&meta.path) {
+        Ok(file) => Some(tokio::fs::File::from_std(file)),
         Err(err) => {
             tracing::warn!(
                 path = %meta.path.display(),
@@ -1515,8 +1533,32 @@ async fn section_writer(mut rx: mpsc::Receiver<SectionChunk>, meta: Arc<SectionM
             meta.partial.store(true, Ordering::Release);
             None
         }
-    };
+    }
+}
 
+/// The background writer for one [`Section`]. The work dir + section file are
+/// created EAGERLY at construction ([`create_section_file`]) and the open handle is
+/// handed in as `file`, so this writer NEVER creates a dir/file itself -- that is
+/// what guarantees a superseded/detached writer scheduled after
+/// [`TurnCaptureState::finalize_and_assemble`] removed the work dir cannot recreate
+/// it (Finding 1): it only ever writes to / truncates the already-open (possibly
+/// unlinked) fd. It loops, PRIORITIZING the coalescing [`SectionMeta::pending_replace`]
+/// slot (F1d review r1's guaranteed last-writer-wins whole-body write -- applied by
+/// truncating the file IN PLACE and writing exactly the slot's bytes) ahead of
+/// draining the next queued [`SectionChunk::Append`] chunk. When the sender drops
+/// (section closed or turn dropped) it ATOMICALLY takes one final pending replace
+/// that raced the close AND seals the slot (so a `replace` racing after is
+/// rejected, never orphaned -- review r2), then flushes, fsyncs, and marks the
+/// section `closed` -- so [`Section::await_closed`] always observes the LAST
+/// accepted replace's bytes, never a stale earlier one. A write/truncate error
+/// marks the section `partial`
+/// and is logged, never propagated (a diagnostic artifact must never fail or
+/// hang the turn).
+async fn section_writer(
+    mut rx: mpsc::Receiver<SectionChunk>,
+    meta: Arc<SectionMeta>,
+    mut file: Option<tokio::fs::File>,
+) {
     loop {
         // Register interest in the next replace-wake BEFORE checking the slot
         // (register-before-check, mirroring `Section::await_closed`), so a
@@ -1597,8 +1639,9 @@ fn seal_and_take_pending_replace(meta: &SectionMeta) -> Option<Vec<u8>> {
 }
 
 /// Write one queued `Append` chunk to the currently-open file. A no-op besides
-/// draining if the file was never opened (or a prior replace's re-create just
-/// failed) -- the section is already flagged `partial` in that case.
+/// draining if the file was never opened (eager creation failed, or a prior
+/// replace's in-place truncate failed) -- the section is already flagged `partial`
+/// in that case.
 async fn write_append(file: &mut Option<tokio::fs::File>, meta: &SectionMeta, bytes: Vec<u8>) {
     let Some(open_file) = file.as_mut() else {
         return;
@@ -1618,31 +1661,43 @@ async fn write_append(file: &mut Option<tokio::fs::File>, meta: &SectionMeta, by
     }
 }
 
-/// Apply one whole-body replace: truncate (re-create) the section file, reset
-/// the `bytes` counter to 0, then write `bytes` as its ENTIRE content -- F1d's
-/// last-writer-wins whole-body write, so the section reflects only THIS
-/// replacement's length, never a concatenation with an earlier attempt. On a
-/// re-create failure the bytes are dropped (nothing to write into) and the
-/// section is flagged `partial`, mirroring the original on-full-replace-error
+/// Apply one whole-body replace: TRUNCATE the already-open section file IN PLACE
+/// (`set_len(0)` + seek to the start) -- NEVER `File::create` -- reset the `bytes`
+/// counter to 0, then write `bytes` as its ENTIRE content. F1d's last-writer-wins
+/// whole-body write, so the section reflects only THIS replacement's length, never a
+/// concatenation with an earlier attempt. Truncating the OPEN fd (rather than
+/// re-creating the path) means a replace can never recreate a file/dir that
+/// `finalize_and_assemble`'s `remove_dir_all` already removed (Finding 1); on a
+/// post-finalize unlinked fd the truncate+write is harmless (it targets the freed
+/// inode). On a truncate failure the bytes are dropped (nothing safe to write into)
+/// and the section is flagged `partial`, mirroring the original on-replace-error
 /// handling.
 async fn apply_replace(file: &mut Option<tokio::fs::File>, meta: &SectionMeta, bytes: Vec<u8>) {
-    match tokio::fs::File::create(&meta.path).await {
-        Ok(new_file) => {
-            *file = Some(new_file);
-            meta.bytes.store(0, Ordering::Release);
-        }
-        Err(err) => {
-            tracing::warn!(
-                path = %meta.path.display(),
-                error = %err,
-                "turn-capture: failed to re-create section file for replace"
-            );
-            meta.partial.store(true, Ordering::Release);
-            *file = None;
-            return;
-        }
+    let Some(open_file) = file.as_mut() else {
+        // Eager creation failed (already flagged `partial`); nothing to write into.
+        return;
+    };
+    if let Err(err) = truncate_section_file(open_file).await {
+        tracing::warn!(
+            path = %meta.path.display(),
+            error = %err,
+            "turn-capture: failed to truncate section file for replace"
+        );
+        meta.partial.store(true, Ordering::Release);
+        *file = None;
+        return;
     }
+    meta.bytes.store(0, Ordering::Release);
     write_append(file, meta, bytes).await;
+}
+
+/// Truncate an open section file to empty and reposition the write cursor at the
+/// start, so the next [`write_append`] overwrites from offset 0 -- the in-place
+/// equivalent of an `O_TRUNC` re-open WITHOUT recreating the path (Finding 1).
+async fn truncate_section_file(file: &mut tokio::fs::File) -> std::io::Result<()> {
+    file.set_len(0).await?;
+    file.seek(SeekFrom::Start(0)).await?;
+    Ok(())
 }
 
 /// The both-`done` assembly barrier state, consolidated under ONE mutex on
@@ -3126,5 +3181,145 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// F1e review r3 (Finding 1): every section's temp file is created EAGERLY +
+    /// SYNCHRONOUSLY at construction, so `start()` and each per-attempt
+    /// `reset_upstream_response` mint their files the instant they return -- BEFORE any
+    /// await, any writer poll, and (crucially) any finalize. That is precisely what lets
+    /// a late/detached writer never need to `File::create`, so it can never recreate a
+    /// file after finalize removed the work dir. (This assertion FAILS on the old lazy
+    /// design, where the file did not exist until its writer task was first polled.)
+    #[tokio::test]
+    async fn sections_are_created_eagerly_and_synchronously() {
+        let dir = temp_dir_path("upstream-response-eager");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_eager", None, 0).expect("state");
+        // start() itself created the work dir + all four section files, synchronously,
+        // before any await could let a writer task run.
+        assert!(
+            state.work_dir().exists(),
+            "start() creates the work dir eagerly (before any writer poll)"
+        );
+        assert!(
+            state.inbound_request_path().exists(),
+            "the inbound_request section file is created eagerly"
+        );
+        // A dispatch attempt's reset mints a fresh upstream_response.<gen> section --
+        // its file must exist the moment reset returns (no await in between).
+        state.reset_upstream_response();
+        let path = state.upstream_response_path();
+        assert!(
+            path.exists(),
+            "reset_upstream_response must create the section file eagerly + synchronously: {}",
+            path.display()
+        );
+    }
+
+    /// F1e review r3 (Finding 1 -- the BLOCKING HIGH): a SUPERSEDED / detached
+    /// `upstream_response` writer must NEVER recreate the work dir or its section file
+    /// after `finalize_and_assemble` removed the work dir. Two back-to-back SYNCHRONOUS
+    /// resets with NO await between them leave the first reset's writer spawned but
+    /// (current-thread test runtime) UNPOLLED, and the second reset supersedes +
+    /// DETACHES it while still unpolled -- exactly the "detached writer scheduled late"
+    /// case the finding describes. We then model finalize by removing the whole work dir
+    /// and DRIVE every detached writer to run post-removal. With the old lazy
+    /// `File::create` a late writer would recreate `.work/<id>/` (+ its file) HERE; with
+    /// eager construction-time creation it can only flush an already-open (now unlinked)
+    /// fd, so the dir stays gone. A successful run also proves no writer hangs.
+    #[tokio::test]
+    async fn detached_superseded_writer_never_recreates_removed_work_dir() {
+        let dir = temp_dir_path("upstream-response-no-recreate");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_no_recreate", None, 0).expect("state");
+        let work_dir = state.work_dir().to_path_buf();
+        state.write_inbound_request(b"{}");
+
+        // Two synchronous resets, NO await between: the first mints gen-N (eager file),
+        // the second supersedes + detaches gen-N's still-unpolled writer.
+        state.reset_upstream_response();
+        let superseded_path = state.upstream_response_path();
+        assert!(
+            superseded_path.exists(),
+            "the superseded section file exists eagerly (pre-finalize): {}",
+            superseded_path.display()
+        );
+        state.reset_upstream_response();
+
+        // Model finalize's remove_dir_all landing BEFORE the detached writer is polled.
+        std::fs::remove_dir_all(&work_dir).expect("remove work dir (models finalize)");
+        assert!(!work_dir.exists());
+
+        // Drive every detached/spawned writer to run NOW, post-removal.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            !work_dir.exists(),
+            "a detached superseded writer must NOT recreate the work dir after finalize: {}",
+            work_dir.display()
+        );
+    }
+
+    /// F1e review r3 (Finding 1), end-to-end: a full turn with a SUPERSEDED prefetch
+    /// attempt (failover A → B) finalizes FOR REAL (assembly runs `remove_dir_all`), and
+    /// NO `.work/<id>/` dir/file remains -- even after driving the detached superseded
+    /// writers to run post-finalize. Mirrors
+    /// [`upstream_response_superseded_prefetch_discarded_final_attempt_wins`], adding the
+    /// no-residue / no-recreation assertion.
+    #[tokio::test]
+    async fn no_work_dir_residue_after_superseded_prefetch_finalizes() {
+        let dir = temp_dir_path("upstream-response-finalize-clean");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_final_clean", None, 0).expect("state");
+        let work_dir = state.work_dir().to_path_buf();
+        state.write_inbound_request(b"{}");
+
+        // Attempt A: 2xx prefetch, some bytes, superseded partial.
+        state.reset_upstream_response();
+        state.mark_upstream_response_streamed();
+        {
+            let mut sink = state.upstream_response_sink().expect("A sink");
+            std::future::poll_fn(|cx| sink.poll_reserve(cx))
+                .await
+                .expect("A writer alive");
+            sink.send(b"data: A-STALE\n\n".to_vec()).expect("A send");
+            state.mark_upstream_response_degraded();
+            drop(sink);
+        }
+        state.upstream_response_done(true);
+
+        // Attempt B (final): 2xx serve, clean.
+        state.reset_upstream_response();
+        state.mark_upstream_response_streamed();
+        {
+            let mut sink = state.upstream_response_sink().expect("B sink");
+            std::future::poll_fn(|cx| sink.poll_reserve(cx))
+                .await
+                .expect("B writer alive");
+            sink.send(b"data: B-SERVED\n\n".to_vec()).expect("B send");
+            drop(sink);
+        }
+        state.upstream_response_done(false);
+
+        state.write_served_response(b"ok");
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        // Finalize publishes the artifact and removes the work dir.
+        let _artifact = wait_for_artifact(&dir.join("api_ur_final_clean.json")).await;
+        assert!(!work_dir.exists(), ".work/<id>/ is removed at finalize");
+
+        // Drive any still-scheduled detached superseded writers; none may recreate it.
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            !work_dir.exists(),
+            "no detached superseded writer may recreate .work/<id>/ after finalize: {}",
+            work_dir.display()
+        );
     }
 }
