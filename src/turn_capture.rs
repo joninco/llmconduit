@@ -232,6 +232,24 @@ pub struct TurnCaptureState {
     model_served: Mutex<Option<String>>,
     /// The redacted inbound Anthropic/OpenAI request body (F1b).
     inbound_request: Section,
+    /// F1d: the redacted, FINAL on-wire OpenAI `ChatCompletionRequest` (post
+    /// profile/lowering/sanitize). Written WHOLE per dispatch attempt via
+    /// [`Section::replace`] (last-writer-wins), NOT streamed -- so a shrink-retry
+    /// or a failover rebuild's later attempt reflects as the recorded section,
+    /// never a concatenation of every attempt tried. Stays OPEN across the
+    /// turn's dispatch attempts; closed at the both-`done` barrier
+    /// ([`finalize_and_assemble`](Self::finalize_and_assemble)), like the other
+    /// sections.
+    upstream_request: Section,
+    /// F1d (don't-lie-with-zeros): whether
+    /// [`write_upstream_request`](Self::write_upstream_request) was EVER called
+    /// for this turn. A turn that never dispatches upstream (e.g. a pre-spawn
+    /// validation failure) never sets this, so [`write_artifact_file`] OMITS the
+    /// `upstream_request` key from the artifact entirely -- absent, never a
+    /// fabricated `bytes:0` "measured empty" section.
+    ///
+    /// [`write_artifact_file`]: Self::write_artifact_file
+    upstream_request_written: AtomicBool,
     /// The exact bytes served to the client, teed off the response `Body` (F1b).
     served_response: Section,
     /// Set synchronously by [`CaptureGuard::new`] the instant the engine takes
@@ -278,6 +296,7 @@ impl TurnCaptureState {
         self_weak: Weak<TurnCaptureState>,
     ) -> Self {
         let inbound_request = Section::new(work_dir.join("inbound_request"));
+        let upstream_request = Section::new(work_dir.join("upstream_request"));
         let served_response = Section::new(work_dir.join("served_response"));
         Self {
             api_call_id,
@@ -289,6 +308,8 @@ impl TurnCaptureState {
             self_weak,
             model_served: Mutex::new(None),
             inbound_request,
+            upstream_request,
+            upstream_request_written: AtomicBool::new(false),
             served_response,
             engine_claimed: AtomicBool::new(false),
             served_tee_installed: AtomicBool::new(false),
@@ -306,6 +327,11 @@ impl TurnCaptureState {
     /// Path of the `inbound_request` section temp file.
     pub fn inbound_request_path(&self) -> &Path {
         self.inbound_request.path()
+    }
+
+    /// Path of the `upstream_request` section temp file (F1d).
+    pub fn upstream_request_path(&self) -> &Path {
+        self.upstream_request.path()
     }
 
     /// Path of the `served_response` section temp file.
@@ -349,13 +375,20 @@ impl TurnCaptureState {
         self.inbound_request.close(false);
     }
 
-    /// F1d fills this: the final on-wire OpenAI request (redacted,
-    /// last-writer-wins across shrink-retry/failover) into the
-    /// `upstream_request` section. No-op in F1b (that section is not created
-    /// until F1d).
-    #[allow(unused_variables)]
+    /// F1d: replace the `upstream_request` section with `bytes` -- the redacted,
+    /// FINAL on-wire OpenAI `ChatCompletionRequest` for THIS dispatch attempt
+    /// (post profile/lowering/sanitize). Called once per attempt
+    /// (`upstream.rs::dispatch_chat_stream` → `logged_send_chat_request`), so a
+    /// shrink-and-retry or a failover rebuild's later attempt REPLACES an earlier
+    /// attempt's bytes (last-writer-wins) rather than concatenating onto them --
+    /// the section is captured WHOLE per attempt, never streamed. `bytes` is an
+    /// owned, already-redacted COPY -- never a slice of a larger buffer (AGENTS.md
+    /// line 144); the caller redacts BEFORE calling (AGENTS.md line 137). A turn
+    /// that never calls this has the section OMITTED from the artifact entirely
+    /// (don't-lie-with-zeros) -- see `upstream_request_written`.
     pub fn write_upstream_request(&self, bytes: &[u8]) {
-        // F1d fills this.
+        self.upstream_request_written.store(true, Ordering::Release);
+        self.upstream_request.replace(bytes);
     }
 
     /// F1e fills this: raw upstream response bytes, streamed incrementally, into
@@ -547,9 +580,15 @@ impl TurnCaptureState {
     /// without hanging.
     async fn finalize_and_assemble(self: Arc<Self>) {
         self.inbound_request.await_closed().await;
+        // F1d: `upstream_request` stays OPEN across the turn's dispatch attempts
+        // (each is a `replace`, last-writer-wins) -- close it now, at the
+        // both-`done` barrier, so the writer task drains + flushes the FINAL
+        // attempt's bytes before assembly reads the file.
+        self.upstream_request.close(false);
+        self.upstream_request.await_closed().await;
         self.served_response.await_closed().await;
-        // F1d/F1e add their `upstream_request`/`upstream_response` section flushes
-        // here (mirror the two lines above) once those sections exist.
+        // F1e adds its `upstream_response` section flush here (mirror the lines
+        // above) once that section exists.
         // Stamp `finished_ms` AFTER the flush barriers so it reflects the turn's true
         // end (both `done`s + the section drain), and is `>= started_ms`.
         self.finished_ms.store(now_ms(), Ordering::Release);
@@ -718,12 +757,19 @@ impl TurnCaptureState {
             write_json_string(&mut w, reason)?;
         }
 
-        // Section-agnostic: F1d/F1e append their sections to this list once those
-        // `Section`s exist. An ABSENT section is simply omitted (never a fabricated
-        // empty measured value). Requests may embed as a JSON value; responses embed
-        // as strings.
+        // Section-agnostic: F1e appends its section to this list once it exists.
+        // An ABSENT section is simply omitted (never a fabricated empty measured
+        // value). Requests may embed as a JSON value; responses embed as strings.
         w.write_all(b",\"sections\":{")?;
         write_section(&mut w, "inbound_request", &self.inbound_request, true)?;
+        // F1d: `upstream_request` is gated on `upstream_request_written` -- a turn
+        // that never dispatched upstream (e.g. a pre-spawn validation failure)
+        // never wrote it, so the key is OMITTED entirely rather than emitted with
+        // `bytes:0` (don't-lie-with-zeros: absent, not empty-measured).
+        if self.upstream_request_written.load(Ordering::Acquire) {
+            w.write_all(b",")?;
+            write_section(&mut w, "upstream_request", &self.upstream_request, true)?;
+        }
         w.write_all(b",")?;
         write_section(&mut w, "served_response", &self.served_response, false)?;
         w.write_all(b"}}")?;
@@ -755,7 +801,7 @@ impl TurnCaptureState {
 /// [`send`]: ServedSink::send
 #[derive(Debug)]
 pub struct ServedSink {
-    inner: PollSender<Vec<u8>>,
+    inner: PollSender<SectionChunk>,
 }
 
 /// The served-section writer is gone -- its bounded channel closed (typically
@@ -766,7 +812,7 @@ pub struct ServedSink {
 pub struct SinkClosed;
 
 impl ServedSink {
-    fn new(inner: PollSender<Vec<u8>>) -> Self {
+    fn new(inner: PollSender<SectionChunk>) -> Self {
         Self { inner }
     }
 
@@ -787,7 +833,9 @@ impl ServedSink {
     ///
     /// [`poll_reserve`]: ServedSink::poll_reserve
     pub fn send(&mut self, bytes: Vec<u8>) -> Result<(), SinkClosed> {
-        self.inner.send_item(bytes).map_err(|_| SinkClosed)
+        self.inner
+            .send_item(SectionChunk::Append(bytes))
+            .map_err(|_| SinkClosed)
     }
 
     /// The bounded capacity of the underlying writer channel: at most this many
@@ -808,27 +856,43 @@ impl ServedSink {
 /// served tee back-pressures on `Poll::Pending` once the channel is full.
 const SECTION_CHANNEL_CAPACITY: usize = 16;
 
+/// One item queued to a section's background writer. [`Append`](Self::Append) is
+/// the streaming/incremental write (the served-body tee, the single-shot
+/// inbound-request write); [`Replace`](Self::Replace) is F1d's last-writer-wins
+/// whole-body write (`upstream_request`: the on-wire request is captured WHOLE
+/// per dispatch attempt, so a later attempt's write must DISCARD -- not
+/// concatenate onto -- an earlier attempt's bytes).
+#[derive(Debug)]
+enum SectionChunk {
+    Append(Vec<u8>),
+    Replace(Vec<u8>),
+}
+
 /// One incremental capture section. Bytes stream to a per-turn temp file on a
 /// background writer task WITHOUT buffering the whole body: they are handed to the
 /// task over a BOUNDED, ordered (FIFO) channel of at most
-/// [`SECTION_CHANNEL_CAPACITY`] frames. Two write paths feed it:
+/// [`SECTION_CHANNEL_CAPACITY`] frames. Three write paths feed it:
 /// - Low-volume, single-shot writers ([`append`], used for the inbound-request
 ///   body and tests) `try_send` a copy -- they never fill the channel.
 /// - The high-volume served-body tee takes a back-pressured [`ServedSink`]
 ///   ([`TurnCaptureState::served_sink`]): it reserves a slot before each frame and
 ///   yields `Poll::Pending` when the writer lags, so a slow disk throttles the
 ///   served stream rather than piling the whole body into RAM (finding #1).
+/// - F1d's whole-body last-writer-wins writer ([`replace`], used for
+///   `upstream_request`) `try_send`s a [`SectionChunk::Replace`] that tells the
+///   writer task to discard whatever it has written so far and start over.
 ///
 /// Either way only small metadata lives in memory and no full-body map forms.
 ///
 /// [`append`]: Section::append
+/// [`replace`]: Section::replace
 #[derive(Debug)]
 struct Section {
     /// `None` once [`close`](Section::close)d -- the writer task then drains the
     /// remaining queued chunks and flushes. A dropped `Section` (abandoned turn)
     /// also drops the sender(s), so the task always terminates (no hang; AGENTS.md
     /// cancellation rule).
-    tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    tx: Mutex<Option<mpsc::Sender<SectionChunk>>>,
     meta: Arc<SectionMeta>,
 }
 
@@ -844,7 +908,7 @@ struct SectionMeta {
 
 impl Section {
     fn new(path: PathBuf) -> Self {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(SECTION_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel::<SectionChunk>(SECTION_CHANNEL_CAPACITY);
         let meta = Arc::new(SectionMeta {
             path,
             bytes: AtomicU64::new(0),
@@ -884,7 +948,7 @@ impl Section {
         if let Ok(guard) = self.tx.lock()
             && let Some(tx) = guard.as_ref()
         {
-            match tx.try_send(bytes.to_vec()) {
+            match tx.try_send(SectionChunk::Append(bytes.to_vec())) {
                 Ok(()) => {}
                 // Unreached by the single-shot callers (one item into a fresh
                 // bounded channel); if it ever were, record it honestly as partial
@@ -898,6 +962,29 @@ impl Section {
         }
     }
 
+    /// F1d: replace the section's ENTIRE content with `bytes` -- last-writer-wins.
+    /// Used by `upstream_request`: the on-wire request is captured WHOLE per
+    /// dispatch attempt (never streamed incrementally), so a shrink-retry or a
+    /// failover rebuild's later attempt must DISCARD an earlier attempt's bytes
+    /// rather than concatenate onto them (unlike [`append`](Section::append),
+    /// which is purely incremental). COPIES `bytes` into an owned `Vec` (never
+    /// retains a caller slice -- AGENTS.md line 144); non-blocking, ordered with
+    /// any other queued chunk on this section, a no-op once closed.
+    fn replace(&self, bytes: &[u8]) {
+        if let Ok(guard) = self.tx.lock()
+            && let Some(tx) = guard.as_ref()
+        {
+            match tx.try_send(SectionChunk::Replace(bytes.to_vec())) {
+                Ok(()) => {}
+                // Same honest-partial handling as `append`'s Full arm.
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.meta.partial.store(true, Ordering::Release);
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        }
+    }
+
     /// A back-pressured [`PollSender`] over this section's bounded writer channel,
     /// for the HTTP served-body tee. Cloning the sender lets the tee `poll_reserve`
     /// a slot from its synchronous `poll_frame` seam and yield `Poll::Pending` when
@@ -906,7 +993,7 @@ impl Section {
     /// The tee's clone plus this section's retained sender both drop at turn end
     /// (tee `Drop` → `served_done` → [`close`](Section::close)), so the writer
     /// always terminates. `None` once the section is closed.
-    fn poll_sender(&self) -> Option<PollSender<Vec<u8>>> {
+    fn poll_sender(&self) -> Option<PollSender<SectionChunk>> {
         self.tx
             .lock()
             .ok()?
@@ -956,11 +1043,13 @@ impl Section {
 
 /// The background writer for one [`Section`]: creates the work dir + section file
 /// (all fs IO via `tokio::fs`, i.e. off the runtime threads), appends each queued
-/// chunk in order, and -- when the sender drops (section closed or turn dropped)
-/// -- flushes, fsyncs, and marks the section `closed`. A file-create/write error
+/// chunk in order (or, on a [`SectionChunk::Replace`], discards whatever it has
+/// written so far and starts the file over -- F1d's last-writer-wins whole-body
+/// write), and -- when the sender drops (section closed or turn dropped) --
+/// flushes, fsyncs, and marks the section `closed`. A file-create/write error
 /// marks the section `partial` and is logged, never propagated (a diagnostic
 /// artifact must never fail or hang the turn).
-async fn section_writer(mut rx: mpsc::Receiver<Vec<u8>>, meta: Arc<SectionMeta>) {
+async fn section_writer(mut rx: mpsc::Receiver<SectionChunk>, meta: Arc<SectionMeta>) {
     // Idempotent + race-tolerant across the turn's sibling sections both racing
     // to create the shared work dir.
     if let Some(parent) = meta.path.parent()
@@ -988,20 +1077,46 @@ async fn section_writer(mut rx: mpsc::Receiver<Vec<u8>>, meta: Arc<SectionMeta>)
     };
 
     while let Some(chunk) = rx.recv().await {
-        let Some(file) = file.as_mut() else {
-            // File never opened: keep draining the channel so senders don't wedge,
-            // but the section is already flagged partial.
+        let bytes = match chunk {
+            SectionChunk::Append(bytes) => bytes,
+            SectionChunk::Replace(bytes) => {
+                // F1d last-writer-wins: discard whatever this section holds so far
+                // by re-creating (truncating) the file fresh, so `bytes` below
+                // becomes the section's ENTIRE content, not a concatenation onto an
+                // earlier dispatch attempt's write.
+                match tokio::fs::File::create(&meta.path).await {
+                    Ok(new_file) => {
+                        file = Some(new_file);
+                        meta.bytes.store(0, Ordering::Release);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %meta.path.display(),
+                            error = %err,
+                            "turn-capture: failed to re-create section file for replace"
+                        );
+                        meta.partial.store(true, Ordering::Release);
+                        file = None;
+                    }
+                }
+                bytes
+            }
+        };
+        let Some(open_file) = file.as_mut() else {
+            // File never opened (or a replace's re-create just failed above): keep
+            // draining the channel so senders don't wedge, but the section is
+            // already flagged partial.
             continue;
         };
-        match file.write_all(&chunk).await {
+        match open_file.write_all(&bytes).await {
             Ok(()) => {
-                meta.bytes.fetch_add(chunk.len() as u64, Ordering::AcqRel);
+                meta.bytes.fetch_add(bytes.len() as u64, Ordering::AcqRel);
             }
             Err(err) => {
                 tracing::warn!(
                     path = %meta.path.display(),
                     error = %err,
-                    "turn-capture: failed to append to section file"
+                    "turn-capture: failed to write to section file"
                 );
                 meta.partial.store(true, Ordering::Release);
             }
@@ -1532,11 +1647,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forward_declared_stubs_are_callable_and_never_panic() {
+    async fn forward_declared_stub_is_callable_and_never_panics() {
         let capture = TurnCapture::enabled(temp_dir_path("stubs"));
         let state = capture.start("api_stub", None, 0).expect("state");
-        // F1d/F1e sections are not created yet -- these are no-ops.
-        state.write_upstream_request(b"{}");
+        // F1e's section is not created yet -- this is still a no-op.
         state.write_upstream_response(b"data: [DONE]\n\n");
         state.write_inbound_request(b"{}");
         state.write_served_response(b"event: message_stop\n\n");
@@ -1544,6 +1658,83 @@ mod tests {
         capture.engine_done("api_stub", "cancelled", Some("client_disconnect"));
         state.await_inbound_closed().await;
         state.await_served_closed().await;
+    }
+
+    /// F1d: `write_upstream_request` is real -- a single write is captured and
+    /// embedded as a parsed JSON value (mirrors `inbound_request`'s encoding).
+    #[tokio::test]
+    async fn upstream_request_section_captures_bytes_when_written() {
+        let dir = temp_dir_path("upstream-request-written");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        state.write_upstream_request(br#"{"model":"served-model","max_tokens":123}"#);
+        state.write_served_response(b"ok");
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_artifact(&dir.join("api_ur.json")).await;
+        let section = &artifact["sections"]["upstream_request"];
+        assert_eq!(
+            section["encoding"], "json",
+            "a parseable request embeds raw"
+        );
+        assert_eq!(section["content"]["model"], "served-model");
+        assert_eq!(section["content"]["max_tokens"], 123);
+        assert_eq!(section["partial"], false);
+    }
+
+    /// F1d last-writer-wins: a SECOND `write_upstream_request` call REPLACES the
+    /// first attempt's bytes entirely -- the section must never grow into a
+    /// concatenation of every attempt tried (which would corrupt the embedded
+    /// JSON value at assembly).
+    #[tokio::test]
+    async fn upstream_request_second_write_replaces_not_appends() {
+        let dir = temp_dir_path("upstream-request-replace");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_replace", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        // First (oversized) attempt, then a shrink-retry attempt -- exactly the
+        // `dispatch_chat_stream` shrink-and-retry shape.
+        state.write_upstream_request(br#"{"model":"m","max_tokens":64000}"#);
+        state.write_upstream_request(br#"{"model":"m","max_tokens":63652}"#);
+        state.write_served_response(b"ok");
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_artifact(&dir.join("api_ur_replace.json")).await;
+        let section = &artifact["sections"]["upstream_request"];
+        assert_eq!(
+            section["content"]["max_tokens"], 63652,
+            "the LAST write wins: {section}"
+        );
+        // Bytes reflect ONLY the second write's length, not a concatenation.
+        let expected_bytes = br#"{"model":"m","max_tokens":63652}"#.len() as u64;
+        assert_eq!(
+            section["bytes"], expected_bytes,
+            "bytes count is the replacement's length, not first+second: {section}"
+        );
+    }
+
+    /// F1d (don't-lie-with-zeros): a turn that never dispatches upstream (the
+    /// pre-spawn-failure shape) never calls `write_upstream_request`, so the
+    /// section is OMITTED from the artifact entirely -- absent, never a
+    /// fabricated `bytes:0` "measured empty" value.
+    #[tokio::test]
+    async fn upstream_request_absent_when_never_written() {
+        let dir = temp_dir_path("upstream-request-absent");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_absent", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        state.write_served_response(b"error body");
+        state.served_done(false);
+        state.engine_done("failed", Some("pre_spawn_validation"));
+
+        let artifact = wait_for_artifact(&dir.join("api_ur_absent.json")).await;
+        assert!(
+            artifact["sections"].get("upstream_request").is_none(),
+            "a never-dispatched turn has NO upstream_request key: {artifact}"
+        );
     }
 
     /// Finding #1 (bounded memory): streaming a large served body through the

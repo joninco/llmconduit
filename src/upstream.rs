@@ -8,6 +8,7 @@ use crate::proxy_headers::header_name_eq;
 use crate::proxy_headers::is_hop_by_hop_header;
 use crate::sse_guard::bounded_sse_byte_stream;
 use crate::sse_guard::default_max_sse_frame_bytes;
+use crate::turn_capture::TurnCaptureState;
 use async_trait::async_trait;
 use axum::body::Bytes;
 use eventsource_stream::Eventsource;
@@ -811,6 +812,28 @@ fn bytes_contain_image_uri(bytes: &[u8]) -> bool {
         || bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"http"))
 }
 
+/// F1d: the redacted bytes for the turn-capture `upstream_request` section — the
+/// FINAL sanitized on-wire `ChatCompletionRequest` (post profile/lowering/
+/// sanitize), redacted through the SAME primitives `UpstreamRequestLogger`/the
+/// HTTP inbound-trace capture use: secret keys via
+/// [`crate::redaction::redact_payload_secrets_in_value`] (AGENTS.md line 137 — a
+/// NEW logged surface must not bypass secret redaction; `UpstreamRequestLogger`
+/// only redacts image URIs, so this is a STRICTER pass, not a mirror of it),
+/// image/data URIs via [`crate::redaction::redact_image_uris_in_value`].
+/// Serializes into a fresh owned `Vec<u8>` — never retains a slice of any larger
+/// buffer (AGENTS.md line 144); `request` is already an owned, parsed typed
+/// struct, not a slice of the inbound middleware buffer.
+fn redacted_upstream_request_bytes(request: &ChatCompletionRequest) -> Vec<u8> {
+    match serde_json::to_value(request) {
+        Ok(mut value) => {
+            crate::redaction::redact_payload_secrets_in_value(&mut value);
+            crate::redaction::redact_image_uris_in_value(&mut value);
+            serde_json::to_vec(&value).unwrap_or_else(|_| b"<failed to serialize json>".to_vec())
+        }
+        Err(_) => b"<failed to serialize json>".to_vec(),
+    }
+}
+
 #[derive(Debug, Clone)]
 struct UpstreamRequestLogger {
     path: PathBuf,
@@ -994,11 +1017,18 @@ impl ReqwestUpstreamClient {
     /// redacting serializer so no oversized/secret body is retained (a slice of the
     /// inbound middleware buffer bounded by `max_request_body_bytes` is NEVER taken — this is a fresh serialization of the
     /// already-parsed typed request).
+    ///
+    /// F1d: `capture` (the turn's `Topic F` durable-capture handle, from
+    /// `BackendChatRequest::capture`) gets the SAME `request` written, whole, into
+    /// its `upstream_request` section — last-writer-wins, so the retry call
+    /// overwrites the first oversized attempt's write (AC-10). `None` when capture
+    /// is disabled/uninstrumented; a no-op then.
     async fn logged_send_chat_request(
         &self,
         url: &Url,
         request: &ChatCompletionRequest,
         response_id: Option<&str>,
+        capture: Option<&Arc<TurnCaptureState>>,
     ) -> AppResult<reqwest::Response> {
         if let Some(ref logger) = self.request_logger
             && let Err(err) = logger.log(request).await
@@ -1010,6 +1040,9 @@ impl ReqwestUpstreamClient {
             );
         }
         self.capture_upstream_body(response_id, request);
+        if let Some(capture) = capture {
+            capture.write_upstream_request(&redacted_upstream_request_bytes(request));
+        }
         self.send_chat_request(url, request).await
     }
 
@@ -1193,6 +1226,7 @@ impl ReqwestUpstreamClient {
         request: ChatCompletionRequest,
         response_id: Option<&str>,
         serving: Option<&Arc<ServingToken>>,
+        capture: Option<&Arc<TurnCaptureState>>,
     ) -> AppResult<UpstreamStream> {
         // First attempt. On a non-2xx whose body indicates a context/completion
         // token-limit overflow, shrink `max_completion_tokens` and retry ONCE.
@@ -1201,7 +1235,7 @@ impl ReqwestUpstreamClient {
         // leaf client so the failover/routing layers never see a context-limit
         // error as a provider failure (it is a same-provider shrink-and-retry).
         let response = self
-            .logged_send_chat_request(url, &request, response_id)
+            .logged_send_chat_request(url, &request, response_id, capture)
             .await?;
         // Gap 03 round-1 review (F1): the upstream response HEADERS just arrived — this is
         // the TRUE on-wire first-byte time. Stamp it BEFORE inspecting the status, so a
@@ -1238,10 +1272,13 @@ impl ReqwestUpstreamClient {
                 new_max_completion_tokens = retry.max_completion_tokens,
                 "upstream context-window overflow; retrying once with reduced completion budget"
             );
-            // D2: the retry is the body that ACTUALLY goes on the wire on the shrink
-            // path, so the capture must reflect the shrunk request (same `response_id`).
+            // D2/F1d: the retry is the body that ACTUALLY goes on the wire on the
+            // shrink path, so BOTH captures (D2's `upstream_body`, F1d's
+            // `upstream_request` section) must reflect the shrunk request (same
+            // `response_id`; F1d is last-writer-wins so this overwrites the first
+            // oversized attempt's write — AC-10).
             let retry_response = self
-                .logged_send_chat_request(url, &retried, response_id)
+                .logged_send_chat_request(url, &retried, response_id, capture)
                 .await?;
             let retry_status = retry_response.status();
             if retry_status.is_success() {
@@ -1356,6 +1393,11 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // D5 R4 (MEDIUM): the shared serving token, captured before `backend.request` is
         // moved into `sanitize`. The leaf finalizes the served model onto it below.
         let serving = backend.serving.clone();
+        // F1d: the turn's durable-capture handle, captured here (mirrors
+        // `response_id`/`serving` above) so both the first-attempt and any
+        // shrink-retry send below can write the SANITIZED on-wire request into the
+        // SAME turn's `upstream_request` section (last-writer-wins).
+        let capture = backend.capture.clone();
         let request = sanitize_chat_request(backend.request, self.flatten_content);
         // D5 R4 (MEDIUM): finalize the ACTUAL on-wire model onto the shared serving
         // token, overwriting the engine's PRE-routing guess (and any earlier
@@ -1395,7 +1437,13 @@ impl UpstreamClient for ReqwestUpstreamClient {
                 serving.clear_pending_response_body();
             }
             return match self
-                .dispatch_chat_stream(&url, request, response_id.as_deref(), serving.as_ref())
+                .dispatch_chat_stream(
+                    &url,
+                    request,
+                    response_id.as_deref(),
+                    serving.as_ref(),
+                    capture.as_ref(),
+                )
                 .await
             {
                 Ok(stream) => {
@@ -1431,8 +1479,14 @@ impl UpstreamClient for ReqwestUpstreamClient {
             };
         }
 
-        self.dispatch_chat_stream(&url, request, response_id.as_deref(), serving.as_ref())
-            .await
+        self.dispatch_chat_stream(
+            &url,
+            request,
+            response_id.as_deref(),
+            serving.as_ref(),
+            capture.as_ref(),
+        )
+        .await
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
@@ -1630,6 +1684,9 @@ impl FailoverUpstreamClient {
             // `Arc`, not the token) so the leaf still captures + tags this flow.
             response_id: backend.response_id.clone(),
             serving: backend.serving.clone(),
+            // F1d (AC-11): carry the turn-capture handle forward too -- a captured
+            // turn keeps capturing across a failover provider rebuild.
+            capture: backend.capture.clone(),
         }
     }
 
@@ -2119,6 +2176,9 @@ impl RoutingUpstreamClient {
             // `Arc`, not the token).
             response_id: backend.response_id.clone(),
             serving: backend.serving.clone(),
+            // F1d: carry the turn-capture handle forward too (same reasoning as the
+            // failover rebuild above, `request_for_provider`).
+            capture: backend.capture.clone(),
         }
     }
 
@@ -3284,6 +3344,9 @@ impl ServingToken {
 /// `Option` and additive; production sets them ONLY at the engine's
 /// `BackendChatRequest::new`, and the failover/routing rebuilds CLONE the `Arc`s
 /// forward so the same token threads through the whole dispatch.
+///
+/// `capture` is F1's (Topic F) durable-turn-capture handle -- see its field doc
+/// below.
 #[derive(Debug, Clone)]
 pub struct BackendChatRequest {
     pub request: ChatCompletionRequest,
@@ -3295,6 +3358,22 @@ pub struct BackendChatRequest {
     /// Shared mutable serving identity (D2). Allocated fresh per flow by the engine;
     /// the routing layer sets `route`, the failover layer sets `provider`.
     pub serving: Option<Arc<ServingToken>>,
+    /// F1d: the turn's durable-capture handle (Topic F, `turn_capture.rs`), when
+    /// `turn_capture_dir` is configured and this flow is instrumented -- the SAME
+    /// `Arc<TurnCaptureState>` the engine's `CaptureGuard`/registry hold (looked up
+    /// from `Gateway::turn_capture().state(api_call_id)` at the single production
+    /// construction site, `engine.rs`'s `run_turn`). `None` when capture is
+    /// disabled/uninstrumented or in a test that does not exercise it (every
+    /// `BackendChatRequest::new` call defaults this to `None`; use
+    /// [`with_capture`](Self::with_capture) to attach one).
+    ///
+    /// The failover/routing rebuilds (`request_for_provider`, `routed_request`)
+    /// CLONE this `Arc` forward -- for free, mirroring `response_id`/`serving` --
+    /// so a captured turn keeps capturing across a provider rebuild (AC-11).
+    /// Diagnostic file IO stays OFF the `ServingToken`/serving-metrics mutex
+    /// (spec Design #3) precisely because the carrier is here, not on
+    /// `ServingToken`.
+    pub capture: Option<Arc<TurnCaptureState>>,
 }
 
 impl BackendChatRequest {
@@ -3304,7 +3383,9 @@ impl BackendChatRequest {
     /// from policies keyed by `request.model` inside `finalize_request_for_backend`.
     /// This is the SINGLE production construction point that sets `response_id` +
     /// `serving`; the failover/routing rebuilds clone the `Arc`s forward and the
-    /// test helpers pass `None` for both.
+    /// test helpers pass `None` for both. `capture` defaults to `None` here (the
+    /// many existing call sites, mostly tests, do not care about it); the engine
+    /// attaches one via [`with_capture`](Self::with_capture).
     pub fn new(
         request: ChatCompletionRequest,
         client_chat_template_kwargs: Option<JsonMap<String, Value>>,
@@ -3316,7 +3397,17 @@ impl BackendChatRequest {
             client_chat_template_kwargs,
             response_id,
             serving,
+            capture: None,
         }
+    }
+
+    /// F1d: attach the turn-capture handle (builder-style, so the many existing
+    /// `BackendChatRequest::new(...)` call sites -- almost all tests that do not
+    /// exercise capture -- are unaffected). Only the engine's production
+    /// construction site (`engine.rs`'s `run_turn`) calls this.
+    pub fn with_capture(mut self, capture: Option<Arc<TurnCaptureState>>) -> Self {
+        self.capture = capture;
+        self
     }
 }
 
@@ -6126,6 +6217,213 @@ mod tests {
             first["max_tokens"],
             json!(64000),
             "first attempt carried the oversized budget"
+        );
+    }
+
+    use crate::turn_capture::TurnCapture;
+
+    /// A unique scratch dir for one F1d turn-capture test (mirrors
+    /// `turn_capture.rs`'s own `temp_dir_path` test helper).
+    fn turn_capture_test_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "llmconduit-upstream-turn-capture-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    /// Poll for the assembled `<dir>/<api_call_id>.json` turn-capture artifact.
+    /// These F1d unit tests dispatch through the leaf/failover client directly
+    /// (bypassing the HTTP/engine layer), so the test itself drives
+    /// `served_done`/`engine_done` to complete the both-`done` assembly barrier;
+    /// this then polls for the async-spawned result. Bounded wait: a barrier that
+    /// never resolves fails the test loudly instead of hanging.
+    async fn wait_for_turn_capture_artifact(
+        dir: &std::path::Path,
+        api_call_id: &str,
+    ) -> serde_json::Value {
+        let path = dir.join(format!("{api_call_id}.json"));
+        for _ in 0..300 {
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("turn-capture artifact never appeared at {}", path.display());
+    }
+
+    /// F1d AC-10: the artifact's `upstream_request` equals the FINAL on-wire
+    /// OpenAI request (post sanitize/profile lowering), redacted (an image URI
+    /// AND a secret both redacted). A shrink-and-retry turn (context-overflow →
+    /// shrink) shows the SHRUNK request (reduced `max_tokens`), NOT the first
+    /// oversized one. Mirrors `leaf_captures_retry_body_on_shrink_path`'s wiremock
+    /// shape, but proves the turn-capture `upstream_request` section (Topic F)
+    /// rather than the D2 FlowStore capture — the two are independent surfaces
+    /// fed by the SAME dispatch.
+    #[tokio::test]
+    async fn f1d_ac10_upstream_request_captures_shrunk_redacted_final_request() {
+        let server = MockServer::start().await;
+        let overflow = "This model's maximum context length is 202752 tokens. \
+            However, you requested 64000 output tokens and your prompt contains 139000 input tokens.";
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(overflow))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        );
+
+        let dir = turn_capture_test_dir("ac10");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ac10", None, 0).expect("state");
+        // `finalize_and_assemble` awaits every section's close, `inbound_request`
+        // included; this unit test bypasses the HTTP layer (which is the only
+        // production caller of `write_inbound_request`), so close it manually —
+        // otherwise the both-`done` barrier never resolves.
+        state.write_inbound_request(b"{}");
+
+        let mut request = family_request("served-model");
+        // Oversized budget that the shrink path will reduce (202752-100-139000).
+        request.max_output_tokens = Some(64000);
+        // Redaction probe (AC-10): a secret + an image URI both present on the
+        // SAME request that actually goes on the wire for BOTH attempts.
+        request
+            .extra_body
+            .insert("api_key".to_string(), json!("sk-LEAKED-SECRET-VALUE"));
+        request.extra_body.insert(
+            "probe_image".to_string(),
+            json!("data:image/png;base64,RAWIMGBYTES9999"),
+        );
+        let backend = BackendChatRequest::new(request, None, None, None)
+            .with_capture(Some(Arc::clone(&state)));
+
+        let mut stream = client
+            .stream_chat_completion(&backend)
+            .await
+            .expect("retry stream opens");
+        while stream.next().await.is_some() {}
+
+        // This unit test bypasses the HTTP/engine layer, so simulate the turn's
+        // terminal seam directly to trigger the both-`done` assembly barrier.
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_turn_capture_artifact(&dir, "api_ac10").await;
+        let section = &artifact["sections"]["upstream_request"];
+        assert_eq!(
+            section["content"]["max_tokens"], 63652,
+            "captured upstream_request is the SHRUNK retry, not the first 64000 attempt: {section}"
+        );
+        let content_str = section["content"].to_string();
+        assert!(
+            !content_str.contains("sk-LEAKED-SECRET-VALUE"),
+            "secret value must be redacted: {content_str}"
+        );
+        assert!(
+            content_str.contains("[redacted]"),
+            "secret redaction marker present: {content_str}"
+        );
+        assert!(
+            !content_str.contains("RAWIMGBYTES9999"),
+            "no raw image bytes may survive: {content_str}"
+        );
+        assert!(
+            content_str.contains("<redacted uri>"),
+            "image URI redaction marker present: {content_str}"
+        );
+    }
+
+    /// F1d AC-11: a FAILOVER turn (provider A fails → provider B serves) still
+    /// captures — the rebuild (`request_for_provider`) preserves the capture
+    /// handle — and `upstream_request` is the SERVING (B's) attempt's request,
+    /// not A's failed one. Mirrors
+    /// `gap05_failover_a500_then_b200_commits_no_stale_error_body`'s two-provider
+    /// wiremock shape; the two providers carry DIFFERENT `upstream_model`
+    /// rewrites so the captured section's `model` unambiguously identifies WHICH
+    /// provider's request was recorded.
+    #[tokio::test]
+    async fn f1d_ac11_failover_upstream_request_captures_serving_providers_request() {
+        let down = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(r#"{"error":{"message":"provider A is down"}}"#),
+            )
+            .mount(&down)
+            .await;
+        let up = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(d2_sse_ok_body()))
+            .mount(&up)
+            .await;
+
+        let dir = turn_capture_test_dir("ac11");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ac11", None, 0).expect("state");
+        // See the AC-10 test above: close `inbound_request` manually since this
+        // unit test bypasses the HTTP layer.
+        state.write_inbound_request(b"{}");
+
+        // Cooldown 0 so the failover loop tries provider A then B in one dispatch.
+        // Dashboard (D2) capture is OFF on both leaves — F1 turn-capture is
+        // independent of the dashboard/FlowStore (AGENTS.md own-gate principle).
+        let failover = FailoverUpstreamClient::new(
+            vec![
+                FailoverUpstreamProvider::new(
+                    "primary",
+                    d2_capturing_client(&down.uri(), DashboardFlowStore::disabled()),
+                    Some("model-a".to_string()),
+                    None,
+                    JsonMap::new(),
+                ),
+                FailoverUpstreamProvider::new(
+                    "backup",
+                    d2_capturing_client(&up.uri(), DashboardFlowStore::disabled()),
+                    Some("model-b".to_string()),
+                    None,
+                    JsonMap::new(),
+                ),
+            ],
+            std::time::Duration::from_secs(0),
+        );
+
+        let backend = BackendChatRequest::new(family_request("m"), None, None, None)
+            .with_capture(Some(Arc::clone(&state)));
+        let mut stream = failover
+            .stream_chat_completion(&backend)
+            .await
+            .expect("failover serves from the backup");
+        while stream.next().await.is_some() {}
+
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_turn_capture_artifact(&dir, "api_ac11").await;
+        let section = &artifact["sections"]["upstream_request"];
+        assert_eq!(
+            section["content"]["model"], "model-b",
+            "upstream_request is the SERVING provider's (B's) request, not A's failed one: {section}"
         );
     }
 

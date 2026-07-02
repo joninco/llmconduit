@@ -104,6 +104,36 @@ pub fn redact_image_uris_in_value(value: &mut serde_json::Value) {
     }
 }
 
+/// Recursively redact SENSITIVE-KEY values in a JSON value — the shared walker
+/// behind `http::redact_payload_secrets` (D1 R1 #10's "single sensitive-key
+/// authority" extended to the walk itself, not just [`is_sensitive_payload_key`]),
+/// so a NEW logged surface (e.g. the turn-capture `upstream_request` section,
+/// `upstream.rs`) reuses the SAME redaction instead of re-implementing it
+/// (AGENTS.md: don't bypass `redact_payload_secrets` when adding a new logged
+/// surface). Any object key satisfying [`is_sensitive_payload_key`] has its value
+/// replaced with the literal string `"[redacted]"`, regardless of nesting depth;
+/// every other value is walked recursively (objects/arrays) or left as-is
+/// (scalars).
+pub(crate) fn redact_payload_secrets_in_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if is_sensitive_payload_key(key) {
+                    *value = serde_json::Value::String("[redacted]".to_string());
+                } else {
+                    redact_payload_secrets_in_value(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_payload_secrets_in_value(value);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Vision text that becomes model-visible or logged — the successful
 /// `VisionOutcome.text` (round-3 #3) and error bodies/messages (review #3,
 /// round-2 #2, round-3 #4): image URIs redacted via [`redact_image_uris`], then

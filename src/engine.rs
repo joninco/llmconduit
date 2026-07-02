@@ -2197,6 +2197,17 @@ impl Gateway {
         // — either maps it (`reasoning_effort_map`) or clamps it to the backend's
         // vocabulary in `finalize_request_for_backend`.
         let normalized_stop = crate::models::chat::normalize_stop(request.stop.clone())?;
+        // F1d: the turn's durable-capture handle (Topic F), looked up ONCE by
+        // `api_call_id` from the SAME registry the `CaptureGuard` built above
+        // reads — `None` when capture is disabled or this request was never
+        // instrumented (the public non-`api_call_id` wrapper). Cloned onto every
+        // per-round `BackendChatRequest` below (a turn's tool-call loop can dispatch
+        // multiple upstream rounds; the failover/routing rebuilds clone it further
+        // — AC-11), so the leaf writes each attempt's on-wire request into the SAME
+        // turn's `upstream_request` section (last-writer-wins).
+        let capture = api_call_id
+            .as_deref()
+            .and_then(|id| self.turn_capture().state(id));
         loop {
             // D6: compose the kill token with the client-hangup check — a dashboard
             // `abort()` flips `abort_token`, surfacing `cancelled()` (499) like a hang-up.
@@ -2313,7 +2324,10 @@ impl Gateway {
                 // serving token so routing/failover can tag `{route, provider}`.
                 Some(response_id.clone()),
                 Some(Arc::clone(&serving_token)),
-            );
+            )
+            // F1d: attach the turn-capture handle (see above) so the leaf's
+            // `upstream_request` write can reach this turn's artifact.
+            .with_capture(capture.clone());
             let mut stream = tokio::select! {
                 biased;
                 _ = tx.closed() => return Err(AppError::cancelled()),

@@ -10433,6 +10433,95 @@ async fn f1c_length_truncated_turn_writes_incomplete_status() {
     assert_eq!(artifact["sections"]["served_response"]["partial"], false);
 }
 
+/// F1d AC-10 (end-to-end, through the REAL engine wiring): a genuine `/v1/messages`
+/// HTTP request over a REAL `ReqwestUpstreamClient` leaf (via the `lib.rs` DI root
+/// — the same wiring production uses — NOT the in-process `MockUpstream` every
+/// other F1 test in this file relies on), hitting a wiremock upstream that returns
+/// a context-overflow 400 then a 200. Proves the FULL chain: HTTP → engine
+/// (`run_turn` looks the capture handle up via `Gateway::turn_capture().state(
+/// api_call_id)`) → `BackendChatRequest::with_capture` → `ReqwestUpstreamClient::
+/// dispatch_chat_stream` → the artifact's `upstream_request` is the FINAL
+/// (shrunk) on-wire request, not the first oversized one — the same shrink shape
+/// `upstream.rs`'s unit-level `f1d_ac10_upstream_request_captures_shrunk_redacted_
+/// final_request` proves against a hand-built `BackendChatRequest`, but here
+/// through the real engine lookup instead.
+#[tokio::test]
+async fn f1d_ac10_gateway_e2e_upstream_request_is_shrunk_final_request() {
+    let capture_dir = unique_capture_dir("f1d-ac10-e2e");
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"id": "glm-5.1"}]
+        })))
+        .mount(&server)
+        .await;
+    let overflow = "This model's maximum context length is 202752 tokens. \
+        However, you requested 64000 output tokens and your prompt contains 139000 input tokens.";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(overflow))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(chat_completion_sse_body(&[json!({
+                    "id": "chat-1",
+                    "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 12, "completion_tokens": 5, "total_tokens": 17}
+                })])),
+        )
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.turn_capture_dir = Some(capture_dir.clone());
+    // `--with-debug-ui` OFF: capture works off its OWN gate (AC-4 principle),
+    // proven again here alongside the real-upstream wiring.
+    let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
+        config,
+        None,
+        llmconduit::AppOptions {
+            with_debug_ui: false,
+        },
+    );
+
+    let body = json!({
+        "model": "glm-5.1",
+        "max_tokens": 64000,
+        "stream": true,
+        "messages": [{ "role": "user", "content": "Hi" }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+    let _ = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read served stream");
+
+    let artifact = wait_for_only_artifact(&capture_dir).await;
+    let section = &artifact["sections"]["upstream_request"];
+    assert_eq!(
+        section["content"]["max_tokens"], 63652,
+        "engine-wired capture end-to-end reflects the SHRUNK retry, not the first \
+         oversized attempt: {section}"
+    );
+}
+
 #[tokio::test]
 async fn head_and_options_probes_return_204_with_allow_header() {
     let config = test_config();

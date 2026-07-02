@@ -752,25 +752,13 @@ fn payload_for_log(body: &Bytes) -> String {
 }
 
 fn redact_payload_secrets(value: &mut Value) {
-    // Single sensitive-key authority lives in `crate::redaction` (D1 R1 #10); this
-    // logging surface routes through it so the secret-key set has one definition.
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map {
-                if crate::redaction::is_sensitive_payload_key(key) {
-                    *value = Value::String("[redacted]".to_string());
-                } else {
-                    redact_payload_secrets(value);
-                }
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                redact_payload_secrets(value);
-            }
-        }
-        _ => {}
-    }
+    // Single sensitive-key authority AND walker now live in `crate::redaction`
+    // (D1 R1 #10; F1d extended the shared authority from just the key-list to the
+    // walk itself, so `upstream.rs`'s turn-capture `upstream_request` section can
+    // reuse the EXACT same redaction without duplicating the tree-walk here).
+    // This name stays as the documented call-through (AGENTS.md line 137, the F1
+    // spec) — only its body changed.
+    crate::redaction::redact_payload_secrets_in_value(value);
 }
 
 /// F1b: the redacted bytes for the turn-capture `inbound_request` section, plus
