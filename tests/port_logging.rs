@@ -9,6 +9,8 @@
 
 use llmconduit::log_rotation::cleanup_dump_files;
 use llmconduit::log_rotation::cleanup_dump_files_with_remover;
+use llmconduit::log_rotation::cleanup_orphan_tmp_files;
+use llmconduit::log_rotation::cleanup_orphan_work_dirs;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -66,6 +68,16 @@ fn backdate(path: &Path, by: Duration) {
         .open(path)
         .expect("open file to set times");
     file.set_times(times).expect("set file times");
+}
+
+/// Backdate a DIRECTORY's modification time. A directory fd can only be opened
+/// read-only, but `futimens` still honors an explicit `set_modified` for the owner,
+/// so a plain `File::open` suffices (unlike [`backdate`], which needs write access).
+fn backdate_dir(path: &Path, by: Duration) {
+    let when = SystemTime::now() - by;
+    let times = fs::FileTimes::new().set_modified(when);
+    let dir = fs::File::open(path).expect("open dir to set times");
+    dir.set_times(times).expect("set dir times");
 }
 
 #[test]
@@ -214,5 +226,162 @@ fn tolerates_removal_race_without_double_count() {
         [a.exists(), b.exists()].iter().filter(|&&e| e).count(),
         1,
         "exactly one of the two eligible files must survive"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F1f AC-17 — durable turn capture rotation: the SAME `debug_log_max_age_hours`
+// window prunes aged `<id>.json` artifacts (via `cleanup_dump_files`) AND sweeps
+// aged orphan `.work/<id>/` section dirs (via `cleanup_orphan_work_dirs`), while
+// leaving a fresh artifact and an in-flight (freshly-written) `.work/<id>/`
+// untouched.
+// ---------------------------------------------------------------------------
+
+/// AC-17: in one rotation pass over a `turn_capture_dir`, an AGED published
+/// `<id>.json` is pruned AND an AGED orphan `.work/<id>/` (crash residue) is swept,
+/// while a FRESH artifact and an in-flight `.work/<id>/` (fresh section file) are
+/// BOTH kept. Uses real `now` + backdating so aged and fresh entries coexist under
+/// one cutoff (the "mixed" pattern), exactly as production runs it.
+#[test]
+fn ac17_rotation_prunes_aged_artifact_and_sweeps_aged_orphan_work_dir() {
+    let dir = TempDir::new();
+    let work_root = dir.path().join(".work");
+
+    // (1) Aged, published artifact -> pruned by the file cleanup.
+    let aged_artifact = dir.write("api_old.json");
+    backdate(&aged_artifact, Duration::from_secs(3 * 3600));
+    // (2) Fresh, published artifact (just written) -> kept.
+    let fresh_artifact = dir.write("api_new.json");
+
+    // (3) Aged ORPHAN work dir (a crash killed the process before finalize deleted
+    // it): backdate BOTH the section file and the dir itself so its most-recent
+    // activity predates the cutoff.
+    let aged_work = work_root.join("api_old");
+    fs::create_dir_all(&aged_work).expect("create aged work dir");
+    let aged_section = aged_work.join("inbound_request");
+    fs::write(&aged_section, b"{\"model\":\"m\"}").expect("write aged section");
+    backdate(&aged_section, Duration::from_secs(3 * 3600));
+    backdate_dir(&aged_work, Duration::from_secs(3 * 3600));
+
+    // (4) In-flight work dir: a turn actively streaming, with a FRESH section file
+    // -> must be kept even though rotation is running.
+    let live_work = work_root.join("api_live");
+    fs::create_dir_all(&live_work).expect("create live work dir");
+    fs::write(live_work.join("served_response"), b"event: partial\n\n")
+        .expect("write live section");
+
+    // One pass, real `now` (so fresh entries stay), 2h window.
+    let now = SystemTime::now();
+    let deleted = cleanup_dump_files(dir.path(), MAX_AGE, now);
+    let swept = cleanup_orphan_work_dirs(dir.path(), MAX_AGE, now);
+
+    // Artifact prune: only the aged `<id>.json` is removed.
+    assert_eq!(deleted, 1, "only the aged artifact is pruned");
+    assert!(!aged_artifact.exists(), "aged <id>.json pruned by rotation");
+    assert!(fresh_artifact.exists(), "fresh <id>.json kept");
+
+    // Orphan sweep: only the aged `.work/<id>/` is reclaimed; the in-flight one
+    // (fresh section mtime) survives.
+    assert_eq!(swept, 1, "only the aged orphan .work dir is swept");
+    assert!(!aged_work.exists(), "aged orphan .work/<id>/ swept");
+    assert!(
+        live_work.exists(),
+        "in-flight .work/<id>/ (fresh section) is NEVER swept"
+    );
+}
+
+/// AC-17 (in-flight protection detail): an orphan `.work/<id>/` whose DIR mtime aged
+/// out but that still holds a FRESHLY-written section file is NOT swept — the newest
+/// activity among the dir's contents keeps it alive. This is the exact shape of a
+/// long-running turn that outlived the window while still streaming.
+#[test]
+fn ac17_orphan_sweep_keeps_dir_with_a_fresh_section_file() {
+    let dir = TempDir::new();
+    let work = dir.path().join(".work").join("api_streaming");
+    fs::create_dir_all(&work).expect("create work dir");
+    // The dir itself is old...
+    backdate_dir(&work, Duration::from_secs(5 * 3600));
+    // ...but a section file was just written (the turn is still live).
+    fs::write(work.join("served_response"), b"still streaming").expect("write section");
+
+    let swept = cleanup_orphan_work_dirs(dir.path(), MAX_AGE, SystemTime::now());
+
+    assert_eq!(swept, 0, "a dir with any fresh section file is not swept");
+    assert!(work.exists(), "the in-flight work dir survives");
+}
+
+/// AC-17 (safety): the sweep is a no-op when there is no `.work/` subtree at all —
+/// e.g. a `turn_capture_dir` before any turn has registered. Defense-in-depth: even
+/// though `spawn_cleanup` now scopes the destructive sweep to `turn_capture_dir` ALONE
+/// (F1f review r1 — never the request-log dirs), a capture dir with no crash residue
+/// still cleanly reclaims nothing.
+#[test]
+fn ac17_orphan_sweep_noop_without_work_subtree() {
+    let dir = TempDir::new();
+    dir.write("api_done.json");
+    let swept = cleanup_orphan_work_dirs(dir.path(), MAX_AGE, now_in_future());
+    assert_eq!(swept, 0, "no `.work/` subtree -> nothing to sweep");
+}
+
+// ---------------------------------------------------------------------------
+// Fable review (Finding 2) — crash-orphaned `<id>.json.tmp` sweep: a crash BETWEEN
+// `assemble_blocking`'s tmp write and the atomic rename leaves an artifact-sized
+// `<id>.json.tmp` that `cleanup_dump_files` never reclaims (extension `tmp`). The
+// new `cleanup_orphan_tmp_files` reclaims aged ones, SCOPED to `turn_capture_dir`.
+// ---------------------------------------------------------------------------
+
+/// An AGED `<id>.json.tmp` (crash residue) is reclaimed; a FRESH in-progress
+/// `<id>.json.tmp` (an assembly writing right now) is protected by its mtime; and the
+/// sweep targets ONLY `*.json.tmp` — a published `.json` artifact and an unrelated
+/// `.tmp` are BOTH left untouched. Uses real `now` + backdating so aged and fresh
+/// coexist under one cutoff (the "mixed" pattern), exactly as production runs it.
+#[test]
+fn f1_tmp_sweep_prunes_aged_json_tmp_keeps_fresh_and_targets_only_json_tmp() {
+    let dir = TempDir::new();
+
+    // (1) Aged crash-orphan `<id>.json.tmp` -> reclaimed.
+    let aged_tmp = dir.write("api_crashed.json.tmp");
+    backdate(&aged_tmp, Duration::from_secs(3 * 3600));
+    // (2) Fresh `<id>.json.tmp` (an assembly writing right now) -> kept (recent mtime).
+    let fresh_tmp = dir.write("api_inflight.json.tmp");
+    // (3) A published artifact + a stray unrelated `.tmp` -> never targeted by THIS sweep.
+    let artifact = dir.write("api_done.json");
+    let stray = dir.write("scratch.tmp");
+
+    let removed = cleanup_orphan_tmp_files(dir.path(), MAX_AGE, SystemTime::now());
+
+    assert_eq!(removed, 1, "only the aged .json.tmp is reclaimed");
+    assert!(!aged_tmp.exists(), "aged <id>.json.tmp reclaimed");
+    assert!(
+        fresh_tmp.exists(),
+        "a fresh in-progress .json.tmp is protected by its mtime"
+    );
+    assert!(
+        artifact.exists(),
+        "a published .json artifact is never touched by the tmp sweep"
+    );
+    assert!(
+        stray.exists(),
+        "a non-artifact .tmp is never touched (only *.json.tmp is targeted)"
+    );
+}
+
+/// Scoping guarantee: the request-log rotation pass (`cleanup_dump_files`, which runs
+/// over EVERY `debug_log_dir`) never deletes a `.json.tmp` — its extension is `tmp`,
+/// not eligible. Only the capture-scoped `cleanup_orphan_tmp_files` reclaims those,
+/// and `spawn_cleanup` runs THAT over `turn_capture_dir` ALONE. So a `.json.tmp`
+/// sitting under a request-log dir is left untouched by the pass covering that dir.
+#[test]
+fn f1_request_log_dir_json_tmp_is_untouched_by_dump_rotation() {
+    let request_log_dir = TempDir::new();
+    let tmp = request_log_dir.write("api_x.json.tmp");
+    backdate(&tmp, Duration::from_secs(5 * 3600));
+
+    let deleted = cleanup_dump_files(request_log_dir.path(), MAX_AGE, SystemTime::now());
+
+    assert_eq!(deleted, 0, "`.json.tmp` is not an eligible dump extension");
+    assert!(
+        tmp.exists(),
+        "a request-log-dir .json.tmp is never reclaimed by dump rotation (tmp sweep is capture-scoped)"
     );
 }

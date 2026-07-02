@@ -4,10 +4,25 @@
 //! with no rotation, so the directory holding dump files can grow unbounded.
 //! This module deletes eligible dump files older than a configurable max age.
 //!
-//! The core [`cleanup_dump_files`] function is synchronous and takes an injected
-//! `now`, so tests can age files out by passing a cutoff rather than backdating
-//! mtimes. Callers on the tokio runtime must invoke it via `spawn_blocking`
-//! (see [`spawn_cleanup`]) because it performs blocking filesystem IO.
+//! F1f (durable turn capture) reuses the SAME age window for two surfaces under a
+//! `turn_capture_dir`: [`cleanup_dump_files`] prunes the published
+//! `<api_call_id>.json` artifacts (top-level `*.json`), and
+//! [`cleanup_orphan_work_dirs`] sweeps orphaned per-turn `.work/<id>/` section dirs
+//! left behind when a process crashes before `TurnCaptureState::finalize_and_assemble`
+//! could delete them. Both run in the same [`spawn_cleanup`] pass, but with DISTINCT
+//! scopes — the artifact/dump prune spans every `Config::debug_log_dirs()` entry, while
+//! the destructive `.work` sweep is scoped to `turn_capture_dir` ALONE (turn capture is
+//! the sole creator of `.work/<id>/` subdirs, and only under `turn_capture_dir`, so the
+//! sweep must never run over a request-log dir — F1f review r1). Neither reclaims an
+//! in-flight turn (its section files carry fresh mtimes, so it is younger than the
+//! window — and the production caller only runs cleanup at startup, before any turn is
+//! registered).
+//!
+//! The core [`cleanup_dump_files`] / [`cleanup_orphan_work_dirs`] functions are
+//! synchronous and take an injected `now`, so tests can age entries out by passing a
+//! cutoff rather than backdating mtimes. Callers on the tokio runtime must invoke them
+//! via `spawn_blocking` (see [`spawn_cleanup`]) because they perform blocking
+//! filesystem IO.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -98,13 +113,185 @@ pub fn cleanup_dump_files_with_remover(
     deleted
 }
 
-/// Run [`cleanup_dump_files`] on the blocking thread pool and log the outcome.
+/// F1f (durable turn capture): reclaim orphaned per-turn `.work/<id>/` section dirs
+/// under `<capture_dir>/.work/` that a crash left behind (the process died before
+/// `TurnCaptureState::finalize_and_assemble` could delete the dir). Returns the number
+/// of orphan dirs actually removed.
 ///
-/// Returns immediately if `max_age_hours` is `None` (the feature is opt-in) or
-/// if `dir` is `None`. The spawned task is detached: cleanup is best-effort and
-/// must never block startup or fail the server.
-pub fn spawn_cleanup(dir: Option<PathBuf>, max_age_hours: Option<u64>) {
-    let (Some(dir), Some(max_age_hours)) = (dir, max_age_hours) else {
+/// Mirrors [`cleanup_dump_files`]: the SAME injected-`now` seam, the SAME age policy
+/// (`now - max_age` cutoff), and the SAME best-effort per-entry tolerance (a removal
+/// race is logged and skipped, not fatal). Only a `.work/<id>/` whose MOST-RECENT
+/// activity — the newest mtime among the dir itself and its immediate section files —
+/// predates the cutoff is removed, so a turn still streaming to its section files
+/// (fresh file mtimes) is NEVER swept even if its dir mtime aged. In-flight protection
+/// is therefore mtime-based; the production caller ([`spawn_cleanup`]) additionally
+/// only runs cleanup at startup, before any turn is registered, so a live turn cannot
+/// coincide with a sweep in practice.
+///
+/// A missing `<capture_dir>/.work/` (the common case — no crash residue) returns `0`
+/// with no error. The production caller ([`spawn_cleanup`]) runs this over
+/// `turn_capture_dir` ALONE — NEVER the request-log dirs — because turn capture is the
+/// sole creator of `.work/<api_call_id>/` subdirs and only under `turn_capture_dir`;
+/// sweeping a request-log dir could `remove_dir_all` an unrelated `.work/` subtree it
+/// does not own (F1f review r1, HIGH). This is blocking IO; do not call it directly on
+/// the async runtime.
+pub fn cleanup_orphan_work_dirs(capture_dir: &Path, max_age: Duration, now: SystemTime) -> usize {
+    let work_root = capture_dir.join(".work");
+    // Missing `.work/` (or a path that isn't a directory) -> no crash residue.
+    let entries = match fs::read_dir(&work_root) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    // `now - max_age` underflowed (max_age beyond the epoch): nothing can be older
+    // than the cutoff, so keep everything (mirrors `is_older_than_cutoff`).
+    let Some(cutoff) = now.checked_sub(max_age) else {
+        return 0;
+    };
+
+    let mut swept = 0usize;
+    for entry in entries {
+        // Tolerate a failing dir entry like a removal race.
+        let Ok(entry) = entry else {
+            continue;
+        };
+        // Only per-turn SUBDIRECTORIES are eligible; a stray file under `.work/` is
+        // left untouched (never removed).
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => {}
+            _ => continue,
+        }
+        let path = entry.path();
+        // Reclaim ONLY a work dir whose most-recent activity predates the cutoff, so
+        // an in-flight turn actively writing its section files is never swept. A dir
+        // with no readable mtime at all is kept (conservative).
+        if newest_mtime(&path).is_some_and(|activity| activity < cutoff) {
+            match fs::remove_dir_all(&path) {
+                Ok(()) => swept += 1,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        %error,
+                        "skipping orphan turn-capture .work dir that could not be removed"
+                    );
+                }
+            }
+        }
+    }
+
+    swept
+}
+
+/// F1 (Fable review): reclaim crash-orphaned `<api_call_id>.json.tmp` artifact temp
+/// files under `capture_dir` older than the same age window. [`super`]'s
+/// `TurnCaptureState::assemble_blocking` writes `<id>.json.tmp`, `fsync`s it, then
+/// atomically renames it to `<id>.json`; a crash BETWEEN the write and the rename
+/// leaves an artifact-sized `.tmp` that [`cleanup_dump_files`] never reclaims (its
+/// extension is `tmp`, not in [`ELIGIBLE_EXTENSIONS`]). Returns the number of
+/// `.json.tmp` files actually removed.
+///
+/// Mirrors [`cleanup_orphan_work_dirs`]: the SAME injected-`now` seam, the SAME
+/// `now - max_age` cutoff (so a FRESH in-progress `<id>.json.tmp` an assembly is
+/// writing RIGHT NOW is protected by its recent mtime and never deleted), and the
+/// SAME best-effort per-entry tolerance. ONLY a top-level regular file whose name
+/// ends in `.json.tmp` is eligible, so an unrelated `.tmp`, a published `.json`, or a
+/// subdirectory is never touched. The production caller ([`spawn_cleanup`]) runs this
+/// over `turn_capture_dir` ALONE — NEVER the request-log dirs — because turn capture
+/// is the sole writer of `<id>.json.tmp` and only under `turn_capture_dir` (identical
+/// scoping to the destructive `.work` sweep, F1f review r1). Blocking IO; do not call
+/// it directly on the async runtime.
+pub fn cleanup_orphan_tmp_files(capture_dir: &Path, max_age: Duration, now: SystemTime) -> usize {
+    // Missing `turn_capture_dir` (or a path that isn't a directory) -> nothing to do.
+    let entries = match fs::read_dir(capture_dir) {
+        Ok(entries) => entries,
+        Err(_) => return 0,
+    };
+    // `now - max_age` underflowed (max_age beyond the epoch): nothing can be older
+    // than the cutoff, so keep everything (mirrors `is_older_than_cutoff`).
+    let Some(cutoff) = now.checked_sub(max_age) else {
+        return 0;
+    };
+
+    let mut removed = 0usize;
+    for entry in entries {
+        // Tolerate a failing dir entry like a removal race.
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        // ONLY the artifact temp files: a `*.json.tmp` NAME. A stray `.tmp`, a
+        // published `.json`, or any other file is never targeted.
+        if !path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.ends_with(".json.tmp"))
+        {
+            continue;
+        }
+        // Only a regular file is eligible; a directory named `*.json.tmp` is ignored.
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if is_older_than_cutoff(&metadata, Some(cutoff)) {
+            // Tolerate races: only count a removal that actually succeeded.
+            match fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        %error,
+                        "skipping orphan turn-capture .json.tmp that could not be removed"
+                    );
+                }
+            }
+        }
+    }
+
+    removed
+}
+
+/// The most-recent activity time for a `.work/<id>/` dir: the LATER of the dir's own
+/// mtime and the newest mtime among its immediate entries (the per-section temp
+/// files). Any recent write anywhere inside protects the dir from the sweep. `None`
+/// when no mtime is readable at all (the caller then keeps the dir — conservative).
+fn newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest = fs::metadata(dir).and_then(|meta| meta.modified()).ok();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) {
+                newest = Some(newest.map_or(modified, |current| current.max(modified)));
+            }
+        }
+    }
+    newest
+}
+
+/// Run [`cleanup_dump_files`] AND [`cleanup_orphan_work_dirs`] on the blocking thread
+/// pool (one pass, one `now`) and log the outcome.
+///
+/// Two DISTINCT surfaces with DISTINCT scopes:
+/// - [`cleanup_dump_files`] age-rotates the published `<id>.json` artifacts + the
+///   request-log dump files across EVERY active dump dir (`dump_dirs` =
+///   `Config::debug_log_dirs()`).
+/// - [`cleanup_orphan_work_dirs`] sweeps orphaned per-turn `.work/<id>/` section dirs,
+///   which ONLY turn capture ever creates and ONLY under `turn_capture_dir`. The
+///   destructive `remove_dir_all` sweep is therefore scoped to `turn_capture_dir`
+///   ALONE — it must NEVER run over a request-log dir, where an unrelated `.work/`
+///   subtree the gateway does not own could be reclaimed (F1f review r1, HIGH). A
+///   `None` `turn_capture_dir` ⇒ the sweep does nothing.
+///
+/// Returns immediately if `max_age_hours` is `None` (the feature is opt-in) or `0`.
+/// The spawned task is detached: cleanup is best-effort and must never block startup
+/// or fail the server.
+pub fn spawn_cleanup(
+    dump_dirs: Vec<PathBuf>,
+    turn_capture_dir: Option<PathBuf>,
+    max_age_hours: Option<u64>,
+) {
+    let Some(max_age_hours) = max_age_hours else {
         return;
     };
     if max_age_hours == 0 {
@@ -114,13 +301,47 @@ pub fn spawn_cleanup(dir: Option<PathBuf>, max_age_hours: Option<u64>) {
     }
     let max_age = Duration::from_secs(max_age_hours.saturating_mul(3600));
     tokio::task::spawn_blocking(move || {
-        let deleted = cleanup_dump_files(&dir, max_age, SystemTime::now());
-        if deleted > 0 {
-            tracing::info!(
-                deleted,
-                dir = %dir.display(),
-                "cleaned up old debug/request-log dump file(s)"
-            );
+        // One `now` for both surfaces so the artifact prune and the `.work` sweep
+        // apply an identical cutoff.
+        let now = SystemTime::now();
+        // Age-rotate the published artifacts + request-log dump files across every
+        // active dump dir.
+        for dir in &dump_dirs {
+            let deleted = cleanup_dump_files(dir, max_age, now);
+            if deleted > 0 {
+                tracing::info!(
+                    deleted,
+                    dir = %dir.display(),
+                    "cleaned up old debug/request-log dump file(s)"
+                );
+            }
+        }
+        // F1f: reclaim orphaned per-turn `.work/<id>/` dirs (crash residue). SCOPED to
+        // `turn_capture_dir` ALONE — turn capture is the sole creator of
+        // `.work/<api_call_id>/` subdirs, so running this destructive sweep over a
+        // request-log dir could `remove_dir_all` an unrelated `.work/` subtree it does
+        // not own (F1f review r1, HIGH).
+        if let Some(capture_dir) = turn_capture_dir.as_ref() {
+            let swept = cleanup_orphan_work_dirs(capture_dir, max_age, now);
+            if swept > 0 {
+                tracing::info!(
+                    swept,
+                    dir = %capture_dir.display(),
+                    "swept orphaned turn-capture .work dir(s)"
+                );
+            }
+            // F1 (Fable review): also reclaim crash-orphaned `<id>.json.tmp` artifact
+            // temp files (a crash between the tmp write and the atomic rename). SAME
+            // scope as the `.work` sweep — `turn_capture_dir` ALONE, never a
+            // request-log dir (turn capture is the sole writer of `<id>.json.tmp`).
+            let tmp_removed = cleanup_orphan_tmp_files(capture_dir, max_age, now);
+            if tmp_removed > 0 {
+                tracing::info!(
+                    removed = tmp_removed,
+                    dir = %capture_dir.display(),
+                    "reclaimed crash-orphaned turn-capture .json.tmp file(s)"
+                );
+            }
         }
     });
 }

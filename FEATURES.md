@@ -290,6 +290,34 @@ features below all hang off. Today a flow is a set of artifacts (bodies, deltas,
 - **Surface:** the D13 config route + a visible "capture: on/sampled/off" indicator.
 - **Backend:** D1 capture is already capped+redacting; add the policy knobs. **Effort:** M.
 
+### Durable per-turn capture ✅ (F1)
+- **Answers:** "a session emitted a stray `<think>` / malformed tool-call / truncated content — show
+  me EXACTLY what the backend sent and what the client received for *that* turn, from a fresh
+  session, days later." A `<think>` leak is a `200 OK`; nothing else persists the response body (the
+  journal is request-only; the dashboard flow ring evicts and wipes on restart).
+- **Data:** opt-in via `turn_capture_dir` — its OWN gate, so it works WITHOUT `--with-debug-ui`.
+  Every instrumented turn (`/v1/responses` · `/v1/messages` · `/v1/chat/completions`) writes ONE
+  self-contained `<dir>/<api_call_id>.json` with four FULL, untruncated sections —
+  `inbound_request` (raw inbound body), `upstream_request` (the translated on-wire OpenAI request,
+  final attempt), `upstream_response` (RAW pre-parse upstream bytes — the ground truth), and
+  `served_response` (the exact bytes returned to the client) — plus outcome metadata (`status`
+  completed/incomplete/failed/cancelled, `terminal_reason`, `started_ms`/`finished_ms`,
+  `model_requested`/`model_served`, per-section `{bytes, partial, encoding}`). `measured` throughout;
+  a never-contacted section is ABSENT, never a fabricated empty (don't lie with zeros).
+- **Debugging use case:** diff `upstream_response` vs `served_response` to localize a `<think>` leak
+  as **upstream-emitted** (present in the raw bytes) vs **converter-introduced** (only in the served
+  bytes) — the one question the live dashboard could not answer.
+- **Posture:** REDACTED at rest (secret keys + image `data:`/URL URIs, the SAME redactors as the
+  `body_payload` log) on the request sections; BOUNDED memory (each section streams to a per-turn
+  temp file under `<dir>/.work/<id>/`, assembled by a streaming JSON escaper — never a full body in
+  RAM, never a slice of the 256 MiB middleware buffer); ATOMIC (tmp → fsync → rename, so a reader or
+  the rotation sweep never sees a torn file); cancellation-safe (a client hang-up still writes a
+  `partial` artifact and never hangs). Age-rotated by `debug_log_max_age_hours` — prunes the aged
+  `<id>.json` AND sweeps crash-orphaned `.work/<id>/` dirs in the same pass.
+- **Follow-ups:** a per-attempt `attempts[]` trace (v1 captures only the FINAL attempt); an
+  `analyze-turn` pretty-printer CLI; chat/responses client-format coverage parity; response-stream
+  image redaction (`served_response`/`upstream_response` are raw model OUTPUT today).
+
 ### Abuse / secret-leak detection 🔭⚙️
 - **Answers:** "did a request carry credentials, PII, or prompt-injection-looking content?"
 - **Data:** deterministic secret/credential patterns over captured bodies+headers first; flag, don't

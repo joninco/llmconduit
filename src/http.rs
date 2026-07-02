@@ -57,13 +57,18 @@ use axum::routing::get;
 use axum::routing::on;
 use axum::routing::post;
 use futures::StreamExt;
+use http_body::Frame;
+use http_body::SizeHint;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -71,6 +76,13 @@ use uuid::Uuid;
 
 const API_LOG_PAYLOAD_DUMP_LIMIT_BYTES: usize = 16 * 1024;
 const API_LOG_PREVIEW_CHARS: usize = 160;
+/// Fable review (Finding 1): inbound bodies at or below this size have their
+/// turn-capture redaction done INLINE; a larger body moves the parse+redact+
+/// re-serialize onto the blocking pool so a multi-MB Claude Code (1M-context)
+/// request never stalls the tokio worker (which the synchronous path did — 100ms+
+/// plus a 3–6× transient allocation spike per concurrent request). Set to the SAME
+/// 16 KiB as the journal dump gate ([`API_LOG_PAYLOAD_DUMP_LIMIT_BYTES`]).
+const TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES: usize = API_LOG_PAYLOAD_DUMP_LIMIT_BYTES;
 const UNKNOWN_MODEL_CREATED_AT: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -414,6 +426,16 @@ async fn log_api_call(
     // extractor) cannot bound memory here because this middleware buffers the
     // whole body for logging FIRST — so the cap is also enforced at the read
     // below for bodies that arrive without a (trustworthy) Content-Length.
+    //
+    // F1b turn-capture scope (review #3): these PRE-body-read rejections (the 413
+    // here, and the read-failure 413/400 just below) return BEFORE the capture
+    // gate runs and BEFORE any `api_call_id` turn/`inbound_request` section is
+    // minted — so they are intentionally NOT captured: there is no turn to attach
+    // a `served_response` to, and we do not mint one just to record a 413 (a
+    // documented non-goal in `.ralph/specs/F1-durable-turn-capture.md`, Task F1b).
+    // Every POST-gate response (an engine error, a `Reject`, any 4xx/5xx produced
+    // AFTER the gate) IS teed, because the tee wraps the WHOLE `next.run` result
+    // below regardless of status.
     let declared_length = content_length(&headers);
     if let Some(declared) = declared_length
         && declared > max_request_body_bytes as u64
@@ -518,55 +540,124 @@ async fn log_api_call(
         );
     }
 
-    // D1 (incl. R1 #1/#6): only when the FlowStore is ENABLED AND this is an
-    // instrumented inference flow (POST + whitelisted path) do we (a) stash the
-    // `api_call_id` extension the engine reads to link `response_id → api_call_id`,
-    // and (b) capture the inbound body + headers and open the record. Gating BOTH on
-    // the same condition keeps the disabled production path zero-cost (no clone, no
-    // extension insert) and prevents HEAD/OPTIONS probes or non-whitelisted paths
-    // from opening an orphan record. Secrets (auth headers, `api_key`, image URIs)
-    // are redacted INLINE by the serializer/header redactor — none persist here.
-    // D3 L0: the RAII middleware guard. `None` for disabled-store / non-whitelisted
-    // requests (zero overhead). When `Some`, it is held across `next.run`: if the
-    // request never reaches the engine (an extractor/`Json` rejection, a layer panic
-    // above the handler) the record is still `OpenL0` at the guard's `Drop`, which
-    // CASes it to `Finalized` + `Failed("unhandled")` — no orphan stuck `Open`. If
-    // the engine claimed it (`ClaimedL1`), the L0 `Drop` is inert and L1 owns
-    // finalization.
-    let _l0_guard =
-        if gateway.flow_store().is_enabled() && is_flow_capture_request(&method, uri.path()) {
-            parts
-                .extensions
-                .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
-            let inbound_body = Some(crate::dashboard_flow::capture_body(&body_bytes));
-            // Gap 04: derive the client attribution from the RAW headers BEFORE they are
-            // redacted — this is the only point the raw API key is still readable, and
-            // `derive` hashes it in-place (a one-way SHA-256 prefix becomes the label; the
-            // raw key is dropped, never stored/logged). The optional configured caller-id
-            // header NAME is read env-only (`LLMCONDUIT_DASHBOARD_CLIENT_HEADER`) so no
-            // secret/identity config lands in the `Debug`/`Clone` persisted `Config`
-            // struct — mirroring the dashboard auth env-only posture. The header name is
-            // non-secret; only the api-key VALUE is, and it is never persisted.
-            let client = crate::dashboard_flow::ClientAttribution::derive(
-                &headers,
-                dashboard_client_header().as_deref(),
-            );
-            let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
-            gateway.flow_store().open(
-                api_call_id.clone(),
-                method.to_string(),
-                uri.path().to_string(),
-                headers_redacted,
-                inbound_body,
-                client,
-            );
-            gateway.flow_store().middleware_guard(&api_call_id)
-        } else {
-            None
-        };
+    // Shared "instrument this request?" predicate (POST + whitelisted inference
+    // path). Both the dashboard FlowStore gate and the F1 turn-capture gate hang
+    // off it, so a HEAD/OPTIONS probe or a non-whitelisted path opens neither.
+    let instrument = is_flow_capture_request(&method, uri.path());
+    // D1: dashboard FlowStore capture is gated on the debug UI (`flow_store()` is
+    // `disabled()` off `--with-debug-ui`).
+    let flow_gate = instrument && gateway.flow_store().is_enabled();
+    // F1b (spec Design #1): turn capture has its OWN gate on the SAME paths but
+    // keyed on `turn_capture().is_enabled()` INDEPENDENT of the flow store / debug
+    // UI — so `api_call_id` reaches the engine and the artifact is written with the
+    // dashboard OFF.
+    let capture_gate = instrument && gateway.turn_capture().is_enabled();
+
+    // The `api_call_id` extension the engine reads to link `response_id →
+    // api_call_id` (D1) and to reach the per-turn capture state (F1c) is inserted
+    // ONCE if EITHER gate wants it — never double-inserted when both fire.
+    if flow_gate || capture_gate {
+        parts
+            .extensions
+            .insert(crate::dashboard_flow::ApiCallId(api_call_id.clone()));
+    }
+
+    // D1 (incl. R1 #1/#6): capture the inbound body + headers and open the record.
+    // Secrets (auth headers, `api_key`, image URIs) are redacted INLINE by the
+    // serializer/header redactor — none persist here. D3 L0: the RAII middleware
+    // guard. `None` for disabled-store / non-whitelisted requests (zero overhead).
+    // When `Some`, it is held across `next.run`: if the request never reaches the
+    // engine (an extractor/`Json` rejection, a layer panic above the handler) the
+    // record is still `OpenL0` at the guard's `Drop`, which CASes it to `Finalized`
+    // + `Failed("unhandled")` — no orphan stuck `Open`. If the engine claimed it
+    // (`ClaimedL1`), the L0 `Drop` is inert and L1 owns finalization.
+    let _l0_guard = if flow_gate {
+        let inbound_body = Some(crate::dashboard_flow::capture_body(&body_bytes));
+        // Gap 04: derive the client attribution from the RAW headers BEFORE they are
+        // redacted — this is the only point the raw API key is still readable, and
+        // `derive` hashes it in-place (a one-way SHA-256 prefix becomes the label; the
+        // raw key is dropped, never stored/logged). The optional configured caller-id
+        // header NAME is read env-only (`LLMCONDUIT_DASHBOARD_CLIENT_HEADER`) so no
+        // secret/identity config lands in the `Debug`/`Clone` persisted `Config`
+        // struct — mirroring the dashboard auth env-only posture. The header name is
+        // non-secret; only the api-key VALUE is, and it is never persisted.
+        let client = crate::dashboard_flow::ClientAttribution::derive(
+            &headers,
+            dashboard_client_header().as_deref(),
+        );
+        let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
+        gateway.flow_store().open(
+            api_call_id.clone(),
+            method.to_string(),
+            uri.path().to_string(),
+            headers_redacted,
+            inbound_body,
+            client,
+        );
+        gateway.flow_store().middleware_guard(&api_call_id)
+    } else {
+        None
+    };
+
+    // F1b: start the per-turn artifact and write the redacted inbound-request
+    // section. `redacted_inbound_section` COPIES + redacts the body (secret keys +
+    // image URIs, the SAME path `payload_for_log` uses — AGENTS.md line 137/144),
+    // never retaining a slice of the 256 MiB buffer.
+    let turn_capture_state = if capture_gate {
+        // Finding 1: redact OFF the tokio worker for large bodies (spawn_blocking),
+        // AWAITED here before `write_inbound_request` so the section is written +
+        // closed before the finalize barrier can read it. `body_bytes.clone()` is a
+        // cheap Arc-backed `Bytes` clone; the offload copies it into an OWNED `Vec` for
+        // the blocking task (F1 — so nothing pins the 256 MiB backing) and this clone
+        // is dropped before `body_bytes` is moved into the rebuilt request below.
+        let (model_requested, inbound_section, inbound_partial) =
+            offload_redacted_inbound_section(body_bytes.clone()).await;
+        let state = gateway
+            .turn_capture()
+            .start(&api_call_id, model_requested, epoch_millis());
+        if let Some(state) = &state {
+            state.write_inbound_request(&inbound_section);
+            if inbound_partial {
+                // F3 (Fable-fix): the redaction offload could not capture the body (a
+                // spawn_blocking join failure); mark the section partial so it never
+                // reads as a complete inbound body (don't-lie-with-zeros).
+                state.mark_inbound_request_degraded();
+            }
+        }
+        state
+    } else {
+        None
+    };
+
+    // F1c: the turn-capture MIDDLEWARE backstop, held across `next.run`. If the
+    // request NEVER reaches the engine (a `Json`/extractor rejection, a
+    // `convert_request` error — so no engine `CaptureGuard` is ever built), the turn
+    // is UNCLAIMED at this guard's `Drop`, which then finalizes the engine side
+    // `failed`/`"unhandled"`. That closes the both-`done` barrier (the served tee
+    // below always fires `served_done`), so the registry entry + `.work` dir are
+    // evicted and a useful `status:"failed"` artifact is still written — no hang, no
+    // leak. A turn that reached the engine is CLAIMED synchronously (before
+    // `next.run` returns), so this backstop is inert for it. Mirrors the dashboard's
+    // L0 `MiddlewareGuard`.
+    let _capture_backstop = turn_capture_state
+        .as_ref()
+        .map(|state| crate::turn_capture::MiddlewareCaptureGuard::new(Arc::clone(state)));
 
     let request = Request::from_parts(parts, Body::from(body_bytes));
     let response = next.run(request).await;
+    // F1b served-body tee (spec Design #4): wrap the outbound response `Body` so
+    // every served byte — streaming SSE, non-streaming JSON, or a handler error
+    // body — is copied to the `served_response` section; its `Drop` marks
+    // `served_done(partial)` when the stream did not reach a clean end (a client
+    // disconnect drops the body mid-stream). One wrapper covers all served shapes.
+    // Review #3: this wraps the WHOLE `next.run` result unconditionally, so every
+    // POST-gate error response (an engine error, a `Reject`, any 4xx/5xx minted
+    // after the gate inserted the `ApiCallId` extension) is teed too — only the
+    // PRE-body-read 413/400 rejections above (no turn minted) are out of scope.
+    let response = match turn_capture_state {
+        Some(state) => tee_served_body(response, state),
+        None => response,
+    };
     // Per-request model-resolution audit: the handler tags the response with the
     // served model (and the requested model when it differs) via
     // `with_model_headers`; echo both here so every response record shows whether
@@ -681,25 +772,98 @@ fn payload_for_log(body: &Bytes) -> String {
 }
 
 fn redact_payload_secrets(value: &mut Value) {
-    // Single sensitive-key authority lives in `crate::redaction` (D1 R1 #10); this
-    // logging surface routes through it so the secret-key set has one definition.
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map {
-                if crate::redaction::is_sensitive_payload_key(key) {
-                    *value = Value::String("[redacted]".to_string());
-                } else {
-                    redact_payload_secrets(value);
-                }
-            }
+    // Single sensitive-key authority AND walker now live in `crate::redaction`
+    // (D1 R1 #10; F1d extended the shared authority from just the key-list to the
+    // walk itself, so `upstream.rs`'s turn-capture `upstream_request` section can
+    // reuse the EXACT same redaction without duplicating the tree-walk here).
+    // This name stays as the documented call-through (AGENTS.md line 137, the F1
+    // spec) — only its body changed.
+    crate::redaction::redact_payload_secrets_in_value(value);
+}
+
+/// F1b: the redacted bytes for the turn-capture `inbound_request` section, plus
+/// the requested `model` (outcome metadata). Redaction MIRRORS `payload_for_log`
+/// EXACTLY — secret keys via [`redact_payload_secrets`], image/data URIs via
+/// [`crate::redaction::redact_image_uris_in_value`] — so the on-disk artifact is a
+/// NEW logged surface that does NOT bypass `redact_payload_secrets` (AGENTS.md
+/// line 137) and never carries raw image bytes. Parses/serializes a fresh owned
+/// `Value`, so it COPIES out of `body` and never retains a slice of the 256 MiB
+/// middleware buffer (AGENTS.md line 144).
+fn redacted_inbound_section(body: &[u8]) -> (Option<String>, Vec<u8>) {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(mut value) => {
+            let model = value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            redact_payload_secrets(&mut value);
+            crate::redaction::redact_image_uris_in_value(&mut value);
+            let bytes = serde_json::to_vec(&value)
+                .unwrap_or_else(|_| b"<failed to serialize json>".to_vec());
+            (model, bytes)
         }
-        Value::Array(values) => {
-            for value in values {
-                redact_payload_secrets(value);
-            }
+        Err(_) => {
+            // Non-JSON body: still strip image URIs from the raw text so a
+            // `data:`/signed URL in a malformed/odd payload is not captured raw.
+            let redacted = crate::redaction::redact_image_uris(&String::from_utf8_lossy(body));
+            (None, redacted.into_bytes())
         }
-        _ => {}
     }
+}
+
+/// Fable review (Finding 1): produce the redacted `inbound_request` bytes, moving the
+/// CPU-bound parse+redact+re-serialize OFF the tokio worker for a LARGE body via
+/// `spawn_blocking` (mirroring `upstream::UpstreamRequestLogger`). Small bodies
+/// (`<= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES`) stay inline — the blocking-pool hop
+/// isn't worth it. Redaction is IDENTICAL on both paths (it is the SAME
+/// [`redacted_inbound_section`]). The caller AWAITS this INLINE, before
+/// `write_inbound_request` (append + close), so the section is fully written and
+/// closed before the both-`done` finalize barrier can read it (no section race, no
+/// hang). Returns `(model_requested, redacted_bytes, partial)`; `partial` is `true`
+/// ONLY on a join failure (the body could not be captured -- the caller then marks
+/// the section degraded rather than reporting a false "complete", don't-lie-with-zeros).
+///
+/// F1 (Fable-fix): the blocking task is handed an OWNED `Vec<u8>` copy of the body,
+/// NOT the Arc-backed `Bytes` — moving a `Bytes` clone into `spawn_blocking` would PIN
+/// the whole 256 MiB inbound middleware backing allocation for the task's lifetime,
+/// and a DETACHED task (outer future cancelled) would keep it pinned (AGENTS.md line
+/// 144 — no retained slice of that buffer). The owned right-sized copy is the intended
+/// cost; the redacted output is likewise a fresh owned `Vec`.
+async fn offload_redacted_inbound_section(body: Bytes) -> (Option<String>, Vec<u8>, bool) {
+    if body.len() <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
+        let (model, bytes) = redacted_inbound_section(&body);
+        return (model, bytes, false);
+    }
+    // Copy to an OWNED, right-sized `Vec` and DROP the Arc-backed `Bytes` BEFORE the
+    // blocking hop, so nothing pins the 256 MiB backing across the task (or after, on
+    // cancellation when the task detaches).
+    let owned: Vec<u8> = body.to_vec();
+    drop(body);
+    match tokio::task::spawn_blocking(move || redacted_inbound_section(&owned)).await {
+        Ok((model, bytes)) => (model, bytes, false),
+        // `redacted_inbound_section` is panic-free (serde failures fall back to a
+        // marker), so a `JoinError` here means the runtime is shutting down. Record an
+        // honest, NON-EMPTY marker AND signal `partial` so the section still closes
+        // (never a hang) and never reads as a fabricated empty/complete body
+        // (don't-lie-with-zeros; F3).
+        Err(err) => {
+            tracing::warn!(error = %err, "turn-capture: inbound redaction task failed");
+            (
+                None,
+                b"<turn-capture: inbound redaction task failed>".to_vec(),
+                true,
+            )
+        }
+    }
+}
+
+/// Current wall-clock time as epoch milliseconds (the `started_ms` clock the
+/// dashboard FlowStore's `started_ms` also uses, for a consistent turn timestamp).
+fn epoch_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
 }
 
 fn summarize_json_api_body(path: &str, value: &Value) -> String {
@@ -1252,6 +1416,160 @@ fn with_model_headers(mut response: Response, requested: &str, served: &str) -> 
     response
 }
 
+/// F1b served-response tee: an `http_body::Body` that mirrors `inner` frame for
+/// frame, COPYING each DATA frame's bytes into the turn-capture `served_response`
+/// section (never retaining the frame's backing allocation) and passing every
+/// frame through UNCHANGED — so SSE framing, keep-alive comments, and trailers are
+/// preserved byte-for-byte. Capture is BACK-PRESSURED (F1b review #1): before
+/// pulling each frame it reserves a slot in the section's BOUNDED writer channel
+/// and, when the writer is behind, returns `Poll::Pending` — throttling the served
+/// stream to disk pace rather than buffering the whole body in RAM (bounded
+/// memory, AGENTS.md). Its `Drop` reports `served_done`: `partial` unless the
+/// stream reached a clean end (a `Ready(None)` poll, or delivering its full
+/// promised length). A client disconnect drops the body mid-stream → partial.
+/// F1b review r2: if `served_sink` ever closes early (writer gone mid-stream —
+/// see the field doc), that alone permanently marks the section `partial` via
+/// `mark_served_degraded`, REGARDLESS of how `Drop`'s own clean-end check comes
+/// out — a truncated capture must never be reported complete just because the
+/// client-facing stream itself still ended cleanly.
+struct TeeBody {
+    inner: Body,
+    state: Arc<crate::turn_capture::TurnCaptureState>,
+    /// Back-pressured sink into the `served_response` section's BOUNDED writer
+    /// channel (F1b review #1). `None` once the writer is gone (a section write
+    /// error closed the channel) — capture then stops but the served stream
+    /// continues byte-for-byte (a diagnostic failure must never break the served
+    /// bytes). The transition to `None` also permanently marks the section
+    /// `partial` (F1b review r2) — see `poll_frame`.
+    served_sink: Option<crate::turn_capture::ServedSink>,
+    /// Set once `inner` yields `Poll::Ready(None)` (clean end-of-stream).
+    clean_eos: bool,
+    /// Total DATA bytes forwarded so far (for the exact-length clean check).
+    forwarded: u64,
+    /// The inner body's exact promised length at construction (a non-streaming JSON
+    /// body has `Some`; a chunked SSE stream has `None`). When `Some`, delivering
+    /// that many bytes is a clean end even if hyper stops polling the
+    /// Content-Length body before it yields `Ready(None)`.
+    exact_len: Option<u64>,
+}
+
+impl http_body::Body for TeeBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        // `axum::body::Body` is `Unpin`, so the fields can be reached by `&mut`.
+        let this = self.get_mut();
+
+        // Bounded-memory back-pressure (F1b review #1): reserve a slot in the
+        // served-section writer channel BEFORE pulling the next frame. If the disk
+        // writer is behind, the BOUNDED channel is full → `poll_reserve` returns
+        // `Pending` and we propagate it, throttling the served stream to the
+        // writer's pace instead of piling the whole body into RAM. A closed channel
+        // (writer gone) drops the sink; we then forward WITHOUT capture — a
+        // diagnostic failure must never break or stall the served stream (AGENTS.md).
+        // F1b review r2 (don't-lie-with-zeros): that also means every byte from
+        // here on is missing the section, so mark the section degraded RIGHT NOW —
+        // sticky, so a later clean end-of-stream can never report this capture
+        // complete (`TurnCaptureState::mark_served_degraded`).
+        if let Some(sink) = this.served_sink.as_mut() {
+            match sink.poll_reserve(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(_)) => {
+                    this.served_sink = None;
+                    this.state.mark_served_degraded();
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref()
+                    && !data.is_empty()
+                {
+                    this.forwarded = this.forwarded.saturating_add(data.len() as u64);
+                    // Send the COPY into the slot reserved above; the frame passes
+                    // through to the client UNCHANGED (never a retained slice —
+                    // AGENTS.md). A failed send just means the writer went away —
+                    // mark the section degraded (F1b review r2; see above).
+                    if let Some(sink) = this.served_sink.as_mut()
+                        && sink.send(data.to_vec()).is_err()
+                    {
+                        this.served_sink = None;
+                        this.state.mark_served_degraded();
+                    }
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(None) => {
+                this.clean_eos = true;
+                Poll::Ready(None)
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for TeeBody {
+    fn drop(&mut self) {
+        // Clean when we observed end-of-stream, OR forwarded the full promised
+        // length (hyper can stop polling a Content-Length body before it ever
+        // yields `Ready(None)`, so a complete non-streaming response would else be
+        // mis-flagged partial). Otherwise the served stream was cut short (client
+        // disconnect / mid-stream error) → partial. F1b review r2: this `clean`
+        // check is about the CLIENT-facing stream only — if the section itself
+        // was marked degraded mid-stream (`poll_frame`'s `mark_served_degraded`
+        // calls, section write errors), `served_done`'s `close` cannot unset that
+        // sticky mark no matter what we pass here, so a `served_sink` failure can
+        // never be reported as a complete capture just because the client still
+        // saw a clean end.
+        let clean = self.clean_eos || self.exact_len.is_some_and(|len| self.forwarded >= len);
+        self.state.served_done(!clean);
+    }
+}
+
+/// Wrap `response`'s body in a [`TeeBody`] so its served bytes are captured to the
+/// turn's `served_response` section. Status/headers are preserved; only the body
+/// is wrapped, and `size_hint`/`is_end_stream` are forwarded so a non-streaming
+/// response keeps its `Content-Length` and framing.
+fn tee_served_body(
+    response: Response,
+    state: Arc<crate::turn_capture::TurnCaptureState>,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let exact_len = http_body::Body::size_hint(&body).exact();
+    // F1c (finding #2): record that the served tee is now installed BEFORE the
+    // `MiddlewareCaptureGuard` served backstop can drop (it drops when `log_api_call`
+    // returns, AFTER this runs). With the tee installed, the tee's own `Drop` owns
+    // `served_done`; the backstop stays inert. Only a pre-tee unwind (this never
+    // runs) leaves the flag false, so the backstop fires `served_done` to resolve the
+    // barrier instead of leaking the turn.
+    state.mark_served_tee_installed();
+    // Take the back-pressured served sink BEFORE moving `state` into the tee.
+    let served_sink = state.served_sink();
+    let tee = TeeBody {
+        inner: body,
+        state,
+        served_sink,
+        clean_eos: false,
+        forwarded: 0,
+        exact_len,
+    };
+    Response::from_parts(parts, Body::new(tee))
+}
+
 fn stream_chat_completions_response(
     model: String,
     include_usage: bool,
@@ -1779,6 +2097,113 @@ mod tests {
     use axum::body::Bytes;
     use axum::http::HeaderName;
     use sha2::Digest as _;
+
+    /// Finding 1: the inbound redaction produces IDENTICAL redacted output on the
+    /// inline (small) and `spawn_blocking` (large) paths — a secret-bearing field and
+    /// an image `data:` URI are BOTH redacted, with no raw secret/image bytes
+    /// surviving, and the requested `model` is still extracted. The large body forces
+    /// the off-worker path (`> TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES`); the small one
+    /// stays inline. Both must round-trip to valid JSON with the same redaction.
+    #[tokio::test]
+    async fn offload_inbound_redacts_small_inline_and_large_spawn_blocking_identically() {
+        use serde_json::Value;
+        let body_with_filler = |filler: &str| {
+            Bytes::from(format!(
+                r#"{{"model":"claude-x","api_key":"sk-LEAK-INBOUND-9999","messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"data:image/png;base64,RAWINBOUNDIMG7777"}}}},{{"type":"text","text":"{filler}"}}]}}]}}"#
+            ))
+        };
+
+        let small = body_with_filler("hi");
+        assert!(
+            small.len() <= super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
+            "small body takes the inline path"
+        );
+        let (model_small, red_small, partial_small) =
+            super::offload_redacted_inbound_section(small.clone()).await;
+        assert!(!partial_small, "a clean inline redaction is not partial");
+
+        let large = body_with_filler(&"x".repeat(32 * 1024));
+        assert!(
+            large.len() > super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
+            "large body takes the spawn_blocking path"
+        );
+        let (model_large, red_large, partial_large) =
+            super::offload_redacted_inbound_section(large).await;
+        assert!(
+            !partial_large,
+            "a clean spawn_blocking redaction is not partial"
+        );
+
+        for (label, model, redacted) in [
+            ("small/inline", model_small, red_small),
+            ("large/spawn_blocking", model_large, red_large),
+        ] {
+            assert_eq!(
+                model.as_deref(),
+                Some("claude-x"),
+                "{label}: model extracted"
+            );
+            let text = String::from_utf8(redacted).expect("redacted section is UTF-8");
+            assert!(
+                !text.contains("sk-LEAK-INBOUND-9999"),
+                "{label}: secret value redacted"
+            );
+            assert!(
+                text.contains("[redacted]"),
+                "{label}: secret marker present"
+            );
+            assert!(
+                !text.contains("RAWINBOUNDIMG7777"),
+                "{label}: raw image bytes redacted"
+            );
+            assert!(
+                text.contains("<redacted uri>"),
+                "{label}: image URI marker present"
+            );
+            let value: Value = serde_json::from_str(&text).expect("redacted section is valid JSON");
+            assert_eq!(value["model"], "claude-x", "{label}: structure intact");
+        }
+    }
+
+    /// F1 (Fable-fix, BLOCKING): the large-body `spawn_blocking` offload must be
+    /// handed an OWNED `Vec` copy, NOT the Arc-backed `Bytes` (which would PIN the
+    /// 256 MiB inbound middleware backing for the task's lifetime — AGENTS.md line
+    /// 144). A large body forces the off-worker path; the capture completes correctly
+    /// AND the offload retains NO clone of the inbound `Bytes` backing after it returns
+    /// (the observable half of the no-pin contract): a second handle to the same shared
+    /// backing is uniquely reclaimable once the offload dropped its `Bytes` in favor of
+    /// the owned copy.
+    #[tokio::test]
+    async fn offload_large_inbound_hands_owned_copy_not_pinned_bytes() {
+        let large = Bytes::from(format!(
+            r#"{{"model":"claude-x","api_key":"sk-LEAK-PIN-1234","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(64 * 1024)
+        ));
+        assert!(
+            large.len() > super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
+            "body forces the spawn_blocking path"
+        );
+        // A SECOND handle to the SAME shared backing; if the offload retained a clone
+        // (old bug: moved the `Bytes` into `spawn_blocking`) this could not reclaim it.
+        let observer = large.clone();
+
+        let (model, redacted, partial) = super::offload_redacted_inbound_section(large).await;
+        assert_eq!(model.as_deref(), Some("claude-x"), "model extracted");
+        assert!(!partial, "a clean spawn_blocking redaction is not partial");
+        let text = String::from_utf8(redacted).expect("redacted section is UTF-8");
+        assert!(
+            !text.contains("sk-LEAK-PIN-1234"),
+            "secret redacted on the offloaded path"
+        );
+
+        // The offload converted the body to an OWNED `Vec` for the blocking task and
+        // dropped its `Bytes`, so nothing pins the shared backing: `observer` is now the
+        // SOLE owner and reclaims uniquely (no retained slice of the inbound buffer).
+        assert!(
+            observer.try_into_mut().is_ok(),
+            "offload retained no clone of the inbound Bytes backing"
+        );
+    }
 
     /// D7a R3 #1 (REGRESSION): a `/dashboard/login` body must yield NO
     /// body-derived log field. Emitting `body_sha256` + `body_bytes` (length) for

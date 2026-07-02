@@ -8,6 +8,7 @@ use crate::proxy_headers::header_name_eq;
 use crate::proxy_headers::is_hop_by_hop_header;
 use crate::sse_guard::bounded_sse_byte_stream;
 use crate::sse_guard::default_max_sse_frame_bytes;
+use crate::turn_capture::TurnCaptureState;
 use async_trait::async_trait;
 use axum::body::Bytes;
 use eventsource_stream::Eventsource;
@@ -811,6 +812,85 @@ fn bytes_contain_image_uri(bytes: &[u8]) -> bool {
         || bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"http"))
 }
 
+/// F1d: the redacted bytes for the turn-capture `upstream_request` section — the
+/// FINAL sanitized on-wire `ChatCompletionRequest` (post profile/lowering/
+/// sanitize), redacted through the SAME primitives `UpstreamRequestLogger`/the
+/// HTTP inbound-trace capture use: secret keys via
+/// [`crate::redaction::redact_payload_secrets_in_value`] (AGENTS.md line 137 — a
+/// NEW logged surface must not bypass secret redaction; `UpstreamRequestLogger`
+/// only redacts image URIs, so this is a STRICTER pass, not a mirror of it),
+/// image/data URIs via [`crate::redaction::redact_image_uris_in_value`].
+/// Serializes into a fresh owned `Vec<u8>` — never retains a slice of any larger
+/// buffer (AGENTS.md line 144); `request` is already an owned, parsed typed
+/// struct, not a slice of the inbound middleware buffer.
+fn redacted_upstream_request_bytes(request: &ChatCompletionRequest) -> Vec<u8> {
+    match serde_json::to_value(request) {
+        Ok(mut value) => {
+            crate::redaction::redact_payload_secrets_in_value(&mut value);
+            crate::redaction::redact_image_uris_in_value(&mut value);
+            serde_json::to_vec(&value).unwrap_or_else(|_| b"<failed to serialize json>".to_vec())
+        }
+        Err(_) => b"<failed to serialize json>".to_vec(),
+    }
+}
+
+/// Fable review (Finding 1): requests whose message-content text is at or below this
+/// size have their `upstream_request` redaction done INLINE; a larger request moves
+/// the serialize+redact+re-serialize onto the blocking pool so it never stalls the
+/// tokio worker (mirrors [`UpstreamRequestLogger`]'s `spawn_blocking`). Matches the
+/// 16 KiB HTTP journal dump gate (`http::API_LOG_PAYLOAD_DUMP_LIMIT_BYTES`).
+const TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES: usize = 16 * 1024;
+
+/// A cheap, allocation-free size estimate for the inline-vs-`spawn_blocking` decision
+/// on the `upstream_request` redaction: the total text length of the message
+/// contents, which dominate a large Claude Code (1M-context) request. An
+/// under-estimate only keeps an unusual request inline; a large message history (the
+/// finding's motivating case) is always well over the limit. It does NOT allocate or
+/// serialize (unlike [`estimate_leaf_input_tokens`]), so it is safe to run on the
+/// worker every dispatch.
+fn estimate_request_text_len(request: &ChatCompletionRequest) -> usize {
+    fn value_text_len(value: &Value) -> usize {
+        match value {
+            Value::String(s) => s.len(),
+            Value::Array(items) => items.iter().map(value_text_len).sum(),
+            Value::Object(map) => map.values().map(value_text_len).sum(),
+            _ => 0,
+        }
+    }
+    request
+        .messages
+        .iter()
+        .map(|message| message.content.as_ref().map_or(0, value_text_len))
+        .sum()
+}
+
+/// Fable review (Finding 1): produce the redacted `upstream_request` bytes, moving the
+/// serialize+redact+re-serialize OFF the tokio worker for a LARGE request via
+/// `spawn_blocking` (mirroring [`UpstreamRequestLogger`]). A small request redacts
+/// inline; a large one is CLONED once (the only on-worker O(body) cost — a struct
+/// clone is far cheaper than the alloc-heavy `to_value`+walk+`to_vec` it offloads) and
+/// redacted on the blocking pool. Redaction is IDENTICAL either way (secret + image
+/// URI, via [`redacted_upstream_request_bytes`]). The caller AWAITS this INLINE, BEFORE
+/// the dispatch send and BEFORE `write_upstream_request`, so the last-writer-wins
+/// `replace` lands well before the finalize barrier reads the section (no race, no
+/// hang). `None` ONLY on a `spawn_blocking` join failure (runtime shutdown) — the
+/// caller then leaves the section ABSENT (don't-lie-with-zeros), never a panic.
+async fn offload_redacted_upstream_request_bytes(
+    request: &ChatCompletionRequest,
+) -> Option<Vec<u8>> {
+    if estimate_request_text_len(request) <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
+        return Some(redacted_upstream_request_bytes(request));
+    }
+    let owned = request.clone();
+    match tokio::task::spawn_blocking(move || redacted_upstream_request_bytes(&owned)).await {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            tracing::warn!(error = %err, "turn-capture: upstream_request redaction task failed");
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct UpstreamRequestLogger {
     path: PathBuf,
@@ -994,11 +1074,18 @@ impl ReqwestUpstreamClient {
     /// redacting serializer so no oversized/secret body is retained (a slice of the
     /// inbound middleware buffer bounded by `max_request_body_bytes` is NEVER taken — this is a fresh serialization of the
     /// already-parsed typed request).
+    ///
+    /// F1d: `capture` (the turn's `Topic F` durable-capture handle, from
+    /// `BackendChatRequest::capture`) gets the SAME `request` written, whole, into
+    /// its `upstream_request` section — last-writer-wins, so the retry call
+    /// overwrites the first oversized attempt's write (AC-10). `None` when capture
+    /// is disabled/uninstrumented; a no-op then.
     async fn logged_send_chat_request(
         &self,
         url: &Url,
         request: &ChatCompletionRequest,
         response_id: Option<&str>,
+        capture: Option<&Arc<TurnCaptureState>>,
     ) -> AppResult<reqwest::Response> {
         if let Some(ref logger) = self.request_logger
             && let Err(err) = logger.log(request).await
@@ -1010,6 +1097,21 @@ impl ReqwestUpstreamClient {
             );
         }
         self.capture_upstream_body(response_id, request);
+        // Finding 1: redact the `upstream_request` section OFF the tokio worker for
+        // large requests (spawn_blocking), AWAITED here — before the send and before
+        // `write_upstream_request` — so the last-writer-wins `replace` lands well
+        // before the finalize barrier reads the section (no race).
+        if let Some(capture) = capture {
+            // F2 (Fable-fix): on a `spawn_blocking` join FAILURE (runtime shutdown) for
+            // THIS attempt, DON'T silently retain a PRIOR attempt's bytes as the FINAL
+            // (authoritative) request — that breaks last-writer-wins and lies about
+            // which attempt served. Replace with an honest partial marker for THIS
+            // attempt instead (don't-lie-with-zeros); normal success is last-writer-wins.
+            match offload_redacted_upstream_request_bytes(request).await {
+                Some(redacted) => capture.write_upstream_request(&redacted),
+                None => capture.mark_upstream_request_redaction_failed(),
+            }
+        }
         self.send_chat_request(url, request).await
     }
 
@@ -1065,7 +1167,24 @@ impl ReqwestUpstreamClient {
     /// the first send's). The redaction is consistent with the existing request-capture
     /// surface; this is a diagnostic body shown to the authenticated operator, captured ONLY
     /// when explicitly opted in.
-    fn capture_upstream_response_body(&self, serving: Option<&Arc<ServingToken>>, body: &str) {
+    fn capture_upstream_response_body(
+        &self,
+        serving: Option<&Arc<ServingToken>>,
+        capture: Option<&Arc<TurnCaptureState>>,
+        body: &str,
+    ) {
+        // F1e: STAGE the failed HTTP body on the turn-capture handle -- gated ONLY
+        // on capture being enabled (independent of the dashboard response-capture
+        // flag, so durable capture works without the debug UI). Image-URI redaction
+        // only (responses carry no header secrets; keep it cheap + consistent, and
+        // it handles non-JSON error bodies). Last-writer-wins within an attempt; the
+        // per-attempt clear at dispatch start + the streamed-success discriminator
+        // make the committed body the FINAL attempt's (gap-05 semantics).
+        if let Some(capture) = capture {
+            let redacted = crate::redaction::redact_image_uris(body).into_bytes();
+            capture.stage_upstream_response_body(&redacted);
+        }
+        // gap-05 dashboard staging (separately gated on the response-capture flag).
         if !self.flow_store.is_response_capture_enabled() {
             return;
         }
@@ -1193,7 +1312,23 @@ impl ReqwestUpstreamClient {
         request: ChatCompletionRequest,
         response_id: Option<&str>,
         serving: Option<&Arc<ServingToken>>,
+        capture: Option<&Arc<TurnCaptureState>>,
     ) -> AppResult<UpstreamStream> {
+        // F1e review r1/r2: per-attempt reset of the `upstream_response` capture at
+        // the START of this dispatch attempt, so the turn's raw response is
+        // FINAL-ATTEMPT-ONLY (mirrors the gap-05 `clear_pending_response_body()`
+        // seam). ONE call now does BOTH: swap in a fresh, empty streamed-section AND
+        // drop any staged FINAL failed body -- so a SUPERSEDED earlier prefetch
+        // attempt (2xx headers → some raw bytes → its tap guard closed the section
+        // sticky-`partial`, then failover) and an earlier provider's staged error
+        // body both get DISCARDED; only the serving/final attempt wins (last-writer-
+        // wins). The reset is SYNCHRONOUS + await-free (review r2 BLOCKING): this seam
+        // runs inside the engine's cancellable per-round `select!`, so a cancel/hang-
+        // up must never drop the reset mid-swap and leave the superseded attempt
+        // authoritative -- the swap + clears are one atomic critical section.
+        if let Some(capture) = capture {
+            capture.reset_upstream_response();
+        }
         // First attempt. On a non-2xx whose body indicates a context/completion
         // token-limit overflow, shrink `max_completion_tokens` and retry ONCE.
         // This happens before any SSE chunk is parsed/yielded downstream, so it
@@ -1201,7 +1336,7 @@ impl ReqwestUpstreamClient {
         // leaf client so the failover/routing layers never see a context-limit
         // error as a provider failure (it is a same-provider shrink-and-retry).
         let response = self
-            .logged_send_chat_request(url, &request, response_id)
+            .logged_send_chat_request(url, &request, response_id, capture)
             .await?;
         // Gap 03 round-1 review (F1): the upstream response HEADERS just arrived — this is
         // the TRUE on-wire first-byte time. Stamp it BEFORE inspecting the status, so a
@@ -1211,7 +1346,8 @@ impl ReqwestUpstreamClient {
         stamp_header_byte(serving);
         let status = response.status();
         if status.is_success() {
-            return stream_success_response(response, self.max_sse_frame_bytes).await;
+            return stream_success_response(response, self.max_sse_frame_bytes, capture.cloned())
+                .await;
         }
 
         let body = response.text().await.unwrap_or_default();
@@ -1238,14 +1374,22 @@ impl ReqwestUpstreamClient {
                 new_max_completion_tokens = retry.max_completion_tokens,
                 "upstream context-window overflow; retrying once with reduced completion budget"
             );
-            // D2: the retry is the body that ACTUALLY goes on the wire on the shrink
-            // path, so the capture must reflect the shrunk request (same `response_id`).
+            // D2/F1d: the retry is the body that ACTUALLY goes on the wire on the
+            // shrink path, so BOTH captures (D2's `upstream_body`, F1d's
+            // `upstream_request` section) must reflect the shrunk request (same
+            // `response_id`; F1d is last-writer-wins so this overwrites the first
+            // oversized attempt's write — AC-10).
             let retry_response = self
-                .logged_send_chat_request(url, &retried, response_id)
+                .logged_send_chat_request(url, &retried, response_id, capture)
                 .await?;
             let retry_status = retry_response.status();
             if retry_status.is_success() {
-                return stream_success_response(retry_response, self.max_sse_frame_bytes).await;
+                return stream_success_response(
+                    retry_response,
+                    self.max_sse_frame_bytes,
+                    capture.cloned(),
+                )
+                .await;
             }
             // The retry ALSO failed. If it is again a context overflow, this is a
             // same-provider sizing problem, not a provider failure: surface a
@@ -1257,7 +1401,8 @@ impl ReqwestUpstreamClient {
             // Gap 05: the RETRY is the body that actually ended the turn on the
             // shrink-and-retry path — stage IT (last-writer-wins over the first
             // attempt's body) so the dashboard shows the upstream's final word.
-            self.capture_upstream_response_body(serving, &retry_body);
+            // F1e also stages it onto the turn-capture handle.
+            self.capture_upstream_response_body(serving, capture, &retry_body);
             if classify_context_overflow(
                 &retry_body,
                 self.min_completion_tokens,
@@ -1297,7 +1442,8 @@ impl ReqwestUpstreamClient {
         // Gap 05: a first-attempt non-2xx that did NOT trigger a context-overflow retry
         // — stage the upstream error body so the operator can see why the turn failed (it
         // is cleared if a later failover provider serves; committed at finalize otherwise).
-        self.capture_upstream_response_body(serving, &body);
+        // F1e also stages it onto the turn-capture handle (final failed HTTP body).
+        self.capture_upstream_response_body(serving, capture, &body);
         // E2a: request-intrinsic 4xx {400,413,415,422} → `Terminal` (never cools or fails
         // over a healthy provider — the request itself is unacceptable to any equivalent
         // backend; e.g. an image reaching a text-only upstream). 401/403/404/408/429/5xx
@@ -1356,6 +1502,11 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // D5 R4 (MEDIUM): the shared serving token, captured before `backend.request` is
         // moved into `sanitize`. The leaf finalizes the served model onto it below.
         let serving = backend.serving.clone();
+        // F1d: the turn's durable-capture handle, captured here (mirrors
+        // `response_id`/`serving` above) so both the first-attempt and any
+        // shrink-retry send below can write the SANITIZED on-wire request into the
+        // SAME turn's `upstream_request` section (last-writer-wins).
+        let capture = backend.capture.clone();
         let request = sanitize_chat_request(backend.request, self.flatten_content);
         // D5 R4 (MEDIUM): finalize the ACTUAL on-wire model onto the shared serving
         // token, overwriting the engine's PRE-routing guess (and any earlier
@@ -1395,7 +1546,13 @@ impl UpstreamClient for ReqwestUpstreamClient {
                 serving.clear_pending_response_body();
             }
             return match self
-                .dispatch_chat_stream(&url, request, response_id.as_deref(), serving.as_ref())
+                .dispatch_chat_stream(
+                    &url,
+                    request,
+                    response_id.as_deref(),
+                    serving.as_ref(),
+                    capture.as_ref(),
+                )
                 .await
             {
                 Ok(stream) => {
@@ -1431,8 +1588,14 @@ impl UpstreamClient for ReqwestUpstreamClient {
             };
         }
 
-        self.dispatch_chat_stream(&url, request, response_id.as_deref(), serving.as_ref())
-            .await
+        self.dispatch_chat_stream(
+            &url,
+            request,
+            response_id.as_deref(),
+            serving.as_ref(),
+            capture.as_ref(),
+        )
+        .await
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
@@ -1630,6 +1793,9 @@ impl FailoverUpstreamClient {
             // `Arc`, not the token) so the leaf still captures + tags this flow.
             response_id: backend.response_id.clone(),
             serving: backend.serving.clone(),
+            // F1d (AC-11): carry the turn-capture handle forward too -- a captured
+            // turn keeps capturing across a failover provider rebuild.
+            capture: backend.capture.clone(),
         }
     }
 
@@ -2119,6 +2285,9 @@ impl RoutingUpstreamClient {
             // `Arc`, not the token).
             response_id: backend.response_id.clone(),
             serving: backend.serving.clone(),
+            // F1d: carry the turn-capture handle forward too (same reasoning as the
+            // failover rebuild above, `request_for_provider`).
+            capture: backend.capture.clone(),
         }
     }
 
@@ -3284,6 +3453,9 @@ impl ServingToken {
 /// `Option` and additive; production sets them ONLY at the engine's
 /// `BackendChatRequest::new`, and the failover/routing rebuilds CLONE the `Arc`s
 /// forward so the same token threads through the whole dispatch.
+///
+/// `capture` is F1's (Topic F) durable-turn-capture handle -- see its field doc
+/// below.
 #[derive(Debug, Clone)]
 pub struct BackendChatRequest {
     pub request: ChatCompletionRequest,
@@ -3295,6 +3467,22 @@ pub struct BackendChatRequest {
     /// Shared mutable serving identity (D2). Allocated fresh per flow by the engine;
     /// the routing layer sets `route`, the failover layer sets `provider`.
     pub serving: Option<Arc<ServingToken>>,
+    /// F1d: the turn's durable-capture handle (Topic F, `turn_capture.rs`), when
+    /// `turn_capture_dir` is configured and this flow is instrumented -- the SAME
+    /// `Arc<TurnCaptureState>` the engine's `CaptureGuard`/registry hold (looked up
+    /// from `Gateway::turn_capture().state(api_call_id)` at the single production
+    /// construction site, `engine.rs`'s `run_turn`). `None` when capture is
+    /// disabled/uninstrumented or in a test that does not exercise it (every
+    /// `BackendChatRequest::new` call defaults this to `None`; use
+    /// [`with_capture`](Self::with_capture) to attach one).
+    ///
+    /// The failover/routing rebuilds (`request_for_provider`, `routed_request`)
+    /// CLONE this `Arc` forward -- for free, mirroring `response_id`/`serving` --
+    /// so a captured turn keeps capturing across a provider rebuild (AC-11).
+    /// Diagnostic file IO stays OFF the `ServingToken`/serving-metrics mutex
+    /// (spec Design #3) precisely because the carrier is here, not on
+    /// `ServingToken`.
+    pub capture: Option<Arc<TurnCaptureState>>,
 }
 
 impl BackendChatRequest {
@@ -3304,7 +3492,9 @@ impl BackendChatRequest {
     /// from policies keyed by `request.model` inside `finalize_request_for_backend`.
     /// This is the SINGLE production construction point that sets `response_id` +
     /// `serving`; the failover/routing rebuilds clone the `Arc`s forward and the
-    /// test helpers pass `None` for both.
+    /// test helpers pass `None` for both. `capture` defaults to `None` here (the
+    /// many existing call sites, mostly tests, do not care about it); the engine
+    /// attaches one via [`with_capture`](Self::with_capture).
     pub fn new(
         request: ChatCompletionRequest,
         client_chat_template_kwargs: Option<JsonMap<String, Value>>,
@@ -3316,7 +3506,17 @@ impl BackendChatRequest {
             client_chat_template_kwargs,
             response_id,
             serving,
+            capture: None,
         }
+    }
+
+    /// F1d: attach the turn-capture handle (builder-style, so the many existing
+    /// `BackendChatRequest::new(...)` call sites -- almost all tests that do not
+    /// exercise capture -- are unaffected). Only the engine's production
+    /// construction site (`engine.rs`'s `run_turn`) calls this.
+    pub fn with_capture(mut self, capture: Option<Arc<TurnCaptureState>>) -> Self {
+        self.capture = capture;
+        self
     }
 }
 
@@ -3999,7 +4199,30 @@ fn parse_token_count(group: &str) -> i64 {
 async fn stream_success_response(
     response: reqwest::Response,
     max_sse_frame_bytes: usize,
+    capture: Option<Arc<TurnCaptureState>>,
 ) -> AppResult<UpstreamStream> {
+    // F1e: tap the RAW pre-parse upstream bytes into the turn's `upstream_response`
+    // section BEFORE the G6 frame guard + SSE parser see them -- the raw bytes are
+    // the ground truth (a `<think>` leak is a 200 OK; nothing else persists it). The
+    // tap COPIES each chunk (no `Bytes`-slice retention, AGENTS.md line 144) and
+    // forwards it UNCHANGED, so the guard/parser see identical bytes; a bounded,
+    // back-pressured [`TurnCaptureState::upstream_response_sink`] throttles the read
+    // to disk pace so a slow disk can never accumulate the whole response in RAM
+    // (bounded memory -- NOT an unbounded channel). Only wrapped when capture is
+    // enabled, so a disabled turn pays nothing (the byte stream flows straight into
+    // the guard as before).
+    let byte_stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>> =
+        match capture {
+            // F1e review r3 (Finding 2 -- don't claim a complete empty response): the
+            // `upstream_response_streamed` discriminator is NO LONGER set here, at
+            // header time. If it were, a bare-leaf cancel AFTER 2xx headers but BEFORE
+            // the first `stream.next()` (the tap block never runs) would finalize an
+            // EMPTY `upstream_response` with `partial:false` -- lyingly "complete". The
+            // tap now marks streamed only once a real byte flows OR the stream reaches a
+            // CLEAN end, so a pre-first-byte cancel stays partial/absent (truthful).
+            Some(capture) => Box::pin(tap_upstream_response(response.bytes_stream(), capture)),
+            None => Box::pin(response.bytes_stream()),
+        };
     // Bound the upstream SSE read BEFORE `eventsource()` parses it (G6). The
     // `eventsource-stream` 0.2 parser accumulates bytes into an internal
     // `String`/`Vec` buffer and only flushes on an event boundary (a blank
@@ -4008,7 +4231,7 @@ async fn stream_success_response(
     // caps the bytes accumulated since the last boundary and surfaces a clean
     // `AppError` before the parser can over-accumulate. The configured request-body
     // cap in `http.rs` is inbound-only and does NOT cover this response path.
-    let bounded = bounded_sse_byte_stream(response.bytes_stream(), max_sse_frame_bytes);
+    let bounded = bounded_sse_byte_stream(byte_stream, max_sse_frame_bytes);
     let stream = bounded.eventsource().filter_map(|result| async move {
         match result {
             Ok(event) if event.data == "[DONE]" => None,
@@ -4029,6 +4252,120 @@ async fn stream_success_response(
         }
     });
     Ok(Box::pin(stream))
+}
+
+/// F1e: tee the RAW upstream byte stream into the turn's `upstream_response`
+/// capture section, forwarding every chunk UNCHANGED. Each chunk is COPIED
+/// (`to_vec` -- never a retained `Bytes` slice, AGENTS.md line 144) into the
+/// BOUNDED, back-pressured [`ServedSink`]: [`poll_reserve`](crate::turn_capture::ServedSink::poll_reserve)
+/// applies flow control BEFORE the copy, so a slow disk throttles the upstream
+/// read to disk pace instead of piling the whole response into RAM (bounded
+/// memory -- the SAME OOM class F1b's review caught; NO unbounded channel).
+///
+/// A diagnostic failure must NEVER break or stall the served turn: a sink close /
+/// send error, or a mid-stream transport error, drops the sink and marks the
+/// section sticky-`partial` -- forwarding continues byte-for-byte WITHOUT capture.
+/// The [`UpstreamTapGuard`] closes the section on drop so the assembly barrier
+/// resolves in BOUNDED time (no hang): a clean end (the raw stream reached `None`)
+/// closes it non-partial; a drop BEFORE that (a G6 frame-cap rejection downstream
+/// stops pulling, a client disconnect, an engine drop) closes it `partial`.
+fn tap_upstream_response<S>(
+    inner: S,
+    capture: Arc<TurnCaptureState>,
+) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    async_stream::stream! {
+        // `guard` declared FIRST so on an early drop (future dropped mid-await --
+        // G6 downstream / disconnect / engine drop) it drops LAST, after `sink`, so
+        // both the sink's sender clone and the section close land: the writer then
+        // sees all senders gone and terminates (no hang).
+        let mut guard = UpstreamTapGuard::new(Arc::clone(&capture));
+        let mut sink = capture.upstream_response_sink();
+        // F1e review r3 (Finding 2): the streamed discriminator is set on the FIRST
+        // real byte (below), NOT at header time -- so a 2xx-headers-then-cancel before
+        // any byte never claims a complete (empty) response. A local latch avoids a
+        // redundant atomic store per chunk.
+        let mut streamed_marked = false;
+        let mut inner = std::pin::pin!(inner);
+        while let Some(item) = inner.next().await {
+            match &item {
+                Ok(bytes) if !bytes.is_empty() => {
+                    if !streamed_marked {
+                        capture.mark_upstream_response_streamed();
+                        streamed_marked = true;
+                    }
+                    if let Some(active) = sink.as_mut() {
+                        // Reserve a slot BEFORE copying (bounded memory / back-pressure).
+                        match std::future::poll_fn(|cx| active.poll_reserve(cx)).await {
+                            Ok(()) => {
+                                if active.send(bytes.to_vec()).is_err() {
+                                    capture.mark_upstream_response_degraded();
+                                    sink = None;
+                                }
+                            }
+                            Err(_) => {
+                                capture.mark_upstream_response_degraded();
+                                sink = None;
+                            }
+                        }
+                    }
+                }
+                // An empty frame carries nothing to capture -- forward as-is.
+                Ok(_) => {}
+                // A mid-stream transport error: the raw capture is truncated.
+                Err(_) => {
+                    capture.mark_upstream_response_degraded();
+                    sink = None;
+                }
+            }
+            // Forward the ORIGINAL chunk UNCHANGED (tee = copy + forward).
+            yield item;
+        }
+        // The raw upstream stream reached a CLEAN end. Mark streamed (idempotent with
+        // the first-byte mark above) so that a genuinely empty-but-cleanly-closed
+        // upstream response (2xx headers + clean EOS + zero bytes) is a TRUTHFUL
+        // `partial:false` empty section -- distinct from a pre-first-byte cancel, which
+        // never reaches here and so stays partial/absent (Finding 2). Then drop the
+        // sink so the writer sees its clone gone, and mark clean so the guard closes
+        // the section non-partial.
+        capture.mark_upstream_response_streamed();
+        drop(sink);
+        guard.mark_clean();
+    }
+}
+
+/// F1e drop guard for [`tap_upstream_response`]: mirrors `http.rs`'s `TeeBody`
+/// `Drop`. Marks the `upstream_response` section sticky-`partial` unless the raw
+/// stream reached a clean end, and ALWAYS closes it so the assembly barrier's
+/// `await_upstream_response_closed` resolves in bounded time (no hang) -- for the
+/// clean end (via the block completing) AND for an early drop (G6 frame-cap
+/// rejection downstream, client disconnect, engine drop).
+struct UpstreamTapGuard {
+    capture: Arc<TurnCaptureState>,
+    clean: bool,
+}
+
+impl UpstreamTapGuard {
+    fn new(capture: Arc<TurnCaptureState>) -> Self {
+        Self {
+            capture,
+            clean: false,
+        }
+    }
+
+    fn mark_clean(&mut self) {
+        self.clean = true;
+    }
+}
+
+impl Drop for UpstreamTapGuard {
+    fn drop(&mut self) {
+        // Sticky `partial` for a truncated raw capture; close either way (idempotent
+        // with the barrier's own close) so the writer drains + finalize resolves.
+        self.capture.upstream_response_done(!self.clean);
+    }
 }
 
 fn parse_chat_completion_chunk(data: &str) -> Result<ChatCompletionChunk, serde_json::Error> {
@@ -6129,6 +6466,284 @@ mod tests {
         );
     }
 
+    use crate::turn_capture::TurnCapture;
+
+    /// A unique scratch dir for one F1d turn-capture test (mirrors
+    /// `turn_capture.rs`'s own `temp_dir_path` test helper).
+    fn turn_capture_test_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "llmconduit-upstream-turn-capture-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    /// Poll for the assembled `<dir>/<api_call_id>.json` turn-capture artifact.
+    /// These F1d unit tests dispatch through the leaf/failover client directly
+    /// (bypassing the HTTP/engine layer), so the test itself drives
+    /// `served_done`/`engine_done` to complete the both-`done` assembly barrier;
+    /// this then polls for the async-spawned result. Bounded wait: a barrier that
+    /// never resolves fails the test loudly instead of hanging.
+    async fn wait_for_turn_capture_artifact(
+        dir: &std::path::Path,
+        api_call_id: &str,
+    ) -> serde_json::Value {
+        let path = dir.join(format!("{api_call_id}.json"));
+        for _ in 0..300 {
+            if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            {
+                return value;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("turn-capture artifact never appeared at {}", path.display());
+    }
+
+    /// Finding 1: `offload_redacted_upstream_request_bytes` produces IDENTICAL
+    /// redacted output on the inline (small) and `spawn_blocking` (large) paths — a
+    /// secret (`api_key` → `extra_body`) and an image `data:` URI are BOTH redacted,
+    /// with no raw secret/image bytes surviving. The large request (a padded message
+    /// content) trips `estimate_request_text_len > TURN_CAPTURE_INLINE_REDACT_LIMIT`
+    /// so the redaction runs OFF the tokio worker; the small one stays inline. Both
+    /// paths reuse the SAME `redacted_upstream_request_bytes`, so redaction is
+    /// unchanged.
+    #[tokio::test]
+    async fn f1_offload_upstream_request_redacts_small_inline_and_large_spawn_blocking() {
+        let make = |filler: &str| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "stream": true,
+                "api_key": "sk-LEAK-UPSTREAM-9999",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": "data:image/png;base64,RAWUPSTREAMIMG7777"}},
+                        {"type": "text", "text": filler}
+                    ]
+                }]
+            }))
+            .expect("valid chat request")
+        };
+
+        let small = make("hi");
+        assert!(
+            super::estimate_request_text_len(&small)
+                <= super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
+            "small request takes the inline path"
+        );
+        let red_small = super::offload_redacted_upstream_request_bytes(&small)
+            .await
+            .expect("inline redaction returns bytes");
+
+        let large = make(&"x".repeat(40 * 1024));
+        assert!(
+            super::estimate_request_text_len(&large)
+                > super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
+            "large request takes the spawn_blocking path"
+        );
+        let red_large = super::offload_redacted_upstream_request_bytes(&large)
+            .await
+            .expect("spawn_blocking redaction returns bytes");
+
+        for (label, redacted) in [
+            ("small/inline", red_small),
+            ("large/spawn_blocking", red_large),
+        ] {
+            let text = String::from_utf8(redacted).expect("redacted section is UTF-8");
+            assert!(
+                !text.contains("sk-LEAK-UPSTREAM-9999"),
+                "{label}: secret value redacted"
+            );
+            assert!(
+                text.contains("[redacted]"),
+                "{label}: secret marker present"
+            );
+            assert!(
+                !text.contains("RAWUPSTREAMIMG7777"),
+                "{label}: raw image bytes redacted"
+            );
+            assert!(
+                text.contains("<redacted uri>"),
+                "{label}: image URI marker present"
+            );
+        }
+    }
+
+    /// F1d AC-10: the artifact's `upstream_request` equals the FINAL on-wire
+    /// OpenAI request (post sanitize/profile lowering), redacted (an image URI
+    /// AND a secret both redacted). A shrink-and-retry turn (context-overflow →
+    /// shrink) shows the SHRUNK request (reduced `max_tokens`), NOT the first
+    /// oversized one. Mirrors `leaf_captures_retry_body_on_shrink_path`'s wiremock
+    /// shape, but proves the turn-capture `upstream_request` section (Topic F)
+    /// rather than the D2 FlowStore capture — the two are independent surfaces
+    /// fed by the SAME dispatch.
+    #[tokio::test]
+    async fn f1d_ac10_upstream_request_captures_shrunk_redacted_final_request() {
+        let server = MockServer::start().await;
+        let overflow = "This model's maximum context length is 202752 tokens. \
+            However, you requested 64000 output tokens and your prompt contains 139000 input tokens.";
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(overflow))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(d2_sse_ok_body(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        );
+
+        let dir = turn_capture_test_dir("ac10");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ac10", None, 0).expect("state");
+        // `finalize_and_assemble` awaits every section's close, `inbound_request`
+        // included; this unit test bypasses the HTTP layer (which is the only
+        // production caller of `write_inbound_request`), so close it manually —
+        // otherwise the both-`done` barrier never resolves.
+        state.write_inbound_request(b"{}");
+
+        let mut request = family_request("served-model");
+        // Oversized budget that the shrink path will reduce (202752-100-139000).
+        request.max_output_tokens = Some(64000);
+        // Redaction probe (AC-10): a secret + an image URI both present on the
+        // SAME request that actually goes on the wire for BOTH attempts.
+        request
+            .extra_body
+            .insert("api_key".to_string(), json!("sk-LEAKED-SECRET-VALUE"));
+        request.extra_body.insert(
+            "probe_image".to_string(),
+            json!("data:image/png;base64,RAWIMGBYTES9999"),
+        );
+        let backend = BackendChatRequest::new(request, None, None, None)
+            .with_capture(Some(Arc::clone(&state)));
+
+        let mut stream = client
+            .stream_chat_completion(&backend)
+            .await
+            .expect("retry stream opens");
+        while stream.next().await.is_some() {}
+
+        // This unit test bypasses the HTTP/engine layer, so simulate the turn's
+        // terminal seam directly to trigger the both-`done` assembly barrier.
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_turn_capture_artifact(&dir, "api_ac10").await;
+        let section = &artifact["sections"]["upstream_request"];
+        assert_eq!(
+            section["content"]["max_tokens"], 63652,
+            "captured upstream_request is the SHRUNK retry, not the first 64000 attempt: {section}"
+        );
+        let content_str = section["content"].to_string();
+        assert!(
+            !content_str.contains("sk-LEAKED-SECRET-VALUE"),
+            "secret value must be redacted: {content_str}"
+        );
+        assert!(
+            content_str.contains("[redacted]"),
+            "secret redaction marker present: {content_str}"
+        );
+        assert!(
+            !content_str.contains("RAWIMGBYTES9999"),
+            "no raw image bytes may survive: {content_str}"
+        );
+        assert!(
+            content_str.contains("<redacted uri>"),
+            "image URI redaction marker present: {content_str}"
+        );
+    }
+
+    /// F1d AC-11: a FAILOVER turn (provider A fails → provider B serves) still
+    /// captures — the rebuild (`request_for_provider`) preserves the capture
+    /// handle — and `upstream_request` is the SERVING (B's) attempt's request,
+    /// not A's failed one. Mirrors
+    /// `gap05_failover_a500_then_b200_commits_no_stale_error_body`'s two-provider
+    /// wiremock shape; the two providers carry DIFFERENT `upstream_model`
+    /// rewrites so the captured section's `model` unambiguously identifies WHICH
+    /// provider's request was recorded.
+    #[tokio::test]
+    async fn f1d_ac11_failover_upstream_request_captures_serving_providers_request() {
+        let down = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string(r#"{"error":{"message":"provider A is down"}}"#),
+            )
+            .mount(&down)
+            .await;
+        let up = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(d2_sse_ok_body()))
+            .mount(&up)
+            .await;
+
+        let dir = turn_capture_test_dir("ac11");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ac11", None, 0).expect("state");
+        // See the AC-10 test above: close `inbound_request` manually since this
+        // unit test bypasses the HTTP layer.
+        state.write_inbound_request(b"{}");
+
+        // Cooldown 0 so the failover loop tries provider A then B in one dispatch.
+        // Dashboard (D2) capture is OFF on both leaves — F1 turn-capture is
+        // independent of the dashboard/FlowStore (AGENTS.md own-gate principle).
+        let failover = FailoverUpstreamClient::new(
+            vec![
+                FailoverUpstreamProvider::new(
+                    "primary",
+                    d2_capturing_client(&down.uri(), DashboardFlowStore::disabled()),
+                    Some("model-a".to_string()),
+                    None,
+                    JsonMap::new(),
+                ),
+                FailoverUpstreamProvider::new(
+                    "backup",
+                    d2_capturing_client(&up.uri(), DashboardFlowStore::disabled()),
+                    Some("model-b".to_string()),
+                    None,
+                    JsonMap::new(),
+                ),
+            ],
+            std::time::Duration::from_secs(0),
+        );
+
+        let backend = BackendChatRequest::new(family_request("m"), None, None, None)
+            .with_capture(Some(Arc::clone(&state)));
+        let mut stream = failover
+            .stream_chat_completion(&backend)
+            .await
+            .expect("failover serves from the backup");
+        while stream.next().await.is_some() {}
+
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_turn_capture_artifact(&dir, "api_ac11").await;
+        let section = &artifact["sections"]["upstream_request"];
+        assert_eq!(
+            section["content"]["model"], "model-b",
+            "upstream_request is the SERVING provider's (B's) request, not A's failed one: {section}"
+        );
+    }
+
     /// A leaf pointed at `server` that returns the SSE 200 success body; `bare`
     /// marks it the direct engine upstream (D2 `into_bare_primary`).
     async fn d2_ok_leaf(server: &MockServer, bare: bool) -> ReqwestUpstreamClient {
@@ -7953,5 +8568,146 @@ mod d4_provider_health_tests {
         assert_eq!(first.version, 1);
         assert!(first.providers.is_empty());
         assert_eq!(second.providers.len(), 1);
+    }
+}
+
+/// F1e review r3 (Finding 2 -- don't claim a complete empty upstream response): the
+/// `upstream_response_streamed` discriminator is set on the FIRST real byte / a CLEAN
+/// end-of-stream, never at 2xx-header time -- so a bare-leaf cancel after headers but
+/// before any byte leaves the section partial/absent (truthful), never an empty
+/// `partial:false` "complete" response. These tests drive the real
+/// [`tap_upstream_response`] / [`stream_success_response`] code paths.
+#[cfg(test)]
+mod f1e_upstream_response_truthful_tests {
+    use super::stream_success_response;
+    use super::tap_upstream_response;
+    use crate::turn_capture::TurnCapture;
+    use axum::body::Bytes;
+    use futures::StreamExt as _;
+    use std::sync::Arc;
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "llmconduit-tap-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    /// Poll for the assembled artifact (assembly is spawned async); a bounded wait so a
+    /// turn that never assembles fails loudly rather than hanging.
+    async fn wait_for_artifact(path: &std::path::Path) -> serde_json::Value {
+        for _ in 0..300 {
+            if let Ok(bytes) = std::fs::read(path) {
+                return serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+                    panic!("artifact at {} not valid JSON: {err}", path.display())
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("artifact never appeared at {}", path.display());
+    }
+
+    /// Finding 2 (the exact scenario): a 2xx upstream response whose raw byte stream is
+    /// DROPPED before the first `stream.next()`. `stream_success_response` must NOT have
+    /// marked the response "streamed" at header time, so finalize OMITS
+    /// `upstream_response` entirely (absent) -- NEVER an empty `partial:false` complete
+    /// section. FAILS on the old code, which set the discriminator at header time.
+    #[tokio::test]
+    async fn stream_success_dropped_before_first_byte_is_absent_not_empty_complete() {
+        let dir = temp_dir("ssr-drop");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ssr_drop", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        {
+            let response = reqwest::Response::from(
+                http::Response::builder()
+                    .status(200)
+                    .body(b"data: {\"choices\":[]}\n\n".to_vec())
+                    .expect("build response"),
+            );
+            let stream = stream_success_response(response, 1024 * 1024, Some(Arc::clone(&state)))
+                .await
+                .expect("stream built");
+            // Dropped WITHOUT a single poll -> the tap block never runs, and (fix) there
+            // is no eager header-time streamed mark, so the discriminator stays clear.
+            drop(stream);
+        }
+        state.write_served_response(b"");
+        state.served_done(true);
+        state.engine_done("cancelled", Some("client_disconnect"));
+
+        let artifact = wait_for_artifact(&dir.join("api_ssr_drop.json")).await;
+        assert!(
+            artifact["sections"].get("upstream_response").is_none(),
+            "2xx headers then cancel before the first byte must leave upstream_response \
+             ABSENT, never an empty partial:false complete: {artifact}"
+        );
+    }
+
+    /// Finding 2 (truthful-empty case): a 2xx upstream response with a CLEAN end-of-
+    /// stream and ZERO bytes. The tap marks streamed at the clean end, so the section IS
+    /// present and `partial:false` with `bytes:0` -- a truthful empty response (allowed),
+    /// distinct from the pre-first-byte cancel above (absent).
+    #[tokio::test]
+    async fn tap_clean_eos_zero_bytes_is_truthful_empty_partial_false() {
+        let dir = temp_dir("clean-empty");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_tap_empty", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        {
+            let inner = futures::stream::empty::<Result<Bytes, reqwest::Error>>();
+            let mut tapped = Box::pin(tap_upstream_response(inner, Arc::clone(&state)));
+            while tapped.next().await.is_some() {}
+        }
+        state.write_served_response(b"");
+        state.served_done(false);
+        state.engine_done("completed", None);
+
+        let artifact = wait_for_artifact(&dir.join("api_tap_empty.json")).await;
+        let section = &artifact["sections"]["upstream_response"];
+        assert_eq!(
+            section["partial"], false,
+            "a clean EOS with zero bytes is a TRUTHFUL partial:false empty: {artifact}"
+        );
+        assert_eq!(section["bytes"], 0, "zero bytes streamed: {artifact}");
+    }
+
+    /// Finding 2 + AC-14: a real byte flows, THEN the stream is cancelled mid-flight. The
+    /// discriminator is marked on the FIRST byte (so the partial bytes are embedded), and
+    /// the tap guard's early drop keeps the section sticky-`partial:true`.
+    #[tokio::test]
+    async fn tap_first_byte_then_cancel_embeds_partial_bytes() {
+        let dir = temp_dir("byte-then-cancel");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_tap_partial", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        {
+            let inner = futures::stream::iter(vec![Ok::<Bytes, reqwest::Error>(
+                Bytes::from_static(b"data: hello\n\n"),
+            )])
+            .chain(futures::stream::pending::<Result<Bytes, reqwest::Error>>());
+            let mut tapped = Box::pin(tap_upstream_response(inner, Arc::clone(&state)));
+            // First byte flows -> streamed marked on the FIRST byte.
+            assert!(tapped.next().await.is_some());
+            // The next poll parks (pending); dropping `tapped` = cancel mid-stream.
+            let fut = tapped.next();
+            futures::pin_mut!(fut);
+            assert!(futures::poll!(fut.as_mut()).is_pending());
+        }
+        state.write_served_response(b"partial");
+        state.served_done(true);
+        state.engine_done("cancelled", Some("client_disconnect"));
+
+        let artifact = wait_for_artifact(&dir.join("api_tap_partial.json")).await;
+        let section = &artifact["sections"]["upstream_response"];
+        let content = section["content"].as_str().expect("content string");
+        assert!(
+            content.contains("hello"),
+            "the first byte's bytes are embedded (streamed marked on first byte): {artifact}"
+        );
+        assert_eq!(
+            section["partial"], true,
+            "a byte-then-cancel stays sticky-partial (AC-14): {artifact}"
+        );
     }
 }

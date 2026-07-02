@@ -38,6 +38,13 @@ pub struct Config {
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
     pub upstream_request_log_path: Option<PathBuf>,
+    /// F1 (Topic F): opt-in durable per-turn capture directory. When set,
+    /// every instrumented inference turn writes `<dir>/<api_call_id>.json`
+    /// with the full inbound request, on-wire upstream request, raw upstream
+    /// response, and served response bytes (redacted) -- see
+    /// `.ralph/specs/F1-durable-turn-capture.md`. `None` disables the
+    /// capture sink entirely (zero-op: no thread, no alloc, no fs).
+    pub turn_capture_dir: Option<PathBuf>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstreams: Vec<UpstreamConfig>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
@@ -623,6 +630,10 @@ pub struct PersistedConfig {
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_log_path: Option<String>,
+    /// F1: opt-in durable per-turn capture directory (see
+    /// `Config::turn_capture_dir`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_capture_dir: Option<String>,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -793,6 +804,7 @@ impl Default for PersistedConfig {
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
@@ -875,6 +887,11 @@ impl Config {
     ///   single/failover branch covers them.
     /// - Mixed (`upstreams` + `model_routes`): per-routing-upstream paths PLUS
     ///   the top-level path (route providers always use the top-level path).
+    ///
+    /// F1: `turn_capture_dir`, when set, is ALWAYS included (unconditionally,
+    /// last) regardless of routing/failover mode -- it is a single
+    /// engine-level directory, not a per-provider request-log path, and it IS
+    /// the directory (not a file whose parent must be extracted).
     pub fn debug_log_dirs(&self) -> Vec<PathBuf> {
         let mut dirs: Vec<PathBuf> = Vec::new();
         let mut push_dir = |path: Option<&PathBuf>| {
@@ -915,6 +932,17 @@ impl Config {
             if !self.model_routes.is_empty() {
                 push_dir(self.upstream_request_log_path.as_ref());
             }
+        }
+        // F1: `turn_capture_dir` IS the directory artifacts land in directly
+        // (`<dir>/<api_call_id>.json`), unlike the request-log paths above
+        // (which are FILE paths whose parent `push_dir` extracts). It is also
+        // engine-level, not per-provider, so -- unlike the branches above --
+        // it is collected unconditionally, independent of routing/failover
+        // mode.
+        if let Some(dir) = self.turn_capture_dir.as_ref()
+            && !dirs.contains(dir)
+        {
+            dirs.push(dir.clone());
         }
         dirs
     }
@@ -969,6 +997,12 @@ impl Config {
                 .cloned(),
             upstream_request_log_path: config
                 .upstream_request_log_path
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            turn_capture_dir: config
+                .turn_capture_dir
                 .as_ref()
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
@@ -1677,6 +1711,11 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     {
         config.upstream_request_log_path = Some(value);
     }
+    if let Ok(value) = env::var("LLMCONDUIT_TURN_CAPTURE_DIR")
+        && !value.trim().is_empty()
+    {
+        config.turn_capture_dir = Some(value);
+    }
     if let Ok(value) = env::var("LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON")
         && !value.trim().is_empty()
         && let Ok(parsed) = serde_json::from_str::<JsonMap<String, JsonValue>>(&value)
@@ -2002,6 +2041,84 @@ model_profiles:
         assert_eq!(result2.upstream_api_key, None);
     }
 
+    /// AC-1 (F1a): `turn_capture_dir` trims like `upstream_request_log_path`
+    /// (mirrors `whitespace_api_key_trimmed`'s trim-to-`None` shape) --
+    /// surrounding whitespace is trimmed, and a blank/whitespace-only value
+    /// resolves to `None` (capture disabled), never `Some("")`.
+    #[test]
+    fn turn_capture_dir_trims_blank_to_none() {
+        let config = PersistedConfig {
+            turn_capture_dir: Some("  /tmp/llmconduit-turns  ".to_string()),
+            ..PersistedConfig::default()
+        };
+        let result = Config::from_persisted(&config).unwrap();
+        assert_eq!(
+            result.turn_capture_dir,
+            Some(PathBuf::from("/tmp/llmconduit-turns"))
+        );
+
+        let blank = PersistedConfig {
+            turn_capture_dir: Some("   ".to_string()),
+            ..PersistedConfig::default()
+        };
+        let blank_result = Config::from_persisted(&blank).unwrap();
+        assert_eq!(blank_result.turn_capture_dir, None);
+
+        let unset = PersistedConfig::default();
+        let unset_result = Config::from_persisted(&unset).unwrap();
+        assert_eq!(unset_result.turn_capture_dir, None);
+    }
+
+    /// AC-1 (F1a): `turn_capture_dir` round-trips through both file formats
+    /// `load_persisted_config` supports (mirrors `toml_file_extension_is_detected_on_load`
+    /// in `tests/port_config.rs`, but exercised here alongside the other
+    /// config-parsing unit tests). Byte-identical resolution from a `.yaml`
+    /// and an equivalent `.toml` file proves the field is "just another
+    /// Option field" on `PersistedConfig` -- no format-specific plumbing
+    /// needed.
+    #[test]
+    fn turn_capture_dir_parses_from_yaml_and_toml_files() {
+        // `Config::from_env_and_file` layers env overrides on top of the file
+        // (`apply_env_overrides`), so hold `ENV_LOCK` and start from a clean
+        // slate -- otherwise this could race `apply_env_overrides_turn_capture_dir`
+        // (below), which mutates the same `LLMCONDUIT_TURN_CAPTURE_DIR` var.
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_TURN_CAPTURE_DIR");
+        }
+        let yaml_path = std::env::temp_dir().join(format!(
+            "llmconduit-turn-capture-{}.yaml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(
+            &yaml_path,
+            "upstream_base_url: http://127.0.0.1:8000/v1\nturn_capture_dir: /tmp/llmconduit-turns\n",
+        )
+        .expect("write yaml");
+        let yaml_config = Config::from_env_and_file(Some(&yaml_path)).expect("load yaml config");
+        let _ = std::fs::remove_file(&yaml_path);
+        assert_eq!(
+            yaml_config.turn_capture_dir,
+            Some(PathBuf::from("/tmp/llmconduit-turns"))
+        );
+
+        let toml_path = std::env::temp_dir().join(format!(
+            "llmconduit-turn-capture-{}.toml",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(
+            &toml_path,
+            "upstream_base_url = \"http://127.0.0.1:8000/v1\"\nturn_capture_dir = \"/tmp/llmconduit-turns\"\n",
+        )
+        .expect("write toml");
+        let toml_config = Config::from_env_and_file(Some(&toml_path)).expect("load toml config");
+        let _ = std::fs::remove_file(&toml_path);
+        assert_eq!(
+            toml_config.turn_capture_dir,
+            Some(PathBuf::from("/tmp/llmconduit-turns"))
+        );
+    }
+
     #[test]
     fn from_persisted_parses_fallback_upstreams() {
         let config = PersistedConfig {
@@ -2216,6 +2333,49 @@ model_profiles:
         };
     }
 
+    /// AC-1 (F1a): `LLMCONDUIT_TURN_CAPTURE_DIR` overrides the persisted
+    /// `turn_capture_dir` (mirrors `apply_env_overrides_system_prompt_prefix`).
+    #[test]
+    fn apply_env_overrides_turn_capture_dir() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLMCONDUIT_TURN_CAPTURE_DIR", "/tmp/llmconduit-turns");
+        }
+        let mut config = PersistedConfig::default();
+        apply_env_overrides(&mut config);
+        assert_eq!(
+            config.turn_capture_dir,
+            Some("/tmp/llmconduit-turns".to_string())
+        );
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_TURN_CAPTURE_DIR");
+        };
+    }
+
+    /// AC-1 (F1a): a blank `LLMCONDUIT_TURN_CAPTURE_DIR` is ignored (same
+    /// blank-guard as every other string env override), leaving the
+    /// persisted value untouched.
+    #[test]
+    fn apply_env_overrides_turn_capture_dir_ignores_blank() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            std::env::set_var("LLMCONDUIT_TURN_CAPTURE_DIR", "   ");
+        }
+        let mut config = PersistedConfig {
+            turn_capture_dir: Some("/tmp/llmconduit-existing".to_string()),
+            ..PersistedConfig::default()
+        };
+        apply_env_overrides(&mut config);
+        assert_eq!(
+            config.turn_capture_dir,
+            Some("/tmp/llmconduit-existing".to_string()),
+            "a blank env override must not clobber the persisted value"
+        );
+        unsafe {
+            std::env::remove_var("LLMCONDUIT_TURN_CAPTURE_DIR");
+        };
+    }
+
     #[test]
     fn apply_env_overrides_template_family() {
         let _guard = ENV_LOCK.lock().expect("env lock");
@@ -2332,6 +2492,7 @@ model_profiles:
             upstream_model: Some("grok-4".to_string()),
             system_prompt_prefix: Some("Global prefix.".to_string()),
             upstream_request_log_path: Some("/tmp/llmconduit-upstream.jsonl".to_string()),
+            turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
             upstream_chat_kwargs: JsonMap::from_iter([(
                 "clear_thinking".to_string(),
                 JsonValue::Bool(false),
@@ -2409,6 +2570,7 @@ model_profiles:
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             // Non-empty GLOBAL base: a global-only sibling key plus a nested key
             // (`thinking`) that CONFLICTS with the per-model policy below, so the
             // leaf precedence (per-model wins on conflict, global-only survives)
@@ -2594,6 +2756,7 @@ model_profiles:
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
@@ -2672,6 +2835,7 @@ model_profiles:
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
@@ -2756,6 +2920,7 @@ model_profiles:
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
@@ -2865,6 +3030,7 @@ model_profiles:
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
@@ -3291,6 +3457,7 @@ model_profiles:
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
@@ -3340,6 +3507,7 @@ model_profiles:
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
@@ -3466,6 +3634,69 @@ model_profiles:
             !dirs.contains(&PathBuf::from("/tmp/llmconduit-inactive-global")),
             "routing mode must exclude the inactive global fallback log dir"
         );
+    }
+
+    /// AC-2 (F1a): `debug_log_dirs()` includes the configured
+    /// `turn_capture_dir` so the existing `debug_log_max_age_hours` rotation
+    /// covers turn-capture artifacts too. Pushed AS-IS (it already IS the
+    /// directory `<api_call_id>.json` artifacts land in, unlike the
+    /// request-log FILE paths above whose *parent* directory is extracted).
+    #[test]
+    fn debug_log_dirs_includes_turn_capture_dir() {
+        let config = Config::from_persisted(&PersistedConfig {
+            upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
+            turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
+            ..PersistedConfig::default()
+        })
+        .expect("config");
+
+        let dirs = config.debug_log_dirs();
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/tmp/llmconduit-top"),
+                PathBuf::from("/tmp/llmconduit-turns"),
+            ],
+            "turn_capture_dir must be collected alongside the request-log dirs"
+        );
+    }
+
+    /// AC-2 (F1a): unlike the per-provider request-log dirs, `turn_capture_dir`
+    /// is engine-level -- it must be collected even in ROUTING mode (where the
+    /// top-level `upstream_request_log_path` itself is inactive/excluded).
+    #[test]
+    fn debug_log_dirs_includes_turn_capture_dir_in_routing_mode() {
+        let config = Config::from_persisted(&PersistedConfig {
+            turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
+            upstreams: vec![PersistedUpstream {
+                upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+                ..PersistedUpstream::default()
+            }],
+            ..PersistedConfig::default()
+        })
+        .expect("config");
+
+        let dirs = config.debug_log_dirs();
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("/tmp/llmconduit-turns")],
+            "turn_capture_dir must be collected in routing mode too"
+        );
+    }
+
+    /// `debug_log_dirs()` dedups when `turn_capture_dir` coincides with a
+    /// directory already collected from a request-log path.
+    #[test]
+    fn debug_log_dirs_dedups_turn_capture_dir_against_request_log_dir() {
+        let config = Config::from_persisted(&PersistedConfig {
+            upstream_request_log_path: Some("/tmp/llmconduit-shared/requests.jsonl".to_string()),
+            turn_capture_dir: Some("/tmp/llmconduit-shared".to_string()),
+            ..PersistedConfig::default()
+        })
+        .expect("config");
+
+        let dirs = config.debug_log_dirs();
+        assert_eq!(dirs, vec![PathBuf::from("/tmp/llmconduit-shared")]);
     }
 
     // -- D13 price table -------------------------------------------------------

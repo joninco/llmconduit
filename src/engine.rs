@@ -157,6 +157,14 @@ pub struct Gateway {
     /// (NOT the middleware); the 5 s snapshot task reads it under the fixed
     /// FlowStore→Metrics lock order.
     metrics: crate::metrics::MetricsLayer,
+    /// F1 (Topic F) durable per-turn capture handle (see `turn_capture.rs`).
+    /// `TurnCapture::disabled()` when `turn_capture_dir` is unset -- every op
+    /// a no-op (no thread, no alloc, no fs). Unlike the FlowStore/metrics/
+    /// monitor triad above, this is NOT gated on `--with-debug-ui`: the DI
+    /// root (`lib.rs`) attaches it unconditionally via `with_turn_capture`,
+    /// keyed only on `config.turn_capture_dir` (spec Design overview #1 --
+    /// its own instrumentation gate, independent of the debug UI).
+    turn_capture: crate::turn_capture::TurnCapture,
     /// D6 AbortHub: the live-cancellation registry keyed by `api_call_id`, so the
     /// dashboard kill route can cancel a stuck server-side stream. Gated identically to
     /// the FlowStore (enabled iff `flow_store.is_enabled()`), because the D3 L1 guard —
@@ -508,6 +516,35 @@ fn candidate_context_floor(plan: &crate::upstream::BackendCandidatePlan) -> Opti
         .min()
 }
 
+/// F1c (review r1, finding #3): the clean-completion shape `run_turn` reports up to
+/// the terminal seam so the turn-capture artifact status can distinguish a genuine
+/// stop from a max-token truncation. A `finish_reason: length` turn completes
+/// cleanly (`Ok`) at the HTTP/serving layer -- the dashboard `FlowStore` still counts
+/// it `Completed` -- but its response was CUT SHORT, so the capture artifact must not
+/// claim `completed` (don't-lie-with-zeros); it maps to `incomplete`. Failed /
+/// cancelled turns are the `Err` arm and never reach this type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnCompletion {
+    /// The turn ended on a genuine stop (upstream `response.completed`).
+    Completed,
+    /// The turn was truncated by the upstream output-token cap (`finish_reason:
+    /// length` ⇒ `response.incomplete`).
+    Incomplete,
+}
+
+/// F1c: map the engine's terminal `FlowStatus` to the turn-capture artifact status
+/// string. `Open` never reaches a terminal seam; treat it as `failed` defensively
+/// rather than emit a non-terminal status into the artifact.
+fn flow_status_artifact_str(status: crate::dashboard_flow::FlowStatus) -> &'static str {
+    match status {
+        crate::dashboard_flow::FlowStatus::Completed => "completed",
+        crate::dashboard_flow::FlowStatus::Cancelled => "cancelled",
+        crate::dashboard_flow::FlowStatus::Failed | crate::dashboard_flow::FlowStatus::Open => {
+            "failed"
+        }
+    }
+}
+
 /// Whether a Chat-Completions inbound request asked for reasoning, either via
 /// the top-level `reasoning_effort` field or an explicit thinking knob in
 /// `chat_template_kwargs` (`thinking` / `enable_thinking`). When true, forced
@@ -683,6 +720,10 @@ impl Gateway {
             // D5: disabled by default (zero overhead); the DI root attaches an
             // enabled layer via `with_metrics` in the `--with-debug-ui` branch.
             metrics: crate::metrics::MetricsLayer::disabled(),
+            // F1: disabled by default (zero overhead); the DI root attaches an
+            // enabled sink via `with_turn_capture` when `turn_capture_dir` is
+            // configured -- independent of `--with-debug-ui`.
+            turn_capture: crate::turn_capture::TurnCapture::disabled(),
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
@@ -738,6 +779,24 @@ impl Gateway {
     /// off, in which case every metrics op is a no-op (zero lock, zero work).
     pub fn metrics(&self) -> &crate::metrics::MetricsLayer {
         &self.metrics
+    }
+
+    /// Attach the F1 [`TurnCapture`](crate::turn_capture::TurnCapture) sink (built in
+    /// the DI root from `config.turn_capture_dir`). Consuming builder so it threads
+    /// through the `Gateway::new(...)` → `Arc::new` construction WITHOUT widening the
+    /// constructor signature (every test that builds a bare `Gateway` keeps the
+    /// default `disabled()` sink -- zero overhead). Mirrors `with_metrics`.
+    pub fn with_turn_capture(mut self, turn_capture: crate::turn_capture::TurnCapture) -> Self {
+        self.turn_capture = turn_capture;
+        self
+    }
+
+    /// Access the F1 durable per-turn capture handle. `is_enabled()` is `false`
+    /// when `turn_capture_dir` is unset, in which case every capture op is a
+    /// no-op (no thread, no alloc, no fs). Independent of the debug UI --
+    /// see `.ralph/specs/F1-durable-turn-capture.md`.
+    pub fn turn_capture(&self) -> &crate::turn_capture::TurnCapture {
+        &self.turn_capture
     }
 
     /// D5: record a TERMINAL response into the metrics rings at the engine's D3
@@ -1150,6 +1209,21 @@ impl Gateway {
             .as_ref()
             .map(|guard| guard.abort_token())
             .unwrap_or_default();
+        // F1c: the turn-capture ENGINE guard. `state(id)` reaches the SAME per-turn
+        // state the HTTP layer's `start()` registered (F1b), so the engine terminal
+        // and the served-body tee share one state. `None` when capture is disabled or
+        // no `api_call_id` was threaded (the public wrapper / non-instrumented paths).
+        // Built HERE, BEFORE the pre-spawn `?` paths (so a lowering/budget failure
+        // finalizes it via `finalize_pre_spawn_err`), and moved into the terminal
+        // `tokio::spawn` below — mirroring `telemetry_guard`. `new` CLAIMS the turn so
+        // the middleware backstop stays inert; the guard's `Drop` is the
+        // abandoned/panicked-turn fallback (`failed`, or `cancelled` if the abort
+        // token fired).
+        let capture_guard = api_call_id.as_deref().and_then(|id| {
+            self.turn_capture()
+                .state(id)
+                .map(|state| crate::turn_capture::CaptureGuard::new(state, abort_token.clone()))
+        });
         // D2 (D13 R1 HIGH): the ORIGINAL request model, captured BEFORE resolution so
         // the flow record's `model_requested` reflects what the CLIENT asked for (an
         // alias / ad-hoc route / profile name), distinct from the resolved/served
@@ -1157,6 +1231,11 @@ impl Gateway {
         // `set_normalized` below alongside the normalized canonical body.
         let model_requested = request.model.clone();
         let (resolved_model, request_genuine) = self.resolve_request_model(&request.model).await;
+        // F1c: stamp the resolved/served model onto the capture outcome metadata now
+        // that resolution has settled (absent for a turn that fails before here).
+        if let Some(guard) = &capture_guard {
+            guard.set_model_served(&resolved_model);
+        }
         let mut request = self.apply_system_prompt_prefix(request, &resolved_model);
 
         // D1/E2b: minted here rather than just before the `tokio::spawn` below
@@ -1209,6 +1288,14 @@ impl Gateway {
                     crate::dashboard_flow::FlowStatus::Failed,
                     guard.elapsed().as_millis(),
                 );
+            }
+            // F1c: a pre-spawn failure (bad request / lowering / budget) is always
+            // `failed`. Record it on the capture guard so the artifact carries the
+            // terminal reason; the served side is the error body the handler returns
+            // (teed by the HTTP layer), so the both-`done` barrier still resolves and
+            // writes a `status:"failed"` artifact — never a hang (AC-7). Idempotent.
+            if let Some(guard) = &capture_guard {
+                guard.finalize("failed", Some(&err.to_string()));
             }
             err
         };
@@ -1454,28 +1541,48 @@ impl Gateway {
             // — a panic INSIDE `run_turn` unwinds through this closure and drops the
             // guard, finalizing `Cancelled`. The CAS makes the explicit finalize win
             // and the drop then no-op (idempotent).
+            // Resolve the terminal status ONCE so the same value drives the FlowStore
+            // finalize, the D5 metrics record, AND the F1c capture terminal (all
+            // co-located at this single choke point → recorded exactly once).
+            // `is_cancelled()` (499 — client hung up) ⇒ Cancelled; any other error ⇒
+            // Failed; `Ok` ⇒ Completed.
+            let (status, reason) = match &result {
+                // Both a genuine stop and a `length` truncation are `Ok` and count as
+                // `Completed` for the dashboard/metrics (a successful HTTP serve); the
+                // capture artifact splits them below (finding #3).
+                Ok(_) => (
+                    crate::dashboard_flow::FlowStatus::Completed,
+                    "response.completed".to_string(),
+                ),
+                Err(err) if err.is_cancelled() => (
+                    crate::dashboard_flow::FlowStatus::Cancelled,
+                    "client_disconnected".to_string(),
+                ),
+                Err(err) => (crate::dashboard_flow::FlowStatus::Failed, err.to_string()),
+            };
             if let Some(guard) = &telemetry_guard {
-                // Resolve the terminal status ONCE so the same value drives both the
-                // FlowStore finalize and the D5 metrics record (co-located at this
-                // single CAS-guarded choke point → recorded exactly once).
-                let (status, reason) = match &result {
-                    Ok(()) => (
-                        crate::dashboard_flow::FlowStatus::Completed,
-                        "response.completed".to_string(),
-                    ),
-                    Err(err) if err.is_cancelled() => (
-                        crate::dashboard_flow::FlowStatus::Cancelled,
-                        "client_disconnected".to_string(),
-                    ),
-                    Err(err) => (crate::dashboard_flow::FlowStatus::Failed, err.to_string()),
-                };
-                guard.finalize(status, Some(reason));
+                guard.finalize(status, Some(reason.clone()));
                 // D5: record the terminal into the metrics rings (sources served
                 // model + endpoint + upstream + final usage from the guard's own
                 // evict-safe inputs — no `detail()` re-read — + the guard's monotonic
                 // latency). No-op when the metrics layer is off. Runs AFTER
                 // `guard.finalize`, which assembled those inputs.
                 gateway.record_terminal_metrics(guard, status, guard.elapsed().as_millis());
+            }
+            // F1c: report the SAME engine terminal to the capture guard (status +
+            // reason come from the engine seam ONLY, never the served tee). Idempotent
+            // first-writer-wins; the both-`done` barrier assembles + evicts once the
+            // served tee's `served_done` has also fired.
+            // Finding #3 (don't-lie-with-zeros): a `length`-truncated turn is `Ok` but
+            // its response was cut short, so the ARTIFACT status is `incomplete`
+            // (`response.incomplete`) even though the dashboard `status` above stays
+            // `Completed`. Genuine stop / failed / cancelled map from the `FlowStatus`.
+            if let Some(guard) = &capture_guard {
+                let (capture_status, capture_reason) = match &result {
+                    Ok(TurnCompletion::Incomplete) => ("incomplete", "response.incomplete"),
+                    _ => (flow_status_artifact_str(status), reason.as_str()),
+                };
+                guard.finalize(capture_status, Some(capture_reason));
             }
             if let Err(err) = &result {
                 if tx.is_closed() {
@@ -1731,7 +1838,7 @@ impl Gateway {
         // surfaces `AppError::cancelled()` (499) just like a hang-up, with no token
         // duplication. A fresh never-cancelled token off the dashboard path.
         abort_token: tokio_util::sync::CancellationToken,
-    ) -> AppResult<()> {
+    ) -> AppResult<TurnCompletion> {
         // D5 R3 (MEDIUM): record the resolved served model onto the shared serving
         // token so the L1 telemetry guard (which holds the token) can attribute the
         // metrics bucket's model at finalize WITHOUT re-reading the FlowStore record —
@@ -2090,6 +2197,17 @@ impl Gateway {
         // — either maps it (`reasoning_effort_map`) or clamps it to the backend's
         // vocabulary in `finalize_request_for_backend`.
         let normalized_stop = crate::models::chat::normalize_stop(request.stop.clone())?;
+        // F1d: the turn's durable-capture handle (Topic F), looked up ONCE by
+        // `api_call_id` from the SAME registry the `CaptureGuard` built above
+        // reads — `None` when capture is disabled or this request was never
+        // instrumented (the public non-`api_call_id` wrapper). Cloned onto every
+        // per-round `BackendChatRequest` below (a turn's tool-call loop can dispatch
+        // multiple upstream rounds; the failover/routing rebuilds clone it further
+        // — AC-11), so the leaf writes each attempt's on-wire request into the SAME
+        // turn's `upstream_request` section (last-writer-wins).
+        let capture = api_call_id
+            .as_deref()
+            .and_then(|id| self.turn_capture().state(id));
         loop {
             // D6: compose the kill token with the client-hangup check — a dashboard
             // `abort()` flips `abort_token`, surfacing `cancelled()` (499) like a hang-up.
@@ -2206,7 +2324,10 @@ impl Gateway {
                 // serving token so routing/failover can tag `{route, provider}`.
                 Some(response_id.clone()),
                 Some(Arc::clone(&serving_token)),
-            );
+            )
+            // F1d: attach the turn-capture handle (see above) so the leaf's
+            // `upstream_request` write can reach this turn's artifact.
+            .with_capture(capture.clone());
             let mut stream = tokio::select! {
                 biased;
                 _ = tx.closed() => return Err(AppError::cancelled()),
@@ -2796,7 +2917,15 @@ impl Gateway {
             self.flow_store().stamp_stream_end(api_call_id);
         }
         self.monitor.emit(response_id, MonitorEventKind::Completed);
-        Ok(())
+        // F1c (finding #3): carry the terminal shape to the seam so the capture
+        // artifact records `incomplete` for a max-token truncation. `is_incomplete`
+        // was already derived above from the upstream `finish_reason` (the same bit
+        // that chose `response.incomplete` vs `response.completed`).
+        Ok(if is_incomplete {
+            TurnCompletion::Incomplete
+        } else {
+            TurnCompletion::Completed
+        })
     }
 
     /// Resolve `model` against the upstream catalog, returning the served model

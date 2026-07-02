@@ -10,7 +10,7 @@
 
 ## Executive summary
 
-**Status: 6/6 Codex-xhigh APPROVED (F1a–F1f) — FEATURE COMPLETE + full-suite green (1112 tests, deterministic) + Fable independent second-lens review (3 findings — sync-redaction-on-worker, orphan-.tmp, panic-in-Drop — all fixed + Codex-verified, incl. an exhaustive Drop-lock poison audit) + LIVE-VERIFIED on alt port :5099 (2026-07-02): artifact with all 4 sections written with --with-debug-ui OFF (own-gate); `<think>` localization confirmed (DeepSeek `delta.reasoning` in upstream_response → Anthropic `thinking` blocks in served_response); mid-stream disconnect → `served_partial:true` + no hang; no `.work`/`.tmp` residue; prod :5022 untouched. Pending: merge decision only.** Opt-in `turn_capture_dir` writes ONE atomic JSON per turn
+**Status: 0/6 tasks — not started.** Opt-in `turn_capture_dir` writes ONE atomic JSON per turn
 (`<dir>/<api_call_id>.json`) with the FULL inbound Anthropic request, translated OpenAI request, RAW vLLM
 response, and served Anthropic bytes + outcome — so an operator / fresh Claude session can debug weird CC
 output (stray `<think>` tags, malformed tool calls) that is otherwise a 200 OK with no durable trace.
@@ -26,12 +26,12 @@ response-`Body` wrapper owns served bytes); RAII drop-guard finalize; UTF-8/base
 
 | Task | Description | Status |
 |-|-|-|
-| F1a | `turn_capture.rs` module (`TurnCapture`/`TurnCaptureState`, disabled zero-op sink) + `turn_capture_dir` on `Config`+`PersistedConfig`+default+env+`configure()`+`debug_log_dirs()` + `Gateway`/`lib.rs` DI. AC-1,2,3 | ✅ |
-| F1b | HTTP own-gate + inbound capture (copy+redact) + served-body `Body` tee (stream/non-stream/error/disconnect); per-turn temp-file sections + registry. AC-4,5,6 | ✅ |
-| F1c | Engine terminal `engine_done` (RAII `CaptureGuard` + middleware backstop) on all terminals incl pre-spawn; both-`done` barrier → bounded streaming assembly + unconditional registry evict + best-effort `.work` delete (failed delete → F1f orphan sweep, never blocks publish/evict) + atomic rename. AC-7,8,9 | ✅ (Codex-xhigh APPROVED r3; r1 fixed 2 HIGH race+leak, r2 fixed HIGH cleanup-invariant) |
-| F1d | `capture: Option<Arc<TurnCaptureState>>` on `BackendChatRequest` (+ `with_capture` builder); upstream_request capture in `dispatch_chat_stream`→`logged_send_chat_request`, `Section` gained `replace`/`SectionChunk::{Append,Replace}` for last-writer-wins (shrink retry / failover final attempt); shared `redact_payload_secrets_in_value` added to `redaction.rs` (`http::redact_payload_secrets` now delegates); replace uses an atomic `Mutex<ReplaceSlot{pending,sealed}>` coalescing slot (guaranteed last-writer-wins under backpressure + accept-vs-close). AC-10,11 | ✅ (Codex-xhigh APPROVED r3; r1 fixed drop-on-full, r2 fixed accept/close race) |
-| F1e | Raw upstream_response tap in `stream_success_response` (bounded `ServedSink` reuse, sticky-partial drop guard, no hang) + final failed HTTP body (capture-local staged body, per-attempt clear, streamed-success wins) + UTF-8/base64 encoding (generic assembly); upstream_response is final-attempt-only via a cancel-safe synchronous gen-suffixed section swap; eager section-file create (no post-finalize recreation); discriminator on first-byte+clean-EOS (truthful partial). AC-12,13,14 | ✅ (Codex-xhigh APPROVED; r1 failover-scope, r2 cancel-safe, r3 no-recreation+truthful-partial) |
-| F1f | Orphan `.work` sweep (`cleanup_orphan_work_dirs`, mtime-based, wired into `spawn_cleanup`) + rotation confirmed (artifacts + orphan `.work`) + `sole_capture_state` flake fixed (4 F1b tests read the durable `<id>.json` via `wait_for_only_artifact`, not the transient `.work` dir) + docs (FEATURES/AGENTS/README); orphan sweep scoped to `turn_capture_dir` only. AC-15,16,17 | ✅ (Codex-xhigh APPROVED r2; r1 fixed HIGH over-broad sweep + vacuous AC-16) |
+| F1a | `turn_capture.rs` module + disabled zero-op sink; `turn_capture_dir` on `Config`+`PersistedConfig`+default+env+`configure()`; `debug_log_dirs()` includes it; `lib.rs` DI. AC-1,2,3 | ☐ |
+| F1b | HTTP own-gate (thread `api_call_id` off debug-ui) + inbound capture (copy+redact) + served-body `Body` wrapper (streaming/non-streaming/error/disconnect). AC-4,5,6 | ☐ |
+| F1c | Engine terminal integration `engine_done(status,reason)` on all terminals incl pre-spawn (`engine.rs:1196`) + RAII drop finalize (mirror `dashboard_flow.rs:1794/1917`); both-done barrier. AC-7,8,9 | ☐ |
+| F1d | `capture: Option<Arc<TurnCaptureState>>` on `BackendChatRequest`; upstream_request capture in `dispatch_chat_stream`, last-writer-wins (shrink retry / failover final attempt). AC-10,11 | ☐ |
+| F1e | Raw upstream_response tap in `stream_success_response` (incremental, partial-on-error, no hang) + final failed HTTP body (gap-05 staged body) + UTF-8/base64 encoding. AC-12,13,14 | ☐ |
+| F1f | Streaming single-JSON assembly + atomic tmp→rename + work-dir cleanup + rotation (artifacts + orphan `.work`) + docs. AC-15,16,17 | ☐ |
 
 **Ordering: serial F1a → F1b → F1c → F1d → F1e → F1f** (shared files force `--agents 1`). Each code task
 leaves `cargo test` GREEN within itself. F1a lands the sink+config every later task calls; F1b/F1c stand up
