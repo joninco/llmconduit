@@ -1100,12 +1100,17 @@ impl ReqwestUpstreamClient {
         // Finding 1: redact the `upstream_request` section OFF the tokio worker for
         // large requests (spawn_blocking), AWAITED here — before the send and before
         // `write_upstream_request` — so the last-writer-wins `replace` lands well
-        // before the finalize barrier reads the section (no race). A `None` (spawn
-        // join failure) leaves the section absent (don't-lie-with-zeros).
-        if let Some(capture) = capture
-            && let Some(redacted) = offload_redacted_upstream_request_bytes(request).await
-        {
-            capture.write_upstream_request(&redacted);
+        // before the finalize barrier reads the section (no race).
+        if let Some(capture) = capture {
+            // F2 (Fable-fix): on a `spawn_blocking` join FAILURE (runtime shutdown) for
+            // THIS attempt, DON'T silently retain a PRIOR attempt's bytes as the FINAL
+            // (authoritative) request — that breaks last-writer-wins and lies about
+            // which attempt served. Replace with an honest partial marker for THIS
+            // attempt instead (don't-lie-with-zeros); normal success is last-writer-wins.
+            match offload_redacted_upstream_request_bytes(request).await {
+                Some(redacted) => capture.write_upstream_request(&redacted),
+                None => capture.mark_upstream_request_redaction_failed(),
+            }
         }
         self.send_chat_request(url, request).await
     }

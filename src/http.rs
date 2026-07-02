@@ -607,15 +607,22 @@ async fn log_api_call(
         // Finding 1: redact OFF the tokio worker for large bodies (spawn_blocking),
         // AWAITED here before `write_inbound_request` so the section is written +
         // closed before the finalize barrier can read it. `body_bytes.clone()` is a
-        // cheap Arc-backed `Bytes` clone (dropped when the redaction completes, before
-        // `body_bytes` is moved into the rebuilt request below).
-        let (model_requested, inbound_section) =
+        // cheap Arc-backed `Bytes` clone; the offload copies it into an OWNED `Vec` for
+        // the blocking task (F1 — so nothing pins the 256 MiB backing) and this clone
+        // is dropped before `body_bytes` is moved into the rebuilt request below.
+        let (model_requested, inbound_section, inbound_partial) =
             offload_redacted_inbound_section(body_bytes.clone()).await;
         let state = gateway
             .turn_capture()
             .start(&api_call_id, model_requested, epoch_millis());
         if let Some(state) = &state {
             state.write_inbound_request(&inbound_section);
+            if inbound_partial {
+                // F3 (Fable-fix): the redaction offload could not capture the body (a
+                // spawn_blocking join failure); mark the section partial so it never
+                // reads as a complete inbound body (don't-lie-with-zeros).
+                state.mark_inbound_request_degraded();
+            }
         }
         state
     } else {
@@ -782,7 +789,7 @@ fn redact_payload_secrets(value: &mut Value) {
 /// line 137) and never carries raw image bytes. Parses/serializes a fresh owned
 /// `Value`, so it COPIES out of `body` and never retains a slice of the 256 MiB
 /// middleware buffer (AGENTS.md line 144).
-fn redacted_inbound_section(body: &Bytes) -> (Option<String>, Vec<u8>) {
+fn redacted_inbound_section(body: &[u8]) -> (Option<String>, Vec<u8>) {
     match serde_json::from_slice::<Value>(body) {
         Ok(mut value) => {
             let model = value
@@ -812,24 +819,39 @@ fn redacted_inbound_section(body: &Bytes) -> (Option<String>, Vec<u8>) {
 /// [`redacted_inbound_section`]). The caller AWAITS this INLINE, before
 /// `write_inbound_request` (append + close), so the section is fully written and
 /// closed before the both-`done` finalize barrier can read it (no section race, no
-/// hang). `body` is an owned `Bytes` (the caller passes a cheap Arc-backed clone);
-/// the redacted output is a fresh owned `Vec` — no retained slice of the middleware
-/// buffer (AGENTS.md line 144).
-async fn offload_redacted_inbound_section(body: Bytes) -> (Option<String>, Vec<u8>) {
+/// hang). Returns `(model_requested, redacted_bytes, partial)`; `partial` is `true`
+/// ONLY on a join failure (the body could not be captured -- the caller then marks
+/// the section degraded rather than reporting a false "complete", don't-lie-with-zeros).
+///
+/// F1 (Fable-fix): the blocking task is handed an OWNED `Vec<u8>` copy of the body,
+/// NOT the Arc-backed `Bytes` — moving a `Bytes` clone into `spawn_blocking` would PIN
+/// the whole 256 MiB inbound middleware backing allocation for the task's lifetime,
+/// and a DETACHED task (outer future cancelled) would keep it pinned (AGENTS.md line
+/// 144 — no retained slice of that buffer). The owned right-sized copy is the intended
+/// cost; the redacted output is likewise a fresh owned `Vec`.
+async fn offload_redacted_inbound_section(body: Bytes) -> (Option<String>, Vec<u8>, bool) {
     if body.len() <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
-        return redacted_inbound_section(&body);
+        let (model, bytes) = redacted_inbound_section(&body);
+        return (model, bytes, false);
     }
-    match tokio::task::spawn_blocking(move || redacted_inbound_section(&body)).await {
-        Ok(result) => result,
+    // Copy to an OWNED, right-sized `Vec` and DROP the Arc-backed `Bytes` BEFORE the
+    // blocking hop, so nothing pins the 256 MiB backing across the task (or after, on
+    // cancellation when the task detaches).
+    let owned: Vec<u8> = body.to_vec();
+    drop(body);
+    match tokio::task::spawn_blocking(move || redacted_inbound_section(&owned)).await {
+        Ok((model, bytes)) => (model, bytes, false),
         // `redacted_inbound_section` is panic-free (serde failures fall back to a
         // marker), so a `JoinError` here means the runtime is shutting down. Record an
-        // honest, NON-EMPTY marker so the section still closes (never a hang) and never
-        // reads as a fabricated empty-measured body (don't-lie-with-zeros).
+        // honest, NON-EMPTY marker AND signal `partial` so the section still closes
+        // (never a hang) and never reads as a fabricated empty/complete body
+        // (don't-lie-with-zeros; F3).
         Err(err) => {
             tracing::warn!(error = %err, "turn-capture: inbound redaction task failed");
             (
                 None,
                 b"<turn-capture: inbound redaction task failed>".to_vec(),
+                true,
             )
         }
     }
@@ -2096,14 +2118,21 @@ mod tests {
             small.len() <= super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
             "small body takes the inline path"
         );
-        let (model_small, red_small) = super::offload_redacted_inbound_section(small.clone()).await;
+        let (model_small, red_small, partial_small) =
+            super::offload_redacted_inbound_section(small.clone()).await;
+        assert!(!partial_small, "a clean inline redaction is not partial");
 
         let large = body_with_filler(&"x".repeat(32 * 1024));
         assert!(
             large.len() > super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
             "large body takes the spawn_blocking path"
         );
-        let (model_large, red_large) = super::offload_redacted_inbound_section(large).await;
+        let (model_large, red_large, partial_large) =
+            super::offload_redacted_inbound_section(large).await;
+        assert!(
+            !partial_large,
+            "a clean spawn_blocking redaction is not partial"
+        );
 
         for (label, model, redacted) in [
             ("small/inline", model_small, red_small),
@@ -2134,6 +2163,46 @@ mod tests {
             let value: Value = serde_json::from_str(&text).expect("redacted section is valid JSON");
             assert_eq!(value["model"], "claude-x", "{label}: structure intact");
         }
+    }
+
+    /// F1 (Fable-fix, BLOCKING): the large-body `spawn_blocking` offload must be
+    /// handed an OWNED `Vec` copy, NOT the Arc-backed `Bytes` (which would PIN the
+    /// 256 MiB inbound middleware backing for the task's lifetime — AGENTS.md line
+    /// 144). A large body forces the off-worker path; the capture completes correctly
+    /// AND the offload retains NO clone of the inbound `Bytes` backing after it returns
+    /// (the observable half of the no-pin contract): a second handle to the same shared
+    /// backing is uniquely reclaimable once the offload dropped its `Bytes` in favor of
+    /// the owned copy.
+    #[tokio::test]
+    async fn offload_large_inbound_hands_owned_copy_not_pinned_bytes() {
+        let large = Bytes::from(format!(
+            r#"{{"model":"claude-x","api_key":"sk-LEAK-PIN-1234","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(64 * 1024)
+        ));
+        assert!(
+            large.len() > super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
+            "body forces the spawn_blocking path"
+        );
+        // A SECOND handle to the SAME shared backing; if the offload retained a clone
+        // (old bug: moved the `Bytes` into `spawn_blocking`) this could not reclaim it.
+        let observer = large.clone();
+
+        let (model, redacted, partial) = super::offload_redacted_inbound_section(large).await;
+        assert_eq!(model.as_deref(), Some("claude-x"), "model extracted");
+        assert!(!partial, "a clean spawn_blocking redaction is not partial");
+        let text = String::from_utf8(redacted).expect("redacted section is UTF-8");
+        assert!(
+            !text.contains("sk-LEAK-PIN-1234"),
+            "secret redacted on the offloaded path"
+        );
+
+        // The offload converted the body to an OWNED `Vec` for the blocking task and
+        // dropped its `Bytes`, so nothing pins the shared backing: `observer` is now the
+        // SOLE owner and reclaims uniquely (no retained slice of the inbound buffer).
+        assert!(
+            observer.try_into_mut().is_ok(),
+            "offload retained no clone of the inbound Bytes backing"
+        );
     }
 
     /// D7a R3 #1 (REGRESSION): a `/dashboard/login` body must yield NO

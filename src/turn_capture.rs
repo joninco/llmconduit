@@ -497,6 +497,19 @@ impl TurnCaptureState {
         self.inbound_request.close(false);
     }
 
+    /// F3 (Fable-fix): mark the `inbound_request` section `partial` -- used when the
+    /// inbound redaction offload could NOT capture the real body (a `spawn_blocking`
+    /// join failure at runtime shutdown), so [`write_inbound_request`] wrote only a
+    /// marker. Mirrors [`mark_served_degraded`](Self::mark_served_degraded): a single
+    /// sticky atomic store, safe to call after the section already `close`d (the mark
+    /// is read at assembly). NEVER report an uncaptured inbound body as complete
+    /// (`partial:false`) -- don't-lie-with-zeros.
+    ///
+    /// [`write_inbound_request`]: Self::write_inbound_request
+    pub fn mark_inbound_request_degraded(&self) {
+        self.inbound_request.mark_partial();
+    }
+
     /// F1d: replace the `upstream_request` section with `bytes` -- the redacted,
     /// FINAL on-wire OpenAI `ChatCompletionRequest` for THIS dispatch attempt
     /// (post profile/lowering/sanitize). Called once per attempt
@@ -513,6 +526,27 @@ impl TurnCaptureState {
     /// section never fabricates the key.
     pub fn write_upstream_request(&self, bytes: &[u8]) {
         if self.upstream_request.replace(bytes) {
+            self.upstream_request_written.store(true, Ordering::Release);
+        }
+    }
+
+    /// F2 (Fable-fix): the redaction of THIS dispatch attempt's on-wire request
+    /// could not be produced (its `spawn_blocking` task failed to join -- runtime
+    /// shutdown). `upstream_request` is LAST-WRITER-WINS, so the FINAL attempt is
+    /// authoritative: on a RETRY/FAILOVER attempt a join failure must NOT leave a
+    /// PRIOR attempt's bytes as the recorded request -- that lies about which attempt
+    /// served and breaks last-writer-wins. REPLACE the section with an honest,
+    /// non-empty marker for THIS attempt and mark it `partial` (don't-lie-with-zeros),
+    /// DISCARDING any superseded prior-attempt bytes. Gated on [`Section::replace`]
+    /// acceptance (like [`write_upstream_request`](Self::write_upstream_request)): a
+    /// section already sealed at the finalize barrier rejects the write, so nothing is
+    /// fabricated for a turn whose section already closed.
+    pub fn mark_upstream_request_redaction_failed(&self) {
+        const MARKER: &[u8] = b"<turn-capture: upstream_request redaction task failed>";
+        if self.upstream_request.replace(MARKER) {
+            // Sticky partial: this section is an honest placeholder for the final
+            // attempt, never a measured-complete capture.
+            self.upstream_request.mark_partial();
             self.upstream_request_written.store(true, Ordering::Release);
         }
     }
@@ -1490,9 +1524,17 @@ impl Section {
         if partial {
             self.meta.partial.store(true, Ordering::Release);
         }
-        if let Ok(mut guard) = self.tx.lock() {
-            *guard = None;
-        }
+        // Poison-tolerant (Fable-fix Finding 4): `close` is reachable from `Drop`
+        // paths (`served_done`/`upstream_response_done`/`finalize_and_assemble`), so
+        // a poisoned `tx` lock must STILL drop the writer sender -- recover the guard
+        // via `PoisonError::into_inner`. The prior `if let Ok(..)` SKIPPED the drop on
+        // poison, leaving the sender installed so the writer task never terminated and
+        // `await_closed()` HUNG forever (leaking the barrier + `.work` dir). Dropping
+        // the sender unconditionally guarantees the writer drains + resolves.
+        *self
+            .tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Mark the section `partial` right now, independent of [`close`](Section::close)
@@ -2313,6 +2355,82 @@ mod tests {
         );
     }
 
+    /// F2 (Fable-fix, BLOCKING): a retry/failover turn whose FINAL attempt's
+    /// `upstream_request` redaction join FAILS must NOT leave the PRIOR attempt's
+    /// bytes as the authoritative (FINAL) request — that breaks last-writer-wins and
+    /// lies about which attempt served. `mark_upstream_request_redaction_failed`
+    /// (what `logged_send_chat_request` calls on a `None` from the redaction offload)
+    /// REPLACES the section with an honest marker for THIS attempt and marks it
+    /// `partial` (don't-lie-with-zeros), DISCARDING the superseded prior bytes.
+    #[tokio::test]
+    async fn upstream_request_join_failure_replaces_prior_attempt_with_partial_marker() {
+        let dir = temp_dir_path("upstream-request-join-fail");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_ur_joinfail", None, 0).expect("state");
+        state.write_inbound_request(b"{}");
+        // A PRIOR attempt captured its on-wire request (last-writer-wins so far).
+        state.write_upstream_request(br#"{"model":"m","max_tokens":64000}"#);
+        // The FINAL attempt's redaction offload fails to join (runtime shutdown):
+        // the caller marks THIS attempt's section redaction-failed instead of leaving
+        // the prior attempt's bytes as FINAL.
+        state.mark_upstream_request_redaction_failed();
+        state.write_served_response(b"ok");
+        state.served_done(false);
+        state.engine_done("failed", Some("runtime_shutdown"));
+
+        let artifact = wait_for_artifact(&dir.join("api_ur_joinfail.json")).await;
+        let section = &artifact["sections"]["upstream_request"];
+        // The section reflects THIS turn's reality (partial marker), NOT the stale
+        // prior attempt's bytes.
+        assert_eq!(
+            section["partial"], true,
+            "final-attempt join failure records the section partial: {section}"
+        );
+        let content = section["content"].as_str().unwrap_or_default();
+        assert!(
+            content.contains("redaction task failed"),
+            "content is the honest redaction-failed marker: {section}"
+        );
+        assert!(
+            section
+                .get("content")
+                .and_then(|c| c.get("max_tokens"))
+                .is_none(),
+            "the stale prior attempt's request is NOT retained as final: {section}"
+        );
+        assert!(
+            !content.contains("64000"),
+            "the prior attempt's bytes are discarded (last-writer-wins honesty): {section}"
+        );
+    }
+
+    /// F3 (Fable-fix): when the inbound redaction offload could NOT capture the body
+    /// (a `spawn_blocking` join failure at runtime shutdown), the HTTP seam writes the
+    /// marker then calls `mark_inbound_request_degraded`. The `inbound_request` section
+    /// must then close `partial:true` — NEVER `partial:false` (which would report an
+    /// uncaptured inbound body as complete; don't-lie-with-zeros).
+    #[tokio::test]
+    async fn inbound_request_join_failure_marks_section_partial_true() {
+        let dir = temp_dir_path("inbound-join-fail");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture
+            .start("api_inbound_joinfail", None, 0)
+            .expect("state");
+        // Exactly the HTTP seam's partial path: write the marker, then degrade.
+        state.write_inbound_request(b"<turn-capture: inbound redaction task failed>");
+        state.mark_inbound_request_degraded();
+        state.write_served_response(b"ok");
+        state.served_done(false);
+        state.engine_done("failed", Some("runtime_shutdown"));
+
+        let artifact = wait_for_artifact(&dir.join("api_inbound_joinfail.json")).await;
+        let section = &artifact["sections"]["inbound_request"];
+        assert_eq!(
+            section["partial"], true,
+            "an uncaptured inbound body is recorded partial, never a false complete: {section}"
+        );
+    }
+
     /// F1d review r1 (BLOCKING fix): the OLD `replace` `try_send`d onto the
     /// bounded channel and DROPPED the write when the channel was full, so a
     /// burst of rapid attempts (shrink-retry + failover) racing ahead of a slow
@@ -2719,6 +2837,63 @@ mod tests {
         // No raw upstream response was streamed/staged, so the section is ABSENT
         // (don't-lie-with-zeros) — the poison never fabricated one.
         assert!(artifact["sections"].get("upstream_response").is_none());
+    }
+
+    /// F4 (Fable-fix, BLOCKING): `Section::close` is reachable from `Drop` paths
+    /// (`served_done`/`upstream_response_done`/finalize). A poisoned `tx` mutex must
+    /// STILL drop the writer sender — the prior `if let Ok(..)` SKIPPED the drop on
+    /// poison, leaving the sender installed so the writer never terminated and
+    /// `await_closed()` HUNG forever. Poison the served section's `tx`, close it via
+    /// the Drop-reachable `served_done`, and assert `await_served_closed()` resolves in
+    /// BOUNDED time (a hang would blow the timeout) with no panic, and the artifact
+    /// still assembles best-effort.
+    #[tokio::test]
+    async fn poisoned_section_tx_lock_close_still_drops_sender_no_hang() {
+        let dir = temp_dir_path("poison-section-tx");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture
+            .start("api_poison_tx", Some("m".to_string()), 1)
+            .expect("state");
+        state.write_inbound_request(br#"{"model":"m"}"#);
+        state.write_served_response(b"served-bytes");
+
+        // Poison the served section's `tx` mutex: a thread panics WHILE HOLDING it.
+        let poisoner = Arc::clone(&state);
+        let joined = std::thread::spawn(move || {
+            let _guard = poisoner
+                .served_response
+                .tx
+                .lock()
+                .expect("acquire to poison");
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(
+            joined.is_err(),
+            "the poisoning thread panicked under the tx lock"
+        );
+        assert!(
+            state.served_response.tx.is_poisoned(),
+            "served_response tx mutex is now poisoned"
+        );
+
+        // Drop-reachable close path. With a poison-INtolerant `close` the sender would
+        // stay installed and the writer would never terminate → the awaits below hang.
+        state.served_done(true);
+
+        // BOUNDED-TIME: `await_closed` resolves now that the sender was dropped despite
+        // the poison; a hang would exceed this timeout instead of blocking forever.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.await_served_closed(),
+        )
+        .await
+        .expect("await_served_closed resolved — no poisoned-lock hang");
+
+        // The both-`done` barrier still assembles best-effort (no panic on the poison).
+        state.engine_done("cancelled", Some("client_disconnect"));
+        let artifact = wait_for_artifact(&dir.join("api_poison_tx.json")).await;
+        assert_eq!(artifact["api_call_id"], "api_poison_tx");
     }
 
     /// F1c review r2 (robust cleanup ordering): a work-dir-delete FAILURE must
