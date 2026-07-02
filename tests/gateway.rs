@@ -869,7 +869,8 @@ async fn normalizes_developer_messages_to_system_for_upstream() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let request = base_request(vec![
         ResponseItem::Message {
@@ -1966,7 +1967,8 @@ async fn merges_instructions_and_developer_into_single_system_message() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("hello"),
@@ -2012,7 +2014,8 @@ async fn merges_multiple_developer_messages_scattered_in_history() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         ResponseItem::Message {
@@ -2097,7 +2100,8 @@ async fn developer_only_no_instructions_produces_single_system_message() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let request = base_request(vec![
         ResponseItem::Message {
@@ -2139,7 +2143,8 @@ async fn function_call_history_with_developer_message_produces_correct_ordering(
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "result is 555"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("what is 15 * 37?"),
@@ -2215,7 +2220,8 @@ async fn multiple_function_calls_interleaved_with_developer_messages() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "done"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("weather and time"),
@@ -2301,7 +2307,8 @@ async fn reasoning_with_developer_message_preserves_reasoning_content() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "5x^4"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("derivative of x^3?"),
@@ -2357,7 +2364,8 @@ async fn custom_tool_call_with_developer_message() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "result"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("run my script"),
@@ -2425,7 +2433,8 @@ async fn local_shell_call_in_history_with_developer_message() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         user_message("list files"),
@@ -2522,7 +2531,8 @@ async fn system_role_in_input_merged_with_instructions() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
 
     let mut request = base_request(vec![
         ResponseItem::Message {
@@ -3103,14 +3113,14 @@ fn roles_config_with(
         llmconduit::config::ModelProfile {
             roles: Some(llmconduit::config::RolesConfig {
                 merge_adjacent: merge_adjacent.iter().map(|s| s.to_string()).collect(),
-                rules: std::collections::BTreeMap::from_iter(
-                    rules.iter().map(|(role, list)| {
-                        (
-                            role.to_string(),
-                            llmconduit::config::RoleRuleSet { rules: list.clone() },
-                        )
-                    }),
-                ),
+                rules: std::collections::BTreeMap::from_iter(rules.iter().map(|(role, list)| {
+                    (
+                        role.to_string(),
+                        llmconduit::config::RoleRuleSet {
+                            rules: list.clone(),
+                        },
+                    )
+                })),
             }),
             ..Default::default()
         },
@@ -3313,7 +3323,11 @@ async fn roles_tag_wraps_content_with_escaped_attributes() {
             ("user", vec![role_accept()]),
             (
                 "developer",
-                vec![role_rewrite_tagged("system", "dev", &[("z", "1&2"), ("a", "x\"<y")])],
+                vec![role_rewrite_tagged(
+                    "system",
+                    "dev",
+                    &[("z", "1&2"), ("a", "x\"<y")],
+                )],
             ),
         ],
     );
@@ -3331,8 +3345,14 @@ async fn roles_tag_wraps_content_with_escaped_attributes() {
     assert_eq!(msg.role, "system");
     let content = msg.content.as_ref().and_then(|v| v.as_str()).unwrap();
     assert!(content.starts_with("<dev "), "content: {content}");
-    assert!(content.contains("a=\"x&quot;&lt;y\""), "a attr escaped+sorted: {content}");
-    assert!(content.contains("z=\"1&amp;2\""), "z attr escaped: {content}");
+    assert!(
+        content.contains("a=\"x&quot;&lt;y\""),
+        "a attr escaped+sorted: {content}"
+    );
+    assert!(
+        content.contains("z=\"1&amp;2\""),
+        "z attr escaped: {content}"
+    );
     assert!(content.ends_with("instr</dev>"), "content: {content}");
 }
 
@@ -4931,7 +4951,8 @@ async fn chat_completions_developer_messages_become_system_messages() {
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
+    let gateway =
+        test_gateway_with_config(upstream.clone(), MockSearch::default(), glm_roles_config());
     let app = llmconduit::build_app_from_gateway(gateway);
 
     let body = json!({
@@ -6591,6 +6612,7 @@ fn glm_gateway(upstream: MockUpstream, model: &str) -> Arc<Gateway> {
             system_prompt_prefix: None,
             upstream_chat_kwargs: JsonMap::new(),
             capabilities: None,
+            roles: None,
             reasoning_effort: Some(llmconduit::config::ReasoningConfig {
                 default: Some("none".to_string()),
                 map: std::collections::BTreeMap::from_iter([
@@ -6847,6 +6869,7 @@ async fn glm_profile_wildcard_rewrites_unlisted_effort() {
         system_prompt_prefix: None,
         upstream_chat_kwargs: JsonMap::new(),
         capabilities: None,
+        roles: None,
         reasoning_effort: Some(llmconduit::config::ReasoningConfig {
             default: None,
             map: std::collections::BTreeMap::from_iter([
@@ -6893,6 +6916,7 @@ async fn explicit_level_beats_wildcard() {
         system_prompt_prefix: None,
         upstream_chat_kwargs: JsonMap::new(),
         capabilities: None,
+        roles: None,
         reasoning_effort: Some(llmconduit::config::ReasoningConfig {
             default: None,
             map: std::collections::BTreeMap::from_iter([
@@ -6942,6 +6966,7 @@ async fn default_profile_shapes_unmatched_model() {
             system_prompt_prefix: None,
             upstream_chat_kwargs: JsonMap::new(),
             capabilities: None,
+            roles: None,
             reasoning_effort: Some(llmconduit::config::ReasoningConfig {
                 default: Some("high".to_string()),
                 map: std::collections::BTreeMap::new(),
@@ -6982,6 +7007,7 @@ async fn matched_profile_without_block_does_not_inherit_default() {
                 system_prompt_prefix: None,
                 upstream_chat_kwargs: JsonMap::new(),
                 capabilities: None,
+                roles: None,
                 reasoning_effort: Some(llmconduit::config::ReasoningConfig {
                     default: Some("high".to_string()),
                     map: std::collections::BTreeMap::new(),
@@ -6996,6 +7022,7 @@ async fn matched_profile_without_block_does_not_inherit_default() {
                 system_prompt_prefix: None,
                 upstream_chat_kwargs: JsonMap::new(),
                 capabilities: None,
+                roles: None,
                 reasoning_effort: None,
             },
         ),
@@ -7114,6 +7141,7 @@ async fn anthropic_thinking_injection_uses_custom_param_config() {
         system_prompt_prefix: None,
         upstream_chat_kwargs: JsonMap::new(),
         capabilities: None,
+        roles: None,
         reasoning_effort: Some(llmconduit::config::ReasoningConfig {
             default: None,
             map: std::collections::BTreeMap::new(),
@@ -7178,6 +7206,7 @@ async fn anthropic_thinking_injection_overrides_static_chat_template_default() {
         system_prompt_prefix: None,
         upstream_chat_kwargs,
         capabilities: None,
+        roles: None,
         reasoning_effort: None,
     };
     let gateway = gateway_with_profile(upstream.clone(), "custom-model", profile);

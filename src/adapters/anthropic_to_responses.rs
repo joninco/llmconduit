@@ -226,28 +226,6 @@ fn convert_thinking(thinking: &Option<AnthropicThinking>) -> Option<ReasoningReq
     }
 }
 
-fn thinking_effort_for_budget(budget: u64) -> &'static str {
-    if budget <= 5_000 {
-        "low"
-    } else if budget <= 20_000 {
-        "medium"
-    } else {
-        "high"
-    }
-}
-
-fn normalize_reasoning_effort(effort: &str) -> AppResult<Option<String>> {
-    let effort = effort.trim();
-    if effort.is_empty() {
-        return Ok(None);
-    }
-    let normalized = match effort.to_ascii_lowercase().as_str() {
-        "max" | "xhigh" => "max",
-        _ => "high",
-    };
-    Ok(Some(normalized.to_string()))
-}
-
 fn convert_messages(
     messages: &[crate::models::anthropic::AnthropicMessage],
 ) -> AppResult<Vec<ResponseItem>> {

@@ -2101,6 +2101,7 @@ mod tests {
             tool_choice: serde_json::Value::String("auto".to_string()),
             parallel_tool_calls: None,
             reasoning: None,
+            thinking: None,
             store: false,
             stream: true,
             include: vec![],
@@ -2133,7 +2134,7 @@ mod tests {
         );
 
         let request = base_responses_request();
-        let extra_body = build_upstream_extra_body(defaults, &request);
+        let extra_body = build_upstream_extra_body(defaults, &request, None);
 
         assert!(
             !extra_body.contains_key("thinking"),
