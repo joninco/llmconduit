@@ -834,6 +834,63 @@ fn redacted_upstream_request_bytes(request: &ChatCompletionRequest) -> Vec<u8> {
     }
 }
 
+/// Fable review (Finding 1): requests whose message-content text is at or below this
+/// size have their `upstream_request` redaction done INLINE; a larger request moves
+/// the serialize+redact+re-serialize onto the blocking pool so it never stalls the
+/// tokio worker (mirrors [`UpstreamRequestLogger`]'s `spawn_blocking`). Matches the
+/// 16 KiB HTTP journal dump gate (`http::API_LOG_PAYLOAD_DUMP_LIMIT_BYTES`).
+const TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES: usize = 16 * 1024;
+
+/// A cheap, allocation-free size estimate for the inline-vs-`spawn_blocking` decision
+/// on the `upstream_request` redaction: the total text length of the message
+/// contents, which dominate a large Claude Code (1M-context) request. An
+/// under-estimate only keeps an unusual request inline; a large message history (the
+/// finding's motivating case) is always well over the limit. It does NOT allocate or
+/// serialize (unlike [`estimate_leaf_input_tokens`]), so it is safe to run on the
+/// worker every dispatch.
+fn estimate_request_text_len(request: &ChatCompletionRequest) -> usize {
+    fn value_text_len(value: &Value) -> usize {
+        match value {
+            Value::String(s) => s.len(),
+            Value::Array(items) => items.iter().map(value_text_len).sum(),
+            Value::Object(map) => map.values().map(value_text_len).sum(),
+            _ => 0,
+        }
+    }
+    request
+        .messages
+        .iter()
+        .map(|message| message.content.as_ref().map_or(0, value_text_len))
+        .sum()
+}
+
+/// Fable review (Finding 1): produce the redacted `upstream_request` bytes, moving the
+/// serialize+redact+re-serialize OFF the tokio worker for a LARGE request via
+/// `spawn_blocking` (mirroring [`UpstreamRequestLogger`]). A small request redacts
+/// inline; a large one is CLONED once (the only on-worker O(body) cost — a struct
+/// clone is far cheaper than the alloc-heavy `to_value`+walk+`to_vec` it offloads) and
+/// redacted on the blocking pool. Redaction is IDENTICAL either way (secret + image
+/// URI, via [`redacted_upstream_request_bytes`]). The caller AWAITS this INLINE, BEFORE
+/// the dispatch send and BEFORE `write_upstream_request`, so the last-writer-wins
+/// `replace` lands well before the finalize barrier reads the section (no race, no
+/// hang). `None` ONLY on a `spawn_blocking` join failure (runtime shutdown) — the
+/// caller then leaves the section ABSENT (don't-lie-with-zeros), never a panic.
+async fn offload_redacted_upstream_request_bytes(
+    request: &ChatCompletionRequest,
+) -> Option<Vec<u8>> {
+    if estimate_request_text_len(request) <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
+        return Some(redacted_upstream_request_bytes(request));
+    }
+    let owned = request.clone();
+    match tokio::task::spawn_blocking(move || redacted_upstream_request_bytes(&owned)).await {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            tracing::warn!(error = %err, "turn-capture: upstream_request redaction task failed");
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct UpstreamRequestLogger {
     path: PathBuf,
@@ -1040,8 +1097,15 @@ impl ReqwestUpstreamClient {
             );
         }
         self.capture_upstream_body(response_id, request);
-        if let Some(capture) = capture {
-            capture.write_upstream_request(&redacted_upstream_request_bytes(request));
+        // Finding 1: redact the `upstream_request` section OFF the tokio worker for
+        // large requests (spawn_blocking), AWAITED here — before the send and before
+        // `write_upstream_request` — so the last-writer-wins `replace` lands well
+        // before the finalize barrier reads the section (no race). A `None` (spawn
+        // join failure) leaves the section absent (don't-lie-with-zeros).
+        if let Some(capture) = capture
+            && let Some(redacted) = offload_redacted_upstream_request_bytes(request).await
+        {
+            capture.write_upstream_request(&redacted);
         }
         self.send_chat_request(url, request).await
     }
@@ -6428,6 +6492,77 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("turn-capture artifact never appeared at {}", path.display());
+    }
+
+    /// Finding 1: `offload_redacted_upstream_request_bytes` produces IDENTICAL
+    /// redacted output on the inline (small) and `spawn_blocking` (large) paths — a
+    /// secret (`api_key` → `extra_body`) and an image `data:` URI are BOTH redacted,
+    /// with no raw secret/image bytes surviving. The large request (a padded message
+    /// content) trips `estimate_request_text_len > TURN_CAPTURE_INLINE_REDACT_LIMIT`
+    /// so the redaction runs OFF the tokio worker; the small one stays inline. Both
+    /// paths reuse the SAME `redacted_upstream_request_bytes`, so redaction is
+    /// unchanged.
+    #[tokio::test]
+    async fn f1_offload_upstream_request_redacts_small_inline_and_large_spawn_blocking() {
+        let make = |filler: &str| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "stream": true,
+                "api_key": "sk-LEAK-UPSTREAM-9999",
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url",
+                         "image_url": {"url": "data:image/png;base64,RAWUPSTREAMIMG7777"}},
+                        {"type": "text", "text": filler}
+                    ]
+                }]
+            }))
+            .expect("valid chat request")
+        };
+
+        let small = make("hi");
+        assert!(
+            super::estimate_request_text_len(&small)
+                <= super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
+            "small request takes the inline path"
+        );
+        let red_small = super::offload_redacted_upstream_request_bytes(&small)
+            .await
+            .expect("inline redaction returns bytes");
+
+        let large = make(&"x".repeat(40 * 1024));
+        assert!(
+            super::estimate_request_text_len(&large)
+                > super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
+            "large request takes the spawn_blocking path"
+        );
+        let red_large = super::offload_redacted_upstream_request_bytes(&large)
+            .await
+            .expect("spawn_blocking redaction returns bytes");
+
+        for (label, redacted) in [
+            ("small/inline", red_small),
+            ("large/spawn_blocking", red_large),
+        ] {
+            let text = String::from_utf8(redacted).expect("redacted section is UTF-8");
+            assert!(
+                !text.contains("sk-LEAK-UPSTREAM-9999"),
+                "{label}: secret value redacted"
+            );
+            assert!(
+                text.contains("[redacted]"),
+                "{label}: secret marker present"
+            );
+            assert!(
+                !text.contains("RAWUPSTREAMIMG7777"),
+                "{label}: raw image bytes redacted"
+            );
+            assert!(
+                text.contains("<redacted uri>"),
+                "{label}: image URI marker present"
+            );
+        }
     }
 
     /// F1d AC-10: the artifact's `upstream_request` equals the FINAL on-wire

@@ -660,9 +660,13 @@ impl TurnCaptureState {
     /// path (no tap). Idempotent (only the first close drops the sender); `partial`
     /// is sticky (a later `close(false)` never clears an earlier degrade mark).
     pub fn upstream_response_done(&self, partial: bool) {
+        // Poison-tolerant (Fable review): reachable from `UpstreamTapGuard`'s `Drop`,
+        // so a poisoned lock must degrade to a best-effort close (recover the guard
+        // via `PoisonError::into_inner`, mirroring `evict_registry`) instead of
+        // panicking-in-Drop, which would abort the process during unwind.
         self.upstream_response
             .lock()
-            .expect("turn-capture upstream-response lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .close(partial);
     }
 
@@ -705,7 +709,14 @@ impl TurnCaptureState {
     /// both-`done` barrier (`spawn_assembly`).
     pub fn served_done(&self, partial: bool) {
         let trigger = {
-            let mut barrier = self.barrier.lock().expect("turn-capture barrier lock");
+            // Poison-tolerant (Fable review): reachable from `TeeBody`'s and
+            // `MiddlewareCaptureGuard`'s `Drop`, so recover a poisoned barrier
+            // (`PoisonError::into_inner`, mirroring `evict_registry`) rather than
+            // panicking-in-Drop → process abort during unwind.
+            let mut barrier = self
+                .barrier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if barrier.served_reported {
                 return;
             }
@@ -811,7 +822,14 @@ impl TurnCaptureState {
     /// side has also reported.
     pub fn engine_done(&self, status: &str, reason: Option<&str>) {
         let trigger = {
-            let mut barrier = self.barrier.lock().expect("turn-capture barrier lock");
+            // Poison-tolerant (Fable review): reachable from `CaptureGuard`'s and
+            // `MiddlewareCaptureGuard`'s `Drop`, so recover a poisoned barrier
+            // (`PoisonError::into_inner`, mirroring `evict_registry`) rather than
+            // panicking-in-Drop → process abort during unwind.
+            let mut barrier = self
+                .barrier
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if barrier.engine_reported {
                 return;
             }
@@ -891,16 +909,21 @@ impl TurnCaptureState {
         } else {
             // Take the staged body FIRST (dropping the mutex guard at the `;`), then
             // `replace` -- never hold the pending-body lock across the section write.
+            // Poison-tolerant (Fable review): this finalize runs on a task spawned
+            // from a `Drop`-reachable `*_done`, so a poisoned lock recovers
+            // (`PoisonError::into_inner`) to keep the artifact best-effort assembled
+            // rather than panicking the finalize — same across this path and
+            // `write_artifact_file` below.
             let staged = self
                 .pending_upstream_body
                 .lock()
-                .expect("turn-capture pending-upstream-body lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
             if let Some(body) = staged
                 && self
                     .upstream_response
                     .lock()
-                    .expect("turn-capture upstream-response lock")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .replace(&body)
             {
                 self.upstream_response_present
@@ -915,7 +938,7 @@ impl TurnCaptureState {
         let upstream_response = self
             .upstream_response
             .lock()
-            .expect("turn-capture upstream-response lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         upstream_response.close(false);
         upstream_response.await_closed().await;
@@ -1056,7 +1079,7 @@ impl TurnCaptureState {
         if let Some(model) = self
             .model_served
             .lock()
-            .expect("turn-capture model_served lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_deref()
         {
             w.write_all(b",\"model_served\":")?;
@@ -1071,7 +1094,7 @@ impl TurnCaptureState {
         let outcome = self
             .barrier
             .lock()
-            .expect("turn-capture barrier lock")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .outcome
             .clone();
         let (status, reason) = match outcome {
@@ -1115,7 +1138,7 @@ impl TurnCaptureState {
             let upstream_response = self
                 .upstream_response
                 .lock()
-                .expect("turn-capture upstream-response lock")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             write_section(&mut w, "upstream_response", &upstream_response, false)?;
         }
@@ -1615,9 +1638,13 @@ async fn section_writer(
 /// (if any) WITHOUT sealing, so replaces arriving while the writer is still
 /// draining are still accepted. Under the slot's own mutex.
 fn take_pending_replace(meta: &SectionMeta) -> Option<Vec<u8>> {
+    // Poison-tolerant (Fable review): the section writer runs the seal/take when
+    // `close` (reachable from a `Drop` path) drops the sender, so a poisoned slot must
+    // recover (`PoisonError::into_inner`) rather than panic the writer — a panicked
+    // writer would never set `closed`, hanging the finalize barrier's `await_closed`.
     meta.pending_replace
         .lock()
-        .expect("turn-capture pending-replace lock")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .pending
         .take()
 }
@@ -1633,7 +1660,7 @@ fn seal_and_take_pending_replace(meta: &SectionMeta) -> Option<Vec<u8>> {
     let mut slot = meta
         .pending_replace
         .lock()
-        .expect("turn-capture pending-replace lock");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     slot.sealed = true;
     slot.pending.take()
 }
@@ -2595,6 +2622,103 @@ mod tests {
         );
         // No .tmp residue in the capture dir.
         assert!(!dir.join("api_barrier.json.tmp").exists());
+    }
+
+    /// Fable review (Finding 3): a poisoned BARRIER mutex must NOT abort the process
+    /// when a `Drop`-reachable path acquires it (`CaptureGuard::drop` → `engine_done`;
+    /// `served_done` on the tee/backstop path). The lock is recovered via
+    /// `PoisonError::into_inner` (mirroring `evict_registry`), so the drop degrades to
+    /// a best-effort finalize: the artifact is STILL assembled — no panic-in-Drop, no
+    /// abort during unwind, no hang.
+    #[tokio::test]
+    async fn poisoned_barrier_lock_is_drop_safe_and_still_finalizes() {
+        let dir = temp_dir_path("poison-barrier");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture
+            .start("api_poison_barrier", Some("m".to_string()), 1)
+            .expect("state");
+        state.write_inbound_request(br#"{"model":"m"}"#);
+        state.write_served_response(b"served-bytes");
+
+        // Poison the barrier mutex: a thread panics WHILE HOLDING its guard.
+        let poisoner = Arc::clone(&state);
+        let joined = std::thread::spawn(move || {
+            let _guard = poisoner.barrier.lock().expect("acquire to poison");
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(
+            joined.is_err(),
+            "the poisoning thread panicked under the lock"
+        );
+        assert!(state.barrier.is_poisoned(), "barrier mutex is now poisoned");
+
+        // `CaptureGuard::drop` calls `engine_done` → `barrier.lock()`; with a
+        // poison-INtolerant `.expect()` this would panic DURING UNWIND and abort the
+        // process. `served_done` (also barrier-locked) is on the same Drop-reachable
+        // path. Neither may panic.
+        let guard = super::CaptureGuard::new(Arc::clone(&state), CancellationToken::new());
+        state.served_done(false);
+        drop(guard);
+
+        // Best-effort finalize STILL published a valid artifact despite the poison.
+        let artifact = wait_for_artifact(&dir.join("api_poison_barrier.json")).await;
+        assert_eq!(artifact["api_call_id"], "api_poison_barrier");
+        // A `CaptureGuard` Drop with no explicit terminal records failed/"dropped".
+        assert_eq!(artifact["status"], "failed");
+        assert!(
+            !state.work_dir().exists(),
+            "best-effort finalize cleaned up the .work dir despite the poison"
+        );
+    }
+
+    /// Fable review (Finding 3): a poisoned `upstream_response` SECTION mutex must NOT
+    /// abort when `UpstreamTapGuard::drop`'s call (`upstream_response_done`) — and the
+    /// finalize terminal-close/assembly — acquire it. All recover via
+    /// `PoisonError::into_inner`, so the close is best-effort and the artifact still
+    /// assembles (no panic-in-Drop, no hang). The absent-section invariant holds: a
+    /// poison never fabricates an `upstream_response`.
+    #[tokio::test]
+    async fn poisoned_upstream_response_lock_is_drop_safe_and_finalizes() {
+        let dir = temp_dir_path("poison-section");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture
+            .start("api_poison_section", Some("m".to_string()), 1)
+            .expect("state");
+        state.write_inbound_request(br#"{"model":"m"}"#);
+
+        // Poison the upstream_response section mutex.
+        let poisoner = Arc::clone(&state);
+        let joined = std::thread::spawn(move || {
+            let _guard = poisoner
+                .upstream_response
+                .lock()
+                .expect("acquire to poison");
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(
+            joined.is_err(),
+            "the poisoning thread panicked under the lock"
+        );
+        assert!(
+            state.upstream_response.is_poisoned(),
+            "upstream_response mutex is now poisoned"
+        );
+
+        // Exactly what `UpstreamTapGuard::drop` calls — must not panic on the poison.
+        state.upstream_response_done(true);
+
+        // Drive the both-`done` barrier; the finalize path also acquires the poisoned
+        // section lock (terminal close + assembly) and must recover, not panic/hang.
+        state.served_done(true);
+        state.engine_done("cancelled", Some("client_disconnect"));
+
+        let artifact = wait_for_artifact(&dir.join("api_poison_section.json")).await;
+        assert_eq!(artifact["status"], "cancelled");
+        // No raw upstream response was streamed/staged, so the section is ABSENT
+        // (don't-lie-with-zeros) — the poison never fabricated one.
+        assert!(artifact["sections"].get("upstream_response").is_none());
     }
 
     /// F1c review r2 (robust cleanup ordering): a work-dir-delete FAILURE must

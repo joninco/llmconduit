@@ -9,6 +9,7 @@
 
 use llmconduit::log_rotation::cleanup_dump_files;
 use llmconduit::log_rotation::cleanup_dump_files_with_remover;
+use llmconduit::log_rotation::cleanup_orphan_tmp_files;
 use llmconduit::log_rotation::cleanup_orphan_work_dirs;
 use std::fs;
 use std::io;
@@ -320,4 +321,67 @@ fn ac17_orphan_sweep_noop_without_work_subtree() {
     dir.write("api_done.json");
     let swept = cleanup_orphan_work_dirs(dir.path(), MAX_AGE, now_in_future());
     assert_eq!(swept, 0, "no `.work/` subtree -> nothing to sweep");
+}
+
+// ---------------------------------------------------------------------------
+// Fable review (Finding 2) — crash-orphaned `<id>.json.tmp` sweep: a crash BETWEEN
+// `assemble_blocking`'s tmp write and the atomic rename leaves an artifact-sized
+// `<id>.json.tmp` that `cleanup_dump_files` never reclaims (extension `tmp`). The
+// new `cleanup_orphan_tmp_files` reclaims aged ones, SCOPED to `turn_capture_dir`.
+// ---------------------------------------------------------------------------
+
+/// An AGED `<id>.json.tmp` (crash residue) is reclaimed; a FRESH in-progress
+/// `<id>.json.tmp` (an assembly writing right now) is protected by its mtime; and the
+/// sweep targets ONLY `*.json.tmp` — a published `.json` artifact and an unrelated
+/// `.tmp` are BOTH left untouched. Uses real `now` + backdating so aged and fresh
+/// coexist under one cutoff (the "mixed" pattern), exactly as production runs it.
+#[test]
+fn f1_tmp_sweep_prunes_aged_json_tmp_keeps_fresh_and_targets_only_json_tmp() {
+    let dir = TempDir::new();
+
+    // (1) Aged crash-orphan `<id>.json.tmp` -> reclaimed.
+    let aged_tmp = dir.write("api_crashed.json.tmp");
+    backdate(&aged_tmp, Duration::from_secs(3 * 3600));
+    // (2) Fresh `<id>.json.tmp` (an assembly writing right now) -> kept (recent mtime).
+    let fresh_tmp = dir.write("api_inflight.json.tmp");
+    // (3) A published artifact + a stray unrelated `.tmp` -> never targeted by THIS sweep.
+    let artifact = dir.write("api_done.json");
+    let stray = dir.write("scratch.tmp");
+
+    let removed = cleanup_orphan_tmp_files(dir.path(), MAX_AGE, SystemTime::now());
+
+    assert_eq!(removed, 1, "only the aged .json.tmp is reclaimed");
+    assert!(!aged_tmp.exists(), "aged <id>.json.tmp reclaimed");
+    assert!(
+        fresh_tmp.exists(),
+        "a fresh in-progress .json.tmp is protected by its mtime"
+    );
+    assert!(
+        artifact.exists(),
+        "a published .json artifact is never touched by the tmp sweep"
+    );
+    assert!(
+        stray.exists(),
+        "a non-artifact .tmp is never touched (only *.json.tmp is targeted)"
+    );
+}
+
+/// Scoping guarantee: the request-log rotation pass (`cleanup_dump_files`, which runs
+/// over EVERY `debug_log_dir`) never deletes a `.json.tmp` — its extension is `tmp`,
+/// not eligible. Only the capture-scoped `cleanup_orphan_tmp_files` reclaims those,
+/// and `spawn_cleanup` runs THAT over `turn_capture_dir` ALONE. So a `.json.tmp`
+/// sitting under a request-log dir is left untouched by the pass covering that dir.
+#[test]
+fn f1_request_log_dir_json_tmp_is_untouched_by_dump_rotation() {
+    let request_log_dir = TempDir::new();
+    let tmp = request_log_dir.write("api_x.json.tmp");
+    backdate(&tmp, Duration::from_secs(5 * 3600));
+
+    let deleted = cleanup_dump_files(request_log_dir.path(), MAX_AGE, SystemTime::now());
+
+    assert_eq!(deleted, 0, "`.json.tmp` is not an eligible dump extension");
+    assert!(
+        tmp.exists(),
+        "a request-log-dir .json.tmp is never reclaimed by dump rotation (tmp sweep is capture-scoped)"
+    );
 }

@@ -76,6 +76,13 @@ use uuid::Uuid;
 
 const API_LOG_PAYLOAD_DUMP_LIMIT_BYTES: usize = 16 * 1024;
 const API_LOG_PREVIEW_CHARS: usize = 160;
+/// Fable review (Finding 1): inbound bodies at or below this size have their
+/// turn-capture redaction done INLINE; a larger body moves the parse+redact+
+/// re-serialize onto the blocking pool so a multi-MB Claude Code (1M-context)
+/// request never stalls the tokio worker (which the synchronous path did — 100ms+
+/// plus a 3–6× transient allocation spike per concurrent request). Set to the SAME
+/// 16 KiB as the journal dump gate ([`API_LOG_PAYLOAD_DUMP_LIMIT_BYTES`]).
+const TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES: usize = API_LOG_PAYLOAD_DUMP_LIMIT_BYTES;
 const UNKNOWN_MODEL_CREATED_AT: &str = "1970-01-01T00:00:00Z";
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -597,7 +604,13 @@ async fn log_api_call(
     // image URIs, the SAME path `payload_for_log` uses — AGENTS.md line 137/144),
     // never retaining a slice of the 256 MiB buffer.
     let turn_capture_state = if capture_gate {
-        let (model_requested, inbound_section) = redacted_inbound_section(&body_bytes);
+        // Finding 1: redact OFF the tokio worker for large bodies (spawn_blocking),
+        // AWAITED here before `write_inbound_request` so the section is written +
+        // closed before the finalize barrier can read it. `body_bytes.clone()` is a
+        // cheap Arc-backed `Bytes` clone (dropped when the redaction completes, before
+        // `body_bytes` is moved into the rebuilt request below).
+        let (model_requested, inbound_section) =
+            offload_redacted_inbound_section(body_bytes.clone()).await;
         let state = gateway
             .turn_capture()
             .start(&api_call_id, model_requested, epoch_millis());
@@ -787,6 +800,37 @@ fn redacted_inbound_section(body: &Bytes) -> (Option<String>, Vec<u8>) {
             // `data:`/signed URL in a malformed/odd payload is not captured raw.
             let redacted = crate::redaction::redact_image_uris(&String::from_utf8_lossy(body));
             (None, redacted.into_bytes())
+        }
+    }
+}
+
+/// Fable review (Finding 1): produce the redacted `inbound_request` bytes, moving the
+/// CPU-bound parse+redact+re-serialize OFF the tokio worker for a LARGE body via
+/// `spawn_blocking` (mirroring `upstream::UpstreamRequestLogger`). Small bodies
+/// (`<= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES`) stay inline — the blocking-pool hop
+/// isn't worth it. Redaction is IDENTICAL on both paths (it is the SAME
+/// [`redacted_inbound_section`]). The caller AWAITS this INLINE, before
+/// `write_inbound_request` (append + close), so the section is fully written and
+/// closed before the both-`done` finalize barrier can read it (no section race, no
+/// hang). `body` is an owned `Bytes` (the caller passes a cheap Arc-backed clone);
+/// the redacted output is a fresh owned `Vec` — no retained slice of the middleware
+/// buffer (AGENTS.md line 144).
+async fn offload_redacted_inbound_section(body: Bytes) -> (Option<String>, Vec<u8>) {
+    if body.len() <= TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES {
+        return redacted_inbound_section(&body);
+    }
+    match tokio::task::spawn_blocking(move || redacted_inbound_section(&body)).await {
+        Ok(result) => result,
+        // `redacted_inbound_section` is panic-free (serde failures fall back to a
+        // marker), so a `JoinError` here means the runtime is shutting down. Record an
+        // honest, NON-EMPTY marker so the section still closes (never a hang) and never
+        // reads as a fabricated empty-measured body (don't-lie-with-zeros).
+        Err(err) => {
+            tracing::warn!(error = %err, "turn-capture: inbound redaction task failed");
+            (
+                None,
+                b"<turn-capture: inbound redaction task failed>".to_vec(),
+            )
         }
     }
 }
@@ -2031,6 +2075,66 @@ mod tests {
     use axum::body::Bytes;
     use axum::http::HeaderName;
     use sha2::Digest as _;
+
+    /// Finding 1: the inbound redaction produces IDENTICAL redacted output on the
+    /// inline (small) and `spawn_blocking` (large) paths — a secret-bearing field and
+    /// an image `data:` URI are BOTH redacted, with no raw secret/image bytes
+    /// surviving, and the requested `model` is still extracted. The large body forces
+    /// the off-worker path (`> TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES`); the small one
+    /// stays inline. Both must round-trip to valid JSON with the same redaction.
+    #[tokio::test]
+    async fn offload_inbound_redacts_small_inline_and_large_spawn_blocking_identically() {
+        use serde_json::Value;
+        let body_with_filler = |filler: &str| {
+            Bytes::from(format!(
+                r#"{{"model":"claude-x","api_key":"sk-LEAK-INBOUND-9999","messages":[{{"role":"user","content":[{{"type":"image_url","image_url":{{"url":"data:image/png;base64,RAWINBOUNDIMG7777"}}}},{{"type":"text","text":"{filler}"}}]}}]}}"#
+            ))
+        };
+
+        let small = body_with_filler("hi");
+        assert!(
+            small.len() <= super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
+            "small body takes the inline path"
+        );
+        let (model_small, red_small) = super::offload_redacted_inbound_section(small.clone()).await;
+
+        let large = body_with_filler(&"x".repeat(32 * 1024));
+        assert!(
+            large.len() > super::TURN_CAPTURE_INLINE_REDACT_LIMIT_BYTES,
+            "large body takes the spawn_blocking path"
+        );
+        let (model_large, red_large) = super::offload_redacted_inbound_section(large).await;
+
+        for (label, model, redacted) in [
+            ("small/inline", model_small, red_small),
+            ("large/spawn_blocking", model_large, red_large),
+        ] {
+            assert_eq!(
+                model.as_deref(),
+                Some("claude-x"),
+                "{label}: model extracted"
+            );
+            let text = String::from_utf8(redacted).expect("redacted section is UTF-8");
+            assert!(
+                !text.contains("sk-LEAK-INBOUND-9999"),
+                "{label}: secret value redacted"
+            );
+            assert!(
+                text.contains("[redacted]"),
+                "{label}: secret marker present"
+            );
+            assert!(
+                !text.contains("RAWINBOUNDIMG7777"),
+                "{label}: raw image bytes redacted"
+            );
+            assert!(
+                text.contains("<redacted uri>"),
+                "{label}: image URI marker present"
+            );
+            let value: Value = serde_json::from_str(&text).expect("redacted section is valid JSON");
+            assert_eq!(value["model"], "claude-x", "{label}: structure intact");
+        }
+    }
 
     /// D7a R3 #1 (REGRESSION): a `/dashboard/login` body must yield NO
     /// body-derived log field. Emitting `body_sha256` + `body_bytes` (length) for
