@@ -451,6 +451,10 @@ docker run --rm -p 4000:4000 \
 To expose `/debug` and `/dashboard`, replace the final line with
 `llmconduit start --with-debug-ui`.
 
+Non-loopback dashboard access requires authentication by default. To deliberately
+run tokenless on a trusted network, set `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1`;
+startup logs a prominent warning because `/debug` and `/dashboard` will be open.
+
 ## Endpoints
 
 | Endpoint | Description |

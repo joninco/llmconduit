@@ -235,12 +235,11 @@ impl PublicOrigin {
 /// [`DashboardEnv`] and shared (behind `Arc`) as an Axum extension on the
 /// protected routes. NEVER stored on the persisted `Config`.
 pub struct DashboardAuth {
-    /// Whether a bearer/login token is configured. `false` on a loopback dev
-    /// server without a configured token — in that mode the login flow always
-    /// "succeeds" (the server is already only reachable from localhost). On a
-    /// non-loopback bind a token is REQUIRED (enforced by
-    /// [`startup_route_decision`]). The token itself is NOT retained in cleartext;
-    /// only its digest ([`Self::token_digest`]) is kept for the comparison.
+    /// Whether a bearer/login token is configured. `false` in explicit dev-open
+    /// mode: either a loopback listener, or a non-loopback listener whose operator
+    /// deliberately set `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1`. The token itself
+    /// is NOT retained in cleartext; only its digest ([`Self::token_digest`]) is
+    /// kept for the comparison.
     has_token: bool,
     /// Precomputed SHA-256 digest of the configured token (D7a R3 #4). Hashing the
     /// configured token ONCE at construction — rather than on every
@@ -255,13 +254,12 @@ pub struct DashboardAuth {
     /// The validated public origin, when configured. Drives the `Secure` cookie
     /// attribute and the WS `Origin` allow-list.
     public_origin: Option<PublicOrigin>,
-    /// Whether the server is bound to a loopback address. D7a R2 #2: the WS
-    /// `Origin` allow-list may fall back to the request's own `Host`-derived
-    /// origin ONLY on a loopback bind (where `Host` is the localhost address the
-    /// dev is using). Off-loopback the `Host` header is attacker-controllable, so
-    /// the fallback is forbidden and an `Origin` is matched ONLY against the
-    /// configured `public_origin`.
+    /// Whether the server is bound to a loopback address.
     loopback: bool,
+    /// Explicit operator opt-in to plaintext/dev-open behavior off loopback. In
+    /// tokenless mode this also permits a same-origin `Origin`/`Host` WS fallback,
+    /// so the dashboard works when reached directly by IP or through a proxy.
+    allow_insecure: bool,
     /// Whether mutating dashboard routes (the D6 kill route) may proceed.
     /// Default off → mutations are 403.
     allow_mutations: bool,
@@ -279,6 +277,7 @@ impl std::fmt::Debug for DashboardAuth {
                 &self.public_origin.as_ref().map(PublicOrigin::as_str),
             )
             .field("loopback", &self.loopback)
+            .field("allow_insecure", &self.allow_insecure)
             .field("allow_mutations", &self.allow_mutations)
             .finish()
     }
@@ -301,24 +300,17 @@ impl DashboardAuth {
     ///
     /// Rules (mirrors the spec):
     /// - `LLMCONDUIT_DASHBOARD_SESSION_KEY`: must decode to ≥ 32 bytes when set.
-    ///   On a loopback bind it may be auto-generated (logged as temporary); on a
-    ///   non-loopback bind it is REQUIRED — a missing key fails closed here (no
-    ///   silent ephemeral key), independent of [`startup_route_decision`].
+    ///   It may be auto-generated in tokenless dev-open mode; authenticated
+    ///   non-loopback deployments require an explicit stable key.
     /// - `LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN`: must be a valid `https://` origin
     ///   when set; required on a non-loopback bind (unless insecure override).
-    /// - `LLMCONDUIT_DASHBOARD_TOKEN`: required on a non-loopback bind (the
-    ///   insecure override does NOT relax this); optional (dev concession) on
-    ///   loopback, where `dev_open` then authenticates every request.
+    /// - `LLMCONDUIT_DASHBOARD_TOKEN`: required on a non-loopback bind unless the
+    ///   explicit insecure override is set. With no token, `dev_open`
+    ///   authenticates every request.
     ///
-    /// Returns `Err` for a malformed value (bad base64 / too-short key / bad
-    /// origin), a MISSING TOKEN on a non-loopback bind (D7a R2 #4 — fail closed so
-    /// a direct caller cannot build a tokenless `dev_open` non-loopback context),
-    /// OR a missing session key on a non-loopback bind. The *route-registration*
-    /// refusal (missing token/key/origin on a non-loopback bind) is a separate,
-    /// testable decision — [`startup_route_decision`] — so a misconfigured
-    /// production server refuses to expose the routes; this constructor
-    /// additionally fails closed on both the token and the key so a direct caller
-    /// cannot obtain an unauthenticated/auto-keyed non-loopback context.
+    /// Returns `Err` for malformed values or for a non-loopback configuration
+    /// that is neither fully authenticated nor explicitly opted into insecure
+    /// dev-open mode.
     pub fn from_env(
         bind_addr: SocketAddr,
         env: &DashboardEnv,
@@ -328,9 +320,9 @@ impl DashboardAuth {
 
         // D7a R3 #6: normalize the token here (trim; empty/whitespace-only → None)
         // so a directly-constructed `DashboardEnv { token: Some("") }` /
-        // `Some("   ")` is treated as tokenless and rejected on a non-loopback
-        // bind, rather than silently becoming a blank-token (effectively
-        // tokenless, since any presented token would have to equal "") dashboard.
+        // `Some("   ")` is treated as tokenless and therefore rejected on a
+        // non-loopback bind unless the explicit insecure override is present,
+        // rather than silently becoming a blank-token dashboard.
         // (`from_process_env` already trims/empties, but the constructor must not
         // rely on that for a hand-built env.)
         let token = env
@@ -339,64 +331,49 @@ impl DashboardAuth {
             .map(str::trim)
             .filter(|value| !value.is_empty());
 
-        // D7a R2 #4: fail closed on a tokenless non-loopback bind. A `None` token
-        // means `dev_open` treats every request as authenticated; that concession
-        // is loopback-only (the server is reachable solely from localhost there).
-        // The route decision also refuses this, but a direct caller could
-        // otherwise construct a tokenless non-loopback context and register it
-        // manually — so the constructor enforces the invariant independently. The
-        // insecure override does NOT relax this (it only relaxes the TLS origin).
-        if !loopback && token.is_none() {
+        // Tokenless non-loopback access must always be an explicit operator
+        // decision. The insecure override is intentionally loud and is the only
+        // way to construct this fully unauthenticated state off loopback.
+        if !loopback && token.is_none() && !env.allow_insecure {
             return Err(format!(
                 "{ENV_TOKEN} is required on a non-loopback bind; a tokenless dashboard is \
-                 fully unauthenticated (dev-open) and is a loopback-dev concession only"
+                 fully unauthenticated (set {ENV_ALLOW_INSECURE}=1 to opt in explicitly)"
             ));
         }
 
         let session_key = match env.session_key_b64.as_deref() {
             Some(encoded) => decode_session_key(encoded)?,
-            None if loopback => {
-                // No key configured. On loopback we auto-generate an ephemeral
-                // one (sessions do not survive a restart — documented).
+            None if loopback || (env.allow_insecure && token.is_none()) => {
+                // Dev-open mode does not use login sessions, but the auth context
+                // still needs a key for its uniform cookie/CSRF implementation.
                 warnings.push(format!(
-                    "{ENV_SESSION_KEY} not set; generated a temporary loopback-dev signing key \
+                    "{ENV_SESSION_KEY} not set; generated a temporary dev-open signing key \
                      (sessions reset on restart; the key is never logged)"
                 ));
                 generate_session_key()
             }
             None => {
-                // Non-loopback bind with no key: ephemeral auto-generation is a
-                // loopback-only concession. Refuse rather than silently signing
-                // sessions with a per-process key the operator never set. (The
-                // route decision also refuses this, but `from_env` fails closed
-                // independently so a direct caller can't get an auto-keyed
-                // non-loopback context.)
+                // An authenticated non-loopback bind needs a stable operator key.
+                // Tokenless explicit dev-open mode was handled by the prior arm.
                 return Err(format!(
                     "{ENV_SESSION_KEY} is required on a non-loopback bind (>= {MIN_SESSION_KEY_BYTES} \
-                     decoded bytes of base64); ephemeral key generation is loopback-dev only"
+                     decoded bytes of base64); authenticated deployments need a stable key"
                 ));
             }
         };
 
-        // An `http://` origin is accepted ONLY under the insecure override (D7a
-        // R2 #2). Off-loopback with no configured origin, the WS path will reject
-        // any browser `Origin` (no `Host` fallback) — see `origin_allowed`.
+        // An `http://` origin is accepted ONLY under the insecure override.
+        // Tokenless explicit dev-open mode may omit it and uses Origin == Host;
+        // authenticated off-loopback mode still requires an exact origin.
         let public_origin = match env.public_origin.as_deref() {
             Some(raw) => Some(PublicOrigin::parse(raw, env.allow_insecure)?),
             None => None,
         };
 
-        // D7a R3 #2: a non-loopback bind under the insecure override with NO
-        // configured origin cannot validate cross-site WS requests — the only
-        // legitimate-origin signal would be the attacker-controllable `Host`, and
-        // `origin_allowed` never trusts `Host` off loopback. The override relaxes
-        // only the TLS (scheme) requirement, NOT the exact-origin requirement, so
-        // fail closed here (mirroring the token/key fail-closed above): an explicit
-        // `http`-or-`https` origin is REQUIRED. `startup_route_decision` makes the
-        // same refusal at registration; the constructor enforces it independently
-        // so a direct caller cannot build an origin-less insecure non-loopback
-        // context.
-        if !loopback && env.allow_insecure && public_origin.is_none() {
+        // An authenticated non-loopback override still requires an exact origin:
+        // unlike dev-open mode, it carries session cookies that a cross-site WS
+        // must never be able to ride.
+        if !loopback && env.allow_insecure && token.is_some() && public_origin.is_none() {
             return Err(format!(
                 "{ENV_ALLOW_INSECURE}=1 on a non-loopback bind requires an explicit \
                  {ENV_PUBLIC_ORIGIN} (http:// is allowed under this override): the Host header is \
@@ -419,6 +396,7 @@ impl DashboardAuth {
                 session_key,
                 public_origin,
                 loopback,
+                allow_insecure: env.allow_insecure,
                 allow_mutations: env.allow_mutations,
             }),
             warnings,
@@ -516,12 +494,9 @@ impl DashboardAuth {
 
     // -- request authentication -------------------------------------------
 
-    /// Dev-open mode: NO token is configured. This only happens on a loopback
-    /// bind (the non-loopback startup decision refuses to register the routes
-    /// without a token), where the server is reachable only from localhost. In
-    /// this mode every request is treated as authenticated so a developer can
-    /// open `/debug`/`/dashboard` without a login round-trip. A logged warning
-    /// at startup makes the concession explicit.
+    /// Dev-open mode: NO token is configured. This is automatic on loopback and
+    /// requires the explicit insecure override off loopback. Every request is
+    /// treated as authenticated; startup emits a warning before routes register.
     pub fn dev_open(&self) -> bool {
         !self.has_token
     }
@@ -577,20 +552,23 @@ impl DashboardAuth {
     ///   deliberately do NOT fall back to the request's `Host` here: `Host` is
     ///   attacker-controllable, so trusting it would let a page on `https://evil`
     ///   with a forged `Host: evil` ride a stolen cookie.
-    /// - If NO `PUBLIC_ORIGIN` is configured, we accept the request's own
-    ///   `Host`-derived origin (the served origin) ONLY on a LOOPBACK bind, where
-    ///   the `Host` is the localhost address the dev is using. Off loopback the
-    ///   `Host` is attacker-controllable, so with no configured origin we REJECT
-    ///   (D7a R2 #2 — CSWSH: a non-loopback insecure-override bind without a
-    ///   `PUBLIC_ORIGIN` must NOT trust a `Host`-derived origin).
+    /// - If NO `PUBLIC_ORIGIN` is configured, the request's `Origin` must match
+    ///   its `Host`. This fallback is enabled on loopback and in explicitly
+    ///   insecure tokenless mode, preserving a same-origin CSWSH boundary.
     fn origin_allowed(&self, headers: &HeaderMap) -> bool {
         let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) else {
             return true;
         };
         match self.public_origin.as_ref() {
             Some(public) => origin == public.as_str(),
-            // No configured origin: the `Host`-derived fallback is loopback-only.
-            None => self.loopback && same_origin_as_host(headers, origin),
+            None => {
+                (self.loopback || (self.allow_insecure && self.dev_open()))
+                    && same_origin_as_host(
+                        headers,
+                        origin,
+                        !self.loopback && self.allow_insecure && self.dev_open(),
+                    )
+            }
         }
     }
 
@@ -685,27 +663,28 @@ impl MutationPolicy for DashboardAuth {
 /// Why the protected routes were refused (for a precise startup log/test).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteRefusal {
-    /// No `LLMCONDUIT_DASHBOARD_TOKEN`. ALWAYS fatal on a non-loopback bind —
-    /// the `ALLOW_INSECURE_DASHBOARD` override does NOT relax this (a tokenless
-    /// non-loopback dashboard would be fully unauthenticated via `dev_open`).
+    /// No `LLMCONDUIT_DASHBOARD_TOKEN` on a non-loopback bind without the
+    /// explicit insecure override.
     MissingToken,
     /// No valid `LLMCONDUIT_DASHBOARD_SESSION_KEY` (missing or < 32 decoded
-    /// bytes). ALWAYS fatal on a non-loopback bind — ephemeral key generation is
-    /// a loopback-only dev concession.
+    /// bytes). Fatal for authenticated non-loopback mode; tokenless explicit
+    /// dev-open mode does not use login sessions and may generate one.
     MissingSessionKey,
     /// No valid `LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN`. Fatal on a non-loopback
     /// bind: a validated `https://` origin is required, OR — when
-    /// `ALLOW_INSECURE_DASHBOARD=1` relaxes ONLY the TLS scheme — a validated
-    /// explicit `http://`-or-`https://` origin. The override does NOT waive the
-    /// exact-origin requirement, so an origin-less insecure non-loopback bind is
-    /// still refused (D7a R3 #2).
+    /// authenticated `ALLOW_INSECURE_DASHBOARD=1` mode accepts a validated
+    /// explicit `http://`-or-`https://` origin. Tokenless dev-open mode does not
+    /// reach this refusal because it uses same-origin Host validation.
     MissingHttpsOrigin,
 }
 
 impl RouteRefusal {
     pub fn reason(self) -> &'static str {
         match self {
-            Self::MissingToken => "LLMCONDUIT_DASHBOARD_TOKEN is required on a non-loopback bind",
+            Self::MissingToken => {
+                "LLMCONDUIT_DASHBOARD_TOKEN is required on a non-loopback bind unless \
+                 LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1 explicitly enables tokenless access"
+            }
             Self::MissingSessionKey => {
                 "a valid LLMCONDUIT_DASHBOARD_SESSION_KEY (>= 32 decoded bytes of base64) is \
                  required on a non-loopback bind"
@@ -744,17 +723,11 @@ impl RouteDecision {
 ///   (warned, and `dev_open` authenticates every request — reachable ONLY here);
 ///   a missing session key is auto-generated; a missing https origin is fine
 ///   (localhost is not TLS).
-/// - **Non-loopback bind:** require a token AND a valid session key AND a valid
-///   `https://` public origin. `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1` relaxes
-///   ONLY the origin *scheme* (TLS): under it an explicit `http://`-or-`https://`
-///   origin is still REQUIRED (D7a R3 #2 — the override does NOT waive the
-///   exact-origin requirement; an origin-less insecure bind cannot validate
-///   cross-site WS upgrades off loopback and is refused). It does NOT relax the
-///   token or session-key requirements either. A tokenless non-loopback dashboard
-///   would be fully unauthenticated (`dev_open` treats every request as authed),
-///   so the token is a hard requirement regardless of the insecure override; the
-///   session key is required because ephemeral key generation is a loopback-only
-///   concession.
+/// - **Non-loopback bind:** normally require a token, valid session key, and
+///   `https://` public origin. `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1` has two
+///   explicit modes: with a token it relaxes only the origin scheme; without a
+///   token it enables fully unauthenticated dev-open access and permits an
+///   ephemeral signing key plus same-origin Host fallback.
 ///
 /// A *malformed* public origin (bad URL / not https) counts as "missing" here
 /// so the routes refuse rather than register with an unusable origin; the
@@ -771,9 +744,19 @@ pub fn startup_route_decision(bind_addr: SocketAddr, env: &DashboardEnv) -> Rout
         return RouteDecision::Register { warnings };
     }
 
-    // Non-loopback. The token and session key are ALWAYS required (the insecure
-    // override never relaxes them); the https origin is required UNLESS overridden.
+    // Explicit tokenless insecure mode. This is intentionally checked before
+    // the authenticated requirements because neither a session key nor a public
+    // origin is needed for login; WS still enforces Origin == Host.
     if env.token.is_none() {
+        if env.allow_insecure {
+            return RouteDecision::Register {
+                warnings: vec![format!(
+                    "{ENV_ALLOW_INSECURE}=1 with no {ENV_TOKEN} on a non-loopback bind: \
+                     /dashboard and /debug are FULLY UNAUTHENTICATED on every listening \
+                     interface; use only behind a trusted network or access proxy"
+                )],
+            };
+        }
         return RouteDecision::Refuse(RouteRefusal::MissingToken);
     }
     if !has_valid_session_key(env) {
@@ -1091,10 +1074,10 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 /// Whether `origin` equals the request's own `scheme://host[:port]`, derived
 /// from `Host`. We can't see the TLS state of the inbound connection from the
 /// handler, so we accept either the http or https form of the request's `Host`
-/// as "same origin". The caller ([`DashboardAuth::origin_allowed`]) invokes this
-/// ONLY on a loopback bind — `Host` is attacker-controllable off loopback, so it
-/// is never trusted there (D7a R2 #2). The strict cross-site defense off loopback
-/// is the exact `PUBLIC_ORIGIN` match plus `SameSite=Strict` on the cookie.
+/// as "same origin". Normally the Host must also be a literal loopback address.
+/// The explicit tokenless non-loopback insecure mode passes
+/// `allow_nonloop_host=true`; it has no authentication cookie to steal, but still
+/// requires `Origin == Host` to stop an unrelated browser origin opening the WS.
 ///
 /// D7a R4: even on a loopback bind the `Host` is only trusted when it is a
 /// LITERAL loopback host name (`localhost`, `127.0.0.1`, `[::1]`/`::1`, with any
@@ -1102,11 +1085,11 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 /// otherwise reaches `/debug/ws` with `Origin: http://evil.com` + `Host:
 /// evil.com` and would ride a stolen cookie; rejecting any non-loopback `Host`
 /// here closes that path while preserving real localhost development.
-fn same_origin_as_host(headers: &HeaderMap, origin: &str) -> bool {
+fn same_origin_as_host(headers: &HeaderMap, origin: &str, allow_nonloop_host: bool) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    if !is_loopback_host(host) {
+    if !allow_nonloop_host && !is_loopback_host(host) {
         return false;
     }
     origin == format!("http://{host}") || origin == format!("https://{host}")
@@ -1265,6 +1248,7 @@ mod tests {
             public_origin: public_origin
                 .map(|raw| PublicOrigin::parse(raw, true).expect("valid test origin")),
             loopback,
+            allow_insecure: false,
             allow_mutations: false,
         })
     }
@@ -1369,27 +1353,38 @@ mod tests {
         );
     }
 
-    // -- insecure override: relaxes ONLY https, never the token/key -----------
+    // -- insecure override ---------------------------------------------------
 
     #[test]
-    fn insecure_override_does_not_relax_missing_token() {
-        // ALLOW_INSECURE=1 on a non-loopback bind with NO token must STILL refuse:
-        // a tokenless dashboard is `dev_open` (every request authed) — an
-        // unauthenticated dashboard on a LAN. The override only relaxes TLS.
+    fn insecure_override_explicitly_allows_tokenless_nonloopback() {
         let env = DashboardEnv {
             token: None,
-            session_key_b64: Some(key_b64()),
+            session_key_b64: None,
             public_origin: None,
             allow_insecure: true,
             ..Default::default()
         };
         let decision = startup_route_decision(public_bind(), &env);
-        assert_eq!(
-            decision,
-            RouteDecision::Refuse(RouteRefusal::MissingToken),
-            "insecure override must NOT register a tokenless non-loopback dashboard"
-        );
-        assert!(!decision.should_register());
+        let RouteDecision::Register { warnings } = decision else {
+            panic!("explicit tokenless insecure mode must register")
+        };
+        assert!(!warnings.is_empty(), "open non-loopback mode must warn");
+
+        let auth = build(public_bind(), &env);
+        assert!(auth.dev_open());
+        assert_eq!(auth.authenticate(&HeaderMap::new()), Some(u64::MAX));
+
+        let same_origin = headers_with(&[
+            ("origin", "http://192.168.1.10:4000"),
+            ("host", "192.168.1.10:4000"),
+        ]);
+        assert_eq!(auth.authenticate_ws(&same_origin), Some(u64::MAX));
+
+        let cross_origin = headers_with(&[
+            ("origin", "http://attacker.example.com"),
+            ("host", "192.168.1.10:4000"),
+        ]);
+        assert_eq!(auth.authenticate_ws(&cross_origin), None);
     }
 
     #[test]
@@ -1996,9 +1991,7 @@ mod tests {
     // -- fail-closed construction (D7a R2 #4) -----------------------------
 
     #[test]
-    fn from_env_rejects_tokenless_nonloopback() {
-        // A direct caller must NOT be able to construct a tokenless non-loopback
-        // `DashboardAuth` (which would be fully unauthenticated via `dev_open`).
+    fn from_env_requires_override_for_tokenless_nonloopback() {
         let env = DashboardEnv {
             token: None,
             session_key_b64: Some(key_b64()),
@@ -2010,15 +2003,17 @@ mod tests {
             err.contains(ENV_TOKEN),
             "tokenless non-loopback must fail closed: {err}"
         );
-        // Even with the insecure override set (which only relaxes TLS), it refuses.
+        // The explicit override permits the otherwise-rejected dev-open state.
         let env_insecure = DashboardEnv {
             allow_insecure: true,
+            session_key_b64: None,
+            public_origin: None,
             ..env
         };
-        assert!(
-            DashboardAuth::from_env(public_bind(), &env_insecure).is_err(),
-            "insecure override must NOT relax the token requirement"
-        );
+        let build = DashboardAuth::from_env(public_bind(), &env_insecure)
+            .expect("explicit insecure override should allow tokenless non-loopback");
+        assert!(build.auth.dev_open());
+        assert!(!build.warnings.is_empty());
         // The loopback dev concession still allows a tokenless build.
         let env_loopback = DashboardEnv {
             token: None,

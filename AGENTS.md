@@ -38,8 +38,9 @@ cargo build --release                                 # node-less host: embeds a
 `/dashboard` + `/dashboard/api/*` + `/dashboard/ws` are registered only when `--with-debug-ui` is on.
 Dashboard auth (env-only, never a persisted `Config` field): `LLMCONDUIT_DASHBOARD_TOKEN`,
 `LLMCONDUIT_DASHBOARD_SESSION_KEY`, `LLMCONDUIT_DASHBOARD_PUBLIC_ORIGIN` (must be `https://` on
-non-loopback — startup refuses to register `/dashboard` + `/debug` otherwise;
-`LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1` overrides). Kill requires `LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS=1`
+non-loopback by default). `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1` explicitly permits plaintext;
+when no token is configured it also permits fully unauthenticated non-loopback dev-open access and
+uses same-origin `Origin`/`Host` validation for dashboard WebSockets. Kill requires `LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS=1`
 + a CSRF token. See `.ralph/specs/D7-dashboard-auth-and-ws.md`.
 
 ## Code layout
