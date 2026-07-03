@@ -12,9 +12,10 @@
 //!    default this is a one-file STUB (`index.html`) — a node-less Rust host
 //!    builds with no frontend toolchain. When the operator opts in with
 //!    `LLMCONDUIT_BUILD_DASHBOARD=1`, the directory is cleared and the real
-//!    React+Vite SPA is built into it via `npm ci && npm run build`; a missing
-//!    `npm` or a failed build fails the Cargo build loudly. The runtime gate is
-//!    the separate `--with-debug-ui` flag — this env var is build-time only.
+//!    React+Vite SPA is built into it via `npm ci && npm run build`. Container
+//!    builds can instead point `LLMCONDUIT_DASHBOARD_DIST` at a bundle produced
+//!    by a separate Node stage. The runtime gate is the separate
+//!    `--with-debug-ui` flag — both environment variables are build-time only.
 
 use std::fs;
 use std::path::Path;
@@ -59,8 +60,9 @@ fn emit_git_provenance() {
 /// scratch so a prior enabled build's real assets never linger into a later
 /// stub build (and vice-versa).
 fn embed_dashboard() {
-    // The flag is the only switch; rebuild this script when it flips.
+    // These are build-time switches; rebuild this script when either flips.
     println!("cargo:rerun-if-env-changed=LLMCONDUIT_BUILD_DASHBOARD");
+    println!("cargo:rerun-if-env-changed=LLMCONDUIT_DASHBOARD_DIST");
     // Re-run when any build-affecting frontend input changes, so an enabled build
     // re-bundles. Covers sources, dependency manifests, and every build-time
     // config (Vite/Tailwind/PostCSS/TypeScript) — not the generated `dist/`,
@@ -92,10 +94,73 @@ fn embed_dashboard() {
         .map(|value| value == "1")
         .unwrap_or(false);
 
-    if build_enabled {
+    let prebuilt_dist = std::env::var_os("LLMCONDUIT_DASHBOARD_DIST")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+
+    assert!(
+        !(build_enabled && prebuilt_dist.is_some()),
+        "LLMCONDUIT_BUILD_DASHBOARD and LLMCONDUIT_DASHBOARD_DIST are mutually exclusive"
+    );
+
+    if let Some(prebuilt_dist) = prebuilt_dist {
+        embed_prebuilt_dashboard(&prebuilt_dist, &dist_dir);
+    } else if build_enabled {
         build_real_dashboard(&dist_dir);
     } else {
         write_stub_dashboard(&dist_dir);
+    }
+}
+
+/// Copy a dashboard bundle produced by a separate build stage into `OUT_DIR`.
+fn embed_prebuilt_dashboard(source: &Path, dist_dir: &Path) {
+    assert!(
+        source.is_dir(),
+        "LLMCONDUIT_DASHBOARD_DIST directory {} does not exist",
+        source.display()
+    );
+    assert!(
+        source.join("index.html").is_file(),
+        "LLMCONDUIT_DASHBOARD_DIST directory {} has no index.html",
+        source.display()
+    );
+
+    println!("cargo:rerun-if-changed={}", source.display());
+    copy_dir_contents(source, dist_dir);
+}
+
+fn copy_dir_contents(source: &Path, destination: &Path) {
+    let entries = fs::read_dir(source)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", source.display()));
+
+    for entry in entries {
+        let entry = entry
+            .unwrap_or_else(|err| panic!("failed to read entry in {}: {err}", source.display()));
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .unwrap_or_else(|err| panic!("failed to inspect {}: {err}", source_path.display()));
+
+        if file_type.is_dir() {
+            fs::create_dir_all(&destination_path).unwrap_or_else(|err| {
+                panic!("failed to create {}: {err}", destination_path.display())
+            });
+            copy_dir_contents(&source_path, &destination_path);
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to copy {} to {}: {err}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            });
+        } else {
+            panic!(
+                "dashboard bundle contains unsupported entry {}",
+                source_path.display()
+            );
+        }
     }
 }
 

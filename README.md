@@ -437,6 +437,9 @@ codex -p llmconduit "what files are in this directory?"
 
 ## Docker
 
+The Docker build compiles and embeds the complete dashboard in a separate Node
+stage; Node and the frontend sources are not present in the final image.
+
 ```bash
 docker build -t llmconduit .
 docker run --rm -p 4000:4000 \
@@ -444,6 +447,9 @@ docker run --rm -p 4000:4000 \
   -e LLMCONDUIT_UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
   llmconduit
 ```
+
+To expose `/debug` and `/dashboard`, replace the final line with
+`llmconduit start --with-debug-ui`.
 
 ## Endpoints
 

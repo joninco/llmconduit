@@ -1,5 +1,8 @@
 .git
 .codex
 target
+dashboard-frontend/node_modules
+dashboard-frontend/dist
+dashboard-frontend/*.tsbuildinfo
 Dockerfile
 .dockerignore
