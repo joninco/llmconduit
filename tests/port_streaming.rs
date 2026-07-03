@@ -50,7 +50,7 @@ fn chat_request() -> ChatCompletionRequest {
         stream: true,
         tools: None,
         tool_choice: None,
-        parallel_tool_calls: false,
+        parallel_tool_calls: Some(false),
         reasoning_effort: None,
         response_format: None,
         stream_options: None,

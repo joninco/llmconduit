@@ -4,7 +4,7 @@ use crate::adapters::chat_to_responses::StreamEmission;
 use crate::adapters::chat_to_responses::StreamState;
 use crate::adapters::responses_to_chat::LoweredTurn;
 use crate::adapters::responses_to_chat::ToolKind;
-use crate::adapters::responses_to_chat::lower_request_with_image_agent;
+use crate::adapters::responses_to_chat::lower_request_with_image_agent_and_roles;
 use crate::config::Config;
 use crate::config::UnsupportedImagePolicy;
 use crate::error::AppError;
@@ -65,6 +65,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 const UPSTREAM_MODEL_CATALOG_TTL_SECS: u64 = 300;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenizeCapability {
+    Unknown,
+    Supported,
+    Unsupported,
+}
 
 /// E1: absolute ceiling on in-gateway repair rounds for hallucinated (unoffered)
 /// tool calls — mirrors `WEB_SEARCH_ROUNDS_HARD_CEILING`. Default 1 (one
@@ -189,6 +196,10 @@ pub struct Gateway {
     /// are NEVER labels (cardinality). `Arc<Mutex<..>>` so a cloned `Gateway`
     /// shares one count, mirroring `model_fallback_warned`.
     unknown_tool_call_counts: Arc<std::sync::Mutex<BTreeMap<UnknownToolCounterKey, u64>>>,
+    /// Process-wide negative capability cache for the optional backend
+    /// `/tokenize` endpoint. The routing implementation probes all eligible
+    /// candidates before returning unsupported.
+    tokenize_capability: Arc<std::sync::Mutex<TokenizeCapability>>,
 }
 
 #[derive(Debug, Clone)]
@@ -284,8 +295,9 @@ impl UpstreamModelCatalog {
 /// model-independent constant reserve, NOT a per-tokenizer computation.
 const CONTEXT_BUDGET_MARGIN_TOKENS: i64 = 128;
 
-/// Pre-flight context budgeting could not fit the input within the model's
-/// context window. The call site maps this to an `AppError::bad_request`.
+/// The local size heuristic found no remaining context budget. This is a
+/// budgeting signal, not proof of tokenizer overflow; the call site defers to
+/// the upstream provider.
 #[derive(Debug)]
 struct ContextBudgetError;
 
@@ -293,35 +305,34 @@ struct ContextBudgetError;
 /// LOWERED payload (`messages`/`tools`/`response_format`) passed through the SAME
 /// `sanitize_chat_request` the upstream leaf applies before POSTing
 /// (`flatten_content` from config). This is the terminal layer — nothing
-/// transforms the body below `sanitize_chat_request` — so counting it makes an
-/// over-count structurally impossible (e.g. multi-part text content is flattened
-/// to a bare string here exactly as on the wire).
+/// transforms the body below `sanitize_chat_request`, so this is the closest
+/// stable byte-size proxy for the actual wire body (e.g. multi-part text content
+/// is flattened to a bare string here exactly as on the wire).
 ///
 /// The ADDITIVE fields the leaf merges later (`extra_body`/`upstream_chat_kwargs`,
 /// G2 family `chat_template_kwargs`, `temperature`/`stop`/penalties) are
 /// deliberately OMITTED — they only ever GROW the real payload, so leaving them
-/// out keeps the estimate a safe lower bound and keeps G3 out of the
-/// kwargs-merge seam (whose entanglement caused the original G3 thrash).
+/// out keeps the serialized-size proxy conservative and keeps G3 out of the
+/// kwargs-merge seam (whose entanglement caused the original G3 thrash). This
+/// byte-size relationship is not a lower-bound proof for every tokenizer.
 ///
 /// `reasoning_effort` is ALSO omitted: a per-model `reasoning_effort_map` clears
 /// the top-level field at the leaf and relays effort through the additive
 /// `chat_template_kwargs` instead, so the field is not guaranteed on the wire.
-/// Omitting it can only SHRINK the estimate, preserving the lower-bound proof in
-/// both the mapped (cleared) and unmapped (kept) cases. `pub` so the test oracle
-/// reuses this exact construction (one source of truth).
+/// Omitting it can only shrink the serialized-size proxy in both the mapped
+/// (cleared) and unmapped (kept) cases.
 /// Additive upstream-request fields that the G3 estimate and the dispatch loop
 /// parameterize differently (T9). The COMMON base (`messages`/`tools`/
 /// `response_format`/`tool_choice`/`stream`/`stream_options`/`parallel_tool_calls`)
 /// is shared via [`build_upstream_chat_request`]; these additives are the seam
-/// where the estimate deliberately uses lower-bound-safe empties while dispatch
+/// where the estimate deliberately uses conservative empty values while dispatch
 /// uses the real values.
 ///
-/// Why the estimate omits what it omits (the lower-bound proof, preserved
-/// exactly from the pre-T9 shadow builder):
+/// Why the estimate omits what it omits:
 /// - `reasoning_effort`: a per-model `reasoning_effort_map` CLEARS the top-level
 ///   field at the leaf for mapped models, so it is not guaranteed on the wire.
-///   Including it could OVER-count for mapped models ⇒ false pre-flight 400.
-///   Omitting can only SHRINK the estimate.
+///   Including it would inflate the proxy for mapped models; omitting can only
+///   shrink it.
 /// - `max_output_tokens`: budgeting CAPS this down, so the real payload carries
 ///   the (smaller) capped value. Including the uncapped request value could
 ///   over-count. Omitting is safe.
@@ -329,14 +340,15 @@ struct ContextBudgetError;
 ///   / `extra_body`: the additive leaf merges (`upstream_chat_kwargs`,
 ///   `chat_template_kwargs`) happen at `finalize_request_for_backend`, AFTER the
 ///   `run_turn` build, so `extra_body` here is pre-leaf-merge and does NOT
-///   include the kwargs that grow the payload. The estimate omits these scalars
-///   to stay a conservative lower bound; they only ever grow the real payload.
+///   include the kwargs that grow the payload. The proxy omits these scalars;
+///   they only ever grow the real payload.
 /// - `model`: the real model id is always on the wire, so the estimate uses the
 ///   real id (safe — it can only make the estimate LARGER, never over-count vs.
 ///   the wire since the wire carries the same id).
 #[derive(Clone)]
 struct UpstreamRequestAdditives {
     model: String,
+    parallel_tool_calls: Option<bool>,
     reasoning_effort: Option<String>,
     max_output_tokens: Option<i64>,
     temperature: Option<f64>,
@@ -353,6 +365,7 @@ impl UpstreamRequestAdditives {
     fn for_estimate(model: String) -> Self {
         Self {
             model,
+            parallel_tool_calls: None,
             reasoning_effort: None,
             max_output_tokens: None,
             temperature: None,
@@ -387,7 +400,7 @@ fn build_upstream_chat_request(
         stream: true,
         tools,
         tool_choice: Some(tool_choice),
-        parallel_tool_calls: false,
+        parallel_tool_calls: additives.parallel_tool_calls,
         reasoning_effort: additives.reasoning_effort,
         response_format,
         stream_options: Some(StreamOptions {
@@ -407,12 +420,11 @@ fn build_upstream_chat_request(
 /// [`build_upstream_chat_request`] with lower-bound-safe additives
 /// ([`UpstreamRequestAdditives::for_estimate`]), then `sanitize_chat_request`
 /// (the terminal leaf transform — nothing transforms the body below it, so
-/// counting it makes an over-count structurally impossible). Private: only
+/// it is the closest stable proxy for the wire body). Private: only
 /// `estimate_input_tokens` calls it. The G3 test oracle (T9) builds its OWN
 /// independent normalization of the recorded request — it does NOT call this
 /// fn, so estimator-vs-oracle drift is detectable. `resolved_model` is the
-/// backend model id the leaf POSTs (on the wire, so counting it is safe — it
-/// only grows the estimate, preserving the lower bound).
+/// backend model id the leaf POSTs, so the proxy includes that real id.
 fn estimate_request_from_lowered(
     messages: &[ChatMessage],
     tools: &[crate::models::chat::ChatTool],
@@ -432,7 +444,7 @@ fn estimate_request_from_lowered(
     sanitize_chat_request(request, flatten_content)
 }
 
-/// Coarse, deterministic, CONSERVATIVE lower-bound estimate of the input tokens
+/// Coarse, deterministic estimate of the input tokens
 /// the FIRST upstream turn will consume. Originally G3 pre-flight budgeting
 /// only; C3 additionally rides this value onto `response.created`
 /// (`created_event`) so the Anthropic streaming converter can seed
@@ -448,14 +460,15 @@ fn estimate_request_from_lowered(
 /// `text.verbosity`, `reasoning.summary`, raw `ToolSpec`, `ImageGenerationCall`,
 /// or leaf content-flattening of multi-part text) can inflate the estimate.
 /// `ceil(serialized_bytes / 4)` is an intentional coarse heuristic, not a
-/// tokenizer — do NOT replace it with one.
+/// tokenizer. Tokenizers can compress some inputs below that ratio or expand
+/// others above it, so this value may cap an explicit output budget
+/// conservatively but must never be the sole reason to reject a request.
 ///
-/// It remains a safe LOWER BOUND of the real request: it omits only the additive
-/// per-provider config/family kwargs merged at the leaf (G2), which only grow
-/// the payload. So it can never OVER-count and thus never cause a false
-/// pre-flight 400; any residual under-count is absorbed by G1's reactive
-/// shrink-and-retry, the precise net. The estimate covers the first upstream
-/// turn only; later tool-loop turns rely on G1.
+/// The serialized request omits only additive per-provider config/family kwargs
+/// merged at the leaf (G2), but byte length is not a proof about tokenizer
+/// output. Any under-count is absorbed by G1's reactive shrink-and-retry; a
+/// would-be local overflow is deferred to that exact provider path. The estimate
+/// covers the first upstream turn only; later tool-loop turns rely on G1.
 fn estimate_input_tokens(
     lowered: &LoweredTurn,
     flatten_content: bool,
@@ -480,8 +493,10 @@ fn estimate_input_tokens(
 /// Cap an explicitly-requested output-token budget down to what the model's
 /// context window can still fit after the estimated input and the fixed margin.
 ///
-/// Pure and unit-testable; the call site maps `Err` to a 400. Rules (mirroring
-/// claude-relay `_cap_max_completion_tokens`):
+/// Pure and unit-testable; `Err` means the heuristic found no remaining budget,
+/// and the call site defers to the provider tokenizer rather than returning a
+/// false-positive 400. Rules (mirroring claude-relay
+/// `_cap_max_completion_tokens`):
 /// - `available = context_limit - estimated_input_tokens - margin`.
 /// - `available <= 0` ⇒ `Err` (input + margin already exhausts the context).
 /// - an explicit positive request is capped to `min(requested, available)`;
@@ -504,8 +519,8 @@ fn budget_explicit_max_output_tokens(
 
 /// Conservative floor for G3 pre-flight budgeting (T9): the STRICTEST context
 /// window across the candidate set's KNOWN per-model limits (the min). A
-/// failover to a smaller-window model then constrains the budget, so the cap /
-/// reject decision is never wider than the tightest backend that could serve.
+/// failover to a smaller-window model then constrains the output-budget cap to
+/// the tightest backend that could serve.
 /// Candidates with no reported window (`None`) are skipped (unknown ⇒ no-op,
 /// matching pre-T9). Returns `None` when the set is empty OR no candidate
 /// reports a window ⇒ budgeting no-ops entirely.
@@ -726,6 +741,7 @@ impl Gateway {
             turn_capture: crate::turn_capture::TurnCapture::disabled(),
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            tokenize_capability: Arc::new(std::sync::Mutex::new(TokenizeCapability::Unknown)),
         }
     }
 
@@ -918,6 +934,20 @@ impl Gateway {
 
     pub fn upstream_client(&self) -> Arc<dyn UpstreamClient> {
         Arc::clone(&self.upstream)
+    }
+
+    pub fn tokenize_capability(&self) -> TokenizeCapability {
+        *self
+            .tokenize_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn set_tokenize_capability(&self, capability: TokenizeCapability) {
+        *self
+            .tokenize_capability
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = capability;
     }
 
     /// D4: the current per-upstream health + counters (lock-free read through
@@ -1404,13 +1434,17 @@ impl Gateway {
         // a side-effect-free read, so computing them here is safe. Pass the image
         // agent flag so an injected/caller `analyzeImage` tool lowers as the
         // server-side ImageAnalysis kind (run by the gateway) on active turns.
-        let lowered = lower_request_with_image_agent(
+        let roles = self
+            .config
+            .resolve_roles_config_for_resolved_model(&request.model, &resolved_model);
+        let lowered = lower_request_with_image_agent_and_roles(
             &tail_request,
             baseline_record
                 .as_ref()
                 .map(|record| record.internal_messages.clone())
                 .unwrap_or_default(),
             vision_session.is_some(),
+            roles,
         )
         .map_err(&finalize_pre_spawn_err)?;
 
@@ -1428,11 +1462,11 @@ impl Gateway {
         // `resolved_model` (the single provider's window — the served model's
         // limit, correct in non-routing mode). If that is also unknown,
         // budgeting no-ops. Cap an explicitly requested `max_output_tokens` down
-        // to what still fits after the estimated input + fixed margin, or reject
-        // clear input overflow with a 400. Returning Err here short-circuits
-        // before `tokio::spawn`, so no upstream chat POST is made. We mutate
-        // ONLY the typed field, which flows through to the chat request build
-        // and wins over conflicting default max-token aliases.
+        // to what still fits after the estimated input + fixed margin. If the
+        // byte heuristic says no budget remains, defer instead of rejecting:
+        // only the provider tokenizer can decide true overflow. We mutate ONLY
+        // the typed field, which flows through to the chat request build and
+        // wins over conflicting default max-token aliases.
         let candidate_plan = self.upstream.backend_candidate_plan(&resolved_model).await;
         // T9: the candidate plan is the authoritative resolver in routing/
         // failover mode. The engine's own `/v1/models` catalog is a budgeting
@@ -1483,11 +1517,16 @@ impl Gateway {
             ) {
                 Ok(capped) => request.max_output_tokens = capped,
                 Err(ContextBudgetError) => {
-                    // D3: pre-spawn budget failure → finalize Failed (the correct
-                    // terminal, not the Drop fallback's Cancelled) before returning.
-                    return Err(finalize_pre_spawn_err(AppError::bad_request(
-                        "input exceeds model context window",
-                    )));
+                    // The local estimator is intentionally approximate. Never
+                    // reject a request solely from the byte/character heuristic:
+                    // let the provider's tokenizer decide, then use the exact
+                    // context-overflow shrink-and-retry path if necessary.
+                    tracing::debug!(
+                        model = %resolved_model,
+                        estimated_input_tokens,
+                        context_limit = limit,
+                        "estimated prompt exceeds context window; deferring to upstream tokenizer"
+                    );
                 }
             }
         }
@@ -1618,7 +1657,7 @@ impl Gateway {
         Ok(ReceiverStream::new(rx))
     }
 
-    fn apply_system_prompt_prefix(
+    pub(crate) fn apply_system_prompt_prefix(
         &self,
         mut request: ResponsesRequest,
         resolved_model: &str,
@@ -2158,6 +2197,7 @@ impl Gateway {
         let mut current_tool_choice = request.tool_choice.clone();
         #[allow(unused_assignments)]
         let mut last_finish_reason: Option<String> = None;
+        let mut last_stop_sequence: Option<String>;
         // T1: `template_family` + `upstream_chat_kwargs` profile resolution moved
         // to the upstream LEAF (`finalize_request_for_backend`), where the FINAL
         // per-provider model is known after routing/failover/exposed-alias remap.
@@ -2208,6 +2248,17 @@ impl Gateway {
         let capture = api_call_id
             .as_deref()
             .and_then(|id| self.turn_capture().state(id));
+        // Gateway-owned server tools run a sequential request/tool/result loop.
+        // Preserve the upstream typed/client setting for ordinary client tools,
+        // but never allow parallel calls to interleave the internal loop.
+        let parallel_tool_calls = if tool_registry.has_active_server_tool(
+            self.config.brave_api_key.is_some(),
+            vision_session.is_some(),
+        ) {
+            Some(false)
+        } else {
+            request.parallel_tool_calls
+        };
         loop {
             // D6: compose the kill token with the client-hangup check — a dashboard
             // `abort()` flips `abort_token`, surfacing `cancelled()` (499) like a hang-up.
@@ -2228,6 +2279,7 @@ impl Gateway {
                 current_tool_choice.clone(),
                 UpstreamRequestAdditives {
                     model: upstream_model.clone(),
+                    parallel_tool_calls,
                     reasoning_effort: reasoning_effort.clone(),
                     max_output_tokens: request.max_output_tokens,
                     temperature: request.temperature,
@@ -2325,6 +2377,7 @@ impl Gateway {
                 Some(response_id.clone()),
                 Some(Arc::clone(&serving_token)),
             )
+            .with_thinking_override(request.thinking)
             // F1d: attach the turn-capture handle (see above) so the leaf's
             // `upstream_request` write can reach this turn's artifact.
             .with_capture(capture.clone());
@@ -2597,6 +2650,7 @@ impl Gateway {
             }
             let finalized = state.finalize(&tool_registry)?;
             last_finish_reason = finalized.finish_reason.clone();
+            last_stop_sequence = finalized.stop_sequence.clone();
             current_messages = upstream_request.messages;
             // G4 round-2 #5: a CLIENT tool whose arguments streamed entirely
             // before its name (name arrived name-only, so no delta ever
@@ -2889,6 +2943,7 @@ impl Gateway {
             } else {
                 None
             },
+            stop_sequence: last_stop_sequence,
             terminal_reason: Some(terminal_reason),
         };
         self.monitor.emit_with(response_id.as_str(), || {

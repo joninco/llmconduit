@@ -25,6 +25,8 @@ The default config path is:
 ~/.config/llmconduit/config.yaml
 ```
 
+Configuration is loaded at startup. Restart llmconduit after editing the file.
+
 Minimal config:
 
 ```yaml
@@ -114,6 +116,12 @@ model_profiles:
       Extra Kimi-specific instructions.
     chat_template_kwargs:
       preserve_thinking: true
+
+  GLM-5.2:
+    extends:
+      - thinking
+    upstream_chat_kwargs:
+      parallel_tool_calls: true
 ```
 
 `system_prompt_prefix` is prepended to all Responses, Chat Completions, and
@@ -122,7 +130,250 @@ global prefix. `upstream_chat_kwargs` merge in this order: top-level defaults,
 matched model profile templates, matched model profile, then explicit request
 values. In model profiles and templates, extra profile-level keys are shorthand
 for upstream chat kwargs; the explicit `upstream_chat_kwargs` wrapper still
-works and overrides the shorthand when both set the same key.
+works and overrides the shorthand when both set the same key. When a profile
+`extends` multiple templates, the `extends` list is applied in declaration
+order: later entries override earlier ones, and the profile's own fields
+override all templates.
+
+### Reserved `*` profile
+
+A profile keyed `*` is a pure fallback for per-model settings. When a request
+names a model that no specific `model_profiles` entry matches, the `*` profile
+stands in as that model's profile: its `upstream_chat_kwargs` and
+`system_prompt_prefix` apply. When a specific profile DOES match, the `*`
+profile is not consulted at all - an explicit match never inherits unset fields
+from `*`. The `*` profile can itself `extend` templates, so extending a shared
+template is the way to give `*` and explicit profiles common defaults. Use
+`model_profile_templates` (`extends`) to share fields between explicit
+profiles, not `*`.
+
+Per-model profile matching precedence, highest to lowest:
+
+1. The request model - matched by name (case-insensitive) against `model_profiles`.
+2. The resolved/upstream model (after `upstream_model` rewriting) - matched by name.
+3. The reserved `*` profile - used only when neither 1 nor 2 matches.
+
+Top-level config is the base below all profiles: `upstream_chat_kwargs` is the
+deep-merge base, and `system_prompt_prefix` is always prepended. Client request
+values still override profile settings, as described above.
+
+```yaml
+model_profiles:
+  # Fallback for any model without an explicit profile.
+  "*":
+    upstream_chat_kwargs:
+      chat_template_kwargs:
+        enable_thinking: true
+
+  GLM-5.2:
+    upstream_chat_kwargs:
+      chat_template_kwargs:
+        enable_thinking: false
+```
+
+With this config, a request for `GLM-5.2` uses only the `GLM-5.2` profile
+(`enable_thinking: false`); the `*` profile contributes nothing. A request for
+any other model (e.g. `Qwen-3`) falls back to `*` (`enable_thinking: true`).
+
+### Model capabilities
+
+A profile's `capabilities` block overrides the Anthropic model capabilities
+advertised on `/v1/models` for Anthropic clients.
+
+```yaml
+model_profiles:
+  "*":
+    capabilities:
+      thinking:
+        types: [adaptive, enabled]
+      effort:
+        levels: [max, xhigh, high, medium, low, minimal, none]
+      image_input: false
+```
+
+- `supported` is the only knob and defaults to `true`. The simple caps (`batch`,
+  `citations`, `code_execution`, `image_input`, `pdf_input`,
+  `structured_outputs`) accept a bare bool as shorthand for `{supported: <bool>}`.
+- `thinking.types`, `effort.levels`, and `context_management.features` list the
+  advertised sub-entries; each inherits the cap's `supported` flag.
+- Unknown cap keys, effort levels, thinking types, and context-management features
+  are rejected at load.
+- A configured cap replaces the base (upstream-supplied, else the default
+  capabilities) for that cap key, wholesale; unconfigured caps keep the base.
+  A matched profile without a `capabilities` block gets no fill-in from the `*`
+  profile. Caps resolve per upstream id: an id-keyed profile, else the first alias
+  whose `upstream_model` targets the id, else the reserved `*` profile.
+
+### Reasoning effort
+
+A profile's `reasoning_effort` block shapes the upstream `reasoning_effort` field
+and controls the thinking template kwarg injected on Anthropic routes. Effort
+shaping applies on `/v1/messages`, `/v1/responses`, `/v1/chat/completions`, and
+`/v1/messages/count_tokens`; thinking-kwarg injection applies on the Anthropic
+routes.
+
+```yaml
+model_profiles:
+  "*":
+    reasoning_effort:
+      default: high
+      map:
+        low: high
+        xhigh: max
+        "*": high
+      thinking_param_name: enable_thinking
+      thinking_param_value_on: true
+      thinking_param_value_off: false
+```
+
+- `map` translates effort levels case-insensitively. An explicit key wins; `*`
+  rewrites any otherwise-unlisted effort.
+- `default` is emitted when the client does not send an effort. Omitting it sends
+  no `reasoning_effort` field.
+- Anthropic requests always state thinking on/off through the configured template
+  kwarg (default `enable_thinking: true`/`false`), overriding static defaults.
+  A resolved `none` effort forces the off value.
+- A matching profile without `reasoning_effort` is not back-filled from `*`.
+
+The fork's advanced fragment form is also retained. It resolves at the final
+provider leaf, so a routed or failover model receives its own vocabulary, and
+it can place controls anywhere in the request rather than only remapping the
+top-level field:
+
+```yaml
+model_profiles:
+  GLM-5.2:
+    reasoning_effort_default: max
+    reasoning_effort_map:
+      high: {chat_template_kwargs: {reasoning_effort: high}}
+      max: {chat_template_kwargs: {reasoning_effort: max}}
+      none: {chat_template_kwargs: {enable_thinking: false}}
+```
+
+`reasoning_effort` and the fragment-based
+`reasoning_effort_map`/`reasoning_effort_default` form are mutually exclusive
+within a resolved profile.
+
+### Example: GLM-5.2 on vLLM
+
+```yaml
+model_profiles:
+  GLM-5.2:
+    reasoning_effort:
+      map:
+        none: none
+        minimal: none
+        low: high
+        medium: high
+        xhigh: max
+```
+
+`parallel_tool_calls` is a typed default: when a client omits it, the resolved
+`upstream_chat_kwargs.parallel_tool_calls` default applies, and an explicit
+client value always wins. The default is the global `upstream_chat_kwargs`
+deep-merged with the matching profile, so a profile value overrides the global
+one. The Anthropic (`/v1/messages`) route has no client field for it, so that
+resolved default is the only way to control it there. Setting it to `true` (as
+on `GLM-5.2` above) lets Claude Code fan out independent tool calls in one turn;
+setting it to `false` forces sequential calls for a model that mishandles
+parallel tool use. llmconduit always forces `false` while a gateway-owned Brave
+Search or image-analysis tool is active, because those internal tool/result
+loops must remain sequential.
+
+### Token counting
+
+`POST /v1/messages/count_tokens` applies the same model resolution, system
+prefix, role rules, tools, chat-template defaults, and backend finalization as
+generation, then calls the upstream server-root `/tokenize` endpoint. An
+upstream without `/tokenize` returns an Anthropic `not_found_error`; that
+unsupported result is cached for the lifetime of the process.
+
+### Roles
+
+A per-profile `roles` block maps whole-message roles before the conversation is
+sent upstream. It is fail-closed: a role with no matching rule is rejected with
+HTTP 400. With no `roles` block configured, the compatibility behavior remains:
+`developer` is rewritten to `system`, and system messages are hoisted. Adding a
+`roles` block opts that model into the exact policy below, including arbitrary
+role pass-through.
+
+`roles` holds an optional `merge_adjacent` list plus a map of role name to a
+rule, or an ordered list of rules. `*` is the wildcard role: it matches any role
+that has no explicit key. A single rule is shorthand for a one-element list. In
+a list, the first rule whose `when` matches wins; a rule with no `when` always
+matches, so put it last as the catch-all.
+
+Per-rule keys:
+
+- `when` (`leading` / `inline` / `always`, default `always`): `leading` matches
+  index 0, `inline` matches index > 0, `always` matches any position. Omitting
+  `when` is equivalent to `always`; spell it out only to be explicit.
+- `action` (`accept` / `reject` / `drop` / `rewrite`, default `accept`):
+  `accept` keeps the message in place; `reject` returns HTTP 400; `drop` removes
+  the message; `rewrite` renames the role, staying its own turn in place.
+- `target_role` (string, required with `action: rewrite`): the new role name.
+- `tag` (string, optional): wrap the message content in `<tag>...</tag>`.
+- `tag_attributes` (map<string,string>, requires `tag`): render attributes on
+  the opening tag, alphabetical by key, XML-escaped (`&` `"` `<`).
+
+Tagging gives the model extra context about a block. For example, rewriting a
+`developer` message to `system` with `tag: system-instruction` and
+`tag_attributes: {description: "IMPORTANT system message. You MUST follow this with high priority!"}`
+wraps the content as
+`<system-instruction description="IMPORTANT system message. You MUST follow this with high priority!">...</system-instruction>`.
+
+`merge_adjacent` is a post-pass keyed on the **final** role (after rewrites). It
+coalesces each maximal run of consecutive messages that share a final role in
+the list into one content-only message joined with `\n\n`. There is no
+inline/leading distinction at this level - it only looks at the role messages
+end up as and whether they are adjacent. Folding system and tool into `user` is
+`rewrite` to `user` plus `merge_adjacent: [user]`, which coalesces the
+resulting adjacent user messages into one while keeping their relative order.
+
+Resolution order for a message: the explicit role key, then the `*` wildcard,
+then fail-closed `reject`.
+
+```yaml
+model_profiles:
+  # Full-role, system inline ANYWHERE; tool role supported (GLM-5.2, Kimi K2.7).
+  # Both group tool runs in-template, so do NOT set merge_adjacent on `tool`.
+  GLM-5.2:
+    roles:
+      "*":       { action: reject }
+      user:      {}
+      assistant: {}
+      tool:      {}
+      system:    {}
+      developer: { action: rewrite, target_role: system }
+
+  # System-FIRST only (Qwen3.5 raises on a non-first system message). An INLINE
+  # system or developer message is rewritten to `user` in place; the index-0
+  # system message stays system and a leading developer message is rewritten to
+  # system, so Qwen never sees a non-first system.
+  Qwen3.5:
+    roles:
+      "*":       { action: reject }
+      user:      {}
+      assistant: {}
+      tool:      {}
+      system:
+        - { when: inline, action: rewrite, target_role: user }
+        - {}
+      developer:
+        - { when: inline, action: rewrite, target_role: user }
+        - { action: rewrite, target_role: system }
+
+  # System-less model (Gemma): only `user`/`assistant` exist. Fold system and
+  # tool into `user` and coalesce the adjacent user runs.
+  Gemma:
+    roles:
+      merge_adjacent: [user]
+      "*":       { action: reject }
+      user:      {}
+      assistant: {}
+      system:    { action: rewrite, target_role: user }
+      tool:      { action: rewrite, target_role: user, tag: tool_result }
+```
 
 Optional Brave Search:
 

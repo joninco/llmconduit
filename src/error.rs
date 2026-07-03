@@ -12,19 +12,17 @@ pub type AppResult<T> = Result<T, AppError>;
 /// not a generic error policy: only the leaf upstream client decides it, and
 /// only the failover loop reads it.
 ///
-/// `Failover` (the default for every error) means the attempt looks like a
-/// provider failure, so failover may retry on the next provider. `Terminal`
-/// means the failure is a same-provider concern that another provider cannot
-/// fix — surface it as-is. The sole `Terminal` case is a context-window overflow
-/// that persists *after* the leaf client's single shrink-and-retry: retrying the
-/// same oversized prompt on another provider would just overflow again (see
-/// `AGENTS.md`: context-overflow is a same-provider shrink-and-retry, not a
-/// failover trigger).
+/// `Failover` (the default) retries and cools a provider. `FailoverNoCooldown`
+/// retries elsewhere without penalizing a healthy provider for a request it
+/// rejected. `Terminal` surfaces the error without retrying or cooling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum FailoverDisposition {
     /// Provider-failure-shaped: failover may retry on the next provider.
     #[default]
     Failover,
+    /// Request-shaped failure: another provider may accept it, but this
+    /// provider remains healthy and must not enter cooldown.
+    FailoverNoCooldown,
     /// Same-provider terminal: surface as-is, do not fail over.
     Terminal,
 }
@@ -55,6 +53,17 @@ impl AppError {
         let msg = message.into();
         Self {
             status: StatusCode::BAD_REQUEST,
+            client_message: msg.clone(),
+            message: msg,
+            code: None,
+            failover: FailoverDisposition::default(),
+        }
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        let msg = message.into();
+        Self {
+            status: StatusCode::NOT_FOUND,
             client_message: msg.clone(),
             message: msg,
             code: None,

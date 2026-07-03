@@ -1,6 +1,8 @@
 use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de::{Deserializer, Error as DeError};
+use serde::ser::{SerializeMap, Serializer};
 use serde_json::Map as JsonMap;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -12,6 +14,509 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use url::Url;
+
+/// Upstream-compatible per-profile reasoning shaping. The fork's older
+/// `reasoning_effort_map` accepts arbitrary request fragments and remains the
+/// more expressive form; this typed form is retained as a convenient shorthand
+/// for top-level effort remapping plus a dynamic thinking template kwarg.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReasoningConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub map: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "is_default_thinking_param_name")]
+    pub thinking_param_name: String,
+    #[serde(skip_serializing_if = "is_default_thinking_param_value_on")]
+    pub thinking_param_value_on: JsonValue,
+    #[serde(skip_serializing_if = "is_default_thinking_param_value_off")]
+    pub thinking_param_value_off: JsonValue,
+}
+
+const DEFAULT_THINKING_PARAM_NAME: &str = "enable_thinking";
+
+fn default_thinking_param_name() -> String {
+    DEFAULT_THINKING_PARAM_NAME.to_string()
+}
+
+fn default_thinking_param_value_on() -> JsonValue {
+    JsonValue::Bool(true)
+}
+
+fn default_thinking_param_value_off() -> JsonValue {
+    JsonValue::Bool(false)
+}
+
+fn is_default_thinking_param_name(name: &str) -> bool {
+    name == DEFAULT_THINKING_PARAM_NAME
+}
+
+fn is_default_thinking_param_value_on(value: &JsonValue) -> bool {
+    matches!(value, JsonValue::Bool(true))
+}
+
+fn is_default_thinking_param_value_off(value: &JsonValue) -> bool {
+    matches!(value, JsonValue::Bool(false))
+}
+
+impl Default for ReasoningConfig {
+    fn default() -> Self {
+        Self {
+            default: None,
+            map: BTreeMap::new(),
+            thinking_param_name: default_thinking_param_name(),
+            thinking_param_value_on: default_thinking_param_value_on(),
+            thinking_param_value_off: default_thinking_param_value_off(),
+        }
+    }
+}
+
+impl ReasoningConfig {
+    pub fn thinking_param_value(&self, on: bool) -> &JsonValue {
+        if on {
+            &self.thinking_param_value_on
+        } else {
+            &self.thinking_param_value_off
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default)]
+            default: Option<String>,
+            #[serde(default)]
+            map: BTreeMap<String, String>,
+            #[serde(default = "default_thinking_param_name")]
+            thinking_param_name: String,
+            #[serde(default = "default_thinking_param_value_on")]
+            thinking_param_value_on: JsonValue,
+            #[serde(default = "default_thinking_param_value_off")]
+            thinking_param_value_off: JsonValue,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let map = raw
+            .map
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let key = key.trim().to_ascii_lowercase();
+                let value = value.trim().to_string();
+                (!key.is_empty() && !value.is_empty()).then_some((key, value))
+            })
+            .collect();
+        let default = raw.default.and_then(|value| {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        });
+        let thinking_param_name = if raw.thinking_param_name.trim().is_empty() {
+            default_thinking_param_name()
+        } else {
+            raw.thinking_param_name.trim().to_string()
+        };
+        Ok(Self {
+            default,
+            map,
+            thinking_param_name,
+            thinking_param_value_on: raw.thinking_param_value_on,
+            thinking_param_value_off: raw.thinking_param_value_off,
+        })
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingType {
+    Adaptive,
+    Enabled,
+}
+
+impl ThinkingType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Adaptive => "adaptive",
+            Self::Enabled => "enabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EffortLevel {
+    Max,
+    Xhigh,
+    High,
+    Medium,
+    Low,
+    Minimal,
+    #[serde(rename = "none")]
+    Disabled,
+}
+
+impl EffortLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Max => "max",
+            Self::Xhigh => "xhigh",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Minimal => "minimal",
+            Self::Disabled => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextFeature {
+    #[serde(rename = "clear_thinking_20251015")]
+    ClearThinking20251015,
+    #[serde(rename = "clear_tool_uses_20250919")]
+    ClearToolUses20250919,
+    #[serde(rename = "compact_20260112")]
+    Compact20260112,
+}
+
+impl ContextFeature {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClearThinking20251015 => "clear_thinking_20251015",
+            Self::ClearToolUses20250919 => "clear_tool_uses_20250919",
+            Self::Compact20260112 => "compact_20260112",
+        }
+    }
+}
+
+fn supported_obj(supported: bool) -> JsonValue {
+    JsonValue::Object(JsonMap::from_iter([(
+        "supported".to_string(),
+        JsonValue::Bool(supported),
+    )]))
+}
+
+/// Anthropic capability with a single support flag. A bare boolean is accepted
+/// as shorthand for `{ supported: ... }`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct SimpleCap {
+    pub supported: bool,
+}
+
+impl SimpleCap {
+    fn to_wire(&self) -> JsonValue {
+        supported_obj(self.supported)
+    }
+}
+
+impl<'de> Deserialize<'de> for SimpleCap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = JsonValue::deserialize(deserializer)?;
+        if let Some(supported) = value.as_bool() {
+            return Ok(Self { supported });
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default = "default_true")]
+            supported: bool,
+        }
+        let raw = serde_json::from_value::<Raw>(value)
+            .map_err(|err| <D::Error as serde::de::Error>::custom(err.to_string()))?;
+        Ok(Self {
+            supported: raw.supported,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThinkingCap {
+    #[serde(default = "default_true")]
+    pub supported: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub types: Vec<ThinkingType>,
+}
+
+impl ThinkingCap {
+    fn to_wire(&self) -> JsonValue {
+        let types = self
+            .types
+            .iter()
+            .map(|kind| (kind.as_str().to_string(), supported_obj(self.supported)))
+            .collect();
+        JsonValue::Object(JsonMap::from_iter([
+            ("supported".to_string(), JsonValue::Bool(self.supported)),
+            ("types".to_string(), JsonValue::Object(types)),
+        ]))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffortCap {
+    #[serde(default = "default_true")]
+    pub supported: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub levels: Vec<EffortLevel>,
+}
+
+impl EffortCap {
+    fn to_wire(&self) -> JsonValue {
+        let mut map = JsonMap::new();
+        map.insert("supported".to_string(), JsonValue::Bool(self.supported));
+        for level in &self.levels {
+            map.insert(level.as_str().to_string(), supported_obj(self.supported));
+        }
+        JsonValue::Object(map)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextManagementCap {
+    #[serde(default = "default_true")]
+    pub supported: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<ContextFeature>,
+}
+
+impl ContextManagementCap {
+    fn to_wire(&self) -> JsonValue {
+        let mut map = JsonMap::new();
+        map.insert("supported".to_string(), JsonValue::Bool(self.supported));
+        for feature in &self.features {
+            map.insert(feature.as_str().to_string(), supported_obj(self.supported));
+        }
+        JsonValue::Object(map)
+    }
+}
+
+/// Per-profile capability overrides used by Anthropic-compatible `/v1/models`.
+/// Each configured capability replaces that one key while unconfigured keys
+/// retain the upstream/default advertisement.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilitiesConfig {
+    pub batch: Option<SimpleCap>,
+    pub citations: Option<SimpleCap>,
+    pub code_execution: Option<SimpleCap>,
+    pub image_input: Option<SimpleCap>,
+    pub pdf_input: Option<SimpleCap>,
+    pub structured_outputs: Option<SimpleCap>,
+    pub thinking: Option<ThinkingCap>,
+    pub effort: Option<EffortCap>,
+    pub context_management: Option<ContextManagementCap>,
+}
+
+impl CapabilitiesConfig {
+    pub fn merge_into(&self, mut base: JsonValue) -> JsonValue {
+        let Some(map) = base.as_object_mut() else {
+            return base;
+        };
+        macro_rules! replace {
+            ($field:ident) => {
+                if let Some(cap) = &self.$field {
+                    map.insert(stringify!($field).to_string(), cap.to_wire());
+                }
+            };
+        }
+        replace!(batch);
+        replace!(citations);
+        replace!(code_execution);
+        replace!(image_input);
+        replace!(pdf_input);
+        replace!(structured_outputs);
+        replace!(thinking);
+        replace!(effort);
+        replace!(context_management);
+        base
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Action {
+    #[default]
+    Accept,
+    Reject,
+    Drop,
+    Rewrite,
+}
+
+impl Action {
+    fn is_accept(&self) -> bool {
+        *self == Self::Accept
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum When {
+    Leading,
+    Inline,
+    Always,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RoleRule {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub when: Option<When>,
+    #[serde(skip_serializing_if = "Action::is_accept")]
+    pub action: Action,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tag_attributes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoleRuleSet {
+    pub rules: Vec<RoleRule>,
+}
+
+impl<'de> Deserialize<'de> for RoleRuleSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = JsonValue::deserialize(deserializer)?;
+        let rules = if value.is_array() {
+            serde_json::from_value(value).map_err(DeError::custom)?
+        } else {
+            vec![serde_json::from_value(value).map_err(DeError::custom)?]
+        };
+        Ok(Self { rules })
+    }
+}
+
+impl Serialize for RoleRuleSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.rules.len() == 1 {
+            self.rules[0].serialize(serializer)
+        } else {
+            self.rules.serialize(serializer)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RolesConfig {
+    pub merge_adjacent: Vec<String>,
+    pub rules: BTreeMap<String, RoleRuleSet>,
+}
+
+impl<'de> Deserialize<'de> for RolesConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = JsonValue::deserialize(deserializer)?;
+        let JsonValue::Object(map) = value else {
+            return Err(DeError::custom(
+                "roles must be a map of role names to rules",
+            ));
+        };
+        let mut merge_adjacent = Vec::new();
+        let mut rules = BTreeMap::new();
+        for (key, value) in map {
+            if key == "merge_adjacent" {
+                merge_adjacent = serde_json::from_value(value).map_err(DeError::custom)?;
+            } else {
+                rules.insert(key, serde_json::from_value(value).map_err(DeError::custom)?);
+            }
+        }
+        Ok(Self {
+            merge_adjacent,
+            rules,
+        })
+    }
+}
+
+impl Serialize for RolesConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(
+            self.rules.len() + usize::from(!self.merge_adjacent.is_empty()),
+        ))?;
+        if !self.merge_adjacent.is_empty() {
+            map.serialize_entry("merge_adjacent", &self.merge_adjacent)?;
+        }
+        for (key, rules) in &self.rules {
+            map.serialize_entry(key, rules)?;
+        }
+        map.end()
+    }
+}
+
+impl RolesConfig {
+    pub fn rules_for(&self, role: &str) -> Option<&[RoleRule]> {
+        self.rules
+            .get(role)
+            .or_else(|| self.rules.get("*"))
+            .map(|set| set.rules.as_slice())
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        for (role, set) in &self.rules {
+            for rule in &set.rules {
+                let has_target = rule
+                    .target_role
+                    .as_deref()
+                    .is_some_and(|target| !target.trim().is_empty());
+                if rule.action == Action::Rewrite && !has_target {
+                    return Err(format!(
+                        "roles[{role}]: action `rewrite` requires a non-empty `target_role`"
+                    ));
+                }
+                if rule.action != Action::Rewrite && rule.target_role.is_some() {
+                    return Err(format!(
+                        "roles[{role}]: `target_role` is only valid with action `rewrite`"
+                    ));
+                }
+                if rule.tag.as_deref().is_some_and(|tag| !valid_tag_name(tag)) {
+                    return Err(format!("roles[{role}]: invalid tag name"));
+                }
+                if !rule.tag_attributes.is_empty() && rule.tag.is_none() {
+                    return Err(format!(
+                        "roles[{role}]: `tag_attributes` requires a non-empty `tag`"
+                    ));
+                }
+                if rule.tag_attributes.keys().any(|key| !valid_tag_name(key)) {
+                    return Err(format!("roles[{role}]: invalid tag attribute name"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn valid_tag_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':' | '.'))
+}
 
 /// E2b: policy for a residual `InputImage` (one the G4 image agent did not
 /// strip — agent inactive/disabled, `tool_choice=="none"`, a `file_id` image,
@@ -473,6 +978,8 @@ pub struct PersistedModelProfile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<RolesConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_family: Option<String>,
     /// Per-profile override for whether the resolved backend can natively see
     /// images (G4). `Some(true)` forces the image agent OFF for this profile
@@ -498,6 +1005,12 @@ pub struct PersistedModelProfile {
     /// has a `reasoning_effort_map` (e.g. GLM's template default is `max`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort_default: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<CapabilitiesConfig>,
+    /// Upstream-compatible shorthand for effort remapping and thinking-kwarg
+    /// control. Mutually exclusive with the fragment-based effort fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningConfig>,
 }
 
 impl<'de> Deserialize<'de> for PersistedModelProfile {
@@ -514,6 +1027,8 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             #[serde(default)]
             system_prompt_prefix: Option<String>,
             #[serde(default)]
+            roles: Option<RolesConfig>,
+            #[serde(default)]
             template_family: Option<String>,
             #[serde(default)]
             native_vision: Option<bool>,
@@ -523,6 +1038,10 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             reasoning_effort_map: BTreeMap<String, JsonValue>,
             #[serde(default)]
             reasoning_effort_default: Option<String>,
+            #[serde(default)]
+            capabilities: Option<CapabilitiesConfig>,
+            #[serde(default)]
+            reasoning_effort: Option<ReasoningConfig>,
             #[serde(default, flatten)]
             shorthand_upstream_chat_kwargs: JsonMap<String, JsonValue>,
         }
@@ -536,16 +1055,22 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
         upstream_chat_kwargs.remove("native_vision");
         upstream_chat_kwargs.remove("reasoning_effort_map");
         upstream_chat_kwargs.remove("reasoning_effort_default");
+        upstream_chat_kwargs.remove("reasoning_effort");
+        upstream_chat_kwargs.remove("roles");
+        upstream_chat_kwargs.remove("capabilities");
         merge_json_maps(&mut upstream_chat_kwargs, &raw.upstream_chat_kwargs);
         Ok(Self {
             extends: raw.extends,
             upstream_model: raw.upstream_model,
             system_prompt_prefix: raw.system_prompt_prefix,
+            roles: raw.roles,
             template_family: raw.template_family,
             native_vision: raw.native_vision,
             upstream_chat_kwargs,
             reasoning_effort_map: raw.reasoning_effort_map,
             reasoning_effort_default: raw.reasoning_effort_default,
+            capabilities: raw.capabilities,
+            reasoning_effort: raw.reasoning_effort,
         })
     }
 }
@@ -554,6 +1079,7 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
 pub struct ModelProfile {
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
+    pub roles: Option<RolesConfig>,
     pub template_family: Option<String>,
     /// Per-profile native-vision override (G4); see `PersistedModelProfile`.
     pub native_vision: Option<bool>,
@@ -561,6 +1087,8 @@ pub struct ModelProfile {
     /// Per-model reasoning-effort map + default; see `PersistedModelProfile`.
     pub reasoning_effort_map: BTreeMap<String, JsonValue>,
     pub reasoning_effort_default: Option<String>,
+    pub capabilities: Option<CapabilitiesConfig>,
+    pub reasoning_effort: Option<ReasoningConfig>,
 }
 
 /// Resolved reasoning-effort policy for a backend model: canonical effort level
@@ -569,6 +1097,10 @@ pub struct ModelProfile {
 pub struct ReasoningEffortPolicy {
     pub map: BTreeMap<String, JsonValue>,
     pub default: Option<String>,
+    /// Present when the policy came from the upstream-compatible typed syntax.
+    /// Unmapped levels pass through verbatim and the dynamic thinking kwarg is
+    /// taken from this config.
+    pub upstream_reasoning: Option<ReasoningConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -1105,21 +1637,61 @@ impl Config {
     /// id (profile name). Applied at the upstream LEAF — the single point that
     /// knows the FINAL provider model after routing/failover/exposed-alias remap
     /// — so a route/failover target gets its OWN model's effort vocabulary rather
-    /// than the request alias's. Each profile's `reasoning_effort_map` is already
-    /// extends-merged. Only profiles that define a map are included.
+    /// than the request alias's. Both the fork's fragment-based map and the
+    /// upstream-compatible typed shorthand are compiled into the same leaf
+    /// policy, after profile inheritance has resolved.
     pub fn reasoning_effort_policies(&self) -> BTreeMap<String, ReasoningEffortPolicy> {
         self.model_profiles
             .iter()
-            .filter(|(_, profile)| !profile.reasoning_effort_map.is_empty())
+            .filter(|(_, profile)| {
+                !profile.reasoning_effort_map.is_empty() || profile.reasoning_effort.is_some()
+            })
             .map(|(name, profile)| {
-                let map = profile
-                    .reasoning_effort_map
-                    .iter()
-                    .map(|(level, fragment)| (level.trim().to_ascii_lowercase(), fragment.clone()))
-                    .collect();
-                let default = trim_nonempty(profile.reasoning_effort_default.as_deref())
-                    .map(|level| level.to_ascii_lowercase());
-                (name.clone(), ReasoningEffortPolicy { map, default })
+                let (map, default, upstream_reasoning) =
+                    if let Some(reasoning) = &profile.reasoning_effort {
+                        let mut map: BTreeMap<String, JsonValue> = reasoning
+                            .map
+                            .iter()
+                            .map(|(level, mapped)| {
+                                (
+                                    level.trim().to_ascii_lowercase(),
+                                    serde_json::json!({"reasoning_effort": mapped}),
+                                )
+                            })
+                            .collect();
+                        let default = trim_nonempty(reasoning.default.as_deref())
+                            .map(|level| level.to_ascii_lowercase());
+                        // Upstream semantics do not run the configured default
+                        // back through `map`: the default is emitted verbatim.
+                        if let Some(level) = &default {
+                            map.insert(
+                                level.clone(),
+                                serde_json::json!({"reasoning_effort": level}),
+                            );
+                        }
+                        (map, default, Some(reasoning.clone()))
+                    } else {
+                        (
+                            profile
+                                .reasoning_effort_map
+                                .iter()
+                                .map(|(level, fragment)| {
+                                    (level.trim().to_ascii_lowercase(), fragment.clone())
+                                })
+                                .collect(),
+                            trim_nonempty(profile.reasoning_effort_default.as_deref())
+                                .map(|level| level.to_ascii_lowercase()),
+                            None,
+                        )
+                    };
+                (
+                    name.clone(),
+                    ReasoningEffortPolicy {
+                        map,
+                        default,
+                        upstream_reasoning,
+                    },
+                )
             })
             .collect()
     }
@@ -1221,6 +1793,37 @@ impl Config {
         )
     }
 
+    /// Resolve the capability overrides advertised for an upstream model id.
+    /// An id-keyed profile wins, followed by the first alias targeting that id;
+    /// the reserved `*` profile is the final fallback.
+    pub fn resolve_capabilities_for_upstream(&self, id: &str) -> Option<&CapabilitiesConfig> {
+        if let Some(profile) = self.model_profile(id) {
+            return profile.capabilities.as_ref();
+        }
+        for profile in self.model_profiles.values() {
+            if profile
+                .upstream_model
+                .as_deref()
+                .is_some_and(|model| model.eq_ignore_ascii_case(id))
+            {
+                return profile.capabilities.as_ref();
+            }
+        }
+        self.model_profile("*")
+            .and_then(|profile| profile.capabilities.as_ref())
+    }
+
+    pub fn resolve_roles_config_for_resolved_model(
+        &self,
+        request_model: &str,
+        resolved_model: &str,
+    ) -> Option<&RolesConfig> {
+        self.model_profiles_for_resolved_model(request_model, resolved_model)
+            .into_iter()
+            .rev()
+            .find_map(|profile| profile.roles.as_ref())
+    }
+
     fn model_profiles_for_resolved_model(
         &self,
         request_model: &str,
@@ -1236,6 +1839,11 @@ impl Config {
             {
                 profiles.push(profile);
             }
+        }
+        if profiles.is_empty()
+            && let Some(profile) = self.model_profile("*")
+        {
+            profiles.push(profile);
         }
         profiles
     }
@@ -1254,11 +1862,14 @@ impl Config {
 struct ResolvedModelProfile {
     upstream_model: Option<String>,
     system_prompt_prefixes: Vec<String>,
+    roles: Option<RolesConfig>,
     template_family: Option<String>,
     native_vision: Option<bool>,
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
     reasoning_effort_map: BTreeMap<String, JsonValue>,
     reasoning_effort_default: Option<String>,
+    capabilities: Option<CapabilitiesConfig>,
+    reasoning_effort: Option<ReasoningConfig>,
 }
 
 impl ResolvedModelProfile {
@@ -1266,11 +1877,14 @@ impl ResolvedModelProfile {
         ModelProfile {
             upstream_model: self.upstream_model,
             system_prompt_prefix: join_prompt_prefixes(self.system_prompt_prefixes),
+            roles: self.roles,
             template_family: normalize_template_family(self.template_family.as_deref()),
             native_vision: self.native_vision,
             upstream_chat_kwargs: self.upstream_chat_kwargs,
             reasoning_effort_map: self.reasoning_effort_map,
             reasoning_effort_default: self.reasoning_effort_default,
+            capabilities: self.capabilities,
+            reasoning_effort: self.reasoning_effort,
         }
     }
 }
@@ -1402,7 +2016,21 @@ fn resolve_model_profiles(
         }
         let profile = resolve_persisted_model_profile(profile, templates, &mut Vec::new())
             .map_err(|err| format!("model_profiles[{name}]: {err}"))?;
-        resolved.insert(name.to_string(), profile.into_model_profile());
+        let profile = profile.into_model_profile();
+        if let Some(roles) = &profile.roles {
+            roles
+                .validate()
+                .map_err(|err| format!("model_profiles[{name}]: {err}"))?;
+        }
+        if profile.reasoning_effort.is_some()
+            && (!profile.reasoning_effort_map.is_empty()
+                || profile.reasoning_effort_default.is_some())
+        {
+            return Err(format!(
+                "model_profiles[{name}]: `reasoning_effort` cannot be combined with `reasoning_effort_map` or `reasoning_effort_default`"
+            ));
+        }
+        resolved.insert(name.to_string(), profile);
     }
     Ok(resolved)
 }
@@ -1454,6 +2082,19 @@ fn merge_resolved_model_profile(
     if source.native_vision.is_some() {
         destination.native_vision = source.native_vision;
     }
+    if source.roles.is_some() {
+        destination.roles = source.roles;
+    }
+    if source.capabilities.is_some() {
+        destination.capabilities = source.capabilities;
+    }
+    if source.reasoning_effort.is_some() {
+        destination.reasoning_effort = source.reasoning_effort;
+        destination.reasoning_effort_map.clear();
+        destination.reasoning_effort_default = None;
+    } else if !source.reasoning_effort_map.is_empty() || source.reasoning_effort_default.is_some() {
+        destination.reasoning_effort = None;
+    }
     destination
         .system_prompt_prefixes
         .extend(source.system_prompt_prefixes);
@@ -1483,6 +2124,21 @@ fn merge_persisted_model_profile(
     }
     if source.native_vision.is_some() {
         destination.native_vision = source.native_vision;
+    }
+    if source.roles.is_some() {
+        destination.roles.clone_from(&source.roles);
+    }
+    if source.capabilities.is_some() {
+        destination.capabilities.clone_from(&source.capabilities);
+    }
+    if source.reasoning_effort.is_some() {
+        destination
+            .reasoning_effort
+            .clone_from(&source.reasoning_effort);
+        destination.reasoning_effort_map.clear();
+        destination.reasoning_effort_default = None;
+    } else if !source.reasoning_effort_map.is_empty() || source.reasoning_effort_default.is_some() {
+        destination.reasoning_effort = None;
     }
     if let Some(system_prompt_prefix) = trim_nonempty(source.system_prompt_prefix.as_deref()) {
         destination
@@ -1893,7 +2549,7 @@ mod tests {
             stream: true,
             tools: None,
             tool_choice: None,
-            parallel_tool_calls: false,
+            parallel_tool_calls: Some(false),
             reasoning_effort: None,
             response_format: None,
             stream_options: None,
@@ -1985,6 +2641,70 @@ model_profiles:
         );
         // A profile with no effort map is not included.
         assert!(!policies.contains_key("other"));
+    }
+
+    #[test]
+    fn upstream_reasoning_syntax_uses_leaf_resolution_and_dynamic_thinking_kwarg() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+model_profiles:
+  served-model:
+    reasoning_effort:
+      default: medium
+      map:
+        low: high
+        "*": max
+      thinking_param_name: thinking_mode
+      thinking_param_value_on: enabled
+      thinking_param_value_off: disabled
+"#,
+        )
+        .expect("yaml");
+        let config = Config::from_persisted(&persisted).expect("config");
+        let policies = BackendFinalizationPolicies::from_config(&config);
+
+        let mut request = leaf_request("served-model");
+        request.reasoning_effort = Some("low".to_string());
+        let mut backend =
+            BackendChatRequest::new(request, None, None, None).with_thinking_override(Some(true));
+        finalize_request_for_backend(&mut backend, &policies);
+        let wire = serde_json::to_value(&backend.request).expect("wire json");
+        assert_eq!(wire["reasoning_effort"], json!("high"));
+        assert_eq!(
+            wire["chat_template_kwargs"]["thinking_mode"],
+            json!("enabled")
+        );
+
+        let mut request = leaf_request("served-model");
+        request.reasoning_effort = Some("unlisted".to_string());
+        let mut backend =
+            BackendChatRequest::new(request, None, None, None).with_thinking_override(Some(false));
+        finalize_request_for_backend(&mut backend, &policies);
+        let wire = serde_json::to_value(&backend.request).expect("wire json");
+        assert_eq!(wire["reasoning_effort"], json!("max"));
+        assert_eq!(
+            wire["chat_template_kwargs"]["thinking_mode"],
+            json!("disabled")
+        );
+    }
+
+    #[test]
+    fn typed_and_fragment_reasoning_syntaxes_are_mutually_exclusive() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+model_profiles:
+  broken:
+    reasoning_effort: {default: high}
+    reasoning_effort_map:
+      high: {reasoning_effort: high}
+"#,
+        )
+        .expect("yaml");
+        let error = Config::from_persisted(&persisted).expect_err("ambiguous config must fail");
+        assert!(
+            error.contains("cannot be combined"),
+            "unexpected error: {error}"
+        );
     }
     use std::collections::BTreeMap;
     use std::path::PathBuf;

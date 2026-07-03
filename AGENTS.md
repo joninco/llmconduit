@@ -99,7 +99,7 @@ Adapter direction map:
 
 These are intentional and load-bearing. Do not change without strong reason + matching test.
 
-- **`parallel_tool_calls: false`** forced upstream regardless of caller (`engine.rs:707-726`). Multi-tool turns interleave badly with replay + web-search loops.
+- **`parallel_tool_calls: false` for gateway-owned server tools.** Ordinary client tools honor the typed request/profile default, but Brave Search and image-analysis loops force sequential calls. Multi-tool server turns interleave badly with replay and internal tool/result loops.
 - **`WEB_SEARCH_ROUNDS_HARD_CEILING = 25`** in `engine.rs:1032`, enforced regardless of config. Defense against infinite tool loops.
 - **`OPENAI_MAX_STOP_SEQUENCES = 4`** in `chat.rs:81`. Returns 400 — do not silently truncate.
 - **`API_LOG_BODY_LIMIT_BYTES` / `API_LOG_PAYLOAD_DUMP_LIMIT_BYTES`** in `http.rs:51-52`. Don't bypass.

@@ -523,7 +523,7 @@ async fn image_agent_keeps_parallel_tool_calls_false_upstream() {
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     let requests = upstream.requests().await;
     assert!(
-        !requests[0].parallel_tool_calls,
+        requests[0].parallel_tool_calls == Some(false),
         "parallel_tool_calls must stay false"
     );
 }
@@ -746,6 +746,7 @@ async fn image_agent_rejects_mixed_client_and_analyze_image() {
                     extra: Default::default(),
                 },
                 finish_reason: Some("tool_calls".to_string()),
+                stop_reason: None,
             }],
             usage: None,
         })])
@@ -811,6 +812,7 @@ async fn image_agent_runs_analyze_and_web_search_sequentially() {
                     extra: Default::default(),
                 },
                 finish_reason: Some("tool_calls".to_string()),
+                stop_reason: None,
             }],
             usage: None,
         })])
@@ -914,6 +916,7 @@ async fn image_agent_hides_analyze_deltas_when_args_precede_name_chat() {
                         extra: Default::default(),
                     },
                     finish_reason: None,
+                    stop_reason: None,
                 }],
                 usage: None,
             }),
@@ -941,6 +944,7 @@ async fn image_agent_hides_analyze_deltas_when_args_precede_name_chat() {
                         extra: Default::default(),
                     },
                     finish_reason: Some("tool_calls".to_string()),
+                    stop_reason: None,
                 }],
                 usage: None,
             }),
@@ -999,6 +1003,7 @@ async fn image_agent_hides_analyze_deltas_when_args_precede_name_anthropic() {
                         extra: Default::default(),
                     },
                     finish_reason: None,
+                    stop_reason: None,
                 }],
                 usage: None,
             }),
@@ -1025,6 +1030,7 @@ async fn image_agent_hides_analyze_deltas_when_args_precede_name_anthropic() {
                         extra: Default::default(),
                     },
                     finish_reason: Some("tool_calls".to_string()),
+                    stop_reason: None,
                 }],
                 usage: None,
             }),
@@ -1270,6 +1276,7 @@ async fn image_agent_oversized_unresolved_tool_buffer_fails_cleanly() {
                 } else {
                     None
                 },
+                stop_reason: None,
             }],
             usage: None,
         }));
@@ -1320,6 +1327,7 @@ async fn image_agent_client_tool_args_before_name_still_emits_all_deltas() {
                         extra: Default::default(),
                     },
                     finish_reason: None,
+                    stop_reason: None,
                 }],
                 usage: None,
             }),
@@ -1346,6 +1354,7 @@ async fn image_agent_client_tool_args_before_name_still_emits_all_deltas() {
                         extra: Default::default(),
                     },
                     finish_reason: None,
+                    stop_reason: None,
                 }],
                 usage: None,
             }),
@@ -1373,6 +1382,7 @@ async fn image_agent_client_tool_args_before_name_still_emits_all_deltas() {
                         extra: Default::default(),
                     },
                     finish_reason: Some("tool_calls".to_string()),
+                    stop_reason: None,
                 }],
                 usage: None,
             }),

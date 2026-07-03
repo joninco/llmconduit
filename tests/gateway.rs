@@ -70,6 +70,7 @@ struct MockUpstream {
     /// SAME profile kwargs the production leaf would (T1). Empty by default
     /// (most tests don't assert kwargs).
     finalization_policies: Arc<StdMutex<llmconduit::upstream::BackendFinalizationPolicies>>,
+    token_count: Arc<Mutex<Option<u64>>>,
 }
 
 impl MockUpstream {
@@ -78,6 +79,10 @@ impl MockUpstream {
         chunks: Vec<Result<ChatCompletionChunk, llmconduit::error::AppError>>,
     ) {
         self.responses.lock().await.push_back(chunks);
+    }
+
+    async fn set_token_count(&self, count: Option<u64>) {
+        *self.token_count.lock().await = count;
     }
 
     /// Set the finalization policies built from the test config, so the mock's
@@ -151,6 +156,21 @@ impl UpstreamClient for MockUpstream {
 
     async fn list_models(&self) -> Result<reqwest::Response, llmconduit::error::AppError> {
         Err(llmconduit::error::AppError::internal("unused in this test"))
+    }
+
+    async fn count_tokens(
+        &self,
+        backend: &llmconduit::upstream::BackendChatRequest,
+    ) -> Result<Option<u64>, llmconduit::error::AppError> {
+        let mut backend = backend.clone();
+        let policies = self
+            .finalization_policies
+            .lock()
+            .expect("policies lock")
+            .clone();
+        llmconduit::upstream::finalize_request_for_backend(&mut backend, &policies);
+        self.requests.lock().await.push(backend.request);
+        Ok(*self.token_count.lock().await)
     }
 
     async fn supported_model_catalog(
@@ -414,8 +434,9 @@ async fn streams_function_call_turn() {
             }),
         }],
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: None,
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -458,7 +479,7 @@ async fn streams_function_call_turn() {
 
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].parallel_tool_calls, false);
+    assert_eq!(requests[0].parallel_tool_calls, Some(true));
     assert_eq!(requests[0].tools.as_ref().map(Vec::len), Some(1));
 }
 
@@ -571,8 +592,9 @@ async fn flattens_namespace_tools_for_upstream_and_preserves_namespace_in_output
             }],
         }],
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: None,
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -4314,8 +4336,9 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
             }),
         }],
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: None,
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -4426,8 +4449,9 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
             },
         ],
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: None,
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -7014,11 +7038,12 @@ fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
         input,
         tools: Vec::new(),
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: Some(llmconduit::models::responses::ReasoningRequest {
             effort: Some("medium".to_string()),
             summary: None,
         }),
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -7064,6 +7089,7 @@ fn content_chunk(id: &str, content: &str) -> ChatCompletionChunk {
                 extra: Default::default(),
             },
             finish_reason: None,
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -7086,6 +7112,7 @@ fn length_finish_chunk(id: &str) -> ChatCompletionChunk {
                 extra: Default::default(),
             },
             finish_reason: Some("length".to_string()),
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -7105,6 +7132,7 @@ fn reasoning_chunk(id: &str, reasoning: &str) -> ChatCompletionChunk {
                 extra: Default::default(),
             },
             finish_reason: None,
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -7130,6 +7158,7 @@ fn nested_thinking_chunk(id: &str, thinking: &str, signature: &str) -> ChatCompl
                 )]),
             },
             finish_reason: None,
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -7157,6 +7186,7 @@ fn tool_call_chunk(id: &str, call_id: &str, name: &str, arguments: &str) -> Chat
                 extra: Default::default(),
             },
             finish_reason: Some("tool_calls".to_string()),
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -7179,6 +7209,7 @@ fn legacy_function_call_chunk(id: &str, name: &str, arguments: &str) -> ChatComp
                 extra: Default::default(),
             },
             finish_reason: Some("function_call".to_string()),
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -8786,7 +8817,11 @@ async fn anthropic_messages_streams_nested_thinking_response() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].stream, true);
     assert_eq!(requests[0].reasoning_effort.as_deref(), Some("low"));
-    assert!(requests[0].extra_body.is_empty());
+    assert_eq!(
+        requests[0].extra_body["chat_template_kwargs"]["enable_thinking"],
+        json!(true),
+        "Anthropic thinking intent is stated explicitly to the backend"
+    );
 }
 
 #[tokio::test]
@@ -9285,6 +9320,83 @@ async fn anthropic_messages_prepends_profile_system_prompt_prefix() {
             .and_then(|value| value.as_str()),
         Some("Profile prefix.\n\nYou are a helpful assistant.")
     );
+}
+
+#[tokio::test]
+async fn anthropic_count_tokens_lowers_and_returns_anthropic_shape() {
+    let upstream = MockUpstream::default();
+    upstream.set_token_count(Some(321)).await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let body = json!({
+        "model": "test-model",
+        "max_tokens": 128,
+        "system": "Be concise.",
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("body");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+        json!({
+            "input_tokens": 321
+        })
+    );
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model, "test-model");
+    assert_eq!(
+        requests[0]
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>(),
+        vec!["system", "user"]
+    );
+}
+
+#[tokio::test]
+async fn anthropic_count_tokens_caches_unsupported_as_not_found() {
+    let upstream = MockUpstream::default();
+    let gateway = test_gateway(upstream, MockSearch::default());
+    let app = llmconduit::build_app_from_gateway(gateway);
+    let body = json!({
+        "model": "test-model",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "Hello"}]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .expect("body");
+    let error: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(error["error"]["type"], "not_found_error");
 }
 
 #[tokio::test]
@@ -9849,7 +9961,7 @@ async fn anthropic_messages_relaxes_forced_web_search_when_brave_is_disabled() {
 }
 
 #[tokio::test]
-async fn anthropic_messages_lifts_claude_code_skill_listing_before_user_prompt() {
+async fn anthropic_messages_preserves_claude_code_skill_listing_as_user_input() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "Hello."))])
@@ -9896,26 +10008,24 @@ async fn anthropic_messages_lifts_claude_code_skill_listing_before_user_prompt()
         .iter()
         .map(|message| message.role.as_str())
         .collect();
-    assert_eq!(roles, vec!["system", "user"]);
-    let system = messages[0]
-        .content
-        .as_ref()
-        .and_then(|value| value.as_str())
-        .expect("system content");
-    assert!(system.contains("skill listing"));
-    assert!(system.contains("security-review"));
-    assert!(system.contains("Do not quote"));
+    assert_eq!(roles, vec!["user", "user"]);
     assert_eq!(
-        messages[1]
+        messages[0]
             .content
             .as_ref()
             .and_then(|value| value.as_str()),
         Some("hello")
     );
+    let listing = messages[1]
+        .content
+        .as_ref()
+        .and_then(|value| value.as_str())
+        .expect("skill listing content");
+    assert!(listing.contains("security-review"));
 }
 
 #[tokio::test]
-async fn anthropic_messages_lifts_late_system_skill_listing_before_user_prompt() {
+async fn anthropic_messages_preserves_late_system_skill_listing_position() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "Hello."))])
@@ -9964,22 +10074,26 @@ async fn anthropic_messages_lifts_late_system_skill_listing_before_user_prompt()
         .iter()
         .map(|message| message.role.as_str())
         .collect();
-    assert_eq!(roles, vec!["system", "user"]);
+    assert_eq!(roles, vec!["system", "user", "system"]);
     let system = messages[0]
         .content
         .as_ref()
         .and_then(|value| value.as_str())
         .expect("system content");
     assert!(system.contains("You are Claude Code."));
-    assert!(system.contains("skill listing"));
-    assert!(system.contains("security-review"));
-    assert!(system.contains("Do not quote"));
     assert_eq!(
         messages[1]
             .content
             .as_ref()
             .and_then(|value| value.as_str()),
         Some("hello")
+    );
+    assert!(
+        messages[2]
+            .content
+            .as_ref()
+            .and_then(|value| value.as_str())
+            .is_some_and(|text| text.contains("security-review"))
     );
 }
 
@@ -11040,8 +11154,9 @@ async fn sse_responses_include_connection_keep_alive() {
         input: vec![user_message("hi")],
         tools: Vec::new(),
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: None,
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -11118,6 +11233,7 @@ fn e1_tool_chunk(
                 extra: Default::default(),
             },
             finish_reason: finish.then(|| "tool_calls".to_string()),
+            stop_reason: None,
         }],
         usage: None,
     }

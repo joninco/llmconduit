@@ -28,14 +28,13 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
             "Anthropic top_k is not supported by this gateway",
         ));
     }
-    let converted_messages = convert_messages(&request.messages)?;
-    let instructions = join_instruction_parts(
-        [extract_system_text(&request.system)]
-            .into_iter()
-            .chain(converted_messages.private_context),
-    );
-    let input = converted_messages.input;
+    let instructions = extract_system_text(&request.system);
+    let input = convert_messages(&request.messages)?;
     let tools = convert_tools(&request.tools);
+    let thinking_on = matches!(
+        request.thinking.as_ref(),
+        Some(AnthropicThinking::Enabled { .. } | AnthropicThinking::Adaptive { .. })
+    );
     let (reasoning, extra_body) = convert_thinking(&request.thinking);
     // Route Anthropic stop_sequences through the same normalize_stop gate as the
     // Chat path so OPENAI_MAX_STOP_SEQUENCES=4 → 400 (and empty-drop) apply here too.
@@ -57,8 +56,9 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         input,
         tools,
         tool_choice,
-        parallel_tool_calls: false,
+        parallel_tool_calls: None,
         reasoning,
+        thinking: Some(thinking_on),
         store: false,
         stream: true,
         include: Vec::new(),
@@ -230,54 +230,27 @@ fn thinking_effort_for_budget(budget: u64) -> &'static str {
     }
 }
 
-struct ConvertedMessages {
-    input: Vec<ResponseItem>,
-    private_context: Vec<String>,
-}
-
 fn convert_messages(
     messages: &[crate::models::anthropic::AnthropicMessage],
-) -> AppResult<ConvertedMessages> {
+) -> AppResult<Vec<ResponseItem>> {
     let mut items = Vec::new();
-    let mut private_context = Vec::new();
     for message in messages {
-        convert_message(
-            &message.role,
-            &message.content,
-            &mut items,
-            &mut private_context,
-        )?;
+        convert_message(&message.role, &message.content, &mut items)?;
     }
-    Ok(ConvertedMessages {
-        input: items,
-        private_context,
-    })
+    Ok(items)
 }
 
 fn convert_message(
     role: &str,
     content: &AnthropicContent,
     items: &mut Vec<ResponseItem>,
-    private_context: &mut Vec<String>,
 ) -> AppResult<()> {
-    if is_private_instruction_role(role) {
-        lift_private_instruction_content(content, private_context);
-        return Ok(());
-    }
-
     match content {
         AnthropicContent::Text(text) => {
             if role == "user" {
-                for segment in split_user_text_segments(text) {
-                    match segment {
-                        UserTextSegment::Prompt(text) => {
-                            let text = strip_date_injection(&text);
-                            if !text.is_empty() {
-                                items.push(text_message_item(role, &text));
-                            }
-                        }
-                        UserTextSegment::PrivateContext(text) => private_context.push(text),
-                    }
+                let text = strip_date_injection(text);
+                if !text.is_empty() {
+                    items.push(text_message_item(role, &text));
                 }
             } else {
                 let text = normalize_message_text(role, text);
@@ -304,19 +277,9 @@ fn convert_message(
                 match block {
                     AnthropicContentBlock::Text { text } => {
                         if role == "user" {
-                            for segment in split_user_text_segments(text) {
-                                match segment {
-                                    UserTextSegment::Prompt(text) => {
-                                        let text = strip_date_injection(&text);
-                                        if !text.is_empty() {
-                                            content_items.push(ContentItem::InputText { text });
-                                        }
-                                    }
-                                    UserTextSegment::PrivateContext(text) => {
-                                        flush_message(items, &mut content_items);
-                                        private_context.push(text);
-                                    }
-                                }
+                            let text = strip_date_injection(text);
+                            if !text.is_empty() {
+                                content_items.push(ContentItem::InputText { text });
                             }
                         } else {
                             let text = normalize_message_text(role, text);
@@ -407,165 +370,6 @@ fn convert_message(
         }
     }
     Ok(())
-}
-
-fn is_private_instruction_role(role: &str) -> bool {
-    matches!(role, "system" | "developer")
-}
-
-fn lift_private_instruction_content(content: &AnthropicContent, private_context: &mut Vec<String>) {
-    let text = match content {
-        AnthropicContent::Text(text) => strip_billing_nonce(text),
-        AnthropicContent::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|block| match block {
-                AnthropicContentBlock::Text { text } => Some(strip_billing_nonce(text)),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-    };
-    let text = text.trim();
-    if text.is_empty() {
-        return;
-    }
-
-    let label = if looks_like_claude_code_skill_listing(text) {
-        "skill listing"
-    } else {
-        "system message"
-    };
-    private_context.push(wrap_private_context(label, text));
-}
-
-enum UserTextSegment {
-    Prompt(String),
-    PrivateContext(String),
-}
-
-fn join_instruction_parts(parts: impl IntoIterator<Item = String>) -> String {
-    parts
-        .into_iter()
-        .map(|part| part.trim().to_string())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
-fn split_user_text_segments(text: &str) -> Vec<UserTextSegment> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-    if looks_like_claude_code_skill_listing(trimmed) {
-        return vec![UserTextSegment::PrivateContext(wrap_private_context(
-            "skill listing",
-            trimmed,
-        ))];
-    }
-    if looks_like_claude_code_local_command(trimmed) {
-        return Vec::new();
-    }
-
-    let mut segments = vec![UserTextSegment::Prompt(text.to_string())];
-    for (tag, label) in [
-        ("system-reminder", "system reminder"),
-        ("local-command-caveat", "local command caveat"),
-    ] {
-        segments = split_private_context_tag_segments(segments, tag, label);
-    }
-    segments
-}
-
-fn split_private_context_tag_segments(
-    segments: Vec<UserTextSegment>,
-    tag: &str,
-    label: &str,
-) -> Vec<UserTextSegment> {
-    segments
-        .into_iter()
-        .flat_map(|segment| match segment {
-            UserTextSegment::Prompt(text) => split_private_context_tag(&text, tag, label),
-            UserTextSegment::PrivateContext(text) => vec![UserTextSegment::PrivateContext(text)],
-        })
-        .collect()
-}
-
-fn split_private_context_tag(text: &str, tag: &str, label: &str) -> Vec<UserTextSegment> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    if !text.contains(&open) {
-        return vec![UserTextSegment::Prompt(text.to_string())];
-    }
-    let mut rest = text;
-    let mut segments = Vec::new();
-
-    while let Some(open_start) = rest.find(&open) {
-        let before = &rest[..open_start];
-        push_prompt_segment(&mut segments, before);
-        let after_open = &rest[open_start + open.len()..];
-        let Some(close_start) = after_open.find(&close) else {
-            push_prompt_segment(&mut segments, &rest[open_start..]);
-            return segments;
-        };
-        let inner = after_open[..close_start].trim();
-        if !inner.is_empty() {
-            segments.push(UserTextSegment::PrivateContext(wrap_private_context(
-                label, inner,
-            )));
-        }
-        rest = &after_open[close_start + close.len()..];
-    }
-
-    push_prompt_segment(&mut segments, rest);
-    segments
-}
-
-fn push_prompt_segment(segments: &mut Vec<UserTextSegment>, text: &str) {
-    let text = text.trim();
-    if !text.is_empty() {
-        segments.push(UserTextSegment::Prompt(text.to_string()));
-    }
-}
-
-fn wrap_private_context(label: &str, text: &str) -> String {
-    format!(
-        "Claude Code supplied this {label} as private execution context. Use it only to interpret the conversation and available capabilities. Do not quote, summarize, continue, or answer this context unless the user explicitly asks about it.\n\n{text}"
-    )
-}
-
-fn looks_like_claude_code_local_command(text: &str) -> bool {
-    text.starts_with("<command-name>")
-        && text.contains("</command-name>")
-        && text.contains("<command-message>")
-        && text.contains("</command-message>")
-}
-
-fn looks_like_claude_code_skill_listing(text: &str) -> bool {
-    let bullet_count = text
-        .lines()
-        .filter(|line| looks_like_skill_listing_bullet(line.trim_start()))
-        .count();
-    bullet_count >= 3
-        && (text.contains("Use when")
-            || text.contains("Invoke with")
-            || text.contains("TRIGGER when")
-            || text.contains("slash command"))
-}
-
-fn looks_like_skill_listing_bullet(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("- ") else {
-        return false;
-    };
-    let Some((name, _)) = rest.split_once(':') else {
-        return false;
-    };
-    let name = name.trim();
-    !name.is_empty()
-        && name.len() <= 80
-        && name
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/' | '.' | '@'))
 }
 
 fn push_function_call(
@@ -853,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn lifts_claude_code_skill_listing_out_of_user_turns() {
+    fn preserves_claude_code_skill_listing_in_user_turns() {
         let skill_listing = concat!(
             "- deep-research: Deep research harness. Use when the user wants research.\n",
             "- update-config: Configure settings. Use when the user asks to update config.\n",
@@ -888,21 +692,18 @@ mod tests {
         };
 
         let result = convert_request(request).expect("convert");
-        assert!(result.instructions.contains("Base instructions."));
-        assert!(result.instructions.contains("skill listing"));
-        assert!(result.instructions.contains("deep-research"));
-        assert!(result.instructions.contains("Do not quote"));
-        assert_eq!(result.input.len(), 1);
+        assert_eq!(result.instructions, "Base instructions.");
+        assert_eq!(result.input.len(), 2);
         assert!(matches!(
-            &result.input[0],
+            &result.input[1],
             ResponseItem::Message { role, content, .. }
                 if role == "user"
-                    && matches!(&content[0], ContentItem::InputText { text } if text == "hello")
+                    && matches!(&content[0], ContentItem::InputText { text } if text.contains("deep-research"))
         ));
     }
 
     #[test]
-    fn lifts_claude_code_skill_listing_out_of_system_history_turns() {
+    fn preserves_claude_code_system_history_role() {
         let skill_listing = concat!(
             "The following skills are available for use with the Skill tool:\n\n",
             "- deep-research: Deep research harness. Use when the user wants research.\n",
@@ -938,21 +739,18 @@ mod tests {
         };
 
         let result = convert_request(request).expect("convert");
-        assert!(result.instructions.contains("Base instructions."));
-        assert!(result.instructions.contains("skill listing"));
-        assert!(result.instructions.contains("deep-research"));
-        assert!(result.instructions.contains("Do not quote"));
-        assert_eq!(result.input.len(), 1);
+        assert_eq!(result.instructions, "Base instructions.");
+        assert_eq!(result.input.len(), 2);
         assert!(matches!(
-            &result.input[0],
+            &result.input[1],
             ResponseItem::Message { role, content, .. }
-                if role == "user"
-                    && matches!(&content[0], ContentItem::InputText { text } if text == "hello")
+                if role == "system"
+                    && matches!(&content[0], ContentItem::OutputText { text } if text.contains("deep-research"))
         ));
     }
 
     #[test]
-    fn lifts_claude_code_tagged_metadata_out_of_user_turns() {
+    fn preserves_claude_code_tagged_metadata_in_user_turns() {
         let request = AnthropicRequest {
             model: "claude-3-5-sonnet-20241022".to_string(),
             max_tokens: Some(1024),
@@ -993,21 +791,13 @@ mod tests {
         };
 
         let result = convert_request(request).expect("convert");
-        assert!(result.instructions.contains("local command caveat"));
-        assert!(
-            result
-                .instructions
-                .contains("Do not answer local command output.")
-        );
-        assert!(result.instructions.contains("system reminder"));
-        assert!(result.instructions.contains("Prefer concise answers."));
-        assert!(!result.instructions.contains("<command-name>"));
-        assert_eq!(result.input.len(), 1);
+        assert!(result.instructions.is_empty());
+        assert_eq!(result.input.len(), 3);
         assert!(matches!(
-            &result.input[0],
+            &result.input[2],
             ResponseItem::Message { role, content, .. }
                 if role == "user"
-                    && matches!(&content[0], ContentItem::InputText { text } if text == "hello")
+                    && matches!(&content[0], ContentItem::InputText { text } if text.contains("system-reminder"))
         ));
     }
 

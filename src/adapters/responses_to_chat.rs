@@ -1,3 +1,4 @@
+use crate::config::{Action, RolesConfig, When};
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatFunctionCall;
@@ -15,6 +16,7 @@ use crate::models::responses::ToolSpec;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +46,18 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn get(&self, name: &str) -> Option<&ToolKind> {
         self.by_name.get(name)
+    }
+
+    pub(crate) fn has_active_server_tool(
+        &self,
+        web_search_active: bool,
+        image_agent_active: bool,
+    ) -> bool {
+        self.by_name.values().any(|kind| match kind {
+            ToolKind::WebSearch => web_search_active,
+            ToolKind::ImageAnalysis => image_agent_active,
+            _ => false,
+        })
     }
 }
 
@@ -101,7 +115,7 @@ pub fn lower_request(
     request: &ResponsesRequest,
     baseline_messages: Vec<ChatMessage>,
 ) -> AppResult<LoweredTurn> {
-    lower_request_with_image_agent(request, baseline_messages, false)
+    lower_request_with_image_agent_and_roles(request, baseline_messages, false, None)
 }
 
 /// Like [`lower_request`], but `image_agent_active` decides whether an
@@ -115,8 +129,21 @@ pub fn lower_request_with_image_agent(
     baseline_messages: Vec<ChatMessage>,
     image_agent_active: bool,
 ) -> AppResult<LoweredTurn> {
+    lower_request_with_image_agent_and_roles(request, baseline_messages, image_agent_active, None)
+}
+
+/// Lower a turn while applying an optional model-profile role policy. Role
+/// rules apply only to the new tail, never replayed baseline messages, so tags
+/// and rewrites are not applied twice on follow-up turns.
+pub fn lower_request_with_image_agent_and_roles(
+    request: &ResponsesRequest,
+    baseline_messages: Vec<ChatMessage>,
+    image_agent_active: bool,
+    roles: Option<&RolesConfig>,
+) -> AppResult<LoweredTurn> {
     validate_request(request)?;
     let mut messages = baseline_messages;
+    let baseline_len = messages.len();
     if messages.is_empty() && !request.instructions.is_empty() {
         messages.push(ChatMessage {
             role: "system".to_string(),
@@ -135,7 +162,11 @@ pub fn lower_request_with_image_agent(
         match item {
             ResponseItem::Message { role, content, .. } => {
                 let text = message_content_to_chat_value(content)?;
-                let normalized_role = normalize_chat_role(role);
+                let normalized_role = if roles.is_some() {
+                    role.to_string()
+                } else {
+                    normalize_chat_role(role)
+                };
                 let (reasoning_content, thinking) = if normalized_role == "assistant" {
                     pending_reasoning
                         .take()
@@ -314,7 +345,15 @@ pub fn lower_request_with_image_agent(
             tool_calls: None,
         });
     }
-    hoist_system_messages(&mut messages);
+    if roles.is_some() {
+        let mut new_messages = messages.split_off(baseline_len);
+        apply_role_rules(&mut new_messages, roles)?;
+        messages.append(&mut new_messages);
+    } else {
+        // Preserve the fork's historical compatibility behavior unless a
+        // profile explicitly opts into the more general role-policy system.
+        hoist_system_messages(&mut messages);
+    }
     let response_format = request
         .text
         .as_ref()
@@ -344,6 +383,131 @@ pub fn lower_request_with_image_agent(
         frequency_penalty: request.frequency_penalty,
         presence_penalty: request.presence_penalty,
     })
+}
+
+pub(crate) fn apply_role_rules(
+    messages: &mut Vec<ChatMessage>,
+    roles: Option<&RolesConfig>,
+) -> AppResult<()> {
+    let Some(roles) = roles else {
+        return Ok(());
+    };
+    let mut out = Vec::with_capacity(messages.len());
+    for (index, mut message) in messages.drain(..).enumerate() {
+        let Some(rules) = roles.rules_for(&message.role) else {
+            return Err(AppError::bad_request(format!(
+                "role \"{}\" is not permitted by the model profile roles config",
+                message.role
+            )));
+        };
+        let Some(rule) = rules.iter().find(|rule| match rule.when {
+            None | Some(When::Always) => true,
+            Some(When::Leading) => index == 0,
+            Some(When::Inline) => index > 0,
+        }) else {
+            return Err(AppError::bad_request(format!(
+                "role \"{}\" at index {} matches no rule in the model profile roles config",
+                message.role, index
+            )));
+        };
+        match rule.action {
+            Action::Reject => {
+                return Err(AppError::bad_request(format!(
+                    "role \"{}\" is rejected by the model profile roles config",
+                    message.role
+                )));
+            }
+            Action::Drop => continue,
+            Action::Accept => {
+                wrap_role_tag(&mut message, &rule.tag, &rule.tag_attributes);
+                out.push(message);
+            }
+            Action::Rewrite => {
+                if let Some(target) = &rule.target_role {
+                    message.role.clone_from(target);
+                }
+                wrap_role_tag(&mut message, &rule.tag, &rule.tag_attributes);
+                out.push(message);
+            }
+        }
+    }
+    *messages = out;
+    if !roles.merge_adjacent.is_empty() {
+        merge_adjacent_role_runs(messages, &roles.merge_adjacent);
+    }
+    Ok(())
+}
+
+fn wrap_role_tag(
+    message: &mut ChatMessage,
+    tag: &Option<String>,
+    attributes: &BTreeMap<String, String>,
+) {
+    let Some(tag) = tag else {
+        return;
+    };
+    let Some(content) = message.content.take() else {
+        return;
+    };
+    let text = match content {
+        Value::String(text) => text,
+        other => other.to_string(),
+    };
+    let mut open = format!("<{tag}");
+    for (key, value) in attributes {
+        open.push(' ');
+        open.push_str(key);
+        open.push_str("=\"");
+        for ch in value.chars() {
+            match ch {
+                '&' => open.push_str("&amp;"),
+                '"' => open.push_str("&quot;"),
+                '<' => open.push_str("&lt;"),
+                _ => open.push(ch),
+            }
+        }
+        open.push('"');
+    }
+    open.push('>');
+    message.content = Some(Value::String(format!("{open}{text}</{tag}>")));
+}
+
+fn merge_adjacent_role_runs(messages: &mut Vec<ChatMessage>, roles: &[String]) {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut index = 0;
+    while index < messages.len() {
+        let role = messages[index].role.clone();
+        if !roles.contains(&role) {
+            out.push(messages[index].clone());
+            index += 1;
+            continue;
+        }
+        let mut parts = Vec::new();
+        while index < messages.len() && messages[index].role == role {
+            if let Some(content) = &messages[index].content {
+                let text = match content {
+                    Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                };
+                if !text.is_empty() {
+                    parts.push(text);
+                }
+            }
+            index += 1;
+        }
+        if !parts.is_empty() {
+            out.push(ChatMessage {
+                role,
+                content: Some(Value::String(parts.join("\n\n"))),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                thinking: None,
+                tool_calls: None,
+            });
+        }
+    }
+    *messages = out;
 }
 
 fn normalize_chat_role(role: &str) -> String {
@@ -919,8 +1083,9 @@ mod tests {
             input: vec![],
             tools: vec![],
             tool_choice: serde_json::Value::String("auto".to_string()),
-            parallel_tool_calls: false,
+            parallel_tool_calls: Some(false),
             reasoning: None,
+            thinking: None,
             store: false,
             stream: true,
             include: vec![],
@@ -1092,6 +1257,62 @@ mod tests {
         });
         let result = lower_request(&req, vec![]).expect("lower_request");
         assert_eq!(result.reasoning_effort.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn role_rules_shape_only_new_tail_then_merge_adjacent() {
+        let roles: RolesConfig = serde_json::from_value(json!({
+            "merge_adjacent": ["user"],
+            "developer": {
+                "action": "rewrite",
+                "target_role": "user",
+                "tag": "instruction",
+                "tag_attributes": {"priority": "high & urgent"}
+            },
+            "user": {},
+            "*": {"action": "reject"}
+        }))
+        .expect("roles config");
+        let baseline = vec![ChatMessage {
+            role: "developer".to_string(),
+            content: Some(json!("already shaped history")),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            thinking: None,
+            tool_calls: None,
+        }];
+        let mut request = base_test_request();
+        request.input = vec![
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "new policy".to_string(),
+                }],
+                phase: None,
+            },
+            user_msg("question"),
+        ];
+
+        let lowered =
+            lower_request_with_image_agent_and_roles(&request, baseline, false, Some(&roles))
+                .expect("lower request");
+
+        assert_eq!(lowered.messages.len(), 2);
+        assert_eq!(lowered.messages[0].role, "developer");
+        assert_eq!(
+            lowered.messages[0].content,
+            Some(json!("already shaped history")),
+            "replay baseline must not be rewritten or tagged again"
+        );
+        assert_eq!(lowered.messages[1].role, "user");
+        assert_eq!(
+            lowered.messages[1].content.as_ref().and_then(Value::as_str),
+            Some(
+                "<instruction priority=\"high &amp; urgent\">new policy</instruction>\n\nquestion"
+            )
+        );
     }
 
     #[test]

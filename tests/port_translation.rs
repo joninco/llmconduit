@@ -250,7 +250,7 @@ fn anthropic_forces_parallel_tool_calls_false() {
         "messages": [{"role": "user", "content": "hi"}],
     })))
     .expect("convert");
-    assert!(!result.parallel_tool_calls);
+    assert_eq!(result.parallel_tool_calls, None);
 }
 
 /// llmconduit's output_config carries structured-output `format`, not effort.

@@ -4,6 +4,7 @@ use crate::adapters::chat_completions::ChatCompletionCollector;
 use crate::adapters::chat_completions::ChatCompletionStreamConverter;
 use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
+use crate::adapters::responses_to_chat;
 use crate::dashboard_api::dashboard_catalog;
 use crate::dashboard_api::dashboard_flow_detail;
 use crate::dashboard_api::dashboard_flows;
@@ -27,9 +28,11 @@ use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::anthropic::AnthropicRequest;
 use crate::models::chat::ChatCompletionRequest;
+use crate::models::chat::normalize_stop;
 use crate::models::responses::ResponsesRequest;
 use crate::proxy_headers::header_name_eq;
 use crate::proxy_headers::is_hop_by_hop_header;
+use crate::upstream::BackendChatRequest;
 use crate::upstream::collect_models_response;
 use axum::Extension;
 use axum::Json;
@@ -105,6 +108,7 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
     let router = Router::new()
         .route("/v1/responses", post(post_responses))
         .route("/v1/messages", post(post_messages))
+        .route("/v1/messages/count_tokens", post(post_count_tokens))
         .route("/v1/messages", on(MethodFilter::HEAD, probe_messages))
         .route("/v1/messages", on(MethodFilter::OPTIONS, probe_messages))
         .route("/v1/chat/completions", post(post_chat_completions))
@@ -1326,6 +1330,91 @@ async fn post_messages(
     }
 }
 
+async fn post_count_tokens(State(gateway): State<Arc<Gateway>>, body: Bytes) -> Response {
+    let request: AnthropicRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            return anthropic_error_response(AppError::bad_request(format!(
+                "invalid request body: {err}"
+            )));
+        }
+    };
+    match handle_count_tokens(gateway, request).await {
+        Ok(response) => response,
+        Err(err) => anthropic_error_response(err),
+    }
+}
+
+async fn handle_count_tokens(
+    gateway: Arc<Gateway>,
+    request: AnthropicRequest,
+) -> AppResult<Response> {
+    use crate::engine::TokenizeCapability;
+
+    if gateway.tokenize_capability() == TokenizeCapability::Unsupported {
+        return Err(AppError::not_found("upstream does not support /tokenize"));
+    }
+
+    let original_model = request.model.clone();
+    let responses_request = anthropic_to_responses::convert_request(request)?;
+    let resolved_model = gateway.resolve_request_model(&original_model).await.0;
+    let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
+    let roles = gateway
+        .config()
+        .resolve_roles_config_for_resolved_model(&original_model, &resolved_model);
+    let lowered = responses_to_chat::lower_request_with_image_agent_and_roles(
+        &responses_request,
+        Vec::new(),
+        false,
+        roles,
+    )?;
+    let client_chat_template_kwargs = responses_request
+        .extra_body
+        .get("chat_template_kwargs")
+        .and_then(Value::as_object)
+        .cloned();
+    let thinking_override = responses_request.thinking;
+    let backend = BackendChatRequest::new(
+        ChatCompletionRequest {
+            model: resolved_model,
+            messages: lowered.messages,
+            stream: false,
+            tools: (!lowered.tools.is_empty()).then_some(lowered.tools),
+            tool_choice: Some(responses_request.tool_choice),
+            parallel_tool_calls: responses_request.parallel_tool_calls,
+            reasoning_effort: lowered.reasoning_effort,
+            response_format: lowered.response_format,
+            stream_options: None,
+            temperature: responses_request.temperature,
+            top_p: responses_request.top_p,
+            max_output_tokens: None,
+            frequency_penalty: lowered.frequency_penalty,
+            presence_penalty: lowered.presence_penalty,
+            stop: normalize_stop(responses_request.stop)?,
+            extra_body: responses_request.extra_body,
+        },
+        client_chat_template_kwargs,
+        None,
+        None,
+    )
+    .with_thinking_override(thinking_override);
+
+    match gateway.upstream_client().count_tokens(&backend).await {
+        Ok(Some(count)) => {
+            gateway.set_tokenize_capability(TokenizeCapability::Supported);
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({ "input_tokens": count })),
+            )
+                .into_response())
+        }
+        Ok(None) | Err(_) => {
+            gateway.set_tokenize_capability(TokenizeCapability::Unsupported);
+            Err(AppError::not_found("upstream does not support /tokenize"))
+        }
+    }
+}
+
 async fn post_chat_completions(
     State(gateway): State<Arc<Gateway>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
@@ -1810,6 +1899,7 @@ fn anthropic_error_response(err: AppError) -> Response {
     let error_type = match err.status_code() {
         axum::http::StatusCode::BAD_REQUEST => "invalid_request_error",
         axum::http::StatusCode::CONFLICT => "invalid_request_error",
+        axum::http::StatusCode::NOT_FOUND => "not_found_error",
         _ => "api_error",
     };
     let body = serde_json::json!({
@@ -1838,7 +1928,7 @@ async fn get_models(
     let response = gateway.upstream_client().list_models().await?;
     let (status, body, etag) = collect_models_response(response).await?;
     let body = if anthropic_models {
-        transform_models_response_for_anthropic(body, &query)?
+        transform_models_response_for_anthropic(body, &query, gateway.config())?
     } else {
         body
     };
@@ -1860,6 +1950,7 @@ fn is_anthropic_models_request(headers: &HeaderMap) -> bool {
 fn transform_models_response_for_anthropic(
     body: Value,
     query: &ModelsListQuery,
+    config: &crate::config::Config,
 ) -> AppResult<Value> {
     if query.after_id.is_some() && query.before_id.is_some() {
         return Err(AppError::bad_request(
@@ -1870,7 +1961,7 @@ fn transform_models_response_for_anthropic(
     let limit = parse_anthropic_models_limit(query.limit.as_deref())?;
     let models = extract_model_entries(&body)
         .into_iter()
-        .filter_map(|entry| anthropic_model_entry(&entry))
+        .filter_map(|entry| anthropic_model_entry(&entry, config))
         .collect::<Vec<_>>();
 
     let (page, has_more) = page_anthropic_models(&models, query, limit)?;
@@ -1921,10 +2012,11 @@ fn extract_model_entries(body: &Value) -> Vec<Value> {
     }
 }
 
-fn anthropic_model_entry(entry: &Value) -> Option<Value> {
+fn anthropic_model_entry(entry: &Value, config: &crate::config::Config) -> Option<Value> {
     match entry {
         Value::String(id) => {
-            let caps = infer_capabilities_from_model_id(id);
+            let caps =
+                merge_configured_capabilities(config, id, infer_capabilities_from_model_id(id));
             Some(build_anthropic_model_entry(
                 id,
                 id,
@@ -1958,6 +2050,7 @@ fn anthropic_model_entry(entry: &Value) -> Option<Value> {
                 .filter(|value| value.is_object())
                 .cloned()
                 .unwrap_or_else(|| infer_capabilities_from_model_id(id));
+            let capabilities = merge_configured_capabilities(config, id, capabilities);
 
             Some(build_anthropic_model_entry(
                 id,
@@ -1992,6 +2085,12 @@ fn parse_created_at(map: &serde_json::Map<String, Value>) -> Option<String> {
 
 fn infer_capabilities_from_model_id(_id: &str) -> Value {
     default_anthropic_model_capabilities()
+}
+
+fn merge_configured_capabilities(config: &crate::config::Config, id: &str, base: Value) -> Value {
+    config
+        .resolve_capabilities_for_upstream(id)
+        .map_or(base.clone(), |capabilities| capabilities.merge_into(base))
 }
 
 fn build_anthropic_model_entry(

@@ -39,10 +39,15 @@ pub struct ResponsesRequest {
     pub tools: Vec<ToolSpec>,
     #[serde(default = "default_tool_choice")]
     pub tool_choice: Value,
-    #[serde(default)]
-    pub parallel_tool_calls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     #[serde(default)]
     pub reasoning: Option<ReasoningRequest>,
+    /// Request-path thinking override resolved from an Anthropic model profile.
+    /// This is internal gateway state: native Responses/Chat clients continue to
+    /// control backend-specific thinking kwargs through their normal fields.
+    #[serde(skip)]
+    pub thinking: Option<bool>,
     #[serde(default = "default_store_true")]
     pub store: bool,
     #[serde(default)]
@@ -574,6 +579,11 @@ pub struct ResponseResource {
     pub metadata: Option<HashMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub incomplete_details: Option<IncompleteDetails>,
+    /// Matched upstream stop string, when vLLM reports one. This internal
+    /// extension lets the Anthropic adapter distinguish a configured stop
+    /// sequence from a natural end-of-sequence completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_sequence: Option<String>,
     /// Typed terminal reason (T7). `None` only on non-terminal `response`
     /// resources (e.g. `response.created`); the terminal `response.completed` /
     /// `response.incomplete` event always carries it so the Anthropic converter

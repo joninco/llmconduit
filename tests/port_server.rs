@@ -34,7 +34,6 @@ use common::test_gateway_with_config;
 use common::usage_chunk;
 use common::user_message;
 
-use serde_json::Value;
 use serde_json::json;
 use tower::ServiceExt;
 use wiremock::matchers::method;
@@ -86,7 +85,9 @@ fn estimate_from_recorded(recorded: &ChatCompletionRequest, flatten_content: boo
         // when there are no tools.
         tool_choice: Some(json!("auto")),
         stream: true,
-        parallel_tool_calls: false,
+        // The estimator omits this request/config-dependent typed field; it is
+        // an additive leaf concern and cannot make the estimate smaller.
+        parallel_tool_calls: None,
         stream_options: Some(llmconduit::models::chat::StreamOptions {
             include_usage: true,
         }),
@@ -393,7 +394,7 @@ fn config_for(server_uri: &str) -> Config {
 }
 
 #[tokio::test]
-async fn preflight_rejects_context_exhausted() {
+async fn preflight_defers_estimated_context_exhaustion_to_upstream() {
     // The model reports a small context window, and the input is sized so the
     // LOWERED payload + the fixed 128 margin exceeds it. The non-streaming
     // request must get a 400 and the upstream must see ZERO chat POSTs. Using a
@@ -409,8 +410,8 @@ async fn preflight_rejects_context_exhausted() {
         .mount(&server)
         .await;
 
-    // Mounted so that ANY chat POST would succeed -- its absence is what proves
-    // the request was rejected pre-spawn.
+    // Mounted so the approximate local estimate can defer to the provider's
+    // tokenizer instead of rejecting a potentially compressible prompt.
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
@@ -444,22 +445,7 @@ async fn preflight_rejects_context_exhausted() {
         .await
         .expect("response");
 
-    assert_eq!(
-        response.status().as_u16(),
-        400,
-        "input overflow must be a clean 400"
-    );
-    let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
-        .await
-        .expect("read body");
-    let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("context window"),
-        "error message should mention the context window: {body}"
-    );
+    assert_eq!(response.status().as_u16(), 200);
 
     let chat_posts = server
         .received_requests()
@@ -470,7 +456,10 @@ async fn preflight_rejects_context_exhausted() {
             request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
         })
         .count();
-    assert_eq!(chat_posts, 0, "rejected request must not POST to upstream");
+    assert_eq!(
+        chat_posts, 1,
+        "the provider tokenizer/reactive retry path must decide actual overflow"
+    );
 }
 
 /// T9: in ROUTING mode, G3 budgeting reads the candidate's context limit from

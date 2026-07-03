@@ -556,6 +556,7 @@ fn conformance_harness_is_reachable_from_port_streaming_peek_crate() {
                 usage: AnthropicUsage {
                     input_tokens: Some(1),
                     output_tokens: Some(0),
+                    output_tokens_details: None,
                     server_tool_use: None,
                 },
             },
@@ -581,6 +582,7 @@ fn conformance_harness_is_reachable_from_port_streaming_peek_crate() {
             usage: AnthropicUsage {
                 input_tokens: Some(1),
                 output_tokens: Some(1),
+                output_tokens_details: None,
                 server_tool_use: None,
             },
         },

@@ -535,11 +535,12 @@ pub fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
         input,
         tools: Vec::new(),
         tool_choice: json!("auto"),
-        parallel_tool_calls: true,
+        parallel_tool_calls: Some(true),
         reasoning: Some(ReasoningRequest {
             effort: Some("medium".to_string()),
             summary: None,
         }),
+        thinking: None,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -589,6 +590,7 @@ pub fn content_chunk(id: &str, content: &str) -> ChatCompletionChunk {
                 extra: Default::default(),
             },
             finish_reason: None,
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -608,6 +610,7 @@ pub fn finish_chunk(id: &str, finish_reason: &str) -> ChatCompletionChunk {
                 extra: Default::default(),
             },
             finish_reason: Some(finish_reason.to_string()),
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -627,6 +630,7 @@ pub fn reasoning_chunk(id: &str, reasoning: &str) -> ChatCompletionChunk {
                 extra: Default::default(),
             },
             finish_reason: None,
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -649,6 +653,7 @@ pub fn nested_thinking_chunk(id: &str, thinking: &str, signature: &str) -> ChatC
                 )]),
             },
             finish_reason: None,
+            stop_reason: None,
         }],
         usage: None,
     }
@@ -681,6 +686,7 @@ pub fn tool_call_chunk(
                 extra: Default::default(),
             },
             finish_reason: Some("tool_calls".to_string()),
+            stop_reason: None,
         }],
         usage: None,
     }

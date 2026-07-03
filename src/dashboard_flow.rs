@@ -503,6 +503,9 @@ pub enum AttemptErrorClass {
 pub enum AttemptFailoverReason {
     /// The provider failed before the first chunk and failover moved to the next.
     ProviderFailed,
+    /// The provider rejected this particular request; failover advanced without
+    /// treating the provider as unhealthy or starting its cooldown.
+    RequestRejected,
     /// The provider's failure was same-provider terminal — failover did NOT advance
     /// (recorded so the trace shows WHY no further provider was tried).
     TerminalNoFailover,

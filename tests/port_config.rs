@@ -350,7 +350,7 @@ fn leaf_family_chat_template_kwargs(config: &Config, backend_model: &str) -> ser
         stream: true,
         tools: None,
         tool_choice: None,
-        parallel_tool_calls: false,
+        parallel_tool_calls: Some(false),
         reasoning_effort: None,
         response_format: None,
         stream_options: None,

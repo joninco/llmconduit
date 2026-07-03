@@ -9,6 +9,7 @@ use crate::models::anthropic::AnthropicDelta;
 use crate::models::anthropic::AnthropicErrorBody;
 use crate::models::anthropic::AnthropicMessageResponse;
 use crate::models::anthropic::AnthropicMessageUsage;
+use crate::models::anthropic::AnthropicOutputTokensDetails;
 use crate::models::anthropic::AnthropicResponseContentBlock;
 use crate::models::anthropic::AnthropicStreamEvent;
 use serde_json::Value;
@@ -43,10 +44,12 @@ pub struct AnthropicStreamCollector {
     message_id: Option<String>,
     model: Option<String>,
     stop_reason: Option<String>,
+    stop_sequence: Option<Value>,
     blocks: Vec<AccumulatedBlock>,
     current_block: Option<AccumulatedBlock>,
     input_tokens: u64,
     output_tokens: u64,
+    output_tokens_details: Option<AnthropicOutputTokensDetails>,
     error: Option<AnthropicErrorBody>,
 }
 
@@ -57,10 +60,12 @@ impl AnthropicStreamCollector {
             message_id: None,
             model: Some(model),
             stop_reason: None,
+            stop_sequence: None,
             blocks: Vec::new(),
             current_block: None,
             input_tokens: 0,
             output_tokens: 0,
+            output_tokens_details: None,
             error: None,
         }
     }
@@ -69,6 +74,7 @@ impl AnthropicStreamCollector {
         if let Some(usage) = response_usage(&event.data) {
             self.input_tokens = usage.input_tokens;
             self.output_tokens = usage.output_tokens;
+            self.output_tokens_details = usage.output_tokens_details;
         }
         let stream_events = self.inner.convert(event);
         for se in stream_events {
@@ -151,8 +157,14 @@ impl AnthropicStreamCollector {
                     if let Some(stop_reason) = delta.stop_reason {
                         self.stop_reason = Some(stop_reason);
                     }
+                    if let Some(stop_sequence) = delta.stop_sequence {
+                        self.stop_sequence = Some(stop_sequence);
+                    }
                     if let Some(output_tokens) = usage.output_tokens {
                         self.output_tokens = output_tokens;
+                    }
+                    if let Some(details) = usage.output_tokens_details {
+                        self.output_tokens_details = Some(details);
                     }
                 }
                 AnthropicStreamEvent::Error { error } => {
@@ -216,10 +228,11 @@ impl AnthropicStreamCollector {
             content,
             model: self.model.unwrap_or_default(),
             stop_reason: self.stop_reason.unwrap_or_else(|| "end_turn".to_string()),
-            stop_sequence: None,
+            stop_sequence: self.stop_sequence,
             usage: AnthropicMessageUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                output_tokens_details: self.output_tokens_details,
             },
         })
     }

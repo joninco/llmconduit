@@ -427,6 +427,12 @@ pub trait UpstreamClient: Send + Sync {
             "upstream completions proxy is not implemented",
         ))
     }
+    /// Count the tokens for a fully lowered backend request. Routing and
+    /// failover implementations rewrite the model through the same candidate
+    /// path as generation before the leaf calls the optional `/tokenize` API.
+    async fn count_tokens(&self, _request: &BackendChatRequest) -> AppResult<Option<u64>> {
+        Ok(None)
+    }
     /// The upstream model catalog (ids + per-model context length) from a single
     /// `/v1/models` snapshot. The default impl fetches `list_models()` once and
     /// parses both the id list and the context-window length per entry, so model
@@ -1045,6 +1051,28 @@ impl ReqwestUpstreamClient {
             .map_err(|err| AppError::internal(format!("invalid upstream URL: {err}")))
     }
 
+    /// vLLM/SGLang expose `/tokenize` at the server root rather than below
+    /// their OpenAI-compatible `/v1` prefix.
+    fn tokenize_url(&self) -> Url {
+        let mut segments: Vec<String> = self
+            .base_url
+            .path_segments()
+            .map(|parts| {
+                parts
+                    .filter(|segment| !segment.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if segments.last().map(String::as_str) == Some("v1") {
+            segments.pop();
+        }
+        segments.push("tokenize".to_string());
+        let mut url = self.base_url.clone();
+        url.set_path(&format!("/{}", segments.join("/")));
+        url
+    }
+
     async fn send_chat_request(
         &self,
         url: &Url,
@@ -1283,10 +1311,10 @@ impl ReqwestUpstreamClient {
         use crate::dashboard_flow::AttemptFailoverReason;
         use crate::dashboard_flow::AttemptStatus;
         use crate::error::FailoverDisposition;
-        let failover_reason = if err.failover_disposition() == FailoverDisposition::Terminal {
-            AttemptFailoverReason::TerminalNoFailover
-        } else {
-            AttemptFailoverReason::ProviderFailed
+        let failover_reason = match err.failover_disposition() {
+            FailoverDisposition::Terminal => AttemptFailoverReason::TerminalNoFailover,
+            FailoverDisposition::FailoverNoCooldown => AttemptFailoverReason::RequestRejected,
+            FailoverDisposition::Failover => AttemptFailoverReason::ProviderFailed,
         };
         crate::dashboard_flow::Attempt {
             provider: Some("primary".to_string()),
@@ -1426,7 +1454,7 @@ impl ReqwestUpstreamClient {
             // default `Failover` disposition, unchanged (disposition matrix in
             // `.ralph/specs/E2-graceful-image-degradation.md`, Task E2a).
             let retry_disposition = if status_is_request_intrinsic_4xx(retry_status) {
-                FailoverDisposition::Terminal
+                FailoverDisposition::FailoverNoCooldown
             } else {
                 FailoverDisposition::Failover
             };
@@ -1452,7 +1480,7 @@ impl ReqwestUpstreamClient {
         // gate in the failover loop (`stream_chat_completion_with_provider_indices`) then
         // skips `mark_failure` for this case — no cooldown, no failover.
         let disposition = if status_is_request_intrinsic_4xx(status) {
-            FailoverDisposition::Terminal
+            FailoverDisposition::FailoverNoCooldown
         } else {
             FailoverDisposition::Failover
         };
@@ -1596,6 +1624,60 @@ impl UpstreamClient for ReqwestUpstreamClient {
             capture.as_ref(),
         )
         .await
+    }
+
+    async fn count_tokens(&self, backend: &BackendChatRequest) -> AppResult<Option<u64>> {
+        let mut backend = backend.clone();
+        finalize_request_for_backend(&mut backend, &self.finalization_policies);
+        let request = sanitize_chat_request(backend.request, self.flatten_content);
+
+        let mut body = JsonMap::new();
+        body.insert("model".to_string(), Value::String(request.model));
+        body.insert(
+            "messages".to_string(),
+            serde_json::to_value(request.messages).map_err(|err| {
+                AppError::internal(format!("failed to serialize tokenize messages: {err}"))
+            })?,
+        );
+        if let Some(tools) = request.tools {
+            body.insert(
+                "tools".to_string(),
+                serde_json::to_value(tools).map_err(|err| {
+                    AppError::internal(format!("failed to serialize tokenize tools: {err}"))
+                })?,
+            );
+        }
+        if let Some(chat_template_kwargs) = request.extra_body.get("chat_template_kwargs") {
+            body.insert(
+                "chat_template_kwargs".to_string(),
+                chat_template_kwargs.clone(),
+            );
+        }
+
+        let response = match self
+            .with_auth(self.client.post(self.tokenize_url()))
+            .json(&Value::Object(body))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::debug!(error = %err, "upstream /tokenize request failed");
+                return Ok(None);
+            }
+        };
+        if !response.status().is_success() {
+            tracing::debug!(status = %response.status(), "upstream /tokenize returned non-success status");
+            return Ok(None);
+        }
+        let value: Value = match response.json().await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::debug!(error = %err, "upstream /tokenize response was not JSON");
+                return Ok(None);
+            }
+        };
+        Ok(value.get("count").and_then(Value::as_u64))
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
@@ -1789,6 +1871,7 @@ impl FailoverUpstreamClient {
         BackendChatRequest {
             request,
             client_chat_template_kwargs: backend.client_chat_template_kwargs.clone(),
+            thinking_override: backend.thinking_override,
             // D2: carry the flow identity + shared serving token forward (clone the
             // `Arc`, not the token) so the leaf still captures + tags this flow.
             response_id: backend.response_id.clone(),
@@ -2022,6 +2105,21 @@ impl FailoverUpstreamClient {
                     );
                     return Err(err);
                 }
+                Err(err)
+                    if err.failover_disposition() == FailoverDisposition::FailoverNoCooldown =>
+                {
+                    let header_byte_ms = Self::take_attempt_header_byte(backend);
+                    Self::record_attempt(
+                        backend,
+                        provider,
+                        attempt_start_ms,
+                        attempt_model,
+                        header_byte_ms,
+                        Some(&err),
+                    );
+                    last_error = Some(err);
+                    continue;
+                }
                 Err(err) => {
                     self.mark_failure(provider_index, &err);
                     // `Some` for an HTTP-status failure (headers arrived), `None` for a
@@ -2148,12 +2246,15 @@ impl FailoverUpstreamClient {
         let (status, error_class, failover_reason) = match err {
             None => (AttemptStatus::Served, None, None),
             Some(err) => {
-                let reason = if err.failover_disposition() == FailoverDisposition::Terminal {
-                    // A terminal disposition ends the flow — failover did NOT advance to
-                    // another provider; record that for the trace.
-                    AttemptFailoverReason::TerminalNoFailover
-                } else {
-                    AttemptFailoverReason::ProviderFailed
+                let reason = match err.failover_disposition() {
+                    FailoverDisposition::Terminal => {
+                        // A terminal disposition ends the flow — failover did NOT advance.
+                        AttemptFailoverReason::TerminalNoFailover
+                    }
+                    FailoverDisposition::FailoverNoCooldown => {
+                        AttemptFailoverReason::RequestRejected
+                    }
+                    FailoverDisposition::Failover => AttemptFailoverReason::ProviderFailed,
                 };
                 (
                     AttemptStatus::Failed,
@@ -2172,6 +2273,41 @@ impl FailoverUpstreamClient {
             error_class,
             failover_reason,
         });
+    }
+
+    async fn count_tokens_from_provider(
+        &self,
+        provider_index: usize,
+        backend: &BackendChatRequest,
+    ) -> AppResult<Option<u64>> {
+        if provider_index >= self.providers.len() {
+            return Err(AppError::internal(
+                "resolved fallback provider index was out of range",
+            ));
+        }
+        self.count_tokens_with_provider_indices(vec![provider_index], backend)
+            .await
+    }
+
+    async fn count_tokens_with_provider_indices(
+        &self,
+        provider_indices: Vec<usize>,
+        backend: &BackendChatRequest,
+    ) -> AppResult<Option<u64>> {
+        for provider_index in provider_indices {
+            let provider = &self.providers[provider_index];
+            let provider_request = Self::request_for_provider(provider, backend);
+            match provider.client.count_tokens(&provider_request).await {
+                Ok(Some(count)) => return Ok(Some(count)),
+                Ok(None) => {}
+                Err(err) => tracing::debug!(
+                    provider = %provider.name,
+                    error = %err,
+                    "provider token counting failed"
+                ),
+            }
+        }
+        Ok(None)
     }
 
     async fn proxy_completions_from_provider(
@@ -2281,6 +2417,7 @@ impl RoutingUpstreamClient {
         BackendChatRequest {
             request: routed_request,
             client_chat_template_kwargs: backend.client_chat_template_kwargs.clone(),
+            thinking_override: backend.thinking_override,
             // D2: carry the flow identity + shared serving token forward (clone the
             // `Arc`, not the token).
             response_id: backend.response_id.clone(),
@@ -2664,6 +2801,15 @@ impl UpstreamClient for FailoverUpstreamClient {
         .await
     }
 
+    async fn count_tokens(&self, backend: &BackendChatRequest) -> AppResult<Option<u64>> {
+        let provider_indices = self.available_provider_indices();
+        if provider_indices.is_empty() {
+            return Ok(None);
+        }
+        self.count_tokens_with_provider_indices(provider_indices, backend)
+            .await
+    }
+
     async fn list_models(&self) -> AppResult<reqwest::Response> {
         let mut last_error = None;
         let provider_indices = self.available_provider_indices();
@@ -2942,6 +3088,49 @@ impl UpstreamClient for RoutingUpstreamClient {
         }
     }
 
+    async fn count_tokens(&self, backend: &BackendChatRequest) -> AppResult<Option<u64>> {
+        let catalog = match self.load_catalog().await {
+            Ok(catalog) => catalog,
+            Err(err) => {
+                tracing::debug!(error = %err, "cannot route token-count request without model catalog");
+                return Ok(None);
+            }
+        };
+        let Some((resolution, match_kind)) = catalog.resolve(&backend.request.model) else {
+            return Ok(None);
+        };
+        if let RoutingResolution::Route {
+            route_provider_index,
+            model_id,
+        } = &resolution
+        {
+            let provider = self.route_provider(*route_provider_index)?;
+            let routed = self.routed_request(backend, model_id, &provider.name, match_kind);
+            return provider.client.count_tokens(&routed).await;
+        }
+        let RoutingResolution::Catalog(resolution) = resolution else {
+            unreachable!("route resolution handled above");
+        };
+        let provider = self
+            .providers
+            .get(resolution.provider_index)
+            .ok_or_else(|| {
+                AppError::internal("resolved upstream provider index was out of range")
+            })?;
+        let routed = self.routed_request(backend, &resolution.model_id, &provider.name, match_kind);
+        match resolution.target {
+            RoutingModelTarget::Primary => provider.client.count_tokens(&routed).await,
+            RoutingModelTarget::Fallback {
+                failover_provider_index,
+            } => {
+                provider
+                    .client
+                    .count_tokens_from_provider(failover_provider_index, &routed)
+                    .await
+            }
+        }
+    }
+
     async fn list_models(&self) -> AppResult<reqwest::Response> {
         let catalog = self.load_catalog().await?;
         json_response(catalog.union_body())
@@ -3152,7 +3341,7 @@ fn policy_for_model<'a, V>(
         .map(|(_, policy)| policy);
     match (matches.next(), matches.next()) {
         (Some(policy), None) => Some(policy),
-        _ => None,
+        _ => map.get("*"),
     }
 }
 
@@ -3460,6 +3649,10 @@ impl ServingToken {
 pub struct BackendChatRequest {
     pub request: ChatCompletionRequest,
     pub client_chat_template_kwargs: Option<JsonMap<String, Value>>,
+    /// Explicit Anthropic thinking state. `None` for native Chat/Responses
+    /// requests; `Some` lets the final provider leaf select family-correct
+    /// template kwargs after routing and failover model rewrites.
+    pub thinking_override: Option<bool>,
     /// The flow's `resp_{uuid}` API id (D2), used to key the leaf's on-wire
     /// upstream-body capture into the FlowStore. `None` outside the engine path
     /// (tests / the failover rebuild before the engine sets it).
@@ -3504,6 +3697,7 @@ impl BackendChatRequest {
         Self {
             request,
             client_chat_template_kwargs,
+            thinking_override: None,
             response_id,
             serving,
             capture: None,
@@ -3516,6 +3710,11 @@ impl BackendChatRequest {
     /// construction site (`engine.rs`'s `run_turn`) calls this.
     pub fn with_capture(mut self, capture: Option<Arc<TurnCaptureState>>) -> Self {
         self.capture = capture;
+        self
+    }
+
+    pub fn with_thinking_override(mut self, thinking: Option<bool>) -> Self {
+        self.thinking_override = thinking;
         self
     }
 }
@@ -3601,21 +3800,95 @@ pub fn finalize_request_for_backend(
     //    its OWN kwargs, not the alias's.
     merge_chat_kwargs_gap_fill(request, &policies.resolve_chat_kwargs(&request.model));
     // 2. Reasoning effort: map (→ fragment, top-level cleared) or clamp.
+    let effort_policy = policy_for_model(&policies.effort, &request.model);
     let fragment = reasoning_effort_fragment(
         &policies.effort,
         &request.model,
         request.reasoning_effort.as_deref(),
     );
+    let effective_thinking = backend.thinking_override.map(|enabled| {
+        enabled
+            && !request
+                .reasoning_effort
+                .as_deref()
+                .is_some_and(|effort| effort.trim().eq_ignore_ascii_case("none"))
+            && !fragment.as_ref().is_some_and(fragment_disables_thinking)
+    });
     request.reasoning_effort = if fragment.is_some() {
         None
+    } else if effort_policy.is_some_and(|policy| policy.upstream_reasoning.is_some()) {
+        request
+            .reasoning_effort
+            .as_deref()
+            .map(str::trim)
+            .filter(|effort| !effort.is_empty())
+            .map(str::to_string)
     } else {
         clamp_reasoning_effort(request.reasoning_effort.as_deref())
     };
+    backend.thinking_override = effective_thinking;
     // 3. Family kwargs from the FINAL model + resolved override.
     apply_family_chat_template_kwargs(backend, policies);
     // 4. Effort fragment after family (effort-map > family default).
     if let Some(fragment) = fragment {
         apply_reasoning_effort_fragment(backend, &fragment);
+    }
+    // 5. Anthropic thinking intent is dynamic. A typed profile can select a
+    // custom template parameter/value; otherwise use the upstream default on
+    // generic and DeepSeek backends. Kimi deliberately keeps its parser-side
+    // thinking enabled to prevent raw chain-of-thought leakage, with response
+    // suppression handling a client-side off request.
+    apply_profile_thinking_kwarg(backend, policies);
+}
+
+fn fragment_disables_thinking(fragment: &Value) -> bool {
+    fragment
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .is_some_and(|effort| effort.eq_ignore_ascii_case("none"))
+        || fragment
+            .get("chat_template_kwargs")
+            .and_then(Value::as_object)
+            .is_some_and(|kwargs| {
+                kwargs.get("enable_thinking") == Some(&Value::Bool(false))
+                    || kwargs.get("thinking") == Some(&Value::Bool(false))
+            })
+}
+
+fn apply_profile_thinking_kwarg(
+    backend: &mut BackendChatRequest,
+    policies: &BackendFinalizationPolicies,
+) {
+    let Some(enabled) = backend.thinking_override else {
+        return;
+    };
+    let reasoning_config = policy_for_model(&policies.effort, &backend.request.model)
+        .and_then(|policy| policy.upstream_reasoning.as_ref());
+    let family_override = policies.resolve_family_override(&backend.request.model);
+    let family = detect_model_family(&backend.request.model, family_override.as_deref());
+    let (name, value) = if let Some(config) = reasoning_config {
+        (
+            config.thinking_param_name.clone(),
+            config.thinking_param_value(enabled).clone(),
+        )
+    } else {
+        if family == Some(ModelFamily::Kimi) {
+            return;
+        }
+        ("enable_thinking".to_string(), Value::Bool(enabled))
+    };
+    let entry = backend
+        .request
+        .extra_body
+        .entry("chat_template_kwargs".to_string())
+        .or_insert_with(|| Value::Object(JsonMap::new()));
+    if !entry.is_object() {
+        *entry = Value::Object(JsonMap::new());
+    }
+    if let Value::Object(kwargs) = entry {
+        // The Anthropic request explicitly states thinking on/off, so it wins
+        // over static profile and client passthrough defaults.
+        kwargs.insert(name, value);
     }
 }
 
@@ -3644,6 +3917,12 @@ fn merge_chat_kwargs_gap_fill(
             .any(|alias| request.extra_body.contains_key(*alias));
     for (key, value) in defaults {
         if max_token_requested && MAX_TOKEN_ALIAS_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        if key == "parallel_tool_calls" {
+            if request.parallel_tool_calls.is_none() {
+                request.parallel_tool_calls = value.as_bool();
+            }
             continue;
         }
         if chat_request_field_is_set(request, key) {
@@ -3687,7 +3966,11 @@ fn reasoning_effort_fragment(
         .filter(|level| !level.is_empty())
         .map(str::to_ascii_lowercase)
         .or_else(|| policy.default.clone())?;
-    policy.map.get(&level).cloned()
+    policy
+        .map
+        .get(&level)
+        .or_else(|| policy.map.get("*"))
+        .cloned()
 }
 
 /// Apply a resolved reasoning-effort `fragment` to the request at the leaf, with
@@ -3744,6 +4027,7 @@ pub fn apply_family_chat_template_kwargs(
     else {
         return;
     };
+    let thinking_override = backend.thinking_override;
     let request = &mut backend.request;
     let reasoning_effort = request.reasoning_effort.clone();
     let entry = request
@@ -3759,7 +4043,7 @@ pub fn apply_family_chat_template_kwargs(
             other.as_object_mut().expect("just set to object")
         }
     };
-    write_family_kwargs(kwargs, family, &reasoning_effort);
+    write_family_kwargs(kwargs, family, &reasoning_effort, thinking_override);
     // Request-supplied keys win over the forced family default (AGENTS.md:
     // request `extra_body` beats configured/injected defaults). Deep-merge so a
     // nested client object overlays the already-merged family/provider object
@@ -3804,6 +4088,7 @@ fn write_family_kwargs(
     kwargs: &mut JsonMap<String, Value>,
     family: ModelFamily,
     reasoning_effort: &Option<String>,
+    thinking_override: Option<bool>,
 ) {
     match family {
         ModelFamily::Kimi => {
@@ -3828,7 +4113,11 @@ fn write_family_kwargs(
             // DeepSeek reads `enable_thinking` (+ `reasoning_effort`). Use
             // setdefault semantics: respect any configured default, and don't
             // fight the separately-handled top-level `reasoning_effort`.
-            kwargs.entry("enable_thinking").or_insert(Value::Bool(true));
+            if let Some(thinking) = thinking_override {
+                kwargs.insert("enable_thinking".to_string(), Value::Bool(thinking));
+            } else {
+                kwargs.entry("enable_thinking").or_insert(Value::Bool(true));
+            }
             if let Some(effort) = reasoning_effort
                 .as_deref()
                 .map(str::trim)
@@ -3844,7 +4133,8 @@ fn write_family_kwargs(
 
 fn chat_request_field_is_set(request: &ChatCompletionRequest, key: &str) -> bool {
     match key {
-        "model" | "messages" | "stream" | "parallel_tool_calls" => true,
+        "model" | "messages" | "stream" => true,
+        "parallel_tool_calls" => request.parallel_tool_calls.is_some(),
         "tools" => request.tools.is_some(),
         "tool_choice" => request.tool_choice.is_some(),
         "reasoning_effort" => request.reasoning_effort.is_some(),
@@ -4786,7 +5076,7 @@ mod tests {
             stream: true,
             tools: None,
             tool_choice: None,
-            parallel_tool_calls: false,
+            parallel_tool_calls: Some(false),
             reasoning_effort: None,
             response_format: None,
             stream_options: None,
@@ -4812,6 +5102,7 @@ mod tests {
             "GLM-5.2-NVFP4-MTP".to_string(),
             crate::config::ReasoningEffortPolicy {
                 default: Some("max".to_string()),
+                upstream_reasoning: None,
                 map: std::collections::BTreeMap::from([
                     (
                         "high".to_string(),
@@ -5059,7 +5350,12 @@ mod tests {
         kwargs.insert("clear_thinking".to_string(), json!(true));
         kwargs.insert("reasoning_effort".to_string(), json!("low"));
         kwargs.insert("keep_me".to_string(), json!(1));
-        write_family_kwargs(&mut kwargs, ModelFamily::Kimi, &Some("high".to_string()));
+        write_family_kwargs(
+            &mut kwargs,
+            ModelFamily::Kimi,
+            &Some("high".to_string()),
+            None,
+        );
         assert_eq!(kwargs["thinking"], json!(true));
         assert_eq!(kwargs["preserve_thinking"], json!(true));
         assert!(!kwargs.contains_key("enable_thinking"));
@@ -5075,6 +5371,7 @@ mod tests {
             &mut kwargs,
             ModelFamily::DeepSeek,
             &Some("high".to_string()),
+            None,
         );
         assert_eq!(kwargs["enable_thinking"], json!(true));
         assert_eq!(kwargs["reasoning_effort"], json!("high"));
@@ -5086,12 +5383,13 @@ mod tests {
             &mut kwargs,
             ModelFamily::DeepSeek,
             &Some("high".to_string()),
+            None,
         );
         assert_eq!(kwargs["enable_thinking"], json!(false));
         assert_eq!(kwargs["reasoning_effort"], json!("low"));
 
         let mut kwargs = JsonMap::new();
-        write_family_kwargs(&mut kwargs, ModelFamily::DeepSeek, &None);
+        write_family_kwargs(&mut kwargs, ModelFamily::DeepSeek, &None, None);
         assert_eq!(kwargs["enable_thinking"], json!(true));
         assert!(!kwargs.contains_key("reasoning_effort"));
     }
@@ -5509,7 +5807,7 @@ mod tests {
             stream: true,
             tools: None,
             tool_choice: Some(Value::String("auto".to_string())),
-            parallel_tool_calls: false,
+            parallel_tool_calls: Some(false),
             reasoning_effort: Some("high".to_string()),
             response_format: None,
             stream_options: None,
@@ -5544,7 +5842,7 @@ mod tests {
             stream: true,
             tools: Some(Vec::new()),
             tool_choice: Some(Value::String("auto".to_string())),
-            parallel_tool_calls: false,
+            parallel_tool_calls: Some(false),
             reasoning_effort: None,
             response_format: None,
             stream_options: None,
@@ -5577,7 +5875,7 @@ mod tests {
             stream: true,
             tools: None,
             tool_choice: Some(Value::String(tc.to_string())),
-            parallel_tool_calls: false,
+            parallel_tool_calls: Some(false),
             reasoning_effort: None,
             response_format: None,
             stream_options: None,
@@ -5619,7 +5917,7 @@ mod tests {
             stream: true,
             tools: None,
             tool_choice: None,
-            parallel_tool_calls: false,
+            parallel_tool_calls: Some(false),
             reasoning_effort: Some("high".to_string()),
             response_format: None,
             stream_options: None,
@@ -5663,7 +5961,7 @@ mod tests {
             stream: true,
             tools: Some(Vec::new()),
             tool_choice: Some(Value::String("auto".to_string())),
-            parallel_tool_calls: false,
+            parallel_tool_calls: Some(false),
             reasoning_effort: None,
             response_format: None,
             stream_options: None,
@@ -5751,7 +6049,7 @@ mod tests {
                 stream: true,
                 tools: None,
                 tool_choice: Some(Value::String("auto".to_string())),
-                parallel_tool_calls: false,
+                parallel_tool_calls: Some(false),
                 reasoning_effort: Some("high".to_string()),
                 response_format: None,
                 stream_options: None,
@@ -6177,6 +6475,52 @@ mod tests {
     use wiremock::ResponseTemplate;
     use wiremock::matchers::method as wm_method;
     use wiremock::matchers::path as wm_path;
+
+    #[tokio::test]
+    async fn count_tokens_posts_finalized_payload_to_server_root_tokenize() {
+        use super::UpstreamClient as _;
+
+        let server = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/tokenize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"count": 42})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            format!("{}/v1", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+        );
+        let mut request = family_request("served-model");
+        request.messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                {"type": "text", "text": "hello"},
+                {"type": "text", "text": "world"}
+            ])),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            thinking: None,
+            tool_calls: None,
+        });
+        let backend = BackendChatRequest::new(request, None, None, None);
+
+        assert_eq!(
+            client.count_tokens(&backend).await.expect("count"),
+            Some(42)
+        );
+        let received = server.received_requests().await.expect("requests");
+        let body: Value = serde_json::from_slice(&received[0].body).expect("json body");
+        assert_eq!(body["model"], json!("served-model"));
+        assert_eq!(body["messages"][0]["content"], json!("hello\nworld"));
+        assert!(body.get("stream").is_none());
+    }
 
     /// A minimal valid upstream SSE success body (`bounded_sse_byte_stream` parses
     /// it, so `stream_chat_completion` returns Ok and the capture is observable).
@@ -8001,8 +8345,8 @@ mod tests {
         );
         assert_eq!(
             attempts[0].failover_reason,
-            Some(AttemptFailoverReason::TerminalNoFailover),
-            "the trace must show failover did NOT advance for this attempt"
+            Some(AttemptFailoverReason::RequestRejected),
+            "the trace must distinguish request rejection from provider failure"
         );
 
         // The provider must NOT be cooling: no deadline, no failure counted.

@@ -410,6 +410,7 @@ mod tests {
                 usage: AnthropicUsage {
                     input_tokens: Some(20),
                     output_tokens: Some(0),
+                    output_tokens_details: None,
                     server_tool_use: None,
                 },
             },
@@ -440,6 +441,7 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: Some(20),
                 output_tokens: Some(output_tokens),
+                output_tokens_details: None,
                 server_tool_use: None,
             },
         }
@@ -456,6 +458,7 @@ mod tests {
             usage: AnthropicUsage {
                 input_tokens: None,
                 output_tokens: Some(output_tokens),
+                output_tokens_details: None,
                 server_tool_use: None,
             },
         }

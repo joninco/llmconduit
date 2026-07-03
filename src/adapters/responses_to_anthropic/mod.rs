@@ -5,6 +5,7 @@ use crate::models::anthropic::AnthropicErrorBody;
 use crate::models::anthropic::AnthropicMessageDeltaBody;
 use crate::models::anthropic::AnthropicMessageStart;
 use crate::models::anthropic::AnthropicMessageUsage;
+use crate::models::anthropic::AnthropicOutputTokensDetails;
 use crate::models::anthropic::AnthropicServerToolUse;
 use crate::models::anthropic::AnthropicStreamEvent;
 use crate::models::anthropic::AnthropicUsage;
@@ -174,6 +175,7 @@ impl AnthropicStreamConverter {
                     usage: AnthropicUsage {
                         input_tokens: Some(self.pending_input_tokens.unwrap_or(0)),
                         output_tokens: Some(0),
+                        output_tokens_details: None,
                         server_tool_use: None,
                     },
                 },
@@ -475,6 +477,7 @@ impl AnthropicStreamConverter {
             usage: AnthropicUsage {
                 input_tokens: self.pending_input_tokens,
                 output_tokens: Some(self.last_output_tokens),
+                output_tokens_details: None,
                 server_tool_use: self.server_tool_use_usage(),
             },
         });
@@ -517,21 +520,27 @@ impl AnthropicStreamConverter {
             .unwrap_or(self.last_output_tokens)
             .max(self.last_output_tokens);
         self.last_output_tokens = output_tokens;
-        let stop_reason = if let Some(reason) = mapped_stop_reason {
-            reason
+        let (stop_reason, stop_sequence) = if let Some(reason) = mapped_stop_reason {
+            (reason, None)
         } else if self.reasoning.has_tool_calls {
-            "tool_use".to_string()
+            // Anthropic precedence is tool_use > stop_sequence > end_turn.
+            ("tool_use".to_string(), None)
+        } else if let Some(stop) = response_stop_sequence(data) {
+            ("stop_sequence".to_string(), Some(Value::String(stop)))
         } else {
-            "end_turn".to_string()
+            ("end_turn".to_string(), None)
         };
         output.push(AnthropicStreamEvent::MessageDelta {
             delta: AnthropicMessageDeltaBody {
                 stop_reason: Some(stop_reason),
-                stop_sequence: None,
+                stop_sequence,
             },
             usage: AnthropicUsage {
                 input_tokens: usage.as_ref().map(|usage| usage.input_tokens),
                 output_tokens: Some(output_tokens),
+                output_tokens_details: usage
+                    .as_ref()
+                    .and_then(|usage| usage.output_tokens_details.clone()),
                 server_tool_use: self.server_tool_use_usage(),
             },
         });
@@ -886,7 +895,25 @@ pub(super) fn response_usage(data: &Value) -> Option<AnthropicMessageUsage> {
     Some(AnthropicMessageUsage {
         input_tokens: usage.get("input_tokens")?.as_u64()?,
         output_tokens: usage.get("output_tokens")?.as_u64()?,
+        output_tokens_details: usage
+            .get("output_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .or_else(|| {
+                usage
+                    .get("output_tokens_details")
+                    .and_then(|details| details.get("thinking_tokens"))
+            })
+            .and_then(Value::as_u64)
+            .map(|thinking_tokens| AnthropicOutputTokensDetails { thinking_tokens }),
     })
+}
+
+fn response_stop_sequence(data: &Value) -> Option<String> {
+    data.get("response")
+        .and_then(|response| response.get("stop_sequence"))
+        .and_then(Value::as_str)
+        .filter(|stop| !stop.is_empty())
+        .map(str::to_string)
 }
 
 fn response_stop_reason(data: &Value) -> Option<String> {

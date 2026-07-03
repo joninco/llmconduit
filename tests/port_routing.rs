@@ -344,7 +344,7 @@ fn chat_request(model: &str, reasoning_effort: Option<&str>) -> ChatCompletionRe
         stream: true,
         tools: None,
         tool_choice: None,
-        parallel_tool_calls: false,
+        parallel_tool_calls: Some(false),
         reasoning_effort: reasoning_effort.map(ToString::to_string),
         response_format: None,
         stream_options: None,
