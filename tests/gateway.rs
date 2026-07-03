@@ -7359,7 +7359,7 @@ fn chat_completion_sse_body(chunks: &[serde_json::Value]) -> String {
 /// conformance` -- the same path later phases (C1-T5) will use together with
 /// `parse_anthropic_sse_events` to assert real `/v1/messages` SSE output.
 /// Hand-built JSON, NOT real converter output (the converter is not wired to
-/// the harness yet -- see `.ralph/IMPLEMENTATION_PLAN.md` Task 0B1).
+/// the harness yet).
 #[test]
 fn conformance_harness_is_reachable_from_gateway_integration_crate() {
     use llmconduit::adapters::responses_to_anthropic::conformance::Surface;

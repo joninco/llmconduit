@@ -6,7 +6,7 @@
 //! there is exactly one definition of "what is sensitive" and one O(CAP) capture
 //! primitive shared with the inbound-trace logger.
 //!
-//! Architecture (DASHBOARD_PLAN §4.2/§4.7, Codex round-2/4/5 fixes):
+//! Dashboard flow architecture:
 //! - The store is `DashboardFlowStore { state: Mutex<DashboardFlowState> }` with a
 //!   `MonitorHub`-style `new()`/`disabled()` split: when `--with-debug-ui` is off
 //!   the store is `disabled()` and EVERY operation is a no-op, so the production

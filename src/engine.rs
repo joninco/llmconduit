@@ -809,8 +809,7 @@ impl Gateway {
 
     /// Access the F1 durable per-turn capture handle. `is_enabled()` is `false`
     /// when `turn_capture_dir` is unset, in which case every capture op is a
-    /// no-op (no thread, no alloc, no fs). Independent of the debug UI --
-    /// see `.ralph/specs/F1-durable-turn-capture.md`.
+    /// no-op (no thread, no alloc, no fs). Independent of the debug UI.
     pub fn turn_capture(&self) -> &crate::turn_capture::TurnCapture {
         &self.turn_capture
     }
@@ -1500,8 +1499,7 @@ impl Gateway {
         // (`http.rs`, one layer up) will use to drain the returned stream --
         // that would require threading an egress hint down through this fn,
         // `run_turn`, and `created_event`, which is a bigger, riskier change
-        // than a LOW-priority finding justifies (see CR1.1's rejected
-        // "out-of-band threading" alternative in `.ralph/COMPLETED_TASKS.md`).
+        // than a LOW-priority finding justifies.
         // The common case (plain single-provider, `limit` resolved) already
         // paid this cost pre-C3 for budgeting, so the incremental cost is
         // bounded to the `limit.is_none()` minority, once per top-level turn

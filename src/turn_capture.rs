@@ -1,4 +1,4 @@
-//! F1 — durable per-turn capture (`.ralph/specs/F1-durable-turn-capture.md`).
+//! Durable per-turn capture.
 //!
 //! `TurnCapture` is the opt-in sink that, once `turn_capture_dir` is
 //! configured, writes ONE self-contained JSON artifact per instrumented

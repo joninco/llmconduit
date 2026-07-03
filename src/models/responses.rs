@@ -491,8 +491,8 @@ pub struct ResponseCreatedPayload {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponseStub {
     pub id: String,
-    /// C3 (`.ralph/specs/anthropic-sse-conformance.md` invariant 5): an EARLY,
-    /// coarse ESTIMATE of prompt input tokens (`engine::estimate_input_tokens`,
+    /// An EARLY, coarse ESTIMATE of prompt input tokens
+    /// (`engine::estimate_input_tokens`,
     /// ~4 bytes/token over the lowered upstream payload), threaded onto
     /// `response.created` ONLY -- never `response.in_progress`, which reuses
     /// this same struct via `ResponseCreatedPayload` -- so the Anthropic

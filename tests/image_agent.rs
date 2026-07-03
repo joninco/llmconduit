@@ -2333,8 +2333,7 @@ async fn upstream_chat_error_body_with_image_url_is_redacted_in_failed() {
 
 // ===========================================================================
 // E2b — residual-image safety pass: no raw image reaches a non-native-vision
-// backend, regardless of whether the G4 agent above activated. See
-// `.ralph/specs/E2-graceful-image-degradation.md` (Task E2b, AC-4/5/7/8/9).
+// backend, regardless of whether the G4 agent above activated.
 // ===========================================================================
 
 fn file_id_image(file_id: &str) -> ContentItem {

@@ -8,9 +8,9 @@
  *  - `src/monitor.rs`: `DebugWsMessage` is itself `#[serde(tag="type", rename_all="snake_case")]`
  *    with arms hello/request_upsert/segment_append/event_append/request_status/request_remove/
  *    snapshot_done — modeled as a real discriminated union below.
- *  - `.ralph/specs/D4-...md`: `ProviderHealth` (id/name/route/base_url/status/cooling_until_ms/
+ *  - `ProviderHealth` (id/name/route/base_url/status/cooling_until_ms/
  *    last_error/served_count/failover_count/consecutive_failures/catalog_fetched_ms/catalog_size).
- *  - `.ralph/specs/D7-...md` + `.ralph/specs/D13-...md`: the WS envelope + REST shapes.
+ *  - The dashboard WS envelope and REST response shapes.
  *
  * Discriminated unions are exhaustive and `any`-free (D9 constraint). `assertNever` turns a
  * missing switch arm into a COMPILE error. Runtime validators (bottom of file) reject any

@@ -1,7 +1,7 @@
 //! test-support: stream conformance assertions.
 //!
 //! Reusable invariant checks for the Anthropic `/v1/messages` **streaming**
-//! wire shape (`.ralph/specs/anthropic-sse-conformance.md`), shared by all
+//! wire shape, shared by all
 //! three surfaces that need to assert it:
 //!   - `src/adapters/responses_to_anthropic/tests.rs` -- crate-internal unit
 //!     tests, operate on the converter's own [`AnthropicStreamEvent`] output
@@ -35,8 +35,7 @@
 //! 5. The last two events are `message_delta` then `message_stop`.
 //! 6. `Surface::Error` instead ends with an `error` event (replaces 1 + 5).
 //!
-//! `message_start.input_tokens` is intentionally NOT checked here -- that
-//! lands in Task C3 (`.ralph/IMPLEMENTATION_PLAN.md`), not this harness.
+//! `message_start.input_tokens` is intentionally NOT checked here.
 
 use crate::models::anthropic::AnthropicContentBlockStart;
 use crate::models::anthropic::AnthropicDelta;
@@ -464,7 +463,7 @@ mod tests {
         }
     }
 
-    /// Mirrors `.ralph/golden_8001_native_messages.sse`: message_start ->
+    /// Mirrors the native Messages sequence: message_start ->
     /// signed thinking block -> text block -> ONE terminal message_delta ->
     /// message_stop.
     fn conformant_reasoning_text_events() -> Vec<AnthropicStreamEvent> {

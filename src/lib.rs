@@ -123,8 +123,7 @@ pub fn build_app_with_gateway_and_options(
     };
     // F1 (Topic F) durable per-turn capture: opt-in, config-only gate --
     // constructed regardless of `--with-debug-ui` (works even when the debug
-    // UI/dashboard is off; see `.ralph/specs/F1-durable-turn-capture.md`
-    // Design overview #1). `disabled()` is a zero-op sink (no thread, no
+    // UI/dashboard is off). `disabled()` is a zero-op sink (no thread, no
     // alloc, no fs) when `turn_capture_dir` is unset.
     let turn_capture = match config.turn_capture_dir.clone() {
         Some(dir) => crate::turn_capture::TurnCapture::enabled(dir),

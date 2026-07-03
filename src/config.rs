@@ -546,8 +546,7 @@ pub struct Config {
     /// F1 (Topic F): opt-in durable per-turn capture directory. When set,
     /// every instrumented inference turn writes `<dir>/<api_call_id>.json`
     /// with the full inbound request, on-wire upstream request, raw upstream
-    /// response, and served response bytes (redacted) -- see
-    /// `.ralph/specs/F1-durable-turn-capture.md`. `None` disables the
+    /// response, and served response bytes (redacted). `None` disables the
     /// capture sink entirely (zero-op: no thread, no alloc, no fs).
     pub turn_capture_dir: Option<PathBuf>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,

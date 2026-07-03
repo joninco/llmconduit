@@ -435,8 +435,7 @@ async fn log_api_call(
     // here, and the read-failure 413/400 just below) return BEFORE the capture
     // gate runs and BEFORE any `api_call_id` turn/`inbound_request` section is
     // minted — so they are intentionally NOT captured: there is no turn to attach
-    // a `served_response` to, and we do not mint one just to record a 413 (a
-    // documented non-goal in `.ralph/specs/F1-durable-turn-capture.md`, Task F1b).
+    // a `served_response` to, and we do not mint one just to record a 413.
     // Every POST-gate response (an engine error, a `Reject`, any 4xx/5xx produced
     // AFTER the gate) IS teed, because the tee wraps the WHOLE `next.run` result
     // below regardless of status.

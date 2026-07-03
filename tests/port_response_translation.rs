@@ -1,6 +1,6 @@
 //! Ported surface: reasoning promotion / suppression (claude-relay
 //! test_convert_stream.py::test_reasoning_* / ::test_*_promoted* /
-//! ::test_signature_* / ::test_late_reasoning_*), GAPS.md G8.
+//! ::test_signature_* / ::test_late_reasoning_*).
 //!
 //! claude-relay buffered upstream reasoning in its Chat->Anthropic converter and
 //! decided its final shape only once the stream's shape was known. llmconduit's

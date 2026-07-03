@@ -6,7 +6,7 @@ Guidance for AI coding agents working in this repo.
 
 Rust LLM API gateway. Accepts OpenAI Responses, OpenAI Chat Completions, and Anthropic Messages on the front; forwards to OpenAI-compatible `/v1/chat/completions` upstream, and proxies legacy `/v1/completions`. Adds server-side Brave web search, per-model defaults, nested failover/model routing across upstreams, replay caching, request-log analysis, and an optional debug UI.
 
-Full architecture map: `llmconduit-architecture.md` — read first when touching unfamiliar areas.
+Use the code layout below as the architecture map when touching unfamiliar areas.
 
 ## Commands
 
@@ -41,7 +41,7 @@ Dashboard auth (env-only, never a persisted `Config` field): `LLMCONDUIT_DASHBOA
 non-loopback by default). `LLMCONDUIT_ALLOW_INSECURE_DASHBOARD=1` explicitly permits plaintext;
 when no token is configured it also permits fully unauthenticated non-loopback dev-open access and
 uses same-origin `Origin`/`Host` validation for dashboard WebSockets. Kill requires `LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS=1`
-+ a CSRF token. See `.ralph/specs/D7-dashboard-auth-and-ws.md`.
++ a CSRF token.
 
 ## Code layout
 

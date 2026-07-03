@@ -153,8 +153,7 @@ impl AnthropicStreamConverter {
         if !self.started {
             self.started = true;
             // C4 (deviation #4): vLLM native emits NO `ping` before
-            // `message_start` (golden: `.ralph/golden_8001_native_messages.sse`
-            // starts directly at `message_start`). Do not push
+            // `message_start`. Do not push
             // `AnthropicStreamEvent::Ping` here to byte-match. This is safe for
             // SSE keep-alive: `http.rs::stream_anthropic_response` (and the
             // sibling Chat/Responses streamers) already wrap the response in
@@ -682,8 +681,7 @@ impl AnthropicStreamConverter {
                 delta: AnthropicDelta::ThinkingDelta { thinking: chunk },
             });
         }
-        // Invariant #4 (`.ralph/specs/anthropic-sse-conformance.md`): every
-        // emitted thinking block must close with a non-empty signature_delta.
+        // Every emitted thinking block must close with a non-empty signature_delta.
         // A real upstream signature (vLLM native, an Anthropic-history replay)
         // forwards unchanged. When the reasoning channel carried none (e.g.
         // DeepSeek's `reasoning_content`), synthesize a deterministic

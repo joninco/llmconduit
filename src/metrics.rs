@@ -1,7 +1,7 @@
 //! D5 — `MetricsLayer`: authoritative aggregated request stats + the coordinated,
 //! memory-safe, internally-consistent time-travel snapshot store.
 //!
-//! Architecture (DASHBOARD_PLAN §4.1, Codex round fixes):
+//! Metrics architecture:
 //! - `MetricsLayer { state: Mutex<MetricsState> }` with the `MonitorHub`/
 //!   `DashboardFlowStore` `new()`/`disabled()` split: when `--with-debug-ui` is off
 //!   the layer is `disabled()` and EVERY mutation/read is a no-op, so the production

@@ -26,7 +26,7 @@ fn default_object() -> Value {
 /// signatures are opaque values only Anthropic can mint -- a proxy can't
 /// produce a genuine one -- so this is a SHAPE-ONLY stand-in that satisfies
 /// clients expecting every `thinking` block to close with a non-empty
-/// `signature_delta` (invariant #4, `.ralph/specs/anthropic-sse-conformance.md`).
+/// `signature_delta`.
 ///
 /// Referenced by BOTH sides of the wire:
 /// - egress (`adapters/responses_to_anthropic/mod.rs`): mints it when

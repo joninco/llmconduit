@@ -1451,8 +1451,7 @@ impl ReqwestUpstreamClient {
             // the size but the request is unacceptable for another reason) — a
             // request-intrinsic 4xx {400,413,415,422} still must not cool/failover a
             // healthy provider. Every other status (401/403/404/408/429/5xx) keeps the
-            // default `Failover` disposition, unchanged (disposition matrix in
-            // `.ralph/specs/E2-graceful-image-degradation.md`, Task E2a).
+            // default `Failover` disposition, unchanged.
             let retry_disposition = if status_is_request_intrinsic_4xx(retry_status) {
                 FailoverDisposition::FailoverNoCooldown
             } else {
@@ -1475,8 +1474,7 @@ impl ReqwestUpstreamClient {
         // E2a: request-intrinsic 4xx {400,413,415,422} → `Terminal` (never cools or fails
         // over a healthy provider — the request itself is unacceptable to any equivalent
         // backend; e.g. an image reaching a text-only upstream). 401/403/404/408/429/5xx
-        // keep the default `Failover` disposition, unchanged (disposition matrix in
-        // `.ralph/specs/E2-graceful-image-degradation.md`, Task E2a). The `== Terminal`
+        // keep the default `Failover` disposition, unchanged. The `== Terminal`
         // gate in the failover loop (`stream_chat_completion_with_provider_indices`) then
         // skips `mark_failure` for this case — no cooldown, no failover.
         let disposition = if status_is_request_intrinsic_4xx(status) {
@@ -3243,8 +3241,7 @@ fn status_is_failover_eligible(status: StatusCode) -> bool {
 /// equivalent backend — a malformed/oversized/unsupported-media request, or the more
 /// specific "unprocessable" reject. Retrying it on another provider would fail
 /// identically (e.g. an image reaching a text-only upstream), so these must never
-/// cool/failover a healthy provider — see the disposition matrix in
-/// `.ralph/specs/E2-graceful-image-degradation.md` (Task E2a). Disjoint BY CONSTRUCTION
+/// cool/failover a healthy provider. Disjoint BY CONSTRUCTION
 /// from [`status_is_failover_eligible`] (no server error, 408, or 429 is in this set);
 /// `debug_assert`ed so the two predicates can never silently start overlapping.
 fn status_is_request_intrinsic_4xx(status: StatusCode) -> bool {

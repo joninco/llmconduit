@@ -1,8 +1,6 @@
 //! G3 keep-alive-peek contract (the *second half* of G3, separate from G3's
-//! pre-flight context budgeting). The spec-of-record is
-//! `.ralph/IMPLEMENTATION_PLAN.md` Task 8 ("G3 keep-alive peek · `50720eb`"),
-//! NOT `.ralph/specs/G3-context-budgeting.md` (which covers only the budgeting
-//! half). This file was promoted to a dedicated gap ("G3-peek") because the
+//! pre-flight context budgeting). This file was promoted to a dedicated gap
+//! ("G3-peek") because the
 //! behavior is redundant with G8 + axum's SSE keep-alive — see the plan.
 //!
 //! claude-relay's `_peek_with_keepalive` did two things for a streaming turn:
@@ -534,7 +532,7 @@ fn anthropic_reasoning_only_is_buffered_until_terminal_then_promoted_to_text() {
 /// conformance`, operating on real `AnthropicStreamEvent`s the way the other
 /// tests in this file construct `AnthropicStreamConverter` output. Hand-built
 /// events, NOT real converter output (the converter is not wired to the
-/// harness yet -- see `.ralph/IMPLEMENTATION_PLAN.md` Task 0B1).
+/// harness yet).
 #[test]
 fn conformance_harness_is_reachable_from_port_streaming_peek_crate() {
     use llmconduit::adapters::responses_to_anthropic::conformance::Surface;
