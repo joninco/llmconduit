@@ -1332,6 +1332,56 @@ impl ReqwestUpstreamClient {
         }
     }
 
+    /// POST the backend's `/tokenize` for the EXACT templated size of an
+    /// already-sanitized `request` (messages + tools + `chat_template_kwargs`
+    /// through the model's own chat template — the vLLM `TokenizeChatRequest`
+    /// shape, whose `add_generation_prompt` defaults to `true`). Shared by the
+    /// `count_tokens` trait method and the G1 overflow precision pass. Returns
+    /// `None` on ANY failure (endpoint absent, non-2xx, timeout, unparseable
+    /// body) — callers treat that as "no exact count available" and fall back,
+    /// so this can only improve accuracy, never break serving.
+    async fn tokenize_sanitized_count(&self, request: &ChatCompletionRequest) -> Option<u64> {
+        let mut body = JsonMap::new();
+        body.insert("model".to_string(), Value::String(request.model.clone()));
+        body.insert(
+            "messages".to_string(),
+            serde_json::to_value(&request.messages).ok()?,
+        );
+        if let Some(tools) = &request.tools {
+            body.insert("tools".to_string(), serde_json::to_value(tools).ok()?);
+        }
+        if let Some(chat_template_kwargs) = request.extra_body.get("chat_template_kwargs") {
+            body.insert(
+                "chat_template_kwargs".to_string(),
+                chat_template_kwargs.clone(),
+            );
+        }
+        let response = match self
+            .with_auth(self.client.post(self.tokenize_url()))
+            .json(&Value::Object(body))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::debug!(error = %err, "upstream /tokenize request failed");
+                return None;
+            }
+        };
+        if !response.status().is_success() {
+            tracing::debug!(status = %response.status(), "upstream /tokenize returned non-success status");
+            return None;
+        }
+        let value: Value = match response.json().await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::debug!(error = %err, "upstream /tokenize response was not JSON");
+                return None;
+            }
+        };
+        value.get("count").and_then(Value::as_u64)
+    }
+
     /// The leaf's actual chat-completions dispatch: POST the finalized + sanitized
     /// `request`, with the G1 context-overflow shrink-and-retry. Split out of
     /// [`stream_chat_completion`](Self::stream_chat_completion) so the bare-leaf path can
@@ -1379,6 +1429,9 @@ impl ReqwestUpstreamClient {
         // client hang-up mid-loop aborts it.
         let mut last_sent_budget = request.max_output_tokens;
         let mut attempt = 1_usize;
+        // One `/tokenize` precision pass per dispatch (lazy — only after the
+        // first overflow error), successful or not.
+        let mut tokenize_attempted = false;
         loop {
             // D2/F1d: every re-send goes through the same logged path, so BOTH
             // captures (D2's `upstream_body`, F1d's `upstream_request` section)
@@ -1435,7 +1488,46 @@ impl ReqwestUpstreamClient {
             };
 
             let mut available = overflow.available_completion_tokens;
-            if overflow.reason == "completion_limit" {
+            // Precision pass first: the overflow error's numbers are heuristics
+            // (a lower/derived bound, or a byte estimate), but the backend's own
+            // tokenizer is authoritative. One exact recount turns the whole
+            // convergence problem into a single correctly-sized retry — and
+            // makes a genuine cannot-fit verdict trustworthy enough to go
+            // terminal on. Any tokenize failure falls through to the
+            // error-driven heuristics below unchanged.
+            let mut exact_input: Option<i64> = None;
+            if !tokenize_attempted {
+                tokenize_attempted = true;
+                if let Some(exact) = self
+                    .tokenize_sanitized_count(&request)
+                    .await
+                    .map(|count| count as i64)
+                {
+                    available = overflow.ctx_limit - CONTEXT_RETRY_SAFETY_TOKENS - exact;
+                    exact_input = Some(exact);
+                    tracing::info!(
+                        exact_input_tokens = exact,
+                        ctx_limit = overflow.ctx_limit,
+                        recomputed_budget = available,
+                        "exact prompt size from upstream /tokenize; retrying once with a precise budget"
+                    );
+                }
+            }
+            if let Some(exact) = exact_input {
+                if available < self.min_completion_tokens {
+                    // Authoritative count: the prompt genuinely cannot fit beside
+                    // the minimum completion budget.
+                    self.capture_upstream_response_body(serving, capture, &body);
+                    return Err(AppError::prompt_too_long(format!(
+                        "prompt is too long: {exact} input tokens (exact, via the backend \
+                         tokenizer) exceed the {}-token context window minus the minimum \
+                         completion budget ({}); reduce the prompt. Upstream said {status}: {}",
+                        overflow.ctx_limit,
+                        self.min_completion_tokens,
+                        redact_and_truncate_error_body(&body, 500)
+                    )));
+                }
+            } else if overflow.reason == "completion_limit" {
                 // The output-only `max_model_len` shape reports no input size, so
                 // `available` rests on the coarse byte ESTIMATE. Never go terminal off an
                 // estimate — floor it and retry; if the prompt truly cannot fit, the next
@@ -1651,54 +1743,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         let mut backend = backend.clone();
         finalize_request_for_backend(&mut backend, &self.finalization_policies);
         let request = sanitize_chat_request(backend.request, self.flatten_content);
-
-        let mut body = JsonMap::new();
-        body.insert("model".to_string(), Value::String(request.model));
-        body.insert(
-            "messages".to_string(),
-            serde_json::to_value(request.messages).map_err(|err| {
-                AppError::internal(format!("failed to serialize tokenize messages: {err}"))
-            })?,
-        );
-        if let Some(tools) = request.tools {
-            body.insert(
-                "tools".to_string(),
-                serde_json::to_value(tools).map_err(|err| {
-                    AppError::internal(format!("failed to serialize tokenize tools: {err}"))
-                })?,
-            );
-        }
-        if let Some(chat_template_kwargs) = request.extra_body.get("chat_template_kwargs") {
-            body.insert(
-                "chat_template_kwargs".to_string(),
-                chat_template_kwargs.clone(),
-            );
-        }
-
-        let response = match self
-            .with_auth(self.client.post(self.tokenize_url()))
-            .json(&Value::Object(body))
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(err) => {
-                tracing::debug!(error = %err, "upstream /tokenize request failed");
-                return Ok(None);
-            }
-        };
-        if !response.status().is_success() {
-            tracing::debug!(status = %response.status(), "upstream /tokenize returned non-success status");
-            return Ok(None);
-        }
-        let value: Value = match response.json().await {
-            Ok(value) => value,
-            Err(err) => {
-                tracing::debug!(error = %err, "upstream /tokenize response was not JSON");
-                return Ok(None);
-            }
-        };
-        Ok(value.get("count").and_then(Value::as_u64))
+        Ok(self.tokenize_sanitized_count(&request).await)
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
@@ -6835,14 +6880,19 @@ mod tests {
             json!(63744),
             "captured body is the SHRUNK retry body (202752-8-139000), not the 64000 first attempt: {value}"
         );
-        // FULL equality on the shrink-retry path (R1 #3): wiremock saw TWO POSTs —
-        // the oversized first attempt and the shrunk retry. The captured body must
-        // equal the SECOND (retry) body byte-for-byte AND differ from the first,
-        // proving capture follows the bytes that ACTUALLY went on the wire.
-        let received = server
+        // FULL equality on the shrink-retry path (R1 #3): wiremock saw TWO chat
+        // POSTs — the oversized first attempt and the shrunk retry (plus the G1
+        // precision pass's /tokenize probe, 404'd here, which is filtered out).
+        // The captured body must equal the SECOND (retry) body byte-for-byte AND
+        // differ from the first, proving capture follows the bytes that ACTUALLY
+        // went on the wire.
+        let received: Vec<_> = server
             .received_requests()
             .await
-            .expect("wiremock recorded requests");
+            .expect("wiremock recorded requests")
+            .into_iter()
+            .filter(|request| request.url.path() == "/v1/chat/completions")
+            .collect();
         assert_eq!(received.len(), 2, "first attempt + one shrink retry");
         let first: serde_json::Value =
             serde_json::from_slice(&received[0].body).expect("first body is JSON");

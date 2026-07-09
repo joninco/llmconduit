@@ -1469,4 +1469,193 @@ mod integration {
             "terminal prompt-too-long must not retry upstream"
         );
     }
+
+    /// The `/tokenize` precision pass: on the FIRST overflow error the leaf
+    /// asks the backend tokenizer for the exact templated prompt size and
+    /// retries ONCE with `ctx − exact − safety` — no error-driven guessing, no
+    /// extra rounds. (Every other integration test in this file runs WITHOUT a
+    /// `/tokenize` mock — wiremock 404s it — which doubles as proof the
+    /// fallback heuristics still carry the loop when the endpoint is absent.)
+    #[tokio::test]
+    async fn overflow_uses_tokenize_for_exact_budget() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "test-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        // vLLM serves /tokenize at the deployment root (sibling of /v1).
+        Mock::given(method("POST"))
+            .and(path("/tokenize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 461500,
+                "max_model_len": 524288
+            })))
+            .mount(&server)
+            .await;
+
+        // First chat POST -> derived-bound overflow (the shape that used to
+        // force multiple backoff rounds).
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "This model's maximum context length is 524288 tokens. However, you requested \
+                 64000 output tokens and your prompt contains at least 460289 input tokens, \
+                 for a total of at least 524289 tokens. (parameter=input_tokens, value=460289)",
+            ))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(chat_sse_body()),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let app = llmconduit::build_app(config_for(&server.uri()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "stream": false,
+                            "max_tokens": 64000,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status().as_u16(), 200, "turn should succeed");
+
+        // Exactly one tokenize call, carrying the model + messages the chat
+        // request would send (the template inputs that determine the count).
+        let tokenize_requests: Vec<_> = server
+            .received_requests()
+            .await
+            .expect("requests")
+            .into_iter()
+            .filter(|request| request.url.path() == "/tokenize")
+            .collect();
+        assert_eq!(
+            tokenize_requests.len(),
+            1,
+            "one precision pass per dispatch"
+        );
+        let tokenize_body: Value =
+            serde_json::from_slice(&tokenize_requests[0].body).expect("tokenize body json");
+        assert_eq!(tokenize_body["model"].as_str(), Some("test-model"));
+        assert!(tokenize_body["messages"].is_array());
+        // `add_generation_prompt` is deliberately omitted: vLLM's
+        // TokenizeChatRequest defaults it to true (same body count_tokens sends).
+
+        // One overflow, then ONE precisely-sized retry: 524288 - 8 - 461500.
+        let chat_requests = chat_post_bodies(&server).await;
+        let budgets: Vec<i64> = chat_requests
+            .iter()
+            .map(|request| request["max_tokens"].as_i64().expect("max_tokens"))
+            .collect();
+        assert_eq!(
+            budgets,
+            vec![64000, 62780],
+            "the exact count sizes the single retry; no backoff rounds"
+        );
+    }
+
+    /// When the backend tokenizer proves the prompt cannot fit beside the
+    /// minimum completion budget, the leaf goes terminal 400 prompt-too-long
+    /// WITHOUT a second chat POST — the count is authoritative, unlike the
+    /// error body's heuristic bounds.
+    #[tokio::test]
+    async fn tokenize_proving_oversized_prompt_is_terminal() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "test-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        // 524288 - 8 - 521000 = 3280 < the 4096 floor.
+        Mock::given(method("POST"))
+            .and(path("/tokenize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 521000,
+                "max_model_len": 524288
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "This model's maximum context length is 524288 tokens. However, you requested \
+                 64000 output tokens and your prompt contains at least 460289 input tokens, \
+                 for a total of at least 524289 tokens. (parameter=input_tokens, value=460289)",
+            ))
+            .mount(&server)
+            .await;
+
+        let app = llmconduit::build_app(config_for(&server.uri()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "stream": false,
+                            "max_tokens": 64000,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "authoritative cannot-fit is a 400"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("prompt is too long") && message.contains("exact"),
+            "terminal must cite the exact tokenizer count, got: {message}"
+        );
+
+        assert_eq!(
+            chat_post_bodies(&server).await.len(),
+            1,
+            "an authoritative cannot-fit verdict must not burn a doomed retry"
+        );
+    }
 }
