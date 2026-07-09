@@ -208,7 +208,12 @@ pub struct SnapshotMessage {
     #[serde(rename = "type")]
     pub kind: SnapshotTag,
     pub cursors: SeqCursors,
-    pub flows: Vec<crate::dashboard_flow::SnapshotFlowSummary>,
+    /// Wire-facing flow ROWS (gap 10b `FlowRow`), NOT raw `SnapshotFlowSummary`s: the SPA's
+    /// `isSnapshotFrame` validates every row with the same guard as `/flows` (gap 07 requires
+    /// `cost_confidence` on EVERY row), so the WS snapshot must carry the same projection as
+    /// the REST reads — a raw summary (no cost fields) fails validation and the SPA then
+    /// silently drops the snapshot and sits at `connecting` forever, shadow-buffering frames.
+    pub flows: Vec<crate::dashboard_api::FlowRow>,
     /// Metrics baseline (or `null` when metrics are disabled).
     pub metrics: Option<MetricsSnapshot>,
     /// Topology baseline (or `null` when no providers are published yet).
@@ -924,7 +929,7 @@ fn topology_snapshot(snapshot: &ProviderHealthSnapshot) -> TopologySnapshot {
 /// flow + monitor domains dedup against the SAME monotonic clock (the flow `flows` body
 /// still comes from the FlowStore).
 fn snapshot_message(
-    flows: Vec<crate::dashboard_flow::SnapshotFlowSummary>,
+    flows: Vec<crate::dashboard_api::FlowRow>,
     flow_seq: u64,
     metrics: Option<MetricsSnapshot>,
     topology: Option<TopologySnapshot>,
@@ -1066,10 +1071,17 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     let topology = Some(topology_snapshot(&topo));
     // Body-free flow summaries from the FlowStore; the FlowStore `seq` is discarded — the
     // flow-domain WS dedup cursor is the monitor's `last_sequence` (finding 1), captured
-    // atomically with the transcript below.
+    // atomically with the transcript below. Projected through `FlowRow::from_summary` (the
+    // SAME wire shape as the REST `/flows` + `/snapshot` reads) — the SPA validates every
+    // snapshot row with the gap-07 guard (`cost_confidence` required), so a raw summary here
+    // fails `isSnapshotFrame` and bricks the client at `connecting` once any flow exists.
     let (flow_summaries, _flow_store_seq) = flow_store.snapshot_summaries_with_seq();
+    let flow_rows: Vec<crate::dashboard_api::FlowRow> = flow_summaries
+        .iter()
+        .map(|summary| crate::dashboard_api::FlowRow::from_summary(summary, &gateway))
+        .collect();
     let initial = snapshot_message(
-        flow_summaries,
+        flow_rows,
         // Flow dedup baseline = the monitor's atomically-captured sequence (finding 1).
         snapshot.last_sequence,
         metrics,
@@ -2590,7 +2602,35 @@ mod tests {
             crate::dashboard_flow::ClientAttribution::none(),
         );
         store.finalize("api_001", FlowStatus::Completed, None, None);
-        let flows = store.snapshot_summaries();
+        // Project summaries → wire-facing FlowRows the way `dashboard_socket` does (no
+        // Gateway in this test, so build the row literally — the SHAPE is what's asserted:
+        // the SPA's `isSnapshotFrame` requires the gap-07 `cost_confidence` on every row).
+        let flows: Vec<crate::dashboard_api::FlowRow> = store
+            .snapshot_summaries()
+            .iter()
+            .map(|s| crate::dashboard_api::FlowRow {
+                api_call_id: s.api_call_id.clone(),
+                response_id: s.response_id.clone(),
+                method: s.method.clone(),
+                uri: s.uri.clone(),
+                model_requested: s.model_requested.clone(),
+                model_served: s.model_served.clone(),
+                upstream_target: s.upstream_target.clone(),
+                usage: s.usage,
+                status: s.status,
+                started_ms: s.started_ms,
+                finished_ms: s.finished_ms,
+                elapsed_ms: s.elapsed_ms,
+                terminal_reason: s.terminal_reason.clone(),
+                client_label: s.client_label.clone(),
+                client_source: s.client_source,
+                cost: None,
+                cost_confidence: crate::dashboard_api::CostConfidence::Unavailable,
+                phases: s.phases,
+                attempts: s.attempts.clone(),
+                first_upstream_byte_ms: s.first_upstream_byte_ms,
+            })
+            .collect();
         let flow_seq = store.flow_seq();
 
         let metrics = Some(metrics_snapshot(
@@ -2629,7 +2669,7 @@ mod tests {
         assert_eq!(cursors["metrics_seq"], serde_json::json!(7));
         assert_eq!(cursors["topology_seq"], serde_json::json!(3));
         assert_eq!(cursors["monitor_seq"], serde_json::json!(0));
-        // flows: an array of body-free summaries keyed by api_call_id (no body keys).
+        // flows: an array of body-free wire ROWS keyed by api_call_id (no body keys).
         let flows = value["flows"].as_array().expect("flows is an array");
         assert_eq!(flows.len(), 1);
         assert_eq!(flows[0]["api_call_id"], serde_json::json!("api_001"));
@@ -2637,6 +2677,15 @@ mod tests {
         assert!(
             flows[0].get("inbound_body").is_none(),
             "summaries are body-free"
+        );
+        // Gap 07: the SPA's `isSnapshotFrame` REQUIRES `cost_confidence` on every snapshot
+        // row (same guard as `/flows`); a raw `SnapshotFlowSummary` (no cost fields) fails
+        // validation and bricks the client at `connecting`. `cost` may be null but the
+        // confidence tag must be PRESENT.
+        assert_eq!(
+            flows[0]["cost_confidence"],
+            serde_json::json!("unavailable"),
+            "snapshot rows must carry the gap-07 cost_confidence tag"
         );
         // metrics: the flat tile + metrics_seq + windows{m1,m5,h1}.
         let m = &value["metrics"];

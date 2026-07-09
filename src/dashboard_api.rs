@@ -181,10 +181,12 @@ impl FlowRow {
         }
     }
 
-    /// Build a row from a body-free snapshot summary (the `/snapshot` summaries),
-    /// pricing it the same way. The snapshot summary has no live `FlowRecord`, so
-    /// this prices off its own `model_served` + `usage`.
-    fn from_summary(
+    /// Build a row from a body-free snapshot summary (the `/snapshot` summaries AND the
+    /// initial `/dashboard/ws` snapshot message — the SPA's `isSnapshotFrame` requires the
+    /// gap-07 `cost_confidence` on every row, so the WS snapshot must project through THIS,
+    /// never serialize raw `SnapshotFlowSummary`s), pricing it the same way. The snapshot
+    /// summary has no live `FlowRecord`, so this prices off its own `model_served` + `usage`.
+    pub(crate) fn from_summary(
         summary: &crate::dashboard_flow::SnapshotFlowSummary,
         gateway: &Gateway,
     ) -> Self {
