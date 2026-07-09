@@ -86,17 +86,25 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   const [drawerCollapsed, setDrawerCollapsed] = usePersistedFlag('drawer-collapsed', false);
   const [railCollapsed, setRailCollapsed] = usePersistedFlag('rail-collapsed', false);
   const railRef = usePanelRef();
-  // Mirror for the drag-snap sync below (onResize fires per pointer move — only write on change).
+  const drawerRef = usePanelRef();
+  // Per-pane + panes-column collapse (NOT persisted flags — the persisted %-layout restores the
+  // size, and each panel's mount-time onResize re-syncs the boolean from `isCollapsed()`).
+  const paneARef = usePanelRef();
+  const paneBRef = usePanelRef();
+  const paneCRef = usePanelRef();
+  const paneRefs = useMemo(() => ({ A: paneARef, B: paneBRef, C: paneCRef }) as const, [paneARef, paneBRef, paneCRef]);
+  const [collapsedPanes, setCollapsedPanes] = useState<Record<'A' | 'B' | 'C', boolean>>({ A: false, B: false, C: false });
+  const panesColRef = usePanelRef();
+  const [panesColCollapsed, setPanesColCollapsed] = useState(false);
+  // Mirrors for the drag-snap sync below (onResize fires per pointer move — only write on change).
   const railCollapsedRef = useRef(railCollapsed);
   railCollapsedRef.current = railCollapsed;
+  const drawerCollapsedRef = useRef(drawerCollapsed);
+  drawerCollapsedRef.current = drawerCollapsed;
 
   // Splitter sizes persist via react-resizable-panels' own storage hook (localStorage keys
-  // `react-resizable-panels:argus-flowdetail-*`). `panelIds` keys the vertical layout per panel
-  // set, so the drawer-collapsed arrangement doesn't clobber the expanded one.
-  const vsplit = useDefaultLayout({
-    id: 'argus-flowdetail-vsplit',
-    panelIds: drawerCollapsed ? ['detail-main'] : ['detail-main', 'detail-drawer'],
-  });
+  // `react-resizable-panels:argus-flowdetail-*`).
+  const vsplit = useDefaultLayout({ id: 'argus-flowdetail-vsplit', panelIds: ['detail-main', 'detail-drawer'] });
   const hsplit = useDefaultLayout({ id: 'argus-flowdetail-hsplit', panelIds: ['detail-panes', 'detail-rail'] });
   const abc = useDefaultLayout({ id: 'argus-flowdetail-abc', panelIds: ['pane-a', 'pane-b', 'pane-c'] });
 
@@ -117,7 +125,8 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   }, [zoom]);
 
   // DevTools console-drawer gesture: clicking the ACTIVE tab toggles the drawer collapsed;
-  // clicking an inactive tab switches AND expands.
+  // clicking an inactive tab switches AND expands. The flag→panel effects below drive the
+  // imperative collapse/expand, so a gesture and a splitter drag stay in the same state machine.
   const onTabClick = useCallback(
     (t: Tab) => {
       if (t === tab && !drawerCollapsed) {
@@ -130,21 +139,50 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
     [tab, drawerCollapsed, setDrawerCollapsed],
   );
 
-  // Deltas-rail collapse: the Panel is `collapsible` (dragging under minSize snaps to the 24px
-  // edge strip); the header/strip buttons drive the imperative API; `onResize` mirrors a
-  // drag-snap back into the persisted flag.
+  // Collapsible-panel state sync, both directions:
+  //  - DRAG: the library snaps a collapsible panel past its minSize to its collapsedSize;
+  //    `onResize` mirrors that into the persisted flag (guarded — it fires per pointer move).
+  //  - FLAG (gesture buttons / persisted restore): the effects re-assert the panel's collapse
+  //    state from the flag. A restored %-layout may not land exactly on a PIXEL collapsedSize
+  //    (viewport changed since save), so this also heals reopen-after-collapse.
   const onRailResize = useCallback(() => {
     const c = railRef.current?.isCollapsed() ?? false;
     if (c !== railCollapsedRef.current) setRailCollapsed(c);
   }, [railRef, setRailCollapsed]);
-  const collapseRail = useCallback(() => {
-    setRailCollapsed(true);
-    railRef.current?.collapse();
-  }, [railRef, setRailCollapsed]);
-  const expandRail = useCallback(() => {
-    setRailCollapsed(false);
-    railRef.current?.expand();
-  }, [railRef, setRailCollapsed]);
+  const onDrawerResize = useCallback(() => {
+    const c = drawerRef.current?.isCollapsed() ?? false;
+    if (c !== drawerCollapsedRef.current) setDrawerCollapsed(c);
+  }, [drawerRef, setDrawerCollapsed]);
+  const onPaneResize = useCallback(
+    (key: 'A' | 'B' | 'C') => {
+      const c = paneRefs[key].current?.isCollapsed() ?? false;
+      setCollapsedPanes((prev) => (prev[key] === c ? prev : { ...prev, [key]: c }));
+    },
+    [paneRefs],
+  );
+  const expandPane = useCallback(
+    (key: 'A' | 'B' | 'C') => {
+      setCollapsedPanes((prev) => ({ ...prev, [key]: false }));
+      paneRefs[key].current?.expand();
+    },
+    [paneRefs],
+  );
+  const onPanesColResize = useCallback(() => {
+    const c = panesColRef.current?.isCollapsed() ?? false;
+    setPanesColCollapsed((prev) => (prev === c ? prev : c));
+  }, [panesColRef]);
+  useEffect(() => {
+    const h = railRef.current;
+    if (!h) return;
+    if (railCollapsed && !h.isCollapsed()) h.collapse();
+    else if (!railCollapsed && h.isCollapsed()) h.expand();
+  }, [railCollapsed, railRef, zoom]);
+  useEffect(() => {
+    const h = drawerRef.current;
+    if (!h) return;
+    if (drawerCollapsed && !h.isCollapsed()) h.collapse();
+    else if (!drawerCollapsed && h.isCollapsed()) h.expand();
+  }, [drawerCollapsed, drawerRef]);
 
   // The flow's response_id (engine id) joins the monitor ring to this flow. While seeking we read
   // it from the FROZEN row (not the live REST detail, which is withheld from non-body surfaces).
@@ -356,7 +394,16 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         defaultLayout={vsplit.defaultLayout}
         onLayoutChanged={vsplit.onLayoutChanged}
       >
-        <Panel id="detail-main" minSize="35%" className="flex min-h-0 min-w-0 flex-col" style={{ overflow: 'hidden' }}>
+        {/* Every panel below is FULL-RANGE collapsible: drag a splitter to the extreme and the
+            panel in the way snaps out of view (collapsedSize 0); drag back and it returns. */}
+        <Panel
+          id="detail-main"
+          collapsible
+          collapsedSize={0}
+          minSize="15%"
+          className="flex min-h-0 min-w-0 flex-col"
+          style={{ overflow: 'hidden' }}
+        >
           {zoom ? (
             /* FOCUS MODE — the zoomed layer fills the whole main region; the others unmount
                (useScrollSync tolerates unmounted sibling refs). Esc or ⤢ restores. */
@@ -392,46 +439,73 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
               defaultLayout={hsplit.defaultLayout}
               onLayoutChanged={hsplit.onLayoutChanged}
             >
-              <Panel id="detail-panes" minSize="30%" className="flex min-h-0 min-w-0 flex-col" style={{ overflow: 'hidden' }}>
-                <SearchBar value={query} onChange={setQuery} />
-                {/* 3 scroll-synced panes with their own splitters (widen one layer as needed). */}
-                <Group
-                  orientation="horizontal"
-                  id="pane-row"
-                  className="min-h-0 min-w-0 flex-1"
-                  defaultLayout={abc.defaultLayout}
-                  onLayoutChanged={abc.onLayoutChanged}
-                >
-                  {panes.map((p, i) => (
-                    <Fragment key={p.key}>
-                      {i > 0 && (
-                        <Separator
-                          id={`split-${panes[i - 1]!.key.toLowerCase()}${p.key.toLowerCase()}`}
-                          className={SPLIT_V}
-                        />
-                      )}
-                      <Panel
-                        id={`pane-${p.key.toLowerCase()}`}
-                        minSize="12%"
-                        className="flex min-h-0 min-w-0 flex-col"
-                        style={{ overflow: 'hidden' }}
-                      >
-                        <JsonPane
-                          label={p.label}
-                          value={p.value}
-                          diff={p.diff}
-                          side={p.side}
-                          query={query}
-                          emptyLabel={emptyBodyLabel(seeking)}
-                          scrollRef={sync.refFor(p.index)}
-                          onScroll={sync.bind(p.index)}
-                          onZoom={() => setZoom(p.key)}
-                          className="min-h-0 flex-1"
-                        />
-                      </Panel>
-                    </Fragment>
-                  ))}
-                </Group>
+              <Panel
+                id="detail-panes"
+                collapsible
+                collapsedSize={16}
+                minSize="20%"
+                panelRef={panesColRef}
+                onResize={onPanesColResize}
+                className="flex min-h-0 min-w-0 flex-col"
+                style={{ overflow: 'hidden' }}
+              >
+                {panesColCollapsed ? (
+                  <EdgeStrip label="layers" onExpand={() => { setPanesColCollapsed(false); panesColRef.current?.expand(); }} testid="panes-strip" />
+                ) : (
+                  <>
+                    <SearchBar value={query} onChange={setQuery} />
+                    {/* 3 scroll-synced panes with their own splitters (widen one layer as needed).
+                        Each pane collapses to a 16px labeled sliver, NOT 0 — a zero-width middle
+                        pane stacks its two separators on the same pixel, which makes the
+                        drag-to-re-expand grab the wrong one. The sliver keeps them apart and is
+                        itself the click-to-restore affordance. */}
+                    <Group
+                      orientation="horizontal"
+                      id="pane-row"
+                      className="min-h-0 min-w-0 flex-1"
+                      defaultLayout={abc.defaultLayout}
+                      onLayoutChanged={abc.onLayoutChanged}
+                    >
+                      {panes.map((p, i) => (
+                        <Fragment key={p.key}>
+                          {i > 0 && (
+                            <Separator
+                              id={`split-${panes[i - 1]!.key.toLowerCase()}${p.key.toLowerCase()}`}
+                              className={SPLIT_V}
+                            />
+                          )}
+                          <Panel
+                            id={`pane-${p.key.toLowerCase()}`}
+                            collapsible
+                            collapsedSize={16}
+                            minSize="10%"
+                            panelRef={paneRefs[p.key]}
+                            onResize={() => onPaneResize(p.key)}
+                            className="flex min-h-0 min-w-0 flex-col"
+                            style={{ overflow: 'hidden' }}
+                          >
+                            {collapsedPanes[p.key] ? (
+                              <EdgeStrip label={p.key} onExpand={() => expandPane(p.key)} testid={`pane-strip-${p.key.toLowerCase()}`} />
+                            ) : (
+                              <JsonPane
+                                label={p.label}
+                                value={p.value}
+                                diff={p.diff}
+                                side={p.side}
+                                query={query}
+                                emptyLabel={emptyBodyLabel(seeking)}
+                                scrollRef={sync.refFor(p.index)}
+                                onScroll={sync.bind(p.index)}
+                                onZoom={() => setZoom(p.key)}
+                                className="min-h-0 flex-1"
+                              />
+                            )}
+                          </Panel>
+                        </Fragment>
+                      ))}
+                    </Group>
+                  </>
+                )}
               </Panel>
               <Separator id="split-rail" className={SPLIT_V} />
               <Panel
@@ -440,41 +514,40 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
                 collapsedSize={24}
                 minSize="12%"
                 defaultSize="22%"
-                maxSize="45%"
                 panelRef={railRef}
                 onResize={onRailResize}
                 className="flex min-h-0 min-w-0 flex-col"
                 style={{ overflow: 'hidden' }}
               >
                 {railCollapsed ? (
-                  <button
-                    type="button"
-                    onClick={expandRail}
-                    aria-label="expand deltas rail"
-                    data-testid="deltas-strip"
-                    className="flex h-full w-full items-start justify-center border-l border-line bg-panel-raised/60 py-2 text-[10px] uppercase tracking-wide text-text-muted transition-colors hover:text-accent"
-                  >
-                    <span style={{ writingMode: 'vertical-rl' }}>deltas</span>
-                  </button>
+                  <EdgeStrip label="deltas" onExpand={() => setRailCollapsed(false)} testid="deltas-strip" className="border-l border-line" />
                 ) : (
-                  <DeltasRail segments={segments} onZoom={() => setZoom('deltas')} onCollapse={collapseRail} />
+                  <DeltasRail segments={segments} onZoom={() => setZoom('deltas')} onCollapse={() => setRailCollapsed(true)} />
                 )}
               </Panel>
             </Group>
           )}
         </Panel>
 
-        {!drawerCollapsed && <Separator id="split-drawer" className={SPLIT_H} />}
-        {!drawerCollapsed && (
-          <Panel
-            id="detail-drawer"
-            defaultSize="25%"
-            minSize="10%"
-            maxSize="60%"
-            className="flex min-h-0 min-w-0 flex-col"
-            style={{ overflow: 'hidden' }}
-          >
-            <TabStrip tab={tab} collapsed={false} onTabClick={onTabClick} />
+        <Separator id="split-drawer" className={SPLIT_H} />
+        {/* The drawer Panel is ALWAYS mounted with the tab strip at its top: collapsed means
+            "exactly the 34px strip" (pixel collapsedSize), so the strip is never hidden, a drag
+            below minSize snaps to it, and dragging the splitter back up re-opens it. Dragging it
+            ALL THE WAY UP instead collapses `detail-main` out of view — the drawer fills the
+            inspector. The tabpanel content unmounts while collapsed. */}
+        <Panel
+          id="detail-drawer"
+          collapsible
+          collapsedSize={34}
+          defaultSize="25%"
+          minSize="12%"
+          panelRef={drawerRef}
+          onResize={onDrawerResize}
+          className="flex min-h-0 min-w-0 flex-col"
+          style={{ overflow: 'hidden' }}
+        >
+          <TabStrip tab={tab} collapsed={drawerCollapsed} onTabClick={onTabClick} />
+          {!drawerCollapsed && (
             <div className="min-h-0 flex-1 overflow-auto" role="tabpanel" data-testid={`tabpanel-${tab}`}>
               {/* Headers + Error read the FROZEN detail (null while seeking) so no live/post-cut
                   metadata leaks; Timeline reads the cut-bounded monitor join (finding 1). */}
@@ -482,11 +555,9 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
               {tab === 'timeline' && <Timeline events={join.events} />}
               {tab === 'error' && <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} seeking={seeking} />}
             </div>
-          </Panel>
-        )}
+          )}
+        </Panel>
       </Group>
-      {/* Collapsed drawer ⇒ the bare tab strip (clicking a tab re-expands). */}
-      {drawerCollapsed && <TabStrip tab={tab} collapsed onTabClick={onTabClick} />}
     </section>
   );
 }
@@ -496,7 +567,9 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
 function TabStrip({ tab, collapsed, onTabClick }: { tab: Tab; collapsed: boolean; onTabClick: (t: Tab) => void }) {
   return (
     <div
-      className="flex shrink-0 items-center gap-1 border-y border-line bg-panel-raised px-2 py-1"
+      // Fixed 34px (border-box) — MUST match the drawer Panel's `collapsedSize={34}`, so the
+      // collapsed drawer shows exactly the strip (no clipped strip / no content sliver).
+      className="flex h-[34px] shrink-0 items-center gap-1 border-y border-line bg-panel-raised px-2"
       role="tablist"
       data-testid="detail-tabstrip"
       data-collapsed={collapsed ? 'true' : 'false'}
@@ -508,6 +581,35 @@ function TabStrip({ tab, collapsed, onTabClick }: { tab: Tab; collapsed: boolean
         {collapsed ? 'click a tab to expand' : 'click the active tab to collapse'}
       </span>
     </div>
+  );
+}
+
+/** A collapsed panel's thin edge strip: a rotated label that IS the re-expand button — the panel
+ * is "out of the way", never hidden entirely (and its splitters never stack on one pixel). */
+function EdgeStrip({
+  label,
+  onExpand,
+  testid,
+  className,
+}: {
+  label: string;
+  onExpand: () => void;
+  testid: string;
+  className?: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onExpand}
+      aria-label={`expand ${label}`}
+      data-testid={testid}
+      className={cn(
+        'flex h-full w-full items-start justify-center bg-panel-raised/60 py-2 text-[10px] uppercase tracking-wide text-text-muted transition-colors hover:text-accent',
+        className,
+      )}
+    >
+      <span style={{ writingMode: 'vertical-rl' }}>{label}</span>
+    </button>
   );
 }
 

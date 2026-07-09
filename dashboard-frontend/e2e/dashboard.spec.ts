@@ -582,7 +582,41 @@ test.describe('Argus dashboard', () => {
     await page.getByTestId('summary-toggle').click();
     await expect(page.getByTestId('summary-line')).toHaveCount(0);
 
-    // 5 — zoom pane C: it fills the main region (A/B unmount); FIRST Esc restores the zoom
+    // 5 — FULL-RANGE drawer: drag the main|drawer splitter to the TOP — the main region
+    // (pane-row) collapses out of view and the drawer fills the inspector; drag back down and
+    // the main region returns.
+    const dsep = (await page.getByTestId('split-drawer').boundingBox())!;
+    await page.mouse.move(dsep.x + 400, dsep.y + dsep.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(dsep.x + 400, 120, { steps: 10 });
+    await page.mouse.up();
+    const collapsedMain = await page.getByTestId('pane-row').boundingBox();
+    expect(collapsedMain === null || collapsedMain.height < 5, 'main region collapsed out of view').toBe(true);
+    await expect(page.getByRole('tabpanel')).toBeVisible(); // the drawer filled the space
+    const dsep2 = (await page.getByTestId('split-drawer').boundingBox())!;
+    await page.mouse.move(dsep2.x + 400, dsep2.y + dsep2.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(dsep2.x + 400, 820, { steps: 10 });
+    await page.mouse.up();
+    expect((await page.getByTestId('pane-row').boundingBox())!.height, 'main region returns on drag-back').toBeGreaterThan(100);
+
+    // 6 — FULL-RANGE pane: drag the A|B splitter hard right — B (and possibly C) collapse to
+    // their labeled slivers; clicking a sliver restores that pane.
+    const ab = (await page.getByTestId('split-ab').boundingBox())!;
+    await page.mouse.move(ab.x + ab.width / 2, ab.y + 200);
+    await page.mouse.down();
+    await page.mouse.move(ab.x + 900, ab.y + 200, { steps: 10 });
+    await page.mouse.up();
+    await expect(page.getByTestId('pane-strip-b')).toBeVisible();
+    await page.getByTestId('pane-strip-b').click();
+    await expect(page.getByTestId('pane-strip-b')).toHaveCount(0);
+    await expect(page.getByTestId('jsonpane-code-B · normalized')).toBeVisible();
+    if (await page.getByTestId('pane-strip-c').count()) {
+      await page.getByTestId('pane-strip-c').click(); // the hard drag may have swept C along too
+    }
+    await expect(page.getByTestId('jsonpane-code-C · upstream')).toBeVisible();
+
+    // 7 — zoom pane C: it fills the main region (A/B unmount); FIRST Esc restores the zoom
     // (drill-down stays open), SECOND Esc dismisses the drill-down.
     await page.getByTestId('jsonpane-zoom-C · upstream').click();
     await expect(page.getByTestId('zoom-region')).toHaveAttribute('data-zoom', 'C');
