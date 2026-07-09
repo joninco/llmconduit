@@ -31,13 +31,13 @@ export function resetWorld(opts: { mock?: boolean } = {}): void {
   // The drill-down selection lives in the hash (`#/flows/<id>`) — clear it so a selection made
   // by one test never leaks a mounted FlowDetail into the next.
   if (window.location.hash) window.location.hash = '';
-  // FlowDetail's adjustable-layout persistence: splitter sizes (react-resizable-panels'
-  // `useDefaultLayout`, keys `react-resizable-panels:argus-flowdetail-*`) + collapse flags
-  // (`argus-flowdetail-*`). Clear both families so one test's arrangement (e.g. a collapsed
-  // drawer) never changes what the next test finds mounted.
+  // Adjustable-layout persistence (FlowDetail splitters + the shell chrome band): splitter
+  // sizes (react-resizable-panels' `useDefaultLayout`, keys `react-resizable-panels:argus-*`)
+  // + collapse flags (`argus-flowdetail-*`). Clear both families so one test's arrangement
+  // (e.g. a collapsed drawer) never changes what the next test finds mounted.
   for (let i = window.localStorage.length - 1; i >= 0; i--) {
     const key = window.localStorage.key(i);
-    if (key && key.includes('argus-flowdetail')) window.localStorage.removeItem(key);
+    if (key && (key.includes('argus-flowdetail') || key.includes('argus-shell'))) window.localStorage.removeItem(key);
   }
   if (opts.mock) {
     delete window.__LLMCONDUIT_DASHBOARD__;

@@ -631,6 +631,50 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on adjustable sections').toEqual([]);
   });
 
+  // Shell chrome band: everything below the nav bar is one split group — the stats strip +
+  // scrubber collapse to a thin labeled strip (never hidden entirely), so any view reclaims the
+  // full height. Composite with the drill-down: the drawer dragged to the top reaches the nav
+  // bar with only the chrome strip + the drill-down top bar + tab strip in between.
+  test('shell chrome collapses to a strip; drawer reaches the nav bar (full-height reclaim)', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[0]!); // Flows
+    await page.waitForTimeout(400);
+
+    // Collapse the chrome band by dragging the shell splitter up to the nav.
+    const s = (await page.getByTestId('split-shell').boundingBox())!;
+    await page.mouse.move(s.x + 500, s.y);
+    await page.mouse.down();
+    await page.mouse.move(s.x + 500, 40, { steps: 10 });
+    await page.mouse.up();
+    await expect(page.getByTestId('shell-chrome-strip')).toBeVisible();
+    await expect(page.getByTestId('chip-reqs_per_sec')).toHaveCount(0); // stats strip out of the way
+
+    // Drill in and send the drawer to the top.
+    await page.getByTestId('flow-row').filter({ hasText: 'api_001' }).first().click();
+    await expect(page.getByTestId('flow-detail')).toBeVisible();
+    const d = (await page.getByTestId('split-drawer').boundingBox())!;
+    await page.mouse.move(d.x + 400, d.y + 1);
+    await page.mouse.down();
+    await page.mouse.move(d.x + 400, 30, { steps: 12 });
+    await page.mouse.up();
+    const tp = (await page.getByRole('tabpanel').boundingBox())!;
+    expect(tp.y, 'tabpanel sits just below the nav + strips').toBeLessThan(170);
+    const pr = await page.getByTestId('pane-row').boundingBox();
+    expect(pr === null || pr.height < 5, 'main region (panes + summary) fully collapsed').toBe(true);
+
+    // Restore both: click the chrome strip; drag the drawer splitter back down.
+    await page.getByTestId('shell-chrome-strip').click();
+    await expect(page.getByTestId('chip-reqs_per_sec')).toBeVisible();
+    const d2 = (await page.getByTestId('split-drawer').boundingBox())!;
+    await page.mouse.move(d2.x + 400, d2.y + 1);
+    await page.mouse.down();
+    await page.mouse.move(d2.x + 400, 800, { steps: 10 });
+    await page.mouse.up();
+    expect((await page.getByTestId('pane-row').boundingBox())!.height, 'main region returns').toBeGreaterThan(100);
+
+    expect(consoleErrors, 'console errors on shell chrome collapse').toEqual([]);
+  });
+
   for (const view of VIEWS) {
     test(`${view.name}: renders + no console errors + matches baseline`, async ({ page, consoleErrors }) => {
       await login(page);

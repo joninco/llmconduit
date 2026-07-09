@@ -48,6 +48,7 @@ import { Timeline } from './Timeline';
 import { useScrollSync } from './useScrollSync';
 import { useFlowDetail, type KillState } from './useFlowDetail';
 import { usePersistedFlag } from './layoutPrefs';
+import { EdgeStrip } from '../ui/EdgeStrip';
 import { cn } from '../../lib/cn';
 
 type Tab = 'headers' | 'timeline' | 'error';
@@ -369,22 +370,6 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         onKill={() => kill(apiCallId)}
         onClose={onClose}
       />
-      <SummaryBand
-        flow={liveFlow}
-        detail={frozenDetail}
-        cost={cost}
-        costConfidence={costConfidence}
-        usage={usage}
-        econ={econ}
-        contextUtil={contextUtil}
-        latency={latency}
-        attempts={attempts}
-        seeking={seeking}
-        seekAtMs={seekAtMs}
-        collapsed={summaryCollapsed}
-        onToggle={() => setSummaryCollapsed(!summaryCollapsed)}
-      />
-
       {/* Main region over the bottom tab drawer — a vertical splitter; the drawer collapses to
           the bare tab strip (rendered below the group), never hides entirely. */}
       <Group
@@ -395,7 +380,9 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         onLayoutChanged={vsplit.onLayoutChanged}
       >
         {/* Every panel below is FULL-RANGE collapsible: drag a splitter to the extreme and the
-            panel in the way snaps out of view (collapsedSize 0); drag back and it returns. */}
+            panel in the way snaps out of view (collapsedSize 0); drag back and it returns. The
+            summary band lives INSIDE the main panel, so a drawer dragged to the top swallows it
+            too — the drawer reaches the drill-down's top bar. */}
         <Panel
           id="detail-main"
           collapsible
@@ -404,6 +391,21 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
           className="flex min-h-0 min-w-0 flex-col"
           style={{ overflow: 'hidden' }}
         >
+          <SummaryBand
+            flow={liveFlow}
+            detail={frozenDetail}
+            cost={cost}
+            costConfidence={costConfidence}
+            usage={usage}
+            econ={econ}
+            contextUtil={contextUtil}
+            latency={latency}
+            attempts={attempts}
+            seeking={seeking}
+            seekAtMs={seekAtMs}
+            collapsed={summaryCollapsed}
+            onToggle={() => setSummaryCollapsed(!summaryCollapsed)}
+          />
           {zoom ? (
             /* FOCUS MODE — the zoomed layer fills the whole main region; the others unmount
                (useScrollSync tolerates unmounted sibling refs). Esc or ⤢ restores. */
@@ -581,35 +583,6 @@ function TabStrip({ tab, collapsed, onTabClick }: { tab: Tab; collapsed: boolean
         {collapsed ? 'click a tab to expand' : 'click the active tab to collapse'}
       </span>
     </div>
-  );
-}
-
-/** A collapsed panel's thin edge strip: a rotated label that IS the re-expand button — the panel
- * is "out of the way", never hidden entirely (and its splitters never stack on one pixel). */
-function EdgeStrip({
-  label,
-  onExpand,
-  testid,
-  className,
-}: {
-  label: string;
-  onExpand: () => void;
-  testid: string;
-  className?: string;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onExpand}
-      aria-label={`expand ${label}`}
-      data-testid={testid}
-      className={cn(
-        'flex h-full w-full items-start justify-center bg-panel-raised/60 py-2 text-[10px] uppercase tracking-wide text-text-muted transition-colors hover:text-accent',
-        className,
-      )}
-    >
-      <span style={{ writingMode: 'vertical-rl' }}>{label}</span>
-    </button>
   );
 }
 
