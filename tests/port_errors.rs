@@ -75,9 +75,28 @@ fn detects_vllm_at_least_context_limit() {
     assert_eq!(retry.ctx_limit, 65536);
     assert_eq!(retry.input_tokens, Some(1537));
     assert!(retry.input_tokens_is_lower_bound);
+    assert_eq!(retry.requested_output_tokens, Some(64000));
+    // 1537 + 64000 == 65537 == ctx + 1: the backend back-computed the minimal
+    // input that explains the overflow — the derived-bound fingerprint.
+    assert!(retry.input_tokens_is_derived);
     // Same small safety reserve as an exact count: 65536 - 8 - 1537. The loop,
     // not a wider margin, absorbs a lower bound's understatement.
     assert_eq!(retry.available_completion_tokens, 63991);
+}
+
+#[test]
+fn at_least_bound_without_exact_overflow_arithmetic_is_not_derived() {
+    // A genuine lower bound whose total does NOT land exactly one past the
+    // window (150000 + 64000 != 202753) is a real (if conservative) count —
+    // the loop may re-budget from it arithmetically.
+    let error_body = "This model's maximum context length is 202752 tokens. \
+        However, you requested 64000 output tokens and your prompt contains at least 150000 input tokens.";
+
+    let retry = classify_context_overflow(error_body, None).expect("retry decision");
+
+    assert!(retry.input_tokens_is_lower_bound);
+    assert!(!retry.input_tokens_is_derived);
+    assert_eq!(retry.available_completion_tokens, 202752 - SAFETY - 150000);
 }
 
 #[test]
@@ -114,6 +133,10 @@ fn derived_lower_bound_converges_across_rounds() {
 
     let first = classify_context_overflow(round1, None).expect("round 1 classifies");
     assert!(first.input_tokens_is_lower_bound);
+    // Both captured rounds carry the derived fingerprint (total == ctx + 1),
+    // which is what routes the retry loop to the escalating backoff.
+    assert!(first.input_tokens_is_derived);
+    assert_eq!(first.requested_output_tokens, Some(64000));
     assert_eq!(first.available_completion_tokens, 524288 - SAFETY - 460289);
 
     let second = classify_context_overflow(round2, None).expect("round 2 classifies");
@@ -534,9 +557,10 @@ mod integration {
     /// The live-incident shape: the backend's "at least N input tokens" is a
     /// lower bound DERIVED from the request (`ctx − max_tokens + 1`), so the
     /// bound TIGHTENS on the retry and a budget computed from the FIRST error
-    /// re-overflows. The loop must re-budget from the LATEST reported input and
-    /// converge: 400(≥460289) → 400(≥461314) → 200, with strictly decreasing
-    /// forwarded budgets, within the attempt cap.
+    /// re-overflows. Round 1 carries the derived fingerprint
+    /// (input + output == ctx + 1) → escalating backoff (−512); round 2 reports
+    /// a REAL tightened bound (no fingerprint) → arithmetic re-budget. The turn
+    /// converges within the attempt cap with strictly decreasing budgets.
     #[tokio::test]
     async fn derived_lower_bound_overflow_converges_after_two_shrinks() {
         let server = MockServer::start().await;
@@ -549,8 +573,9 @@ mod integration {
             .mount(&server)
             .await;
 
-        // POST 1 -> loose derived bound. ctx=524288, input ">= 460289":
-        // budget = 524288 - 8 - 460289 = 63991.
+        // POST 1 -> derived bound (460289 + 64000 == 524289 == ctx + 1): the
+        // fingerprint carries no true prompt size, so the loop backs off
+        // 64000 - 512 = 63488 instead of chasing the arithmetic bound.
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
@@ -563,14 +588,14 @@ mod integration {
             .mount(&server)
             .await;
 
-        // POST 2 -> the bound TIGHTENED (this is what sank the one-shot design):
-        // budget = 524288 - 8 - 461314 = 62966.
+        // POST 2 -> a REAL tightened bound (461314 + 63488 != ctx + 1, so no
+        // derived fingerprint): arithmetic re-budget = 524288 - 8 - 461314 = 62966.
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
                 "This model's maximum context length is 524288 tokens. However, you requested \
-                 63991 output tokens and your prompt contains at least 461314 input tokens, \
-                 for a total of at least 524289 tokens. (parameter=input_tokens, value=461314)",
+                 63488 output tokens and your prompt contains at least 461314 input tokens, \
+                 for a total of at least 524802 tokens. (parameter=input_tokens, value=461314)",
             ))
             .up_to_n_times(1)
             .with_priority(2)
@@ -637,8 +662,8 @@ mod integration {
             .collect();
         assert_eq!(
             budgets,
-            vec![64000, 63991, 62966],
-            "each retry re-budgets from the LATEST reported input"
+            vec![64000, 63488, 62966],
+            "derived round backs off 512; the real tightened bound re-budgets arithmetically"
         );
         assert!(
             budgets.windows(2).all(|pair| pair[1] < pair[0]),
@@ -720,15 +745,17 @@ mod integration {
             .await
             .expect("response");
 
-        assert_eq!(response.status().as_u16(), 502, "terminal upstream error");
+        // 400, not 502: the client must treat this as its own input to fix
+        // (Claude Code keys on the "prompt is too long" shape), never as a
+        // transient gateway failure worth retrying.
+        assert_eq!(response.status().as_u16(), 400, "prompt-too-long is a 400");
         let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
             .expect("read body");
         let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("input exceeds the context window")
-                && message.contains("reduce the prompt"),
+            message.contains("prompt is too long") && message.contains("reduce the prompt"),
             "error must tell the caller to reduce the prompt, got: {message}"
         );
 
@@ -922,10 +949,10 @@ mod integration {
             .await
             .expect("response");
 
-        // Terminal upstream error (502), NOT a 200 produced by failing over.
+        // Terminal 400 prompt-too-long, NOT a 200 produced by failing over.
         assert_eq!(
             response.status().as_u16(),
-            502,
+            400,
             "a persistent overflow must surface terminally, not succeed via failover"
         );
         let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
@@ -1027,8 +1054,8 @@ mod integration {
 
         assert_eq!(
             response.status().as_u16(),
-            502,
-            "cap exhaustion is terminal"
+            400,
+            "cap exhaustion is a terminal 400 prompt-too-long"
         );
         let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
@@ -1266,5 +1293,180 @@ mod integration {
         );
 
         let _ = std::fs::remove_file(&log_path);
+    }
+
+    /// A backend whose bound is PURELY derived (every error reports exactly
+    /// `ctx − sent + 1`, tracking whatever we send — the live 2026-07-09
+    /// failure) gives the arithmetic re-budget only SAFETY+1 tokens per round.
+    /// The fingerprint must route every such round through the ESCALATING
+    /// backoff instead: −512, then −1024 off the budget the backend just
+    /// rejected.
+    #[tokio::test]
+    async fn derived_bound_backoff_escalates_512_then_1024() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "test-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        // Round 1: derived for sent=64000 (460289 + 64000 == 524289) -> backoff
+        // 64000 - 512 = 63488.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "This model's maximum context length is 524288 tokens. However, you requested \
+                 64000 output tokens and your prompt contains at least 460289 input tokens, \
+                 for a total of at least 524289 tokens. (parameter=input_tokens, value=460289)",
+            ))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        // Round 2: the bound TRACKED the shrink — derived again for sent=63488
+        // (460801 + 63488 == 524289) -> backoff escalates: 63488 - 1024 = 62464.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "This model's maximum context length is 524288 tokens. However, you requested \
+                 63488 output tokens and your prompt contains at least 460801 input tokens, \
+                 for a total of at least 524289 tokens. (parameter=input_tokens, value=460801)",
+            ))
+            .up_to_n_times(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        // Round 3: fits.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(chat_sse_body()),
+            )
+            .with_priority(3)
+            .mount(&server)
+            .await;
+
+        let app = llmconduit::build_app(config_for(&server.uri()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "stream": false,
+                            "max_tokens": 64000,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "escalating backoff must land a purely derived-bound backend"
+        );
+
+        let chat_requests = chat_post_bodies(&server).await;
+        let budgets: Vec<i64> = chat_requests
+            .iter()
+            .map(|request| request["max_tokens"].as_i64().expect("max_tokens"))
+            .collect();
+        assert_eq!(
+            budgets,
+            vec![64000, 63488, 62464],
+            "each derived round concedes an escalating slice (512, then 1024)"
+        );
+    }
+
+    /// The Anthropic surface (Claude Code's compaction path): a terminal
+    /// prompt-too-long must reach the client as HTTP 400 with Anthropic's
+    /// `invalid_request_error` type and a "prompt is too long" message — the
+    /// shape clients key on to stop retrying and engage their own trim
+    /// fallbacks — never a "temporary" 502 `api_error`.
+    #[tokio::test]
+    async fn anthropic_prompt_too_long_surfaces_invalid_request_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "test-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        // input=65000 of ctx=65536 leaves 528 < the 4096 floor: terminal on the
+        // first error, no retry.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "This model's maximum context length is 65536 tokens. However, you requested \
+                 4096 output tokens and your prompt contains 65000 input tokens.",
+            ))
+            .mount(&server)
+            .await;
+
+        let app = llmconduit::build_app(config_for(&server.uri()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "stream": false,
+                            "max_tokens": 64000,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "Anthropic surface must serve prompt-too-long as a 400"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
+        assert_eq!(
+            body["error"]["type"].as_str(),
+            Some("invalid_request_error"),
+            "Anthropic error type must be invalid_request_error, got: {body}"
+        );
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("prompt is too long")),
+            "message must lead with the prompt-is-too-long shape, got: {body}"
+        );
+
+        assert_eq!(
+            chat_post_bodies(&server).await.len(),
+            1,
+            "terminal prompt-too-long must not retry upstream"
+        );
     }
 }

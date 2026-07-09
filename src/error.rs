@@ -7,6 +7,13 @@ use std::fmt;
 
 pub type AppResult<T> = Result<T, AppError>;
 
+/// Structured error code carried by a terminal context-overflow the CLIENT must
+/// fix by shrinking its input (OpenAI wire name). The `response.failed` event
+/// keeps only `message` + `code`, so every place that rebuilds an HTTP response
+/// from that event keys on THIS code to restore the 400 "prompt is too long"
+/// shape instead of the generic 502 (see [`AppError::from_terminal_event`]).
+pub(crate) const CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
+
 /// How the multi-provider `FailoverUpstreamClient`/routing layer should treat a
 /// failed upstream attempt. This is a property of the upstream-attempt OUTCOME,
 /// not a generic error policy: only the leaf upstream client decides it, and
@@ -127,6 +134,39 @@ impl AppError {
         Self {
             failover: disposition,
             ..Self::upstream(message)
+        }
+    }
+
+    /// A terminal context-window overflow the CLIENT must resolve by shrinking
+    /// its input: the prompt (plus any completion budget worth sending) cannot
+    /// fit the upstream window, so no gateway-side retry, failover, or "try
+    /// again in a moment" can help. Served as HTTP 400 with a message that
+    /// leads with the Anthropic-style `prompt is too long` phrase — clients
+    /// like Claude Code key on that shape to engage their own trim/compaction
+    /// fallbacks instead of hammering a "temporary" 502 — and carries the
+    /// OpenAI-style structured code for the Chat/Responses surfaces.
+    pub(crate) fn prompt_too_long(message: impl Into<String>) -> Self {
+        let msg = message.into();
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            client_message: msg.clone(),
+            message: msg,
+            code: Some(CONTEXT_LENGTH_EXCEEDED_CODE.to_string()),
+            failover: FailoverDisposition::Terminal,
+        }
+    }
+
+    /// Rebuild an [`AppError`] from a canonical `response.failed` event's
+    /// `message` + structured `code`. The event does not carry the original
+    /// HTTP status, so the collectors historically collapsed every terminal to
+    /// a 502 — turning a permanent "your prompt cannot fit" into a
+    /// "temporary, try again" that clients hammer. The context-overflow code
+    /// restores the 400 `prompt is too long` shape; everything else keeps the
+    /// 502 upstream default.
+    pub(crate) fn from_terminal_event(message: &str, code: Option<&str>) -> Self {
+        match code {
+            Some(CONTEXT_LENGTH_EXCEEDED_CODE) => Self::prompt_too_long(message),
+            _ => Self::upstream(message),
         }
     }
 

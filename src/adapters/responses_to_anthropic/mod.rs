@@ -562,16 +562,23 @@ impl AnthropicStreamConverter {
     // `Surface::Error` contract (`conformance.rs` invariant 6: the stream must
     // end WITH the `error` event), which this now satisfies for real.
     fn handle_failed(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
-        let message = data
-            .get("response")
-            .and_then(|r| r.get("error"))
+        let error = data.get("response").and_then(|r| r.get("error"));
+        let message = error
             .and_then(|e| e.get("message"))
             .and_then(Value::as_str)
             .unwrap_or("gateway error")
             .to_string();
+        // A context-overflow terminal is the CLIENT's input to fix: surface it
+        // as Anthropic's `invalid_request_error` (the type the real API's
+        // "prompt is too long" 400 carries) so clients engage their own trim/
+        // compaction handling instead of retrying an `api_error` as transient.
+        let kind = match error.and_then(|e| e.get("code")).and_then(Value::as_str) {
+            Some(crate::error::CONTEXT_LENGTH_EXCEEDED_CODE) => "invalid_request_error",
+            _ => "api_error",
+        };
         output.push(AnthropicStreamEvent::Error {
             error: AnthropicErrorBody {
-                kind: "api_error".to_string(),
+                kind: kind.to_string(),
                 message,
             },
         });

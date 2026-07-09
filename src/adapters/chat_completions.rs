@@ -577,7 +577,10 @@ impl ChatCompletionStreamConverter {
 pub struct ChatCompletionCollector {
     model: String,
     final_response: Option<Value>,
-    error: Option<String>,
+    /// Terminal failure as `(message, structured code)`. The code decides the
+    /// restored HTTP shape (a context-overflow terminal resurfaces as its 400
+    /// "prompt is too long", not the generic 502).
+    error: Option<(String, String)>,
     /// See `ChatCompletionStreamConverter::suppress_reasoning` (G2, Finding 2):
     /// drop forced-but-unrequested `reasoning_content` from the assembled
     /// non-streaming Chat response.
@@ -604,15 +607,18 @@ impl ChatCompletionCollector {
                 self.final_response = event.data.get("response").cloned();
             }
             "response.failed" => {
-                self.error = Some(response_error_message(&event.data));
+                self.error = Some((
+                    response_error_message(&event.data),
+                    response_error_code(&event.data),
+                ));
             }
             _ => {}
         }
     }
 
     pub fn into_response(self) -> AppResult<Value> {
-        if let Some(error) = self.error {
-            return Err(AppError::upstream(error));
+        if let Some((message, code)) = self.error {
+            return Err(AppError::from_terminal_event(&message, Some(&code)));
         }
         let response = self.final_response.ok_or_else(|| {
             AppError::upstream("stream ended before a final response resource was emitted")

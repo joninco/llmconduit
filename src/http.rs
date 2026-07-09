@@ -1843,14 +1843,21 @@ async fn collect_responses_response(
                 final_payload = event.data.get("response").cloned();
             }
             "response.failed" => {
-                let message = event
+                let error = event
                     .data
                     .get("response")
-                    .and_then(|response| response.get("error"))
+                    .and_then(|response| response.get("error"));
+                let message = error
                     .and_then(|error| error.get("message"))
                     .and_then(Value::as_str)
                     .unwrap_or("upstream request failed");
-                return Err(AppError::upstream(message));
+                // The structured `code` decides the restored HTTP shape: a
+                // context-overflow terminal must resurface as its 400
+                // "prompt is too long", not the generic 502.
+                let code = error
+                    .and_then(|error| error.get("code"))
+                    .and_then(Value::as_str);
+                return Err(AppError::from_terminal_event(message, code));
             }
             _ => {}
         }
@@ -1889,7 +1896,17 @@ async fn collect_anthropic_response(
     }
     match collector.into_response() {
         Ok(msg) => Ok(Json(msg).into_response()),
-        Err(err) => Ok(anthropic_error_response(AppError::upstream(err.message))),
+        // The collector's error carries the Anthropic error TYPE the streaming
+        // converter chose; `invalid_request_error` (context overflow — the
+        // client's input to fix) restores the 400 shape, everything else stays
+        // the historical 502.
+        Err(err) => Ok(anthropic_error_response(
+            if err.kind == "invalid_request_error" {
+                AppError::bad_request(err.message)
+            } else {
+                AppError::upstream(err.message)
+            },
+        )),
     }
 }
 

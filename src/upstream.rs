@@ -118,8 +118,7 @@ fn stamp_header_byte(serving: Option<&Arc<ServingToken>>) {
 /// `HttpStatus` (it IS a genuine upstream HTTP-status response) — `AttemptErrorClass::
 /// Terminal` stays reserved for a context-window overflow the leaf could not resolve —
 /// persisted after the shrink-retry loop, or a prompt that alone exceeds the window —
-/// whose messages (`"upstream context-window overflow persisted …"`, `"upstream input
-/// exceeds the context window: …"`) never match the `"upstream chat failed with "`
+/// whose `"prompt is too long: …"` messages never match the `"upstream chat failed with "`
 /// prefix below. Checking the fixed prefixes BEFORE the disposition fallback lets the
 /// SAME message-shape drive the SAME `HttpStatus` code regardless of disposition, while
 /// the Terminal producers stay classified differently: request-intrinsic 4xx →
@@ -1443,25 +1442,37 @@ impl ReqwestUpstreamClient {
                 // error is a context-limit shape whose PARSED input drives the real
                 // decision below.
                 available = available.max(self.min_completion_tokens);
+            } else if overflow.input_tokens_is_derived {
+                // The reported input is the backend's back-computed minimum
+                // (`ctx − max_tokens + 1`) — zero information about the true prompt, and
+                // it tightens by exactly whatever we shrink, so the arithmetic re-budget
+                // above would gain only SAFETY+1 tokens per round (live 2026-07-09
+                // failure: 64000 → 63973 over four rounds, still over). Concede an
+                // ESCALATING slice off the budget the backend just rejected instead:
+                // 512, then 1024, then 2048. Floor-clamped; a clamp that stops the
+                // budget shrinking exits via the no-progress guard below.
+                let rejected = last_sent_budget
+                    .or(overflow.requested_output_tokens)
+                    .unwrap_or(available);
+                let backoff = DERIVED_BOUND_BACKOFF_INITIAL << (attempt - 1);
+                available = (rejected - backoff).max(self.min_completion_tokens);
             } else if available < self.min_completion_tokens {
                 // The backend-reported input alone (a lower bound at worst — the true
                 // prompt is only bigger) leaves less than the configured minimum
-                // completion budget: no output shrink can fix this request. Terminal for
-                // the same reason as the persisted case — re-sending the same oversized
-                // prompt to another provider would overflow identically.
+                // completion budget: no output shrink can fix this request. Terminal —
+                // re-sending the same oversized prompt to another provider would
+                // overflow identically — and served as a 400 "prompt is too long" so
+                // clients treat it as their own input to fix, not a transient 502.
                 self.capture_upstream_response_body(serving, capture, &body);
-                return Err(AppError::upstream_with_disposition(
-                    format!(
-                        "upstream input exceeds the context window: the prompt alone is at \
-                         least {} of {} tokens, leaving less than the minimum completion \
-                         budget ({}); reduce the prompt. Upstream said {status}: {}",
-                        overflow.input_tokens.unwrap_or(0),
-                        overflow.ctx_limit,
-                        self.min_completion_tokens,
-                        redact_and_truncate_error_body(&body, 500)
-                    ),
-                    FailoverDisposition::Terminal,
-                ));
+                return Err(AppError::prompt_too_long(format!(
+                    "prompt is too long: at least {} input tokens exceed the {}-token \
+                     context window minus the minimum completion budget ({}); reduce the \
+                     prompt. Upstream said {status}: {}",
+                    overflow.input_tokens.unwrap_or(0),
+                    overflow.ctx_limit,
+                    self.min_completion_tokens,
+                    redact_and_truncate_error_body(&body, 500)
+                )));
             }
 
             // Strict progress required: a recomputed budget that is not smaller than the
@@ -1473,14 +1484,11 @@ impl ReqwestUpstreamClient {
             let no_progress = last_sent_budget.is_some_and(|sent| available >= sent);
             if no_progress || attempt >= CONTEXT_OVERFLOW_MAX_ATTEMPTS {
                 self.capture_upstream_response_body(serving, capture, &body);
-                return Err(AppError::upstream_with_disposition(
-                    format!(
-                        "upstream context-window overflow persisted after shrink-and-retry; \
-                         failed with {status}: {}",
-                        redact_and_truncate_error_body(&body, 500)
-                    ),
-                    FailoverDisposition::Terminal,
-                ));
+                return Err(AppError::prompt_too_long(format!(
+                    "prompt is too long: upstream context-window overflow persisted after \
+                     shrink-and-retry; failed with {status}: {}",
+                    redact_and_truncate_error_body(&body, 500)
+                )));
             }
 
             // The reduced budget lives on the typed `max_output_tokens` field
@@ -4265,10 +4273,21 @@ fn should_proxy_request_header(name: &HeaderName) -> bool {
 const CONTEXT_RETRY_SAFETY_TOKENS: i64 = 8;
 
 /// Total upstream sends allowed per dispatch while converging on a context
-/// overflow (the first attempt plus up to N−1 shrink retries). vLLM's derived
-/// lower bound typically tightens to the true count in one extra round; the cap
-/// only bounds a pathological backend whose reported input never converges.
+/// overflow (the first attempt plus up to N−1 shrink retries). A backend that
+/// reports real input counts converges in one extra round; the derived-bound
+/// backoff below converges within the remaining rounds for realistic
+/// overshoots; the cap bounds everything else.
 const CONTEXT_OVERFLOW_MAX_ATTEMPTS: usize = 4;
+
+/// First backoff step when the overflow error's input is the degenerate
+/// DERIVED bound (`input + requested_output == ctx + 1`): such an error proves
+/// only "total > ctx" — re-budgeting from its input gains just SAFETY+1 tokens
+/// per round (live 2026-07-09 failure: four rounds moved 64000 → 63973 and
+/// still lost). Instead each derived round concedes an escalating slice off
+/// the budget the backend just rejected — 512, then 1024, then 2048 — keeping
+/// as much completion budget as possible while covering several thousand
+/// tokens of true-prompt understatement within the attempt cap.
+const DERIVED_BOUND_BACKOFF_INITIAL: i64 = 512;
 
 /// A parsed context/completion token-limit overflow, carrying the recomputed
 /// completion budget for the next shrink attempt.
@@ -4290,6 +4309,18 @@ pub struct ContextOverflowRetry {
     pub reason: &'static str,
     /// True when `input_tokens` is a lower bound ("prompt contains at least N").
     pub input_tokens_is_lower_bound: bool,
+    /// Requested completion tokens parsed from the error body, when the matched
+    /// shape carries them (every shape does except a `completion_limit` body
+    /// with no parseable request side).
+    pub requested_output_tokens: Option<i64>,
+    /// True when the reported input is the degenerate DERIVED bound:
+    /// `input + requested_output == ctx + 1`. The backend back-computed the
+    /// minimal input that explains the overflow from the request's own
+    /// `max_tokens`, so the number carries NO information about the true prompt
+    /// size — it tightens by exactly whatever the next attempt shrinks.
+    /// Arithmetic re-budgeting cannot converge on it; the retry loop switches
+    /// to an escalating backoff instead.
+    pub input_tokens_is_derived: bool,
 }
 
 fn context_retry_completion_budget(ctx_limit: i64, input_tokens: Option<i64>) -> i64 {
@@ -4417,7 +4448,8 @@ pub fn classify_context_overflow(
     error_body: &str,
     estimated_input_tokens: Option<i64>,
 ) -> Option<ContextOverflowRetry> {
-    // vLLM/SGLang output-only limit (group 2 = max_model_len = ctx limit).
+    // vLLM/SGLang output-only limit (group 1 = requested completion tokens,
+    // group 2 = max_model_len = ctx limit).
     if let Some(captures) = COMPLETION_LIMIT_RE.captures(error_body) {
         let ctx_limit = parse_token_count(&captures[2]);
         return Some(ContextOverflowRetry {
@@ -4429,6 +4461,8 @@ pub fn classify_context_overflow(
             input_tokens: estimated_input_tokens,
             reason: "completion_limit",
             input_tokens_is_lower_bound: false,
+            requested_output_tokens: Some(parse_token_count(&captures[1])),
+            input_tokens_is_derived: false,
         });
     }
 
@@ -4439,8 +4473,16 @@ pub fn classify_context_overflow(
     // input count is group 4, not 3.
     if let Some(captures) = VLLM_COMBINED_RE.captures(error_body) {
         let ctx_limit = parse_token_count(&captures[1]);
+        let requested_output = parse_token_count(&captures[2]);
         let input_tokens = parse_token_count(&captures[4]);
         let is_lower_bound = captures.name("lower_bound").is_some();
+        // The derived-bound fingerprint: an "at least" input whose total lands
+        // EXACTLY one past the window is the backend's minimal back-computed
+        // explanation (`ctx − max_tokens + 1`), not a measured prompt size.
+        // A real tokenized count satisfies this only when the request genuinely
+        // overflowed by exactly one token — in which case treating it as
+        // derived costs one modest backoff step instead of a wrong terminal.
+        let is_derived = is_lower_bound && input_tokens + requested_output == ctx_limit + 1;
         return Some(ContextOverflowRetry {
             available_completion_tokens: context_retry_completion_budget(
                 ctx_limit,
@@ -4450,6 +4492,8 @@ pub fn classify_context_overflow(
             input_tokens: Some(input_tokens),
             reason: "context_limit",
             input_tokens_is_lower_bound: is_lower_bound,
+            requested_output_tokens: Some(requested_output),
+            input_tokens_is_derived: is_derived,
         });
     }
 
@@ -4470,6 +4514,10 @@ pub fn classify_context_overflow(
             input_tokens: Some(input_tokens),
             reason: "context_limit",
             input_tokens_is_lower_bound: false,
+            // Both shapes report a measured split (group 4 = completion tokens),
+            // never the derived "at least" arithmetic.
+            requested_output_tokens: Some(parse_token_count(&captures[4])),
+            input_tokens_is_derived: false,
         });
     }
 
