@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { FlowDetail } from './FlowDetail';
 import { dashboardStore } from '../../store/dashboardStore';
@@ -806,7 +806,7 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
       deltas: [{ sequence: 1, kind: 'response.output_text.delta', payload: { text: 'REST-LEAK' }, ts_ms: 5 }],
     };
-    const { getByTestId, getByRole, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_cut" onClose={noop} />);
+    const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_cut" onClose={noop} />);
     act(() => queryClient.setQueryData(['flows', 'api_cut'], liveDetail));
     act(() => dashboardStore.getState().enterSeek(started + 1_000));
     await waitFor(() => expect(document.querySelector('[data-testid="seek-badge"]')).toBeTruthy());
@@ -817,7 +817,8 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     expect(deltas).not.toContain('POST-CUT');
     expect(deltas).not.toContain('REST-LEAK');
     // Headers: the live REST auth header is withheld while seeking (frozen cut has no headers).
-    fireEvent.click(getByRole('tab', { name: 'Headers' }));
+    // Headers IS the default tab — re-clicking the ACTIVE tab now collapses the drawer (the
+    // DevTools console-drawer gesture), so assert the already-shown panel directly.
     expect(getByTestId('headers-empty')).toBeTruthy();
   });
 
@@ -902,5 +903,125 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     await waitFor(() => expect(getByTestId('kill-forbidden')).toBeTruthy());
     expect(dashboardStore.getState().flows.has('api_001')).toBe(false);
     expect(dashboardStore.getState().flows.size).toBe(0);
+  });
+});
+
+describe('FlowDetail — adjustable sections (splitters / collapse-to-strip / zoom)', () => {
+  beforeEach(() => {
+    resetWorld({ mock: true });
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_001',
+        response_id: 'resp_001',
+        status: 'open',
+        model_requested: 'gpt-4o',
+        model_served: 'llama-3.1-70b',
+        upstream_target: 'vllm-a',
+        started_ms: 1_700_000_000_000,
+      }),
+    ]);
+  });
+  afterEach(cleanup);
+
+  it('zoom C fills the main region; FIRST Esc restores (swallowed), SECOND reaches the dismiss layer', async () => {
+    // Stand-in for FlowsView's bubble-phase window keydown (the Esc→dismiss layer). The zoom
+    // capture-phase handler must swallow the FIRST Esc; the second must propagate through.
+    const dismissSpy = vi.fn();
+    window.addEventListener('keydown', dismissSpy);
+    try {
+      const { getByTestId, queryByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+      await waitFor(() => expect(getByTestId('jsonpane-code-C · upstream').querySelectorAll('.json-line').length).toBeGreaterThan(0));
+
+      fireEvent.click(getByTestId('jsonpane-zoom-C · upstream'));
+      expect(getByTestId('zoom-region').getAttribute('data-zoom')).toBe('C');
+      // The other layers unmount; the zoomed pane still renders its body + diff.
+      expect(queryByTestId('jsonpane-code-A · inbound')).toBeNull();
+      expect(queryByTestId('jsonpane-code-B · normalized')).toBeNull();
+      expect(getByTestId('jsonpane-code-C · upstream').querySelectorAll('.json-line').length).toBeGreaterThan(0);
+
+      // FIRST Esc: restores the zoom and is swallowed BEFORE the bubble-phase dismiss listener.
+      fireEvent.keyDown(document.body, { key: 'Escape' });
+      expect(queryByTestId('zoom-region')).toBeNull();
+      await waitFor(() => expect(getByTestId('jsonpane-code-A · inbound')).toBeTruthy());
+      expect(dismissSpy).not.toHaveBeenCalled();
+
+      // Scroll-sync survives the zoom round-trip (refs re-attach, none went stale).
+      const a = getByTestId('jsonpane-scroll-A · inbound');
+      const b = getByTestId('jsonpane-scroll-B · normalized');
+      a.scrollTop = 33;
+      fireEvent.scroll(a);
+      expect(b.scrollTop).toBe(33);
+
+      // SECOND Esc (no zoom active): propagates to the dismiss layer unimpeded.
+      fireEvent.keyDown(document.body, { key: 'Escape' });
+      expect(dismissSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener('keydown', dismissSpy);
+    }
+  });
+
+  it('zooms the deltas rail to fill the main region; ⤢ toggles back', async () => {
+    const { getByTestId, queryByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('deltas-panel')).toBeTruthy());
+
+    fireEvent.click(getByTestId('deltas-zoom'));
+    expect(getByTestId('zoom-region').getAttribute('data-zoom')).toBe('deltas');
+    expect(queryByTestId('jsonpane-code-A · inbound')).toBeNull();
+    expect(getByTestId('deltas-panel')).toBeTruthy();
+
+    // The zoomed header's ⤢ restores the split layout.
+    fireEvent.click(getByTestId('deltas-zoom'));
+    expect(queryByTestId('zoom-region')).toBeNull();
+    await waitFor(() => expect(getByTestId('jsonpane-code-A · inbound')).toBeTruthy());
+  });
+
+  it('clicking the ACTIVE tab collapses the drawer to the bare strip; an inactive tab switches AND expands', async () => {
+    const { getByTestId, getByRole, queryByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('tabpanel-headers')).toBeTruthy());
+
+    fireEvent.click(getByRole('tab', { name: 'Headers' })); // active → collapse
+    expect(queryByTestId('tabpanel-headers')).toBeNull();
+    // The strip itself survives (never hidden entirely).
+    expect(getByRole('tablist')).toBeTruthy();
+    expect(getByTestId('detail-tabstrip').getAttribute('data-collapsed')).toBe('true');
+
+    fireEvent.click(getByRole('tab', { name: 'Timeline' })); // inactive → switch AND expand
+    expect(getByTestId('tabpanel-timeline')).toBeTruthy();
+    fireEvent.click(getByRole('tab', { name: 'Timeline' })); // active again → collapse
+    expect(queryByTestId('tabpanel-timeline')).toBeNull();
+    fireEvent.click(getByRole('tab', { name: 'Timeline' })); // active while collapsed → expand
+    expect(getByTestId('tabpanel-timeline')).toBeTruthy();
+  });
+
+  it('summary band collapses to the one-line strip (same formatted values) and persists across remount', async () => {
+    const first = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(first.getByTestId('usage-subcounts')).toBeTruthy());
+
+    fireEvent.click(first.getByTestId('summary-toggle'));
+    const line = first.getByTestId('summary-line');
+    // The one-liner reuses the SAME formatted values (upstream + model pair render verbatim).
+    expect(line.textContent).toContain('vllm-a');
+    expect(line.textContent).toContain('llama-3.1-70b');
+    expect(first.queryByTestId('usage-subcounts')).toBeNull(); // gauge/waterfall columns folded away
+
+    // Collapsed state persists (localStorage) across close/reopen.
+    first.unmount();
+    const second = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(second.getByTestId('summary-line')).toBeTruthy());
+    // Expand restores the full band.
+    fireEvent.click(second.getByTestId('summary-toggle'));
+    expect(second.getByTestId('usage-subcounts')).toBeTruthy();
+  });
+
+  it('deltas rail collapses to the vertical edge strip and re-expands on click', async () => {
+    const { getByTestId, queryByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    await waitFor(() => expect(getByTestId('deltas-panel')).toBeTruthy());
+
+    fireEvent.click(getByTestId('deltas-collapse-btn'));
+    expect(queryByTestId('deltas-panel')).toBeNull();
+    expect(getByTestId('deltas-strip')).toBeTruthy(); // the thin edge strip, never fully hidden
+
+    fireEvent.click(getByTestId('deltas-strip'));
+    expect(getByTestId('deltas-panel')).toBeTruthy();
   });
 });

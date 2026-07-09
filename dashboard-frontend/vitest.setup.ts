@@ -1,6 +1,21 @@
 import '@testing-library/jest-dom/vitest';
 
 /**
+ * jsdom has no `ResizeObserver`. react-resizable-panels (the FlowDetail splitters) constructs one
+ * at Group mount, and the react-virtual suites stub it per-file — provide the shared no-op here so
+ * any component containing a splitter or virtualizer can mount. Suites that need a specific
+ * implementation still override via `vi.stubGlobal` (`unstubAllGlobals` restores this one).
+ */
+if (typeof globalThis.ResizeObserver === 'undefined') {
+  class ResizeObserverStub {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  globalThis.ResizeObserver = ResizeObserverStub as unknown as typeof ResizeObserver;
+}
+
+/**
  * jsdom does not implement `window.matchMedia`. uPlot calls it at construction time
  * (`setPxRatio`), and `prefersReducedMotion()` consults it. Provide a benign default
  * (`matches: false`) so viz tests can construct uPlot; individual tests that need a specific

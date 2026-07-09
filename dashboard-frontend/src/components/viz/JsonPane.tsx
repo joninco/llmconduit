@@ -73,6 +73,11 @@ export interface JsonPaneProps {
   className?: string;
   scrollRef?: React.RefObject<HTMLDivElement>;
   onScroll?: React.UIEventHandler<HTMLDivElement>;
+  /** Focus-mode hook (inspector zoom): toggles this pane filling the whole main region. When
+   * provided, the header gets a ⤢ button and double-clicking the header surface triggers it. */
+  onZoom?: () => void;
+  /** Whether this pane is currently the zoomed (focus-mode) pane — flips the ⤢ affordance. */
+  zoomed?: boolean;
 }
 
 export function JsonPane({
@@ -85,6 +90,8 @@ export function JsonPane({
   className,
   scrollRef,
   onScroll,
+  onZoom,
+  zoomed = false,
 }: JsonPaneProps) {
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(() => new Set());
 
@@ -117,7 +124,19 @@ export function JsonPane({
 
   return (
     <div className={`flex min-h-0 flex-col ${className ?? ''}`} data-testid={`jsonpane-${label}`}>
-      <div className="flex items-center justify-between gap-2 border-b border-line bg-panel-raised px-3 py-1.5">
+      <div
+        className="flex items-center justify-between gap-2 border-b border-line bg-panel-raised px-3 py-1.5"
+        // Double-clicking the header surface zooms (focus mode) — but not double-clicks that
+        // landed on the fold/zoom buttons, whose own single-click actions must not also zoom.
+        onDoubleClick={
+          onZoom
+            ? (e) => {
+                if ((e.target as HTMLElement).closest('button')) return;
+                onZoom();
+              }
+            : undefined
+        }
+      >
         <span className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-[0.12em] text-text-muted">
           {label}
           {searching && (
@@ -129,16 +148,30 @@ export function JsonPane({
             </span>
           )}
         </span>
-        {hasValue && !searching && model.containerPaths.length > 0 && (
-          <button
-            type="button"
-            onClick={toggleAll}
-            className="rounded-sm px-1 font-mono text-[10px] uppercase tracking-wide text-text-muted transition-colors hover:text-accent"
-            data-testid={`jsonpane-foldall-${label}`}
-          >
-            {allCollapsed ? 'expand' : 'collapse'}
-          </button>
-        )}
+        <span className="flex items-center gap-1">
+          {hasValue && !searching && model.containerPaths.length > 0 && (
+            <button
+              type="button"
+              onClick={toggleAll}
+              className="rounded-sm px-1 font-mono text-[10px] uppercase tracking-wide text-text-muted transition-colors hover:text-accent"
+              data-testid={`jsonpane-foldall-${label}`}
+            >
+              {allCollapsed ? 'expand' : 'collapse'}
+            </button>
+          )}
+          {onZoom && (
+            <button
+              type="button"
+              onClick={onZoom}
+              aria-label={zoomed ? `restore pane ${label}` : `zoom pane ${label}`}
+              title={zoomed ? 'restore (Esc)' : 'zoom to fill the inspector'}
+              className="rounded-sm px-1 text-[11px] leading-none text-text-muted transition-colors hover:text-accent"
+              data-testid={`jsonpane-zoom-${label}`}
+            >
+              ⤢
+            </button>
+          )}
+        </span>
       </div>
       <div
         ref={scrollRef}

@@ -537,6 +537,66 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on the control-room overview').toEqual([]);
   });
 
+  // Adjustable FlowDetail sections: draggable splitters (persisted via localStorage), the three
+  // collapse-to-strip surfaces, and per-pane zoom with the Esc PRECEDENCE contract (first Esc
+  // restores zoom, second dismisses — with NO zoom the first Esc still dismisses, which every
+  // other test's `dismissDetail` helper keeps exercising).
+  test('flow detail: splitter resize persists, collapse-to-strip, zoom + Esc precedence', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[0]!); // Flows
+    await page.waitForTimeout(400);
+    await page.getByTestId('flow-row').filter({ hasText: 'api_001' }).first().click();
+    await expect(page.getByTestId('flow-detail')).toBeVisible();
+
+    // 1 — drag the panes|rail splitter left: the deltas rail widens, and the layout persists.
+    const railBefore = (await page.getByTestId('detail-rail').boundingBox())!;
+    const sep = (await page.getByTestId('split-rail').boundingBox())!;
+    await page.mouse.move(sep.x + sep.width / 2, sep.y + sep.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(sep.x - 150, sep.y + sep.height / 2, { steps: 8 });
+    await page.mouse.up();
+    const railAfter = (await page.getByTestId('detail-rail').boundingBox())!;
+    expect(railAfter.width, 'rail widened by the drag').toBeGreaterThan(railBefore.width + 100);
+    const savedKeys = await page.evaluate(() => Object.keys(localStorage).filter((k) => k.includes('argus-flowdetail')));
+    expect(savedKeys.length, 'splitter layout persisted under argus-flowdetail keys').toBeGreaterThan(0);
+
+    // 2 — drawer: clicking the ACTIVE tab collapses to the bare strip; an inactive tab switches
+    // AND expands (the DevTools console-drawer gesture).
+    await expect(page.getByTestId('tabpanel-headers')).toBeVisible();
+    await page.getByRole('tab', { name: 'Headers' }).click(); // active → collapse
+    await expect(page.getByTestId('tabpanel-headers')).toHaveCount(0);
+    await expect(page.getByRole('tablist')).toBeVisible(); // the strip survives
+    await page.getByRole('tab', { name: 'Timeline' }).click(); // inactive → switch + expand
+    await expect(page.getByTestId('tabpanel-timeline')).toBeVisible();
+
+    // 3 — deltas rail collapses to the rotated edge strip and re-expands on click.
+    await page.getByTestId('deltas-collapse-btn').click();
+    await expect(page.getByTestId('deltas-panel')).toHaveCount(0);
+    await page.getByTestId('deltas-strip').click();
+    await expect(page.getByTestId('deltas-panel')).toBeVisible();
+
+    // 4 — summary band collapses to the one-line strip (same formatted values inline).
+    await page.getByTestId('summary-toggle').click();
+    await expect(page.getByTestId('summary-line')).toBeVisible();
+    await expect(page.getByTestId('summary-line')).toContainText('vllm-a');
+    await page.getByTestId('summary-toggle').click();
+    await expect(page.getByTestId('summary-line')).toHaveCount(0);
+
+    // 5 — zoom pane C: it fills the main region (A/B unmount); FIRST Esc restores the zoom
+    // (drill-down stays open), SECOND Esc dismisses the drill-down.
+    await page.getByTestId('jsonpane-zoom-C · upstream').click();
+    await expect(page.getByTestId('zoom-region')).toHaveAttribute('data-zoom', 'C');
+    await expect(page.getByTestId('jsonpane-code-A · inbound')).toHaveCount(0);
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('zoom-region')).toHaveCount(0);
+    await expect(page.getByTestId('flow-detail')).toBeVisible(); // NOT dismissed by the first Esc
+    await expect(page.getByTestId('jsonpane-code-A · inbound')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('flow-detail')).toHaveCount(0); // second Esc dismisses
+
+    expect(consoleErrors, 'console errors on adjustable sections').toEqual([]);
+  });
+
   for (const view of VIEWS) {
     test(`${view.name}: renders + no console errors + matches baseline`, async ({ page, consoleErrors }) => {
       await login(page);

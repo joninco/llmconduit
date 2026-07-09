@@ -21,8 +21,9 @@
  * pane's "body evicted" placeholder. Kill POSTs with CSRF, optimistically flips the row, and
  * shows a distinct state on 403.
  */
-import { useMemo, useState } from 'react';
-import type { CostConfidence, FlowDetail as FlowDetailDto, FlowSummary, Usage } from '../../api/types';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from 'react-resizable-panels';
+import type { CostConfidence, DebugSegment, FlowDetail as FlowDetailDto, FlowSummary, Usage } from '../../api/types';
 import { useDashboard } from '../../store/hooks';
 import { Button } from '../ui/Button';
 import { StatusChip } from '../FlowTable/StatusChip';
@@ -46,9 +47,21 @@ import { DeltasPanel } from './DeltasPanel';
 import { Timeline } from './Timeline';
 import { useScrollSync } from './useScrollSync';
 import { useFlowDetail, type KillState } from './useFlowDetail';
+import { usePersistedFlag } from './layoutPrefs';
 import { cn } from '../../lib/cn';
 
 type Tab = 'headers' | 'timeline' | 'error';
+
+/** Focus-mode target: one of the three JSON layers, or the deltas rail. */
+type ZoomTarget = 'A' | 'B' | 'C' | 'deltas';
+
+/**
+ * Splitter visuals: a thin `border-line`-colored strip with an accent on hover/keyboard focus.
+ * The library expands the pointer hit-target well beyond the 1px visual, owns the resize cursor
+ * and arrow-key resizing, and double-click resets the neighboring panel to its default size.
+ */
+const SPLIT_V = 'w-px bg-line outline-none transition-colors hover:bg-accent/70 focus-visible:bg-accent';
+const SPLIT_H = 'h-px bg-line outline-none transition-colors hover:bg-accent/70 focus-visible:bg-accent';
 
 export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose: () => void }) {
   const { detail, frozenDetail, liveFlow, status, seeking, seekMonitorSeq, seekAtMs, mutationsEnabled, kill, killState } =
@@ -62,6 +75,76 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   // Shared search across all three layers (A inbound · B normalized · C upstream) — find a field
   // once and see how it transformed. Each JsonPane filters to matches + their ancestors.
   const [query, setQuery] = useState('');
+
+  // ── Adjustable sections ──────────────────────────────────────────────────────────────────
+  // Focus mode (zoom): one layer (A/B/C/deltas) fills the whole main region. NOT persisted — a
+  // reopened drill-down always starts un-zoomed (FlowsView keys this component by id, so a row
+  // switch also resets it).
+  const [zoom, setZoom] = useState<ZoomTarget | null>(null);
+  // Collapse-to-strip flags — persisted so the operator's arrangement survives close/reopen.
+  const [summaryCollapsed, setSummaryCollapsed] = usePersistedFlag('summary-collapsed', false);
+  const [drawerCollapsed, setDrawerCollapsed] = usePersistedFlag('drawer-collapsed', false);
+  const [railCollapsed, setRailCollapsed] = usePersistedFlag('rail-collapsed', false);
+  const railRef = usePanelRef();
+  // Mirror for the drag-snap sync below (onResize fires per pointer move — only write on change).
+  const railCollapsedRef = useRef(railCollapsed);
+  railCollapsedRef.current = railCollapsed;
+
+  // Splitter sizes persist via react-resizable-panels' own storage hook (localStorage keys
+  // `react-resizable-panels:argus-flowdetail-*`). `panelIds` keys the vertical layout per panel
+  // set, so the drawer-collapsed arrangement doesn't clobber the expanded one.
+  const vsplit = useDefaultLayout({
+    id: 'argus-flowdetail-vsplit',
+    panelIds: drawerCollapsed ? ['detail-main'] : ['detail-main', 'detail-drawer'],
+  });
+  const hsplit = useDefaultLayout({ id: 'argus-flowdetail-hsplit', panelIds: ['detail-panes', 'detail-rail'] });
+  const abc = useDefaultLayout({ id: 'argus-flowdetail-abc', panelIds: ['pane-a', 'pane-b', 'pane-c'] });
+
+  // Esc PRECEDENCE: the FIRST Esc restores an active zoom; only the SECOND dismisses the
+  // drill-down. The dismiss lives in FlowsView's bubble-phase window keydown — this CAPTURE-phase
+  // listener runs first and swallows the event ONLY while a zoom is active, so with no zoom the
+  // first Esc still dismisses (the e2e `dismissDetail` helper depends on that).
+  useEffect(() => {
+    if (!zoom) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopPropagation();
+      setZoom(null);
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [zoom]);
+
+  // DevTools console-drawer gesture: clicking the ACTIVE tab toggles the drawer collapsed;
+  // clicking an inactive tab switches AND expands.
+  const onTabClick = useCallback(
+    (t: Tab) => {
+      if (t === tab && !drawerCollapsed) {
+        setDrawerCollapsed(true);
+        return;
+      }
+      setTab(t);
+      if (drawerCollapsed) setDrawerCollapsed(false);
+    },
+    [tab, drawerCollapsed, setDrawerCollapsed],
+  );
+
+  // Deltas-rail collapse: the Panel is `collapsible` (dragging under minSize snaps to the 24px
+  // edge strip); the header/strip buttons drive the imperative API; `onResize` mirrors a
+  // drag-snap back into the persisted flag.
+  const onRailResize = useCallback(() => {
+    const c = railRef.current?.isCollapsed() ?? false;
+    if (c !== railCollapsedRef.current) setRailCollapsed(c);
+  }, [railRef, setRailCollapsed]);
+  const collapseRail = useCallback(() => {
+    setRailCollapsed(true);
+    railRef.current?.collapse();
+  }, [railRef, setRailCollapsed]);
+  const expandRail = useCallback(() => {
+    setRailCollapsed(false);
+    railRef.current?.expand();
+  }, [railRef, setRailCollapsed]);
 
   // The flow's response_id (engine id) joins the monitor ring to this flow. While seeking we read
   // it from the FROZEN row (not the live REST detail, which is withheld from non-body surfaces).
@@ -225,6 +308,16 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
     [liveFlow?.attempts, frozenDetail?.attempts],
   );
 
+  // One source of truth for the three layers, so the zoomed render and the 3-pane row feed the
+  // SAME props into JsonPane (search + per-layer diff tint keep applying in focus mode), and the
+  // scroll-sync ref indices stay stable whether or not the siblings are mounted.
+  const panes = [
+    { key: 'A' as const, label: 'A · inbound', value: detail?.inbound_body, diff: diffAB, side: 'left' as const, index: 0 },
+    { key: 'B' as const, label: 'B · normalized', value: detail?.normalized, diff: diffBMiddle, side: 'both' as const, index: 1 },
+    { key: 'C' as const, label: 'C · upstream', value: detail?.upstream_body, diff: diffBC, side: 'right' as const, index: 2 },
+  ];
+  const zoomedPane = zoom && zoom !== 'deltas' ? panes.find((p) => p.key === zoom) ?? null : null;
+
   return (
     <section className="flex min-h-0 min-w-0 flex-1 flex-col bg-panel" data-testid="flow-detail" aria-label="flow detail">
       <TopBar
@@ -250,73 +343,228 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         attempts={attempts}
         seeking={seeking}
         seekAtMs={seekAtMs}
+        collapsed={summaryCollapsed}
+        onToggle={() => setSummaryCollapsed(!summaryCollapsed)}
       />
 
-      {/* Main row: the transformation panes (search + A→B→C) with the live deltas rail. */}
-      <div className="flex min-h-0 min-w-0 flex-1">
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <SearchBar value={query} onChange={setQuery} />
+      {/* Main region over the bottom tab drawer — a vertical splitter; the drawer collapses to
+          the bare tab strip (rendered below the group), never hides entirely. */}
+      <Group
+        orientation="vertical"
+        id="flowdetail-vsplit"
+        className="min-h-0 min-w-0 flex-1"
+        defaultLayout={vsplit.defaultLayout}
+        onLayoutChanged={vsplit.onLayoutChanged}
+      >
+        <Panel id="detail-main" minSize="35%" className="flex min-h-0 min-w-0 flex-col" style={{ overflow: 'hidden' }}>
+          {zoom ? (
+            /* FOCUS MODE — the zoomed layer fills the whole main region; the others unmount
+               (useScrollSync tolerates unmounted sibling refs). Esc or ⤢ restores. */
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col" data-testid="zoom-region" data-zoom={zoom}>
+              {zoomedPane ? (
+                <>
+                  <SearchBar value={query} onChange={setQuery} />
+                  <JsonPane
+                    label={zoomedPane.label}
+                    value={zoomedPane.value}
+                    diff={zoomedPane.diff}
+                    side={zoomedPane.side}
+                    query={query}
+                    emptyLabel={emptyBodyLabel(seeking)}
+                    scrollRef={sync.refFor(zoomedPane.index)}
+                    onScroll={sync.bind(zoomedPane.index)}
+                    onZoom={() => setZoom(null)}
+                    zoomed
+                    className="min-h-0 flex-1"
+                  />
+                </>
+              ) : (
+                <DeltasRail segments={segments} zoomed onZoom={() => setZoom(null)} />
+              )}
+            </div>
+          ) : (
+            /* Panes column | deltas rail — a horizontal splitter; the rail collapses to a thin
+               edge strip (24px), never hides entirely. */
+            <Group
+              orientation="horizontal"
+              id="flowdetail-hsplit"
+              className="min-h-0 min-w-0 flex-1"
+              defaultLayout={hsplit.defaultLayout}
+              onLayoutChanged={hsplit.onLayoutChanged}
+            >
+              <Panel id="detail-panes" minSize="30%" className="flex min-h-0 min-w-0 flex-col" style={{ overflow: 'hidden' }}>
+                <SearchBar value={query} onChange={setQuery} />
+                {/* 3 scroll-synced panes with their own splitters (widen one layer as needed). */}
+                <Group
+                  orientation="horizontal"
+                  id="pane-row"
+                  className="min-h-0 min-w-0 flex-1"
+                  defaultLayout={abc.defaultLayout}
+                  onLayoutChanged={abc.onLayoutChanged}
+                >
+                  {panes.map((p, i) => (
+                    <Fragment key={p.key}>
+                      {i > 0 && (
+                        <Separator
+                          id={`split-${panes[i - 1]!.key.toLowerCase()}${p.key.toLowerCase()}`}
+                          className={SPLIT_V}
+                        />
+                      )}
+                      <Panel
+                        id={`pane-${p.key.toLowerCase()}`}
+                        minSize="12%"
+                        className="flex min-h-0 min-w-0 flex-col"
+                        style={{ overflow: 'hidden' }}
+                      >
+                        <JsonPane
+                          label={p.label}
+                          value={p.value}
+                          diff={p.diff}
+                          side={p.side}
+                          query={query}
+                          emptyLabel={emptyBodyLabel(seeking)}
+                          scrollRef={sync.refFor(p.index)}
+                          onScroll={sync.bind(p.index)}
+                          onZoom={() => setZoom(p.key)}
+                          className="min-h-0 flex-1"
+                        />
+                      </Panel>
+                    </Fragment>
+                  ))}
+                </Group>
+              </Panel>
+              <Separator id="split-rail" className={SPLIT_V} />
+              <Panel
+                id="detail-rail"
+                collapsible
+                collapsedSize={24}
+                minSize="12%"
+                defaultSize="22%"
+                maxSize="45%"
+                panelRef={railRef}
+                onResize={onRailResize}
+                className="flex min-h-0 min-w-0 flex-col"
+                style={{ overflow: 'hidden' }}
+              >
+                {railCollapsed ? (
+                  <button
+                    type="button"
+                    onClick={expandRail}
+                    aria-label="expand deltas rail"
+                    data-testid="deltas-strip"
+                    className="flex h-full w-full items-start justify-center border-l border-line bg-panel-raised/60 py-2 text-[10px] uppercase tracking-wide text-text-muted transition-colors hover:text-accent"
+                  >
+                    <span style={{ writingMode: 'vertical-rl' }}>deltas</span>
+                  </button>
+                ) : (
+                  <DeltasRail segments={segments} onZoom={() => setZoom('deltas')} onCollapse={collapseRail} />
+                )}
+              </Panel>
+            </Group>
+          )}
+        </Panel>
 
-          {/* 3 scroll-synced panes — full remaining width/height. */}
-          <div className="grid min-h-0 flex-1 grid-cols-3 divide-x divide-line" data-testid="pane-row">
-            <JsonPane
-              label="A · inbound"
-              value={detail?.inbound_body}
-              diff={diffAB}
-              side="left"
-              query={query}
-              emptyLabel={emptyBodyLabel(seeking)}
-              scrollRef={sync.refFor(0)}
-              onScroll={sync.bind(0)}
-            />
-            <JsonPane
-              label="B · normalized"
-              value={detail?.normalized}
-              diff={diffBMiddle}
-              side="both"
-              query={query}
-              emptyLabel={emptyBodyLabel(seeking)}
-              scrollRef={sync.refFor(1)}
-              onScroll={sync.bind(1)}
-            />
-            <JsonPane
-              label="C · upstream"
-              value={detail?.upstream_body}
-              diff={diffBC}
-              side="right"
-              query={query}
-              emptyLabel={emptyBodyLabel(seeking)}
-              scrollRef={sync.refFor(2)}
-              onScroll={sync.bind(2)}
-            />
-          </div>
-        </div>
-
-        {/* Deltas rail — the live segment stream, full height beside the panes. */}
-        <aside className="flex min-h-0 w-80 shrink-0 flex-col border-l border-line xl:w-96">
-          <div className="shrink-0 border-b border-line bg-panel-raised px-3 py-1 text-[10px] uppercase tracking-wide text-text-muted">
-            deltas
-          </div>
-          <div className="min-h-0 flex-1 overflow-auto">
-            <DeltasPanel segments={segments} />
-          </div>
-        </aside>
-      </div>
-
-      {/* tabs */}
-      <div className="flex shrink-0 items-center gap-1 border-y border-line bg-panel-raised px-2 py-1" role="tablist">
-        <TabButton id="headers" active={tab} onClick={setTab}>Headers</TabButton>
-        <TabButton id="timeline" active={tab} onClick={setTab}>Timeline</TabButton>
-        <TabButton id="error" active={tab} onClick={setTab}>Error</TabButton>
-      </div>
-      <div className="max-h-56 min-h-[3rem] shrink-0 overflow-auto" role="tabpanel" data-testid={`tabpanel-${tab}`}>
-        {/* Headers + Error read the FROZEN detail (null while seeking) so no live/post-cut metadata
-            leaks; Timeline reads the cut-bounded monitor join (finding 1). */}
-        {tab === 'headers' && <HeadersTab headers={frozenDetail?.inbound_headers} />}
-        {tab === 'timeline' && <Timeline events={join.events} />}
-        {tab === 'error' && <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} seeking={seeking} />}
-      </div>
+        {!drawerCollapsed && <Separator id="split-drawer" className={SPLIT_H} />}
+        {!drawerCollapsed && (
+          <Panel
+            id="detail-drawer"
+            defaultSize="25%"
+            minSize="10%"
+            maxSize="60%"
+            className="flex min-h-0 min-w-0 flex-col"
+            style={{ overflow: 'hidden' }}
+          >
+            <TabStrip tab={tab} collapsed={false} onTabClick={onTabClick} />
+            <div className="min-h-0 flex-1 overflow-auto" role="tabpanel" data-testid={`tabpanel-${tab}`}>
+              {/* Headers + Error read the FROZEN detail (null while seeking) so no live/post-cut
+                  metadata leaks; Timeline reads the cut-bounded monitor join (finding 1). */}
+              {tab === 'headers' && <HeadersTab headers={frozenDetail?.inbound_headers} />}
+              {tab === 'timeline' && <Timeline events={join.events} />}
+              {tab === 'error' && <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} seeking={seeking} />}
+            </div>
+          </Panel>
+        )}
+      </Group>
+      {/* Collapsed drawer ⇒ the bare tab strip (clicking a tab re-expands). */}
+      {drawerCollapsed && <TabStrip tab={tab} collapsed onTabClick={onTabClick} />}
     </section>
+  );
+}
+
+/** The Headers/Timeline/Error tab strip. Rendered inside the drawer panel when expanded, or as
+ * the bare strip below the split group when the drawer is collapsed (strip-only, never hidden). */
+function TabStrip({ tab, collapsed, onTabClick }: { tab: Tab; collapsed: boolean; onTabClick: (t: Tab) => void }) {
+  return (
+    <div
+      className="flex shrink-0 items-center gap-1 border-y border-line bg-panel-raised px-2 py-1"
+      role="tablist"
+      data-testid="detail-tabstrip"
+      data-collapsed={collapsed ? 'true' : 'false'}
+    >
+      <TabButton id="headers" active={tab} onClick={onTabClick}>Headers</TabButton>
+      <TabButton id="timeline" active={tab} onClick={onTabClick}>Timeline</TabButton>
+      <TabButton id="error" active={tab} onClick={onTabClick}>Error</TabButton>
+      <span className="ml-auto hidden text-[9px] uppercase tracking-wide text-text-muted sm:inline">
+        {collapsed ? 'click a tab to expand' : 'click the active tab to collapse'}
+      </span>
+    </div>
+  );
+}
+
+/** The deltas rail: header (zoom / collapse controls) + the live segment stream. Fills the rail
+ * panel, or the whole main region when zoomed (focus mode). */
+function DeltasRail({
+  segments,
+  zoomed = false,
+  onZoom,
+  onCollapse,
+}: {
+  segments: DebugSegment[];
+  zoomed?: boolean;
+  onZoom: () => void;
+  onCollapse?: () => void;
+}) {
+  return (
+    <div className={cn('flex min-h-0 min-w-0 flex-1 flex-col', !zoomed && 'border-l border-line')} data-testid="deltas-rail">
+      <div
+        className="flex shrink-0 items-center justify-between border-b border-line bg-panel-raised px-3 py-1"
+        // Double-clicking the header surface zooms — but not double-clicks landing on the
+        // zoom/collapse buttons, whose single-click actions must not also toggle zoom.
+        onDoubleClick={(e) => {
+          if ((e.target as HTMLElement).closest('button')) return;
+          onZoom();
+        }}
+      >
+        <span className="text-[10px] uppercase tracking-wide text-text-muted">deltas</span>
+        <span className="flex items-center gap-1">
+          <button
+            type="button"
+            onClick={onZoom}
+            aria-label={zoomed ? 'restore deltas rail' : 'zoom deltas rail'}
+            title={zoomed ? 'restore (Esc)' : 'zoom to fill the inspector'}
+            className="rounded-sm px-1 text-[11px] leading-none text-text-muted transition-colors hover:text-accent"
+            data-testid="deltas-zoom"
+          >
+            ⤢
+          </button>
+          {onCollapse && (
+            <button
+              type="button"
+              onClick={onCollapse}
+              aria-label="collapse deltas rail"
+              title="collapse to edge strip"
+              className="rounded-sm px-1 text-[11px] leading-none text-text-muted transition-colors hover:text-accent"
+              data-testid="deltas-collapse-btn"
+            >
+              ⇥
+            </button>
+          )}
+        </span>
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto">
+        <DeltasPanel segments={segments} />
+      </div>
+    </div>
   );
 }
 
@@ -454,6 +702,8 @@ function SummaryBand({
   attempts,
   seeking,
   seekAtMs,
+  collapsed,
+  onToggle,
 }: {
   flow: FlowSummary | null;
   detail: FlowDetailDto | null;
@@ -466,6 +716,8 @@ function SummaryBand({
   attempts: AttemptTraceModel;
   seeking: boolean;
   seekAtMs: number | null;
+  collapsed: boolean;
+  onToggle: () => void;
 }) {
   // Gap 07: render the dollar STRING + the `estimated` flag together via the shared contract, so an
   // `unavailable` cost reads `—` (never `$0.00`) even if a stray number rode with the tag, and an
@@ -484,8 +736,45 @@ function SummaryBand({
     ? elapsedMs(flow, seeking ? seekAtMs ?? flow.started_ms : Date.now())
     : (seeking ? null : detail?.elapsed_ms ?? null);
 
+  const chevron = (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-expanded={!collapsed}
+      aria-label={collapsed ? 'expand summary' : 'collapse summary'}
+      data-testid="summary-toggle"
+      className="shrink-0 self-start rounded-sm px-1 py-0.5 text-[10px] text-text-muted transition-colors hover:text-accent"
+    >
+      {collapsed ? '▸' : '▾'}
+    </button>
+  );
+
+  if (collapsed) {
+    // Collapsed-to-strip: ONE line — model · upstream · cost · elapsed — built from the SAME
+    // formatted values the full band renders (nothing re-derived), so collapsing never changes
+    // a figure or its confidence tag.
+    return (
+      <div
+        className="flex shrink-0 items-center gap-2 overflow-hidden border-b border-line bg-panel-raised/60 px-3 py-1 text-xs"
+        data-testid="summary-line"
+      >
+        {chevron}
+        <span className="truncate font-mono text-text">{fmtModelPair(modelReq, modelServed)}</span>
+        <span className="shrink-0 text-line">·</span>
+        <span className="truncate font-mono text-text">{upstream}</span>
+        <span className="shrink-0 text-line">·</span>
+        <span className="shrink-0 tabular-nums text-text">
+          <CostCell costView={costView} />
+        </span>
+        <span className="shrink-0 text-line">·</span>
+        <span className="shrink-0 tabular-nums text-text">{fmtElapsed(elapsed)}</span>
+      </div>
+    );
+  }
+
   return (
     <div className="flex shrink-0 flex-wrap gap-x-8 gap-y-2 border-b border-line bg-panel-raised/60 px-3 py-2">
+      {chevron}
       {/* Identity + cost + token facts. */}
       <dl className="grid shrink-0 grid-cols-[auto_1fr] content-start gap-x-3 gap-y-0.5 text-xs">
         <dt className="text-text-muted">model</dt>
@@ -494,20 +783,7 @@ function SummaryBand({
         <dd className="font-mono text-text">{upstream}</dd>
         <dt className="text-text-muted">cost / elapsed</dt>
         <dd className="tabular-nums text-text">
-          <span className="text-meta" data-testid="detail-cost" data-confidence={costView.confidence}>{costView.value}</span>
-          {/* Gap 07: an `estimated` cost MUST be labelled (the cross-cutting rule) — a small
-              tag so an operator never mistakes a best-effort figure for a confident one. An
-              `unavailable` cost already reads as `—`; `confident` needs no badge. */}
-          {costView.estimated && (
-            <span
-              className="ml-1.5 rounded-sm bg-status-cooling/15 px-1 py-0.5 text-[10px] uppercase tracking-wide text-status-cooling"
-              data-testid="cost-confidence"
-              data-confidence="estimated"
-              title="cost is an estimate — a billed token class has no configured rate"
-            >
-              est
-            </span>
-          )}
+          <CostCell costView={costView} />
           <span className="text-line"> · </span>
           {fmtElapsed(elapsed)}
         </dd>
@@ -588,6 +864,29 @@ function SummaryBand({
         </dl>
       )}
     </div>
+  );
+}
+
+/** The cost value + its confidence badge — ONE renderer, so the collapsed one-liner and the full
+ * band show the IDENTICAL formatted pair (gap 07: the value and its tag must never desync). */
+function CostCell({ costView }: { costView: ReturnType<typeof costDisplay> }) {
+  return (
+    <>
+      <span className="text-meta" data-testid="detail-cost" data-confidence={costView.confidence}>{costView.value}</span>
+      {/* Gap 07: an `estimated` cost MUST be labelled (the cross-cutting rule) — a small
+          tag so an operator never mistakes a best-effort figure for a confident one. An
+          `unavailable` cost already reads as `—`; `confident` needs no badge. */}
+      {costView.estimated && (
+        <span
+          className="ml-1.5 rounded-sm bg-status-cooling/15 px-1 py-0.5 text-[10px] uppercase tracking-wide text-status-cooling"
+          data-testid="cost-confidence"
+          data-confidence="estimated"
+          title="cost is an estimate — a billed token class has no configured rate"
+        >
+          est
+        </span>
+      )}
+    </>
   );
 }
 
