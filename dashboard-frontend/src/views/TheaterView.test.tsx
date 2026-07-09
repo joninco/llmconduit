@@ -55,11 +55,32 @@ describe('River — renders output/reasoning/tool deltas with tok/s + cursor', (
     expect(getByTestId('river-tps').textContent).toMatch(/[\d.]+ tok\/s/);
     // Tool card rendered.
     expect(within(getByTestId('river-tools')).getByText('search()')).not.toBeNull();
-    // Reasoning collapsed by default, revealed on toggle.
-    expect(queryByTestId('river-reasoning')).toBeNull();
-    fireEvent.click(getByTestId('river-reasoning-toggle'));
+    // Reasoning EXPANDED by default (it streams first), collapsible via the toggle.
     expect(getByTestId('river-reasoning').textContent).toBe('because');
+    fireEvent.click(getByTestId('river-reasoning-toggle'));
+    expect(queryByTestId('river-reasoning')).toBeNull();
     void container;
+  });
+
+  it('renders reasoning ABOVE the output (it streams first)', () => {
+    const [river] = buildRivers([
+      upsert('r1', 'gpt-4o'),
+      seg('r1', 'reasoning', 'thinking first', 1000),
+      seg('r1', 'output', 'answer after', 1100),
+    ]);
+    const { getByTestId } = render(<River river={river!} />);
+    const reasoning = getByTestId('river-reasoning');
+    const output = getByTestId('river-output');
+    // The reasoning node precedes the output node in document order.
+    expect(reasoning.compareDocumentPosition(output) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('shows the explicit trimmed marker only when a memory cap head-trimmed the river', () => {
+    const [river] = buildRivers([upsert('r1', 'm'), seg('r1', 'output', 'hi', 1000)]);
+    const { queryByTestId, rerender } = render(<River river={river!} />);
+    expect(queryByTestId('river-truncated')).toBeNull();
+    rerender(<River river={{ ...river!, truncated: true }} />);
+    expect(queryByTestId('river-truncated')).not.toBeNull();
   });
 
   it('a completed river shows NO cursor', () => {
@@ -100,6 +121,30 @@ describe('TheaterView — live rivers from segment_append, auto-grid, fullscreen
     expect(view.getAttribute('data-fullscreen')).toBeNull();
     fireEvent.click(getByTestId('theater-fullscreen-toggle'));
     expect(getByTestId('theater-view').getAttribute('data-fullscreen')).toBe('true');
+  });
+
+  it('keeps the FULL stream text past the monitor ring cap — no tokens deleted from the top', () => {
+    // 600 segments blow past MONITOR_RING_CAP (500). The old ring-rebuild lost the head (the
+    // theater visibly deleted tokens from the top); the incremental fold keeps everything.
+    const { getByTestId } = render(<TheaterView />);
+    const msgs: DebugWsMessage[] = [upsert('r1', 'gpt-4o')];
+    for (let i = 0; i < 600; i++) msgs.push(seg('r1', 'output', `w${i} `, 1000 + i));
+    pushMonitor(msgs);
+    const text = getByTestId('river-output').textContent ?? '';
+    expect(text).toContain('w0 '); // the head survives eviction
+    expect(text).toContain('w599 '); // the tail is appended
+    expect(dashboardStore.getState().monitor.length).toBeLessThanOrEqual(500); // ring still capped
+    // No cap was hit — the honest trimmed marker must NOT show.
+    expect(getByTestId('river-body').querySelector('[data-testid="river-truncated"]')).toBeNull();
+  });
+
+  it('reasoning that streamed BEFORE ring eviction still renders (it is not lost to the ring)', () => {
+    const { getByTestId } = render(<TheaterView />);
+    const msgs: DebugWsMessage[] = [upsert('r1', 'gpt-4o'), seg('r1', 'reasoning', 'the plan', 999)];
+    // 550 output segments push the reasoning segment out of the ring.
+    for (let i = 0; i < 550; i++) msgs.push(seg('r1', 'output', 'x', 1000 + i));
+    pushMonitor(msgs);
+    expect(getByTestId('river-reasoning').textContent).toBe('the plan');
   });
 
   it('empty monitor → an explicit empty state, no grid', () => {

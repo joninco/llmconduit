@@ -63,11 +63,11 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
   });
 
   it('applies ALL sibling messages in a multi-message Monitor frame (none dropped by dedup)', () => {
-    const frame = buildMonitorFrame(6, 'resp_X'); // 4 sibling DebugWsMessages under one seq
-    expect(frame.batch).toHaveLength(4);
+    const frame = buildMonitorFrame(6, 'resp_X'); // 5 sibling DebugWsMessages under one seq
+    expect(frame.batch).toHaveLength(5);
 
     expect(socket.applyFrame(frame)).toBe(true);
-    expect(dashboardStore.getState().monitor).toHaveLength(4);
+    expect(dashboardStore.getState().monitor).toHaveLength(5);
     expect(socket.getCursors().monitor).toBe(6);
   });
 
@@ -181,16 +181,16 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
 
   it('drops a stale frame WHOLESALE when seq <= last_seq[domain]', () => {
     socket.applyFrame(buildMonitorFrame(6));
-    expect(dashboardStore.getState().monitor).toHaveLength(4);
+    expect(dashboardStore.getState().monitor).toHaveLength(5);
 
     expect(socket.applyFrame(buildMonitorFrame(6))).toBe(false); // duplicate
-    expect(dashboardStore.getState().monitor).toHaveLength(4);
+    expect(dashboardStore.getState().monitor).toHaveLength(5);
 
     expect(socket.applyFrame(buildMonitorFrame(5))).toBe(false); // stale
-    expect(dashboardStore.getState().monitor).toHaveLength(4);
+    expect(dashboardStore.getState().monitor).toHaveLength(5);
 
     expect(socket.applyFrame(buildMonitorFrame(7))).toBe(true); // fresh
-    expect(dashboardStore.getState().monitor).toHaveLength(8);
+    expect(dashboardStore.getState().monitor).toHaveLength(10);
   });
 
   it('dedups PER DOMAIN — a stale monitor seq does not block a flow frame at the same number', () => {
@@ -742,7 +742,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
 
     socket.live();
     expect(socket.isPaused()).toBe(false);
-    expect(dashboardStore.getState().monitor).toHaveLength(8);
+    expect(dashboardStore.getState().monitor).toHaveLength(10);
     expect(socket.shadowBufferLength()).toBe(0);
   });
 
@@ -932,7 +932,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // D11 finding 1). Here we model the active-seek state explicitly so the staging assertions below
     // verify a reconnect leaves the frozen cut + 'seeking' connection intact.
     socket.applyFrame(buildMonitorFrame(6));
-    expect(dashboardStore.getState().monitor).toHaveLength(4);
+    expect(dashboardStore.getState().monitor).toHaveLength(5);
     socket.seek();
     expect(socket.isPaused()).toBe(true);
     dashboardStore.getState().enterSeek(Date.now());
@@ -947,7 +947,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     socket.handleParsed(reconnectSnap);
 
     // The frozen cut is INTACT: monitor still 4, connection still seeking, cursors unchanged.
-    expect(dashboardStore.getState().monitor).toHaveLength(4);
+    expect(dashboardStore.getState().monitor).toHaveLength(5);
     expect(dashboardStore.getState().connection).toBe('seeking');
     expect(socket.getCursors().monitor).toBe(6);
 

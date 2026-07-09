@@ -150,7 +150,7 @@ describe('useSankeyWindow — timestamped deltas, not cumulative totals (finding
         cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
         flows: new Map([['a', flow({ api_call_id: 'a', usage: usage({ prompt: 500, total: 500 }) })]]),
         flowOrder: ['a'], metrics: null, topologyNodes: [], topologyEdges: [], priceTable: {},
-        monitor: [], monitorSeqs: [],
+        monitor: [], monitorSeqs: [], riverFold: { rivers: new Map(), order: [] },
       });
     });
     // 'a' is unchanged across the round-trip → diffs to 0 → NO new band restamped (still just [500]).

@@ -309,6 +309,8 @@ export function buildMonitorFrame(seq = 6, responseId = 'resp_001'): DashboardFr
         error: null,
       },
     },
+    // Reasoning streams FIRST (the real backend order) — the theater renders it above the output.
+    { type: 'segment_append', response_id: responseId, segment: { timestamp_ms: now, kind: 'reasoning', text: 'Considering a greeting…' } },
     { type: 'segment_append', response_id: responseId, segment: { timestamp_ms: now, kind: 'output', text: 'Hello' } },
     { type: 'segment_append', response_id: responseId, segment: { timestamp_ms: now, kind: 'output', text: ', world' } },
     { type: 'request_status', response_id: responseId, status: 'completed', completed_at_ms: now, error: null },

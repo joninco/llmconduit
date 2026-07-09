@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { buildRivers, gridColumns } from './riverModel';
+import {
+  buildRivers,
+  createRiverFold,
+  finalizeRivers,
+  foldRiverMessage,
+  gridColumns,
+  MAX_RIVERS,
+  RIVER_CHANNEL_CHAR_CAP,
+} from './riverModel';
 import type { DebugWsMessage, DebugRequestStatus } from '../../api/types';
 
 function upsert(id: string, model: string, status: DebugRequestStatus = 'running'): DebugWsMessage {
@@ -127,6 +135,63 @@ describe('buildRivers — folds the monitor ring into per-stream rivers', () => 
   it('preserves first-seen order across multiple rivers', () => {
     const rivers = buildRivers([upsert('a', 'm'), upsert('b', 'm'), upsert('c', 'm')]);
     expect(rivers.map((r) => r.id)).toEqual(['a', 'b', 'c']);
+  });
+});
+
+describe('incremental fold — memory caps + immutability (theater ring-eviction fix)', () => {
+  it('folds one message at a time into the SAME rivers buildRivers produces', () => {
+    const msgs: DebugWsMessage[] = [
+      upsert('r1', 'gpt-4o'),
+      seg('r1', 'reasoning', 'why', 1000),
+      seg('r1', 'output', 'text', 1100),
+    ];
+    let fold = createRiverFold();
+    for (const m of msgs) fold = foldRiverMessage(fold, m);
+    expect(finalizeRivers(fold)).toEqual(buildRivers(msgs));
+  });
+
+  it('fold updates are immutable: a captured fold reference is frozen against later messages', () => {
+    let fold = createRiverFold();
+    fold = foldRiverMessage(fold, upsert('r1', 'm'));
+    fold = foldRiverMessage(fold, seg('r1', 'output', 'before', 1000));
+    const captured = { rivers: new Map(fold.rivers), order: [...fold.order] }; // the baseline copy
+    fold = foldRiverMessage(fold, seg('r1', 'output', ' after', 1100));
+    expect(finalizeRivers(captured)[0]?.output).toBe('before'); // capture unchanged
+    expect(finalizeRivers(fold)[0]?.output).toBe('before after');
+  });
+
+  it('non-river messages return the SAME fold reference (cheap no-change detection)', () => {
+    let fold = createRiverFold();
+    fold = foldRiverMessage(fold, upsert('r1', 'm'));
+    const next = foldRiverMessage(fold, { type: 'snapshot_done' });
+    expect(next).toBe(fold);
+  });
+
+  it('head-trims a channel past RIVER_CHANNEL_CHAR_CAP and flags `truncated` (honest cap, not silent)', () => {
+    let fold = createRiverFold();
+    fold = foldRiverMessage(fold, upsert('r1', 'm'));
+    fold = foldRiverMessage(fold, seg('r1', 'output', 'HEAD-'.repeat(1) + 'x'.repeat(RIVER_CHANNEL_CHAR_CAP - 5), 1000));
+    let [river] = finalizeRivers(fold);
+    expect(river?.truncated).toBe(false); // exactly at cap — untouched
+    fold = foldRiverMessage(fold, seg('r1', 'output', 'y'.repeat(10), 1100));
+    [river] = finalizeRivers(fold);
+    expect(river?.truncated).toBe(true);
+    expect(river?.output.length).toBeLessThanOrEqual(RIVER_CHANNEL_CHAR_CAP);
+    expect(river?.output.startsWith('HEAD-')).toBe(false); // trimmed from the TOP
+    expect(river?.output.endsWith('y'.repeat(10))).toBe(true); // tail intact
+  });
+
+  it('caps tracked rivers at MAX_RIVERS, evicting the oldest TERMINAL river first (never a running one)', () => {
+    let fold = createRiverFold();
+    for (let i = 0; i < MAX_RIVERS; i++) fold = foldRiverMessage(fold, upsert(`r${i}`, 'm'));
+    // r0 running, r1 completed → creating one more evicts r1 (oldest terminal), not r0.
+    fold = foldRiverMessage(fold, { type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: 2000, error: null });
+    fold = foldRiverMessage(fold, upsert('new', 'm'));
+    const ids = finalizeRivers(fold).map((r) => r.id);
+    expect(ids).toHaveLength(MAX_RIVERS);
+    expect(ids).toContain('r0');
+    expect(ids).toContain('new');
+    expect(ids).not.toContain('r1');
   });
 });
 

@@ -1,6 +1,6 @@
 /**
- * `useLingeringRivers` (D12, finding 4) — wraps `buildRivers` with the spec's "tiles linger-then-
- * fade" lifecycle. Without it a completed/failed river stays in the grid until the monitor EVICTS it
+ * `useLingeringRivers` (D12, finding 4) — wraps already-built rivers (from `useLiveRivers`, which
+ * reads the store's incremental fold) with the spec's "tiles linger-then-fade" lifecycle. Without it a completed/failed river stays in the grid until the monitor EVICTS it
  * (a `request_remove`, up to ~30 min later — D3 retention), so finished streams pile up looking
  * active. This hook instead, when a river goes terminal (completed/failed): keeps it for a SHORT
  * linger, then flips it to an `exiting` phase (the CSS exit fade), then REMOVES it from the rendered
@@ -23,8 +23,7 @@
  * filtered out entirely.
  */
 import { useEffect, useRef, useState } from 'react';
-import { buildRivers, type River } from './riverModel';
-import type { DebugWsMessage } from '../../api/types';
+import type { River } from './riverModel';
 
 /** A river plus its exit-phase flag (true once the linger elapsed and the fade is running). */
 export interface LingeringRiver extends River {
@@ -40,14 +39,12 @@ export const FADE_MS = 400;
 type Phase = 'visible' | 'exiting' | 'removed';
 
 export function useLingeringRivers(
-  monitor: DebugWsMessage[],
+  rivers: River[],
   opts: { lingerMs?: number; fadeMs?: number; now?: () => number } = {},
 ): LingeringRiver[] {
   const lingerMs = opts.lingerMs ?? LINGER_MS;
   const fadeMs = opts.fadeMs ?? FADE_MS;
   const now = opts.now ?? Date.now;
-
-  const rivers = buildRivers(monitor);
   // The per-river lifecycle signature (ids + their terminal instants) — the effect keys on THIS, not
   // the rivers array identity, so it re-runs when a river flips terminal / appears / is evicted, NOT
   // on every text delta. `rivers` is read inside the effect via a ref so it stays out of the dep array.

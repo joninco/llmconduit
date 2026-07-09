@@ -8,6 +8,7 @@
  */
 import { createStore } from 'zustand/vanilla';
 import { pickAttempts } from '../api/attempts';
+import { createRiverFold, foldRiverMessage, type RiverFold } from '../components/viz/riverModel';
 import type {
   FlowStatusPayload,
   FlowSummary,
@@ -40,6 +41,7 @@ export interface LiveBaseline {
   priceTable: TopologyResponse['price_table'];
   monitor: DebugWsMessage[];
   monitorSeqs: number[];
+  riverFold: RiverFold;
 }
 
 export interface DashboardState {
@@ -86,6 +88,15 @@ export interface DashboardState {
    * messages while seeking by dropping any whose stamp is `> seekMonitorSeq` (finding 1).
    */
   monitorSeqs: number[];
+  /**
+   * The theater's INCREMENTAL river fold, fed one message at a time by `pushMonitor` — NOT derived
+   * from the capped `monitor` ring. The ring evicts old `segment_append`s at `MONITOR_RING_CAP`, so
+   * rivers rebuilt from it lose their head on long streams (the theater visibly deleted tokens from
+   * the top, and reasoning — which streams first — vanished entirely). The fold keeps FULL stream
+   * text; its own caps in riverModel bound memory (per-channel head-trim + `truncated` flag,
+   * `MAX_RIVERS`). Captured/restored with the live baseline like the ring, cleared on reset.
+   */
+  riverFold: RiverFold;
 
   // -- mutations (called by the socket) --
   setConnection: (s: ConnectionState) => void;
@@ -190,6 +201,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
   priceTable: {},
   monitor: [],
   monitorSeqs: [],
+  riverFold: createRiverFold(),
 
   // Leaving 'seeking' (any non-seek state — typically 'live') DROPS the frozen cut so elapsed
   // resumes ticking and the monitor join unbounds. Entering 'seeking' directly via setConnection
@@ -260,6 +272,9 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       priceTable: { ...s.priceTable },
       monitor: [...s.monitor],
       monitorSeqs: [...s.monitorSeqs],
+      // Shallow copy is a real freeze: fold updates are immutable (fresh Map + fresh river object
+      // per applied message), so the captured Map's river objects can never mutate underneath.
+      riverFold: { rivers: new Map(s.riverFold.rivers), order: [...s.riverFold.order] },
     };
   },
 
@@ -284,6 +299,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       priceTable: { ...baseline.priceTable },
       monitor: [...baseline.monitor],
       monitorSeqs: [...baseline.monitorSeqs],
+      riverFold: { rivers: new Map(baseline.riverFold.rivers), order: [...baseline.riverFold.order] },
     })),
 
   applySnapshot: (snap) =>
@@ -461,7 +477,10 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       const drop = atCap ? s.monitor.length - MONITOR_RING_CAP + 1 : 0;
       const monitor = atCap ? [...s.monitor.slice(drop), msg] : [...s.monitor, msg];
       const monitorSeqs = atCap ? [...s.monitorSeqs.slice(drop), seq] : [...s.monitorSeqs, seq];
-      return { monitor, monitorSeqs };
+      // Fold the message into the theater's river accumulator at ARRIVAL (survives ring eviction —
+      // see the `riverFold` slice doc). Non-river messages return the same fold reference.
+      const riverFold = foldRiverMessage(s.riverFold, msg);
+      return { monitor, monitorSeqs, riverFold };
     }),
 
   reset: () =>
@@ -481,6 +500,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       priceTable: {},
       monitor: [],
       monitorSeqs: [],
+      riverFold: createRiverFold(),
     })),
 }));
 

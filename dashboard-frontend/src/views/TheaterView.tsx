@@ -1,7 +1,8 @@
 /**
  * TheaterView (D12) — the "wow": a fullscreen-capable dark grid of live "rivers", one per active
- * stream. Each river streams its output/reasoning/tool deltas (folded from the monitor ring's
- * `segment_append` messages), with a per-river tokens/sec meter + a blinking cursor. The grid
+ * stream. Each river streams its output/reasoning/tool deltas (from the store's incremental
+ * `riverFold`, fed per `segment_append` at arrival — ring-eviction-proof), with a per-river
+ * tokens/sec meter + a blinking cursor. The grid
  * auto-sizes: 1 river → big, 2 → split, 3-6 → a 3-wide multi-grid. A fullscreen toggle expands the
  * theater over the whole viewport.
  *
@@ -15,6 +16,7 @@ import { useMemo, useState } from 'react';
 import { River } from '../components/viz/River';
 import { gridColumns } from '../components/viz/riverModel';
 import { useLingeringRivers } from '../components/viz/useLingeringRivers';
+import { useLiveRivers } from '../components/viz/useLiveRivers';
 import { useDashboard } from '../store/hooks';
 import type { FlowSummary } from '../api/types';
 import { cn } from '../lib/cn';
@@ -24,13 +26,17 @@ export function TheaterView() {
   return seeking ? <HistoricalTheater /> : <LiveTheater />;
 }
 
-/** Live rivers from the monitor ring (one per `response_id`), auto-gridded, fullscreen-toggleable. */
+/**
+ * Live rivers (one per `response_id`), auto-gridded, fullscreen-toggleable. Rivers come from the
+ * store's INCREMENTAL fold (`useLiveRivers`), not a rebuild off the capped monitor ring — so a long
+ * stream keeps its full text (the ring's eviction used to visibly delete tokens from the top and
+ * drop the reasoning channel, which streams first).
+ */
 function LiveTheater() {
-  const monitor = useDashboard((s) => s.monitor);
   const [fullscreen, setFullscreen] = useState(false);
   // Terminated tiles linger-then-fade-then-remove (finding 4) rather than persisting until the
   // monitor evicts them; the hook owns the StrictMode-safe timers.
-  const rivers = useLingeringRivers(monitor);
+  const rivers = useLingeringRivers(useLiveRivers());
   const cols = gridColumns(rivers.length);
 
   return (
