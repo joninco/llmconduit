@@ -1,13 +1,18 @@
 /**
- * FlowDetail — the 3-pane transformation inspector (D10 flagship).
+ * FlowDetail — the FULL-WIDTH transformation drill-down (D10 flagship, reworked from the old
+ * 46%-side-panel squeeze). Mounted by FlowsView as a takeover of the whole view area; the
+ * selection lives in the hash (`#/flows/<id>`) so it is deep-linkable and Esc/←/browser-back
+ * dismiss it back to the table.
  *
  * Layout:
- *   ┌ header: id, models, status chip, kill button ─────────────────────────────┐
- *   ├ 3 scroll-synced JSON panes ───────────────────────────────────────────────┤
- *   │   A inbound body   →   B normalized Responses   →   C upstream chat body    │
- *   │   (diff A→B left)      (diff A→B right)              (diff B→C right)        │
- *   ├ tabs: Headers / Timeline / Error ─────────────────────────────────────────┤
- *   └ deltas sub-panel (segment_append: output/reasoning/tool cards) ────────────┘
+ *   ┌ top bar: ← flows · status chip · id · seek badge · kill · ✕ ───────────────────────────┐
+ *   ├ summary band: identity/cost/tokens dl │ context gauge + timing waterfall │ failover ────┤
+ *   ├ main row (flex-1) ───────────────────────────────────────────┬ deltas rail ────────────┤
+ *   │   search bar over 3 scroll-synced JSON panes                 │ live segment stream     │
+ *   │   A inbound  →  B normalized  →  C upstream                  │ (output/reasoning/tool) │
+ *   │   (diff A→B left)  (combined middle)  (diff B→C right)       │                         │
+ *   ├ tabs: Headers / Timeline / Error (full-width strip) ─────────┴─────────────────────────┤
+ *   └──────────────────────────────────────────────────────────────────────────────────────────┘
  *
  * The structural diff (./diff) tints each JSON PATH: B is tinted vs A (added/changed), C is
  * tinted vs B, and A surfaces what B removed. The panes scroll together (useScrollSync — the
@@ -221,9 +226,19 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   );
 
   return (
-    <section className="flex min-h-0 w-[46%] min-w-[420px] flex-col border-l border-line bg-panel" data-testid="flow-detail" aria-label="flow detail">
-      <DetailHeader
+    <section className="flex min-h-0 min-w-0 flex-1 flex-col bg-panel" data-testid="flow-detail" aria-label="flow detail">
+      <TopBar
         apiCallId={apiCallId}
+        flow={liveFlow}
+        detail={frozenDetail}
+        seeking={seeking}
+        isActive={isActive}
+        mutationsEnabled={mutationsEnabled}
+        killState={killState}
+        onKill={() => kill(apiCallId)}
+        onClose={onClose}
+      />
+      <SummaryBand
         flow={liveFlow}
         detail={frozenDetail}
         cost={cost}
@@ -235,47 +250,57 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         attempts={attempts}
         seeking={seeking}
         seekAtMs={seekAtMs}
-        isActive={isActive}
-        mutationsEnabled={mutationsEnabled}
-        killState={killState}
-        onKill={() => kill(apiCallId)}
-        onClose={onClose}
       />
 
-      <SearchBar value={query} onChange={setQuery} />
+      {/* Main row: the transformation panes (search + A→B→C) with the live deltas rail. */}
+      <div className="flex min-h-0 min-w-0 flex-1">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <SearchBar value={query} onChange={setQuery} />
 
-      {/* 3 scroll-synced panes */}
-      <div className="grid min-h-0 flex-1 grid-cols-3 divide-x divide-line" data-testid="pane-row">
-        <JsonPane
-          label="A · inbound"
-          value={detail?.inbound_body}
-          diff={diffAB}
-          side="left"
-          query={query}
-          emptyLabel={emptyBodyLabel(seeking)}
-          scrollRef={sync.refFor(0)}
-          onScroll={sync.bind(0)}
-        />
-        <JsonPane
-          label="B · normalized"
-          value={detail?.normalized}
-          diff={diffBMiddle}
-          side="both"
-          query={query}
-          emptyLabel={emptyBodyLabel(seeking)}
-          scrollRef={sync.refFor(1)}
-          onScroll={sync.bind(1)}
-        />
-        <JsonPane
-          label="C · upstream"
-          value={detail?.upstream_body}
-          diff={diffBC}
-          side="right"
-          query={query}
-          emptyLabel={emptyBodyLabel(seeking)}
-          scrollRef={sync.refFor(2)}
-          onScroll={sync.bind(2)}
-        />
+          {/* 3 scroll-synced panes — full remaining width/height. */}
+          <div className="grid min-h-0 flex-1 grid-cols-3 divide-x divide-line" data-testid="pane-row">
+            <JsonPane
+              label="A · inbound"
+              value={detail?.inbound_body}
+              diff={diffAB}
+              side="left"
+              query={query}
+              emptyLabel={emptyBodyLabel(seeking)}
+              scrollRef={sync.refFor(0)}
+              onScroll={sync.bind(0)}
+            />
+            <JsonPane
+              label="B · normalized"
+              value={detail?.normalized}
+              diff={diffBMiddle}
+              side="both"
+              query={query}
+              emptyLabel={emptyBodyLabel(seeking)}
+              scrollRef={sync.refFor(1)}
+              onScroll={sync.bind(1)}
+            />
+            <JsonPane
+              label="C · upstream"
+              value={detail?.upstream_body}
+              diff={diffBC}
+              side="right"
+              query={query}
+              emptyLabel={emptyBodyLabel(seeking)}
+              scrollRef={sync.refFor(2)}
+              onScroll={sync.bind(2)}
+            />
+          </div>
+        </div>
+
+        {/* Deltas rail — the live segment stream, full height beside the panes. */}
+        <aside className="flex min-h-0 w-80 shrink-0 flex-col border-l border-line xl:w-96">
+          <div className="shrink-0 border-b border-line bg-panel-raised px-3 py-1 text-[10px] uppercase tracking-wide text-text-muted">
+            deltas
+          </div>
+          <div className="min-h-0 flex-1 overflow-auto">
+            <DeltasPanel segments={segments} />
+          </div>
+        </aside>
       </div>
 
       {/* tabs */}
@@ -284,20 +309,12 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         <TabButton id="timeline" active={tab} onClick={setTab}>Timeline</TabButton>
         <TabButton id="error" active={tab} onClick={setTab}>Error</TabButton>
       </div>
-      <div className="max-h-44 min-h-[3rem] shrink-0 overflow-auto" role="tabpanel" data-testid={`tabpanel-${tab}`}>
+      <div className="max-h-56 min-h-[3rem] shrink-0 overflow-auto" role="tabpanel" data-testid={`tabpanel-${tab}`}>
         {/* Headers + Error read the FROZEN detail (null while seeking) so no live/post-cut metadata
             leaks; Timeline reads the cut-bounded monitor join (finding 1). */}
         {tab === 'headers' && <HeadersTab headers={frozenDetail?.inbound_headers} />}
         {tab === 'timeline' && <Timeline events={join.events} />}
         {tab === 'error' && <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} seeking={seeking} />}
-      </div>
-
-      {/* deltas sub-panel */}
-      <div className="flex max-h-52 shrink-0 flex-col overflow-auto border-t border-line">
-        <div className="sticky top-0 z-10 border-b border-line bg-panel-raised px-3 py-1 text-[10px] uppercase tracking-wide text-text-muted">
-          deltas
-        </div>
-        <DeltasPanel segments={segments} />
       </div>
     </section>
   );
@@ -354,8 +371,78 @@ function SearchBar({ value, onChange }: { value: string; onChange: (v: string) =
   );
 }
 
-function DetailHeader({
+/** The drill-down top bar: back-to-table, identity + status, seek badge, kill + close. */
+function TopBar({
   apiCallId,
+  flow,
+  detail,
+  seeking,
+  isActive,
+  mutationsEnabled,
+  killState,
+  onKill,
+  onClose,
+}: {
+  apiCallId: string;
+  flow: FlowSummary | null;
+  detail: FlowDetailDto | null;
+  seeking: boolean;
+  isActive: boolean;
+  mutationsEnabled: boolean;
+  killState: KillState;
+  onKill: () => void;
+  onClose: () => void;
+}) {
+  const status = flow?.status ?? detail?.status ?? 'open';
+  // The request line lives on the row (`FlowSummary`) only — `/flows/:id` does not carry it.
+  const method = flow?.method ?? '';
+  const uri = flow?.uri ?? '';
+  return (
+    <header className="flex shrink-0 items-center gap-3 border-b border-line bg-panel-raised px-3 py-2">
+      <button
+        type="button"
+        onClick={onClose}
+        aria-label="back to flows"
+        data-testid="detail-back"
+        className="flex items-center gap-1.5 rounded-md border border-line px-2 py-1 text-xs text-text-muted transition-colors hover:border-accent/50 hover:text-text"
+      >
+        <span aria-hidden="true">←</span> flows
+      </button>
+      <StatusChip status={status} terminalReason={flow?.terminal_reason ?? detail?.terminal_reason} />
+      <span className="font-mono text-sm text-text" title={apiCallId}>{apiCallId}</span>
+      {(method || uri) && (
+        <span className="hidden truncate font-mono text-xs text-text-muted md:inline" title={`${method} ${uri}`}>
+          {method} {uri}
+        </span>
+      )}
+      {seeking && (
+        <span className="rounded-sm bg-status-cooling/15 px-1.5 py-0.5 text-[10px] uppercase text-status-cooling" data-testid="seek-badge">
+          snapshot
+        </span>
+      )}
+      <span className="ml-auto hidden text-[10px] uppercase tracking-wide text-text-muted lg:inline">esc to dismiss</span>
+      <div className="flex items-center gap-2">
+        <KillControl isActive={isActive} mutationsEnabled={mutationsEnabled} seeking={seeking} killState={killState} onKill={onKill} />
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="close detail"
+          className="rounded-md border border-transparent px-2 py-1 text-sm text-text-muted hover:text-text"
+        >
+          ✕
+        </button>
+      </div>
+    </header>
+  );
+}
+
+/**
+ * The summary band under the top bar — the identity/cost/token facts (left), the context gauge +
+ * latency waterfall (middle, the widest column), and the failover trace (right, only when a trace
+ * was recorded). Every figure keeps its don't-lie-with-zeros contract from the old header: an
+ * unreported class renders `—`, never a fabricated `0`.
+ */
+function SummaryBand({
   flow,
   detail,
   cost,
@@ -367,13 +454,7 @@ function DetailHeader({
   attempts,
   seeking,
   seekAtMs,
-  isActive,
-  mutationsEnabled,
-  killState,
-  onKill,
-  onClose,
 }: {
-  apiCallId: string;
   flow: FlowSummary | null;
   detail: FlowDetailDto | null;
   cost: number | null;
@@ -385,17 +466,11 @@ function DetailHeader({
   attempts: AttemptTraceModel;
   seeking: boolean;
   seekAtMs: number | null;
-  isActive: boolean;
-  mutationsEnabled: boolean;
-  killState: KillState;
-  onKill: () => void;
-  onClose: () => void;
 }) {
   // Gap 07: render the dollar STRING + the `estimated` flag together via the shared contract, so an
   // `unavailable` cost reads `—` (never `$0.00`) even if a stray number rode with the tag, and an
   // estimated figure is labelled — identical to the FlowTable + Sankey $ surfaces.
   const costView = costDisplay(cost, costConfidence);
-  const status = flow?.status ?? detail?.status ?? 'open';
   const modelReq = flow?.model_requested ?? detail?.model_requested;
   const modelServed = flow?.model_served ?? detail?.model_served;
   const upstream = flow?.upstream_target ?? detail?.upstream_target ?? '—';
@@ -410,28 +485,9 @@ function DetailHeader({
     : (seeking ? null : detail?.elapsed_ms ?? null);
 
   return (
-    <header className="flex shrink-0 flex-col gap-2 border-b border-line bg-panel-raised px-3 py-2">
-      <div className="flex items-center gap-2">
-        <StatusChip status={status} terminalReason={flow?.terminal_reason ?? detail?.terminal_reason} />
-        <span className="font-mono text-sm text-text" title={apiCallId}>{apiCallId}</span>
-        {seeking && (
-          <span className="rounded-sm bg-status-cooling/15 px-1.5 py-0.5 text-[10px] uppercase text-status-cooling" data-testid="seek-badge">
-            snapshot
-          </span>
-        )}
-        <div className="ml-auto flex items-center gap-2">
-          <KillControl isActive={isActive} mutationsEnabled={mutationsEnabled} seeking={seeking} killState={killState} onKill={onKill} />
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="close detail"
-            className="rounded-md border border-transparent px-2 py-1 text-sm text-text-muted hover:text-text"
-          >
-            ✕
-          </button>
-        </div>
-      </div>
-      <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-xs">
+    <div className="flex shrink-0 flex-wrap gap-x-8 gap-y-2 border-b border-line bg-panel-raised/60 px-3 py-2">
+      {/* Identity + cost + token facts. */}
+      <dl className="grid shrink-0 grid-cols-[auto_1fr] content-start gap-x-3 gap-y-0.5 text-xs">
         <dt className="text-text-muted">model</dt>
         <dd className="font-mono text-text">{fmtModelPair(modelReq, modelServed)}</dd>
         <dt className="text-text-muted">upstream</dt>
@@ -494,11 +550,15 @@ function DetailHeader({
             </span>
           )}
         </dd>
+      </dl>
+
+      {/* Context gauge + latency waterfall — the widest column (the bars want the room). */}
+      <dl className="grid min-w-72 max-w-2xl flex-1 grid-cols-[auto_1fr] content-start gap-x-3 gap-y-1 text-xs">
         {/* Gap 09: the context-window utilization gauge (% of the input window the PROMPT consumed +
             remaining headroom + a near/over badge). Numerator is `Usage.prompt` only (spec 09 /
             FEATURES item 4) — the completion is not counted. `derived` only with a known model
             `context_limit` (gap-06) + reported prompt usage; UNKNOWN capacity or unreported prompt ⇒
-            `—` and an empty dashed track, NEVER a fabricated 0%/100%. Spans the full row (a bar). */}
+            `—` and an empty dashed track, NEVER a fabricated 0%/100%. */}
         <dt className="self-start text-text-muted" title="context-window utilization: prompt (input) tokens vs the model's context window">context</dt>
         <dd className="min-w-0">
           <ContextGauge util={contextUtil} />
@@ -507,26 +567,27 @@ function DetailHeader({
             + a phase waterfall (queue → routing → upstream → prefill → generation → finalize). TTFT
             is `measured` from the gap-02 first-content-delta, else a labelled `estimated`
             first-visible-activity fallback from the monitor output segments; a phase with a missing
-            endpoint renders `—` (no bar), never a fabricated 0ms. Spans the full row. */}
+            endpoint renders `—` (no bar), never a fabricated 0ms. */}
         <dt className="self-start text-text-muted" title="latency breakdown: where the turn spent its wall-clock — provider prefill/TTFT vs generation">timing</dt>
         <dd className="min-w-0">
           <LatencyBreakdown model={latency} />
         </dd>
-        {/* Gap 11: the failover / attempt-trace stepper — one node per recorded `attempts[]` entry
-            (provider, status/error_class, duration, first upstream byte, failover_reason), the served
-            node visually distinct. Rendered ONLY when an attempt was recorded: a single attempt is a
-            single node (no fake failover); ≥2 is the chain. A per-attempt unmeasured time reads `—`,
-            never `0`. Absent ⇒ the row is omitted entirely (no empty stepper). Spans the full row. */}
-        {attempts.hasTrace && (
-          <>
-            <dt className="self-start text-text-muted" title="failover trace: which provider failed, why, how long, and what served">failover</dt>
-            <dd className="min-w-0">
-              <AttemptTrace model={attempts} />
-            </dd>
-          </>
-        )}
       </dl>
-    </header>
+
+      {/* Gap 11: the failover / attempt-trace stepper — one node per recorded `attempts[]` entry
+          (provider, status/error_class, duration, first upstream byte, failover_reason), the served
+          node visually distinct. Rendered ONLY when an attempt was recorded: a single attempt is a
+          single node (no fake failover); ≥2 is the chain. A per-attempt unmeasured time reads `—`,
+          never `0`. Absent ⇒ the column is omitted entirely (no empty stepper). */}
+      {attempts.hasTrace && (
+        <dl className="grid min-w-64 max-w-xl flex-1 grid-cols-[auto_1fr] content-start gap-x-3 gap-y-0.5 text-xs">
+          <dt className="self-start text-text-muted" title="failover trace: which provider failed, why, how long, and what served">failover</dt>
+          <dd className="min-w-0">
+            <AttemptTrace model={attempts} />
+          </dd>
+        </dl>
+      )}
+    </div>
   );
 }
 

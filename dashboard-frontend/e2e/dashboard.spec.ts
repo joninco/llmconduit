@@ -1,4 +1,12 @@
+import type { Page } from '@playwright/test';
 import { test, expect, VIEWS, installDeterminism, login, openView } from './harness';
+
+/** The drill-down is a FULL-WIDTH takeover (the table is hidden while it's open) — dismiss it
+ * (Esc, same as ←/browser-back) before selecting another row. */
+async function dismissDetail(page: Page): Promise<void> {
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('flow-detail')).toHaveCount(0);
+}
 
 test.describe('Argus dashboard', () => {
   test('login shell renders before auth', async ({ page, consoleErrors }) => {
@@ -101,6 +109,7 @@ test.describe('Argus dashboard', () => {
     // api_004 is served by `mystery-model` (catalog context_limit NULL) but DOES report usage →
     // the gauge must read `—` (unknown capacity), NEVER 0% / 100%. Select by the model id (unique
     // to that row) so the known-window llama row on the same endpoint is not picked instead.
+    await dismissDetail(page);
     const unknown = page.getByTestId('flow-row').filter({ hasText: 'mystery-model' }).first();
     await unknown.click();
     await expect(page.getByTestId('context-gauge')).toHaveAttribute('data-quality', 'unavailable');
@@ -149,6 +158,7 @@ test.describe('Argus dashboard', () => {
     // api_003 (failed before content): the prefill + generation segments are UNAVAILABLE — `—`, NOT
     // 0ms — and have no bar fill. Select by its id (the row renders the short api_call_id verbatim;
     // `openai` is no longer unique — the gap-11 `api_005` failover flow also serves it).
+    await dismissDetail(page);
     const failed = page.getByTestId('flow-row').filter({ hasText: 'api_003' }).first();
     await failed.click();
     await expect(page.getByTestId('latency-legend-prefill')).toHaveAttribute('data-quality', 'unavailable');
@@ -163,6 +173,7 @@ test.describe('Argus dashboard', () => {
     // round 1). It is a SEPARATELY-LABELLED `derived` "routing → first token" span — `data-quality`
     // is `derived` (not `measured`), it carries a visible `derived` badge, and its label is NOT
     // "prefill". The wire TTFB headline is unavailable since no first byte was measured.
+    await dismissDetail(page);
     const mystery = page.getByTestId('flow-row').filter({ hasText: 'mystery' }).first();
     await mystery.click();
     const prefillLegend = page.getByTestId('latency-legend-prefill');
@@ -208,6 +219,7 @@ test.describe('Argus dashboard', () => {
     await expect(failedByte).toHaveText('—');
 
     // api_003 is a SINGLE FAILED attempt (no failover): one node, the "no failover" label, no chain.
+    await dismissDetail(page);
     await page.getByTestId('flow-row').filter({ hasText: 'api_003' }).first().click();
     await expect(page.getByTestId('attempt-trace')).toHaveAttribute('data-failover', 'false');
     await expect(page.getByTestId('attempt-single-label')).toBeVisible();
@@ -313,6 +325,7 @@ test.describe('Argus dashboard', () => {
 
     // ErrorTab — capture OFF: api_006 (failed, timeout) has NO captured body ⇒ explicit "capture
     // disabled" state (unavailable), NOT a blank implying "no error".
+    await dismissDetail(page);
     await page.getByTestId('flow-row').filter({ hasText: 'api_006' }).first().click();
     await page.getByRole('tab', { name: 'Error' }).click();
     const capture2 = page.getByTestId('error-capture');

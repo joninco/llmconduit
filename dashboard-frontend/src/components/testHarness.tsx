@@ -28,6 +28,9 @@ export function resetWorld(opts: { mock?: boolean } = {}): void {
   // The shared FlowTable filter (D12) is a global singleton — clear it so a filter set by one
   // test (or a Topology/Sankey cross-link) never carries into the next.
   flowFilterStore.getState().clear();
+  // The drill-down selection lives in the hash (`#/flows/<id>`) — clear it so a selection made
+  // by one test never leaks a mounted FlowDetail into the next.
+  if (window.location.hash) window.location.hash = '';
   if (opts.mock) {
     delete window.__LLMCONDUIT_DASHBOARD__;
   } else {
