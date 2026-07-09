@@ -77,8 +77,9 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
       expect(row?.cost).toBe(0.42);
     });
     const row = result.current.rows.find((r) => r.api_call_id === 'api_live');
-    // …while the live status still WINS over the REST row.
-    expect(row?.status).toBe('open');
+    // …and the terminal-absorbing heal adopts the REST terminal status over the stale live
+    // `open` (a flow never goes terminal→open; see the mergeLiveWithRest field policy).
+    expect(row?.status).toBe('completed');
     expect(row?.terminal_reason).toBe('response.completed');
   });
 
@@ -128,8 +129,8 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
     const row = result.current.rows.find((r) => r.api_call_id === 'api_cc');
     // The confidence tag is backfilled with the cost (no longer stuck at `unavailable`)…
     expect(row?.cost_confidence).toBe('estimated');
-    // …while the live 'open' status still wins.
-    expect(row?.status).toBe('open');
+    // …and the terminal-absorbing heal adopts the REST terminal status too.
+    expect(row?.status).toBe('completed');
   });
 
   // The confidence tag is PAIRED with the cost source: when the LIVE row authored a real cost, its
@@ -143,6 +144,61 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
     const merged = result.current.rows.find((r) => r.api_call_id === 'api_cc2');
     expect(merged?.cost).toBe(0.99); // live cost wins
     expect(merged?.cost_confidence).toBe('confident'); // its paired tag wins too
+  });
+});
+
+describe('useFlowRows — terminal REST status heals a stale live `open` row (absorbing state)', () => {
+  beforeEach(() => resetWorld());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  /** Render + wait until the merged row for `id` reports `status`. */
+  async function expectHealedStatus(id: string, status: FlowSummary['status']) {
+    const { result } = renderRows();
+    await waitFor(() => {
+      const row = result.current.rows.find((r) => r.api_call_id === id);
+      expect(row?.status).toBe(status);
+    });
+  }
+
+  it('adopts a REST `failed` over a live `open` (missed terminal frame)', async () => {
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_heal_f', status: 'failed', terminal_reason: 'boom' })]);
+    seedFlows([makeFlow({ api_call_id: 'api_heal_f', status: 'open', terminal_reason: null })]);
+    await expectHealedStatus('api_heal_f', 'failed');
+    // The store row itself is untouched — the heal happens in the merge only.
+    expect(dashboardStore.getState().flows.get('api_heal_f')?.status).toBe('open');
+  });
+
+  it('adopts a REST `cancelled` over a live `open` (cancel emits no terminal frame)', async () => {
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_heal_c', status: 'cancelled' })]);
+    seedFlows([makeFlow({ api_call_id: 'api_heal_c', status: 'open' })]);
+    await expectHealedStatus('api_heal_c', 'cancelled');
+  });
+
+  it('a live TERMINAL status is never overwritten by a differing REST status (live freshest)', async () => {
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_heal_t', status: 'failed' })]);
+    seedFlows([makeFlow({ api_call_id: 'api_heal_t', status: 'completed' })]);
+    // Wait for the REST list to land, then confirm the live terminal stands.
+    const { result } = renderRows();
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    await waitFor(() => {
+      const row = result.current.rows.find((r) => r.api_call_id === 'api_heal_t');
+      expect(row?.status).toBe('completed');
+    });
+  });
+
+  it('both `open` stays `open` (no fabricated terminal)', async () => {
+    stubFlowsFetch([makeFlow({ api_call_id: 'api_heal_o', status: 'open' })]);
+    seedFlows([makeFlow({ api_call_id: 'api_heal_o', status: 'open' })]);
+    const { result } = renderRows();
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    await waitFor(() => {
+      const row = result.current.rows.find((r) => r.api_call_id === 'api_heal_o');
+      expect(row?.status).toBe('open');
+    });
   });
 });
 
@@ -202,8 +258,8 @@ describe('useFlowRows — a WS-created row backfills REST-authoritative fields (
     expect(row?.elapsed_ms).toBe(5_000);
     expect(row?.cost).toBe(0.5);
     expect(row?.terminal_reason).toBe('response.completed');
-    // …while the LIVE status + usage still win over the completed REST row.
-    expect(row?.status).toBe('open');
+    // The heal adopts the REST terminal status (absorbing); live usage still wins.
+    expect(row?.status).toBe('completed');
     expect(row?.usage?.prompt).toBe(11);
     // The store itself is untouched (merge is view-only).
     expect(dashboardStore.getState().flows.get('api_ws')?.uri).toBe('');
@@ -255,8 +311,8 @@ describe('useFlowRows — live row backfills REST-projected spine fields (gap 10
     expect(row?.finalize_ms).toBe(1_700_000_001_100);
     expect(row?.first_upstream_byte_ms).toBe(1_700_000_000_350);
     expect(row?.attempts).toEqual([SERVED]);
-    // …while the LIVE 'open' status still wins over the completed REST row.
-    expect(row?.status).toBe('open');
+    // …and the terminal-absorbing heal adopts the REST terminal status.
+    expect(row?.status).toBe('completed');
   });
 
   it('a live spine value WINS over the REST projection (live-first)', async () => {
@@ -289,7 +345,7 @@ describe('useFlowRows — live row backfills REST-projected spine fields (gap 10
     });
     const row = result.current.rows.find((r) => r.api_call_id === 'api_att');
     expect(row?.attempts).toEqual([SERVED]); // REST trace surfaced, not the empty live []
-    expect(row?.status).toBe('open'); // live status still wins
+    expect(row?.status).toBe('completed'); // terminal-absorbing heal
   });
 
   it('a NON-EMPTY live attempts[] WINS over the REST projection (live-first)', async () => {

@@ -59,6 +59,7 @@ use crate::dashboard_flow::FlowUsage;
 use crate::dashboard_flow::PhaseTimings;
 use crate::engine::Gateway;
 use crate::metrics::MetricsView;
+use crate::monitor::DebugRequestStatus;
 use crate::monitor::DebugUpdate;
 use crate::monitor::DebugWsMessage;
 use crate::upstream::ProviderHealthSnapshot;
@@ -580,12 +581,14 @@ pub fn frames_for_update(
             }
             DebugWsMessage::RequestStatus {
                 response_id,
+                status,
                 completed_at_ms,
                 ..
             } => {
                 let intent = intent_for(&mut intents, &mut intent_index, response_id);
-                // Latest status fallback timestamp wins for a repeated response_id.
+                // Latest status (+ its fallback timestamp) wins for a repeated response_id.
                 intent.status_completed_at_ms = Some(*completed_at_ms);
+                intent.monitor_status = Some(*status);
             }
             _ => {}
         }
@@ -623,7 +626,11 @@ pub fn frames_for_update(
             });
         }
         if let Some(completed_at_ms) = merged.status_completed_at_ms {
-            flow_batch.push(flow_status_payload(&merged.record, completed_at_ms));
+            flow_batch.push(flow_status_payload(
+                &merged.record,
+                completed_at_ms,
+                merged.monitor_status,
+            ));
         }
     }
 
@@ -674,6 +681,13 @@ struct FlowEnrichIntent {
     /// The latest monitor `RequestStatus` completion stamp (if a status was seen);
     /// the inner `Option` is the message's own `completed_at_ms` (may be `None`).
     status_completed_at_ms: Option<Option<u128>>,
+    /// The latest monitor `RequestStatus`'s own lifecycle status. Carried so the
+    /// payload build can close the finalize race: the engine emits the terminal
+    /// monitor event BEFORE the L1 guard commits the FlowStore record terminal, so
+    /// a record snapshot read at drain time can still say `Open` on the flow's LAST
+    /// frame (which would freeze the UI row at "running" — there is no later flow
+    /// frame to correct it).
+    monitor_status: Option<DebugRequestStatus>,
 }
 
 /// Get the mutable [`FlowEnrichIntent`] for `response_id`, creating it (preserving
@@ -689,6 +703,7 @@ fn intent_for<'a>(
             response_id: response_id.to_string(),
             usage: None,
             status_completed_at_ms: None,
+            monitor_status: None,
         });
         intents.len() - 1
     });
@@ -713,6 +728,9 @@ struct MergedRecordIntent {
     /// Latest monitor `RequestStatus` completion stamp across all aliases (the inner
     /// `Option` is the message's own `completed_at_ms`, which may be `None`).
     status_completed_at_ms: Option<Option<u128>>,
+    /// Latest monitor `RequestStatus` lifecycle status across all aliases (moves in
+    /// lockstep with `status_completed_at_ms` — both come from the same message).
+    monitor_status: Option<DebugRequestStatus>,
 }
 
 /// Resolve each per-`response_id` [`FlowEnrichIntent`] to its FlowStore record and MERGE
@@ -740,6 +758,7 @@ fn merge_intents_by_record(
                 response_id: intent.response_id.clone(),
                 usage: None,
                 status_completed_at_ms: None,
+                monitor_status: None,
             });
             merged.len() - 1
         });
@@ -750,6 +769,7 @@ fn merge_intents_by_record(
         }
         if intent.status_completed_at_ms.is_some() {
             entry.status_completed_at_ms = intent.status_completed_at_ms;
+            entry.monitor_status = intent.monitor_status;
         }
     }
     merged
@@ -766,16 +786,39 @@ fn merge_intents_by_record(
 /// `cancelled`, not be flattened to `failed`. The monitor `completed_at_ms` is used
 /// ONLY as a fallback to derive `elapsed_ms` when the record has not finalized its
 /// own measured elapsed yet.
-fn flow_status_payload(record: &FlowRecord, completed_at_ms: Option<u128>) -> DashboardPayload {
+///
+/// EXCEPTION — the finalize race: the engine emits the terminal monitor event
+/// (`Completed`/`Failed`, engine.rs) BEFORE the spawned L1 guard commits the
+/// FlowStore record terminal, so the record snapshot joined at drain time can
+/// still read `Open` on the flow's LAST monitor update. Serializing that stale
+/// `open` freezes the UI row at "running" forever — no later flow frame exists to
+/// correct it (the FlowStore finalize itself emits no monitor event). When the
+/// record snapshot is still `Open` AND the monitor message carries a TERMINAL
+/// status, project the monitor's terminal status instead. A record that already
+/// finalized (`Completed`/`Failed`/`Cancelled`) always wins — in particular the
+/// D7b R1 finding-4 `Cancelled` case is untouched (its record is finalized by the
+/// time its frame builds, so the override never fires for it).
+fn flow_status_payload(
+    record: &FlowRecord,
+    completed_at_ms: Option<u128>,
+    monitor_status: Option<DebugRequestStatus>,
+) -> DashboardPayload {
     // Prefer the record's measured elapsed; fall back to a wall-clock delta from
     // the monitor's completion stamp (when the record has not finalized yet).
     let elapsed_ms = record
         .elapsed_ms
         .or_else(|| completed_at_ms.map(|done| done.saturating_sub(record.started_ms)));
+    let status = match (record.status, monitor_status) {
+        // Finalize race: monitor says terminal, record not finalized yet.
+        (FlowStatus::Open, Some(DebugRequestStatus::Completed)) => FlowStatus::Completed,
+        (FlowStatus::Open, Some(DebugRequestStatus::Failed)) => FlowStatus::Failed,
+        // Everything else: the record is authoritative (D7b R1 finding 4).
+        (status, _) => status,
+    };
     DashboardPayload::FlowStatus {
         api_call_id: record.api_call_id.clone(),
         response_id: record.response_id.clone(),
-        status: record.status,
+        status,
         model_requested: record.model_requested.clone(),
         model_served: record.model_served.clone(),
         upstream_target: record.upstream_target.clone(),
@@ -1597,8 +1640,11 @@ mod tests {
                 ..
             } => {
                 assert_eq!(api_call_id, "api_001");
-                // Record status (Open), NOT the monitor message's Completed (finding 4).
-                assert_eq!(*status, FlowStatus::Open);
+                // The record snapshot still reads `Open` but the monitor message is a
+                // TERMINAL `Completed` — the finalize-race override projects the terminal
+                // status (see `terminal_monitor_status_overrides_stale_open_record`; the
+                // finding-4 `Cancelled` case is `cancelled_flow_serializes_cancelled_not_failed`).
+                assert_eq!(*status, FlowStatus::Completed);
             }
             other => panic!("expected flow_status payload, got {other:?}"),
         }
@@ -1696,6 +1742,108 @@ mod tests {
             .find(|p| p["type"] == "flow_status")
             .unwrap()["status"];
         assert_eq!(*wire_status, serde_json::json!("cancelled"));
+    }
+
+    /// The finalize race: the engine emits the terminal monitor `Completed`/`Failed`
+    /// BEFORE the spawned L1 guard commits the FlowStore record terminal, so the
+    /// record snapshot joined at drain time can still read `Open` on the flow's LAST
+    /// monitor update. Serializing that stale `open` froze the UI row at "running"
+    /// forever (no later flow frame corrects it — FlowStore finalize emits no monitor
+    /// event). The monitor's own TERMINAL status must win over a still-`Open` record
+    /// snapshot; a `Running` status must NOT override (a genuinely open flow stays
+    /// open, e.g. on snapshot replay).
+    #[test]
+    fn terminal_monitor_status_overrides_stale_open_record() {
+        let payload_status = |messages: Vec<DebugWsMessage>, store: &DashboardFlowStore| {
+            let update = DebugUpdate {
+                sequence: 9,
+                messages,
+            };
+            let frames = frames_for_update(&update, store);
+            let flow = frames
+                .iter()
+                .find(|f| f.domain == Domain::Flow)
+                .expect("flow frame");
+            flow.batch
+                .iter()
+                .find_map(|p| match p {
+                    DashboardPayload::FlowStatus {
+                        status, elapsed_ms, ..
+                    } => Some((*status, *elapsed_ms)),
+                    _ => None,
+                })
+                .expect("flow_status payload")
+        };
+        let open_store = |api: &str, resp: &str| {
+            let store = DashboardFlowStore::new();
+            store.open(
+                api.to_string(),
+                "POST".to_string(),
+                "/v1/messages".to_string(),
+                redact_headers(&HeaderMap::new()),
+                Some(capture_body(b"{}")),
+                crate::dashboard_flow::ClientAttribution::none(),
+            );
+            store.link(resp.to_string(), api.to_string());
+            // NO finalize — the record snapshot still reads `Open` (the race window).
+            store
+        };
+
+        // Monitor `Completed` beats the stale `Open` snapshot…
+        let store = open_store("api_race_c", "resp_race_c");
+        let (status, elapsed_ms) = payload_status(
+            vec![DebugWsMessage::RequestStatus {
+                response_id: "resp_race_c".to_string(),
+                status: DebugRequestStatus::Completed,
+                completed_at_ms: Some(u128::MAX),
+                error: None,
+            }],
+            &store,
+        );
+        assert_eq!(
+            status,
+            FlowStatus::Completed,
+            "monitor Completed wins over the un-finalized Open snapshot"
+        );
+        // …and the monitor stamp still backs the elapsed fallback (record has none yet).
+        assert!(
+            elapsed_ms.is_some(),
+            "elapsed falls back to the monitor stamp"
+        );
+
+        // …monitor `Failed` too…
+        let store = open_store("api_race_f", "resp_race_f");
+        let (status, _) = payload_status(
+            vec![DebugWsMessage::RequestStatus {
+                response_id: "resp_race_f".to_string(),
+                status: DebugRequestStatus::Failed,
+                completed_at_ms: Some(u128::MAX),
+                error: Some("boom".to_string()),
+            }],
+            &store,
+        );
+        assert_eq!(
+            status,
+            FlowStatus::Failed,
+            "monitor Failed wins over the un-finalized Open snapshot"
+        );
+
+        // …but `Running` never overrides: a genuinely open flow stays `open`.
+        let store = open_store("api_race_r", "resp_race_r");
+        let (status, _) = payload_status(
+            vec![DebugWsMessage::RequestStatus {
+                response_id: "resp_race_r".to_string(),
+                status: DebugRequestStatus::Running,
+                completed_at_ms: None,
+                error: None,
+            }],
+            &store,
+        );
+        assert_eq!(
+            status,
+            FlowStatus::Open,
+            "a Running status leaves the open record untouched"
+        );
     }
 
     /// D7b R4 finding 1: the flow enrichment frame is stamped with the ORIGINATING

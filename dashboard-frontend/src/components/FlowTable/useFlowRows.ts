@@ -78,6 +78,13 @@ function mergeRows(
  *
  * Field policy:
  *  - status / usage / started_ms: LIVE wins (the socket owns the live state + stream start).
+ *    EXCEPTION — terminal is ABSORBING: a flow never goes terminal→open, so when the REST
+ *    roll-up reports a TERMINAL status (completed/failed/cancelled) while the live store row
+ *    still says `open`, the REST status wins. This heals a row whose terminal `flow_status`
+ *    frame was missed (WS reconnect gap, backlog eviction, any emission bug) — without it the
+ *    row is stuck "running" FOREVER, because the store row only changes on a new WS frame for
+ *    that flow and none is coming (`...live` would keep re-asserting the stale `open` over
+ *    every authoritative refetch).
  *  - method / uri: REST-authoritative request line — REST wins when present (it never changes over a
  *    flow's life, so this only replaces a WS placeholder; falls back to live if REST omitted it).
  *  - model_requested / model_served / upstream_target / response_id: LIVE wins when present, else
@@ -102,8 +109,12 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
   // figure and its confidence label always agree: if the live frame supplied the cost, use its tag;
   // else adopt the REST roll-up's tag together with the REST cost.
   const liveAuthoredCost = live.cost != null;
+  // Terminal is absorbing: heal a live `open` row from a terminal REST roll-up (see the
+  // field-policy doc above). Any other combination keeps the live status (socket freshest).
+  const status = live.status === 'open' && rest.status !== 'open' ? rest.status : live.status;
   const merged: FlowSummary = {
     ...live,
+    status,
     // REST-authoritative request line: replace a WS placeholder with the real value.
     method: rest.method || live.method,
     uri: rest.uri || live.uri,
@@ -150,6 +161,9 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
 /** True when every `FlowSummary` field is identical (so the merge can return `live` unchanged). */
 function shallowEqualSummary(a: FlowSummary, b: FlowSummary): boolean {
   return (
+    // `status` is part of row identity: the terminal-absorbing heal can change it while
+    // every other field matches — the merged row MUST be a new object so the chip re-renders.
+    a.status === b.status &&
     a.method === b.method &&
     a.uri === b.uri &&
     (a.response_id ?? null) === (b.response_id ?? null) &&
