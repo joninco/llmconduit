@@ -3,41 +3,48 @@
 //!
 //! The unit tests exercise the pure classifier
 //! [`llmconduit::upstream::classify_context_overflow`] directly: each upstream
-//! overflow shape must parse into the recomputed `max_completion_tokens`, the
-//! right `reason`/lower-bound flags, the min-floor clamp, and unrelated text
-//! must yield `None` (no retry). The integration test proves the classifier is
-//! wired into the upstream non-2xx path so a real overflow triggers exactly one
-//! shrink-and-retry.
+//! overflow shape must parse into the recomputed UNCLAMPED
+//! `available_completion_tokens` (`ctx − safety − input`; floor/terminal policy
+//! lives in the leaf retry loop), the right `reason`/lower-bound flags, and
+//! unrelated text must yield `None` (no retry). The integration tests prove the
+//! classifier is wired into the upstream non-2xx path as a bounded CONVERGENCE
+//! loop: it re-budgets from each error's LATEST reported input, goes terminal
+//! ("reduce the prompt") when even the minimum completion budget cannot fit
+//! beside a backend-REPORTED input, stops on no-progress or the attempt cap,
+//! and hands a non-overflow retry error to the normal failover disposition
+//! (E2a) instead of looping.
 
 use llmconduit::upstream::classify_context_overflow;
 
-const MIN_FLOOR: i64 = 4096;
+/// Mirrors `upstream::CONTEXT_RETRY_SAFETY_TOKENS`. Deliberately tiny: backends
+/// reject only `input + output > ctx`, and the leaf loop (not a fat margin)
+/// absorbs a lower bound's understatement by re-budgeting from the next error.
+const SAFETY: i64 = 8;
 
 #[test]
 fn detects_completion_token_limit() {
     let error_body = "max_completion_tokens=250000 cannot be greater than max_model_len=202,752";
 
-    let retry = classify_context_overflow(error_body, MIN_FLOOR, None).expect("retry decision");
+    let retry = classify_context_overflow(error_body, None).expect("retry decision");
 
     assert_eq!(retry.reason, "completion_limit");
     assert_eq!(retry.ctx_limit, 202752);
     assert_eq!(retry.input_tokens, None);
-    // ctx_limit - CONTEXT_RETRY_MARGIN(100), no input estimate available.
-    assert_eq!(retry.max_completion_tokens, 202652);
+    // ctx_limit - SAFETY, no input estimate available.
+    assert_eq!(retry.available_completion_tokens, 202752 - SAFETY);
 }
 
 #[test]
 fn uses_available_context_for_completion_token_limit() {
     let error_body = "max_completion_tokens=250000 cannot be greater than max_model_len=202,752";
 
-    let retry =
-        classify_context_overflow(error_body, MIN_FLOOR, Some(139000)).expect("retry decision");
+    let retry = classify_context_overflow(error_body, Some(139000)).expect("retry decision");
 
     assert_eq!(retry.reason, "completion_limit");
     assert_eq!(retry.ctx_limit, 202752);
     assert_eq!(retry.input_tokens, Some(139000));
-    // 202752 - 100 - 139000.
-    assert_eq!(retry.max_completion_tokens, 63652);
+    // 202752 - 8 - 139000.
+    assert_eq!(retry.available_completion_tokens, 63744);
 }
 
 #[test]
@@ -45,14 +52,14 @@ fn detects_vllm_context_limit() {
     let error_body = "This model's maximum context length is 202752 tokens. \
         However, you requested 64000 output tokens and your prompt contains 139000 input tokens.";
 
-    let retry = classify_context_overflow(error_body, MIN_FLOOR, None).expect("retry decision");
+    let retry = classify_context_overflow(error_body, None).expect("retry decision");
 
     assert_eq!(retry.reason, "context_limit");
     assert_eq!(retry.ctx_limit, 202752);
     assert_eq!(retry.input_tokens, Some(139000));
     assert!(!retry.input_tokens_is_lower_bound);
-    // 202752 - 100 - 139000.
-    assert_eq!(retry.max_completion_tokens, 63652);
+    // 202752 - 8 - 139000.
+    assert_eq!(retry.available_completion_tokens, 63744);
 }
 
 #[test]
@@ -62,31 +69,63 @@ fn detects_vllm_at_least_context_limit() {
         for a total of at least 65537 tokens. Please reduce the length of the input prompt or the number \
         of requested output tokens. (parameter=input_tokens, value=1537)";
 
-    let retry = classify_context_overflow(error_body, MIN_FLOOR, None).expect("retry decision");
+    let retry = classify_context_overflow(error_body, None).expect("retry decision");
 
     assert_eq!(retry.reason, "context_limit");
     assert_eq!(retry.ctx_limit, 65536);
     assert_eq!(retry.input_tokens, Some(1537));
     assert!(retry.input_tokens_is_lower_bound);
-    // Lower-bound margin (1024): 65536 - 1024 - 1537.
-    assert_eq!(retry.max_completion_tokens, 62975);
+    // Same small safety reserve as an exact count: 65536 - 8 - 1537. The loop,
+    // not a wider margin, absorbs a lower bound's understatement.
+    assert_eq!(retry.available_completion_tokens, 63991);
 }
 
 #[test]
-fn uses_larger_margin_for_vllm_at_least_boundary_error() {
+fn lower_bound_boundary_error_uses_same_small_safety_reserve() {
     let error_body = "This model's maximum context length is 262144 tokens. \
         However, you requested 63798 output tokens and your prompt contains at least 198347 input tokens, \
         for a total of at least 262145 tokens. Please reduce the length of the input prompt or the number \
         of requested output tokens. (parameter=input_tokens, value=198347)";
 
-    let retry = classify_context_overflow(error_body, MIN_FLOOR, None).expect("retry decision");
+    let retry = classify_context_overflow(error_body, None).expect("retry decision");
 
     assert_eq!(retry.reason, "context_limit");
     assert_eq!(retry.ctx_limit, 262144);
     assert_eq!(retry.input_tokens, Some(198347));
     assert!(retry.input_tokens_is_lower_bound);
-    // Lower-bound margin (1024): 262144 - 1024 - 198347.
-    assert_eq!(retry.max_completion_tokens, 62773);
+    // 262144 - 8 - 198347.
+    assert_eq!(retry.available_completion_tokens, 63789);
+}
+
+#[test]
+fn derived_lower_bound_converges_across_rounds() {
+    // Live incident (2026-07-08, 524288-ctx backend): the "at least N" input is
+    // DERIVED from the request (`ctx − max_tokens + 1`), so it tightened by
+    // exactly the shrunk amount and the retired one-shot design (1024-token
+    // margin off the FIRST error) re-overflowed by exactly one token. Replaying
+    // both captured bodies must yield strictly decreasing budgets whose second
+    // round genuinely fits beside the tightened bound.
+    let round1 = "This model's maximum context length is 524288 tokens. However, you \
+        requested 64000 output tokens and your prompt contains at least 460289 input tokens, \
+        for a total of at least 524289 tokens. (parameter=input_tokens, value=460289)";
+    let round2 = "This model's maximum context length is 524288 tokens. However, you \
+        requested 62975 output tokens and your prompt contains at least 461314 input tokens, \
+        for a total of at least 524289 tokens. (parameter=input_tokens, value=461314)";
+
+    let first = classify_context_overflow(round1, None).expect("round 1 classifies");
+    assert!(first.input_tokens_is_lower_bound);
+    assert_eq!(first.available_completion_tokens, 524288 - SAFETY - 460289);
+
+    let second = classify_context_overflow(round2, None).expect("round 2 classifies");
+    assert_eq!(second.available_completion_tokens, 524288 - SAFETY - 461314);
+    assert!(
+        second.available_completion_tokens < first.available_completion_tokens,
+        "the tightened bound must shrink the budget (strict progress)"
+    );
+    assert!(
+        461314 + second.available_completion_tokens <= 524288,
+        "the re-budgeted round must fit the window"
+    );
 }
 
 #[test]
@@ -94,13 +133,13 @@ fn detects_openai_compatible_context_limit() {
     let error_body = "This model's maximum context length is 202752 tokens. \
         However, you requested 203000 tokens (139000 in the messages, 64000 in the completion).";
 
-    let retry = classify_context_overflow(error_body, MIN_FLOOR, None).expect("retry decision");
+    let retry = classify_context_overflow(error_body, None).expect("retry decision");
 
     assert_eq!(retry.reason, "context_limit");
     assert_eq!(retry.ctx_limit, 202752);
     assert_eq!(retry.input_tokens, Some(139000));
-    // 202752 - 100 - 139000.
-    assert_eq!(retry.max_completion_tokens, 63652);
+    // 202752 - 8 - 139000.
+    assert_eq!(retry.available_completion_tokens, 63744);
 }
 
 #[test]
@@ -111,13 +150,13 @@ fn detects_openai_compatible_context_limit_in_the_prompt_variant() {
     let error_body = "This model's maximum context length is 202752 tokens. \
         However, you requested 203000 tokens (139000 in the prompt, 64000 in the completion).";
 
-    let retry = classify_context_overflow(error_body, MIN_FLOOR, None).expect("retry decision");
+    let retry = classify_context_overflow(error_body, None).expect("retry decision");
 
     assert_eq!(retry.reason, "context_limit");
     assert_eq!(retry.ctx_limit, 202752);
     assert_eq!(retry.input_tokens, Some(139000));
-    // 202752 - 100 - 139000.
-    assert_eq!(retry.max_completion_tokens, 63652);
+    // 202752 - 8 - 139000.
+    assert_eq!(retry.available_completion_tokens, 63744);
 }
 
 #[test]
@@ -127,30 +166,48 @@ fn detects_requested_token_count_context_limit() {
         and 64000 tokens for the completion. Please reduce the number of tokens in the \
         input messages or the completion to fit within the limit.";
 
-    let retry = classify_context_overflow(error_body, MIN_FLOOR, None).expect("retry decision");
+    let retry = classify_context_overflow(error_body, None).expect("retry decision");
 
     assert_eq!(retry.reason, "context_limit");
     assert_eq!(retry.ctx_limit, 202752);
     assert_eq!(retry.input_tokens, Some(142272));
-    // 202752 - 100 - 142272.
-    assert_eq!(retry.max_completion_tokens, 60380);
+    // 202752 - 8 - 142272.
+    assert_eq!(retry.available_completion_tokens, 60472);
 }
 
 #[test]
-fn respects_min_completion_token_floor() {
+fn reports_budget_below_floor_unclamped() {
+    // The classifier no longer clamps to the configured floor: the leaf loop
+    // owns that policy (a parsed input leaving less than the floor goes
+    // TERMINAL "reduce the prompt" instead of retrying at a budget the backend
+    // would reject or truncate into uselessness).
     let error_body = "This model's maximum context length is 202752 tokens. \
         However, you requested 64000 output tokens and your prompt contains 202000 input tokens.";
 
-    let retry = classify_context_overflow(error_body, MIN_FLOOR, None).expect("retry decision");
+    let retry = classify_context_overflow(error_body, None).expect("retry decision");
 
-    // 202752 - 100 - 202000 = 652, clamped up to the configured floor.
-    assert_eq!(retry.max_completion_tokens, MIN_FLOOR);
+    // 202752 - 8 - 202000 = 744, reported raw.
+    assert_eq!(retry.available_completion_tokens, 744);
+}
+
+#[test]
+fn reports_negative_budget_when_prompt_exceeds_window() {
+    // A prompt that alone exceeds the window yields a NEGATIVE budget — still
+    // reported raw so the call site can distinguish "cannot fit at all" from
+    // "fits below the floor" without re-parsing the body.
+    let error_body = "This model's maximum context length is 202752 tokens. \
+        However, you requested 64000 output tokens and your prompt contains 202800 input tokens.";
+
+    let retry = classify_context_overflow(error_body, None).expect("retry decision");
+
+    assert_eq!(retry.available_completion_tokens, 202752 - SAFETY - 202800);
+    assert!(retry.available_completion_tokens < 0);
 }
 
 #[test]
 fn ignores_unrelated_errors() {
     assert_eq!(
-        classify_context_overflow("backend is unavailable", MIN_FLOOR, None),
+        classify_context_overflow("backend is unavailable", None),
         None
     );
 }
@@ -165,7 +222,7 @@ fn ignores_unrelated_body_that_merely_mentions_token_keywords() {
         together with max_model_len=202752 for this deployment; remove one of them.";
 
     assert_eq!(
-        classify_context_overflow(error_body, MIN_FLOOR, None),
+        classify_context_overflow(error_body, None),
         None,
         "an unrelated error mentioning max_completion_tokens/max_model_len must not trigger a retry"
     );
@@ -182,7 +239,7 @@ fn ignores_body_with_overflow_anchors_but_no_requested_token_count_exceeds() {
         budget; adjust your deployment, this is not a per-request limit.";
 
     assert_eq!(
-        classify_context_overflow(error_body, MIN_FLOOR, None),
+        classify_context_overflow(error_body, None),
         None,
         "anchors without the literal 'requested token count exceeds' must not trigger a retry"
     );
@@ -204,7 +261,7 @@ fn ignores_requested_total_anchors_without_requested_token_count_exceeds_literal
         the completion, but the rejected field was temperature.";
 
     assert_eq!(
-        classify_context_overflow(error_body, MIN_FLOOR, None),
+        classify_context_overflow(error_body, None),
         None,
         "all 'requested a total of' anchors present but the leading 'requested token count \
          exceeds' literal absent must not trigger a retry"
@@ -225,7 +282,7 @@ fn ignores_vllm_combined_anchors_without_requested_output_tokens_literal() {
         139000 input tokens from a prior turn. This is informational, not a limit.";
 
     assert_eq!(
-        classify_context_overflow(error_body, MIN_FLOOR, None),
+        classify_context_overflow(error_body, None),
         None,
         "generic combined anchors without the 'requested N output tokens' literal must not retry"
     );
@@ -241,7 +298,7 @@ fn ignores_vllm_combined_when_request_side_follows_context_side() {
         139000 input tokens, which is fine; separately you requested 64000 output tokens earlier.";
 
     assert_eq!(
-        classify_context_overflow(error_body, MIN_FLOOR, None),
+        classify_context_overflow(error_body, None),
         None,
         "out-of-order combined clauses (context side before request side) must not retry"
     );
@@ -258,7 +315,7 @@ fn ignores_openai_compatible_anchors_without_completion_clause() {
         We counted 139000 tokens in the messages cache for telemetry purposes. No request was rejected.";
 
     assert_eq!(
-        classify_context_overflow(error_body, MIN_FLOOR, None),
+        classify_context_overflow(error_body, None),
         None,
         "OpenAI-compatible anchors without the 'requested N tokens' + 'in the completion' literals must not retry"
     );
@@ -274,7 +331,7 @@ fn ignores_openai_compatible_when_clauses_out_of_order() {
         203000 tokens; 64000 in the completion budget were set before 139000 in the messages were tallied.";
 
     assert_eq!(
-        classify_context_overflow(error_body, MIN_FLOOR, None),
+        classify_context_overflow(error_body, None),
         None,
         "out-of-order OpenAI-compatible clauses (completion before messages) must not retry"
     );
@@ -293,23 +350,10 @@ fn ignores_requested_without_adjacent_token_count() {
         tokens. Diagnostics: 139000 in the prompt, 64000 in the completion.";
 
     assert_eq!(
-        classify_context_overflow(error_body, MIN_FLOOR, None),
+        classify_context_overflow(error_body, None),
         None,
         "a body whose 'requested' is not adjacent to 'N tokens' must not trigger a retry"
     );
-}
-
-#[test]
-fn custom_floor_clamps_reduced_budget() {
-    // A higher floor than the available budget wins, proving the floor knob is
-    // honored rather than hard-coded.
-    let error_body = "This model's maximum context length is 202752 tokens. \
-        However, you requested 64000 output tokens and your prompt contains 200000 input tokens.";
-
-    let retry = classify_context_overflow(error_body, 8192, None).expect("retry decision");
-
-    // 202752 - 100 - 200000 = 2652, clamped up to 8192.
-    assert_eq!(retry.max_completion_tokens, 8192);
 }
 
 mod integration {
@@ -379,10 +423,25 @@ mod integration {
         format!("data: {}\n\ndata: [DONE]\n\n", chunk)
     }
 
+    /// Collect the chat-completions POST bodies an upstream mock received, in
+    /// arrival order, so tests can assert on the forwarded `max_tokens` per attempt.
+    async fn chat_post_bodies(server: &MockServer) -> Vec<Value> {
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .into_iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
+            })
+            .map(|request| serde_json::from_slice(&request.body).expect("chat body json"))
+            .collect()
+    }
+
     /// Upstream returns a context-limit 400 on the first chat POST, then 200 on
     /// the retry. The leaf client must shrink `max_completion_tokens` and retry
-    /// exactly once (two POSTs total), and the turn must succeed. The reduced
-    /// budget is checked on the second (retried) upstream request body.
+    /// (two POSTs total), and the turn must succeed. The reduced budget is
+    /// checked on the second (retried) upstream request body.
     #[tokio::test]
     async fn upstream_context_limit_400_then_200_retries_once_with_reduced_budget() {
         let server = MockServer::start().await;
@@ -396,7 +455,7 @@ mod integration {
             .await;
 
         // First chat POST -> context-limit 400. ctx=65536, input=1000,
-        // margin=100 => reduced budget = 65536 - 100 - 1000 = 64436.
+        // safety=8 => reduced budget = 65536 - 8 - 1000 = 64528.
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
@@ -451,48 +510,35 @@ mod integration {
             Some("hello after retry")
         );
 
-        let chat_requests: Vec<_> = server
-            .received_requests()
-            .await
-            .expect("requests")
-            .into_iter()
-            .filter(|request| {
-                request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-            })
-            .collect();
+        let chat_requests = chat_post_bodies(&server).await;
 
-        // Exactly ONE retry: the original POST plus a single re-request.
+        // One shrink was enough here: the original POST plus a single re-request.
         assert_eq!(
             chat_requests.len(),
             2,
             "expected exactly one shrink-and-retry"
         );
 
-        let first: Value = serde_json::from_slice(&chat_requests[0].body).expect("first body json");
         assert_eq!(
-            first["max_tokens"].as_i64(),
+            chat_requests[0]["max_tokens"].as_i64(),
             Some(250000),
             "first attempt keeps the caller's requested budget"
         );
-
-        let retried: Value =
-            serde_json::from_slice(&chat_requests[1].body).expect("retry body json");
         assert_eq!(
-            retried["max_tokens"].as_i64(),
-            Some(64436),
+            chat_requests[1]["max_tokens"].as_i64(),
+            Some(64528),
             "retry carries the reduced completion budget"
         );
     }
 
-    /// A configured `upstream_chat_kwargs` max-token ALIAS (`max_completion_tokens`)
-    /// flows into the request `extra_body` when the caller sends no max-token
-    /// field. On a context-overflow retry the leaf shrinks the typed
-    /// `max_output_tokens` (serialized as `max_tokens`) but must also STRIP the
-    /// stale alias so the upstream cannot honor the oversized value and defeat the
-    /// retry. The retried body must carry only the reduced `max_tokens` and none
-    /// of the max-token aliases.
+    /// The live-incident shape: the backend's "at least N input tokens" is a
+    /// lower bound DERIVED from the request (`ctx − max_tokens + 1`), so the
+    /// bound TIGHTENS on the retry and a budget computed from the FIRST error
+    /// re-overflows. The loop must re-budget from the LATEST reported input and
+    /// converge: 400(≥460289) → 400(≥461314) → 200, with strictly decreasing
+    /// forwarded budgets, within the attempt cap.
     #[tokio::test]
-    async fn retry_strips_max_token_aliases_from_extra_body() {
+    async fn derived_lower_bound_overflow_converges_after_two_shrinks() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -503,19 +549,35 @@ mod integration {
             .mount(&server)
             .await;
 
-        // First chat POST -> context-limit 400. ctx=65536, input=1000,
-        // margin=100 => reduced budget = 65536 - 100 - 1000 = 64436.
+        // POST 1 -> loose derived bound. ctx=524288, input ">= 460289":
+        // budget = 524288 - 8 - 460289 = 63991.
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
-                "This model's maximum context length is 65536 tokens. However, you requested \
-                 250000 output tokens and your prompt contains 1000 input tokens.",
+                "This model's maximum context length is 524288 tokens. However, you requested \
+                 64000 output tokens and your prompt contains at least 460289 input tokens, \
+                 for a total of at least 524289 tokens. (parameter=input_tokens, value=460289)",
             ))
             .up_to_n_times(1)
             .with_priority(1)
             .mount(&server)
             .await;
 
+        // POST 2 -> the bound TIGHTENED (this is what sank the one-shot design):
+        // budget = 524288 - 8 - 461314 = 62966.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "This model's maximum context length is 524288 tokens. However, you requested \
+                 63991 output tokens and your prompt contains at least 461314 input tokens, \
+                 for a total of at least 524289 tokens. (parameter=input_tokens, value=461314)",
+            ))
+            .up_to_n_times(1)
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        // POST 3 -> fits.
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(
@@ -523,18 +585,11 @@ mod integration {
                     .insert_header("content-type", "text/event-stream")
                     .set_body_string(chat_sse_body()),
             )
-            .with_priority(2)
+            .with_priority(3)
             .mount(&server)
             .await;
 
-        let mut config = config_for(&server.uri());
-        // A configured max-token alias default. Because the caller sends no
-        // max-token field, the engine leaves this in the request extra_body, so
-        // the leaf retry sees a stale alias that must be stripped.
-        config.upstream_chat_kwargs =
-            serde_json::Map::from_iter([("max_completion_tokens".to_string(), json!(250000))]);
-
-        let app = llmconduit::build_app(config);
+        let app = llmconduit::build_app(config_for(&server.uri()));
         let response = app
             .oneshot(
                 Request::builder()
@@ -545,6 +600,7 @@ mod integration {
                         json!({
                             "model": "test-model",
                             "stream": false,
+                            "max_tokens": 64000,
                             "messages": [{"role": "user", "content": "hi"}]
                         })
                         .to_string(),
@@ -554,55 +610,249 @@ mod integration {
             .await
             .expect("response");
 
-        assert_eq!(response.status().as_u16(), 200, "turn should succeed");
-
-        let chat_requests: Vec<_> = server
-            .received_requests()
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the converging loop must turn the persisted overflow into a success"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
             .await
-            .expect("requests")
-            .into_iter()
-            .filter(|request| {
-                request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-            })
-            .collect();
+            .expect("read body");
+        let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
+        assert_eq!(
+            body["choices"][0]["message"]["content"].as_str(),
+            Some("hello after retry")
+        );
+
+        let chat_requests = chat_post_bodies(&server).await;
         assert_eq!(
             chat_requests.len(),
-            2,
-            "expected exactly one shrink-and-retry"
+            3,
+            "two shrinks then success — within the 4-attempt cap"
         );
 
-        // First attempt: the configured alias is present (no typed field yet).
-        let first: Value = serde_json::from_slice(&chat_requests[0].body).expect("first body json");
+        let budgets: Vec<i64> = chat_requests
+            .iter()
+            .map(|request| request["max_tokens"].as_i64().expect("max_tokens"))
+            .collect();
         assert_eq!(
-            first["max_completion_tokens"].as_i64(),
-            Some(250000),
-            "first attempt carries the configured alias default"
+            budgets,
+            vec![64000, 63991, 62966],
+            "each retry re-budgets from the LATEST reported input"
+        );
+        assert!(
+            budgets.windows(2).all(|pair| pair[1] < pair[0]),
+            "forwarded budgets must be strictly decreasing"
+        );
+        // The final budget fits beside the tightest reported bound.
+        assert!(461314 + budgets[2] <= 524288);
+    }
+
+    /// A backend-REPORTED input that leaves less than the configured minimum
+    /// completion budget (4096) cannot be fixed by shrinking output: the leaf
+    /// must go terminal on the FIRST error — no retry, no failover — and tell
+    /// the caller to reduce the prompt.
+    #[tokio::test]
+    async fn prompt_exceeding_window_is_terminal_without_retry() {
+        let primary = MockServer::start().await;
+        let fallback = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "primary-model"}]
+            })))
+            .mount(&primary)
+            .await;
+
+        // input=65000 of ctx=65536 leaves 65536 - 8 - 65000 = 528 < 4096 floor.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "This model's maximum context length is 65536 tokens. However, you requested \
+                 4096 output tokens and your prompt contains 65000 input tokens.",
+            ))
+            .mount(&primary)
+            .await;
+
+        // Fallback would happily succeed -- it must NEVER be reached.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(chat_sse_body()),
+            )
+            .mount(&fallback)
+            .await;
+
+        let mut config = config_for(&primary.uri());
+        config.upstream_model = Some("primary-model".to_string());
+        config.fallback_upstreams = vec![FallbackUpstreamConfig {
+            name: "fallback".to_string(),
+            upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
+            upstream_api_key: None,
+            upstream_model: Some("fallback-model".to_string()),
+            exposed_model: None,
+            upstream_chat_kwargs: serde_json::Map::new(),
+            upstream_request_log_path: None,
+        }];
+        config.upstream_failure_cooldown_secs = 3600;
+
+        let app = llmconduit::build_app(config);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "primary-model",
+                            "stream": false,
+                            "max_tokens": 64000,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status().as_u16(), 502, "terminal upstream error");
+        let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("input exceeds the context window")
+                && message.contains("reduce the prompt"),
+            "error must tell the caller to reduce the prompt, got: {message}"
         );
 
-        // Retry: only the reduced typed `max_tokens` survives; every alias is gone.
-        let retried: Value =
-            serde_json::from_slice(&chat_requests[1].body).expect("retry body json");
+        let primary_posts = chat_post_bodies(&primary).await.len();
         assert_eq!(
-            retried["max_tokens"].as_i64(),
-            Some(64436),
-            "retry carries the reduced completion budget on the typed field"
+            primary_posts, 1,
+            "no shrink can fix an oversized prompt — exactly one upstream POST"
         );
-        assert!(
-            retried.get("max_completion_tokens").is_none(),
-            "retry must strip the stale max_completion_tokens alias"
-        );
-        assert!(
-            retried.get("max_output_tokens").is_none(),
-            "retry must not leak a max_output_tokens alias"
+        let fallback_posts = chat_post_bodies(&fallback).await.len();
+        assert_eq!(
+            fallback_posts, 0,
+            "an oversized prompt must NOT fail over to the next provider"
         );
     }
 
-    /// A context-window overflow that PERSISTS after the single shrink-and-retry
-    /// is a same-provider sizing problem, not a provider failure. With a fallback
-    /// upstream configured, the leaf must surface a TERMINAL error so the failover
-    /// client does NOT re-send the same oversized prompt to the next provider.
-    /// We prove the fallback is never contacted and the turn fails (it does not
-    /// silently succeed via the fallback).
+    /// A NON-overflow error on a shrink retry must exit the loop immediately
+    /// with the normal E2a disposition — here a 429, which stays
+    /// failover-eligible, so the turn succeeds via the fallback provider
+    /// instead of looping against the primary.
+    #[tokio::test]
+    async fn non_overflow_error_after_shrink_exits_loop_as_failover() {
+        let primary = MockServer::start().await;
+        let fallback = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "primary-model"}]
+            })))
+            .mount(&primary)
+            .await;
+
+        // POST 1 -> genuine overflow: triggers one shrink.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "This model's maximum context length is 65536 tokens. However, you requested \
+                 250000 output tokens and your prompt contains 1000 input tokens.",
+            ))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&primary)
+            .await;
+
+        // POST 2 (the shrunk retry) -> 429: NOT an overflow, must not loop.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("rate limited, slow down"))
+            .with_priority(2)
+            .mount(&primary)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(chat_sse_body()),
+            )
+            .mount(&fallback)
+            .await;
+
+        let mut config = config_for(&primary.uri());
+        config.upstream_model = Some("primary-model".to_string());
+        config.fallback_upstreams = vec![FallbackUpstreamConfig {
+            name: "fallback".to_string(),
+            upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
+            upstream_api_key: None,
+            upstream_model: Some("fallback-model".to_string()),
+            exposed_model: None,
+            upstream_chat_kwargs: serde_json::Map::new(),
+            upstream_request_log_path: None,
+        }];
+        config.upstream_failure_cooldown_secs = 3600;
+
+        let app = llmconduit::build_app(config);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "primary-model",
+                            "stream": false,
+                            "max_tokens": 250000,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "the 429 must fail over to the fallback provider, not loop or go terminal"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
+        assert_eq!(
+            body["choices"][0]["message"]["content"].as_str(),
+            Some("hello after retry")
+        );
+
+        let primary_posts = chat_post_bodies(&primary).await.len();
+        assert_eq!(
+            primary_posts, 2,
+            "the 429 must exit the shrink loop immediately (overflow POST + one retry)"
+        );
+        let fallback_posts = chat_post_bodies(&fallback).await.len();
+        assert_eq!(fallback_posts, 1, "the fallback serves the turn");
+    }
+
+    /// A context-window overflow that PERSISTS with an UNCHANGED reported input
+    /// stalls the budget (the recomputation yields the same value that was just
+    /// rejected): the no-progress guard must exit terminal after the second
+    /// POST rather than re-sending an identical request, and the failover
+    /// client must NOT re-send the oversized prompt to the next provider.
     #[tokio::test]
     async fn persistent_overflow_after_retry_does_not_fail_over_to_next_provider() {
         let primary = MockServer::start().await;
@@ -616,7 +866,8 @@ mod integration {
             .mount(&primary)
             .await;
 
-        // Primary returns a context-overflow on BOTH the first POST and the retry.
+        // Primary returns the SAME context-overflow body on every POST, so the
+        // second recomputation makes no progress (identical budget).
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
@@ -688,34 +939,225 @@ mod integration {
             "error should describe the persistent overflow, got: {body}"
         );
 
-        // Primary saw exactly the original POST plus one retry.
-        let primary_posts = primary
-            .received_requests()
-            .await
-            .expect("primary requests")
-            .into_iter()
-            .filter(|request| {
-                request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-            })
-            .count();
+        // Primary saw the original POST plus exactly one retry: the unchanged
+        // reported input stalls the budget, and the no-progress guard stops the loop.
+        let primary_posts = chat_post_bodies(&primary).await.len();
         assert_eq!(
             primary_posts, 2,
-            "primary should get exactly one shrink-and-retry (2 POSTs)"
+            "a stalled budget must stop after one shrink-and-retry (2 POSTs)"
         );
 
         // The fallback provider must NEVER have been contacted.
-        let fallback_posts = fallback
-            .received_requests()
-            .await
-            .expect("fallback requests")
-            .into_iter()
-            .filter(|request| {
-                request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
-            })
-            .count();
+        let fallback_posts = chat_post_bodies(&fallback).await.len();
         assert_eq!(
             fallback_posts, 0,
             "a same-provider context overflow must NOT fail over to the next provider"
+        );
+    }
+
+    /// A reported input that keeps GROWING always promises progress, so only
+    /// the attempt cap stops the loop: after 4 total upstream POSTs the leaf
+    /// must go terminal ("persisted") — a 5th send that would have succeeded
+    /// must never happen.
+    #[tokio::test]
+    async fn unconverging_bound_exhausts_attempt_cap() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "test-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        // Four overflow rounds whose reported input grows each time; every
+        // recomputation still makes strict progress, so only the cap can stop
+        // the loop. ctx=524288, safety=8:
+        //   input 300000 -> budget 224280
+        //   input 350000 -> budget 174280
+        //   input 400000 -> budget 124280
+        //   input 450000 -> (4th attempt: cap reached, terminal)
+        for (index, input_tokens) in [300000, 350000, 400000, 450000].into_iter().enumerate() {
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(400).set_body_string(format!(
+                    "This model's maximum context length is 524288 tokens. However, you \
+                     requested 250000 output tokens and your prompt contains {input_tokens} \
+                     input tokens."
+                )))
+                .up_to_n_times(1)
+                .with_priority((index + 1) as u8)
+                .mount(&server)
+                .await;
+        }
+
+        // A 5th POST would hit this 200 — the cap must prevent it.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(chat_sse_body()),
+            )
+            .with_priority(5)
+            .mount(&server)
+            .await;
+
+        let app = llmconduit::build_app(config_for(&server.uri()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "stream": false,
+                            "max_tokens": 250000,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(
+            response.status().as_u16(),
+            502,
+            "cap exhaustion is terminal"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("read body");
+        let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("persisted after shrink-and-retry")),
+            "cap exhaustion should surface the persisted-overflow terminal, got: {body}"
+        );
+
+        let chat_requests = chat_post_bodies(&server).await;
+        assert_eq!(
+            chat_requests.len(),
+            4,
+            "attempts are capped at 4 total upstream POSTs"
+        );
+        let budgets: Vec<i64> = chat_requests
+            .iter()
+            .map(|request| request["max_tokens"].as_i64().expect("max_tokens"))
+            .collect();
+        assert_eq!(
+            budgets,
+            vec![250000, 224280, 174280, 124280],
+            "each capped round re-budgets from the LATEST reported input"
+        );
+    }
+
+    /// A configured `upstream_chat_kwargs` max-token ALIAS (`max_completion_tokens`)
+    /// flows into the request `extra_body` when the caller sends no max-token
+    /// field. On a context-overflow retry the leaf shrinks the typed
+    /// `max_output_tokens` (serialized as `max_tokens`) but must also STRIP the
+    /// stale alias so the upstream cannot honor the oversized value and defeat the
+    /// retry. The retried body must carry only the reduced `max_tokens` and none
+    /// of the max-token aliases.
+    #[tokio::test]
+    async fn retry_strips_max_token_aliases_from_extra_body() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id": "test-model"}]
+            })))
+            .mount(&server)
+            .await;
+
+        // First chat POST -> context-limit 400. ctx=65536, input=1000,
+        // safety=8 => reduced budget = 65536 - 8 - 1000 = 64528.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "This model's maximum context length is 65536 tokens. However, you requested \
+                 250000 output tokens and your prompt contains 1000 input tokens.",
+            ))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(chat_sse_body()),
+            )
+            .with_priority(2)
+            .mount(&server)
+            .await;
+
+        let mut config = config_for(&server.uri());
+        // A configured max-token alias default. Because the caller sends no
+        // max-token field, the engine leaves this in the request extra_body, so
+        // the leaf retry sees a stale alias that must be stripped.
+        config.upstream_chat_kwargs =
+            serde_json::Map::from_iter([("max_completion_tokens".to_string(), json!(250000))]);
+
+        let app = llmconduit::build_app(config);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "test-model",
+                            "stream": false,
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status().as_u16(), 200, "turn should succeed");
+
+        let chat_requests = chat_post_bodies(&server).await;
+        assert_eq!(
+            chat_requests.len(),
+            2,
+            "expected exactly one shrink-and-retry"
+        );
+
+        // First attempt: the configured alias is present (no typed field yet).
+        assert_eq!(
+            chat_requests[0]["max_completion_tokens"].as_i64(),
+            Some(250000),
+            "first attempt carries the configured alias default"
+        );
+
+        // Retry: only the reduced typed `max_tokens` survives; every alias is gone.
+        let retried = &chat_requests[1];
+        assert_eq!(
+            retried["max_tokens"].as_i64(),
+            Some(64528),
+            "retry carries the reduced completion budget on the typed field"
+        );
+        assert!(
+            retried.get("max_completion_tokens").is_none(),
+            "retry must strip the stale max_completion_tokens alias"
+        );
+        assert!(
+            retried.get("max_output_tokens").is_none(),
+            "retry must not leak a max_output_tokens alias"
         );
     }
 
@@ -737,7 +1179,7 @@ mod integration {
             .await;
 
         // First chat POST -> context-limit 400. ctx=65536, input=1000,
-        // margin=100 => reduced budget = 65536 - 100 - 1000 = 64436.
+        // safety=8 => reduced budget = 65536 - 8 - 1000 = 64528.
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
@@ -810,7 +1252,7 @@ mod integration {
         let retried: Value = serde_json::from_str(lines[1]).expect("retried logged request");
         assert_eq!(
             retried["max_tokens"].as_i64(),
-            Some(64436),
+            Some(64528),
             "second logged request carries the reduced retry budget"
         );
 

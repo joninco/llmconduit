@@ -116,12 +116,14 @@ fn stamp_header_byte(serving: Option<&Arc<ServingToken>>) {
 /// request-intrinsic 4xx (`{400,413,415,422}`, `dispatch_chat_stream`) `Terminal` so
 /// failover/cooldown skip it, but the DASHBOARD taxonomy must still show that case as
 /// `HttpStatus` (it IS a genuine upstream HTTP-status response) — `AttemptErrorClass::
-/// Terminal` stays reserved for a context-window overflow that survived shrink-and-retry,
-/// whose message (`"upstream context-window overflow persisted …"`) never matches the
-/// `"upstream chat failed with "` prefix below. Checking the fixed prefixes BEFORE the
-/// disposition fallback lets the SAME message-shape drive the SAME `HttpStatus` code
-/// regardless of disposition, while the two Terminal producers stay classified
-/// differently: request-intrinsic 4xx → `HttpStatus` (via the prefix match), persisted
+/// Terminal` stays reserved for a context-window overflow the leaf could not resolve —
+/// persisted after the shrink-retry loop, or a prompt that alone exceeds the window —
+/// whose messages (`"upstream context-window overflow persisted …"`, `"upstream input
+/// exceeds the context window: …"`) never match the `"upstream chat failed with "`
+/// prefix below. Checking the fixed prefixes BEFORE the disposition fallback lets the
+/// SAME message-shape drive the SAME `HttpStatus` code regardless of disposition, while
+/// the Terminal producers stay classified differently: request-intrinsic 4xx →
+/// `HttpStatus` (via the prefix match), unresolved
 /// overflow → `Terminal` (via the fallback, nothing else matches its message). Only
 /// `failover_reason` (`AttemptFailoverReason::TerminalNoFailover`, set by the callers
 /// below) distinguishes "terminal, no failover" from an ordinary failover-eligible
@@ -173,9 +175,10 @@ fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptError
         return AttemptErrorClass::Stream;
     }
     // Nothing above matched: a `Terminal` disposition reaching here is the OTHER
-    // Terminal producer — a context-window overflow that survived shrink-and-retry
-    // (its message never matches the `"upstream chat failed with "` prefix above, so it
-    // falls through to here rather than being caught as `HttpStatus`).
+    // Terminal producer — a context-window overflow the leaf could not resolve
+    // (persisted after the shrink-retry loop, or a prompt that alone exceeds the window;
+    // neither message matches the `"upstream chat failed with "` prefix above, so both
+    // fall through to here rather than being caught as `HttpStatus`).
     if err.failover_disposition() == FailoverDisposition::Terminal {
         return AttemptErrorClass::Terminal;
     }
@@ -507,7 +510,9 @@ pub struct ReqwestUpstreamClient {
     request_logger: Option<UpstreamRequestLogger>,
     flatten_content: bool,
     /// Floor for the shrink-and-retry completion budget on a context-window
-    /// overflow (G1). A retry never reduces `max_completion_tokens` below this.
+    /// overflow (G1). A retry never sends a budget below this; when even the
+    /// floor cannot fit beside the backend-REPORTED input, the leaf goes
+    /// terminal ("reduce the prompt") instead of retrying.
     min_completion_tokens: i64,
     /// Per-frame byte ceiling for the upstream SSE read path (G6 DoS guard).
     /// Bounds bytes accumulated between event boundaries so a hostile/buggy
@@ -1337,7 +1342,7 @@ impl ReqwestUpstreamClient {
     async fn dispatch_chat_stream(
         &self,
         url: &Url,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
         response_id: Option<&str>,
         serving: Option<&Arc<ServingToken>>,
         capture: Option<&Arc<TurnCaptureState>>,
@@ -1357,138 +1362,148 @@ impl ReqwestUpstreamClient {
         if let Some(capture) = capture {
             capture.reset_upstream_response();
         }
-        // First attempt. On a non-2xx whose body indicates a context/completion
-        // token-limit overflow, shrink `max_completion_tokens` and retry ONCE.
-        // This happens before any SSE chunk is parsed/yielded downstream, so it
-        // can never duplicate already-streamed tokens, and it stays inside the
-        // leaf client so the failover/routing layers never see a context-limit
-        // error as a provider failure (it is a same-provider shrink-and-retry).
-        let response = self
-            .logged_send_chat_request(url, &request, response_id, capture)
-            .await?;
-        // Gap 03 round-1 review (F1): the upstream response HEADERS just arrived — this is
-        // the TRUE on-wire first-byte time. Stamp it BEFORE inspecting the status, so a
-        // non-2xx (HTTP-status failure) attempt carries a measured wire byte time too, not
-        // `None`. A connect/timeout-before-response never reaches here (`?` above
-        // propagated the transport error), so the slot stays `None` for those.
-        stamp_header_byte(serving);
-        let status = response.status();
-        if status.is_success() {
-            return stream_success_response(response, self.max_sse_frame_bytes, capture.cloned())
-                .await;
-        }
-
-        let body = response.text().await.unwrap_or_default();
-        if let Some(retry) = classify_context_overflow(
-            &body,
-            self.min_completion_tokens,
-            Some(estimate_leaf_input_tokens(&request)),
-        ) {
-            let mut retried = request.clone();
-            retried.max_output_tokens = Some(retry.max_completion_tokens);
-            // The reduced budget lives on the typed `max_output_tokens` field
-            // (serialized as `max_tokens`). Any max-token ALIAS that flowed into
-            // `extra_body` (`max_tokens`, `max_completion_tokens`,
-            // `max_output_tokens`) would serialize alongside and let the upstream
-            // honor the stale oversized value, defeating the retry. Mirror the
-            // engine's "explicit field removes conflicting default keys" rule and
-            // strip them so only the reduced typed field applies.
-            remove_max_token_aliases(&mut retried.extra_body);
-            tracing::warn!(
-                reason = retry.reason,
-                ctx_limit = retry.ctx_limit,
-                input_tokens = retry.input_tokens.unwrap_or(0),
-                input_is_lower_bound = retry.input_tokens_is_lower_bound,
-                new_max_completion_tokens = retry.max_completion_tokens,
-                "upstream context-window overflow; retrying once with reduced completion budget"
-            );
-            // D2/F1d: the retry is the body that ACTUALLY goes on the wire on the
-            // shrink path, so BOTH captures (D2's `upstream_body`, F1d's
-            // `upstream_request` section) must reflect the shrunk request (same
-            // `response_id`; F1d is last-writer-wins so this overwrites the first
-            // oversized attempt's write — AC-10).
-            let retry_response = self
-                .logged_send_chat_request(url, &retried, response_id, capture)
+        // G1: on a non-2xx whose body indicates a context/completion token-limit
+        // overflow, shrink `max_completion_tokens` and retry — a bounded CONVERGENCE
+        // loop (≤ CONTEXT_OVERFLOW_MAX_ATTEMPTS total sends) that re-budgets from
+        // each error's LATEST reported input. One shrink is provably not enough:
+        // vLLM's "at least N input tokens" is a lower bound DERIVED from the
+        // request (`ctx − max_tokens + 1`), so it tightens by exactly the shrunk
+        // amount on the next attempt and budgeting from the FIRST error's loose
+        // bound loses by one token no matter the margin. Each round must make
+        // strict progress (a smaller budget than the one just rejected), so the
+        // loop converges or exits terminal; upstream prefix caching makes the
+        // re-sent prompt cheap. Every retry happens before any SSE chunk is
+        // parsed/yielded downstream, so it can never duplicate already-streamed
+        // tokens, and it stays inside the leaf client so the failover/routing
+        // layers never see a context-limit error as a provider failure. The whole
+        // loop runs inside the engine's cancellable per-round `select!`, so a
+        // client hang-up mid-loop aborts it.
+        let mut last_sent_budget = request.max_output_tokens;
+        let mut attempt = 1_usize;
+        loop {
+            // D2/F1d: every re-send goes through the same logged path, so BOTH
+            // captures (D2's `upstream_body`, F1d's `upstream_request` section)
+            // reflect the body that ACTUALLY went on the wire (same `response_id`;
+            // F1d is last-writer-wins so each round overwrites the previous
+            // attempt's write — AC-10).
+            let response = self
+                .logged_send_chat_request(url, &request, response_id, capture)
                 .await?;
-            let retry_status = retry_response.status();
-            if retry_status.is_success() {
+            // Gap 03 round-1 review (F1): the upstream response HEADERS just arrived —
+            // this is the TRUE on-wire first-byte time. Stamp it BEFORE inspecting the
+            // status, so a non-2xx (HTTP-status failure) attempt carries a measured wire
+            // byte time too, not `None`. A connect/timeout-before-response never reaches
+            // here (`?` above propagated the transport error), so the slot stays `None`
+            // for those.
+            stamp_header_byte(serving);
+            let status = response.status();
+            if status.is_success() {
                 return stream_success_response(
-                    retry_response,
+                    response,
                     self.max_sse_frame_bytes,
                     capture.cloned(),
                 )
                 .await;
             }
-            // The retry ALSO failed. If it is again a context overflow, this is a
-            // same-provider sizing problem, not a provider failure: surface a
-            // TERMINAL error so `FailoverUpstreamClient`/routing does NOT retry
-            // the same oversized prompt on another provider (only one shrink-and-
-            // retry is allowed; we do not loop). Any other non-2xx is a normal
-            // (failover-eligible) upstream error.
-            let retry_body = retry_response.text().await.unwrap_or_default();
-            // Gap 05: the RETRY is the body that actually ended the turn on the
-            // shrink-and-retry path — stage IT (last-writer-wins over the first
-            // attempt's body) so the dashboard shows the upstream's final word.
-            // F1e also stages it onto the turn-capture handle.
-            self.capture_upstream_response_body(serving, capture, &retry_body);
-            if classify_context_overflow(
-                &retry_body,
-                self.min_completion_tokens,
-                Some(estimate_leaf_input_tokens(&retried)),
-            )
-            .is_some()
-            {
+
+            let body = response.text().await.unwrap_or_default();
+            let overflow =
+                classify_context_overflow(&body, Some(estimate_leaf_input_tokens(&request)));
+            let Some(overflow) = overflow else {
+                // Not an overflow — either the first attempt failed outright, or a shrink
+                // fixed the size but the request is unacceptable for another reason (E2a).
+                // Gap 05: stage the upstream error body so the operator can see why the
+                // turn failed (cleared if a later failover provider serves; committed at
+                // finalize otherwise). F1e also stages it onto the turn-capture handle.
+                // E2a: request-intrinsic 4xx {400,413,415,422} → never cools or fails over
+                // a healthy provider (the request itself is unacceptable to any equivalent
+                // backend; e.g. an image reaching a text-only upstream).
+                // 401/403/404/408/429/5xx keep the default `Failover` disposition,
+                // unchanged.
+                self.capture_upstream_response_body(serving, capture, &body);
+                let disposition = if status_is_request_intrinsic_4xx(status) {
+                    FailoverDisposition::FailoverNoCooldown
+                } else {
+                    FailoverDisposition::Failover
+                };
                 return Err(AppError::upstream_with_disposition(
                     format!(
-                        "upstream context-window overflow persisted after shrink-and-retry; \
-                         failed with {retry_status}: {}",
-                        redact_and_truncate_error_body(&retry_body, 500)
+                        "upstream chat failed with {status}: {}",
+                        redact_and_truncate_error_body(&body, 500)
+                    ),
+                    disposition,
+                ));
+            };
+
+            let mut available = overflow.available_completion_tokens;
+            if overflow.reason == "completion_limit" {
+                // The output-only `max_model_len` shape reports no input size, so
+                // `available` rests on the coarse byte ESTIMATE. Never go terminal off an
+                // estimate — floor it and retry; if the prompt truly cannot fit, the next
+                // error is a context-limit shape whose PARSED input drives the real
+                // decision below.
+                available = available.max(self.min_completion_tokens);
+            } else if available < self.min_completion_tokens {
+                // The backend-reported input alone (a lower bound at worst — the true
+                // prompt is only bigger) leaves less than the configured minimum
+                // completion budget: no output shrink can fix this request. Terminal for
+                // the same reason as the persisted case — re-sending the same oversized
+                // prompt to another provider would overflow identically.
+                self.capture_upstream_response_body(serving, capture, &body);
+                return Err(AppError::upstream_with_disposition(
+                    format!(
+                        "upstream input exceeds the context window: the prompt alone is at \
+                         least {} of {} tokens, leaving less than the minimum completion \
+                         budget ({}); reduce the prompt. Upstream said {status}: {}",
+                        overflow.input_tokens.unwrap_or(0),
+                        overflow.ctx_limit,
+                        self.min_completion_tokens,
+                        redact_and_truncate_error_body(&body, 500)
                     ),
                     FailoverDisposition::Terminal,
                 ));
             }
-            // E2a: the retry's status might not be an overflow at all (the shrink fixed
-            // the size but the request is unacceptable for another reason) — a
-            // request-intrinsic 4xx {400,413,415,422} still must not cool/failover a
-            // healthy provider. Every other status (401/403/404/408/429/5xx) keeps the
-            // default `Failover` disposition, unchanged.
-            let retry_disposition = if status_is_request_intrinsic_4xx(retry_status) {
-                FailoverDisposition::FailoverNoCooldown
-            } else {
-                FailoverDisposition::Failover
-            };
-            return Err(AppError::upstream_with_disposition(
-                format!(
-                    "upstream chat failed with {retry_status}: {}",
-                    redact_and_truncate_error_body(&retry_body, 500)
-                ),
-                retry_disposition,
-            ));
-        }
 
-        // Gap 05: a first-attempt non-2xx that did NOT trigger a context-overflow retry
-        // — stage the upstream error body so the operator can see why the turn failed (it
-        // is cleared if a later failover provider serves; committed at finalize otherwise).
-        // F1e also stages it onto the turn-capture handle (final failed HTTP body).
-        self.capture_upstream_response_body(serving, capture, &body);
-        // E2a: request-intrinsic 4xx {400,413,415,422} → `Terminal` (never cools or fails
-        // over a healthy provider — the request itself is unacceptable to any equivalent
-        // backend; e.g. an image reaching a text-only upstream). 401/403/404/408/429/5xx
-        // keep the default `Failover` disposition, unchanged. The `== Terminal`
-        // gate in the failover loop (`stream_chat_completion_with_provider_indices`) then
-        // skips `mark_failure` for this case — no cooldown, no failover.
-        let disposition = if status_is_request_intrinsic_4xx(status) {
-            FailoverDisposition::FailoverNoCooldown
-        } else {
-            FailoverDisposition::Failover
-        };
-        Err(AppError::upstream_with_disposition(
-            format!(
-                "upstream chat failed with {status}: {}",
-                redact_and_truncate_error_body(&body, 500)
-            ),
-            disposition,
-        ))
+            // Strict progress required: a recomputed budget that is not smaller than the
+            // one just rejected would re-send a request the backend already refused
+            // (e.g. a floored `completion_limit` estimate that stopped shrinking). Same
+            // terminal as attempt exhaustion: a same-provider sizing problem, not a
+            // provider failure — `FailoverUpstreamClient`/routing must NOT retry the
+            // same oversized prompt on another provider.
+            let no_progress = last_sent_budget.is_some_and(|sent| available >= sent);
+            if no_progress || attempt >= CONTEXT_OVERFLOW_MAX_ATTEMPTS {
+                self.capture_upstream_response_body(serving, capture, &body);
+                return Err(AppError::upstream_with_disposition(
+                    format!(
+                        "upstream context-window overflow persisted after shrink-and-retry; \
+                         failed with {status}: {}",
+                        redact_and_truncate_error_body(&body, 500)
+                    ),
+                    FailoverDisposition::Terminal,
+                ));
+            }
+
+            // The reduced budget lives on the typed `max_output_tokens` field
+            // (serialized as `max_tokens`). Any max-token ALIAS that flowed into
+            // `extra_body` (`max_tokens`, `max_completion_tokens`, `max_output_tokens`)
+            // would serialize alongside and let the upstream honor the stale oversized
+            // value, defeating the retry. Mirror the engine's "explicit field removes
+            // conflicting default keys" rule and strip them so only the reduced typed
+            // field applies.
+            request.max_output_tokens = Some(available);
+            remove_max_token_aliases(&mut request.extra_body);
+            tracing::warn!(
+                attempt,
+                reason = overflow.reason,
+                ctx_limit = overflow.ctx_limit,
+                input_tokens = overflow.input_tokens.unwrap_or(0),
+                input_is_lower_bound = overflow.input_tokens_is_lower_bound,
+                new_max_completion_tokens = available,
+                "upstream context-window overflow; retrying with reduced completion budget"
+            );
+            last_sent_budget = Some(available);
+            attempt += 1;
+        }
     }
 }
 
@@ -4239,24 +4254,34 @@ fn should_proxy_request_header(name: &HeaderName) -> bool {
 }
 
 /// Small fixed reserve subtracted from the context window when recomputing the
-/// completion budget for an exact-token overflow error.
-const CONTEXT_RETRY_MARGIN: i64 = 100;
-/// Larger reserve used when the reported input-token count is only a lower
-/// bound (vLLM's "prompt contains at least N input tokens"). The real prompt is
-/// at least that large, so a wider margin avoids chasing a one-token-over
-/// boundary across retries.
-const CONTEXT_LOWER_BOUND_RETRY_MARGIN: i64 = 1024;
+/// completion budget from an overflow error's reported input count. Deliberately
+/// tiny: backends reject only `input + output > ctx` (an exact fit passes), and
+/// the shrink loop in `dispatch_chat_stream` re-budgets from each error's LATEST
+/// reported input, so convergence comes from the loop, not from a fat margin.
+/// (The retired one-shot design leaned on a 1024-token lower-bound margin; vLLM's
+/// "at least N" input is DERIVED from the request — `ctx − max_tokens + 1` — so it
+/// tightens by exactly the shrunk amount on the next attempt and any fixed margin
+/// loses by one token. That was the live failure the loop replaces.)
+const CONTEXT_RETRY_SAFETY_TOKENS: i64 = 8;
 
-/// A structured decision to retry an upstream request after a context/
-/// completion token-limit overflow, carrying the recomputed completion budget.
+/// Total upstream sends allowed per dispatch while converging on a context
+/// overflow (the first attempt plus up to N−1 shrink retries). vLLM's derived
+/// lower bound typically tightens to the true count in one extra round; the cap
+/// only bounds a pathological backend whose reported input never converges.
+const CONTEXT_OVERFLOW_MAX_ATTEMPTS: usize = 4;
+
+/// A parsed context/completion token-limit overflow, carrying the recomputed
+/// completion budget for the next shrink attempt.
 ///
-/// `max_completion_tokens` is already clamped to the configured minimum floor;
-/// callers reduce the request's `max_completion_tokens` to this value and retry
-/// exactly once.
+/// `available_completion_tokens` is UNCLAMPED (`ctx_limit − SAFETY − input`; may
+/// be ≤ 0 or below the configured floor). Policy lives at the call site
+/// (`dispatch_chat_stream`): a parsed input that leaves less than the floor goes
+/// terminal ("reduce the prompt") instead of retrying, while the estimate-based
+/// `completion_limit` shape is floored — never terminal off an estimate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextOverflowRetry {
-    /// Recomputed `max_completion_tokens` for the retry (>= the min floor).
-    pub max_completion_tokens: i64,
+    /// Recomputed completion budget for the next attempt (unclamped).
+    pub available_completion_tokens: i64,
     /// The model's context window as reported by the error body.
     pub ctx_limit: i64,
     /// Input/prompt tokens parsed from the error body, when available.
@@ -4267,19 +4292,8 @@ pub struct ContextOverflowRetry {
     pub input_tokens_is_lower_bound: bool,
 }
 
-fn context_retry_completion_budget(
-    ctx_limit: i64,
-    input_tokens: Option<i64>,
-    min_completion_tokens: i64,
-    input_tokens_is_lower_bound: bool,
-) -> i64 {
-    let margin = if input_tokens_is_lower_bound {
-        CONTEXT_LOWER_BOUND_RETRY_MARGIN
-    } else {
-        CONTEXT_RETRY_MARGIN
-    };
-    let available = ctx_limit - margin - input_tokens.unwrap_or(0);
-    available.max(min_completion_tokens)
+fn context_retry_completion_budget(ctx_limit: i64, input_tokens: Option<i64>) -> i64 {
+    ctx_limit - CONTEXT_RETRY_SAFETY_TOKENS - input_tokens.unwrap_or(0)
 }
 
 /// vLLM/SGLang output-only limit:
@@ -4371,7 +4385,7 @@ static REQUESTED_TOTAL_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// the leaf POSTs for `request`, mirroring `engine::estimate_input_tokens`.
 /// Used only by the G1 reactive retry's `COMPLETION_LIMIT_RE` shape (an
 /// output-only `max_model_len` error that reports the context window but NOT
-/// the prompt size); without it the retry budget would be `ctx_limit - margin`,
+/// the prompt size); without it the retry budget would be `ctx_limit - safety`,
 /// ignoring the prompt and re-overflowing. `ceil(serialized_bytes / 4)` is the
 /// same ~4-bytes-per-token heuristic the engine uses — not a tokenizer. It
 /// runs on the sanitized, post-`finalize_request_for_backend` request, so it
@@ -4383,7 +4397,8 @@ fn estimate_leaf_input_tokens(request: &ChatCompletionRequest) -> i64 {
 }
 
 /// Parse a non-streaming upstream error body for a context/completion
-/// token-limit overflow and compute the reduced completion budget for a retry.
+/// token-limit overflow and compute the (unclamped) completion budget for the
+/// next shrink attempt; floor/terminal policy stays with the caller.
 ///
 /// Returns `None` for any error text that is not a recognizable token-limit
 /// overflow, so the original error is surfaced unchanged (no retry).
@@ -4400,18 +4415,15 @@ fn estimate_leaf_input_tokens(request: &ChatCompletionRequest) -> i64 {
 /// extracted from the capture groups (commas stripped before parsing).
 pub fn classify_context_overflow(
     error_body: &str,
-    min_completion_tokens: i64,
     estimated_input_tokens: Option<i64>,
 ) -> Option<ContextOverflowRetry> {
     // vLLM/SGLang output-only limit (group 2 = max_model_len = ctx limit).
     if let Some(captures) = COMPLETION_LIMIT_RE.captures(error_body) {
         let ctx_limit = parse_token_count(&captures[2]);
         return Some(ContextOverflowRetry {
-            max_completion_tokens: context_retry_completion_budget(
+            available_completion_tokens: context_retry_completion_budget(
                 ctx_limit,
                 estimated_input_tokens,
-                min_completion_tokens,
-                false,
             ),
             ctx_limit,
             input_tokens: estimated_input_tokens,
@@ -4430,11 +4442,9 @@ pub fn classify_context_overflow(
         let input_tokens = parse_token_count(&captures[4]);
         let is_lower_bound = captures.name("lower_bound").is_some();
         return Some(ContextOverflowRetry {
-            max_completion_tokens: context_retry_completion_budget(
+            available_completion_tokens: context_retry_completion_budget(
                 ctx_limit,
                 Some(input_tokens),
-                min_completion_tokens,
-                is_lower_bound,
             ),
             ctx_limit,
             input_tokens: Some(input_tokens),
@@ -4452,11 +4462,9 @@ pub fn classify_context_overflow(
         let ctx_limit = parse_token_count(&captures[1]);
         let input_tokens = parse_token_count(&captures[3]);
         return Some(ContextOverflowRetry {
-            max_completion_tokens: context_retry_completion_budget(
+            available_completion_tokens: context_retry_completion_budget(
                 ctx_limit,
                 Some(input_tokens),
-                min_completion_tokens,
-                false,
             ),
             ctx_limit,
             input_tokens: Some(input_tokens),
@@ -6752,7 +6760,7 @@ mod tests {
         let client = d2_capturing_client(&server.uri(), store.clone());
 
         let mut request = family_request("served-model");
-        // Oversized budget that the shrink path will reduce. 202752 - 100 - 139000.
+        // Oversized budget that the shrink path will reduce. 202752 - 8 - 139000.
         request.max_output_tokens = Some(64000);
         let backend = BackendChatRequest::new(
             request,
@@ -6776,8 +6784,8 @@ mod tests {
             serde_json::from_slice(body).expect("captured retry body is valid JSON");
         assert_eq!(
             value["max_tokens"],
-            json!(63652),
-            "captured body is the SHRUNK retry body (202752-100-139000), not the 64000 first attempt: {value}"
+            json!(63744),
+            "captured body is the SHRUNK retry body (202752-8-139000), not the 64000 first attempt: {value}"
         );
         // FULL equality on the shrink-retry path (R1 #3): wiremock saw TWO POSTs —
         // the oversized first attempt and the shrunk retry. The captured body must
@@ -6960,7 +6968,7 @@ mod tests {
         state.write_inbound_request(b"{}");
 
         let mut request = family_request("served-model");
-        // Oversized budget that the shrink path will reduce (202752-100-139000).
+        // Oversized budget that the shrink path will reduce (202752-8-139000).
         request.max_output_tokens = Some(64000);
         // Redaction probe (AC-10): a secret + an image URI both present on the
         // SAME request that actually goes on the wire for BOTH attempts.
@@ -6988,7 +6996,7 @@ mod tests {
         let artifact = wait_for_turn_capture_artifact(&dir, "api_ac10").await;
         let section = &artifact["sections"]["upstream_request"];
         assert_eq!(
-            section["content"]["max_tokens"], 63652,
+            section["content"]["max_tokens"], 63744,
             "captured upstream_request is the SHRUNK retry, not the first 64000 attempt: {section}"
         );
         let content_str = section["content"].to_string();

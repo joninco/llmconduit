@@ -10640,7 +10640,7 @@ async fn f1d_ac10_gateway_e2e_upstream_request_is_shrunk_final_request() {
     let artifact = wait_for_only_artifact(&capture_dir).await;
     let section = &artifact["sections"]["upstream_request"];
     assert_eq!(
-        section["content"]["max_tokens"], 63652,
+        section["content"]["max_tokens"], 63744,
         "engine-wired capture end-to-end reflects the SHRUNK retry, not the first \
          oversized attempt: {section}"
     );
