@@ -9,25 +9,26 @@ describe('bootstrap parsing — frozen field names (finding 6)', () => {
       authenticated: true,
       csrf_token: 'csrf-abc123',
       mutations_enabled: true,
+      schema_version: 2,
     });
   });
 
-  it('defaults safely for an UNAUTHENTICATED bootstrap', () => {
-    expect(parseBootstrap({ authenticated: false, csrf_token: null, mutations_enabled: false })).toEqual({
-      authenticated: false,
-      csrf_token: null,
-      mutations_enabled: false,
-    });
+  it('accepts only the server-authored schema-v2 bootstrap', () => {
+    expect(
+      parseBootstrap({
+        authenticated: true,
+        csrf_token: 'csrf',
+        mutations_enabled: false,
+        schema_version: 2,
+      }),
+    ).toEqual({ authenticated: true, csrf_token: 'csrf', mutations_enabled: false, schema_version: 2 });
   });
 
-  it('coerces ill-typed / missing fields to safe defaults (no crash, no silent mutations)', () => {
-    expect(parseBootstrap({})).toEqual({ authenticated: false, csrf_token: null, mutations_enabled: false });
-    expect(parseBootstrap(null)).toEqual({ authenticated: false, csrf_token: null, mutations_enabled: false });
-    // A truthy-but-not-true `authenticated` must NOT authenticate; a non-string token → null.
-    expect(parseBootstrap({ authenticated: 'yes', csrf_token: 123, mutations_enabled: 1 })).toEqual({
-      authenticated: false,
-      csrf_token: null,
-      mutations_enabled: false,
-    });
+  it('surfaces malformed contracts instead of silently coercing them', () => {
+    expect(() => parseBootstrap({})).toThrow(/contract validation failed/);
+    expect(() => parseBootstrap(null)).toThrow(/contract validation failed/);
+    expect(() =>
+      parseBootstrap({ authenticated: 'yes', csrf_token: 123, mutations_enabled: 1, schema_version: 2 }),
+    ).toThrow(/contract validation failed/);
   });
 });

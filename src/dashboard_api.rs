@@ -43,8 +43,13 @@ use crate::dashboard_ws::TopologyNode;
 use crate::dashboard_ws::TopologySnapshot;
 use crate::engine::Gateway;
 use crate::metrics::MetricsView;
+use crate::metrics::OverviewAggregate;
+use crate::metrics::OverviewDataQuality;
+use crate::metrics::OverviewFilter;
+use crate::metrics::SnapshotHistoryMetadata;
 use crate::metrics::StatusClass;
 use crate::metrics::WindowReport;
+use crate::monitor::DebugSnapshot;
 use crate::monitor::DebugWsMessage;
 use crate::upstream::ProviderHealthSnapshot;
 use axum::extract::Path;
@@ -76,8 +81,10 @@ const WINDOW_1H_SECS: f64 = 3600.0;
 /// to match the frontend's optional-key validators, EXCEPT `usage` (serialized as
 /// `null` when absent — the frontend accepts absent/null/usage) and `cost`
 /// (`null`-not-absent when the served model has no configured price).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct FlowRow {
+    /// Per-flow optimistic-concurrency version from the authoritative FlowStore.
+    pub revision: u64,
     pub api_call_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
@@ -148,10 +155,11 @@ pub struct FlowRow {
 impl FlowRow {
     /// Build a row from a live [`FlowRecord`], pricing it via the gateway's price
     /// table keyed by the SERVED model (the backend that actually answered).
-    fn from_record(record: &FlowRecord, gateway: &Gateway) -> Self {
+    pub(crate) fn from_record(record: &FlowRecord, gateway: &Gateway) -> Self {
         let (cost, cost_confidence) =
             flow_cost_and_confidence(record.model_served.as_deref(), record.usage, gateway);
         Self {
+            revision: record.revision,
             api_call_id: record.api_call_id.clone(),
             response_id: record.response_id.clone(),
             method: record.method.clone(),
@@ -193,6 +201,7 @@ impl FlowRow {
         let (cost, cost_confidence) =
             flow_cost_and_confidence(summary.model_served.as_deref(), summary.usage, gateway);
         Self {
+            revision: summary.revision,
             api_call_id: summary.api_call_id.clone(),
             response_id: summary.response_id.clone(),
             method: summary.method.clone(),
@@ -224,7 +233,7 @@ impl FlowRow {
 
 /// `GET /dashboard/api/flows` — the paged flow list + total + the FlowStore
 /// domain cursor. Matches the frozen `FlowsResponse`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct FlowsResponse {
     pub flows: Vec<FlowRow>,
     /// Total rows AFTER filtering but BEFORE paging (so the SPA can page).
@@ -248,7 +257,7 @@ pub struct FlowsQuery {
 /// `{sequence, kind, payload?, ts_ms?}`. `payload` is the heterogeneous delta body
 /// (a segment text, an event summary, a status, …); the SPA narrows at the use
 /// site. `sequence` is a per-flow ordinal (the replay order), NOT a domain cursor.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct FlowDelta {
     pub sequence: u64,
     pub kind: String,
@@ -273,7 +282,7 @@ pub struct FlowDelta {
 /// enclosing [`FlowDetailBody`] stays serialize-only (it is only ever a response), so the
 /// round-trip is pinned on THIS self-contained sub-DTO. Consumed by gap 14 (failure
 /// taxonomy).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct FlowUpstreamResponse {
     /// The redacted, capped upstream response/error body, parsed to JSON (or a string
     /// `Value` for a non-JSON / marker body). An EMPTY captured body parses to a string
@@ -290,9 +299,10 @@ pub struct FlowUpstreamResponse {
 /// headers, the replayed deltas, usage, the terminal, and cost. Mirrors the frozen
 /// `FlowDetail` (`:id == api_call_id`). The three bodies, headers, and deltas are
 /// the additive detail fields over a [`FlowRow`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct FlowDetailBody {
     pub flow_seq: u64,
+    pub revision: u64,
     pub api_call_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
@@ -328,6 +338,13 @@ pub struct FlowDetailBody {
     pub upstream_target: Option<String>,
     pub usage: Option<FlowUsage>,
     pub status: FlowStatus,
+    /// Monitor-domain watermark of the single transcript snapshot used to build
+    /// `deltas`. [`FlowDelta::sequence`] remains a per-flow replay ordinal and is
+    /// intentionally NOT comparable to live `DebugUpdate.sequence` values. The SPA
+    /// appends only live monitor segments whose monitor sequence is strictly greater
+    /// than this watermark, so the replay/live seam neither duplicates nor drops
+    /// repeated or same-millisecond content.
+    pub deltas_through_monitor_seq: u64,
     pub deltas: Vec<FlowDelta>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_reason: Option<String>,
@@ -376,7 +393,7 @@ pub struct FlowDetailBody {
 /// The frontend renders `—` on `null`, NEVER `0`. Derives `Deserialize` alongside
 /// `Serialize` so the changed wire field round-trips in a test (AGENTS.md: no
 /// changed wire field without a deserialize-then-serialize proof).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CatalogEntry {
     pub id: String,
     /// The per-model max-context window (tokens), or `null`/absent when the
@@ -392,13 +409,17 @@ pub struct CatalogEntry {
 /// the frozen `SnapshotResponse`: the per-domain `cursors`, the cut instant, the
 /// body-free flow summaries (priced), and the metrics/topology cuts reshaped into
 /// their REST bodies (`null` when the cut is empty for that domain).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SnapshotResponse {
     pub cursors: SeqCursors,
     pub at_ms: u128,
     pub summaries: Vec<FlowRow>,
     pub metrics: Option<MetricsSnapshot>,
     pub topology: Option<TopologySnapshot>,
+    /// Bounds and memory use of the retained historical-cut ring.
+    pub history: SnapshotHistoryMetadata,
+    /// Whether this selected cut dropped its oldest flow summaries to fit the quota.
+    pub flow_summaries_truncated: bool,
 }
 
 /// Query param for `GET /dashboard/api/snapshot` — the wall-clock instant (unix
@@ -408,6 +429,54 @@ pub struct SnapshotResponse {
 #[derive(Debug, Default, Deserialize)]
 pub struct SnapshotQuery {
     pub at: Option<u64>,
+}
+
+/// Exact server-side Overview window. Kept to the three MetricsLayer ring spans so a
+/// live and historical request always selects the same retained population.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum OverviewWindow {
+    #[default]
+    M1,
+    M5,
+    H1,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OverviewQuery {
+    #[serde(default)]
+    pub window: OverviewWindow,
+    pub at: Option<u64>,
+    pub status: Option<String>,
+    pub model: Option<String>,
+    pub upstream: Option<String>,
+    pub client: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewScope {
+    pub window: OverviewWindow,
+    pub requested_at_ms: Option<u128>,
+    pub selected_at_ms: Option<u128>,
+    pub status: Option<String>,
+    pub model: Option<String>,
+    pub upstream: Option<String>,
+    pub client: Option<String>,
+}
+
+/// `GET /dashboard/api/overview`: an immutable exact-window rollup. The aggregate is
+/// flattened so the wire reads naturally (`totals`, `served_models`, `cost_series`, …)
+/// while the calculation remains owned by MetricsLayer for both live and historical
+/// cuts.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewResponse {
+    pub generated_at_ms: u128,
+    pub metrics_seq: u64,
+    pub scope: OverviewScope,
+    #[serde(flatten)]
+    pub aggregate: OverviewAggregate,
 }
 
 // ---------------------------------------------------------------------------
@@ -449,7 +518,7 @@ pub fn cost_for_usage(usage: FlowUsage, price: ModelPrice) -> f64 {
 /// every flow row + detail (and aggregated onto the metrics windows). Serializes
 /// snake_case to mirror the data-quality vocabulary the frontend already uses
 /// (`measured`/`derived`/`estimated`/`unavailable`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CostConfidence {
     /// The model is priced AND every billed token class has a known rate: the prompt
@@ -830,19 +899,6 @@ fn upstream_edge_rates(
     )
 }
 
-/// Count the flows currently OPEN (live streams) in the FlowStore — the
-/// `active_streams` tile value (the metrics rings count terminals, not liveness).
-/// `pub(crate)` so the live `/dashboard/ws` tick + initial snapshot derive the SAME
-/// open-flow count as the REST `/metrics` read (gap 01 — one source, no drift).
-pub(crate) fn active_stream_count(gateway: &Gateway) -> u64 {
-    gateway
-        .flow_store()
-        .list()
-        .iter()
-        .filter(|record| record.status == FlowStatus::Open)
-        .count() as u64
-}
-
 /// Count the OPEN flows in a FROZEN snapshot cut's body-free summaries — the
 /// `active_streams` value for a historical `/snapshot?at=` (D13 R1 HIGH). Reading the
 /// live FlowStore for a time-travel cut would report NOW's open count, not the cut's;
@@ -862,16 +918,20 @@ fn cut_active_stream_count(summaries: &[crate::dashboard_flow::SnapshotFlowSumma
 /// Replay the streamed deltas for a flow from the MonitorHub snapshot, filtered by
 /// the flow's `response_id` (the monitor keys transcript messages by the engine's
 /// response id, NOT the `api_call_id`). Returns an empty `Vec` when the flow has no
-/// linked `response_id` yet (nothing to correlate). Each matching `SegmentAppend`/
+/// linked `response_id` yet (nothing to correlate). The returned watermark is still
+/// the snapshot's `last_sequence`, so an empty replay cannot accidentally append
+/// pre-snapshot live history. Each matching `SegmentAppend`/
 /// `EventAppend`/`RequestStatus` becomes a [`FlowDelta`] in monitor order, with a
 /// per-flow `sequence` ordinal. `RequestUpsert`/`Usage`/`RequestRemove`/`Hello`/
 /// `SnapshotDone` are not per-token deltas (the row already carries usage/status),
-/// so they are skipped — the inspector wants the segment/event timeline.
-fn replay_deltas(response_id: Option<&str>, gateway: &Gateway) -> Vec<FlowDelta> {
+/// so they are skipped — the inspector wants the segment/event timeline. Taking the
+/// already-captured [`DebugSnapshot`] makes the replay and its monitor watermark one
+/// indivisible read; the handler must never fetch them separately.
+fn replay_deltas(response_id: Option<&str>, snapshot: DebugSnapshot) -> (Vec<FlowDelta>, u64) {
+    let through_monitor_seq = snapshot.last_sequence;
     let Some(response_id) = response_id else {
-        return Vec::new();
+        return (Vec::new(), through_monitor_seq);
     };
-    let snapshot = gateway.debug_snapshot();
     let mut deltas = Vec::new();
     let mut sequence = 0u64;
     for message in &snapshot.messages {
@@ -916,7 +976,7 @@ fn replay_deltas(response_id: Option<&str>, gateway: &Gateway) -> Vec<FlowDelta>
         deltas.push(delta);
         sequence += 1;
     }
-    deltas
+    (deltas, through_monitor_seq)
 }
 
 /// The snake_case wire string for a [`crate::monitor::DebugSegmentKind`] (matches
@@ -961,14 +1021,12 @@ pub async fn dashboard_flows(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<FlowsQuery>,
 ) -> Response {
-    let flow_seq = gateway.flow_store().flow_seq();
+    let (records, flow_seq) = gateway.flow_store().list_with_seq();
     let status_filter = query.status.as_deref().and_then(parse_status_filter);
     let model_filter = query.model.as_deref().map(str::to_ascii_lowercase);
     let upstream_filter = query.upstream.as_deref().map(str::to_ascii_lowercase);
 
-    let rows: Vec<FlowRow> = gateway
-        .flow_store()
-        .list()
+    let rows: Vec<FlowRow> = records
         .iter()
         .filter(|record| {
             status_filter.is_none_or(|status| record.status == status)
@@ -1020,7 +1078,11 @@ pub async fn dashboard_flow_detail(
         record.usage,
         gateway.as_ref(),
     );
-    let deltas = replay_deltas(record.response_id.as_deref(), gateway.as_ref());
+    // One MonitorHub snapshot supplies BOTH the replay and its coverage watermark.
+    // `FlowDelta.sequence` is only a per-flow ordinal; the separate monitor cursor is
+    // what lets the SPA place live `segment_append`s after this replay exactly.
+    let (deltas, deltas_through_monitor_seq) =
+        replay_deltas(record.response_id.as_deref(), gateway.debug_snapshot());
     let inbound_headers = if record.headers.is_empty() {
         None
     } else {
@@ -1034,6 +1096,7 @@ pub async fn dashboard_flow_detail(
     };
     let body = FlowDetailBody {
         flow_seq,
+        revision: record.revision,
         api_call_id: record.api_call_id.clone(),
         response_id: record.response_id.clone(),
         inbound_body: record.inbound_body.as_ref().map(parse_captured_body),
@@ -1057,6 +1120,7 @@ pub async fn dashboard_flow_detail(
         upstream_target: record.upstream_target.clone(),
         usage: record.usage,
         status: record.status,
+        deltas_through_monitor_seq,
         deltas,
         terminal_reason: record.terminal_reason.clone(),
         started_ms: record.started_ms,
@@ -1082,19 +1146,111 @@ pub async fn dashboard_flow_detail(
 /// seconds). The view + its cursor are captured in ONE metrics-lock hold so the
 /// body and `metrics_seq` are consistent.
 pub async fn dashboard_metrics(State(gateway): State<Arc<Gateway>>) -> Response {
-    let (view, metrics_seq) = gateway.metrics().view_with_seq();
-    let active = active_stream_count(gateway.as_ref());
-    let body = metrics_body(&view, metrics_seq, active, gateway.price_table());
+    let body = if let Some(cut) = gateway.metrics().latest_published_metrics() {
+        metrics_body(
+            &cut.view,
+            cut.cursors.metrics_seq,
+            cut.active_streams,
+            gateway.price_table(),
+        )
+    } else {
+        // A manually-constructed Gateway may omit the DI bootstrap publication. Return
+        // the explicit zero-sample/unavailable shape; never independently recompute a
+        // second presentation or allocate a cursor outside the process publisher.
+        metrics_body(&MetricsView::default(), 0, 0, gateway.price_table())
+    };
     json_no_store(StatusCode::OK, &body)
+}
+
+/// `GET /dashboard/api/overview?window=m1|m5|h1&at=&status=&model=&upstream=&client=`.
+/// Live reads consume the latest process-wide immutable metrics cut. Historical reads
+/// use the absolute nearest retained cut (ties prefer the older cut), including the terminal-time prices
+/// embedded in that cut; neither path consults the current flow list or reprices data.
+pub async fn dashboard_overview(
+    State(gateway): State<Arc<Gateway>>,
+    Query(query): Query<OverviewQuery>,
+) -> Response {
+    let (status, status_scope) = normalize_overview_status(query.status.as_deref());
+    let model = clean_overview_filter(query.model);
+    let upstream = clean_overview_filter(query.upstream);
+    let client = clean_overview_filter(query.client);
+    let filter = OverviewFilter {
+        status,
+        model: model.clone(),
+        upstream: upstream.clone(),
+        client: client.clone(),
+    };
+    let requested_at_ms = query.at.map(u128::from);
+
+    let (generated_at_ms, metrics_seq, selected_at_ms, mut aggregate) =
+        if let Some(at) = requested_at_ms {
+            if let Some(cut) = gateway.metrics().nearest_snapshot(at) {
+                (
+                    cut.taken_at_ms,
+                    cut.cursors.metrics_seq,
+                    Some(cut.taken_at_ms),
+                    overview_window_report(&cut.metrics, query.window).overview(&filter),
+                )
+            } else {
+                let mut empty =
+                    overview_window_report(&MetricsView::default(), query.window).overview(&filter);
+                empty.data_quality = OverviewDataQuality::Unavailable;
+                (at, 0, None, empty)
+            }
+        } else if let Some(cut) = gateway.metrics().latest_published_metrics() {
+            (
+                cut.taken_at_ms,
+                cut.cursors.metrics_seq,
+                Some(cut.taken_at_ms),
+                overview_window_report(&cut.view, query.window).overview(&filter),
+            )
+        } else {
+            let mut empty =
+                overview_window_report(&MetricsView::default(), query.window).overview(&filter);
+            empty.data_quality = OverviewDataQuality::Unavailable;
+            (dashboard_now_ms(), 0, None, empty)
+        };
+
+    // A filtered query over a window with bounded overflow is necessarily partial: the
+    // fixed `__other__` key no longer carries enough identity to prove whether a folded
+    // sample matched. The metrics projection already marks every overflowed aggregate;
+    // retain the explicit assignment here as a guard against future projection changes.
+    if aggregate.overflow.overflowed {
+        aggregate.data_quality = OverviewDataQuality::Partial;
+    }
+
+    json_no_store(
+        StatusCode::OK,
+        &OverviewResponse {
+            generated_at_ms,
+            metrics_seq,
+            scope: OverviewScope {
+                window: query.window,
+                requested_at_ms,
+                selected_at_ms,
+                status: status_scope,
+                model,
+                upstream,
+                client,
+            },
+            aggregate,
+        },
+    )
 }
 
 /// `GET /dashboard/api/topology` — the provider topology (D4 nodes + edges) + the
 /// price table + the topology domain `topology_seq`. Edges carry per-upstream
 /// per-second request/token/cost rates rolled up from the live `m1` metrics window.
 pub async fn dashboard_topology(State(gateway): State<Arc<Gateway>>) -> Response {
-    let snapshot = gateway.provider_health_publisher().latest();
-    let view = gateway.metrics().view();
-    let body = topology_body(&snapshot, gateway.price_table(), &view.window_1m);
+    let body = if let Some(cut) = gateway.metrics().latest_published_metrics() {
+        topology_body(&cut.topology, gateway.price_table(), &cut.view.window_1m)
+    } else {
+        topology_body(
+            &ProviderHealthSnapshot::default(),
+            gateway.price_table(),
+            &MetricsView::default().window_1m,
+        )
+    };
     json_no_store(StatusCode::OK, &body)
 }
 
@@ -1146,6 +1302,7 @@ pub async fn dashboard_snapshot(
         Some(at) => gateway.metrics().snapshot_at(at),
         None => gateway.metrics().latest_snapshot(),
     };
+    let history = gateway.metrics().snapshot_history_metadata();
     let Some(cut) = cut else {
         // No cut yet (the 5 s task has not run, or every cut is newer than `at`):
         // a contract-valid empty snapshot, not a 404.
@@ -1157,6 +1314,8 @@ pub async fn dashboard_snapshot(
                 summaries: Vec::new(),
                 metrics: None,
                 topology: None,
+                history,
+                flow_summaries_truncated: false,
             },
         );
     };
@@ -1195,6 +1354,8 @@ pub async fn dashboard_snapshot(
             summaries,
             metrics,
             topology,
+            history,
+            flow_summaries_truncated: cut.flow_summaries_truncated,
         },
     )
 }
@@ -1217,6 +1378,21 @@ fn record_matches_model(record: &FlowRecord, wanted: &str) -> bool {
             .is_some_and(|model| model.to_ascii_lowercase().contains(wanted))
 }
 
+fn overview_window_report(view: &MetricsView, window: OverviewWindow) -> &WindowReport {
+    match window {
+        OverviewWindow::M1 => &view.window_1m,
+        OverviewWindow::M5 => &view.window_5m,
+        OverviewWindow::H1 => &view.window_1h,
+    }
+}
+
+fn dashboard_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 /// Parse a `status=` filter value into a [`FlowStatus`] (the frozen
 /// open/completed/failed/cancelled enum). An unrecognized value yields `None` so
 /// the filter is simply ignored (no rows wrongly hidden by a typo).
@@ -1228,6 +1404,23 @@ fn parse_status_filter(value: &str) -> Option<FlowStatus> {
         "cancelled" => Some(FlowStatus::Cancelled),
         _ => None,
     }
+}
+
+fn normalize_overview_status(value: Option<&str>) -> (Option<FlowStatus>, Option<String>) {
+    let status = value.and_then(parse_status_filter);
+    let effective = status.map(|status| match status {
+        FlowStatus::Open => "open",
+        FlowStatus::Completed => "completed",
+        FlowStatus::Failed => "failed",
+        FlowStatus::Cancelled => "cancelled",
+    });
+    (status, effective.map(str::to_string))
+}
+
+fn clean_overview_filter(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Apply 1-based `page`/`limit` paging to the filtered rows. Absent `limit` ⇒ all
@@ -1267,6 +1460,77 @@ fn json_no_store<T: Serialize>(status: StatusCode, body: &T) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overview_contract_serializes_exact_scope_rollups_and_window_names() {
+        assert_eq!(
+            serde_json::from_str::<OverviewWindow>("\"m5\"").unwrap(),
+            OverviewWindow::M5
+        );
+        let metrics = crate::metrics::MetricsLayer::new();
+        let input = crate::dashboard_flow::TerminalMetricsInputs {
+            model_requested: Some("requested".to_string()),
+            model_served: Some("served".to_string()),
+            endpoint: "/v1/responses".to_string(),
+            upstream: Some("provider".to_string()),
+            client_label: Some("client".to_string()),
+            usage: Some(FlowUsage {
+                prompt: 100,
+                completion: 20,
+                total: 120,
+                cached: Some(0),
+                reasoning: Some(0),
+            }),
+            failure_reason: crate::dashboard_flow::TerminalReasonClass::Stop,
+            cost_usd: Some(0.25),
+            cost_confidence: crate::dashboard_flow::TerminalCostConfidence::Confident,
+            effective_route_limit: Some(8_192),
+            ..Default::default()
+        };
+        metrics.record_terminal_inputs(FlowStatus::Completed, 10, &input);
+        let aggregate = metrics
+            .view()
+            .window_5m
+            .overview(&OverviewFilter::default());
+        let response = OverviewResponse {
+            generated_at_ms: 123,
+            metrics_seq: 7,
+            scope: OverviewScope {
+                window: OverviewWindow::M5,
+                requested_at_ms: None,
+                selected_at_ms: Some(123),
+                status: None,
+                model: None,
+                upstream: None,
+                client: None,
+            },
+            aggregate,
+        };
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["scope"]["window"], "m5");
+        assert_eq!(json["totals"]["requests"], 1);
+        assert_eq!(json["cost"]["total_usd"], 0.25);
+        assert_eq!(json["context"]["effective_route_limit_min"], 8_192);
+        assert_eq!(json["provider_attempts_global"]["scope"], "global");
+    }
+
+    #[test]
+    fn overview_scope_echoes_only_normalized_effective_filters() {
+        assert_eq!(
+            normalize_overview_status(Some("  FAILED ")),
+            (Some(FlowStatus::Failed), Some("failed".to_string()))
+        );
+        assert_eq!(
+            normalize_overview_status(Some("not-a-status")),
+            (None, None),
+            "an ignored status must not be echoed as if it constrained the aggregate"
+        );
+        assert_eq!(
+            clean_overview_filter(Some("  model-a  ".to_string())),
+            Some("model-a".to_string())
+        );
+        assert_eq!(clean_overview_filter(Some("   ".to_string())), None);
+    }
 
     /// A price with an EXPLICITLY configured cached rate (presence `true`) — the
     /// default for these cost tests. Confidence-specific tests use
@@ -1545,6 +1809,7 @@ mod tests {
         let rows = |n: usize| -> Vec<FlowRow> {
             (0..n)
                 .map(|i| FlowRow {
+                    revision: 1,
                     api_call_id: format!("api_{i}"),
                     response_id: None,
                     method: "POST".to_string(),
@@ -1586,6 +1851,7 @@ mod tests {
     #[test]
     fn flow_row_serializes_optional_client_attribution_present_and_absent() {
         let base = || FlowRow {
+            revision: 1,
             api_call_id: "api_x".to_string(),
             response_id: None,
             method: "POST".to_string(),
@@ -1646,6 +1912,7 @@ mod tests {
     fn flow_detail_body_upstream_response_round_trips_present_and_absent() {
         let base = || FlowDetailBody {
             flow_seq: 7,
+            revision: 1,
             api_call_id: "api_d".to_string(),
             response_id: Some("resp_d".to_string()),
             inbound_body: None,
@@ -1658,6 +1925,7 @@ mod tests {
             upstream_target: None,
             usage: None,
             status: FlowStatus::Failed,
+            deltas_through_monitor_seq: 41,
             deltas: Vec::new(),
             terminal_reason: None,
             started_ms: 1,
@@ -1681,6 +1949,11 @@ mod tests {
             ..base()
         };
         let value = serde_json::to_value(&present).expect("serialize present detail");
+        assert_eq!(
+            value["deltas_through_monitor_seq"],
+            serde_json::json!(41),
+            "the replay watermark is a required scalar on flow detail"
+        );
         assert_eq!(
             value["upstream_response"]["body"]["error"]["message"],
             serde_json::json!("backend on fire")
@@ -1771,6 +2044,7 @@ mod tests {
     #[test]
     fn flow_row_projects_spine_fields_present_and_absent() {
         let base = || FlowRow {
+            revision: 1,
             api_call_id: "api_s".to_string(),
             response_id: None,
             method: "POST".to_string(),
@@ -1849,6 +2123,7 @@ mod tests {
     fn flow_detail_body_projects_spine_fields_present_and_absent() {
         let base = || FlowDetailBody {
             flow_seq: 3,
+            revision: 1,
             api_call_id: "api_sd".to_string(),
             response_id: None,
             inbound_body: None,
@@ -1861,6 +2136,7 @@ mod tests {
             upstream_target: None,
             usage: None,
             status: FlowStatus::Completed,
+            deltas_through_monitor_seq: 17,
             deltas: Vec::new(),
             terminal_reason: None,
             started_ms: 1_000,
@@ -1907,6 +2183,65 @@ mod tests {
         }
     }
 
+    /// The REST replay ordinal and the MonitorHub cursor are intentionally different
+    /// clocks. Repeated, same-millisecond segments retain consecutive per-flow ordinals,
+    /// while the separately returned watermark comes from the ONE snapshot that supplied
+    /// those messages. The frontend can therefore drop only live messages at/before 77
+    /// without confusing ordinal `0/1` for monitor sequence numbers.
+    #[test]
+    fn replay_deltas_keeps_ordinal_separate_from_snapshot_monitor_watermark() {
+        let segment = |response_id: &str| DebugWsMessage::SegmentAppend {
+            response_id: response_id.to_string(),
+            segment: crate::monitor::DebugSegment {
+                timestamp_ms: 123,
+                kind: crate::monitor::DebugSegmentKind::Output,
+                text: ".".to_string(),
+            },
+        };
+        let snapshot = DebugSnapshot {
+            last_sequence: 77,
+            messages: vec![
+                segment("resp_target"),
+                segment("resp_other"),
+                segment("resp_target"),
+            ],
+        };
+
+        let (deltas, through_monitor_seq) = replay_deltas(Some("resp_target"), snapshot);
+
+        assert_eq!(through_monitor_seq, 77);
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|delta| delta.sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "sequence stays the per-flow replay ordinal"
+        );
+        assert_eq!(deltas[0].ts_ms, Some(123));
+        assert_eq!(deltas[1].ts_ms, Some(123));
+        assert_eq!(
+            deltas[0].payload, deltas[1].payload,
+            "repeated content survives"
+        );
+    }
+
+    /// Even a flow that is not linked yet carries the snapshot watermark. Otherwise a
+    /// temporarily empty replay would append retained pre-snapshot live history as if it
+    /// were new when the response id appears later.
+    #[test]
+    fn replay_deltas_without_response_id_still_returns_snapshot_watermark() {
+        let (deltas, through_monitor_seq) = replay_deltas(
+            None,
+            DebugSnapshot {
+                last_sequence: 9,
+                messages: Vec::new(),
+            },
+        );
+        assert!(deltas.is_empty());
+        assert_eq!(through_monitor_seq, 9);
+    }
+
     /// The `status=` filter parses the frozen open/completed/failed/cancelled enum
     /// and ignores an unrecognized value (a typo hides no rows).
     #[test]
@@ -1927,6 +2262,7 @@ mod tests {
     #[test]
     fn flow_usage_unreported_class_is_absent_measured_zero_is_present() {
         let row = |cached: Option<i64>, reasoning: Option<i64>| FlowRow {
+            revision: 1,
             api_call_id: "api_u".to_string(),
             response_id: None,
             method: "POST".to_string(),

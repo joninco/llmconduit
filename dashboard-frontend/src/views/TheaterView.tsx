@@ -12,14 +12,13 @@
  * not replayed" banner and render only the frozen snapshot's TERMINAL SUMMARY per flow (model,
  * status, token totals), NOT a fake live river. Leaving seek returns to the live rivers.
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { River } from '../components/viz/River';
 import { gridColumns } from '../components/viz/riverModel';
 import { useLingeringRivers } from '../components/viz/useLingeringRivers';
 import { useLiveRivers } from '../components/viz/useLiveRivers';
 import { useDashboard } from '../store/hooks';
 import type { FlowSummary } from '../api/types';
-import { cn } from '../lib/cn';
 
 export function TheaterView() {
   const seeking = useDashboard((s) => s.connection === 'seeking');
@@ -34,28 +33,52 @@ export function TheaterView() {
  */
 function LiveTheater() {
   const [fullscreen, setFullscreen] = useState(false);
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const fullscreenToggleRef = useRef<HTMLButtonElement>(null);
+  const wasFullscreenRef = useRef(false);
   // Terminated tiles linger-then-fade-then-remove (finding 4) rather than persisting until the
   // monitor evicts them; the hook owns the StrictMode-safe timers.
   const rivers = useLingeringRivers(useLiveRivers());
   const cols = gridColumns(rivers.length);
 
-  return (
-    <div
-      className={cn(
-        'flex min-h-0 min-w-0 flex-1 flex-col bg-bg p-4',
-        fullscreen && 'fixed inset-0 z-40',
-      )}
-      data-testid="theater-view"
-      data-fullscreen={fullscreen || undefined}
-    >
+  useEffect(() => {
+    if (!fullscreen) {
+      if (wasFullscreenRef.current) {
+        requestAnimationFrame(() => fullscreenToggleRef.current?.focus({ preventScroll: true }));
+      }
+      wasFullscreenRef.current = false;
+      return;
+    }
+
+    wasFullscreenRef.current = true;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (typeof dialog.showModal === 'function') {
+      if (!dialog.open) dialog.showModal();
+    } else {
+      // jsdom and a few older embedded engines expose <dialog> without showModal(). Keeping the
+      // open attribute makes the fallback usable; supported browsers still get native modality.
+      dialog.setAttribute('open', '');
+    }
+    requestAnimationFrame(() => fullscreenToggleRef.current?.focus({ preventScroll: true }));
+
+    return () => {
+      if (typeof dialog.close === 'function' && dialog.open) dialog.close();
+      else dialog.removeAttribute('open');
+    };
+  }, [fullscreen]);
+
+  const content = (
+    <>
       <header className="mb-3 flex items-center gap-3">
-        <h2 className="text-base font-semibold text-text">Theater</h2>
+        <h2 id="theater-title" className="text-base font-semibold text-text">Theater</h2>
         <p className="text-sm text-text-muted">live streams · {rivers.length} active</p>
         <button
+          ref={fullscreenToggleRef}
           type="button"
-          onClick={() => setFullscreen((v) => !v)}
+          onClick={() => setFullscreen((value) => !value)}
           aria-pressed={fullscreen}
-          className="ml-auto rounded-md border border-line px-2.5 py-1 text-xs text-text-muted transition-colors hover:text-text"
+          className="ml-auto rounded-md border border-line px-2.5 py-1 text-xs text-text-muted transition-colors hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
           data-testid="theater-fullscreen-toggle"
         >
           {fullscreen ? 'exit fullscreen' : 'fullscreen'}
@@ -77,6 +100,33 @@ function LiveTheater() {
           ))}
         </div>
       )}
+    </>
+  );
+
+  if (fullscreen) {
+    return (
+      <dialog
+        ref={dialogRef}
+        aria-labelledby="theater-title"
+        className="fixed inset-0 z-40 m-0 hidden h-[100dvh] max-h-none w-screen max-w-none flex-col border-0 bg-bg p-4 text-text backdrop:bg-black/70 open:flex"
+        data-testid="theater-view"
+        data-fullscreen="true"
+        onCancel={(event) => {
+          event.preventDefault();
+          setFullscreen(false);
+        }}
+      >
+        {content}
+      </dialog>
+    );
+  }
+
+  return (
+    <div
+      className="flex min-h-0 min-w-0 flex-1 flex-col bg-bg p-4"
+      data-testid="theater-view"
+    >
+      {content}
     </div>
   );
 }

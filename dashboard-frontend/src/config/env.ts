@@ -12,6 +12,9 @@
  */
 import type { DashboardBootstrap } from '../api/types';
 import { mockBootstrapCsrf } from '../api/mock';
+import { validateBootstrap } from '../api/generated/validators-initial';
+import { assertContract } from '../api/validation';
+import { assertDashboardSchemaVersion, DASHBOARD_SCHEMA_VERSION } from '../api/schemaVersion';
 
 declare global {
   interface Window {
@@ -42,12 +45,9 @@ export function isMockEnabled(): boolean {
  * malformed embed can never crash boot or silently grant mutations.
  */
 export function parseBootstrap(raw: unknown): DashboardBootstrap {
-  const obj = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>;
-  return {
-    authenticated: obj.authenticated === true,
-    csrf_token: typeof obj.csrf_token === 'string' ? obj.csrf_token : null,
-    mutations_enabled: obj.mutations_enabled === true,
-  };
+  const bootstrap = assertContract('bootstrap', validateBootstrap, raw);
+  assertDashboardSchemaVersion(bootstrap.schema_version, 'HTML bootstrap');
+  return bootstrap;
 }
 
 /**
@@ -64,5 +64,6 @@ export function readBootstrap(): DashboardBootstrap {
     authenticated: false,
     csrf_token: isMockEnabled() ? mockBootstrapCsrf : null,
     mutations_enabled: isMockEnabled(),
+    schema_version: DASHBOARD_SCHEMA_VERSION,
   };
 }

@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { pickAttempts, sameAttempts } from './attempts';
-import type { Attempt } from './types';
+import { isAttempt, type Attempt } from './types';
 
 /**
  * `pickAttempts` (gap 10b review round 2) — the shared "non-empty wins, else backfill" rule the
@@ -73,5 +73,14 @@ describe('sameAttempts — empty and absent are the same "no trace" state', () =
     const list = [SERVED];
     expect(sameAttempts(list, list)).toBe(true);
     expect(sameAttempts([SERVED], [SERVED])).toBe(false); // distinct refs
+  });
+});
+
+describe('Attempt wire contract', () => {
+  it('accepts Rust request_rejected as a bounded failover reason', () => {
+    expect(isAttempt({
+      ...FAILED,
+      failover_reason: 'request_rejected',
+    })).toBe(true);
   });
 });

@@ -9,6 +9,7 @@ use crate::dashboard_api::dashboard_catalog;
 use crate::dashboard_api::dashboard_flow_detail;
 use crate::dashboard_api::dashboard_flows;
 use crate::dashboard_api::dashboard_metrics;
+use crate::dashboard_api::dashboard_overview;
 use crate::dashboard_api::dashboard_snapshot;
 use crate::dashboard_api::dashboard_topology;
 use crate::dashboard_auth::DashboardAuth;
@@ -184,6 +185,7 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .route("/dashboard/api/flows/{id}", get(dashboard_flow_detail))
         .route("/dashboard/api/flows/{id}/kill", post(dashboard_flow_kill))
         .route("/dashboard/api/metrics", get(dashboard_metrics))
+        .route("/dashboard/api/overview", get(dashboard_overview))
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
         .route("/dashboard/api/snapshot", get(dashboard_snapshot))
@@ -233,7 +235,12 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
 /// [`crate::dashboard_auth::no_store`]; the handlers' own `json_no_store` re-stamps
 /// the same static values, so applying this on top is idempotent.
 async fn dashboard_api_no_store(response: Response) -> Response {
-    crate::dashboard_auth::no_store(response)
+    let mut response = crate::dashboard_auth::no_store(response);
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static(crate::dashboard_contracts::DASHBOARD_SCHEMA_HEADER),
+        HeaderValue::from_static("2"),
+    );
+    response
 }
 
 /// D6 — the outcome of a `POST /dashboard/api/flows/:id/kill` attempt, decoupled from
@@ -300,7 +307,10 @@ pub async fn dashboard_flow_kill(
         // (dashboard-frontend/src/api/types.ts) — the SPA decodes both fields.
         FlowKillOutcome::Killed => (
             StatusCode::OK,
-            Json(serde_json::json!({"api_call_id": api_call_id, "killed": true})),
+            Json(crate::dashboard_contracts::KillResponse {
+                api_call_id,
+                killed: true,
+            }),
         )
             .into_response(),
         FlowKillOutcome::NotFound => (

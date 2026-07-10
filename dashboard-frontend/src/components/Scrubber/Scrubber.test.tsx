@@ -165,6 +165,8 @@ describe('Scrubber — seek + LIVE', () => {
     const { socket, client } = getConnection();
     const snapSpy = vi.spyOn(client, 'snapshot').mockResolvedValue({
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 }, at_ms: Date.now(), summaries: [], metrics: null, topology: null,
+      history: { oldest_at_ms: null, newest_at_ms: null, retained_bytes: 0, quota_bytes: 64 * 1024 * 1024, retained_cuts: 0 },
+      flow_summaries_truncated: false,
     });
     const { getByTestId } = renderWithQuery(<Scrubber socket={socket} />);
     act(() => {
@@ -233,6 +235,78 @@ describe('Scrubber — seek + LIVE', () => {
     });
     fireEvent.click(getByTestId('live-toggle'));
     expect(liveSpy).toHaveBeenCalled();
+  });
+
+  it('restores live after a failed seek and offers a retry for the same target', async () => {
+    const { socket, client } = getConnection();
+    const snapshot = vi.spyOn(client, 'snapshot')
+      .mockRejectedValueOnce(new Error('temporary failure'))
+      .mockResolvedValueOnce({
+        cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+        at_ms: Date.now(), summaries: [], metrics: null, topology: null,
+        history: { oldest_at_ms: null, newest_at_ms: null, retained_bytes: 0, quota_bytes: 64 * 1024 * 1024, retained_cuts: 0 },
+        flow_summaries_truncated: false,
+      });
+    const { getByTestId, getByRole } = renderWithQuery(<Scrubber socket={socket} />);
+    seedHill([1, 4, 2, 6, 3]);
+
+    fireEvent.pointerDown(getByTestId('scrubber-track'), { clientX: 80, pointerId: 1 });
+    await waitFor(() => expect(getByRole('alert').textContent).toContain('Historical snapshot unavailable'));
+    expect(socket.isPaused()).toBe(false);
+    expect(dashboardStore.getState().connection).toBe('live');
+
+    fireEvent.click(getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(snapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(dashboardStore.getState().connection).toBe('seeking'));
+  });
+});
+
+describe('Scrubber — keyboard slider semantics', () => {
+  it('describes live and historical positions with meaningful aria-valuetext', () => {
+    const { socket } = getConnection();
+    const { getByTestId } = renderWithQuery(<Scrubber socket={socket} />);
+    const track = getByTestId('scrubber-track');
+    expect(track.getAttribute('aria-valuetext')).toBe('Live, no retained history');
+
+    seedHill([1, 4, 2, 6, 3]);
+    expect(track.getAttribute('aria-valuetext')).toMatch(
+      /^Live, newest retained sample at \d{2}:\d{2}:\d{2}\.\d{3}$/,
+    );
+  });
+
+  it('supports arrows, PageUp/Down, Home/End and pauses live before seeking', () => {
+    const { socket, client } = getConnection();
+    const seekSpy = vi.spyOn(socket, 'seek');
+    vi.spyOn(client, 'snapshot').mockImplementation(() => new Promise(() => {}));
+    const { getByTestId } = renderWithQuery(<Scrubber socket={socket} />);
+    // The producer guarantees strictly monotonic millisecond stamps; 101 points gives a 100 ms
+    // span, enough for each one-percent Arrow step to resolve to a distinct instant in this test.
+    seedHill(Array.from({ length: 101 }, (_, i) => i % 7));
+    const track = getByTestId('scrubber-track');
+    expect(track.getAttribute('aria-valuenow')).toBe('100');
+
+    expect(fireEvent.keyDown(track, { key: 'ArrowLeft' })).toBe(false);
+    expect(track.getAttribute('aria-valuenow')).toBe('99');
+    expect(track.getAttribute('aria-valuetext')).toMatch(
+      /^Historical view at \d{2}:\d{2}:\d{2}\.\d{3}, 99 percent through retained history$/,
+    );
+    expect(seekSpy).toHaveBeenCalledTimes(1);
+    expect(socket.isPaused()).toBe(true);
+
+    fireEvent.keyDown(track, { key: 'ArrowDown' });
+    expect(track.getAttribute('aria-valuenow')).toBe('98');
+    fireEvent.keyDown(track, { key: 'ArrowRight' });
+    expect(track.getAttribute('aria-valuenow')).toBe('99');
+    fireEvent.keyDown(track, { key: 'ArrowUp' });
+    expect(track.getAttribute('aria-valuenow')).toBe('100');
+    fireEvent.keyDown(track, { key: 'PageDown' });
+    expect(track.getAttribute('aria-valuenow')).toBe('90');
+    fireEvent.keyDown(track, { key: 'PageUp' });
+    expect(track.getAttribute('aria-valuenow')).toBe('100');
+    fireEvent.keyDown(track, { key: 'Home' });
+    expect(track.getAttribute('aria-valuenow')).toBe('0');
+    fireEvent.keyDown(track, { key: 'End' });
+    expect(track.getAttribute('aria-valuenow')).toBe('100');
   });
 });
 

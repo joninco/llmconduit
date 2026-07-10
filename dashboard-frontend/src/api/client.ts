@@ -15,11 +15,54 @@ import type {
   KillResponse,
   LoginRequest,
   MetricsResponse,
+  OverviewQuery,
+  OverviewResponse,
   SnapshotResponse,
   TopologyResponse,
 } from './types';
+import type { ContractValidator } from './contractValidator';
+import {
+  assertDashboardSchemaVersion,
+  DashboardSchemaMismatchError,
+  DASHBOARD_SCHEMA_HEADER,
+} from './schemaVersion';
+import { assertContract, DashboardContractError } from './validation';
 
 export type FetchImpl = typeof fetch;
+type RestValidatorName =
+  | 'validateCatalog'
+  | 'validateFlowDetail'
+  | 'validateFlows'
+  | 'validateKill'
+  | 'validateMetrics'
+  | 'validateOverview'
+  | 'validateSnapshot'
+  | 'validateTopology';
+type RestValidatorsModule = typeof import('./generated/validators-rest');
+
+let restValidatorsPromise: Promise<RestValidatorsModule> | null = null;
+
+async function loadRestValidator(name: RestValidatorName): Promise<ContractValidator<unknown>> {
+  // Share one fully-evaluated module promise across concurrent startup queries. Selecting each
+  // named export explicitly also keeps Vite/Rollup from trying to infer a computed namespace read
+  // while route chunks race to import this large generated module.
+  const validators = await (restValidatorsPromise ??= import('./generated/validators-rest'));
+  let validator: ContractValidator<unknown>;
+  switch (name) {
+    case 'validateCatalog': validator = validators.validateCatalog; break;
+    case 'validateFlowDetail': validator = validators.validateFlowDetail; break;
+    case 'validateFlows': validator = validators.validateFlows; break;
+    case 'validateKill': validator = validators.validateKill; break;
+    case 'validateMetrics': validator = validators.validateMetrics; break;
+    case 'validateOverview': validator = validators.validateOverview; break;
+    case 'validateSnapshot': validator = validators.validateSnapshot; break;
+    case 'validateTopology': validator = validators.validateTopology; break;
+  }
+  if (typeof validator !== 'function') {
+    throw new DashboardContractError(name, [`generated validator export ${name} is unavailable`]);
+  }
+  return validator;
+}
 
 /** Raised when a fetch returns 401; the shell listens for this to bounce to login. */
 export class UnauthorizedError extends Error {
@@ -38,6 +81,8 @@ export interface DashboardClientOptions {
   getCsrfToken?: () => string | null;
   /** Fired on ANY 401 so the app can bounce to the login shell. */
   onUnauthorized?: () => void;
+  /** Fired when a persistent schema/root-contract mismatch must replace normal query UI. */
+  onFatal?: (error: DashboardSchemaMismatchError | DashboardContractError) => void;
 }
 
 export class DashboardClient {
@@ -45,6 +90,7 @@ export class DashboardClient {
   private readonly fetchImpl: FetchImpl;
   private readonly getCsrfToken: () => string | null;
   private readonly onUnauthorized: (() => void) | undefined;
+  private readonly onFatal: DashboardClientOptions['onFatal'];
 
   constructor(opts: DashboardClientOptions = {}) {
     this.basePath = opts.basePath ?? '/dashboard/api';
@@ -52,9 +98,14 @@ export class DashboardClient {
     this.fetchImpl = opts.fetchImpl ?? ((...a: Parameters<FetchImpl>) => globalThis.fetch(...a));
     this.getCsrfToken = opts.getCsrfToken ?? (() => null);
     this.onUnauthorized = opts.onUnauthorized;
+    this.onFatal = opts.onFatal;
   }
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+  private async request<T>(
+    path: string,
+    validatorName: RestValidatorName,
+    init?: RequestInit,
+  ): Promise<T> {
     const res = await this.fetchImpl(`${this.basePath}${path}`, {
       credentials: 'include',
       ...init,
@@ -67,9 +118,37 @@ export class DashboardClient {
     if (!res.ok) {
       throw new Error(`${init?.method ?? 'GET'} ${path} failed: ${res.status}`);
     }
+    try {
+      assertDashboardSchemaVersion(res.headers.get(DASHBOARD_SCHEMA_HEADER), `REST ${path}`);
+    } catch (error) {
+      // The first mismatch already requested a hard reload. Only a persistent mismatch replaces
+      // the shell with the explicit upgrade screen.
+      if (error instanceof DashboardSchemaMismatchError && !error.reloadRequested) {
+        this.onFatal?.(error);
+      }
+      throw error;
+    }
     // 204/empty bodies decode to `undefined as T` at the call sites that allow it.
     const text = await res.text();
-    return (text ? JSON.parse(text) : undefined) as T;
+    let parsed: unknown;
+    try {
+      parsed = text ? JSON.parse(text) : undefined;
+    } catch (error) {
+      const contractError = new DashboardContractError(path, [
+        error instanceof Error ? error.message : 'invalid JSON',
+      ]);
+      this.onFatal?.(contractError);
+      throw contractError;
+    }
+    // REST validation is still mandatory before cache/store entry, but its generated code is
+    // loaded on first API use rather than inflating the HTML's initial module graph.
+    try {
+      const validator = await loadRestValidator(validatorName);
+      return assertContract(path, validator, parsed) as T;
+    } catch (error) {
+      if (error instanceof DashboardContractError) this.onFatal?.(error);
+      throw error;
+    }
   }
 
   // -- Auth -----------------------------------------------------------------
@@ -113,28 +192,35 @@ export class DashboardClient {
 
   flows(query: FlowsQuery = {}): Promise<FlowsResponse> {
     const qs = buildQuery(query);
-    return this.request<FlowsResponse>(`/flows${qs}`);
+    return this.request<FlowsResponse>(`/flows${qs}`, 'validateFlows');
   }
 
   flowDetail(id: string): Promise<FlowDetail> {
-    return this.request<FlowDetail>(`/flows/${encodeURIComponent(id)}`);
+    return this.request<FlowDetail>(`/flows/${encodeURIComponent(id)}`, 'validateFlowDetail');
   }
 
   metrics(): Promise<MetricsResponse> {
-    return this.request<MetricsResponse>('/metrics');
+    return this.request<MetricsResponse>('/metrics', 'validateMetrics');
+  }
+
+  overview(query: OverviewQuery): Promise<OverviewResponse> {
+    return this.request<OverviewResponse>(`/overview${buildQuery(query)}`, 'validateOverview');
   }
 
   topology(): Promise<TopologyResponse> {
-    return this.request<TopologyResponse>('/topology');
+    return this.request<TopologyResponse>('/topology', 'validateTopology');
   }
 
   /** Bare array — no cursor (D13: static-ish catalog read). */
   catalog(): Promise<CatalogEntry[]> {
-    return this.request<CatalogEntry[]>('/catalog');
+    return this.request<CatalogEntry[]>('/catalog', 'validateCatalog');
   }
 
   snapshot(atMs: number): Promise<SnapshotResponse> {
-    return this.request<SnapshotResponse>(`/snapshot?at=${encodeURIComponent(String(atMs))}`);
+    return this.request<SnapshotResponse>(
+      `/snapshot?at=${encodeURIComponent(String(atMs))}`,
+      'validateSnapshot',
+    );
   }
 
   // -- Mutation (CSRF-gated) ------------------------------------------------
@@ -144,15 +230,19 @@ export class DashboardClient {
     const csrf = this.getCsrfToken();
     const headers: Record<string, string> = {};
     if (csrf) headers['X-CSRF-Token'] = csrf;
-    return this.request<KillResponse>(`/flows/${encodeURIComponent(id)}/kill`, {
-      method: 'POST',
-      headers,
-    });
+    return this.request<KillResponse>(
+      `/flows/${encodeURIComponent(id)}/kill`,
+      'validateKill',
+      {
+        method: 'POST',
+        headers,
+      },
+    );
   }
 }
 
 /** Serializes a flows query into a `?a=b&c=d` string, dropping undefined values. */
-function buildQuery(query: FlowsQuery): string {
+function buildQuery(query: FlowsQuery | OverviewQuery): string {
   const params = new URLSearchParams();
   for (const [k, v] of Object.entries(query)) {
     if (v !== undefined && v !== null) params.set(k, String(v));

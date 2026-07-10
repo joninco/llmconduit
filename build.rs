@@ -227,9 +227,10 @@ fn build_real_dashboard(dist_dir: &Path) {
         "npm ci (frontend dependency install)",
     );
 
-    // `npm run build` == `tsc -b && vite build`. Pass Vite the OUT_DIR target and
-    // `--emptyOutDir` (it sits outside the project root) AFTER `--` so the flags
-    // reach `vite build`, not npm. `base: '/dashboard/'` stays as configured.
+    // `npm run build` type-checks, invokes the small Node build driver, then
+    // precompresses/checks the Vite output. The driver forwards these OUT_DIR
+    // flags to Vite before finalizing that exact directory. `base: '/dashboard/'`
+    // stays as configured.
     let out_dir_arg = dist_dir.display().to_string();
     run_in(
         &frontend,

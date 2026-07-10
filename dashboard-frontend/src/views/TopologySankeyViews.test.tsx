@@ -4,13 +4,14 @@
  * are covered by the component tests; here we assert the VIEW wiring.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { cleanup, fireEvent, act } from '@testing-library/react';
+import { cleanup, fireEvent, act, waitFor } from '@testing-library/react';
 import { TopologyView } from './TopologyView';
 import { SankeyView } from './SankeyView';
 import { dashboardStore } from '../store/dashboardStore';
 import { flowFilterStore } from '../store/flowFilterStore';
 import { renderWithQuery, resetWorld } from '../components/testHarness';
 import type { ProviderHealth, TopologyResponse, FlowSummary, MetricsResponse, Usage } from '../api/types';
+import { getConnection } from '../api/connection';
 
 /** A metrics sample carrying a `cost_per_min` (the authoritative `$`/min source — finding 3).
  * Gap 07: `priced_samples`/`cost_confidence` are overridable so the `$/min` readout's
@@ -46,7 +47,7 @@ const TOPOLOGY: TopologyResponse = {
 
 function flow(over: Partial<FlowSummary>): FlowSummary {
   return {
-    api_call_id: `api_${Math.random().toString(36).slice(2, 8)}`, method: 'POST', uri: '/v1/responses', cost_confidence: 'unavailable',
+    revision: 1, api_call_id: `api_${Math.random().toString(36).slice(2, 8)}`, method: 'POST', uri: '/v1/responses', cost_confidence: 'unavailable',
     status: 'completed', started_ms: Date.now() - 2000, finished_ms: Date.now() - 500, ...over,
   };
 }
@@ -74,6 +75,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe('TopologyView — click node → shared filter + navigate to flows', () => {
@@ -82,7 +84,7 @@ describe('TopologyView — click node → shared filter + navigate to flows', ()
     const { container } = renderWithQuery(<TopologyView />);
     fireEvent.click(container.querySelector('[data-node-id="vllm-a"]')!);
     expect(flowFilterStore.getState().filters.upstream).toBe('vllm-a');
-    expect(window.location.hash).toBe('#/flows');
+    expect(window.location.hash).toBe('#/flows?upstream=vllm-a');
   });
 
   it('renders the historical affordance while seeking and the frozen topology nodes', () => {
@@ -97,6 +99,38 @@ describe('TopologyView — click node → shared filter + navigate to flows', ()
     expect(getByTestId('topology-historical')).not.toBeNull();
     // The frozen cut's nodes are rendered (topology comes from the store's frozen slices).
     expect(container.querySelectorAll('[data-testid="topo-node"]').length).toBe(2);
+  });
+});
+
+describe('TopologyView — transport and empty states', () => {
+  it('shows a retryable load failure instead of an ordinary no-provider message', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 503 }));
+    vi.stubGlobal('fetch', fetchMock);
+    getConnection().queryClient.setDefaultOptions({ queries: { retry: false } });
+    const { getByTestId, getByRole } = renderWithQuery(<TopologyView />);
+
+    await waitFor(() => expect(getByTestId('topology-error')).toBeTruthy());
+    expect(getByTestId('topology-error').textContent).not.toContain('No providers');
+    const calls = fetchMock.mock.calls.length;
+    fireEvent.click(getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(calls));
+  });
+
+  it('labels a successful zero-provider response as an honest empty state', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      topology_seq: 1,
+      nodes: [],
+      edges: [],
+      price_table: {},
+    }), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-LLMConduit-Dashboard-Schema': '2',
+      },
+    })));
+    const { getByTestId } = renderWithQuery(<TopologyView />);
+    await waitFor(() => expect(getByTestId('topology-empty').textContent).toContain('No providers configured'));
   });
 });
 
@@ -119,7 +153,7 @@ describe('SankeyView — click band → shared filter + navigate; $/min; seek', 
     fireEvent.click(container.querySelector('[data-testid="sankey-band"][data-model="gpt-4o"]')!);
     expect(flowFilterStore.getState().filters.model).toBe('gpt-4o');
     expect(flowFilterStore.getState().filters.upstream).toBe('vllm-a');
-    expect(window.location.hash).toBe('#/flows');
+    expect(window.location.hash).toBe('#/flows?model=gpt-4o&upstream=vllm-a');
   });
 
   // Gap 07 (review round 2): the `$`/min readout honors `cost_confidence` + the priced denominator

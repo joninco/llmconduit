@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { useState } from 'react';
 import { act, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { FlowDetail } from './FlowDetail';
 import { dashboardStore } from '../../store/dashboardStore';
@@ -6,8 +7,22 @@ import { authStore } from '../../store/authStore';
 import { mockKillLog, MOCK_KILL_UNAUTHORIZED_ID } from '../../api/mock';
 import { makeFlow, renderWithQuery, resetWorld, seedFlows } from '../testHarness';
 import type { DebugWsMessage, FlowDetail as FlowDetailDto } from '../../api/types';
+import { getConnection } from '../../api/connection';
 
 function noop() {}
+
+function stubNarrowViewport(): void {
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    matches: query === '(max-width: 1023px)',
+    media: query,
+    onchange: null,
+    addEventListener() {},
+    removeEventListener() {},
+    addListener() {},
+    removeListener() {},
+    dispatchEvent: () => false,
+  }));
+}
 
 /** Push a monitor message into the live ring, stamped with its arrival `monitor_seq`. */
 function pushMonitor(msg: DebugWsMessage, seq = 0): void {
@@ -40,6 +55,25 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     expect(tintedB.length + tintedC.length).toBeGreaterThan(0);
   });
 
+  it('distinguishes initial detail loading from a retryable load failure and body eviction', async () => {
+    seedFlows([makeFlow({ api_call_id: 'api_load_failure', status: 'completed' })]);
+    const { client, queryClient } = getConnection();
+    queryClient.setDefaultOptions({ queries: { retry: false } });
+    const detailSpy = vi.spyOn(client, 'flowDetail').mockRejectedValue(new Error('transport down'));
+    const { getByTestId, getByRole } = renderWithQuery(
+      <FlowDetail apiCallId="api_load_failure" onClose={noop} />,
+    );
+
+    expect(getByTestId('detail-loading').textContent).toContain('Loading captured flow detail');
+    await waitFor(() => expect(getByTestId('detail-load-error')).toBeTruthy());
+    const empties = document.querySelectorAll('[data-testid^="jsonpane-empty-"]');
+    expect(empties[0]?.textContent).toContain('load failed');
+    expect(empties[0]?.textContent).not.toContain('evicted');
+
+    fireEvent.click(getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(detailSpy).toHaveBeenCalledTimes(2));
+  });
+
   it('scroll-syncs the panes (scrolling A mirrors to B and C)', async () => {
     const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
     await waitFor(() => expect(getByTestId('jsonpane-scroll-A · inbound')).toBeTruthy());
@@ -57,12 +91,11 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
 
     // Stream a timeline event + segments (output + a tool call) for resp_001. The segments arrive
-    // AFTER the mock REST replay's coverage — the replay's max delta `sequence` is 3, so the live
-    // continuation carries higher `monitor_seq`s (4, 5) and is appended past the replay watermark
-    // (deltas merge by MonitorHub SEQUENCE — finding 2).
-    pushMonitor({ type: 'event_append', response_id: 'resp_001', event: { timestamp_ms: 1, kind: 'response.created', summary: 'created', images: [] } }, 4);
-    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 1, kind: 'output', text: 'Hello world' } }, 4);
-    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 2, kind: 'tool', text: JSON.stringify({ name: 'search' }) } }, 5);
+    // AFTER the mock REST replay's explicit monitor watermark (5). The replay delta ordinals
+    // happen to end at 3, but those are a different domain and are never compared here.
+    pushMonitor({ type: 'event_append', response_id: 'resp_001', event: { timestamp_ms: 1, kind: 'response.created', summary: 'created', images: [] } }, 6);
+    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 1, kind: 'output', text: 'Hello world' } }, 6);
+    pushMonitor({ type: 'segment_append', response_id: 'resp_001', segment: { timestamp_ms: 2, kind: 'tool', text: JSON.stringify({ name: 'search' }) } }, 7);
 
     // Deltas sub-panel shows the output text + an expandable tool card.
     expect(getByTestId('deltas-panel').textContent).toContain('Hello world');
@@ -125,7 +158,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     // does NOT overwrite the injected detail.
     seedFlows([makeFlow({ api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', started_ms: 1_700_000_000_000 })]);
     const detail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', cost_confidence: 'unavailable',
+      flow_seq: 1, revision: 1, api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', cost_confidence: 'unavailable',
       deltas: [], started_ms: 1_700_000_000_000,
       // `b_only` is present in A and B alike (unchanged A→B) but dropped by C — so the ONLY signal
       // for it is the B→C removal, which must surface in pane B (it would be invisible under the
@@ -149,7 +182,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     // `api_replay` is unknown to the mock so the 404 won't replace the injected detail.
     seedFlows([makeFlow({ api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', started_ms: 1_700_000_000_000 })]);
     const detail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', cost_confidence: 'unavailable',
+      flow_seq: 1, revision: 1, api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', cost_confidence: 'unavailable',
       started_ms: 1_700_000_000_000,
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
       deltas: [
@@ -162,6 +195,44 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     act(() => queryClient.setQueryData(['flows', 'api_replay'], detail));
     // The replayed deltas render (coalesced) even with NO live monitor frames pushed.
     await waitFor(() => expect(getByTestId('deltas-panel').textContent).toContain('Replayed output'));
+  });
+
+  it('uses deltas_through_monitor_seq instead of the replay ordinal at the live seam', async () => {
+    seedFlows([makeFlow({
+      api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed',
+      started_ms: 1_700_000_000_000,
+    })]);
+    // Same-millisecond, identical content at the snapshot boundary, followed by a real tail.
+    pushMonitor({
+      type: 'segment_append', response_id: 'resp_replay',
+      segment: { timestamp_ms: 100, kind: 'output', text: 'BASE' },
+    }, 50);
+    pushMonitor({
+      type: 'segment_append', response_id: 'resp_replay',
+      segment: { timestamp_ms: 100, kind: 'output', text: 'TAIL' },
+    }, 51);
+    const detail: FlowDetailDto = {
+      flow_seq: 1,
+      revision: 1,
+      api_call_id: 'api_replay',
+      response_id: 'resp_replay',
+      status: 'completed',
+      cost_confidence: 'unavailable',
+      started_ms: 1_700_000_000_000,
+      deltas_through_monitor_seq: 50,
+      // Ordinal 0 is deliberately nowhere near monitor seq 50. Treating it as the
+      // watermark would append BASE twice; the explicit cursor keeps one BASE + TAIL.
+      deltas: [
+        { sequence: 0, kind: 'segment.output', payload: { text: 'BASE' }, ts_ms: 100 },
+      ],
+    };
+    const { getByTestId, queryClient } = renderWithQuery(
+      <FlowDetail apiCallId="api_replay" onClose={noop} />,
+    );
+    act(() => queryClient.setQueryData(['flows', 'api_replay'], detail));
+
+    await waitFor(() => expect(getByTestId('deltas-panel').textContent).toContain('BASETAIL'));
+    expect(getByTestId('deltas-panel').textContent).not.toContain('BASEBASE');
   });
 
   it('detail cost roll-up shows even when the live row carries no cost (finding 4)', async () => {
@@ -354,7 +425,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     // Inject a stale detail with NO cost + an `unavailable` tag — the desync trap. Were the tag
     // derived independently (detail-first), it would mask the live estimated cost as `—`.
     const staleDetail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_g07c', status: 'completed',
+      flow_seq: 1, revision: 1, api_call_id: 'api_g07c', status: 'completed',
       cost: null, cost_confidence: 'unavailable',
       deltas: [], started_ms: 1_700_000_000_000,
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
@@ -439,7 +510,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     ]);
     const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_g07d" onClose={noop} />);
     const staleDetail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_g07d', status: 'completed',
+      flow_seq: 1, revision: 1, api_call_id: 'api_g07d', status: 'completed',
       cost: null, cost_confidence: 'unavailable',
       deltas: [], started_ms: 1_700_000_000_000,
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
@@ -553,7 +624,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_g10c" onClose={noop} />);
     // The REST detail carries the POPULATED served attempt (with a wire first byte) + flow-level TTFB.
     const detail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_g10c', status: 'completed', cost_confidence: 'unavailable',
+      flow_seq: 1, revision: 1, api_call_id: 'api_g10c', status: 'completed', cost_confidence: 'unavailable',
       deltas: [], started_ms: t0,
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
       attempts: [{ provider: 'vllm-a', model: 'llama-3.1-70b', start_ms: t0 + 50, end_ms: t0 + 270, first_upstream_byte_ms: t0 + 270, status: 'served' }],
@@ -587,7 +658,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     ]);
     const { getByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_g10d" onClose={noop} />);
     const detail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_g10d', status: 'completed', cost_confidence: 'unavailable',
+      flow_seq: 1, revision: 1, api_call_id: 'api_g10d', status: 'completed', cost_confidence: 'unavailable',
       deltas: [], started_ms: t0,
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
       attempts: [], // …and the detail is empty too (no fabricated wire byte).
@@ -649,7 +720,7 @@ describe('FlowDetail — ErrorTab captured upstream body (gap 14)', () => {
     // The store row is FAILED; the injected detail has NO terminal_reason and NO upstream_response.
     seedFlows([makeFlow({ api_call_id: 'api_bare_fail', status: 'failed', started_ms: 1_700_000_000_000 })]);
     const bare: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_bare_fail', status: 'failed', cost_confidence: 'unavailable',
+      flow_seq: 1, revision: 1, api_call_id: 'api_bare_fail', status: 'failed', cost_confidence: 'unavailable',
       deltas: [], started_ms: 1_700_000_000_000,
       // terminal_reason + upstream_response intentionally ABSENT.
     };
@@ -694,7 +765,7 @@ describe('FlowDetail — ErrorTab captured upstream body (gap 14)', () => {
     // An id the mock does NOT know; a COMPLETED store row + an injected detail with no error/no body.
     seedFlows([makeFlow({ api_call_id: 'api_ok_noerr', status: 'completed', started_ms: 1_700_000_000_000 })]);
     const ok: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_ok_noerr', status: 'completed', cost_confidence: 'unavailable',
+      flow_seq: 1, revision: 1, api_call_id: 'api_ok_noerr', status: 'completed', cost_confidence: 'unavailable',
       deltas: [], started_ms: 1_700_000_000_000,
     };
     const { getByTestId, getByRole, queryByTestId, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_ok_noerr" onClose={noop} />);
@@ -720,7 +791,7 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
   it('shows the snapshot badge and "body evicted (snapshot)" when seeking with no body', async () => {
     // A detail with evicted bodies (absent fields) — what /flows/:id returns post-eviction.
     const evicted: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_evicted', response_id: 'resp_evicted', status: 'completed', cost_confidence: 'unavailable',
+      flow_seq: 1, revision: 1, api_call_id: 'api_evicted', response_id: 'resp_evicted', status: 'completed', cost_confidence: 'unavailable',
       deltas: [], started_ms: 1_700_000_000_000,
       // inbound_body / normalized / upstream_body intentionally ABSENT (evicted).
     };
@@ -768,7 +839,7 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
       started_ms: started, cost: 0.1234, cost_confidence: 'confident',
     })]);
     const liveDetail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_frozen', response_id: 'resp_frozen', status: 'open', cost_confidence: 'unavailable',
+      flow_seq: 1, revision: 1, api_call_id: 'api_frozen', response_id: 'resp_frozen', status: 'open', cost_confidence: 'unavailable',
       deltas: [], started_ms: started,
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
       cost: 0.9999, elapsed_ms: 999_000, // live values that must NOT bleed into the frozen view
@@ -801,7 +872,7 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     act(() => dashboardStore.getState().pushMonitor({ type: 'segment_append', response_id: 'resp_cut', segment: { timestamp_ms: 10, kind: 'output', text: 'IN-CUT' } }, 2));
     act(() => dashboardStore.getState().pushMonitor({ type: 'segment_append', response_id: 'resp_cut', segment: { timestamp_ms: 20, kind: 'output', text: 'POST-CUT' } }, 3));
     const liveDetail: FlowDetailDto = {
-      flow_seq: 1, api_call_id: 'api_cut', response_id: 'resp_cut', status: 'open', cost_confidence: 'unavailable',
+      flow_seq: 1, revision: 1, api_call_id: 'api_cut', response_id: 'resp_cut', status: 'open', cost_confidence: 'unavailable',
       started_ms: started, inbound_headers: { authorization: 'Bearer LEAK' },
       inbound_body: { model: 'gpt-4o' }, normalized: { model: 'm' }, upstream_body: { model: 'm' },
       deltas: [{ sequence: 1, kind: 'response.output_text.delta', payload: { text: 'REST-LEAK' }, ts_ms: 5 }],
@@ -979,7 +1050,17 @@ describe('FlowDetail — adjustable sections (splitters / collapse-to-strip / zo
     const { getByTestId, getByRole, queryByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
     await waitFor(() => expect(getByTestId('tabpanel-headers')).toBeTruthy());
 
-    fireEvent.click(getByRole('tab', { name: 'Headers' })); // active → collapse
+    const headersTab = getByRole('tab', { name: 'Headers' });
+    const headersPanel = getByTestId('tabpanel-headers');
+    expect(headersTab.getAttribute('aria-controls')).toBe(headersPanel.id);
+    expect(headersPanel.getAttribute('aria-labelledby')).toBe(headersTab.id);
+    act(() => headersTab.focus());
+    fireEvent.keyDown(headersTab, { key: 'End' });
+    expect(document.activeElement).toBe(getByRole('tab', { name: 'Error' }));
+    fireEvent.keyDown(getByRole('tab', { name: 'Error' }), { key: 'Home' });
+    expect(document.activeElement).toBe(headersTab);
+
+    fireEvent.click(headersTab); // active → collapse
     expect(queryByTestId('tabpanel-headers')).toBeNull();
     // The strip itself survives (never hidden entirely).
     expect(getByRole('tablist')).toBeTruthy();
@@ -1023,5 +1104,112 @@ describe('FlowDetail — adjustable sections (splitters / collapse-to-strip / zo
 
     fireEvent.click(getByTestId('deltas-strip'));
     expect(getByTestId('deltas-panel')).toBeTruthy();
+  });
+});
+
+describe('FlowDetail — narrow single-pane accessibility', () => {
+  beforeEach(() => {
+    resetWorld({ mock: true });
+    stubNarrowViewport();
+    seedFlows([
+      makeFlow({
+        api_call_id: 'api_001',
+        response_id: 'resp_001',
+        status: 'open',
+        model_requested: 'gpt-4o',
+        model_served: 'llama-3.1-70b',
+        upstream_target: 'vllm-a',
+        started_ms: 1_700_000_000_000,
+      }),
+    ]);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+  });
+
+  it('renders one of seven related tabpanels instead of desktop split panes', async () => {
+    const { getByRole, getAllByRole, getByTestId, queryByTestId } = renderWithQuery(
+      <FlowDetail apiCallId="api_001" onClose={noop} />,
+    );
+    await waitFor(() => expect(getByTestId('flow-detail-narrow')).toBeTruthy());
+    expect(queryByTestId('flowdetail-vsplit')).toBeNull();
+
+    const tablist = getByRole('tablist', { name: 'Flow detail sections' });
+    const tabs = within(tablist).getAllByRole('tab');
+    expect(tabs).toHaveLength(7);
+    const inbound = getByRole('tab', { name: 'A · inbound' });
+    const panel = getByRole('tabpanel');
+    expect(inbound.getAttribute('aria-selected')).toBe('true');
+    expect(inbound.tabIndex).toBe(0);
+    expect(inbound.getAttribute('aria-controls')).toBe(panel.id);
+    expect(panel.getAttribute('aria-labelledby')).toBe(inbound.id);
+    expect(getByTestId('jsonpane-A · inbound')).toBeTruthy();
+    expect(queryByTestId('jsonpane-B · normalized')).toBeNull();
+
+    fireEvent.click(getByRole('tab', { name: 'B · normalized' }));
+    expect(getByTestId('jsonpane-B · normalized')).toBeTruthy();
+    expect(queryByTestId('jsonpane-A · inbound')).toBeNull();
+    fireEvent.click(getByRole('tab', { name: 'Deltas' }));
+    expect(getByTestId('deltas-panel')).toBeTruthy();
+    expect(getAllByRole('tabpanel')).toHaveLength(1);
+  });
+
+  it('uses a roving tab stop with Arrow/Home/End automatic activation', () => {
+    const { getByRole, getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
+    const inbound = getByRole('tab', { name: 'A · inbound' });
+    act(() => inbound.focus());
+
+    fireEvent.keyDown(inbound, { key: 'ArrowRight' });
+    const normalized = getByRole('tab', { name: 'B · normalized' });
+    expect(document.activeElement).toBe(normalized);
+    expect(normalized.getAttribute('aria-selected')).toBe('true');
+    expect(getByTestId('narrow-tabpanel-B').getAttribute('aria-labelledby')).toBe(normalized.id);
+
+    fireEvent.keyDown(normalized, { key: 'End' });
+    const error = getByRole('tab', { name: 'Error' });
+    expect(document.activeElement).toBe(error);
+    expect(getByTestId('narrow-tabpanel-error')).toBeTruthy();
+    fireEvent.keyDown(error, { key: 'Home' });
+    expect(document.activeElement).toBe(inbound);
+    fireEvent.keyDown(inbound, { key: 'ArrowLeft' });
+    expect(document.activeElement).toBe(error);
+  });
+
+  it('moves focus into the detail and restores the originating trigger after close', async () => {
+    function FocusHarness() {
+      const [open, setOpen] = useState(false);
+      return (
+        <>
+          <div data-testid="flow-row">
+            <button
+              type="button"
+              title="api_001"
+              data-testid="flow-origin"
+              onClick={(event) => {
+                // Suspense can leave the row hidden/blurred before the lazy detail mounts. The
+                // detail falls back to the selected flow trigger rather than losing restoration.
+                event.currentTarget.blur();
+                setOpen(true);
+              }}
+            >
+              open flow
+            </button>
+          </div>
+          {open && <FlowDetail apiCallId="api_001" onClose={() => setOpen(false)} />}
+        </>
+      );
+    }
+
+    const { getByTestId, queryByTestId } = renderWithQuery(<FocusHarness />);
+    const origin = getByTestId('flow-origin');
+    act(() => origin.focus());
+    fireEvent.click(origin);
+    await waitFor(() => expect(document.activeElement).toBe(getByTestId('flow-detail')));
+
+    fireEvent.click(getByTestId('detail-back'));
+    await waitFor(() => expect(queryByTestId('flow-detail')).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(origin));
   });
 });

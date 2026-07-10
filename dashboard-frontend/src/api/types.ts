@@ -16,6 +16,7 @@
  * missing switch arm into a COMPILE error. Runtime validators (bottom of file) reject any
  * frame whose shape/enum/seq does not match BEFORE it can mutate state.
  */
+import { validateWsFrame, validateWsSnapshot } from './generated/validators-initial';
 
 // ---------------------------------------------------------------------------
 // Shared scalars
@@ -33,6 +34,10 @@ export type ResponseId = string;
 /** Lifecycle status of a flow — the EXACT `FlowStatus` enum from `dashboard_flow.rs`. */
 export type FlowStatus = 'open' | 'completed' | 'failed' | 'cancelled';
 export const FLOW_STATUSES: readonly FlowStatus[] = ['open', 'completed', 'failed', 'cancelled'];
+
+/** Bounded lifecycle phase on each authoritative FlowStore mutation. */
+export type FlowMutationPhase = 'open' | 'progress' | 'terminal';
+export const FLOW_MUTATION_PHASES: readonly FlowMutationPhase[] = ['open', 'progress', 'terminal'];
 
 /** Provider health state — the EXACT D4 `ProviderHealth.status` (snake_case serialize). */
 export type ProviderStatus = 'healthy' | 'cooling' | 'down';
@@ -134,9 +139,10 @@ export const ATTEMPT_ERROR_CLASSES: readonly AttemptErrorClass[] = [
  * Gap 03 — a BOUNDED taxonomic reason a failed attempt triggered failover (Rust
  * `AttemptFailoverReason`, snake_case). `null`/absent on the served attempt.
  */
-export type AttemptFailoverReason = 'provider_failed' | 'terminal_no_failover';
+export type AttemptFailoverReason = 'provider_failed' | 'request_rejected' | 'terminal_no_failover';
 export const ATTEMPT_FAILOVER_REASONS: readonly AttemptFailoverReason[] = [
   'provider_failed',
+  'request_rejected',
   'terminal_no_failover',
 ];
 
@@ -498,24 +504,14 @@ export interface MetricTickPayload {
  * (mirrors the `Option<String>` fields on `FlowRecord`). Validator: require `api_call_id`,
  * accept optional `response_id`.
  */
-export interface FlowStatusPayload extends PhaseTimings {
+export interface FlowStatusPayload extends FlowSummary {
   type: 'flow_status';
-  /** REQUIRED authoritative flow key (matches D1 FlowRecord + D6 kill + D13 `:id`). */
-  api_call_id: ApiCallId;
-  /** OPTIONAL secondary correlation id (the engine response id); coexists with api_call_id. */
-  response_id?: ResponseId | null;
-  status: FlowStatus;
-  model_requested?: string | null;
-  /** Served identity (D1 `model_served`; supersedes D7 sketch's `served_model`). */
-  model_served?: string | null;
-  upstream_target?: string | null;
+  /** The mutation that produced this complete post-mutation row. */
+  phase: FlowMutationPhase;
+  /** Required on every complete live row (the REST compatibility type remains additive). */
   usage: Usage | null;
-  started_ms: number;
-  elapsed_ms?: number | null;
-  /** Gap 03 — the per-attempt failover trace (optional; present once the backend projects it). */
-  attempts?: Attempt[];
-  /** Gap 03 — flow-level wire TTFB; `null`/absent, never `0`. */
-  first_upstream_byte_ms?: number | null;
+  /** Required nullable priced roll-up paired with `cost_confidence`. */
+  cost: number | null;
 }
 
 /**
@@ -595,6 +591,7 @@ export const DOMAIN_PAYLOADS: Record<Domain, ReadonlySet<DashboardPayload['type'
 /** The first WS message after connect: a full snapshot the live frames build upon. */
 export interface SnapshotFrame {
   type: 'snapshot';
+  schema_version: number;
   cursors: SeqCursors;
   flows: FlowSummary[];
   metrics: MetricsResponse | null;
@@ -621,6 +618,8 @@ export interface SeqCursors {
  * optional exactly as the Rust `Option<_>` fields are. `cost` is a D13 roll-up addition.
  */
 export interface FlowSummary extends PhaseTimings {
+  /** Monotonic optimistic-concurrency version for this flow. */
+  revision: number;
   api_call_id: ApiCallId;
   response_id?: ResponseId | null;
   method: string;
@@ -688,7 +687,37 @@ export interface FlowsQuery {
   limit?: number;
 }
 
-/** A single streamed delta replayed into the inspector (from MonitorHub snapshot). */
+// ---------------------------------------------------------------------------
+// Exact Overview rollups — Rust-authored generated contract.
+// ---------------------------------------------------------------------------
+
+/** Exact server-side window selected by the shared hash scope. */
+export type OverviewWindow = import('./generated/contracts').OverviewWindow;
+/** Cross-cutting quality for exact, bounded Overview aggregates. */
+export type OverviewDataQuality = import('./generated/contracts').OverviewDataQuality;
+export type OverviewCost = import('./generated/contracts').OverviewCost;
+export type OverviewTokens = import('./generated/contracts').OverviewTokens;
+export type OverviewDimensionRollup = import('./generated/contracts').OverviewDimensionRollup;
+export type OverviewContextRollup = import('./generated/contracts').OverviewContextRollup;
+export type OverviewCostPoint = import('./generated/contracts').OverviewCostPoint;
+export type OverviewResponse = import('./generated/contracts').OverviewResponse;
+
+/** `GET /dashboard/api/overview` query. `at` selects the nearest retained historical cut. */
+export interface OverviewQuery {
+  window: OverviewWindow;
+  at?: number;
+  status?: FlowStatus;
+  model?: string;
+  upstream?: string;
+  client?: string;
+}
+
+/**
+ * A single streamed delta replayed into the inspector (from one MonitorHub snapshot).
+ * `sequence` is a per-flow ordering ordinal only. It is NOT a monitor-domain cursor and
+ * must never be compared with the `monitor_seq` attached to live WS messages; flow detail's
+ * separate `deltas_through_monitor_seq` places that replay/live seam.
+ */
 export interface FlowDelta {
   sequence: number;
   kind: string;
@@ -704,6 +733,8 @@ export interface FlowDelta {
  */
 export interface FlowDetail extends PhaseTimings {
   flow_seq: number;
+  /** Monotonic optimistic-concurrency version for this flow. */
+  revision: number;
   api_call_id: ApiCallId;
   response_id?: ResponseId | null;
   /** Absent when the body has been evicted by the summary-byte quota (D1). */
@@ -725,6 +756,12 @@ export interface FlowDetail extends PhaseTimings {
   upstream_target?: string | null;
   usage?: Usage | null;
   status: FlowStatus;
+  /**
+   * Monitor-domain cursor of the single transcript snapshot that produced `deltas`.
+   * Only live segments with a strictly greater monitor sequence extend the replay.
+   * Optional solely for additive compatibility with an older host; a v2 host emits it.
+   */
+  deltas_through_monitor_seq?: number;
   deltas: FlowDelta[];
   terminal_reason?: string | null;
   started_ms: number;
@@ -837,12 +874,22 @@ export interface CatalogEntry {
 }
 
 /** `GET /dashboard/api/snapshot?at=<unix_ms>` */
+export interface SnapshotHistoryMetadata {
+  oldest_at_ms: number | null;
+  newest_at_ms: number | null;
+  retained_bytes: number;
+  quota_bytes: number;
+  retained_cuts: number;
+}
+
 export interface SnapshotResponse {
   cursors: SeqCursors;
   at_ms: number;
   summaries: SnapshotFlowSummary[];
   metrics: MetricsResponse | null;
   topology: TopologyResponse | null;
+  history: SnapshotHistoryMetadata;
+  flow_summaries_truncated: boolean;
 }
 
 /** `POST /dashboard/api/flows/:id/kill` */
@@ -869,6 +916,7 @@ export interface DashboardBootstrap {
   authenticated: boolean;
   csrf_token: string | null;
   mutations_enabled: boolean;
+  schema_version: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,12 +1233,10 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
       );
     case 'flow_status':
       return (
-        isStr(v.api_call_id) && isOptStr(v.response_id) &&
-        isOneOf(v.status, FLOW_STATUSES) &&
-        isOptStr(v.model_requested) && isOptStr(v.model_served) && isOptStr(v.upstream_target) &&
-        isUsageOrNull(v.usage) && isUint(v.started_ms) && isOptUint(v.elapsed_ms) &&
-        // Gap 02/03: optional spine fields on the live flow update — validated when present.
-        isOptPhaseTimings(v) && isOptAttempts(v.attempts) && isOptUint(v.first_upstream_byte_ms)
+        isOneOf(v.phase, FLOW_MUTATION_PHASES)
+        && isFlowSummary(v)
+        && isUsageOrNull(v.usage)
+        && (v.cost === null || isNum(v.cost))
       );
     case 'topology_update':
       return Array.isArray(v.nodes) && Array.isArray(v.edges) && v.nodes.every(isProviderHealth) && v.edges.every(isTopologyEdge);
@@ -1205,28 +1251,30 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
  * `type` legal under `domain` (domain↔payload compatibility — finding 5).
  */
 export function isDashboardFrame(v: unknown): v is DashboardFrame {
-  if (!isObj(v) || !isDomain(v.domain) || !isUint(v.seq) || !Array.isArray(v.batch)) {
-    return false;
-  }
+  if (!validateWsFrame(v)) return false;
+  // Serde's enum schema describes payload shapes but cannot express the
+  // envelope-level domain↔payload invariant. Keep that one semantic check next
+  // to the generated structural validator.
   const allowed = DOMAIN_PAYLOADS[v.domain];
-  return v.batch.every((p) => isDashboardPayload(p) && allowed.has(p.type));
+  return v.batch.every((payload) => isDashboardPayload(payload) && allowed.has(payload.type));
 }
 
-function isSeqCursors(v: unknown): v is SeqCursors {
+export function isSeqCursors(v: unknown): v is SeqCursors {
   return isObj(v) && isUint(v.flow_seq) && isUint(v.metrics_seq) && isUint(v.topology_seq) && isUint(v.monitor_seq);
 }
 
 /** Validates a body-free flow summary (each snapshot summary — finding 4). */
-function isFlowSummary(v: unknown): v is FlowSummary {
+export function isFlowSummary(v: unknown): v is FlowSummary {
   return (
     isObj(v) &&
+    isUint(v.revision) &&
     isStr(v.api_call_id) && isOptStr(v.response_id) &&
     isStr(v.method) && isStr(v.uri) &&
     isOptStr(v.model_requested) && isOptStr(v.model_served) && isOptStr(v.upstream_target) &&
     isOptUsage(v.usage) &&
     isOneOf(v.status, FLOW_STATUSES) &&
     isUint(v.started_ms) && isOptUint(v.finished_ms) && isOptUint(v.elapsed_ms) &&
-    isOptStr(v.terminal_reason) &&
+    isOptStr(v.terminal_reason) && (v.cost === undefined || v.cost === null || isNum(v.cost)) &&
     // Gap 07: the per-flow cost-confidence tag is REQUIRED on every row.
     isCostConfidence(v.cost_confidence) &&
     // Gap 02/03: the optional spine fields, when present, must be well-shaped (don't trust the
@@ -1245,7 +1293,7 @@ function isOptClientSource(v: unknown): boolean {
   return v === undefined || v === null || isOneOf(v, CLIENT_SOURCES);
 }
 
-function isMetricsResponse(v: unknown): v is MetricsResponse {
+export function isMetricsResponse(v: unknown): v is MetricsResponse {
   return (
     isObj(v) && isUint(v.metrics_seq) &&
     isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
@@ -1255,7 +1303,7 @@ function isMetricsResponse(v: unknown): v is MetricsResponse {
   );
 }
 
-function isTopologyResponse(v: unknown): v is TopologyResponse {
+export function isTopologyResponse(v: unknown): v is TopologyResponse {
   return (
     isObj(v) && isUint(v.topology_seq) &&
     Array.isArray(v.nodes) && v.nodes.every(isProviderHealth) &&
@@ -1271,13 +1319,7 @@ function isTopologyResponse(v: unknown): v is TopologyResponse {
  * null or their full valid shapes — BEFORE the snapshot can be applied.
  */
 export function isSnapshotFrame(v: unknown): v is SnapshotFrame {
-  return (
-    isObj(v) && v.type === 'snapshot' &&
-    isSeqCursors(v.cursors) &&
-    Array.isArray(v.flows) && v.flows.every(isFlowSummary) &&
-    (v.metrics === null || isMetricsResponse(v.metrics)) &&
-    (v.topology === null || isTopologyResponse(v.topology))
-  );
+  return validateWsSnapshot(v) && v.flows.every(isFlowSummary);
 }
 
 // ---------------------------------------------------------------------------

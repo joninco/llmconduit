@@ -58,7 +58,7 @@ describe('FlowsView — seek suppresses a selection absent from the frozen snaps
     const { getAllByTestId, queryByTestId } = renderWithQuery(<FlowsView />);
     await waitFor(() => expect(getAllByTestId('flow-row').length).toBeGreaterThan(0));
     act(() => selectFirstRow(getAllByTestId));
-    expect(queryByTestId('flow-detail')).toBeTruthy();
+    await waitFor(() => expect(queryByTestId('flow-detail')).toBeTruthy());
     // Enter seek: the row is STILL in the frozen store → the inspector stays open.
     act(() => dashboardStore.getState().setConnection('seeking'));
     expect(queryByTestId('flow-detail')).toBeTruthy();
@@ -71,7 +71,7 @@ describe('FlowsView — seek suppresses a selection absent from the frozen snaps
     const { getAllByTestId, queryByTestId } = renderWithQuery(<FlowsView />);
     await waitFor(() => expect(getAllByTestId('flow-row').length).toBeGreaterThan(0));
     act(() => selectFirstRow(getAllByTestId));
-    expect(queryByTestId('flow-detail')).toBeTruthy();
+    await waitFor(() => expect(queryByTestId('flow-detail')).toBeTruthy());
 
     // Enter seek with a frozen cut that does NOT contain api_future (a moment before it existed).
     // `applySnapshot` replaces the store rows; we then flip to 'seeking'.
@@ -87,6 +87,6 @@ describe('FlowsView — seek suppresses a selection absent from the frozen snaps
       seedFlows([makeFlow({ api_call_id: 'api_future', status: 'open', started_ms: 1_700_000_999_999 })]);
       dashboardStore.getState().setConnection('live');
     });
-    expect(queryByTestId('flow-detail')).toBeTruthy();
+    await waitFor(() => expect(queryByTestId('flow-detail')).toBeTruthy());
   });
 });

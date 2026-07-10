@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Array_of_CatalogEntry",
+  "type": "array",
+  "items": {
+    "$ref": "#/$defs/CatalogEntry"
+  },
+  "$defs": {
+    "CatalogEntry": {
+      "description": "One catalog entry (`GET /dashboard/api/catalog` — a BARE array, no cursor).\n`{id, context_limit}` where `context_limit` is the per-model max-context window\nsurfaced from the upstream `/v1/models` snapshot (gap 06).\n\nNULLABLE end-to-end (gap 06 contract migration): `context_limit` is\n`Option<i64>`, serialized as `null` when the upstream advertises no window —\ndistinct from a real `0`. Previously this DTO collapsed a missing window to a\nnon-null `0` (`unwrap_or(0)`), which lies-with-zeros: a `0` ceiling reads as\ngarbage/infinite utilization downstream (spec 09's context-window gauge).\n`measured` when advertised; `unavailable`/`None` when the upstream omits it.\nThe frontend renders `—` on `null`, NEVER `0`. Derives `Deserialize` alongside\n`Serialize` so the changed wire field round-trips in a test (AGENTS.md: no\nchanged wire field without a deserialize-then-serialize proof).",
+      "type": "object",
+      "properties": {
+        "context_limit": {
+          "description": "The per-model max-context window (tokens), or `null`/absent when the\nupstream advertises none. `skip_serializing_if` so an unavailable window\nOMITS the key rather than emitting `null` — either is honest (the frontend\ntype is `number | null` with the field optional); both are distinct from a\nreal `0`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ]
+    }
+  }
+}

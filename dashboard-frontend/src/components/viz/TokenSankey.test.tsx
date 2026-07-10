@@ -83,6 +83,31 @@ describe('TokenSankey — click → filter wiring (both facets — finding 9)', 
     fireEvent.click(container.querySelector('[data-node-id="served:vllm-b|cheap"]')!);
     expect(onSelect).toHaveBeenCalledWith('cheap', 'vllm-b');
   });
+
+  it('makes bands and model nodes labelled keyboard buttons', () => {
+    const onSelect = vi.fn();
+    const { container } = render(<TokenSankey model={fixture()} width={600} height={400} onSelectModel={onSelect} />);
+    const band = container.querySelector('[data-testid="sankey-band"][data-model="gpt-4o"]')!;
+    expect(band.getAttribute('role')).toBe('button');
+    expect(band.getAttribute('tabindex')).toBe('0');
+    expect(band.getAttribute('aria-label')).toMatch(/2000 tokens.*activate to filter/i);
+    fireEvent.focus(band);
+    const tooltip = container.querySelector('[data-testid="sankey-tooltip"]') as HTMLElement;
+    expect(tooltip.hidden).toBe(false);
+    expect(tooltip.textContent).toContain('gpt-4o');
+    fireEvent.keyDown(band, { key: 'Enter' });
+    expect(onSelect).toHaveBeenCalledWith('gpt-4o', 'vllm-a');
+
+    const node = container.querySelector('[data-node-id="served:vllm-b|cheap"]')!;
+    expect(node.getAttribute('role')).toBe('button');
+    expect(node.getAttribute('aria-label')).toMatch(/cheap @vllm-b lane/i);
+    fireEvent.blur(band);
+    fireEvent.focus(node);
+    expect(tooltip.hidden).toBe(false);
+    expect(tooltip.textContent).toContain('cheap');
+    fireEvent.keyDown(node, { key: ' ' });
+    expect(onSelect).toHaveBeenCalledWith('cheap', 'vllm-b');
+  });
 });
 
 describe('TokenSankey — StrictMode-safe (no leaked / duplicate SVG)', () => {

@@ -22,12 +22,12 @@ import { cn } from '../../lib/cn';
 /** Quality → the small provenance badge (mirrors the gap-10 latency badges). */
 const QUALITY_BADGE: Partial<Record<Quality, { cls: string; text: string; title: string }>> = {
   derived: {
-    cls: 'bg-accent/15 text-accent',
+    cls: 'border border-accent/50 bg-accent/10 text-text',
     text: 'derived',
     title: 'derived — a percentile computed from this provider\'s own attempt-latency histogram (incl. failed primaries)',
   },
   measured: {
-    cls: 'bg-status-healthy/15 text-status-healthy',
+    cls: 'border border-status-healthy/50 bg-status-healthy/10 text-text',
     text: 'measured',
     title: 'measured — a directly-counted failed/total attempt ratio for this provider',
   },
@@ -39,7 +39,7 @@ function QualityBadge({ quality }: { quality: Quality }) {
   if (!b) return null;
   return (
     <span
-      className={cn('ml-1 rounded-sm px-1 py-px text-[8px] uppercase tracking-wide', b.cls)}
+      className={cn('ml-1 rounded-sm px-1 py-px text-[9px] uppercase tracking-wide', b.cls)}
       data-testid="provider-latency-quality-badge"
       data-quality={quality}
       title={b.title}

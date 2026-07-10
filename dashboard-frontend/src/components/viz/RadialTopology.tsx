@@ -35,6 +35,7 @@ import { colors, statusColor, prefersReducedMotion } from '../../design/tokens';
 import { useImperativeViz, type VizCleanup } from '../../viz/useImperativeViz';
 import { radialTopologyState } from './radialTopologyState';
 import { providerNodeEmphasis } from './providerLatency';
+import { useObservedWidth } from '../../lib/useObservedWidth';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -141,6 +142,9 @@ export function RadialTopology({
   onHover,
 }: RadialTopologyProps) {
   const ref = useRef<HTMLDivElement>(null);
+  const observedWidth = useObservedWidth(ref);
+  const renderWidth = Math.max(220, Math.floor(observedWidth ?? width));
+  const renderHeight = Math.min(height, Math.max(220, Math.floor(renderWidth * 0.67)));
   // Keep the latest data + callbacks reachable from the (size/motion-keyed) setup without
   // re-running it: a streaming TopologyUpdate updates these refs and the live re-render pass
   // (the `dataRef` read on each frame) recolors nodes WITHOUT restarting the simulation. The
@@ -168,10 +172,10 @@ export function RadialTopology({
 
       const svg = document.createElementNS(SVG_NS, 'svg');
       svg.setAttribute('data-testid', 'radial-topology-svg');
-      svg.setAttribute('width', String(width));
-      svg.setAttribute('height', String(height));
-      svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-      svg.setAttribute('role', 'img');
+      svg.setAttribute('width', String(renderWidth));
+      svg.setAttribute('height', String(renderHeight));
+      svg.setAttribute('viewBox', `0 0 ${renderWidth} ${renderHeight}`);
+      svg.setAttribute('role', 'group');
       svg.setAttribute('aria-label', 'Provider topology');
       svg.style.display = 'block';
       svg.style.maxWidth = '100%';
@@ -183,9 +187,9 @@ export function RadialTopology({
       svg.append(edgeLayer, nodeLayer);
       el.appendChild(svg);
 
-      const cx = width / 2;
-      const cy = height / 2;
-      const ringR = Math.min(width, height) / 2 - NODE_R - 24;
+      const cx = renderWidth / 2;
+      const cy = renderHeight / 2;
+      const ringR = Math.min(renderWidth, renderHeight) / 2 - NODE_R - 24;
 
       const { nodes: graphNodes, links } = buildGraph(dataRef.current.nodes, dataRef.current.edges);
       // Pin the client behind the hub and the hub at center so the ring radiates predictably.
@@ -269,15 +273,26 @@ export function RadialTopology({
         // tick/update mid-hover never tears down the listener nor the hover target — they read the
         // live `node.x/node.y` + `node.id` via closure (finding 5 + finding 7).
         if (node.kind === 'provider') {
+          g.setAttribute('role', 'button');
+          g.setAttribute('tabindex', '0');
+          g.setAttribute('class', 'topo-interactive-node');
           g.style.cursor = 'pointer';
           g.addEventListener('click', () => selectRef.current(node.id));
+          g.addEventListener('keydown', (event) => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            selectRef.current(node.id);
+          });
           // Report the provider ID (not the health datum) so the view re-resolves CURRENT health by
           // id on each render — an open tooltip then reflects streaming updates (finding 7).
-          g.addEventListener('mouseenter', () => {
+          const reportHover = () => {
             const rect = svg.getBoundingClientRect();
             hoverRef.current?.({ id: node.id, x: rect.left + (node.x ?? 0), y: rect.top + (node.y ?? 0) });
-          });
+          };
+          g.addEventListener('mouseenter', reportHover);
           g.addEventListener('mouseleave', () => hoverRef.current?.(null));
+          g.addEventListener('focus', reportHover);
+          g.addEventListener('blur', () => hoverRef.current?.(null));
         }
         nodeLayer.appendChild(g);
         return { g, circle, ring };
@@ -374,6 +389,14 @@ export function RadialTopology({
             );
             els.g.setAttribute('data-p99', emphasis.p99Ms === null ? '' : String(emphasis.p99Ms));
             els.g.setAttribute('data-latency-degraded', emphasis.latencyDegraded ? 'true' : 'false');
+            els.g.setAttribute(
+              'aria-label',
+              `${health?.name ?? node.label} provider, ${health?.status ?? 'down'} status, ${
+                emphasis.errorRatePct === null
+                  ? 'attempt health unavailable'
+                  : `${emphasis.errorRatePct.toFixed(1)} percent attempt errors`
+              }. Activate to filter flows.`,
+            );
             if (els.ring) {
               if (emphasis.showErrorRing) {
                 els.ring.setAttribute('r', String(scaledR + 3));
@@ -412,7 +435,7 @@ export function RadialTopology({
     // `identity` re-runs setup when the node/edge SET changes (a provider/edge added/removed —
     // finding 7); size/motion changes also rebuild. Health/throughput-only changes flow through
     // `renderGraph` below (recolor, no physics restart).
-    [width, height, reduced, identity],
+    [renderWidth, renderHeight, reduced, identity],
   );
 
   // Live recolor: a streaming TopologyUpdate (same node set, changed health/throughput) OR a

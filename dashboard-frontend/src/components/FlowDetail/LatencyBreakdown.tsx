@@ -168,37 +168,39 @@ export function LatencyBreakdown({ model }: { model: LatencyBreakdownModel }) {
 function LegendRow({ seg }: { seg: PhaseSegment }) {
   const unavailable = seg.quality === 'unavailable';
   return (
-    <div className="contents" data-testid={`latency-legend-${seg.id}`} data-quality={seg.quality}>
+    <>
+      <dt className="contents" data-testid={`latency-legend-${seg.id}`} data-quality={seg.quality}>
       {/* Swatch — a solid phase color for a measured/derived segment; a dashed muted box for an
           unavailable one (mirrors the gauge's dashed unavailable rail). */}
-      <span
-        className={cn(
-          'h-2 w-2 rounded-sm',
-          unavailable ? 'border border-dashed border-line/70 bg-transparent' : PHASE_FILL[seg.id],
-        )}
-        aria-hidden="true"
-      />
-      <span className={cn('text-[11px]', unavailable ? 'text-text-muted' : 'text-text')} title={seg.detail}>
-        {seg.label}
-        {/* A `derived` segment is a labelled stand-in over a known pair that is NOT this phase's true
-            endpoints (e.g. routing→first-content when the wire TTFB is absent). Surface it visibly so
-            it is never read as a measured phase — mirrors the headline figures' `derived` badge. */}
-        {seg.quality === 'derived' && (
-          <span
-            className="ml-1 rounded-sm bg-accent/15 px-1 py-0.5 text-[9px] uppercase tracking-wide text-accent"
-            title={seg.detail}
-            data-testid={`latency-derived-${seg.id}`}
-          >
-            derived
-          </span>
-        )}
-        {seg.disordered && (
-          <span className="ml-1 text-[9px] uppercase tracking-wide text-status-cooling" title="clock skew — endpoints out of order, clamped to 0 (not negative)" data-testid={`latency-skew-${seg.id}`}>
-            skew
-          </span>
-        )}
-      </span>
-      <span
+        <span
+          className={cn(
+            'h-2 w-2 rounded-sm',
+            unavailable ? 'border border-dashed border-line/70 bg-transparent' : PHASE_FILL[seg.id],
+          )}
+          aria-hidden="true"
+        />
+        <span className={cn('text-[11px]', unavailable ? 'text-text-muted' : 'text-text')} title={seg.detail}>
+          {seg.label}
+          {/* A `derived` segment is a labelled stand-in over a known pair that is NOT this phase's true
+              endpoints (e.g. routing→first-content when the wire TTFB is absent). Surface it visibly so
+              it is never read as a measured phase — mirrors the headline figures' `derived` badge. */}
+          {seg.quality === 'derived' && (
+            <span
+              className="ml-1 rounded-sm bg-accent/15 px-1 py-0.5 text-[9px] uppercase tracking-wide text-accent"
+              title={seg.detail}
+              data-testid={`latency-derived-${seg.id}`}
+            >
+              derived
+            </span>
+          )}
+          {seg.disordered && (
+            <span className="ml-1 text-[9px] uppercase tracking-wide text-status-cooling" title="clock skew — endpoints out of order, clamped to 0 (not negative)" data-testid={`latency-skew-${seg.id}`}>
+              skew
+            </span>
+          )}
+        </span>
+      </dt>
+      <dd
         className={cn('justify-self-end text-[11px] tabular-nums', unavailable ? 'text-text-muted' : 'text-text')}
         data-testid={`latency-dur-${seg.id}`}
         title={unavailable ? seg.detail : `${seg.label}: ${seg.detail}`}
@@ -206,8 +208,8 @@ function LegendRow({ seg }: { seg: PhaseSegment }) {
         {/* `—` for unavailable (an endpoint was unknown), a real duration otherwise. A measured 0ms
             reads `0ms` — distinct from `—`. */}
         {unavailable ? '—' : fmtElapsed(seg.durationMs)}
-      </span>
-    </div>
+      </dd>
+    </>
   );
 }
 

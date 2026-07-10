@@ -3,6 +3,7 @@ pub mod cli;
 pub mod config;
 pub mod dashboard_api;
 pub mod dashboard_auth;
+pub mod dashboard_contracts;
 pub mod dashboard_flow;
 pub mod dashboard_ui;
 pub mod dashboard_ws;
@@ -113,9 +114,9 @@ pub fn build_app_with_gateway_and_options(
         crate::dashboard_flow::DashboardFlowStore::disabled()
     };
     // D5 MetricsLayer: enabled only when the debug UI is on (same zero-overhead
-    // `disabled()` split). Attached to the Gateway via `with_metrics`; the 5 s
-    // coordinated snapshot task is spawned below (on a live runtime) under the same
-    // gate, so production runs no ring/histogram/snapshot work.
+    // `disabled()` split). Attached to the Gateway via `with_metrics`; the shared 1 s
+    // publisher (with a snapshot every fifth cut) is spawned below under the same gate,
+    // so production runs no ring/histogram/publisher/snapshot work.
     let metrics = if options.with_debug_ui {
         crate::metrics::MetricsLayer::new()
     } else {
@@ -285,13 +286,12 @@ pub fn build_app_with_gateway_and_options(
         (None, false)
     };
 
-    // D5: capture cheap `Clone` handles BEFORE the originals move into `Gateway::new`
-    // so the 5 s coordinated snapshot task can own them (each is an `Arc`-backed
-    // handle; `disabled()` ones no-op). The snapshot task reads the FlowStore THEN
-    // the MetricsLayer (the fixed lock order) + one topology `Arc` + the monitor seq.
-    let snapshot_flow_store = flow_store.clone();
-    let snapshot_metrics = metrics.clone();
-    let snapshot_monitor = monitor.clone();
+    // Capture cheap handles for the ONE process-wide one-second metrics publisher before
+    // the originals move into Gateway. The task takes the fixed FlowStore→Metrics order,
+    // broadcasts one immutable shared cut, and persists that same cut every fifth tick.
+    let publisher_flow_store = flow_store.clone();
+    let publisher_metrics = metrics.clone();
+    let publisher_monitor = monitor.clone();
     let gateway = Arc::new(
         Gateway::new(
             config,
@@ -308,21 +308,31 @@ pub fn build_app_with_gateway_and_options(
         .with_metrics(metrics)
         .with_turn_capture(turn_capture),
     );
+    // Install the initial immutable presentation synchronously, before any REST/WS
+    // consumer can observe the Gateway. The async publisher owns every later cut, but
+    // this bootstrap cut removes the pre-first-tick recomputation race while sharing
+    // the same sequence allocator and FlowStore→Metrics lock order.
+    if options.with_debug_ui {
+        let _ = gateway.metrics().publish_metrics_cut(
+            gateway.flow_store(),
+            &gateway.provider_health_publisher(),
+            gateway.debug_snapshot().last_sequence,
+            false,
+        );
+    }
     // D4: spawn the topology-health publication task ONLY when the debug UI is on,
     // so production keeps the zero-overhead path (no 1 s tick). Guard on a live
     // tokio runtime so a non-async embedder that enables the debug UI does not
     // panic in `tokio::spawn` (the `main.rs` server path always has one).
     if options.with_debug_ui && tokio::runtime::Handle::try_current().is_ok() {
         gateway.spawn_provider_health_publisher();
-        // D5: spawn the 5 s coordinated body-free snapshot task (same gate + live-
-        // runtime guard). It takes the single FlowStore→Metrics critical section,
-        // captures one topology `Arc` (D4's publisher), and pushes a body-free cut
-        // onto the bounded ring every 5 s.
-        crate::metrics::spawn_snapshot_task(
-            snapshot_metrics,
-            snapshot_flow_store,
+        // Spawn ONE process-level publisher rather than a timer per dashboard socket.
+        // Every fifth one-second cut is also retained as the historical snapshot.
+        let _ = crate::metrics::spawn_metrics_publisher_task(
+            publisher_metrics,
+            publisher_flow_store,
             gateway.provider_health_publisher(),
-            snapshot_monitor,
+            publisher_monitor,
         );
     }
     let router_options = RouterOptions {

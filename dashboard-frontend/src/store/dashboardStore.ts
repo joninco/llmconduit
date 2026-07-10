@@ -7,7 +7,6 @@
  * time a payload reaches a setter it is known to be fresh.
  */
 import { createStore } from 'zustand/vanilla';
-import { pickAttempts } from '../api/attempts';
 import { createRiverFold, foldRiverMessage, type RiverFold } from '../components/viz/riverModel';
 import type {
   FlowStatusPayload,
@@ -46,6 +45,13 @@ export interface LiveBaseline {
 
 export interface DashboardState {
   connection: ConnectionState;
+  /** Fatal contract/version error that requires a server/client upgrade. */
+  fatalError: string | null;
+  /**
+   * The bounded seek shadow buffer overflowed. The historical cut remains visible, but it can no
+   * longer be advanced safely; returning LIVE must establish a fresh socket snapshot.
+   */
+  resyncRequired: boolean;
   /**
    * MONOTONIC connection-transition generation. Bumped on EVERY connection transition that changes
    * which store the mutable slices belong to (live ↔ seek ↔ teardown ↔ fresh snapshot). Unlike the
@@ -100,6 +106,8 @@ export interface DashboardState {
 
   // -- mutations (called by the socket) --
   setConnection: (s: ConnectionState) => void;
+  setFatalError: (message: string | null) => void;
+  setResyncRequired: (required: boolean) => void;
   /** Enter the frozen seek cut: marks `seeking` and captures `at_ms` + the `monitor_seq` cut. */
   enterSeek: (atMs: number) => void;
   /**
@@ -161,6 +169,12 @@ export interface DashboardState {
     topology: TopologyResponse | null;
   }) => void;
   upsertFlow: (flow: FlowSummary) => void;
+  /**
+   * Reconcile the live map from an unfiltered, cursor-bearing `/flows` response. A strictly newer
+   * REST cursor can contain removals that the row-only WS publisher cannot represent (TTL/count/
+   * quota eviction), so this replaces the retained id set atomically. Stale/equal cuts are ignored.
+   */
+  reconcileFlowRows: (flows: FlowSummary[], flowSeq: number) => void;
   /** Patch from a `flow_status` WS payload (keyed by `api_call_id`). */
   patchFlowStatus: (p: FlowStatusPayload) => void;
   /** Patch usage onto a flow by `api_call_id`. */
@@ -175,10 +189,26 @@ export interface DashboardState {
   seedTopology: (topology: TopologyResponse) => void;
   /** Append a monitor message, stamped with the `monitor_seq` of the frame that delivered it. */
   pushMonitor: (msg: DebugWsMessage, seq?: number) => void;
+  /** Append one accepted monitor frame atomically, preserving payload order and one seq stamp. */
+  pushMonitorBatch: (messages: DebugWsMessage[], seq?: number) => void;
   reset: () => void;
 }
 
 const MONITOR_RING_CAP = 500;
+// Mirrors `dashboard_flow::FLOW_CAP`. This is a defense-in-depth browser bound; the periodic REST
+// reconciliation below is still authoritative when the server's byte quota evicts fewer rows.
+const FLOW_ROW_CAP = 512;
+
+function capFlowRows(
+  flows: Map<string, FlowSummary>,
+  order: string[],
+): { flows: Map<string, FlowSummary>; flowOrder: string[] } {
+  if (order.length <= FLOW_ROW_CAP) return { flows, flowOrder: order };
+  const flowOrder = order.slice(0, FLOW_ROW_CAP);
+  const keep = new Set(flowOrder);
+  for (const id of flows.keys()) if (!keep.has(id)) flows.delete(id);
+  return { flows, flowOrder };
+}
 
 const emptyCursors = (): SeqCursors => ({
   flow_seq: 0,
@@ -189,6 +219,8 @@ const emptyCursors = (): SeqCursors => ({
 
 export const dashboardStore = createStore<DashboardState>((set, get) => ({
   connection: 'idle',
+  fatalError: null,
+  resyncRequired: false,
   connEpoch: 0,
   cursors: emptyCursors(),
   seekAtMs: null,
@@ -217,6 +249,8 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       }
       return { connection, connEpoch, seekAtMs: null, seekMonitorSeq: null };
     }),
+  setFatalError: (fatalError) => set({ fatalError }),
+  setResyncRequired: (resyncRequired) => set({ resyncRequired }),
 
   enterSeek: (atMs) =>
     set((s) => ({
@@ -256,7 +290,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
     }),
 
   setCursor: (domain, seq) =>
-    set((s) => ({ cursors: { ...s.cursors, [domain]: seq } })),
+    set((s) => ({ cursors: { ...s.cursors, [domain]: Math.max(s.cursors[domain], seq) } })),
 
   // Read-only capture — defensively COPY the mutable Maps/arrays so the returned baseline is frozen
   // against later live mutation (a captured `Map`/array shared by reference would keep ticking).
@@ -362,75 +396,42 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       const flows = new Map(s.flows);
       const existed = flows.has(flow.api_call_id);
       flows.set(flow.api_call_id, flow);
+      return capFlowRows(flows, existed ? s.flowOrder : [flow.api_call_id, ...s.flowOrder]);
+    }),
+
+  reconcileFlowRows: (rows, flowSeq) =>
+    set((s) => {
+      // Historical rows are frozen, and an older/equal REST cut cannot add information. Requiring
+      // a strictly newer cursor also keeps the common initial WS-snapshot + equal REST read cheap.
+      if (s.connection === 'seeking' || flowSeq <= s.cursors.flow_seq) return {};
+      const flows = new Map<string, FlowSummary>();
+      const flowOrder: string[] = [];
+      for (const row of rows.slice(0, FLOW_ROW_CAP)) {
+        // Preserve a matching optimistic kill row until the server reaches its revision. Absence is
+        // still authoritative: an evicted row is removed even if a mutation was in flight.
+        const current = s.flows.get(row.api_call_id);
+        flows.set(row.api_call_id, current && current.revision > row.revision ? current : row);
+        flowOrder.push(row.api_call_id);
+      }
       return {
         flows,
-        flowOrder: existed ? s.flowOrder : [flow.api_call_id, ...s.flowOrder],
+        flowOrder,
+        cursors: { ...s.cursors, flow_seq: flowSeq },
       };
     }),
 
   patchFlowStatus: (p) =>
     set((s) => {
+      const prev = s.flows.get(p.api_call_id);
+      // A v2 mutation carries the COMPLETE post-mutation FlowRow. Never field-merge two revisions:
+      // doing so can manufacture a row that never existed (for example new usage paired with an
+      // old cost). A delayed lower revision is ignored; an equal revision is allowed so a server
+      // echo can replace an optimistic local object at the same version.
+      if (prev && p.revision < prev.revision) return {};
       const flows = new Map(s.flows);
-      const prev = flows.get(p.api_call_id);
-      const next: FlowSummary = {
-        api_call_id: p.api_call_id,
-        response_id: p.response_id ?? prev?.response_id ?? null,
-        method: prev?.method ?? 'POST',
-        uri: prev?.uri ?? '',
-        model_requested: p.model_requested ?? prev?.model_requested ?? null,
-        model_served: p.model_served ?? prev?.model_served ?? null,
-        upstream_target: p.upstream_target ?? prev?.upstream_target ?? null,
-        usage: p.usage ?? prev?.usage ?? null,
-        status: p.status,
-        started_ms: prev?.started_ms ?? p.started_ms,
-        finished_ms: prev?.finished_ms ?? null,
-        elapsed_ms: p.elapsed_ms ?? prev?.elapsed_ms ?? null,
-        terminal_reason: prev?.terminal_reason ?? null,
-        cost: prev?.cost ?? null,
-        // Gap 07: the live `flow_status` WS frame carries NO cost/confidence (cost is a REST
-        // roll-up). Keep any prior tag; default to `unavailable` (no confident claim live) —
-        // never fabricate `confident`. The REST `/flows` row supplies the real tag.
-        cost_confidence: prev?.cost_confidence ?? 'unavailable',
-        // Gap 02/03 (gap 10b) — thread the PROJECTED spine fields off the live `flow_status`
-        // frame onto the store row, so the measured latency waterfall (gap 10) + attempt trace
-        // (gap 11) light up for a LIVE flow (the FlowDetail spine reads them off this row).
-        //
-        // `p.field ?? prev?.field` is load-bearing for two reasons:
-        //  - PROGRESSIVE frames: a later `flow_status` frame may OMIT a phase/attempt field an
-        //    earlier frame already established (e.g. the terminal frame carries `finalize_ms`
-        //    but no longer repeats `first_content_delta_ms`). An omitted/`null` field falls back
-        //    to the prior known value — a present field updates. A later frame never ERASES an
-        //    earlier-known phase.
-        //  - HONESTY: an unmeasured phase is ABSENT on the wire (never `0` — `skip_serializing_if`),
-        //    so `??` (not `|| 0`) keeps "unavailable" as absent downstream — the breakdown renders
-        //    `—`, never a fabricated `0ms` segment.
-        ingress_ms: p.ingress_ms ?? prev?.ingress_ms,
-        normalization_done_ms: p.normalization_done_ms ?? prev?.normalization_done_ms,
-        routing_decision_ms: p.routing_decision_ms ?? prev?.routing_decision_ms,
-        first_content_delta_ms: p.first_content_delta_ms ?? prev?.first_content_delta_ms,
-        stream_end_ms: p.stream_end_ms ?? prev?.stream_end_ms,
-        finalize_ms: p.finalize_ms ?? prev?.finalize_ms,
-        // `attempts` is an ARRAY, so `p.attempts ?? prev?.attempts` is WRONG (gap 10b review round
-        // 2): an empty `attempts: []` is the "no attempt recorded yet" serialization, and `??` only
-        // falls back on null/undefined — so a LATER frame carrying `[]` would ERASE an
-        // earlier-known NON-EMPTY trace. `pickAttempts` (non-empty wins, else keep prior) treats a
-        // later empty array as "no update", so a known trace is never lost; a later NON-EMPTY frame
-        // still updates it. (Mirrors the scalar-field rule: a later frame never erases a known phase.)
-        attempts: pickAttempts(p.attempts, prev?.attempts),
-        first_upstream_byte_ms: p.first_upstream_byte_ms ?? prev?.first_upstream_byte_ms,
-        // Gap 04/15: the client attribution is an IMMUTABLE per-flow identity (derived ONCE at flow
-        // open, pre-redaction) and the live `flow_status` WS frame carries NONE (it's a gate-F field
-        // on `FlowRow`, not on the `FlowStatusPayload`). CARRY the prior value (from the snapshot /
-        // an earlier frame) so a live patch never DROPS the attribution off the store row — else the
-        // CLIENT cell + the "by client" roll-up would blank to `—` the instant a frame lands.
-        client_label: prev?.client_label ?? null,
-        client_source: prev?.client_source ?? null,
-      };
+      const next = flowRowFromStatus(p);
       flows.set(p.api_call_id, next);
-      return {
-        flows,
-        flowOrder: prev ? s.flowOrder : [p.api_call_id, ...s.flowOrder],
-      };
+      return capFlowRows(flows, prev ? s.flowOrder : [p.api_call_id, ...s.flowOrder]);
     }),
 
   patchUsage: (apiCallId, usage) =>
@@ -438,7 +439,15 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       const prev = s.flows.get(apiCallId);
       if (!prev) return {};
       const flows = new Map(s.flows);
-      flows.set(apiCallId, { ...prev, usage });
+      // Schema-v1 compatibility: a standalone usage frame does not carry a priced roll-up. Once
+      // usage changes, any inherited cost belongs to the old usage and must be cleared until an
+      // authoritative full row supplies a newly priced value.
+      flows.set(apiCallId, {
+        ...prev,
+        usage,
+        cost: null,
+        cost_confidence: 'unavailable',
+      });
       return { flows };
     }),
 
@@ -470,22 +479,31 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       return { priceTable: topology.price_table };
     }),
 
-  pushMonitor: (msg, seq = 0) =>
+  pushMonitor: (msg, seq = 0) => get().pushMonitorBatch([msg], seq),
+
+  pushMonitorBatch: (messages, seq = 0) =>
     set((s) => {
-      // `monitor` + `monitorSeqs` are sliced together so index i always pairs message↔arrival seq.
-      const atCap = s.monitor.length >= MONITOR_RING_CAP;
-      const drop = atCap ? s.monitor.length - MONITOR_RING_CAP + 1 : 0;
-      const monitor = atCap ? [...s.monitor.slice(drop), msg] : [...s.monitor, msg];
-      const monitorSeqs = atCap ? [...s.monitorSeqs.slice(drop), seq] : [...s.monitorSeqs, seq];
-      // Fold the message into the theater's river accumulator at ARRIVAL (survives ring eviction —
-      // see the `riverFold` slice doc). Non-river messages return the same fold reference.
-      const riverFold = foldRiverMessage(s.riverFold, msg);
+      if (messages.length === 0) return {};
+      // Clone and cap ONCE for the whole accepted frame. `monitor` + `monitorSeqs` are sliced in
+      // lockstep so index i always pairs message↔arrival seq, even when one large replay batch
+      // evicts the ring head.
+      const monitor = [...s.monitor, ...messages].slice(-MONITOR_RING_CAP);
+      const monitorSeqs = [
+        ...s.monitorSeqs,
+        ...messages.map(() => seq),
+      ].slice(-MONITOR_RING_CAP);
+      // Fold in wire order inside the same mutation. The theater accumulator survives monitor-ring
+      // eviction, so adjacent output/tool fragments must observe every preceding sibling.
+      let riverFold = s.riverFold;
+      for (const message of messages) riverFold = foldRiverMessage(riverFold, message);
       return { monitor, monitorSeqs, riverFold };
     }),
 
   reset: () =>
     set((s) => ({
       connection: 'idle',
+      fatalError: null,
+      resyncRequired: false,
       // Teardown clears the live store — a boundary an in-flight mutation must not write across
       // (finding 1). The epoch is the one slice that survives a reset (monotonic across the session).
       connEpoch: s.connEpoch + 1,
@@ -503,5 +521,13 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       riverFold: createRiverFold(),
     })),
 }));
+
+/** Strip the WS-only discriminants while preserving every field of the complete authoritative row. */
+function flowRowFromStatus(payload: FlowStatusPayload): FlowSummary {
+  const row = { ...payload };
+  Reflect.deleteProperty(row, 'type');
+  Reflect.deleteProperty(row, 'phase');
+  return row;
+}
 
 export type DashboardStore = typeof dashboardStore;

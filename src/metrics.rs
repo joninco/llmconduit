@@ -2,11 +2,11 @@
 //! memory-safe, internally-consistent time-travel snapshot store.
 //!
 //! Metrics architecture:
-//! - `MetricsLayer { state: Mutex<MetricsState> }` with the `MonitorHub`/
-//!   `DashboardFlowStore` `new()`/`disabled()` split: when `--with-debug-ui` is off
-//!   the layer is `disabled()` and EVERY mutation/read is a no-op, so the production
-//!   hot path keeps zero overhead (a streamed request with the dashboard off does
-//!   NO ring/histogram work and takes NO lock).
+//! - `MetricsLayer` holds its rings and latest-cut broadcaster behind optional shared
+//!   state, mirroring the `MonitorHub`/`DashboardFlowStore` `new()`/`disabled()` split.
+//!   When `--with-debug-ui` is off the layer owns neither rings nor a channel and EVERY
+//!   mutation/read is a no-op, so the production hot path keeps zero overhead (a streamed
+//!   request with the dashboard off does NO ring/histogram work and takes NO lock).
 //! - Per-window RING buffers (1m / 5m / 1h at 1 s resolution = 60 / 300 / 3600
 //!   slots). Each slot is a [`Bucket`] keyed `{status_class, model, endpoint,
 //!   upstream}` plus a 30-bucket log-spaced latency [`Histogram`] and summed token
@@ -18,17 +18,18 @@
 //!   (the single CAS-guarded choke point — NOT the middleware, NOT per-chunk), so a
 //!   streamed request populates metrics exactly once, at finalize. `record_usage`
 //!   rides the same D3 usage upsert the FlowStore/monitor already consume.
-//! - A `metrics_seq` increments on EVERY mutation; it is the metrics domain's
-//!   per-domain cursor (no global watermark — AGENTS.md).
-//! - The 5 s coordinated snapshot task (D5, spawned only under `--with-debug-ui`)
-//!   takes ONE critical section: it holds the FlowStore mutex THEN the MetricsLayer
-//!   mutex (the FIXED lock order — only the snapshot task ever holds >1 lock, so no
-//!   deadlock is possible) and captures ONE `Arc<ProviderHealthSnapshot>` (D4),
-//!   producing a true atomic cut across all three stores into a body-free
-//!   [`DashboardSnapshot`]. The summaries are body-free [`SnapshotFlowSummary`]
+//! - A private data watermark increments on each terminal mutation. One process-level
+//!   publisher allocates the sole externally-consumable metrics presentation sequence,
+//!   including expiry-only updates when no traffic arrives.
+//! - The one-second publisher (spawned only under `--with-debug-ui`) takes the fixed
+//!   FlowStore-then-Metrics lock order, captures one `Arc<ProviderHealthSnapshot>` (D4),
+//!   and broadcasts one immutable latest-value cut for every consumer. Every fifth cut
+//!   is also retained as a body-free [`DashboardSnapshot`]. The summaries are body-free
+//!   [`SnapshotFlowSummary`]
 //!   (NO `Arc<[u8]>`, NO live-store reference) — body retention on snapshots
-//!   recreates a 135 GiB worst case (AGENTS.md don't-rule). A snapshot-summary quota
-//!   bounds peak ring memory to ≤ ~400 MiB (720 cuts × 512 summaries × <1 KiB).
+//!   recreates a 135 GiB worst case (AGENTS.md don't-rule). An env-only snapshot
+//!   quota bounds retained cuts; an oversized cut is reduced to its newest summary
+//!   prefix before insertion, and the ring never retains a cut it cannot fit.
 
 use crate::dashboard_flow::Attempt;
 use crate::dashboard_flow::AttemptErrorClass;
@@ -37,6 +38,9 @@ use crate::dashboard_flow::DashboardFlowStore;
 use crate::dashboard_flow::FlowStatus;
 use crate::dashboard_flow::FlowUsage;
 use crate::dashboard_flow::SnapshotFlowSummary;
+use crate::dashboard_flow::TerminalCostConfidence;
+use crate::dashboard_flow::TerminalMetricsInputs;
+use crate::dashboard_flow::TerminalReasonClass;
 use crate::upstream::ProviderHealthPublisher;
 use crate::upstream::ProviderHealthSnapshot;
 use serde::Serialize;
@@ -45,6 +49,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+use tokio::sync::watch;
 
 /// Ring length for the 1-minute window (1 s resolution).
 const WINDOW_1M_SLOTS: usize = 60;
@@ -64,6 +69,11 @@ const HISTOGRAM_MAX_MS: f64 = 120_000.0;
 /// Snapshot ring length: 720 body-free cuts = 12 per minute (one per 5 s) × 60 min.
 const SNAPSHOT_RING_SLOTS: usize = 720;
 
+/// One process-wide published cut is retained. `watch` deliberately coalesces slow
+/// consumers onto the latest version instead of buffering a potentially-large metrics
+/// view per socket.
+pub type PublishedMetricsReceiver = watch::Receiver<Option<Arc<PublishedMetricsCut>>>;
+
 /// Gap 12 — HARD cap on the number of DISTINCT providers tracked in the per-provider
 /// latency/error rings (PER SLOT). The provider key is derived from the attempt's
 /// `provider` label, which can be an attacker-influenceable routed/remapped alias, so
@@ -76,18 +86,43 @@ const SNAPSHOT_RING_SLOTS: usize = 720;
 /// fixed-size 30-bucket [`Histogram`] (counts saturate; no per-sample retention).
 const MAX_TRACKED_PROVIDERS: usize = 64;
 
+/// Hard cap for overview dimension combinations, INCLUDING the fixed overflow key.
+/// Reserving one entry for `__other__` means at most 63 exact combinations plus the
+/// catch-all survive in any one-second slot or aggregate union.
+pub const MAX_OVERVIEW_DIMENSION_COMBINATIONS: usize = 64;
+const MAX_EXACT_OVERVIEW_DIMENSIONS: usize = MAX_OVERVIEW_DIMENSION_COMBINATIONS - 1;
+pub const OVERVIEW_OTHER: &str = "__other__";
+
 /// Gap 12 — the bounded catch-all provider key a slot folds OVERFLOW providers into once
 /// it already tracks [`MAX_TRACKED_PROVIDERS`] distinct providers. A single fixed key, so
 /// the overflow can never itself grow the key space. Chosen to never collide with a real
 /// provider name (a configured provider/route id is never this sentinel).
 const OVERFLOW_PROVIDER: &str = "__other__";
 
-/// Default peak snapshot-ring memory quota (bytes). 720 cuts × 512 summaries ×
-/// <1 KiB ≈ 360 MiB; the 400 MiB quota is the HARD bound the ring cannot exceed —
-/// when a fresh cut would push the retained summary-byte total over quota, the
-/// OLDEST cuts are dropped first until it fits. This is the 135 GiB fix: bodies are
-/// never on a snapshot, and the summary bytes are quota-bounded.
-const DEFAULT_SNAPSHOT_QUOTA_BYTES: usize = 400 * 1024 * 1024;
+/// Env-only snapshot history quota, in MiB. This deliberately does not live on
+/// persisted [`crate::config::Config`]: dashboard retention policy is runtime-only,
+/// like the dashboard auth settings, and must not enter config debug output.
+pub const DASHBOARD_SNAPSHOT_QUOTA_ENV: &str = "LLMCONDUIT_DASHBOARD_SNAPSHOT_QUOTA_MIB";
+
+/// Default snapshot-ring quota: 64 MiB. Every retained cut is body-free and charged
+/// for its owned capacities (including nested attempt strings and topology data).
+/// Old cuts are evicted before insertion, and a single oversized cut is summary-
+/// truncated before it is considered for retention.
+const DEFAULT_SNAPSHOT_QUOTA_BYTES: usize = 64 * 1024 * 1024;
+
+const MIB_BYTES: usize = 1024 * 1024;
+
+/// Conservative accounting for the two reference counters stored alongside an
+/// `Arc<T>` allocation. Allocator bookkeeping is implementation-defined and excluded,
+/// but every Rust-owned payload/capacity reachable only because the cut is retained is
+/// counted below.
+const ARC_CONTROL_BYTES: usize = 2 * std::mem::size_of::<usize>();
+
+/// Conservative per-entry bookkeeping for `BTreeMap` nodes. Rust does not expose node
+/// capacities/layout; charging four pointer-width words per logical entry avoids
+/// treating the key/value payload as the whole allocation while remaining stable
+/// across standard-library implementation changes.
+const BTREE_ENTRY_OVERHEAD_BYTES: usize = 4 * std::mem::size_of::<usize>();
 
 /// HTTP status class for a terminal flow, the metrics bucket key dimension. Derived
 /// from the [`FlowStatus`] terminal (the engine does not thread a raw numeric code
@@ -309,7 +344,9 @@ impl Histogram {
 /// per-class `0` here is honest (that class did not occur); the don't-lie-with-zeros
 /// rule lives at the PROVIDER level (a provider with NO samples in the window is absent
 /// from the per-provider report entirely, never a fabricated all-zero distribution).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(default)]
 pub struct ProviderErrorDistribution {
     #[serde(skip_serializing_if = "is_zero_u64")]
@@ -404,6 +441,160 @@ impl ProviderSample {
     }
 }
 
+/// One exact overview dimension combination retained in a slot. Every string is
+/// already scalar-capped by the evict-safe terminal payload. Missing attribution is
+/// normalized to `unknown`, while cardinality overflow uses the distinct enum-level
+/// [`OverviewKey::Other`] key so a legitimate label can never collide with it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct OverviewDimensions {
+    status: StatusClass,
+    requested_model: String,
+    served_model: String,
+    upstream: String,
+    client: String,
+    failure_reason: TerminalReasonClass,
+    effective_route_limit: Option<i64>,
+}
+
+impl OverviewDimensions {
+    fn new(status: FlowStatus, inputs: &TerminalMetricsInputs) -> Self {
+        Self {
+            status: StatusClass::from_status(status),
+            requested_model: label_or_unknown(inputs.model_requested.as_deref()),
+            served_model: label_or_unknown(inputs.model_served.as_deref()),
+            upstream: label_or_unknown(inputs.upstream.as_deref()),
+            client: label_or_unknown(inputs.client_label.as_deref()),
+            failure_reason: inputs.failure_reason,
+            effective_route_limit: inputs.effective_route_limit.filter(|limit| *limit > 0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum OverviewKey {
+    Exact(OverviewDimensions),
+    Other,
+}
+
+fn overview_key_heap_bytes(key: &OverviewKey) -> usize {
+    match key {
+        OverviewKey::Exact(dimensions) => dimensions
+            .requested_model
+            .capacity()
+            .saturating_add(dimensions.served_model.capacity())
+            .saturating_add(dimensions.upstream.capacity())
+            .saturating_add(dimensions.client.capacity()),
+        OverviewKey::Other => 0,
+    }
+}
+
+/// Additive terminal facts for one overview combination. Cost is the value captured at
+/// terminal time; no price table is consulted while a live or historical view is read.
+#[derive(Debug, Clone, Default)]
+struct OverviewCounts {
+    requests: u64,
+    usage_samples: u64,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cached_tokens: i64,
+    reasoning_tokens: i64,
+    cached_reported_samples: u64,
+    reasoning_reported_samples: u64,
+    priced_samples: u64,
+    estimated_priced_samples: u64,
+    unpriced_usage_samples: u64,
+    cost_usd: f64,
+    context_samples: u64,
+    context_input_tokens: i64,
+    context_pressure_sum: f64,
+    context_limit_min: Option<i64>,
+}
+
+impl OverviewCounts {
+    fn record(&mut self, inputs: &TerminalMetricsInputs) {
+        self.requests = self.requests.saturating_add(1);
+        if let Some(usage) = inputs.usage {
+            self.usage_samples = self.usage_samples.saturating_add(1);
+            self.prompt_tokens = self.prompt_tokens.saturating_add(usage.prompt);
+            self.completion_tokens = self.completion_tokens.saturating_add(usage.completion);
+            if let Some(cached) = usage.cached {
+                self.cached_tokens = self.cached_tokens.saturating_add(cached);
+                self.cached_reported_samples = self.cached_reported_samples.saturating_add(1);
+            }
+            if let Some(reasoning) = usage.reasoning {
+                self.reasoning_tokens = self.reasoning_tokens.saturating_add(reasoning);
+                self.reasoning_reported_samples = self.reasoning_reported_samples.saturating_add(1);
+            }
+            if let Some(limit) = inputs.effective_route_limit.filter(|limit| *limit > 0) {
+                self.context_samples = self.context_samples.saturating_add(1);
+                self.context_input_tokens = self.context_input_tokens.saturating_add(usage.prompt);
+                self.context_pressure_sum += usage.prompt.max(0) as f64 / limit as f64;
+                self.context_limit_min = Some(
+                    self.context_limit_min
+                        .map_or(limit, |current| current.min(limit)),
+                );
+            }
+            if inputs.cost_usd.is_none() {
+                self.unpriced_usage_samples = self.unpriced_usage_samples.saturating_add(1);
+            }
+        }
+        if let Some(cost) = inputs.cost_usd.filter(|cost| cost.is_finite()) {
+            self.cost_usd += cost;
+            self.priced_samples = self.priced_samples.saturating_add(1);
+            if inputs.cost_confidence != TerminalCostConfidence::Confident {
+                self.estimated_priced_samples = self.estimated_priced_samples.saturating_add(1);
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.usage_samples = self.usage_samples.saturating_add(other.usage_samples);
+        self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
+        self.completion_tokens = self
+            .completion_tokens
+            .saturating_add(other.completion_tokens);
+        self.cached_tokens = self.cached_tokens.saturating_add(other.cached_tokens);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+        self.cached_reported_samples = self
+            .cached_reported_samples
+            .saturating_add(other.cached_reported_samples);
+        self.reasoning_reported_samples = self
+            .reasoning_reported_samples
+            .saturating_add(other.reasoning_reported_samples);
+        self.priced_samples = self.priced_samples.saturating_add(other.priced_samples);
+        self.estimated_priced_samples = self
+            .estimated_priced_samples
+            .saturating_add(other.estimated_priced_samples);
+        self.unpriced_usage_samples = self
+            .unpriced_usage_samples
+            .saturating_add(other.unpriced_usage_samples);
+        self.cost_usd += other.cost_usd;
+        self.context_samples = self.context_samples.saturating_add(other.context_samples);
+        self.context_input_tokens = self
+            .context_input_tokens
+            .saturating_add(other.context_input_tokens);
+        self.context_pressure_sum += other.context_pressure_sum;
+        if let Some(limit) = other.context_limit_min {
+            self.context_limit_min = Some(
+                self.context_limit_min
+                    .map_or(limit, |current| current.min(limit)),
+            );
+        }
+    }
+
+    fn approx_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OverviewSlotReport {
+    epoch_s: u64,
+    entries: BTreeMap<OverviewKey, OverviewCounts>,
+    folded_samples: u64,
+}
+
 /// One 1-second slot of a window ring: the per-key counts, the latency histogram,
 /// the per-provider attempt tallies (gap 12), and the epoch-second this slot
 /// currently represents. `epoch_s == 0` marks an unused slot. When wall-clock
@@ -420,6 +611,10 @@ struct Slot {
     /// fresh provider beyond the cap folds into [`OVERFLOW_PROVIDER`], so an
     /// attacker-influenceable provider alias can never grow this map without bound.
     providers: BTreeMap<String, ProviderSample>,
+    /// Exact terminal combinations for server-side Overview filtering/rollups. At most
+    /// 63 exact keys plus one fixed overflow key are retained per second.
+    overview: BTreeMap<OverviewKey, OverviewCounts>,
+    overview_folded_samples: u64,
 }
 
 impl Slot {
@@ -429,6 +624,8 @@ impl Slot {
         self.buckets.clear();
         self.histogram = Histogram::default();
         self.providers.clear();
+        self.overview.clear();
+        self.overview_folded_samples = 0;
     }
 
     /// The mutable per-provider sample for `provider`, BOUNDING the map to
@@ -444,6 +641,24 @@ impl Slot {
         self.providers
             .entry(OVERFLOW_PROVIDER.to_string())
             .or_default()
+    }
+
+    fn record_overview(&mut self, status: FlowStatus, inputs: &TerminalMetricsInputs) {
+        let exact = OverviewKey::Exact(OverviewDimensions::new(status, inputs));
+        let key = if self.overview.contains_key(&exact)
+            || self
+                .overview
+                .keys()
+                .filter(|key| matches!(key, OverviewKey::Exact(_)))
+                .count()
+                < MAX_EXACT_OVERVIEW_DIMENSIONS
+        {
+            exact
+        } else {
+            self.overview_folded_samples = self.overview_folded_samples.saturating_add(1);
+            OverviewKey::Other
+        };
+        self.overview.entry(key).or_default().record(inputs);
     }
 }
 
@@ -505,6 +720,10 @@ impl WindowRing {
         let mut buckets: BTreeMap<BucketKey, BucketCounts> = BTreeMap::new();
         let mut histogram = Histogram::default();
         let mut providers: BTreeMap<String, ProviderSample> = BTreeMap::new();
+        let mut overview: BTreeMap<OverviewKey, OverviewCounts> = BTreeMap::new();
+        let mut overview_slots = Vec::new();
+        let mut slot_folded_samples = 0u64;
+        let mut aggregate_folded_samples = 0u64;
         for slot in &self.slots {
             if slot.epoch_s < floor || slot.epoch_s > now_epoch_s {
                 continue;
@@ -544,12 +763,47 @@ impl WindowRing {
                     .unreported_cached_samples
                     .saturating_add(counts.unreported_cached_samples);
             }
+            if !slot.overview.is_empty() {
+                overview_slots.push(OverviewSlotReport {
+                    epoch_s: slot.epoch_s,
+                    entries: slot.overview.clone(),
+                    folded_samples: slot.overview_folded_samples,
+                });
+                slot_folded_samples =
+                    slot_folded_samples.saturating_add(slot.overview_folded_samples);
+            }
+            for (key, counts) in &slot.overview {
+                let aggregate_key = match key {
+                    OverviewKey::Other => OverviewKey::Other,
+                    OverviewKey::Exact(_) if overview.contains_key(key) => key.clone(),
+                    OverviewKey::Exact(_)
+                        if overview
+                            .keys()
+                            .filter(|key| matches!(key, OverviewKey::Exact(_)))
+                            .count()
+                            < MAX_EXACT_OVERVIEW_DIMENSIONS =>
+                    {
+                        key.clone()
+                    }
+                    OverviewKey::Exact(_) => {
+                        aggregate_folded_samples =
+                            aggregate_folded_samples.saturating_add(counts.requests);
+                        OverviewKey::Other
+                    }
+                };
+                overview.entry(aggregate_key).or_default().merge(counts);
+            }
             histogram.merge(&slot.histogram);
         }
+        overview_slots.sort_by_key(|slot| slot.epoch_s);
         WindowReport {
             buckets,
             histogram,
             providers,
+            overview,
+            overview_slots,
+            slot_folded_samples,
+            aggregate_folded_samples,
         }
     }
 }
@@ -569,6 +823,14 @@ pub struct WindowReport {
     /// the snapshot payload unchanged.
     #[serde(skip)]
     providers: BTreeMap<String, ProviderSample>,
+    #[serde(skip)]
+    overview: BTreeMap<OverviewKey, OverviewCounts>,
+    #[serde(skip)]
+    overview_slots: Vec<OverviewSlotReport>,
+    #[serde(skip)]
+    slot_folded_samples: u64,
+    #[serde(skip)]
+    aggregate_folded_samples: u64,
 }
 
 impl WindowReport {
@@ -697,7 +959,9 @@ fn finite_ms(value: f64) -> f64 {
 /// ABSENCE of a [`ProviderLatency`] entirely, not by a variant here — so a present DTO is
 /// always a real `derived` measurement (don't-lie-with-zeros). Serializes snake_case to
 /// match the cross-cutting DQ-tag contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderMetricQuality {
     Derived,
@@ -710,7 +974,7 @@ pub enum ProviderMetricQuality {
 /// is the percentage of the provider's attempts that FAILED. A provider with zero
 /// in-window samples is ABSENT (don't-lie-with-zeros), so a present DTO always has
 /// `samples >= 1`. All floats are finite (the frozen finite-number wire contract).
-#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct ProviderLatency {
     /// The provider label these metrics are for (the bounded provider/route id, or the
     /// `__other__` overflow bucket once the per-slot provider cap is exceeded).
@@ -735,6 +999,370 @@ pub struct ProviderLatency {
     pub error_rate: f64,
     /// Bounded per-class failure tally (gap 03 taxonomy). Absent classes are omitted.
     pub errors: ProviderErrorDistribution,
+}
+
+/// Cross-cutting quality tag for Overview values. `partial` is explicit whenever a
+/// bounded slot/union folded dimensions into `__other__`; missing source facts are
+/// `unavailable`, never fabricated zeroes.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OverviewDataQuality {
+    Measured,
+    Derived,
+    Partial,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OverviewFilter {
+    pub status: Option<FlowStatus>,
+    pub model: Option<String>,
+    pub upstream: Option<String>,
+    pub client: Option<String>,
+}
+
+impl OverviewFilter {
+    fn is_empty(&self) -> bool {
+        self.status.is_none()
+            && self.model.is_none()
+            && self.upstream.is_none()
+            && self.client.is_none()
+    }
+
+    fn matches(&self, dimensions: &OverviewDimensions) -> bool {
+        self.status.is_none_or(|status| match status {
+            FlowStatus::Completed => dimensions.status == StatusClass::Success,
+            FlowStatus::Failed => dimensions.status == StatusClass::Error,
+            FlowStatus::Cancelled => dimensions.status == StatusClass::Cancelled,
+            FlowStatus::Open => false,
+        }) && self.model.as_ref().is_none_or(|wanted| {
+            contains_folded(&dimensions.requested_model, wanted)
+                || contains_folded(&dimensions.served_model, wanted)
+        }) && self
+            .upstream
+            .as_ref()
+            .is_none_or(|wanted| contains_folded(&dimensions.upstream, wanted))
+            && self
+                .client
+                .as_ref()
+                .is_none_or(|wanted| contains_folded(&dimensions.client, wanted))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewTokens {
+    pub samples: u64,
+    pub prompt: Option<i64>,
+    pub completion: Option<i64>,
+    pub cached: Option<i64>,
+    pub reasoning: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewCost {
+    pub samples: u64,
+    pub total_usd: Option<f64>,
+    pub confidence: TerminalCostConfidence,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewTotals {
+    pub requests: u64,
+    pub tokens: OverviewTokens,
+    pub cost: OverviewCost,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewDimensionRollup {
+    pub key: String,
+    pub requests: u64,
+    pub tokens: OverviewTokens,
+    pub cost: OverviewCost,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewContextRollup {
+    pub data_quality: OverviewDataQuality,
+    pub samples: u64,
+    pub unavailable_samples: u64,
+    pub effective_route_limit_min: Option<i64>,
+    pub input_tokens: Option<i64>,
+    pub average_pressure_pct: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewCostPoint {
+    pub at_ms: u128,
+    pub data_quality: OverviewDataQuality,
+    pub requests: u64,
+    pub cost: OverviewCost,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewOverflowMetadata {
+    pub dimension_limit: usize,
+    pub slot_folded_samples: u64,
+    pub aggregate_folded_samples: u64,
+    pub provider_folded_samples: u64,
+    pub overflowed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OverviewMetricScope {
+    Global,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewProviderAttempts {
+    pub scope: OverviewMetricScope,
+    pub data_quality: OverviewDataQuality,
+    pub providers: Vec<ProviderLatency>,
+}
+
+/// Fully materialized Overview for one selected window and filter scope. It is built
+/// only from the immutable live/historical [`MetricsView`], never the evictable flow
+/// list, so a failed primary and a pruned terminal flow remain represented.
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewAggregate {
+    pub data_quality: OverviewDataQuality,
+    pub overflow: OverviewOverflowMetadata,
+    pub totals: OverviewTotals,
+    pub requested_models: Vec<OverviewDimensionRollup>,
+    pub served_models: Vec<OverviewDimensionRollup>,
+    pub providers: Vec<OverviewDimensionRollup>,
+    pub clients: Vec<OverviewDimensionRollup>,
+    pub failures: Vec<OverviewDimensionRollup>,
+    pub context: OverviewContextRollup,
+    pub tokens: OverviewTokens,
+    pub cost: OverviewCost,
+    pub cost_series: Vec<OverviewCostPoint>,
+    pub provider_attempts_global: OverviewProviderAttempts,
+}
+
+impl WindowReport {
+    pub fn overview(&self, filter: &OverviewFilter) -> OverviewAggregate {
+        let mut totals = OverviewCounts::default();
+        let mut requested_models = BTreeMap::<String, OverviewCounts>::new();
+        let mut served_models = BTreeMap::<String, OverviewCounts>::new();
+        let mut providers = BTreeMap::<String, OverviewCounts>::new();
+        let mut clients = BTreeMap::<String, OverviewCounts>::new();
+        let mut failures = BTreeMap::<String, OverviewCounts>::new();
+
+        for (key, counts) in &self.overview {
+            match key {
+                OverviewKey::Exact(dimensions) if filter.matches(dimensions) => {
+                    totals.merge(counts);
+                    merge_rollup(&mut requested_models, &dimensions.requested_model, counts);
+                    merge_rollup(&mut served_models, &dimensions.served_model, counts);
+                    merge_rollup(&mut providers, &dimensions.upstream, counts);
+                    merge_rollup(&mut clients, &dimensions.client, counts);
+                    if dimensions.status != StatusClass::Success {
+                        merge_rollup(
+                            &mut failures,
+                            terminal_reason_label(dimensions.failure_reason),
+                            counts,
+                        );
+                    }
+                }
+                OverviewKey::Other if filter.is_empty() => {
+                    // Totals remain exact for the unfiltered window. Attribution is
+                    // explicitly partial and folded under one fixed key.
+                    totals.merge(counts);
+                    merge_rollup(&mut requested_models, OVERVIEW_OTHER, counts);
+                    merge_rollup(&mut served_models, OVERVIEW_OTHER, counts);
+                    merge_rollup(&mut providers, OVERVIEW_OTHER, counts);
+                    merge_rollup(&mut clients, OVERVIEW_OTHER, counts);
+                }
+                OverviewKey::Exact(_) | OverviewKey::Other => {}
+            }
+        }
+
+        let provider_values = self.per_provider().into_values().collect::<Vec<_>>();
+        let provider_folded_samples = provider_values
+            .iter()
+            .filter(|provider| provider.provider == OVERFLOW_PROVIDER)
+            .map(|provider| provider.samples)
+            .fold(0u64, u64::saturating_add);
+        let overflowed = self.slot_folded_samples > 0
+            || self.aggregate_folded_samples > 0
+            || provider_folded_samples > 0;
+        let data_quality = if overflowed {
+            OverviewDataQuality::Partial
+        } else {
+            OverviewDataQuality::Measured
+        };
+        let cost_series = self
+            .overview_slots
+            .iter()
+            .filter_map(|slot| {
+                let mut counts = OverviewCounts::default();
+                for (key, sample) in &slot.entries {
+                    match key {
+                        OverviewKey::Exact(dimensions) if filter.matches(dimensions) => {
+                            counts.merge(sample)
+                        }
+                        OverviewKey::Other if filter.is_empty() => counts.merge(sample),
+                        OverviewKey::Exact(_) | OverviewKey::Other => {}
+                    }
+                }
+                (counts.requests > 0).then(|| OverviewCostPoint {
+                    at_ms: u128::from(slot.epoch_s).saturating_mul(1000),
+                    data_quality: if slot.folded_samples > 0 {
+                        OverviewDataQuality::Partial
+                    } else {
+                        OverviewDataQuality::Measured
+                    },
+                    requests: counts.requests,
+                    cost: overview_cost(&counts),
+                })
+            })
+            .collect();
+        let provider_quality = if provider_values.is_empty() {
+            OverviewDataQuality::Unavailable
+        } else if provider_folded_samples > 0 {
+            OverviewDataQuality::Partial
+        } else {
+            OverviewDataQuality::Derived
+        };
+        let tokens = overview_tokens(&totals);
+        let cost = overview_cost(&totals);
+        OverviewAggregate {
+            data_quality,
+            overflow: OverviewOverflowMetadata {
+                dimension_limit: MAX_OVERVIEW_DIMENSION_COMBINATIONS,
+                slot_folded_samples: self.slot_folded_samples,
+                aggregate_folded_samples: self.aggregate_folded_samples,
+                provider_folded_samples,
+                overflowed,
+            },
+            totals: OverviewTotals {
+                requests: totals.requests,
+                tokens: tokens.clone(),
+                cost: cost.clone(),
+            },
+            requested_models: rollup_values(requested_models),
+            served_models: rollup_values(served_models),
+            providers: rollup_values(providers),
+            clients: rollup_values(clients),
+            failures: rollup_values(failures),
+            context: overview_context(&totals, data_quality),
+            tokens,
+            cost,
+            cost_series,
+            provider_attempts_global: OverviewProviderAttempts {
+                scope: OverviewMetricScope::Global,
+                data_quality: provider_quality,
+                providers: provider_values,
+            },
+        }
+    }
+}
+
+fn contains_folded(value: &str, wanted: &str) -> bool {
+    value
+        .to_ascii_lowercase()
+        .contains(&wanted.trim().to_ascii_lowercase())
+}
+
+fn merge_rollup(map: &mut BTreeMap<String, OverviewCounts>, key: &str, counts: &OverviewCounts) {
+    map.entry(key.to_string()).or_default().merge(counts);
+}
+
+fn rollup_values(map: BTreeMap<String, OverviewCounts>) -> Vec<OverviewDimensionRollup> {
+    let mut values = map
+        .into_iter()
+        .map(|(key, counts)| OverviewDimensionRollup {
+            key,
+            requests: counts.requests,
+            tokens: overview_tokens(&counts),
+            cost: overview_cost(&counts),
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .requests
+            .cmp(&left.requests)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    values
+}
+
+fn overview_tokens(counts: &OverviewCounts) -> OverviewTokens {
+    let measured = counts.usage_samples > 0;
+    OverviewTokens {
+        samples: counts.usage_samples,
+        prompt: measured.then_some(counts.prompt_tokens),
+        completion: measured.then_some(counts.completion_tokens),
+        cached: (measured && counts.cached_reported_samples == counts.usage_samples)
+            .then_some(counts.cached_tokens),
+        reasoning: (measured && counts.reasoning_reported_samples == counts.usage_samples)
+            .then_some(counts.reasoning_tokens),
+    }
+}
+
+fn overview_cost(counts: &OverviewCounts) -> OverviewCost {
+    let confidence = if counts.priced_samples == 0 {
+        TerminalCostConfidence::Unavailable
+    } else if counts.estimated_priced_samples > 0 || counts.unpriced_usage_samples > 0 {
+        TerminalCostConfidence::Estimated
+    } else {
+        TerminalCostConfidence::Confident
+    };
+    OverviewCost {
+        samples: counts.priced_samples,
+        total_usd: (counts.priced_samples > 0).then_some(finite_ms(counts.cost_usd)),
+        confidence,
+    }
+}
+
+fn overview_context(
+    counts: &OverviewCounts,
+    aggregate_quality: OverviewDataQuality,
+) -> OverviewContextRollup {
+    if counts.context_samples == 0 {
+        return OverviewContextRollup {
+            data_quality: OverviewDataQuality::Unavailable,
+            samples: 0,
+            unavailable_samples: counts.requests,
+            effective_route_limit_min: None,
+            input_tokens: None,
+            average_pressure_pct: None,
+        };
+    }
+    let missing = counts.requests.saturating_sub(counts.context_samples);
+    OverviewContextRollup {
+        data_quality: if aggregate_quality == OverviewDataQuality::Partial || missing > 0 {
+            OverviewDataQuality::Partial
+        } else {
+            OverviewDataQuality::Derived
+        },
+        samples: counts.context_samples,
+        unavailable_samples: missing,
+        effective_route_limit_min: counts.context_limit_min,
+        input_tokens: Some(counts.context_input_tokens),
+        average_pressure_pct: Some(finite_ms(
+            counts.context_pressure_sum / counts.context_samples as f64 * 100.0,
+        )),
+    }
+}
+
+fn terminal_reason_label(reason: TerminalReasonClass) -> &'static str {
+    match reason {
+        TerminalReasonClass::Connect => "connect",
+        TerminalReasonClass::HttpStatus => "http_status",
+        TerminalReasonClass::Timeout => "timeout",
+        TerminalReasonClass::Stream => "stream",
+        TerminalReasonClass::Terminal => "terminal",
+        TerminalReasonClass::Other => "other",
+        TerminalReasonClass::Stop => "stop",
+        TerminalReasonClass::Length => "length",
+        TerminalReasonClass::ToolCalls => "tool_calls",
+        TerminalReasonClass::ContentFilter => "content_filter",
+        TerminalReasonClass::Unclassified => "unclassified",
+    }
 }
 
 /// The reported p50/p95/p99 (ms) for a provider — a local triple used to assemble
@@ -769,34 +1397,66 @@ pub struct MetricsView {
 }
 
 impl MetricsView {
-    /// Approximate retained bytes of this view (for the snapshot-memory quota):
-    /// per-window bucket key strings + counts + the fixed histograms, PLUS (gap 12) the
-    /// per-provider maps retained on `WindowReport.providers` — those are `#[serde(skip)]`
-    /// (kept off the wire) but STILL retained on every `DashboardSnapshot` cut, so the
-    /// quota must charge them or the snapshot ring would undercount the per-provider
-    /// keys/histograms and exceed its memory bound (the bounded-memory invariant).
-    fn approx_bytes(&self) -> usize {
-        let window_bytes = |report: &WindowReport| -> usize {
-            let mut bytes = std::mem::size_of::<Histogram>();
+    /// Heap bytes owned by this view. The fixed `MetricsView`/`WindowReport`/
+    /// `Histogram` storage is inline in `DashboardSnapshot` and therefore charged by
+    /// `size_of::<DashboardSnapshot>()`; this method accounts for every map allocation,
+    /// key buffer capacity, value payload, and conservative B-tree node overhead.
+    fn heap_bytes(&self) -> usize {
+        let window_heap_bytes = |report: &WindowReport| -> usize {
+            let mut bytes = 0usize;
             for (key, counts) in &report.buckets {
-                bytes += key.model.len()
-                    + key.endpoint.len()
-                    + key.upstream.len()
-                    + std::mem::size_of::<BucketKey>()
-                    + counts.approx_bytes();
+                bytes = bytes
+                    .saturating_add(std::mem::size_of::<BucketKey>())
+                    .saturating_add(counts.approx_bytes())
+                    .saturating_add(key.model.capacity())
+                    .saturating_add(key.endpoint.capacity())
+                    .saturating_add(key.upstream.capacity())
+                    .saturating_add(BTREE_ENTRY_OVERHEAD_BYTES);
             }
-            // Gap 12: charge the per-provider map the SAME way — each entry's provider key
-            // string bytes + the `String` overhead + the fixed `ProviderSample`
-            // (histogram + counts + error distribution). Bounded by `MAX_TRACKED_PROVIDERS
-            // + 1` entries (the per-window union cap), so this is a bounded addend.
+            // These maps are skipped by serde but retained by every historical cut.
+            // Provider samples are fixed-size; their key String buffers are not.
             for (provider, sample) in &report.providers {
-                bytes += provider.len() + std::mem::size_of::<String>() + sample.approx_bytes();
+                bytes = bytes
+                    .saturating_add(std::mem::size_of::<String>())
+                    .saturating_add(sample.approx_bytes())
+                    .saturating_add(provider.capacity())
+                    .saturating_add(BTREE_ENTRY_OVERHEAD_BYTES);
+            }
+            for (key, counts) in &report.overview {
+                bytes = bytes
+                    .saturating_add(std::mem::size_of::<OverviewKey>())
+                    .saturating_add(counts.approx_bytes())
+                    .saturating_add(overview_key_heap_bytes(key))
+                    .saturating_add(BTREE_ENTRY_OVERHEAD_BYTES);
+            }
+            bytes = bytes.saturating_add(
+                report
+                    .overview_slots
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<OverviewSlotReport>()),
+            );
+            for slot in &report.overview_slots {
+                for (key, counts) in &slot.entries {
+                    bytes = bytes
+                        .saturating_add(std::mem::size_of::<OverviewKey>())
+                        .saturating_add(counts.approx_bytes())
+                        .saturating_add(overview_key_heap_bytes(key))
+                        .saturating_add(BTREE_ENTRY_OVERHEAD_BYTES);
+                }
             }
             bytes
         };
-        window_bytes(&self.window_1m)
-            + window_bytes(&self.window_5m)
-            + window_bytes(&self.window_1h)
+        window_heap_bytes(&self.window_1m)
+            .saturating_add(window_heap_bytes(&self.window_5m))
+            .saturating_add(window_heap_bytes(&self.window_1h))
+    }
+
+    /// Full retained-size estimate when a `MetricsView` is stored on its own. Snapshot
+    /// accounting uses [`Self::heap_bytes`] because the fixed view is already inline in
+    /// the cut. Kept as a separate helper for focused accounting tests.
+    #[cfg(test)]
+    fn approx_bytes(&self) -> usize {
+        std::mem::size_of::<MetricsView>().saturating_add(self.heap_bytes())
     }
 }
 
@@ -815,8 +1475,91 @@ pub struct DomainCursors {
     pub monitor_seq: u64,
 }
 
-/// One body-free atomic cut across the FlowStore, MetricsLayer, and topology stores
-/// taken by the 5 s coordinated snapshot task. Carries:
+/// The single process-wide immutable metrics presentation cut. A one-second publisher
+/// computes this under the established FlowStore→Metrics lock order, then publishes the
+/// `Arc` only after both locks are released. Every subscriber therefore observes the
+/// same view, active-stream count, topology generation, and metrics-domain presentation
+/// sequence; slow subscribers coalesce to the newest cut through [`watch`].
+#[derive(Debug, Clone)]
+pub struct PublishedMetricsCut {
+    /// Wall-clock-compatible epoch milliseconds derived from a monotonic publisher
+    /// clock. This advances under Tokio paused time, allowing windows to age without
+    /// traffic while remaining anchored to the epoch used by terminal samples.
+    pub taken_at_ms: u128,
+    /// Per-domain versions captured at the cut. `metrics_seq` is the sole presentation
+    /// sequence allocated by MetricsState, distinct from the internal terminal-mutation
+    /// counter exposed as `source_metrics_seq` below.
+    pub cursors: DomainCursors,
+    /// Internal terminal-mutation watermark included in this presentation. Useful to
+    /// prove a cut contains all samples recorded before it without making that mutation
+    /// clock a second wire/presentation cursor.
+    pub source_metrics_seq: u64,
+    /// OPEN flows at this exact cut, counted from the same body-free FlowStore summaries
+    /// captured while the FlowStore lock was held.
+    pub active_streams: u64,
+    /// The three age-filtered metric windows as of `taken_at_ms`.
+    pub view: MetricsView,
+    /// The topology generation sampled for this same cut. Consumers that need provider
+    /// joins should use this Arc rather than independently reading the topology publisher.
+    pub topology: Arc<ProviderHealthSnapshot>,
+}
+
+/// One latest-value broadcaster shared by the process. The `watch` channel retains a
+/// single `Arc<PublishedMetricsCut>` regardless of subscriber count or lag. `commit_lock`
+/// keeps the latest sequence monotonic if tests/manual callers race the normal sole task.
+struct MetricsPublisher {
+    sender: watch::Sender<Option<Arc<PublishedMetricsCut>>>,
+    commit_lock: Mutex<()>,
+}
+
+impl MetricsPublisher {
+    fn new() -> Self {
+        let (sender, _receiver) = watch::channel(None);
+        Self {
+            sender,
+            commit_lock: Mutex::new(()),
+        }
+    }
+
+    fn latest(&self) -> Option<Arc<PublishedMetricsCut>> {
+        self.sender.borrow().clone()
+    }
+
+    fn subscribe(&self) -> PublishedMetricsReceiver {
+        self.sender.subscribe()
+    }
+
+    fn commit(&self, cut: Arc<PublishedMetricsCut>) {
+        let _guard = self
+            .commit_lock
+            .lock()
+            .expect("metrics publisher commit lock poisoned");
+        if self
+            .sender
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.cursors.metrics_seq >= cut.cursors.metrics_seq)
+        {
+            return;
+        }
+        self.sender.send_replace(Some(cut));
+    }
+}
+
+impl std::fmt::Debug for MetricsPublisher {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetricsPublisher")
+            .field(
+                "latest_seq",
+                &self.latest().as_ref().map(|cut| cut.cursors.metrics_seq),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+/// One body-free atomic cut across the FlowStore, MetricsLayer, and topology stores,
+/// retained every fifth process-wide publisher tick. Carries:
 /// - `taken_at_ms`: the cut's wall-clock instant (the `snapshot_at(ts)` key).
 /// - `cursors`: per-domain `{flow,metrics,topology,monitor}` sequences at the cut.
 /// - `summaries`: body-free [`SnapshotFlowSummary`]s (NO `Arc<[u8]>` — the 135 GiB
@@ -831,6 +1574,10 @@ pub struct DashboardSnapshot {
     pub taken_at_ms: u128,
     pub cursors: DomainCursors,
     pub summaries: Vec<SnapshotFlowSummary>,
+    /// True when this cut originally contained more flow summaries than its configured
+    /// history quota could retain. Summaries are newest-first, so truncation always drops
+    /// the oldest suffix and preserves a contiguous newest prefix.
+    pub flow_summaries_truncated: bool,
     pub metrics: MetricsView,
     /// The ONE topology cut captured in this snapshot. Serialized by DEREF (serde's
     /// blanket `Arc: Serialize` needs the `rc` feature, which we don't enable
@@ -852,45 +1599,159 @@ where
 }
 
 impl DashboardSnapshot {
-    /// Approximate retained bytes of this cut, for the snapshot-ring memory quota.
-    /// Counts ONLY the body-free summary scalar strings + the metrics view + a small
-    /// topology estimate — there are NO body `Arc<[u8]>`s to count (that is the
-    /// point: a cut is provably body-free, so its memory is bounded at ~1 KiB/flow).
+    /// Retained bytes charged to this cut. This counts the `Arc<DashboardSnapshot>`
+    /// allocation, every vector capacity, every nested String buffer capacity, metrics
+    /// map entries, and the complete topology graph pinned by the topology Arc. A topology
+    /// Arc shared by several cuts is deliberately charged to each cut: that conservative
+    /// over-count guarantees the ring cannot exceed its quota merely because old cuts pin
+    /// different topology generations.
     fn approx_bytes(&self) -> usize {
-        let summary_bytes: usize = self
-            .summaries
-            .iter()
-            .map(summary_approx_bytes)
-            .fold(0usize, usize::saturating_add);
-        summary_bytes
-            .saturating_add(self.metrics.approx_bytes())
-            // A small fixed estimate for the shared topology Arc (counted once; the
-            // Arc is shared across cuts that captured the same version).
-            .saturating_add(std::mem::size_of::<ProviderHealthSnapshot>())
+        ARC_CONTROL_BYTES
+            .saturating_add(std::mem::size_of::<DashboardSnapshot>())
+            .saturating_add(snapshot_summaries_retained_bytes(&self.summaries))
+            .saturating_add(self.metrics.heap_bytes())
+            .saturating_add(topology_retained_bytes(&self.topology))
+    }
+
+    /// Reduce an oversized cut to the largest contiguous NEWEST summary prefix that
+    /// can fit `quota_bytes`. The FlowStore supplies summaries newest-first. Rebuilding
+    /// the vector also removes excess source-vector capacity before the final size check.
+    /// If the metrics/topology base alone exceeds the quota, all summaries are removed;
+    /// the ring will subsequently reject the still-oversized cut rather than violate its
+    /// hard bound.
+    fn truncate_summaries_to_fit(&mut self, quota_bytes: usize) {
+        if self.approx_bytes() <= quota_bytes {
+            return;
+        }
+
+        let original = std::mem::take(&mut self.summaries);
+        let original_len = original.len();
+        let base_bytes = self.approx_bytes();
+        let mut available = quota_bytes.saturating_sub(base_bytes);
+        let mut keep = 0usize;
+        for summary in &original {
+            let bytes = summary_approx_bytes(summary);
+            if bytes > available {
+                break;
+            }
+            available -= bytes;
+            keep += 1;
+        }
+
+        let mut retained: Vec<_> = original.into_iter().take(keep).collect();
+        retained.shrink_to_fit();
+        self.summaries = retained;
+        self.flow_summaries_truncated |= keep < original_len;
+
+        // `shrink_to_fit` may legally retain spare capacity. Re-check the ACTUAL
+        // capacity and drop additional oldest summaries until the cut fits or only the
+        // metrics/topology base remains.
+        while self.approx_bytes() > quota_bytes && !self.summaries.is_empty() {
+            self.summaries.pop();
+            self.summaries.shrink_to_fit();
+            self.flow_summaries_truncated = true;
+        }
     }
 }
 
-/// Approximate retained bytes of one body-free [`SnapshotFlowSummary`]: the sum of
-/// its dynamic scalar string lengths + the fixed struct size. There are NO body
-/// fields to count (the summary is body-free by construction), so this is the full
-/// memory footprint — the basis for the ≤400 MiB ring-quota assertion.
+/// Heap allocations reachable from one body-free summary. Its fixed struct storage is
+/// charged through the summaries vector capacity. Every `String` uses `capacity()`, not
+/// `len()`, and the attempt vector charges its capacity plus both dynamic attempt labels.
+fn summary_heap_bytes(summary: &SnapshotFlowSummary) -> usize {
+    let opt = |value: &Option<String>| value.as_ref().map(String::capacity).unwrap_or(0);
+    let attempts = summary
+        .attempts
+        .capacity()
+        .saturating_mul(std::mem::size_of::<Attempt>());
+    let attempt_strings = summary
+        .attempts
+        .iter()
+        .map(|attempt| opt(&attempt.provider).saturating_add(opt(&attempt.model)))
+        .fold(0usize, usize::saturating_add);
+    summary
+        .api_call_id
+        .capacity()
+        .saturating_add(opt(&summary.response_id))
+        .saturating_add(summary.method.capacity())
+        .saturating_add(summary.uri.capacity())
+        .saturating_add(opt(&summary.model_requested))
+        .saturating_add(opt(&summary.model_served))
+        .saturating_add(opt(&summary.upstream_target))
+        .saturating_add(opt(&summary.terminal_reason))
+        .saturating_add(opt(&summary.client_label))
+        .saturating_add(attempts)
+        .saturating_add(attempt_strings)
+}
+
+/// Full retained bytes of one body-free [`SnapshotFlowSummary`] when stored in a
+/// tightly-sized vector slot.
 fn summary_approx_bytes(summary: &SnapshotFlowSummary) -> usize {
-    let opt = |value: &Option<String>| value.as_ref().map(String::len).unwrap_or(0);
-    std::mem::size_of::<SnapshotFlowSummary>()
-        + summary.api_call_id.len()
-        + opt(&summary.response_id)
-        + summary.method.len()
-        + summary.uri.len()
-        + opt(&summary.model_requested)
-        + opt(&summary.model_served)
-        + opt(&summary.upstream_target)
-        + opt(&summary.terminal_reason)
+    std::mem::size_of::<SnapshotFlowSummary>().saturating_add(summary_heap_bytes(summary))
+}
+
+fn snapshot_summaries_retained_bytes(summaries: &Vec<SnapshotFlowSummary>) -> usize {
+    summaries
+        .capacity()
+        .saturating_mul(std::mem::size_of::<SnapshotFlowSummary>())
+        .saturating_add(
+            summaries
+                .iter()
+                .map(summary_heap_bytes)
+                .fold(0usize, usize::saturating_add),
+        )
+}
+
+/// Complete topology allocation pinned by a snapshot cut. Provider strings are
+/// charged by capacity; the vector's unused capacity is charged as fixed provider
+/// slots. The Arc allocation is conservatively charged to every cut that references it.
+fn topology_retained_bytes(topology: &Arc<ProviderHealthSnapshot>) -> usize {
+    let provider_strings = topology
+        .providers
+        .iter()
+        .map(|provider| {
+            provider
+                .id
+                .capacity()
+                .saturating_add(provider.name.capacity())
+                .saturating_add(provider.route.as_ref().map(String::capacity).unwrap_or(0))
+                .saturating_add(provider.base_url.capacity())
+                .saturating_add(
+                    provider
+                        .last_error
+                        .as_ref()
+                        .map(String::capacity)
+                        .unwrap_or(0),
+                )
+        })
+        .fold(0usize, usize::saturating_add);
+    ARC_CONTROL_BYTES
+        .saturating_add(std::mem::size_of::<ProviderHealthSnapshot>())
+        .saturating_add(
+            topology
+                .providers
+                .capacity()
+                .saturating_mul(std::mem::size_of::<crate::upstream::ProviderHealth>()),
+        )
+        .saturating_add(provider_strings)
+}
+
+/// Public, body-free description of the retained snapshot history. The selected cut's
+/// [`DashboardSnapshot::flow_summaries_truncated`] flag is intentionally per-cut; this
+/// struct describes the ring itself so a later API projection can expose both without
+/// reaching into MetricsLayer internals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct SnapshotHistoryMetadata {
+    pub oldest_at_ms: Option<u128>,
+    pub newest_at_ms: Option<u128>,
+    pub retained_bytes: usize,
+    pub quota_bytes: usize,
+    pub retained_cuts: usize,
 }
 
 /// The bounded ring of body-free [`DashboardSnapshot`] cuts (720 = 1 h at 5 s). A
 /// fresh cut is pushed at the back; the ring is bounded BOTH by slot count (720) AND
-/// by a retained-summary-byte quota (the HARD ≤400 MiB bound — when a push would
-/// exceed it, the OLDEST cuts are dropped first). `snapshot_at(ts)` binary-searches
+/// by a retained-byte quota (64 MiB by default — when a push would exceed it, the
+/// OLDEST cuts are dropped before insertion). `snapshot_at(ts)` binary-searches
 /// the time-ordered cuts for the nearest cut with `taken_at_ms ≤ ts`.
 #[derive(Debug, Default)]
 struct SnapshotRing {
@@ -902,27 +1763,36 @@ struct SnapshotRing {
 impl SnapshotRing {
     fn new(quota_bytes: usize) -> Self {
         Self {
-            cuts: std::collections::VecDeque::with_capacity(SNAPSHOT_RING_SLOTS),
+            cuts: std::collections::VecDeque::new(),
             retained_bytes: 0,
             quota_bytes,
         }
     }
 
-    /// Push a fresh cut, then enforce BOTH the slot cap (720) and the byte quota
-    /// (≤400 MiB) by dropping the OLDEST cuts. Cuts are pushed in monotonic
-    /// `taken_at_ms` order (the 5 s task is the only writer), so the deque stays
-    /// time-sorted for `snapshot_at`'s binary search.
-    fn push(&mut self, cut: Arc<DashboardSnapshot>) {
-        self.retained_bytes = self.retained_bytes.saturating_add(cut.approx_bytes());
+    /// Retain a fresh cut while preserving the hard byte bound at every step. An
+    /// individually oversized cut is rejected (its summaries should already have been
+    /// trimmed by the cut builder); otherwise oldest cuts are evicted BEFORE insertion.
+    /// Returns whether the cut was retained.
+    fn push(&mut self, cut: Arc<DashboardSnapshot>) -> bool {
+        let cut_bytes = cut.approx_bytes();
+        if cut_bytes > self.quota_bytes {
+            debug_assert!(self.retained_bytes <= self.quota_bytes);
+            return false;
+        }
+        while self.cuts.len() >= SNAPSHOT_RING_SLOTS {
+            self.pop_oldest();
+        }
+        while self.retained_bytes > self.quota_bytes.saturating_sub(cut_bytes) {
+            if self.cuts.is_empty() {
+                debug_assert!(self.retained_bytes <= self.quota_bytes);
+                return false;
+            }
+            self.pop_oldest();
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(cut_bytes);
         self.cuts.push_back(cut);
-        while self.cuts.len() > SNAPSHOT_RING_SLOTS {
-            self.pop_oldest();
-        }
-        while self.retained_bytes > self.quota_bytes && self.cuts.len() > 1 {
-            // Keep at least the newest cut even if a single cut somehow exceeds the
-            // quota (degenerate); the quota is a peak bound, not a per-cut bound.
-            self.pop_oldest();
-        }
+        debug_assert!(self.retained_bytes <= self.quota_bytes);
+        true
     }
 
     fn pop_oldest(&mut self) {
@@ -954,15 +1824,57 @@ impl SnapshotRing {
         best.map(|index| Arc::clone(&self.cuts[index]))
     }
 
+    /// Absolute nearest retained cut, with ties resolved toward the older cut. Overview
+    /// uses this for an explicit `at=` selection; `/snapshot` keeps its causal
+    /// at-or-before semantics through [`Self::snapshot_at`].
+    fn nearest(&self, ts: u128) -> Option<Arc<DashboardSnapshot>> {
+        if self.cuts.is_empty() {
+            return None;
+        }
+        let mut lo = 0usize;
+        let mut hi = self.cuts.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.cuts[mid].taken_at_ms < ts {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        match lo {
+            0 => Some(Arc::clone(&self.cuts[0])),
+            index if index >= self.cuts.len() => self.cuts.back().map(Arc::clone),
+            index => {
+                let older = &self.cuts[index - 1];
+                let newer = &self.cuts[index];
+                if ts.saturating_sub(older.taken_at_ms) <= newer.taken_at_ms.saturating_sub(ts) {
+                    Some(Arc::clone(older))
+                } else {
+                    Some(Arc::clone(newer))
+                }
+            }
+        }
+    }
+
     /// The most recent cut, if any (the live `/snapshot` with no `at=`).
     fn latest(&self) -> Option<Arc<DashboardSnapshot>> {
         self.cuts.back().map(Arc::clone)
     }
+
+    fn metadata(&self) -> SnapshotHistoryMetadata {
+        SnapshotHistoryMetadata {
+            oldest_at_ms: self.cuts.front().map(|cut| cut.taken_at_ms),
+            newest_at_ms: self.cuts.back().map(|cut| cut.taken_at_ms),
+            retained_bytes: self.retained_bytes,
+            quota_bytes: self.quota_bytes,
+            retained_cuts: self.cuts.len(),
+        }
+    }
 }
 
 /// Interior state of the [`MetricsLayer`], guarded by its single `Mutex`. Holds the
-/// three window rings, the monotonic `metrics_seq`, and the snapshot ring. The
-/// snapshot ring lives UNDER the same mutex so the 5 s task pushes a cut while
+/// three window rings, the data and presentation sequences, and the snapshot ring. The
+/// snapshot ring lives UNDER the same mutex so every-fifth-tick retention happens while
 /// already holding the metrics lock (inside the FlowStore→Metrics critical section),
 /// avoiding a third lock.
 #[derive(Debug)]
@@ -970,7 +1882,14 @@ struct MetricsState {
     ring_1m: WindowRing,
     ring_5m: WindowRing,
     ring_1h: WindowRing,
+    /// Terminal/data mutation watermark. This proves which recorded samples a view
+    /// includes but is not the published presentation cursor.
     metrics_seq: u64,
+    /// Sole metrics-domain presentation sequence. Only snapshot/publication cut builders
+    /// allocate from it, so every externally-consumable immutable cut is strictly newer
+    /// than both the prior cut and the internal data watermark consumers may have observed
+    /// before the publisher's first tick.
+    presentation_seq: u64,
     snapshots: SnapshotRing,
 }
 
@@ -981,8 +1900,21 @@ impl MetricsState {
             ring_5m: WindowRing::new(WINDOW_5M_SLOTS),
             ring_1h: WindowRing::new(WINDOW_1H_SLOTS),
             metrics_seq: 0,
+            presentation_seq: 0,
             snapshots: SnapshotRing::new(snapshot_quota_bytes),
         }
+    }
+
+    fn next_presentation_seq(&mut self) -> u64 {
+        self.presentation_seq = self
+            .presentation_seq
+            .max(self.metrics_seq)
+            .saturating_add(1);
+        self.presentation_seq
+    }
+
+    fn current_seq(&self) -> u64 {
+        self.presentation_seq.max(self.metrics_seq)
     }
 
     /// Record one terminal response into all three rings at `epoch_s`, bumping
@@ -1000,8 +1932,8 @@ impl MetricsState {
     /// Record one terminal response AND its optional final cumulative usage into all
     /// three rings at the SAME `epoch_s`, bumping `metrics_seq` ONCE (Codex D5 R1 #2).
     /// This is the atomic terminal path: the response count and the token totals are
-    /// applied under a SINGLE metrics-lock hold at ONE epoch/slot, so a concurrent 5 s
-    /// snapshot can never interleave between them and land the count and the tokens in
+    /// applied under a SINGLE metrics-lock hold at ONE epoch/slot, so a concurrent
+    /// publisher cut can never interleave between them and land the count and the tokens in
     /// DIFFERENT 1 s slots (which separate `record_response` + `add_tokens` calls —
     /// each computing its own `now_epoch_s()` under its own lock — could do across a
     /// second boundary). Both join the same `{status, model, endpoint, upstream}`
@@ -1013,16 +1945,27 @@ impl MetricsState {
         elapsed_ms: f64,
         usage: Option<FlowUsage>,
         attempts: &[Attempt],
+        overview_inputs: Option<&TerminalMetricsInputs>,
     ) {
         for ring in [&mut self.ring_1m, &mut self.ring_5m, &mut self.ring_1h] {
             let slot = ring.slot_mut(epoch_s);
             // Gap 12: fold the per-attempt trace into the per-provider tallies in the SAME
             // slot, under the SAME single metrics-lock hold as the count/tokens — so a
-            // concurrent 5 s snapshot can never observe the flow's terminal count without
+            // concurrent publisher cut can never observe the flow's terminal count without
             // its per-provider attempt samples (they are co-located atomically). A FAILED
             // primary that failed over IS counted toward its own provider (final-served
             // latency alone would hide it — spec 12). Bounded by the per-slot provider cap.
             record_attempts_into_slot(slot, attempts);
+            if let Some(inputs) = overview_inputs {
+                slot.record_overview(
+                    match key.status {
+                        StatusClass::Success => FlowStatus::Completed,
+                        StatusClass::Error => FlowStatus::Failed,
+                        StatusClass::Cancelled => FlowStatus::Cancelled,
+                    },
+                    inputs,
+                );
+            }
             let entry = slot.buckets.entry(key.clone()).or_default();
             entry.count = entry.count.saturating_add(1);
             if let Some(usage) = usage {
@@ -1112,7 +2055,11 @@ impl MetricsState {
 #[derive(Clone)]
 pub struct MetricsLayer {
     enabled: bool,
-    state: Arc<Mutex<MetricsState>>,
+    /// `None` on the disabled path: no 3,960-slot ring allocation, no mutex/Arc.
+    state: Option<Arc<Mutex<MetricsState>>>,
+    /// `None` on the disabled path: no watch channel and therefore no publisher
+    /// allocation or subscription surface when `--with-debug-ui` is off.
+    publisher: Option<Arc<MetricsPublisher>>,
 }
 
 impl std::fmt::Debug for MetricsLayer {
@@ -1120,16 +2067,22 @@ impl std::fmt::Debug for MetricsLayer {
         formatter
             .debug_struct("MetricsLayer")
             .field("enabled", &self.enabled)
+            .field("publisher", &self.publisher)
             .finish_non_exhaustive()
     }
 }
 
 impl MetricsLayer {
-    /// Enabled layer (debug UI on). Uses the default 400 MiB snapshot-ring quota.
+    /// Enabled layer (debug UI on). Reads the env-only
+    /// [`DASHBOARD_SNAPSHOT_QUOTA_ENV`] value in MiB, defaulting to 64 MiB when it is
+    /// absent, blank, invalid, or overflows the host `usize`.
     pub fn new() -> Self {
         Self {
             enabled: true,
-            state: Arc::new(Mutex::new(MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES))),
+            state: Some(Arc::new(Mutex::new(MetricsState::new(
+                configured_snapshot_quota_bytes(),
+            )))),
+            publisher: Some(Arc::new(MetricsPublisher::new())),
         }
     }
 
@@ -1138,18 +2091,19 @@ impl MetricsLayer {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            // A tiny quota; the state is never mutated on the disabled path.
-            state: Arc::new(Mutex::new(MetricsState::new(0))),
+            state: None,
+            publisher: None,
         }
     }
 
-    /// Test-only constructor with an explicit snapshot-ring byte quota, so the
-    /// memory-quota test can drive eviction without allocating 400 MiB.
+    /// Test-only constructor with an explicit snapshot-ring byte quota, so quota
+    /// enforcement can be exercised without allocating the production default.
     #[cfg(test)]
     fn with_snapshot_quota(quota_bytes: usize) -> Self {
         Self {
             enabled: true,
-            state: Arc::new(Mutex::new(MetricsState::new(quota_bytes))),
+            state: Some(Arc::new(Mutex::new(MetricsState::new(quota_bytes)))),
+            publisher: Some(Arc::new(MetricsPublisher::new())),
         }
     }
 
@@ -1158,7 +2112,11 @@ impl MetricsLayer {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, MetricsState> {
-        self.state.lock().expect("metrics layer lock poisoned")
+        self.state
+            .as_ref()
+            .expect("enabled metrics layer has state")
+            .lock()
+            .expect("metrics layer lock poisoned")
     }
 
     /// Record one TERMINAL response (the D3 terminal finalize seam — NOT the
@@ -1221,7 +2179,7 @@ impl MetricsLayer {
     /// metrics-lock hold at ONE epoch/slot — the engine drives this once at the D3
     /// terminal finalize seam INSTEAD of a separate `record_response` + `record_usage`
     /// pair. Taking one lock and computing one `epoch_s` here guarantees the count and
-    /// the tokens land in the SAME 1 s slot even if a 5 s coordinated snapshot runs
+    /// the tokens land in the SAME 1 s slot even if a coordinated publisher cut runs
     /// concurrently: there is no window between two lock acquisitions for a snapshot to
     /// observe the count without the tokens (or to split them across a second
     /// boundary). The `served_model`/`endpoint`/`upstream` collapse to `"unknown"`
@@ -1258,17 +2216,61 @@ impl MetricsLayer {
             upstream: label_or_unknown(upstream),
         };
         let epoch_s = now_epoch_s();
-        self.lock()
-            .record_terminal(epoch_s, &key, elapsed_ms as f64, usage, attempts);
+        let overview_inputs = TerminalMetricsInputs {
+            model_served: served_model.map(str::to_string),
+            endpoint: endpoint.to_string(),
+            upstream: upstream.map(str::to_string),
+            usage,
+            attempts: attempts.to_vec(),
+            ..TerminalMetricsInputs::default()
+        };
+        self.lock().record_terminal(
+            epoch_s,
+            &key,
+            elapsed_ms as f64,
+            usage,
+            attempts,
+            Some(&overview_inputs),
+        );
     }
 
-    /// The current metrics domain sequence (the per-domain cursor). `0` when
-    /// disabled.
+    /// Record the complete evict-safe terminal payload. Unlike the compatibility
+    /// [`record_terminal`](Self::record_terminal) seam, this preserves requested/served
+    /// identity, client attribution, bounded failure reason, terminal-time cost, and
+    /// effective route limit for exact Overview rollups.
+    pub fn record_terminal_inputs(
+        &self,
+        status: FlowStatus,
+        elapsed_ms: u128,
+        inputs: &TerminalMetricsInputs,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let key = BucketKey {
+            status: StatusClass::from_status(status),
+            model: label_or_unknown(inputs.model_served.as_deref()),
+            endpoint: inputs.endpoint.clone(),
+            upstream: label_or_unknown(inputs.upstream.as_deref()),
+        };
+        self.lock().record_terminal(
+            now_epoch_s(),
+            &key,
+            elapsed_ms as f64,
+            inputs.usage,
+            &inputs.attempts,
+            Some(inputs),
+        );
+    }
+
+    /// Current metrics-domain watermark. Before the first presentation cut this tracks
+    /// terminal mutations; afterward it is the greater of the internal data watermark
+    /// and the sole presentation sequence. `0` when disabled.
     pub fn metrics_seq(&self) -> u64 {
         if !self.enabled {
             return 0;
         }
-        self.lock().metrics_seq
+        self.lock().current_seq()
     }
 
     /// Collapse the three rings into a body-free [`MetricsView`] as of NOW. Empty
@@ -1303,7 +2305,127 @@ impl MetricsLayer {
         }
         let state = self.lock();
         let now = now_epoch_s();
-        (state.view(now), state.metrics_seq)
+        (state.view(now), state.current_seq())
+    }
+
+    /// Latest immutable process-wide metrics presentation, or `None` before the first
+    /// publisher tick / when disabled. Cloning is one Arc increment; no metric rings are
+    /// re-aggregated on this read.
+    pub fn latest_published_metrics(&self) -> Option<Arc<PublishedMetricsCut>> {
+        self.publisher
+            .as_ref()
+            .and_then(|publisher| publisher.latest())
+    }
+
+    /// Subscribe to the process-wide latest metrics presentation. `watch` is a broadcast
+    /// latest-value channel: every subscriber is notified, but lag coalesces instead of
+    /// retaining an unbounded/per-socket queue of large cuts. `None` when disabled, so
+    /// the `--with-debug-ui`-off path allocates no channel.
+    pub fn subscribe_published_metrics(&self) -> Option<PublishedMetricsReceiver> {
+        self.publisher
+            .as_ref()
+            .map(|publisher| publisher.subscribe())
+    }
+
+    /// Synchronously publish one process-wide cut using the current wall clock. This is
+    /// primarily the deterministic/manual seam; the production task uses the monotonic-
+    /// anchored clock in [`spawn_metrics_publisher_task`] so Tokio paused time advances
+    /// window expiry. When `persist_snapshot` is true, the coordinated historical cut is
+    /// built from this exact metrics view, timestamp, topology Arc, and cursor.
+    pub fn publish_metrics_cut(
+        &self,
+        flow_store: &DashboardFlowStore,
+        topology: &ProviderHealthPublisher,
+        monitor_seq: u64,
+        persist_snapshot: bool,
+    ) -> Option<Arc<PublishedMetricsCut>> {
+        self.publish_metrics_cut_with(
+            flow_store,
+            topology,
+            || monitor_seq,
+            now_ms,
+            persist_snapshot,
+        )
+    }
+
+    /// Shared cut builder for the production task and deterministic tests. Both clocks
+    /// are sampled INSIDE the FlowStore→Metrics critical section; the timestamp runs last
+    /// after topology/monitor/sequence reads, matching the snapshot stamp-last invariant.
+    fn publish_metrics_cut_with<M, T>(
+        &self,
+        flow_store: &DashboardFlowStore,
+        topology_publisher: &ProviderHealthPublisher,
+        read_monitor_seq: M,
+        read_time_ms: T,
+        persist_snapshot: bool,
+    ) -> Option<Arc<PublishedMetricsCut>>
+    where
+        M: FnOnce() -> u64,
+        T: FnOnce() -> u128,
+    {
+        if !self.enabled {
+            return None;
+        }
+        let publisher = Arc::clone(
+            self.publisher
+                .as_ref()
+                .expect("enabled metrics layer has publisher"),
+        );
+        let published = flow_store.with_summaries_under_lock(|flow_guard, summaries, flow_seq| {
+            // FIXED LOCK ORDER step 2: Metrics is always nested under FlowStore.
+            let mut state = self.lock();
+            let active_streams = summaries
+                .iter()
+                .filter(|summary| summary.status == FlowStatus::Open)
+                .count() as u64;
+            let topology = topology_publisher.latest();
+            let topology_seq = topology.version;
+            let source_metrics_seq = state.metrics_seq;
+            let monitor_seq = read_monitor_seq();
+            let metrics_seq = state.next_presentation_seq();
+            // Stamp LAST, after every independently mutable domain read.
+            let taken_at_ms = read_time_ms();
+            let now_epoch_s = (taken_at_ms / 1000) as u64;
+
+            // The atomic cut is fixed. Release FlowStore before the heavier window
+            // aggregation and optional summary trimming; Metrics remains locked.
+            flow_guard.release();
+            let view = state.view(now_epoch_s);
+            let cursors = DomainCursors {
+                flow_seq,
+                metrics_seq,
+                topology_seq,
+                monitor_seq,
+            };
+
+            if persist_snapshot {
+                let mut snapshot = DashboardSnapshot {
+                    taken_at_ms,
+                    cursors,
+                    summaries,
+                    flow_summaries_truncated: false,
+                    metrics: view.clone(),
+                    topology: Arc::clone(&topology),
+                };
+                snapshot.truncate_summaries_to_fit(state.snapshots.quota_bytes);
+                let _ = state.snapshots.push(Arc::new(snapshot));
+            }
+
+            let cut = Arc::new(PublishedMetricsCut {
+                taken_at_ms,
+                cursors,
+                source_metrics_seq,
+                active_streams,
+                view,
+                topology,
+            });
+            // Never hold FlowStore/Metrics while waking subscribers. A consumer may
+            // immediately call back into either store.
+            drop(state);
+            publisher.commit(Arc::clone(&cut));
+            cut
+        });
+        Some(published)
     }
 
     /// **The 5 s coordinated snapshot.** Takes the FIXED lock order — FlowStore mutex
@@ -1411,7 +2533,10 @@ impl MetricsLayer {
             // ONE topology Arc capture (D4) at the cut instant.
             let topology = topology.latest();
             let topology_seq = topology.version;
-            let metrics_seq = state.metrics_seq;
+            // Manual cuts share the SAME presentation allocator as the one-second
+            // publisher, so a diagnostic/test snapshot can never make the metrics cursor
+            // regress relative to a published cut.
+            let metrics_seq = state.next_presentation_seq();
             // The monitor cursor, sampled at the cut instant (not pre-read by the caller).
             let monitor_seq = read_monitor_seq();
             // Wall-clock instant of the cut, stamped LAST — after every independent
@@ -1429,14 +2554,22 @@ impl MetricsLayer {
                 topology_seq,
                 monitor_seq,
             };
-            let cut = Arc::new(DashboardSnapshot {
+            let mut cut = DashboardSnapshot {
                 taken_at_ms,
                 cursors,
                 summaries,
+                flow_summaries_truncated: false,
                 metrics,
                 topology,
-            });
-            state.snapshots.push(Arc::clone(&cut));
+            };
+            // A single cut may exceed the configured history quota even though every
+            // summary is body-free (512 summaries with max-cap client/attempt labels can
+            // still be large). Keep the contiguous NEWEST prefix that fits before the
+            // ring sees it. The ring then evicts older cuts before insertion and rejects
+            // the cut only if its metrics/topology base alone is still oversized.
+            cut.truncate_summaries_to_fit(state.snapshots.quota_bytes);
+            let cut = Arc::new(cut);
+            let _retained = state.snapshots.push(Arc::clone(&cut));
             cut
         });
         Some(cut)
@@ -1452,6 +2585,17 @@ impl MetricsLayer {
         self.lock().snapshots.snapshot_at(ts)
     }
 
+    /// Absolute nearest historical cut for Overview time travel. Unlike
+    /// [`snapshot_at`](Self::snapshot_at), a requested instant before the oldest cut
+    /// selects that oldest retained cut and an instant closer to the next cut selects
+    /// the next one.
+    pub fn nearest_snapshot(&self, ts: u128) -> Option<Arc<DashboardSnapshot>> {
+        if !self.enabled {
+            return None;
+        }
+        self.lock().snapshots.nearest(ts)
+    }
+
     /// The most recent retained snapshot cut (live `/snapshot` with no `at=`). `None`
     /// when disabled or no cut has been taken yet.
     pub fn latest_snapshot(&self) -> Option<Arc<DashboardSnapshot>> {
@@ -1459,6 +2603,16 @@ impl MetricsLayer {
             return None;
         }
         self.lock().snapshots.latest()
+    }
+
+    /// Metadata for the bounded historical snapshot ring. This is an API-neutral,
+    /// body-free value intended for later REST projection. The disabled layer returns
+    /// an empty/default value without taking a lock, preserving the zero-op path.
+    pub fn snapshot_history_metadata(&self) -> SnapshotHistoryMetadata {
+        if !self.enabled {
+            return SnapshotHistoryMetadata::default();
+        }
+        self.lock().snapshots.metadata()
     }
 }
 
@@ -1468,8 +2622,68 @@ impl Default for MetricsLayer {
     }
 }
 
-/// Spawn the D5 5-second coordinated snapshot task. Gated by `--with-debug-ui` at
-/// the DI root (production must NOT run this — zero overhead). The task holds only
+/// Epoch-compatible clock anchored to Tokio's monotonic time. Terminal samples are
+/// recorded against wall-clock epoch seconds, so the anchor starts at wall time; after
+/// that, Tokio elapsed time drives the cut timestamp. This avoids wall-clock regressions
+/// and, critically, lets `#[tokio::test(start_paused)]` advance window expiry without
+/// sleeping or mutating the process clock.
+struct MetricsPublisherClock {
+    wall_anchor_ms: u128,
+    monotonic_anchor: tokio::time::Instant,
+}
+
+impl MetricsPublisherClock {
+    fn new() -> Self {
+        Self {
+            wall_anchor_ms: now_ms(),
+            monotonic_anchor: tokio::time::Instant::now(),
+        }
+    }
+
+    fn now_ms(&self) -> u128 {
+        self.wall_anchor_ms
+            .saturating_add(self.monotonic_anchor.elapsed().as_millis())
+    }
+}
+
+/// Spawn the ONE process-wide dashboard metrics publisher. Every second it takes the
+/// established FlowStore→Metrics cut, advances the sole metrics presentation sequence,
+/// ages all windows against the monotonic-anchored timestamp, and broadcasts one shared
+/// immutable Arc. Every fifth tick it also persists a historical snapshot built from the
+/// SAME view/timestamp/topology/cursors. Returns `None` without spawning or allocating
+/// when the metrics layer is disabled.
+pub fn spawn_metrics_publisher_task(
+    metrics: MetricsLayer,
+    flow_store: DashboardFlowStore,
+    topology: ProviderHealthPublisher,
+    monitor: crate::monitor::MonitorHub,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !metrics.is_enabled() {
+        return None;
+    }
+    Some(tokio::spawn(async move {
+        let clock = MetricsPublisherClock::new();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut tick_count = 0u64;
+        loop {
+            interval.tick().await;
+            tick_count = tick_count.saturating_add(1);
+            let persist_snapshot = tick_count.is_multiple_of(5);
+            let _ = metrics.publish_metrics_cut_with(
+                &flow_store,
+                &topology,
+                || monitor.last_sequence(),
+                || clock.now_ms(),
+                persist_snapshot,
+            );
+        }
+    }))
+}
+
+/// Legacy standalone 5-second snapshot task retained for focused callers/tests. The DI
+/// root uses [`spawn_metrics_publisher_task`] instead, which publishes every second and
+/// persists the exact same cut every fifth tick. If called, this task holds only
 /// `Clone` handles (the metrics layer, the FlowStore, the topology publisher, the
 /// monitor) — all behind `Arc`, so it is `Send + 'static` and runs for the process
 /// lifetime. Every 5 s it takes the single FlowStore→Metrics critical section and,
@@ -1499,6 +2713,23 @@ pub fn spawn_snapshot_task(
 /// spawns a distinct `None` bucket and the key space stays bounded.
 fn label_or_unknown(value: Option<&str>) -> String {
     value.unwrap_or("unknown").to_string()
+}
+
+/// Parse the env-only snapshot quota. `0` is accepted as an explicit request to retain
+/// no historical cuts; live metrics remain enabled. Invalid/negative/overflowing values
+/// fall back to the 64 MiB default.
+fn snapshot_quota_bytes_from_env_value(value: Option<&str>) -> usize {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(|mib| mib.checked_mul(MIB_BYTES))
+        .unwrap_or(DEFAULT_SNAPSHOT_QUOTA_BYTES)
+}
+
+fn configured_snapshot_quota_bytes() -> usize {
+    let value = std::env::var(DASHBOARD_SNAPSHOT_QUOTA_ENV).ok();
+    snapshot_quota_bytes_from_env_value(value.as_deref())
 }
 
 /// `skip_serializing_if` predicate for the per-class error counters: a `0` class is
@@ -1535,9 +2766,49 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_quota_env_parser_defaults_and_accepts_mib() {
+        assert_eq!(
+            snapshot_quota_bytes_from_env_value(None),
+            DEFAULT_SNAPSHOT_QUOTA_BYTES
+        );
+        assert_eq!(
+            snapshot_quota_bytes_from_env_value(Some("")),
+            DEFAULT_SNAPSHOT_QUOTA_BYTES
+        );
+        assert_eq!(
+            snapshot_quota_bytes_from_env_value(Some("not-a-number")),
+            DEFAULT_SNAPSHOT_QUOTA_BYTES
+        );
+        assert_eq!(
+            snapshot_quota_bytes_from_env_value(Some(" 2 ")),
+            2 * MIB_BYTES
+        );
+        assert_eq!(
+            snapshot_quota_bytes_from_env_value(Some("0")),
+            0,
+            "zero explicitly disables retained history"
+        );
+        assert_eq!(
+            snapshot_quota_bytes_from_env_value(Some(&usize::MAX.to_string())),
+            DEFAULT_SNAPSHOT_QUOTA_BYTES,
+            "MiB multiplication overflow falls back to the default"
+        );
+    }
+
+    #[test]
     fn disabled_layer_is_a_no_op() {
         let metrics = MetricsLayer::disabled();
         assert!(!metrics.is_enabled());
+        assert!(
+            metrics.state.is_none(),
+            "disabled path allocates no metric rings"
+        );
+        assert!(
+            metrics.publisher.is_none(),
+            "disabled path allocates no publisher channel"
+        );
+        assert!(metrics.subscribe_published_metrics().is_none());
+        assert!(metrics.latest_published_metrics().is_none());
         metrics.record_response(
             FlowStatus::Completed,
             Some("m"),
@@ -1557,10 +2828,162 @@ mod tests {
         assert_eq!(view.window_1m.total_count(), 0);
         assert!(metrics.latest_snapshot().is_none());
         assert!(metrics.snapshot_at(u128::MAX).is_none());
+        assert_eq!(
+            metrics.snapshot_history_metadata(),
+            SnapshotHistoryMetadata::default(),
+            "disabled history metadata is an allocation-free empty value"
+        );
         // The coordinated snapshot is a no-op too.
         let flow = DashboardFlowStore::disabled();
         let topo = ProviderHealthPublisher::default();
         assert!(metrics.snapshot(&flow, &topo).is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_metrics_publisher_spawns_no_task() {
+        let handle = spawn_metrics_publisher_task(
+            MetricsLayer::disabled(),
+            DashboardFlowStore::disabled(),
+            ProviderHealthPublisher::default(),
+            crate::monitor::MonitorHub::disabled(),
+        );
+        assert!(
+            handle.is_none(),
+            "disabled dashboard spawns no publisher task"
+        );
+    }
+
+    async fn next_published_cut(
+        receiver: &mut PublishedMetricsReceiver,
+    ) -> Arc<PublishedMetricsCut> {
+        receiver.changed().await.expect("publisher remains open");
+        receiver
+            .borrow_and_update()
+            .clone()
+            .expect("publisher installed a cut")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn publisher_advances_sequence_and_ages_windows_without_traffic() {
+        let metrics = MetricsLayer::with_snapshot_quota(1024 * 1024);
+        metrics.record_terminal(
+            FlowStatus::Completed,
+            Some("served-m"),
+            "/v1/responses",
+            Some("provider-a"),
+            10,
+            None,
+            &[],
+        );
+        let flow = DashboardFlowStore::new();
+        let topology = ProviderHealthPublisher::default();
+        topology.publish(Vec::new());
+        let mut receiver = metrics
+            .subscribe_published_metrics()
+            .expect("enabled publisher has a subscription");
+        let handle = spawn_metrics_publisher_task(
+            metrics.clone(),
+            flow,
+            topology,
+            crate::monitor::MonitorHub::disabled(),
+        )
+        .expect("enabled publisher task");
+
+        tokio::task::yield_now().await;
+        let first = next_published_cut(&mut receiver).await;
+        assert_eq!(first.view.window_1m.total_count(), 1);
+        assert_eq!(first.view.window_5m.total_count(), 1);
+        assert_eq!(first.source_metrics_seq, 1);
+
+        // No terminal mutation occurs. Advancing only Tokio's paused monotonic clock
+        // still drives the publisher's epoch-compatible timestamp far enough to expire
+        // the 1m ring while leaving the sample in 5m/1h.
+        tokio::time::advance(std::time::Duration::from_secs(61)).await;
+        let aged = next_published_cut(&mut receiver).await;
+        assert!(
+            aged.cursors.metrics_seq > first.cursors.metrics_seq,
+            "the presentation cursor advances on time expiry without traffic"
+        );
+        assert_eq!(aged.source_metrics_seq, first.source_metrics_seq);
+        assert_eq!(aged.view.window_1m.total_count(), 0, "1m sample aged out");
+        assert_eq!(aged.view.window_5m.total_count(), 1, "5m sample remains");
+        assert_eq!(aged.view.window_1h.total_count(), 1, "1h sample remains");
+        assert_eq!(
+            metrics
+                .latest_published_metrics()
+                .expect("latest cut")
+                .cursors
+                .metrics_seq,
+            aged.cursors.metrics_seq
+        );
+        handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_fifth_publisher_tick_persists_the_exact_published_cut() {
+        let metrics = MetricsLayer::with_snapshot_quota(1024 * 1024);
+        let flow = DashboardFlowStore::new();
+        flow.open(
+            "api_open".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+            None,
+            crate::dashboard_flow::ClientAttribution::none(),
+        );
+        let topology = ProviderHealthPublisher::default();
+        topology.publish(Vec::new());
+        let mut receiver = metrics
+            .subscribe_published_metrics()
+            .expect("enabled publisher has a subscription");
+        let handle = spawn_metrics_publisher_task(
+            metrics.clone(),
+            flow,
+            topology,
+            crate::monitor::MonitorHub::disabled(),
+        )
+        .expect("enabled publisher task");
+
+        tokio::task::yield_now().await;
+        let mut published = next_published_cut(&mut receiver).await;
+        assert_eq!(published.active_streams, 1);
+        assert!(
+            metrics.latest_snapshot().is_none(),
+            "tick 1 is not persisted"
+        );
+
+        for tick in 2..=5 {
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            published = next_published_cut(&mut receiver).await;
+            if tick < 5 {
+                assert!(
+                    metrics.latest_snapshot().is_none(),
+                    "tick {tick} is not persisted"
+                );
+            }
+        }
+
+        let snapshot = metrics
+            .latest_snapshot()
+            .expect("tick 5 persisted a snapshot");
+        assert_eq!(snapshot.taken_at_ms, published.taken_at_ms);
+        assert_eq!(snapshot.cursors, published.cursors);
+        assert!(Arc::ptr_eq(&snapshot.topology, &published.topology));
+        assert_eq!(
+            snapshot.metrics.window_1m.total_count(),
+            published.view.window_1m.total_count()
+        );
+        assert_eq!(published.active_streams, 1);
+        assert!(
+            snapshot
+                .summaries
+                .iter()
+                .any(|s| s.api_call_id == "api_open")
+        );
+        let history = metrics.snapshot_history_metadata();
+        assert_eq!(history.retained_cuts, 1);
+        assert_eq!(history.newest_at_ms, Some(published.taken_at_ms));
+        handle.abort();
     }
 
     #[test]
@@ -1926,6 +3349,295 @@ mod tests {
         }
     }
 
+    fn record_overview_terminal(
+        state: &mut MetricsState,
+        epoch: u64,
+        status: FlowStatus,
+        inputs: &TerminalMetricsInputs,
+    ) {
+        let key = BucketKey {
+            status: StatusClass::from_status(status),
+            model: label_or_unknown(inputs.model_served.as_deref()),
+            endpoint: inputs.endpoint.clone(),
+            upstream: label_or_unknown(inputs.upstream.as_deref()),
+        };
+        state.record_terminal(
+            epoch,
+            &key,
+            25.0,
+            inputs.usage,
+            &inputs.attempts,
+            Some(inputs),
+        );
+    }
+
+    fn overview_input(
+        requested: &str,
+        served: &str,
+        provider: &str,
+        client: &str,
+        usage: FlowUsage,
+        cost_usd: Option<f64>,
+        confidence: TerminalCostConfidence,
+    ) -> TerminalMetricsInputs {
+        TerminalMetricsInputs {
+            model_requested: Some(requested.to_string()),
+            model_served: Some(served.to_string()),
+            endpoint: "/v1/responses".to_string(),
+            upstream: Some(provider.to_string()),
+            client_label: Some(client.to_string()),
+            usage: Some(usage),
+            attempts: Vec::new(),
+            failure_reason: TerminalReasonClass::Stop,
+            cost_usd,
+            cost_confidence: confidence,
+            effective_route_limit: None,
+        }
+    }
+
+    #[test]
+    fn overview_filters_cost_quality_tokens_context_and_failures() {
+        let epoch = 4_000_000;
+        let mut state = MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES);
+        let mut first = overview_input(
+            "requested-a",
+            "served-a",
+            "provider-a",
+            "client-a",
+            FlowUsage {
+                prompt: 100,
+                completion: 50,
+                total: 150,
+                cached: Some(0),
+                reasoning: Some(10),
+            },
+            Some(0.20),
+            TerminalCostConfidence::Confident,
+        );
+        first.effective_route_limit = Some(1_000);
+        first.attempts = vec![served_attempt("provider-a", 20)];
+        record_overview_terminal(&mut state, epoch, FlowStatus::Completed, &first);
+
+        let mut failed = overview_input(
+            "requested-b",
+            "served-b",
+            "provider-b",
+            "client-b",
+            FlowUsage {
+                prompt: 200,
+                completion: 20,
+                total: 220,
+                cached: None,
+                reasoning: Some(5),
+            },
+            Some(0.30),
+            TerminalCostConfidence::Estimated,
+        );
+        failed.failure_reason = TerminalReasonClass::Timeout;
+        failed.attempts = vec![failed_attempt("provider-b", 80, AttemptErrorClass::Timeout)];
+        record_overview_terminal(&mut state, epoch, FlowStatus::Failed, &failed);
+
+        let unpriced = overview_input(
+            "requested-a",
+            "served-a",
+            "provider-a",
+            "client-a",
+            FlowUsage {
+                prompt: 50,
+                completion: 10,
+                total: 60,
+                cached: Some(0),
+                reasoning: None,
+            },
+            None,
+            TerminalCostConfidence::Unavailable,
+        );
+        record_overview_terminal(&mut state, epoch, FlowStatus::Completed, &unpriced);
+
+        let view = state.view(epoch);
+        let aggregate = view.window_1m.overview(&OverviewFilter::default());
+        assert_eq!(aggregate.totals.requests, 3);
+        assert_eq!(aggregate.cost.samples, 2);
+        assert_eq!(aggregate.cost.total_usd, Some(0.5));
+        assert_eq!(
+            aggregate.cost.confidence,
+            TerminalCostConfidence::Estimated,
+            "weakest priced confidence plus an omitted unpriced usage stays estimated"
+        );
+        assert_eq!(aggregate.tokens.prompt, Some(350));
+        assert_eq!(
+            aggregate.tokens.cached, None,
+            "one unreported class => unavailable"
+        );
+        assert_eq!(
+            aggregate.tokens.reasoning, None,
+            "one unreported reasoning class => unavailable"
+        );
+        assert_eq!(aggregate.context.samples, 1);
+        assert_eq!(aggregate.context.effective_route_limit_min, Some(1_000));
+        assert_eq!(aggregate.provider_attempts_global.providers.len(), 2);
+
+        let model = view.window_1m.overview(&OverviewFilter {
+            model: Some("served-a".to_string()),
+            ..OverviewFilter::default()
+        });
+        assert_eq!(model.totals.requests, 2);
+        let client = view.window_1m.overview(&OverviewFilter {
+            client: Some("client-b".to_string()),
+            ..OverviewFilter::default()
+        });
+        assert_eq!(client.totals.requests, 1);
+        let failed_only = view.window_1m.overview(&OverviewFilter {
+            status: Some(FlowStatus::Failed),
+            ..OverviewFilter::default()
+        });
+        assert_eq!(failed_only.totals.requests, 1);
+        assert_eq!(failed_only.failures[0].key, "timeout");
+    }
+
+    #[test]
+    fn overview_exposes_global_provider_attempt_health_for_all_three_windows() {
+        let epoch = 4_500_000;
+        let mut state = MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES);
+        let mut input = overview_input(
+            "requested",
+            "served",
+            "provider-b",
+            "client",
+            FlowUsage::default(),
+            None,
+            TerminalCostConfidence::Unavailable,
+        );
+        input.failure_reason = TerminalReasonClass::Timeout;
+        input.attempts = vec![failed_attempt("provider-a", 75, AttemptErrorClass::Timeout)];
+        record_overview_terminal(&mut state, epoch, FlowStatus::Failed, &input);
+        let view = state.view(epoch);
+        for (name, report) in [
+            ("m1", &view.window_1m),
+            ("m5", &view.window_5m),
+            ("h1", &view.window_1h),
+        ] {
+            let overview = report.overview(&OverviewFilter::default());
+            assert_eq!(
+                overview.provider_attempts_global.scope,
+                OverviewMetricScope::Global
+            );
+            assert_eq!(
+                overview.provider_attempts_global.data_quality,
+                OverviewDataQuality::Derived
+            );
+            let provider = overview
+                .provider_attempts_global
+                .providers
+                .iter()
+                .find(|provider| provider.provider == "provider-a")
+                .unwrap_or_else(|| panic!("{name} carries provider-a attempt health"));
+            assert_eq!(provider.samples, 1, "{name}");
+            assert_eq!(provider.failed, 1, "{name}");
+            assert_eq!(provider.errors.timeout, 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn overview_bounds_slot_and_aggregate_union_with_explicit_partial_quality() {
+        let base = 5_000_000;
+        let mut state = MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES);
+        let total = MAX_OVERVIEW_DIMENSION_COMBINATIONS + 16;
+        for index in 0..total {
+            let input = overview_input(
+                &format!("requested-{index}"),
+                &format!("served-{index}"),
+                "provider",
+                "client",
+                FlowUsage::default(),
+                Some(0.01),
+                TerminalCostConfidence::Confident,
+            );
+            record_overview_terminal(&mut state, base, FlowStatus::Completed, &input);
+        }
+        let slot_view = state.view(base);
+        assert_eq!(
+            slot_view.window_1m.overview.len(),
+            MAX_OVERVIEW_DIMENSION_COMBINATIONS
+        );
+        let aggregate = slot_view.window_1m.overview(&OverviewFilter::default());
+        assert_eq!(aggregate.totals.requests, total as u64);
+        assert_eq!(aggregate.data_quality, OverviewDataQuality::Partial);
+        assert_eq!(aggregate.overflow.slot_folded_samples, 17);
+        assert!(
+            aggregate
+                .served_models
+                .iter()
+                .any(|rollup| rollup.key == OVERVIEW_OTHER)
+        );
+
+        let mut rotating = MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES);
+        for index in 0..total {
+            let input = overview_input(
+                "requested",
+                &format!("rotating-{index}"),
+                "provider",
+                "client",
+                FlowUsage::default(),
+                Some(0.01),
+                TerminalCostConfidence::Confident,
+            );
+            record_overview_terminal(
+                &mut rotating,
+                base + index as u64,
+                FlowStatus::Completed,
+                &input,
+            );
+        }
+        let union = rotating
+            .view(base + total as u64 - 1)
+            .window_1h
+            .overview(&OverviewFilter::default());
+        assert_eq!(union.totals.requests, total as u64);
+        assert_eq!(union.overflow.slot_folded_samples, 0);
+        assert_eq!(union.overflow.aggregate_folded_samples, 17);
+        assert_eq!(union.data_quality, OverviewDataQuality::Partial);
+    }
+
+    #[test]
+    fn historical_metrics_cut_retains_terminal_time_cost_and_context() {
+        let metrics = MetricsLayer::with_snapshot_quota(4 * MIB_BYTES);
+        let mut input = overview_input(
+            "requested",
+            "served",
+            "provider",
+            "client",
+            FlowUsage {
+                prompt: 256,
+                completion: 64,
+                total: 320,
+                cached: Some(0),
+                reasoning: Some(0),
+            },
+            Some(0.42),
+            TerminalCostConfidence::Confident,
+        );
+        input.effective_route_limit = Some(4_096);
+        metrics.record_terminal_inputs(FlowStatus::Completed, 15, &input);
+        let cut = metrics
+            .snapshot(
+                &DashboardFlowStore::new(),
+                &ProviderHealthPublisher::default(),
+            )
+            .expect("historical cut");
+        let selected = metrics
+            .snapshot_at(cut.taken_at_ms.saturating_add(1))
+            .expect("nearest retained cut");
+        let overview = selected
+            .metrics
+            .window_1m
+            .overview(&OverviewFilter::default());
+        assert_eq!(overview.cost.total_usd, Some(0.42));
+        assert_eq!(overview.cost.confidence, TerminalCostConfidence::Confident);
+        assert_eq!(overview.context.effective_route_limit_min, Some(4_096));
+        assert_eq!(overview.context.input_tokens, Some(256));
+    }
+
     #[test]
     fn per_provider_aggregates_attempts_off_the_terminal_seam() {
         // The per-provider ring is fed from the terminal payload's `attempts[]` (spec 03),
@@ -2125,6 +3837,19 @@ mod tests {
             total, many as u64,
             "no attempt is dropped — overflow is folded"
         );
+        let overview = metrics
+            .view()
+            .window_1m
+            .overview(&OverviewFilter::default());
+        assert_eq!(
+            overview.provider_attempts_global.data_quality,
+            OverviewDataQuality::Partial
+        );
+        assert_eq!(
+            overview.overflow.provider_folded_samples,
+            (many - (MAX_TRACKED_PROVIDERS - 1)) as u64
+        );
+        assert!(overview.overflow.overflowed);
     }
 
     #[test]
@@ -2157,6 +3882,7 @@ mod tests {
                         10,
                         AttemptErrorClass::Other,
                     )],
+                    None,
                 );
             }
             // Aggregate the full 1h window ending at the last-written second. The 1h ring
@@ -2198,7 +3924,7 @@ mod tests {
         // (a) a terminal with NO attempts → no per-provider entries.
         let without = {
             let mut state = MetricsState::new(DEFAULT_SNAPSHOT_QUOTA_BYTES);
-            state.record_terminal(epoch, &key, 40.0, None, &[]);
+            state.record_terminal(epoch, &key, 40.0, None, &[], None);
             state.view(epoch).approx_bytes()
         };
         // (b) the SAME terminal but WITH several distinct-provider attempts → populated
@@ -2210,7 +3936,7 @@ mod tests {
                 failed_attempt("provider-beta", 70, AttemptErrorClass::Timeout),
                 served_attempt("provider-gamma", 40),
             ];
-            state.record_terminal(epoch, &key, 40.0, None, &attempts);
+            state.record_terminal(epoch, &key, 40.0, None, &attempts, None);
             state.view(epoch).approx_bytes()
         };
 
@@ -2272,6 +3998,7 @@ mod tests {
                 40.0,
                 None,
                 &[served_attempt("provider-a", 40)],
+                None,
             );
             // As of the SAME epoch the provider is present...
             assert!(
@@ -2315,6 +4042,181 @@ mod tests {
         );
     }
 
+    fn accounting_summary(id: &str) -> SnapshotFlowSummary {
+        SnapshotFlowSummary {
+            revision: 1,
+            api_call_id: id.to_string(),
+            response_id: Some(format!("resp_{id}")),
+            method: "POST".to_string(),
+            uri: "/v1/responses".to_string(),
+            model_requested: Some("requested-model".to_string()),
+            model_served: Some("served-model".to_string()),
+            upstream_target: Some("provider-a".to_string()),
+            usage: None,
+            status: FlowStatus::Completed,
+            started_ms: 1,
+            finished_ms: Some(2),
+            elapsed_ms: Some(1),
+            terminal_reason: Some("stop".to_string()),
+            phases: crate::dashboard_flow::PhaseTimings::default(),
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
+            client_label: None,
+            client_source: None,
+        }
+    }
+
+    fn reserved_string(capacity: usize, value: &str) -> String {
+        let mut string = String::with_capacity(capacity);
+        string.push_str(value);
+        string
+    }
+
+    #[test]
+    fn summary_accounting_charges_capacities_attempts_and_client_label() {
+        let mut rich = accounting_summary("api_lean");
+        // Clone the common scalar baseline before adding the retained allocations. A
+        // String clone may right-size spare capacity, so keeping the original as the
+        // rich side makes any such difference conservative for this lower-bound check.
+        let lean = rich.clone();
+        rich.client_label = Some(reserved_string(4 * 1024, "key-0123456789ab"));
+        let mut attempts = Vec::with_capacity(8);
+        attempts.push(Attempt {
+            provider: Some(reserved_string(2 * 1024, "provider-a")),
+            model: Some(reserved_string(1024, "served-model")),
+            start_ms: 1,
+            end_ms: 2,
+            first_upstream_byte_ms: None,
+            status: AttemptStatus::Failed,
+            error_class: Some(AttemptErrorClass::Timeout),
+            failover_reason: Some(crate::dashboard_flow::AttemptFailoverReason::ProviderFailed),
+        });
+        rich.attempts = attempts;
+
+        let client_capacity = rich.client_label.as_ref().unwrap().capacity();
+        let attempt_capacity = rich.attempts.capacity() * std::mem::size_of::<Attempt>();
+        let attempt_string_capacity = rich.attempts[0].provider.as_ref().unwrap().capacity()
+            + rich.attempts[0].model.as_ref().unwrap().capacity();
+        let added = summary_approx_bytes(&rich) - summary_approx_bytes(&lean);
+        assert!(
+            added >= client_capacity + attempt_capacity + attempt_string_capacity,
+            "summary accounting charges client + attempt vector/string capacities"
+        );
+    }
+
+    #[test]
+    fn topology_accounting_charges_provider_vector_and_string_capacities() {
+        let empty = Arc::new(ProviderHealthSnapshot {
+            version: 1,
+            providers: Vec::new(),
+        });
+        let mut providers = Vec::with_capacity(8);
+        providers.push(crate::upstream::ProviderHealth {
+            id: reserved_string(512, "provider-a"),
+            name: reserved_string(512, "Provider A"),
+            route: Some(reserved_string(256, "route-a")),
+            base_url: reserved_string(2048, "https://provider.invalid/v1"),
+            status: crate::upstream::ProviderStatus::Healthy,
+            cooling_until_ms: None,
+            last_error: Some(reserved_string(4096, "bounded error")),
+            served_count: 1,
+            failover_count: 0,
+            consecutive_failures: 0,
+            catalog_fetched_ms: None,
+            catalog_size: None,
+        });
+        let topology = Arc::new(ProviderHealthSnapshot {
+            version: 2,
+            providers,
+        });
+        let provider = &topology.providers[0];
+        let expected_dynamic = topology.providers.capacity()
+            * std::mem::size_of::<crate::upstream::ProviderHealth>()
+            + provider.id.capacity()
+            + provider.name.capacity()
+            + provider.route.as_ref().unwrap().capacity()
+            + provider.base_url.capacity()
+            + provider.last_error.as_ref().unwrap().capacity();
+        assert!(
+            topology_retained_bytes(&topology) - topology_retained_bytes(&empty)
+                >= expected_dynamic,
+            "topology accounting includes vector slots and every provider string capacity"
+        );
+    }
+
+    #[test]
+    fn oversized_cut_keeps_newest_summary_prefix_before_retention() {
+        let flow = DashboardFlowStore::new();
+        for index in 0..3 {
+            flow.open(
+                format!("api_{index}"),
+                "POST".to_string(),
+                "/v1/responses".to_string(),
+                crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+                None,
+                crate::dashboard_flow::ClientAttribution {
+                    label: Some("x".repeat(4 * 1024)),
+                    source: Some(crate::dashboard_flow::ClientSource::ConfiguredHeader),
+                },
+            );
+        }
+        let topology = ProviderHealthPublisher::default();
+        topology.publish(Vec::new());
+
+        // Measure the no-summary base and one tightly-sized newest summary from an
+        // otherwise identical cut, then choose a quota that fits exactly one summary.
+        let probe_metrics = MetricsLayer::with_snapshot_quota(usize::MAX);
+        let probe = probe_metrics.snapshot(&flow, &topology).expect("probe cut");
+        assert_eq!(probe.summaries.len(), 3);
+        let base_bytes = probe
+            .approx_bytes()
+            .saturating_sub(snapshot_summaries_retained_bytes(&probe.summaries));
+        let quota = base_bytes
+            .saturating_add(summary_approx_bytes(&probe.summaries[0]))
+            .saturating_add(64);
+
+        let metrics = MetricsLayer::with_snapshot_quota(quota);
+        let cut = metrics.snapshot(&flow, &topology).expect("trimmed cut");
+        assert!(
+            cut.flow_summaries_truncated,
+            "cut reports summary truncation"
+        );
+        assert_eq!(cut.summaries.len(), 1, "only the newest summary fits");
+        assert_eq!(cut.summaries[0].api_call_id, "api_2", "newest survives");
+        assert!(cut.approx_bytes() <= quota, "trimmed cut itself fits quota");
+
+        let history = metrics.snapshot_history_metadata();
+        assert_eq!(history.retained_cuts, 1);
+        assert_eq!(history.oldest_at_ms, Some(cut.taken_at_ms));
+        assert_eq!(history.newest_at_ms, Some(cut.taken_at_ms));
+        assert!(history.retained_bytes <= history.quota_bytes);
+        assert_eq!(history.quota_bytes, quota);
+    }
+
+    #[test]
+    fn ring_rejects_base_cut_that_cannot_fit_and_never_exceeds_quota() {
+        let flow = DashboardFlowStore::new();
+        let topology = ProviderHealthPublisher::default();
+        topology.publish(Vec::new());
+        let metrics = MetricsLayer::with_snapshot_quota(1);
+
+        let cut = metrics
+            .snapshot(&flow, &topology)
+            .expect("cut is still returned");
+        assert!(
+            cut.approx_bytes() > 1,
+            "metrics/topology base exceeds tiny quota"
+        );
+        assert!(
+            metrics.latest_snapshot().is_none(),
+            "an individually oversized base cut is not retained"
+        );
+        let history = metrics.snapshot_history_metadata();
+        assert_eq!(history.retained_bytes, 0);
+        assert_eq!(history.retained_cuts, 0);
+        assert!(history.retained_bytes <= history.quota_bytes);
+    }
+
     #[test]
     fn coordinated_snapshot_is_internally_consistent() {
         // The cut captures summaries, metrics, topology, and per-domain cursors at a
@@ -2356,6 +4258,7 @@ mod tests {
         assert_eq!(cut.metrics.window_1m.total_count(), 1);
         // Topology is the captured published version.
         assert_eq!(cut.topology.version, 1);
+        assert!(!cut.flow_summaries_truncated);
         // Per-domain cursors are all present + non-zero (flow + metrics + topology).
         assert!(cut.cursors.flow_seq >= 1, "flow_seq advanced");
         assert!(cut.cursors.metrics_seq >= 1, "metrics_seq advanced");
@@ -2367,7 +4270,7 @@ mod tests {
         // The 135 GiB fix: simulate many cuts over a churning store with large
         // bodies live, and assert (a) NO body bytes are reachable from any cut and
         // (b) the ring's retained bytes stay under a small quota (eviction works).
-        // Use a tiny quota so eviction is exercised without allocating 400 MiB.
+        // Use a tiny quota so eviction is exercised without allocating the 64 MiB default.
         let quota = 256 * 1024; // 256 KiB ring quota
         let metrics = MetricsLayer::with_snapshot_quota(quota);
         let flow = DashboardFlowStore::new();
@@ -2434,7 +4337,7 @@ mod tests {
         for _ in 0..3 {
             let cut = metrics.snapshot(&flow, &topo).expect("cut");
             timestamps.push(cut.taken_at_ms);
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
         // A ts at/after the last cut returns the last cut.
         let latest = metrics
@@ -2451,6 +4354,24 @@ mod tests {
             metrics
                 .snapshot_at(timestamps[0].saturating_sub(1))
                 .is_none()
+        );
+
+        // Overview's absolute-nearest selector can choose the next cut and clamps to
+        // the retained edges. A point one millisecond before cut 2 is closer to cut 2
+        // than cut 1 because the test sleeps between cuts.
+        assert_eq!(
+            metrics
+                .nearest_snapshot(timestamps[1].saturating_sub(1))
+                .expect("absolute nearest")
+                .taken_at_ms,
+            timestamps[1]
+        );
+        assert_eq!(
+            metrics
+                .nearest_snapshot(timestamps[0].saturating_sub(100))
+                .expect("clamped oldest")
+                .taken_at_ms,
+            timestamps[0]
         );
     }
 

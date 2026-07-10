@@ -15,7 +15,8 @@
 //!   The SPA is a hash router, so deep links live in the fragment and need no
 //!   server-side rewrite.
 //! - `GET /dashboard/assets/{*path}` → a static asset under `dist/assets/`, with
-//!   `Content-Type` inferred from the extension; `404` for a missing path.
+//!   Brotli/gzip negotiation, representation ETags, immutable caching, and
+//!   `Content-Type` inferred from the canonical extension; `404` when missing.
 //!
 //! ## CSP-safe bootstrap injection
 //! The dashboard CSP is `script-src 'self'` (no `'unsafe-inline'`). The SPA's
@@ -28,6 +29,8 @@ use crate::dashboard_auth::AuthSession;
 use crate::dashboard_auth::CSRF_COOKIE;
 use crate::dashboard_auth::DashboardAuth;
 use crate::dashboard_auth::SESSION_TTL_SECS;
+use crate::dashboard_contracts::DASHBOARD_SCHEMA_VERSION;
+use crate::dashboard_contracts::DashboardBootstrap;
 use axum::Extension;
 use axum::extract::Path;
 use axum::http::HeaderMap;
@@ -38,6 +41,8 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use include_dir::Dir;
 use include_dir::include_dir;
+use sha2::Digest;
+use sha2::Sha256;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -90,11 +95,15 @@ fn serve_authenticated_shell(auth: &DashboardAuth, nonce: &str) -> Response {
         );
     };
     let csrf = auth.issue_csrf_token();
+    let bootstrap_value = serde_json::to_string(&DashboardBootstrap {
+        authenticated: true,
+        csrf_token: csrf.clone(),
+        mutations_enabled: auth.mutations_enabled(),
+        schema_version: DASHBOARD_SCHEMA_VERSION,
+    })
+    .expect("dashboard bootstrap is serializable");
     let bootstrap = format!(
-        "<script nonce=\"{nonce}\">window.__LLMCONDUIT_DASHBOARD__={{\"authenticated\":true,\
-         \"csrf_token\":{csrf},\"mutations_enabled\":{mutations}}};</script>",
-        csrf = json_string(&csrf),
-        mutations = auth.mutations_enabled(),
+        "<script nonce=\"{nonce}\">window.__LLMCONDUIT_DASHBOARD__={bootstrap_value};</script>"
     );
     let html = inject_before_head_close(&String::from_utf8_lossy(file.contents()), &bootstrap);
 
@@ -114,17 +123,34 @@ fn serve_login_shell(nonce: &str) -> Response {
 }
 
 /// `GET /dashboard/assets/{*path}` — serve a static asset from `dist/assets/`.
-/// The captured `path` is the portion AFTER `assets/`; we look it up under
-/// `assets/` in the embedded tree and 404 if absent. Carries the security
-/// headers (no CSP needed on a sub-resource, but `nosniff`/`no-referrer`/
-/// frame-deny still apply) but NOT `no-store` — hashed Vite assets are
-/// immutable and may be cached.
-pub async fn dashboard_asset(Path(path): Path<String>) -> Response {
-    let asset_path = format!("assets/{path}");
-    match DASHBOARD_DIST.get_file(&asset_path) {
-        Some(file) => asset_security_headers(serve_file(&asset_path, file.contents())),
-        None => asset_security_headers((StatusCode::NOT_FOUND, "asset not found").into_response()),
+/// The build writes `.br`/`.gz` siblings for compressible assets; negotiate the
+/// best accepted representation while keeping the canonical URL/content type.
+/// Every successful representation carries its own strong ETag and one-year
+/// immutable caching. Direct sidecar URLs stay private implementation details.
+pub async fn dashboard_asset(Path(path): Path<String>, headers: HeaderMap) -> Response {
+    if path.ends_with(".br") || path.ends_with(".gz") {
+        return asset_security_headers((StatusCode::NOT_FOUND, "asset not found").into_response());
     }
+    let asset_path = format!("assets/{path}");
+    let Some(identity) = DASHBOARD_DIST.get_file(&asset_path) else {
+        return asset_security_headers((StatusCode::NOT_FOUND, "asset not found").into_response());
+    };
+    let brotli_path = format!("{asset_path}.br");
+    let gzip_path = format!("{asset_path}.gz");
+    let brotli = DASHBOARD_DIST.get_file(&brotli_path);
+    let gzip = DASHBOARD_DIST.get_file(&gzip_path);
+
+    let Some(encoding) = select_content_encoding(&headers, brotli.is_some(), gzip.is_some()) else {
+        return asset_security_headers(
+            (StatusCode::NOT_ACCEPTABLE, "no acceptable asset encoding").into_response(),
+        );
+    };
+    let contents = match encoding {
+        ContentEncoding::Brotli => brotli.expect("selected only when embedded").contents(),
+        ContentEncoding::Gzip => gzip.expect("selected only when embedded").contents(),
+        ContentEncoding::Identity => identity.contents(),
+    };
+    serve_asset(&asset_path, contents, encoding, &headers)
 }
 
 /// Apply the dashboard CSP (with the bootstrap nonce when `nonce` is `Some`) plus
@@ -143,10 +169,184 @@ fn security_headers(mut response: Response, nonce: Option<&str>) -> Response {
     response
 }
 
-/// Static-asset variant: the common hardening headers, no CSP, no `no-store`.
+/// Static-asset variant: common hardening plus the representation-negotiation
+/// cache key. Successful responses add the immutable policy in `serve_asset`.
 fn asset_security_headers(mut response: Response) -> Response {
     apply_common_security_headers(response.headers_mut());
     response
+        .headers_mut()
+        .insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    response
+}
+
+const IMMUTABLE_CACHE_CONTROL: &str = "public,max-age=31536000,immutable";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentEncoding {
+    Brotli,
+    Gzip,
+    Identity,
+}
+
+impl ContentEncoding {
+    fn header_value(self) -> Option<HeaderValue> {
+        match self {
+            Self::Brotli => Some(HeaderValue::from_static("br")),
+            Self::Gzip => Some(HeaderValue::from_static("gzip")),
+            Self::Identity => None,
+        }
+    }
+}
+
+/// Honor q-values and prefer Brotli over gzip over identity when qualities tie.
+/// Identity remains acceptable by default unless explicitly excluded.
+fn select_content_encoding(
+    headers: &HeaderMap,
+    has_brotli: bool,
+    has_gzip: bool,
+) -> Option<ContentEncoding> {
+    let raw = headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(",");
+    if raw.trim().is_empty() {
+        return Some(ContentEncoding::Identity);
+    }
+    let preferences = EncodingPreferences::parse(&raw);
+    let candidates = [
+        (
+            ContentEncoding::Brotli,
+            has_brotli,
+            preferences.quality("br"),
+        ),
+        (ContentEncoding::Gzip, has_gzip, preferences.quality("gzip")),
+        (
+            ContentEncoding::Identity,
+            true,
+            preferences.identity_quality(),
+        ),
+    ];
+    candidates
+        .into_iter()
+        .filter(|(_, available, quality)| *available && *quality > 0.0)
+        // `max_by` would pick the LAST tie; compare in reverse so array order is
+        // the explicit br > gzip > identity tiebreak.
+        .fold(None, |best, candidate| match best {
+            None => Some(candidate),
+            Some(current) if candidate.2 > current.2 => Some(candidate),
+            Some(current) => Some(current),
+        })
+        .map(|(encoding, _, _)| encoding)
+}
+
+#[derive(Default)]
+struct EncodingPreferences {
+    values: Vec<(String, f32)>,
+}
+
+impl EncodingPreferences {
+    fn parse(raw: &str) -> Self {
+        let mut values = Vec::new();
+        for item in raw.split(',') {
+            let mut pieces = item.trim().split(';');
+            let name = pieces
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            let mut quality = 1.0;
+            for parameter in pieces {
+                let Some((key, value)) = parameter.trim().split_once('=') else {
+                    continue;
+                };
+                if key.trim().eq_ignore_ascii_case("q") {
+                    quality = value
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|q| q.is_finite())
+                        .map(|q| q.clamp(0.0, 1.0))
+                        .unwrap_or(0.0);
+                }
+            }
+            values.push((name, quality));
+        }
+        Self { values }
+    }
+
+    fn explicit_quality(&self, coding: &str) -> Option<f32> {
+        self.values
+            .iter()
+            .rev()
+            .find_map(|(name, quality)| (name == coding).then_some(*quality))
+    }
+
+    fn quality(&self, coding: &str) -> f32 {
+        self.explicit_quality(coding)
+            .or_else(|| self.explicit_quality("*"))
+            .unwrap_or(0.0)
+    }
+
+    fn identity_quality(&self) -> f32 {
+        self.explicit_quality("identity").unwrap_or_else(|| {
+            if self.explicit_quality("*") == Some(0.0) {
+                0.0
+            } else {
+                1.0
+            }
+        })
+    }
+}
+
+fn serve_asset(
+    canonical_path: &str,
+    contents: &'static [u8],
+    encoding: ContentEncoding,
+    request_headers: &HeaderMap,
+) -> Response {
+    let etag = strong_etag(contents);
+    let not_modified = if_none_match_matches(request_headers, &etag);
+    let mut response = if not_modified {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        serve_file(canonical_path, contents)
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(IMMUTABLE_CACHE_CONTROL),
+    );
+    headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).expect("SHA-256 ETag is a valid header"),
+    );
+    if let Some(value) = encoding.header_value() {
+        headers.insert(header::CONTENT_ENCODING, value);
+    }
+    asset_security_headers(response)
+}
+
+fn strong_etag(contents: &[u8]) -> String {
+    format!("\"{}\"", hex::encode(Sha256::digest(contents)))
+}
+
+fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        // If-None-Match uses weak comparison for GET/HEAD, so a client-supplied
+        // weak marker for these exact bytes also validates the cached response.
+        .any(|candidate| {
+            candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+        })
 }
 
 fn apply_common_security_headers(headers: &mut HeaderMap) {
@@ -195,12 +395,6 @@ fn find_ci(haystack: &str, needle: &str) -> Option<usize> {
     hay.find(&need)
 }
 
-/// Serialize a string as a JSON string literal (quotes + escaping) so the
-/// bootstrap object is valid JS even if the token ever contained a quote.
-fn json_string(value: &str) -> String {
-    serde_json::Value::String(value.to_string()).to_string()
-}
-
 /// A fresh random nonce for the per-response CSP `script-src`.
 fn new_nonce() -> String {
     Uuid::new_v4().simple().to_string()
@@ -222,7 +416,12 @@ fn new_nonce() -> String {
 pub fn first_embedded_asset_path() -> Option<String> {
     DASHBOARD_DIST
         .get_dir("assets")
-        .and_then(|assets| assets.files().next())
+        .and_then(|assets| {
+            assets.files().find(|file| {
+                let path = file.path().to_string_lossy();
+                !path.ends_with(".br") && !path.ends_with(".gz")
+            })
+        })
         .map(|file| file.path().to_string_lossy().into_owned())
 }
 
@@ -266,7 +465,15 @@ fn content_type_for(path: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::ContentEncoding;
+    use super::IMMUTABLE_CACHE_CONTROL;
     use super::content_type_for;
+    use super::select_content_encoding;
+    use super::serve_asset;
+    use axum::http::HeaderMap;
+    use axum::http::HeaderValue;
+    use axum::http::StatusCode;
+    use axum::http::header;
 
     #[test]
     fn maps_known_vite_asset_extensions() {
@@ -291,5 +498,99 @@ mod tests {
         );
         // No extension: `rsplit('.')` yields the whole string, which we reject.
         assert_eq!(content_type_for("noext"), "application/octet-stream");
+    }
+
+    #[test]
+    fn negotiates_precompressed_assets_with_q_values_and_safe_fallbacks() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            select_content_encoding(&headers, true, true),
+            Some(ContentEncoding::Identity),
+            "a client that sends no Accept-Encoding gets the canonical bytes"
+        );
+
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip, br"),
+        );
+        assert_eq!(
+            select_content_encoding(&headers, true, true),
+            Some(ContentEncoding::Brotli),
+            "Brotli wins an equal-quality tie"
+        );
+
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("gzip;q=1, br;q=0.4"),
+        );
+        assert_eq!(
+            select_content_encoding(&headers, true, true),
+            Some(ContentEncoding::Gzip),
+            "client q-values take precedence over server preference"
+        );
+
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("br, gzip;q=0.5, identity;q=0"),
+        );
+        assert_eq!(
+            select_content_encoding(&headers, false, true),
+            Some(ContentEncoding::Gzip),
+            "an unavailable Brotli sidecar falls through to gzip"
+        );
+
+        headers.insert(
+            header::ACCEPT_ENCODING,
+            HeaderValue::from_static("br;q=0, gzip;q=0, identity;q=0"),
+        );
+        assert_eq!(select_content_encoding(&headers, true, true), None);
+    }
+
+    #[test]
+    fn asset_response_has_representation_etag_and_supports_conditional_304() {
+        static CONTENTS: &[u8] = b"const answer = 42;";
+        let request_headers = HeaderMap::new();
+        let response = serve_asset(
+            "assets/index-ABC.js",
+            CONTENTS,
+            ContentEncoding::Brotli,
+            &request_headers,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING),
+            Some(&HeaderValue::from_static("br"))
+        );
+        assert_eq!(
+            response.headers().get(header::VARY),
+            Some(&HeaderValue::from_static("Accept-Encoding"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static(IMMUTABLE_CACHE_CONTROL))
+        );
+        let etag = response.headers().get(header::ETAG).expect("ETag").clone();
+        let etag_text = etag.to_str().expect("ASCII ETag");
+        assert!(etag_text.starts_with('"') && etag_text.ends_with('"'));
+        assert!(!etag_text.starts_with("W/"), "ETag must be strong");
+
+        let mut conditional = HeaderMap::new();
+        conditional.insert(header::IF_NONE_MATCH, etag.clone());
+        let not_modified = serve_asset(
+            "assets/index-ABC.js",
+            CONTENTS,
+            ContentEncoding::Brotli,
+            &conditional,
+        );
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(not_modified.headers().get(header::ETAG), Some(&etag));
+        assert_eq!(
+            not_modified.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static(IMMUTABLE_CACHE_CONTROL))
+        );
+        assert_eq!(
+            not_modified.headers().get(header::CONTENT_ENCODING),
+            Some(&HeaderValue::from_static("br"))
+        );
     }
 }

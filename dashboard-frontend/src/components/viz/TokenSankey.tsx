@@ -17,6 +17,7 @@ import { colors } from '../../design/tokens';
 import { useImperativeViz, type VizCleanup } from '../../viz/useImperativeViz';
 import { costColor, type SankeyModel } from './sankeyModel';
 import { tokenSankeyCounters } from './tokenSankeyState';
+import { useObservedWidth } from '../../lib/useObservedWidth';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -38,6 +39,9 @@ const MARGIN = 16;
 
 export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSelectModel }: TokenSankeyProps) {
   const ref = useRef<HTMLDivElement>(null);
+  const observedWidth = useObservedWidth(ref);
+  const renderWidth = Math.max(220, Math.floor(observedWidth ?? width));
+  const renderHeight = Math.min(height, Math.max(220, Math.floor(renderWidth * 0.58)));
   const modelRef = useRef(model);
   modelRef.current = model;
   const selectRef = useRef(onSelectModel);
@@ -51,10 +55,10 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
       tokenSankeyCounters.setups += 1;
       const svg = document.createElementNS(SVG_NS, 'svg');
       svg.setAttribute('data-testid', 'token-sankey-svg');
-      svg.setAttribute('width', String(width));
-      svg.setAttribute('height', String(height));
-      svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-      svg.setAttribute('role', 'img');
+      svg.setAttribute('width', String(renderWidth));
+      svg.setAttribute('height', String(renderHeight));
+      svg.setAttribute('viewBox', `0 0 ${renderWidth} ${renderHeight}`);
+      svg.setAttribute('role', 'group');
       svg.setAttribute('aria-label', 'Token-flow Sankey');
       svg.style.display = 'block';
       svg.style.maxWidth = '100%';
@@ -63,7 +67,21 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
       const nodeLayer = document.createElementNS(SVG_NS, 'g');
       nodeLayer.setAttribute('data-layer', 'nodes');
       svg.append(linkLayer, nodeLayer);
-      el.appendChild(svg);
+      const tooltip = document.createElement('div');
+      tooltip.setAttribute('role', 'tooltip');
+      tooltip.setAttribute('data-testid', 'sankey-tooltip');
+      tooltip.hidden = true;
+      tooltip.className = 'pointer-events-none absolute bottom-2 left-2 z-10 max-w-[calc(100%_-_1rem)] rounded border border-line bg-panel-raised px-2 py-1 text-xs text-text shadow';
+      el.style.position = 'relative';
+      el.append(svg, tooltip);
+
+      const showTooltip = (message: string) => {
+        tooltip.textContent = message;
+        tooltip.hidden = false;
+      };
+      const hideTooltip = () => {
+        tooltip.hidden = true;
+      };
 
       const render = (): void => {
         const m = modelRef.current;
@@ -88,7 +106,7 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
           .nodeId((n) => n.id)
           .nodeWidth(14)
           .nodePadding(18)
-          .extent([[MARGIN, MARGIN], [width - MARGIN, height - MARGIN]]);
+          .extent([[MARGIN, MARGIN], [renderWidth - MARGIN, renderHeight - MARGIN]]);
         const graph: SankeyGraph<SNode, SLink> = layout({
           nodes: nodes as never,
           links: links as never,
@@ -117,7 +135,29 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
             path.style.cursor = 'pointer';
             const model = sl.model;
             const upstream = sl.upstream ?? null;
-            path.addEventListener('click', () => selectRef.current(model, upstream));
+            const activate = () => selectRef.current(model, upstream);
+            const source = link.source as unknown as SNode;
+            const target = link.target as unknown as SNode;
+            const description = `${source.label} to ${target.label} for ${model}${upstream ? ` on ${upstream}` : ''}: ${link.value} tokens, $${sl.cost.toFixed(4)} cost. Activate to filter flows.`;
+            path.setAttribute('role', 'button');
+            path.setAttribute('tabindex', '0');
+            path.setAttribute('aria-label', description);
+            path.addEventListener('click', activate);
+            path.addEventListener('keydown', (event) => {
+              if (event.key !== 'Enter' && event.key !== ' ') return;
+              event.preventDefault();
+              activate();
+            });
+            path.addEventListener('mouseenter', () => showTooltip(description));
+            path.addEventListener('mouseleave', hideTooltip);
+            path.addEventListener('focus', () => {
+              path.setAttribute('stroke-opacity', '1');
+              showTooltip(description);
+            });
+            path.addEventListener('blur', () => {
+              path.setAttribute('stroke-opacity', '0.45');
+              hideTooltip();
+            });
           }
           linkLayer.appendChild(path);
         }
@@ -143,7 +183,29 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
             rect.style.cursor = 'pointer';
             const model = sn.model;
             const upstream = sn.upstream ?? null;
-            rect.addEventListener('click', () => selectRef.current(model, upstream));
+            const activate = () => selectRef.current(model, upstream);
+            const description = `${sn.label} lane. Activate to filter flows by ${model}${upstream ? ` on ${upstream}` : ''}.`;
+            rect.setAttribute('role', 'button');
+            rect.setAttribute('tabindex', '0');
+            rect.setAttribute('aria-label', description);
+            rect.addEventListener('click', activate);
+            rect.addEventListener('keydown', (event) => {
+              if (event.key !== 'Enter' && event.key !== ' ') return;
+              event.preventDefault();
+              activate();
+            });
+            rect.addEventListener('focus', () => {
+              rect.setAttribute('stroke', colors.text);
+              rect.setAttribute('stroke-width', '3');
+              showTooltip(description);
+            });
+            rect.addEventListener('blur', () => {
+              rect.removeAttribute('stroke');
+              rect.removeAttribute('stroke-width');
+              hideTooltip();
+            });
+            rect.addEventListener('mouseenter', () => showTooltip(description));
+            rect.addEventListener('mouseleave', hideTooltip);
           }
           nodeLayer.appendChild(rect);
 
@@ -166,10 +228,11 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
       return () => {
         tokenSankeyCounters.cleanups += 1;
         renderRef.current = null;
+        tooltip.remove();
         svg.remove();
       };
     },
-    [width, height],
+    [renderWidth, renderHeight],
   );
 
   // Live re-layout: a streaming token update (same SVG, new band heights) recomputes in place

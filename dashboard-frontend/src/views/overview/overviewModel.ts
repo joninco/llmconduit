@@ -13,8 +13,8 @@
  * PROVIDER (volume + cost), and a token-mix split.
  *
  * SOURCE — all read from the FLOW-LIST population (`FlowRow` via `useFlowRows`, i.e. `/flows` +
- * `/snapshot` + the live store union), the source that actually carries per-flow `cost` /
- * `cost_confidence` / `usage` (the live `flow_status` frame does NOT — gap 15's wire-source trap).
+ * `/snapshot` + the live store union), whose revisioned live mutations carry the same complete
+ * per-flow cost/usage/attribution row as REST and snapshots.
  * The per-provider LATENCY/ERROR tiles are explicitly NOT derived here (they would hide failed
  * primaries — spec 16): they come from the gap-12 per-provider DTO on the REST/snapshot topology
  * node, consumed by the view via gap-13's read pattern.

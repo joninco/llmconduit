@@ -19,6 +19,7 @@ import type { FlowSummary } from '../../api/types';
  */
 function flow(over: Partial<FlowSummary> = {}): FlowSummary {
   return {
+    revision: 1,
     api_call_id: `api_${Math.random().toString(36).slice(2, 8)}`,
     method: 'POST',
     uri: '/v1/responses',

@@ -422,7 +422,7 @@ test.describe('Argus dashboard', () => {
     await page.goto('/dashboard/?mock=1&longclient=1', { waitUntil: 'networkidle' });
     await page.locator('input').first().fill('dev-token');
     await page.getByRole('button', { name: /sign in/i }).click();
-    await expect(page.getByRole('button', { name: 'Flows', exact: true })).toBeVisible();
+    await expect(page.getByRole('tab', { name: 'Flows', exact: true })).toBeVisible();
     await openView(page, VIEWS[0]!); // Flows
     await page.waitForTimeout(400);
 
@@ -452,23 +452,22 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on the long-client chip').toEqual([]);
   });
 
-  // Gap 16: the CONTROL-ROOM overview (the 5th route) COMPOSES the gap-01–15 surfaces into one honest
-  // screen. Asserts: the route loads; the per-provider tiles read the REST/snapshot topology DTO (the
-  // gap-12/13 wire source — a degrading provider shows real derived percentiles, NOT a fabricated 0);
-  // a mixed-confidence cost leaderboard inherits the WEAKEST tag (estimated, labelled); an unpriced
-  // model's cost reads — (never $0.00); the failure + client tiles compose the gap-14/15 models; and
-  // an unreported token class reads — (don't-lie-with-zeros). Rows selected by stable identity.
+  // The control room consumes one exact, immutable server cut. Asserts: provenance distinguishes
+  // scoped flow rollups from global provider-attempt health; weak cost confidence survives every
+  // aggregation; unpriced/unknown fields stay unavailable; and each drill-down is keyboard-native.
   test('control-room overview composes the surfaces with honest DQ tags (gap 16)', async ({ page, consoleErrors }) => {
     await login(page);
     await openView(page, VIEWS[4]!); // Overview
     await page.waitForTimeout(600);
 
-    // The view + headline render (the unified gap-01 metrics tile, with measured active streams).
+    // StatsStrip is the sole headline. Overview begins with the server-cut provenance instead of
+    // duplicating those global tiles.
     await expect(page.getByTestId('overview-view')).toBeVisible();
-    await expect(page.getByTestId('overview-headline')).toBeVisible();
-    await expect(page.getByTestId('overview-hl-active')).toHaveAttribute('data-quality', 'measured');
-    // The mock's $/min is an ESTIMATE (unconfigured cache rate) ⇒ the headline labels it estimated.
-    await expect(page.getByTestId('overview-hl-cost')).toHaveAttribute('data-quality', 'estimated');
+    await expect(page.getByTestId('overview-headline')).toHaveCount(0);
+    await expect(page.getByTestId('overview-provenance')).toHaveAttribute('data-quality', 'measured');
+    await expect(page.getByTestId('overview-provenance')).toContainText('Flow rollups · Global');
+    await expect(page.getByTestId('overview-provenance')).toContainText('Provider attempts · Global');
+    await expect(page.getByTestId('overview-cost-trend')).toHaveAttribute('data-quality', 'estimated');
 
     // PER-PROVIDER tiles (gap 12/13 — from the REST/snapshot topology node, NOT the WS frame). vllm-b
     // is degrading: a real derived p50 (NOT —) + a measured error rate. This proves the wire source —
@@ -490,7 +489,7 @@ test.describe('Argus dashboard', () => {
     await expect(costBoard).toHaveAttribute('data-available', 'true');
     const llamaCost = costBoard.getByTestId('overview-leaderboard-row').filter({ hasText: 'llama-3.1-70b' }).first();
     await expect(llamaCost.getByTestId('overview-leaderboard-cost')).toHaveAttribute('data-quality', 'estimated');
-    await expect(llamaCost.getByTestId('overview-leaderboard-est')).toBeVisible();
+    await expect(llamaCost.getByText('est', { exact: true })).toBeVisible();
 
     // TOP MODELS · VOLUME: mystery-model has an UNPRICED flow ⇒ its cost reads — (never $0.00).
     const volBoard = page.getByTestId('overview-top-models-volume');
@@ -515,24 +514,32 @@ test.describe('Argus dashboard', () => {
     await expect(failures.getByTestId('overview-failures-rate')).toHaveAttribute('data-quality', 'derived');
     expect(await failures.getByTestId('overview-failure-group').count()).toBeGreaterThanOrEqual(1);
 
-    // CLIENTS tile (gap 15 model): the heaviest client is the key-hash (api_001+002), shown as the
-    // one-way HASH (the auth-gated diagnostic purpose — never a raw key); api_006 is unattributed.
+    // Client dimensions are exact server keys. Missing attribution is folded under the explicit
+    // bounded `unknown` key; source-strength presentation remains a flow-list concern.
     const clients = page.getByTestId('overview-clients');
     await expect(clients).toHaveAttribute('data-available', 'true');
     await expect(clients.getByTestId('overview-client-row').filter({ hasText: 'key-9f3a1c0b2d4e' }).first()).toBeVisible();
-    await expect(clients).toContainText(/unattributed/);
-    // The weak UA client is rendered with a `ua` badge (a fallback, not a confirmed identity).
-    await expect(clients.getByTestId('overview-client-row').filter({ hasText: 'python-httpx/0.27' }).first().getByTestId('overview-client-ua')).toBeVisible();
+    await expect(clients.getByTestId('overview-client-row').filter({ hasText: 'unknown' }).first()).toBeVisible();
+    await expect(clients.getByTestId('overview-client-row').filter({ hasText: 'python-httpx/0.27' }).first()).toBeVisible();
 
     // TOKEN MIX: prompt is measured; the cached class is reported by some flows (api_001) so it is
     // measured too — but reasoning, reported by none of the usage flows as > nothing, stays honest.
     const mix = page.getByTestId('overview-token-mix');
     await expect(mix).toHaveAttribute('data-available', 'true');
     await expect(mix.getByTestId('overview-token-prompt')).toHaveAttribute('data-quality', 'measured');
+    await expect(mix.getByTestId('overview-token-reasoning')).toHaveAttribute('data-quality', 'unavailable');
+    await expect(mix.getByTestId('overview-token-reasoning')).toHaveText('—');
 
-    // CONTEXT PRESSURE (gap 09 model): a derived peak (the known-window flows are measurable) with a
-    // measured/total coverage readout.
-    await expect(page.getByTestId('overview-context-coverage')).toContainText('measured');
+    // CONTEXT PRESSURE uses the conservative effective route limit and exposes missing coverage.
+    await expect(page.getByTestId('overview-context')).toHaveAttribute('data-quality', 'partial');
+    await expect(page.getByTestId('overview-context-limit')).toHaveAttribute('data-quality', 'derived');
+    await expect(page.getByTestId('overview-context')).toContainText(/measured · [1-9]\d* unavailable/);
+
+    // Every row family is a native button, so Enter/Space semantics come for free.
+    await expect(page.getByTestId('overview-provider').first()).toHaveJSProperty('tagName', 'BUTTON');
+    await expect(page.getByTestId('overview-leaderboard-row').first()).toHaveJSProperty('tagName', 'BUTTON');
+    await expect(page.getByTestId('overview-client-row').first()).toHaveJSProperty('tagName', 'BUTTON');
+    await expect(page.getByTestId('overview-failure-group').first()).toHaveJSProperty('tagName', 'BUTTON');
 
     expect(consoleErrors, 'console errors on the control-room overview').toEqual([]);
   });
@@ -565,7 +572,7 @@ test.describe('Argus dashboard', () => {
     await expect(page.getByTestId('tabpanel-headers')).toBeVisible();
     await page.getByRole('tab', { name: 'Headers' }).click(); // active → collapse
     await expect(page.getByTestId('tabpanel-headers')).toHaveCount(0);
-    await expect(page.getByRole('tablist')).toBeVisible(); // the strip survives
+    await expect(page.getByTestId('detail-tabstrip')).toBeVisible(); // the strip survives
     await page.getByRole('tab', { name: 'Timeline' }).click(); // inactive → switch + expand
     await expect(page.getByTestId('tabpanel-timeline')).toBeVisible();
 
@@ -658,7 +665,11 @@ test.describe('Argus dashboard', () => {
     await page.mouse.move(d.x + 400, 30, { steps: 12 });
     await page.mouse.up();
     const tp = (await page.getByRole('tabpanel').boundingBox())!;
-    expect(tp.y, 'tabpanel sits just below the nav + strips').toBeLessThan(170);
+    const strip = (await page.getByTestId('detail-tabstrip').boundingBox())!;
+    expect(
+      Math.abs(tp.y - (strip.y + strip.height)),
+      'tabpanel starts immediately below its surviving tab strip',
+    ).toBeLessThanOrEqual(2);
     const pr = await page.getByTestId('pane-row').boundingBox();
     expect(pr === null || pr.height < 5, 'main region (panes + summary) fully collapsed').toBe(true);
 

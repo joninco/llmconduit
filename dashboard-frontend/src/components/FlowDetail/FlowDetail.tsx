@@ -42,7 +42,7 @@ import { useCatalog } from '../FlowTable/useCatalog';
 import { JsonPane } from '../viz/JsonPane';
 import { combineMiddleDiff, diffLayers } from './diff';
 import { joinMonitor } from './monitorJoin';
-import { mergeDeltas, normalizeRestDeltas, type SeqSegment } from './deltas';
+import { mergeDeltas, normalizeRestDeltas, type MonitorSegment } from './deltas';
 import { DeltasPanel } from './DeltasPanel';
 import { Timeline } from './Timeline';
 import { useScrollSync } from './useScrollSync';
@@ -50,11 +50,47 @@ import { useFlowDetail, type KillState } from './useFlowDetail';
 import { usePersistedFlag } from './layoutPrefs';
 import { EdgeStrip } from '../ui/EdgeStrip';
 import { cn } from '../../lib/cn';
+import { useMediaQuery } from '../../lib/useMediaQuery';
 
 type Tab = 'headers' | 'timeline' | 'error';
 
 /** Focus-mode target: one of the three JSON layers, or the deltas rail. */
 type ZoomTarget = 'A' | 'B' | 'C' | 'deltas';
+type NarrowTab = ZoomTarget | Tab;
+
+const NARROW_QUERY = '(max-width: 1023px)';
+const DRAWER_TABS: ReadonlyArray<{ id: Tab; label: string }> = [
+  { id: 'headers', label: 'Headers' },
+  { id: 'timeline', label: 'Timeline' },
+  { id: 'error', label: 'Error' },
+];
+const NARROW_TABS: ReadonlyArray<{ id: NarrowTab; label: string }> = [
+  { id: 'A', label: 'A · inbound' },
+  { id: 'B', label: 'B · normalized' },
+  { id: 'C', label: 'C · upstream' },
+  { id: 'deltas', label: 'Deltas' },
+  { id: 'headers', label: 'Headers' },
+  { id: 'timeline', label: 'Timeline' },
+  { id: 'error', label: 'Error' },
+];
+
+function findFlowTrigger(apiCallId: string): HTMLButtonElement | null {
+  if (typeof document === 'undefined') return null;
+  return Array.from(document.querySelectorAll<HTMLButtonElement>('[data-testid="flow-row"] button'))
+    .find((button) => button.title === apiCallId) ?? null;
+}
+
+function restoreFlowTrigger(apiCallId: string, preferred: HTMLElement | null, attempts = 12): void {
+  const target = preferred?.isConnected ? preferred : findFlowTrigger(apiCallId);
+  if (target?.isConnected) {
+    target.focus({ preventScroll: true });
+    return;
+  }
+  // The virtualized list is hidden while detail owns the route. Its first measurable render can
+  // land a frame or two after this component unmounts, so wait for the actual trigger instead of
+  // moving focus to a generic page fallback.
+  if (attempts > 0) requestAnimationFrame(() => restoreFlowTrigger(apiCallId, preferred, attempts - 1));
+}
 
 /**
  * Splitter visuals: a thin `border-line`-colored strip with an accent on hover/keyboard focus.
@@ -65,7 +101,7 @@ const SPLIT_V = 'w-px bg-line outline-none transition-colors hover:bg-accent/70 
 const SPLIT_H = 'h-px bg-line outline-none transition-colors hover:bg-accent/70 focus-visible:bg-accent';
 
 export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose: () => void }) {
-  const { detail, frozenDetail, liveFlow, status, seeking, seekMonitorSeq, seekAtMs, mutationsEnabled, kill, killState } =
+  const { detail, detailQuery, frozenDetail, liveFlow, status, seeking, seekMonitorSeq, seekAtMs, mutationsEnabled, kill, killState } =
     useFlowDetail(apiCallId);
   const monitor = useDashboard((s) => s.monitor);
   const monitorSeqs = useDashboard((s) => s.monitorSeqs);
@@ -73,9 +109,44 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   // Gap 09: per-model context-window capacities (gap-06 nullable `context_limit`), for the gauge.
   const contextLimits = useCatalog();
   const [tab, setTab] = useState<Tab>('headers');
+  const [narrowTab, setNarrowTab] = useState<NarrowTab>('A');
+  const narrow = useMediaQuery(NARROW_QUERY);
+  const detailRef = useRef<HTMLElement>(null);
+  const openerRef = useRef<HTMLElement | null>(null);
+  const openerCapturedRef = useRef(false);
+  if (!openerCapturedRef.current) {
+    openerCapturedRef.current = true;
+    const activeElement = typeof document !== 'undefined'
+      && document.activeElement instanceof HTMLElement
+      && document.activeElement !== document.body
+      ? document.activeElement
+      : null;
+    openerRef.current = activeElement ?? findFlowTrigger(apiCallId);
+  }
   // Shared search across all three layers (A inbound · B normalized · C upstream) — find a field
   // once and see how it transformed. Each JsonPane filters to matches + their ancestors.
   const [query, setQuery] = useState('');
+  const detailLoading = detail === null && detailQuery.isPending && detailQuery.fetchStatus === 'fetching';
+  const detailFailed = detail === null && detailQuery.isError;
+  const bodyEmptyLabel = detailLoading
+    ? 'loading captured body…'
+    : detailFailed
+      ? 'body unavailable — load failed'
+      : emptyBodyLabel(seeking);
+
+  // Move keyboard focus into the takeover on open. On every unmount path (back button, close,
+  // Escape/browser navigation), restore the originating flow trigger once the hidden table becomes
+  // visible again. The connected-node guard keeps StrictMode's effect replay from stealing focus.
+  useEffect(() => {
+    const detailNode = detailRef.current;
+    const opener = openerRef.current;
+    detailNode?.focus({ preventScroll: true });
+    return () => {
+      requestAnimationFrame(() => {
+        if (!detailNode?.isConnected) restoreFlowTrigger(apiCallId, opener);
+      });
+    };
+  }, [apiCallId]);
 
   // ── Adjustable sections ──────────────────────────────────────────────────────────────────
   // Focus mode (zoom): one layer (A/B/C/deltas) fills the whole main region. NOT persisted — a
@@ -198,15 +269,19 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   // Deltas shown in the sub-panel = the REST replay (base) MERGED with the live monitor segments
   // (appended) — finding 5. While seeking, the live REST replay (`detail.deltas`) is post-cut and
   // withheld; the cut-bounded monitor join alone supplies the frozen stream (finding 1). The merge
-  // de-dups the seam by MonitorHub seq (finding 2): the live side carries `join.segmentSeqs` (the
-  // per-segment `monitor_seq`) so a coalesced/same-millisecond tail merges without dup or drop.
-  const liveSegs = useMemo<SeqSegment[]>(
-    () => join.segments.map((segment, i) => ({ segment, seq: join.segmentSeqs[i] ?? null })),
+  // de-dups the seam with the explicit MonitorHub watermark captured alongside the REST replay:
+  // `FlowDelta.sequence` remains an ordinal, while the live side carries real monitor sequences.
+  const liveSegs = useMemo<MonitorSegment[]>(
+    () => join.segments.map((segment, i) => ({ segment, monitorSeq: join.segmentSeqs[i] ?? null })),
     [join.segments, join.segmentSeqs],
   );
   const segments = useMemo(
-    () => mergeDeltas(normalizeRestDeltas(frozenDetail?.deltas), liveSegs),
-    [frozenDetail?.deltas, liveSegs],
+    () => mergeDeltas(
+      normalizeRestDeltas(frozenDetail?.deltas),
+      liveSegs,
+      frozenDetail?.deltas_through_monitor_seq,
+    ),
+    [frozenDetail?.deltas, frozenDetail?.deltas_through_monitor_seq, liveSegs],
   );
 
   // Structural diffs between the captured layers (path → kind).
@@ -252,6 +327,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
       ...(summary ?? {}),
       ...(liveFlow ?? {}),
       api_call_id: apiCallId,
+      revision: liveFlow?.revision ?? summary?.revision ?? 0,
       method: liveFlow?.method ?? 'POST',
       uri: liveFlow?.uri ?? '',
       status: status ?? liveFlow?.status ?? summary?.status ?? 'open',
@@ -278,6 +354,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
     const model = liveFlow?.model_served ?? frozenDetail?.model_served ?? liveFlow?.model_requested ?? frozenDetail?.model_requested ?? null;
     const econFlow: FlowSummary = {
       api_call_id: apiCallId,
+      revision: liveFlow?.revision ?? frozenDetail?.revision ?? 0,
       method: 'POST',
       uri: '',
       status: status ?? 'open',
@@ -356,9 +433,18 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
     { key: 'C' as const, label: 'C · upstream', value: detail?.upstream_body, diff: diffBC, side: 'right' as const, index: 2 },
   ];
   const zoomedPane = zoom && zoom !== 'deltas' ? panes.find((p) => p.key === zoom) ?? null : null;
+  const narrowPane = narrowTab === 'A' || narrowTab === 'B' || narrowTab === 'C'
+    ? panes.find((pane) => pane.key === narrowTab) ?? null
+    : null;
 
   return (
-    <section className="flex min-h-0 min-w-0 flex-1 flex-col bg-panel" data-testid="flow-detail" aria-label="flow detail">
+    <section
+      ref={detailRef}
+      tabIndex={-1}
+      className="flex min-h-0 min-w-0 flex-1 flex-col bg-panel outline-none"
+      data-testid="flow-detail"
+      aria-label="flow detail"
+    >
       <TopBar
         apiCallId={apiCallId}
         flow={liveFlow}
@@ -370,8 +456,72 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         onKill={() => kill(apiCallId)}
         onClose={onClose}
       />
-      {/* Main region over the bottom tab drawer — a vertical splitter; the drawer collapses to
-          the bare tab strip (rendered below the group), never hides entirely. */}
+      {detailLoading && (
+        <div className="shrink-0 border-b border-line bg-panel px-3 py-2 text-xs text-text-muted" role="status" data-testid="detail-loading">
+          Loading captured flow detail…
+        </div>
+      )}
+      {detailQuery.isError && (
+        <div className="flex shrink-0 items-center gap-3 border-b border-status-down/40 bg-status-down/10 px-3 py-2 text-xs" role="alert" data-testid="detail-load-error">
+          <span>{detail ? 'Flow detail could not refresh. Showing the last captured version.' : 'Flow detail could not be loaded. Captured bodies are unavailable.'}</span>
+          <button type="button" className="ml-auto text-accent underline" onClick={() => { void detailQuery.refetch(); }}>Retry</button>
+        </div>
+      )}
+      {narrow ? (
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col" data-testid="flow-detail-narrow">
+          <SummaryBand
+            flow={liveFlow}
+            detail={frozenDetail}
+            cost={cost}
+            costConfidence={costConfidence}
+            usage={usage}
+            econ={econ}
+            contextUtil={contextUtil}
+            latency={latency}
+            attempts={attempts}
+            seeking={seeking}
+            seekAtMs={seekAtMs}
+            collapsed={summaryCollapsed}
+            onToggle={() => setSummaryCollapsed(!summaryCollapsed)}
+          />
+          <NarrowTabStrip active={narrowTab} onChange={setNarrowTab} />
+          <div
+            id={narrowPanelId(narrowTab)}
+            role="tabpanel"
+            aria-labelledby={narrowTabId(narrowTab)}
+            tabIndex={0}
+            className="flex min-h-0 min-w-0 flex-1 flex-col overflow-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+            data-testid={`narrow-tabpanel-${narrowTab}`}
+          >
+            {narrowPane ? (
+              <>
+                <SearchBar value={query} onChange={setQuery} />
+                <JsonPane
+                  label={narrowPane.label}
+                  value={narrowPane.value}
+                  diff={narrowPane.diff}
+                  side={narrowPane.side}
+                  query={query}
+                  emptyLabel={bodyEmptyLabel}
+                  scrollRef={sync.refFor(narrowPane.index)}
+                  onScroll={sync.bind(narrowPane.index)}
+                  className="min-h-0 flex-1"
+                />
+              </>
+            ) : narrowTab === 'deltas' ? (
+              <DeltasRail segments={segments} />
+            ) : narrowTab === 'headers' ? (
+              <HeadersTab headers={frozenDetail?.inbound_headers} />
+            ) : narrowTab === 'timeline' ? (
+              <Timeline events={join.events} />
+            ) : (
+              <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} seeking={seeking} />
+            )}
+          </div>
+        </div>
+      ) : (
+      /* Main region over the bottom tab drawer — a vertical splitter; the drawer collapses to
+         the bare tab strip (rendered below the group), never hides entirely. */
       <Group
         orientation="vertical"
         id="flowdetail-vsplit"
@@ -419,7 +569,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
                     diff={zoomedPane.diff}
                     side={zoomedPane.side}
                     query={query}
-                    emptyLabel={emptyBodyLabel(seeking)}
+                    emptyLabel={bodyEmptyLabel}
                     scrollRef={sync.refFor(zoomedPane.index)}
                     onScroll={sync.bind(zoomedPane.index)}
                     onZoom={() => setZoom(null)}
@@ -495,7 +645,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
                                 diff={p.diff}
                                 side={p.side}
                                 query={query}
-                                emptyLabel={emptyBodyLabel(seeking)}
+                                emptyLabel={bodyEmptyLabel}
                                 scrollRef={sync.refFor(p.index)}
                                 onScroll={sync.bind(p.index)}
                                 onZoom={() => setZoom(p.key)}
@@ -550,7 +700,14 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
         >
           <TabStrip tab={tab} collapsed={drawerCollapsed} onTabClick={onTabClick} />
           {!drawerCollapsed && (
-            <div className="min-h-0 flex-1 overflow-auto" role="tabpanel" data-testid={`tabpanel-${tab}`}>
+            <div
+              id={drawerPanelId(tab)}
+              className="min-h-0 flex-1 overflow-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+              role="tabpanel"
+              aria-labelledby={drawerTabId(tab)}
+              tabIndex={0}
+              data-testid={`tabpanel-${tab}`}
+            >
               {/* Headers + Error read the FROZEN detail (null while seeking) so no live/post-cut
                   metadata leaks; Timeline reads the cut-bounded monitor join (finding 1). */}
               {tab === 'headers' && <HeadersTab headers={frozenDetail?.inbound_headers} />}
@@ -560,6 +717,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
           )}
         </Panel>
       </Group>
+      )}
     </section>
   );
 }
@@ -567,21 +725,127 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
 /** The Headers/Timeline/Error tab strip. Rendered inside the drawer panel when expanded, or as
  * the bare strip below the split group when the drawer is collapsed (strip-only, never hidden). */
 function TabStrip({ tab, collapsed, onTabClick }: { tab: Tab; collapsed: boolean; onTabClick: (t: Tab) => void }) {
+  const refs = useRef<Array<HTMLButtonElement | null>>([]);
+  const activate = (index: number) => {
+    const normalized = (index + DRAWER_TABS.length) % DRAWER_TABS.length;
+    const next = DRAWER_TABS[normalized];
+    if (!next) return;
+    onTabClick(next.id);
+    refs.current[normalized]?.focus();
+  };
+
   return (
     <div
       // Fixed 34px (border-box) — MUST match the drawer Panel's `collapsedSize={34}`, so the
       // collapsed drawer shows exactly the strip (no clipped strip / no content sliver).
       className="flex h-[34px] shrink-0 items-center gap-1 border-y border-line bg-panel-raised px-2"
       role="tablist"
+      aria-label="Flow detail metadata"
       data-testid="detail-tabstrip"
       data-collapsed={collapsed ? 'true' : 'false'}
     >
-      <TabButton id="headers" active={tab} onClick={onTabClick}>Headers</TabButton>
-      <TabButton id="timeline" active={tab} onClick={onTabClick}>Timeline</TabButton>
-      <TabButton id="error" active={tab} onClick={onTabClick}>Error</TabButton>
+      {DRAWER_TABS.map((item, index) => (
+        <TabButton
+          key={item.id}
+          buttonRef={(node) => { refs.current[index] = node; }}
+          id={item.id}
+          active={tab}
+          onClick={onTabClick}
+          onKeyDown={(event) => {
+            let next: number | null = null;
+            if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = index + 1;
+            else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = index - 1;
+            else if (event.key === 'Home') next = 0;
+            else if (event.key === 'End') next = DRAWER_TABS.length - 1;
+            if (next === null) return;
+            event.preventDefault();
+            activate(next);
+          }}
+        >
+          {item.label}
+        </TabButton>
+      ))}
       <span className="ml-auto hidden text-[9px] uppercase tracking-wide text-text-muted sm:inline">
         {collapsed ? 'click a tab to expand' : 'click the active tab to collapse'}
       </span>
+    </div>
+  );
+}
+
+function drawerTabId(tab: Tab): string {
+  return `flow-detail-drawer-tab-${tab}`;
+}
+
+function drawerPanelId(tab: Tab): string {
+  return `flow-detail-drawer-panel-${tab}`;
+}
+
+function narrowTabId(tab: NarrowTab): string {
+  return `flow-detail-tab-${tab.toLowerCase()}`;
+}
+
+function narrowPanelId(tab: NarrowTab): string {
+  return `flow-detail-panel-${tab.toLowerCase()}`;
+}
+
+/** Seven-surface, automatic-activation tablist used by the narrow single-pane inspector. */
+function NarrowTabStrip({
+  active,
+  onChange,
+}: {
+  active: NarrowTab;
+  onChange: (tab: NarrowTab) => void;
+}) {
+  const refs = useRef<Array<HTMLButtonElement | null>>([]);
+  const activate = (index: number) => {
+    const normalized = (index + NARROW_TABS.length) % NARROW_TABS.length;
+    const next = NARROW_TABS[normalized];
+    if (!next) return;
+    onChange(next.id);
+    refs.current[normalized]?.focus();
+  };
+
+  return (
+    <div
+      role="tablist"
+      aria-label="Flow detail sections"
+      className="flex shrink-0 gap-1 overflow-x-auto border-y border-line bg-panel-raised px-2 py-1.5"
+      data-testid="narrow-detail-tablist"
+    >
+      {NARROW_TABS.map((item, index) => {
+        const selected = item.id === active;
+        return (
+          <button
+            key={item.id}
+            ref={(node) => { refs.current[index] = node; }}
+            id={narrowTabId(item.id)}
+            type="button"
+            role="tab"
+            aria-selected={selected}
+            aria-controls={narrowPanelId(item.id)}
+            tabIndex={selected ? 0 : -1}
+            onClick={() => onChange(item.id)}
+            onKeyDown={(event) => {
+              let next: number | null = null;
+              if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = index + 1;
+              else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') next = index - 1;
+              else if (event.key === 'Home') next = 0;
+              else if (event.key === 'End') next = NARROW_TABS.length - 1;
+              if (next === null) return;
+              event.preventDefault();
+              activate(next);
+            }}
+            className={cn(
+              'shrink-0 rounded-md px-2.5 py-1 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+              selected
+                ? 'bg-accent/20 text-text ring-1 ring-inset ring-accent/60'
+                : 'text-text hover:bg-panel hover:text-text',
+            )}
+          >
+            {item.label}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -596,7 +860,7 @@ function DeltasRail({
 }: {
   segments: DebugSegment[];
   zoomed?: boolean;
-  onZoom: () => void;
+  onZoom?: () => void;
   onCollapse?: () => void;
 }) {
   return (
@@ -605,23 +869,27 @@ function DeltasRail({
         className="flex shrink-0 items-center justify-between border-b border-line bg-panel-raised px-3 py-1"
         // Double-clicking the header surface zooms — but not double-clicks landing on the
         // zoom/collapse buttons, whose single-click actions must not also toggle zoom.
-        onDoubleClick={(e) => {
-          if ((e.target as HTMLElement).closest('button')) return;
-          onZoom();
-        }}
+        onDoubleClick={onZoom
+          ? (e) => {
+              if ((e.target as HTMLElement).closest('button')) return;
+              onZoom();
+            }
+          : undefined}
       >
         <span className="text-[10px] uppercase tracking-wide text-text-muted">deltas</span>
         <span className="flex items-center gap-1">
-          <button
-            type="button"
-            onClick={onZoom}
-            aria-label={zoomed ? 'restore deltas rail' : 'zoom deltas rail'}
-            title={zoomed ? 'restore (Esc)' : 'zoom to fill the inspector'}
-            className="rounded-sm px-1 text-[11px] leading-none text-text-muted transition-colors hover:text-accent"
-            data-testid="deltas-zoom"
-          >
-            ⤢
-          </button>
+          {onZoom && (
+            <button
+              type="button"
+              onClick={onZoom}
+              aria-label={zoomed ? 'restore deltas rail' : 'zoom deltas rail'}
+              title={zoomed ? 'restore (Esc)' : 'zoom to fill the inspector'}
+              className="rounded-sm px-1 text-[11px] leading-none text-text-muted transition-colors hover:text-accent"
+              data-testid="deltas-zoom"
+            >
+              ⤢
+            </button>
+          )}
           {onCollapse && (
             <button
               type="button"
@@ -721,18 +989,18 @@ function TopBar({
   const method = flow?.method ?? '';
   const uri = flow?.uri ?? '';
   return (
-    <header className="flex shrink-0 items-center gap-3 border-b border-line bg-panel-raised px-3 py-2">
+    <header className="flex min-w-0 shrink-0 items-center gap-2 border-b border-line bg-panel-raised px-2 py-2 sm:gap-3 sm:px-3">
       <button
         type="button"
         onClick={onClose}
         aria-label="back to flows"
         data-testid="detail-back"
-        className="flex items-center gap-1.5 rounded-md border border-line px-2 py-1 text-xs text-text-muted transition-colors hover:border-accent/50 hover:text-text"
+        className="flex shrink-0 items-center gap-1.5 rounded-md border border-line px-2 py-1 text-xs text-text-muted transition-colors hover:border-accent/50 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
       >
         <span aria-hidden="true">←</span> flows
       </button>
       <StatusChip status={status} terminalReason={flow?.terminal_reason ?? detail?.terminal_reason} />
-      <span className="font-mono text-sm text-text" title={apiCallId}>{apiCallId}</span>
+      <span className="min-w-0 flex-1 truncate font-mono text-sm text-text sm:flex-none" title={apiCallId}>{apiCallId}</span>
       {(method || uri) && (
         <span className="hidden truncate font-mono text-xs text-text-muted md:inline" title={`${method} ${uri}`}>
           {method} {uri}
@@ -744,13 +1012,13 @@ function TopBar({
         </span>
       )}
       <span className="ml-auto hidden text-[10px] uppercase tracking-wide text-text-muted lg:inline">esc to dismiss</span>
-      <div className="flex items-center gap-2">
+      <div className="flex shrink-0 items-center gap-1 sm:gap-2">
         <KillControl isActive={isActive} mutationsEnabled={mutationsEnabled} seeking={seeking} killState={killState} onKill={onKill} />
         <button
           type="button"
           onClick={onClose}
           aria-label="close detail"
-          className="rounded-md border border-transparent px-2 py-1 text-sm text-text-muted hover:text-text"
+          className="rounded-md border border-transparent px-2 py-1 text-sm text-text-muted hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
         >
           ✕
         </button>
@@ -979,13 +1247,13 @@ function KillControl({
   onKill: () => void;
 }) {
   if (killState.phase === 'forbidden') {
-    return <span className="text-xs text-status-down" data-testid="kill-forbidden">mutations disabled</span>;
+    return <span className="text-xs text-status-down" role="status" aria-live="polite" data-testid="kill-forbidden">mutations disabled</span>;
   }
   if (killState.phase === 'killed') {
     return <span className="text-xs text-text-muted" data-testid="kill-done">killed</span>;
   }
   if (killState.phase === 'error') {
-    return <span className="text-xs text-status-down" data-testid="kill-error" title={killState.message}>kill failed</span>;
+    return <span className="text-xs text-status-down" role="alert" data-testid="kill-error" title={killState.message}>kill failed: {killState.message}</span>;
   }
   if (!isActive) return null;
   // Kill mutates LIVE state; a frozen historical cut must not be mutable (finding 2). While
@@ -1006,17 +1274,38 @@ function KillControl({
   );
 }
 
-function TabButton({ id, active, onClick, children }: { id: Tab; active: Tab; onClick: (t: Tab) => void; children: React.ReactNode }) {
+function TabButton({
+  buttonRef,
+  id,
+  active,
+  onClick,
+  onKeyDown,
+  children,
+}: {
+  buttonRef: (node: HTMLButtonElement | null) => void;
+  id: Tab;
+  active: Tab;
+  onClick: (t: Tab) => void;
+  onKeyDown: React.KeyboardEventHandler<HTMLButtonElement>;
+  children: React.ReactNode;
+}) {
   const selected = id === active;
   return (
     <button
+      ref={buttonRef}
+      id={drawerTabId(id)}
       type="button"
       role="tab"
       aria-selected={selected}
+      aria-controls={drawerPanelId(id)}
+      tabIndex={selected ? 0 : -1}
       onClick={() => onClick(id)}
+      onKeyDown={onKeyDown}
       className={cn(
-        'rounded-md px-2.5 py-1 text-xs transition-colors',
-        selected ? 'bg-accent/15 text-accent' : 'text-text-muted hover:text-text',
+        'rounded-md px-2.5 py-1 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent',
+        selected
+          ? 'bg-accent/20 text-text ring-1 ring-inset ring-accent/60'
+          : 'text-text hover:bg-panel hover:text-text',
       )}
     >
       {children}

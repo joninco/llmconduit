@@ -1,10 +1,23 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { SnapshotResponse } from '../../api/types';
-import { SnapshotController, bucketOf, BUCKET_MS } from './snapshotController';
+import {
+  SnapshotController,
+  bucketOf,
+  BUCKET_MS,
+  SNAPSHOT_CACHE_MAX_CUTS,
+} from './snapshotController';
 
 /** A snapshot whose `at_ms` echoes the requested bucket (so we can assert which one delivered). */
 function snap(atMs: number): SnapshotResponse {
-  return { cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 }, at_ms: atMs, summaries: [], metrics: null, topology: null };
+  return {
+    cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+    at_ms: atMs,
+    summaries: [],
+    metrics: null,
+    topology: null,
+    history: { oldest_at_ms: atMs, newest_at_ms: atMs, retained_bytes: 0, quota_bytes: 64 * 1024 * 1024, retained_cuts: 1 },
+    flow_summaries_truncated: false,
+  };
 }
 
 /** A manual rAF: callbacks queue, `flush()` runs them (one frame). */
@@ -112,6 +125,51 @@ describe('SnapshotController — rAF coalescing (no fetch storm)', () => {
     flush();
     await Promise.resolve(); await Promise.resolve();
     expect(c.fetchCount()).toBe(before + 1);
+  });
+
+  it('defaults to at most 16 returned cuts and keys aliases by the server cut time', async () => {
+    const { raf, cancelRaf, flush } = manualRaf();
+    const fetchSnapshot = vi.fn(async (atMs: number) => snap(atMs - 500));
+    const c = new SnapshotController({ fetchSnapshot, onSnapshot: () => {}, raf, cancelRaf });
+
+    for (let i = 1; i <= SNAPSHOT_CACHE_MAX_CUTS + 1; i++) {
+      c.requestAt(i * 10_000);
+      flush();
+      await Promise.resolve(); await Promise.resolve();
+    }
+    expect(c.cachedCuts()).toBe(SNAPSHOT_CACHE_MAX_CUTS);
+    expect(c.has(10_000)).toBe(false);
+    expect(c.has((SNAPSHOT_CACHE_MAX_CUTS + 1) * 10_000)).toBe(true);
+
+    const before = c.fetchCount();
+    c.requestAt((SNAPSHOT_CACHE_MAX_CUTS + 1) * 10_000);
+    expect(c.fetchCount()).toBe(before); // request bucket aliases the returned `at_ms` cut
+  });
+
+  it('does not retain a single cut larger than the 8 MiB-style byte quota', async () => {
+    const { raf, cancelRaf, flush } = manualRaf();
+    const oversized = (atMs: number): SnapshotResponse => ({
+      ...snap(atMs),
+      summaries: [{
+        revision: 1, api_call_id: 'large', method: 'POST', uri: 'x'.repeat(4096), status: 'completed',
+        started_ms: 1, cost_confidence: 'unavailable',
+      }],
+    });
+    const fetchSnapshot = vi.fn(async (atMs: number) => oversized(atMs));
+    const c = new SnapshotController({
+      fetchSnapshot,
+      onSnapshot: () => {},
+      raf,
+      cancelRaf,
+      cacheMaxBytes: 512,
+    });
+
+    c.requestAt(5_000);
+    flush();
+    await Promise.resolve(); await Promise.resolve();
+    expect(c.cachedCuts()).toBe(0);
+    expect(c.retainedBytes()).toBe(0);
+    expect(c.has(5_000)).toBe(false);
   });
 
   it('cancel() drops a scheduled frame so no late fetch fires', async () => {

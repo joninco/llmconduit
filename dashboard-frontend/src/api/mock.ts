@@ -1,5 +1,5 @@
 /**
- * In-browser mock backend — lets all four views ship before the Rust contract is live.
+ * In-browser mock backend — lets every dashboard view run without a live Rust host.
  *
  * Provides:
  *  - `mockFetch`: a `fetch`-compatible function answering the D13 REST routes + D7 auth.
@@ -18,6 +18,10 @@ import type {
   FlowsResponse,
   MetricsResponse,
   MonitorPayload,
+  OverviewCost,
+  OverviewDimensionRollup,
+  OverviewResponse,
+  OverviewTokens,
   ProviderHealth,
   ProviderLatency,
   SnapshotFrame,
@@ -96,7 +100,7 @@ function seedFlows(): FlowSummary[] {
     // Gap 10: FULL phase spine + a served attempt with a wire first byte (open, still streaming) ⇒
     // the latency breakdown reads a MEASURED TTFT (first_content_delta) + wire TTFB + every segment.
     {
-      api_call_id: 'api_001', response_id: 'resp_001', method: 'POST', uri: '/v1/responses', status: 'open',
+      revision: 1, api_call_id: 'api_001', response_id: 'resp_001', method: 'POST', uri: '/v1/responses', status: 'open',
       model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a',
       usage: { prompt: 812, completion: 240, total: 1052, cached: 128, reasoning: 0 },
       started_ms: now - 2400, finished_ms: null, elapsed_ms: 2400, terminal_reason: null,
@@ -115,7 +119,7 @@ function seedFlows(): FlowSummary[] {
     // Gap 07: cached/reasoning UNREPORTED (absent ⇒ renders `—`, never `0`); unpriced cache ⇒ estimated.
     // Gap 10: a COMPLETED flow with the full phase spine ⇒ every segment measured, tok/s derived.
     {
-      api_call_id: 'api_002', response_id: 'resp_002', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
+      revision: 1, api_call_id: 'api_002', response_id: 'resp_002', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
       model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a',
       usage: { prompt: 1500, completion: 980, total: 2480 },
       started_ms: now - 12000, finished_ms: now - 7800, elapsed_ms: 4200, terminal_reason: 'response.completed',
@@ -135,7 +139,7 @@ function seedFlows(): FlowSummary[] {
     // first_content_delta_ms / stream_end_ms ⇒ the prefill + generation segments are UNAVAILABLE
     // (`—`, never 0ms); the attempt FAILED pre-headers ⇒ no wire TTFB. TTFT/tok/s ⇒ `—`.
     {
-      api_call_id: 'api_003', response_id: null, method: 'POST', uri: '/v1/responses', status: 'failed',
+      revision: 1, api_call_id: 'api_003', response_id: null, method: 'POST', uri: '/v1/responses', status: 'failed',
       model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai',
       usage: null, started_ms: now - 30000, finished_ms: now - 29200, elapsed_ms: 800,
       terminal_reason: 'upstream 503', cost: null, cost_confidence: 'unavailable',
@@ -156,7 +160,7 @@ function seedFlows(): FlowSummary[] {
     // unavailable and the prefill segment is a SEPARATELY-LABELLED `derived` routing→first-token
     // span (the no-TTFB path — never a measured prefill, since the wire first byte is absent).
     {
-      api_call_id: 'api_004', response_id: 'resp_004', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
+      revision: 1, api_call_id: 'api_004', response_id: 'resp_004', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
       model_requested: 'mystery-model', model_served: 'mystery-model', upstream_target: 'vllm-b',
       usage: { prompt: 4096, completion: 512, total: 4608 },
       started_ms: now - 18000, finished_ms: now - 16000, elapsed_ms: 2000, terminal_reason: 'response.completed',
@@ -173,7 +177,7 @@ function seedFlows(): FlowSummary[] {
     // 2-node chain (A failed → B served), the served node visually distinct, the failed node's
     // first byte `—` (never 0). Routed via `/v1/responses` on `openai` (the served target).
     {
-      api_call_id: 'api_005', response_id: 'resp_005', method: 'POST', uri: '/v1/responses', status: 'completed',
+      revision: 1, api_call_id: 'api_005', response_id: 'resp_005', method: 'POST', uri: '/v1/responses', status: 'completed',
       model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'openai',
       usage: { prompt: 640, completion: 320, total: 960, cached: 0, reasoning: 0 },
       started_ms: now - 9000, finished_ms: now - 6200, elapsed_ms: 2800, terminal_reason: 'response.completed',
@@ -197,7 +201,7 @@ function seedFlows(): FlowSummary[] {
       // Gap 15: NO client attribution (no key, no configured id, no UA) ⇒ `client_label`/`client_source`
       // ABSENT ⇒ the CLIENT cell renders `—` (don't-lie-with-zeros, never a fabricated id) and the flow
       // bumps the roll-up's explicit "unattributed" count rather than inventing a client.
-      api_call_id: 'api_006', response_id: null, method: 'POST', uri: '/v1/chat/completions', status: 'failed',
+      revision: 1, api_call_id: 'api_006', response_id: null, method: 'POST', uri: '/v1/chat/completions', status: 'failed',
       model_requested: 'llama-3.1-70b', model_served: 'llama-3.1-70b', upstream_target: 'vllm-b',
       usage: null, started_ms: now - 40000, finished_ms: now - 39000, elapsed_ms: 1000,
       terminal_reason: 'upstream timeout', cost: null, cost_confidence: 'unavailable',
@@ -212,7 +216,7 @@ function seedFlows(): FlowSummary[] {
     // Gap 15 review round 3 (opt-in e2e only): a ~4 KiB UA `client_label` — the worst case the
     // filter-bar chip must bound. WEAK source so it also exercises the UA tagging on a huge label.
     flows.push({
-      api_call_id: 'api_long', response_id: 'resp_long', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
+      revision: 1, api_call_id: 'api_long', response_id: 'resp_long', method: 'POST', uri: '/v1/chat/completions', status: 'completed',
       model_requested: 'gpt-4o', model_served: 'gpt-4o', upstream_target: 'vllm-a',
       usage: { prompt: 10, completion: 10, total: 20 },
       started_ms: now - 5000, finished_ms: now - 4000, elapsed_ms: 1000, terminal_reason: 'response.completed',
@@ -266,6 +270,151 @@ function buildMetrics(): MetricsResponse {
   };
 }
 
+/** Exact mock counterpart of `GET /dashboard/api/overview` for the in-browser demo. */
+function buildOverview(qs: URLSearchParams): OverviewResponse {
+  const window = qs.get('window') === 'm5' || qs.get('window') === 'h1'
+    ? qs.get('window') as 'm5' | 'h1'
+    : 'm1';
+  const atRaw = qs.get('at');
+  const requestedAt = atRaw === null ? null : Number(atRaw);
+  const generatedAt = requestedAt ?? Date.now();
+  const status = qs.get('status');
+  const model = qs.get('model');
+  const upstream = qs.get('upstream');
+  const client = qs.get('client');
+  const contains = (actual: string | null | undefined, wanted: string | null) =>
+    wanted === null || (actual ?? '').toLocaleLowerCase().includes(wanted.trim().toLocaleLowerCase());
+
+  // The real publisher aggregates finalized terminal inputs. Keep the demo faithful: an open
+  // flow remains visible in the live flow list, but cannot enter an exact historical rollup yet.
+  const flows = seedFlows().filter((flow) =>
+    flow.status !== 'open'
+    && (status === null || flow.status === status)
+    && (model === null || contains(flow.model_requested, model) || contains(flow.model_served, model))
+    && contains(flow.upstream_target, upstream)
+    && contains(flow.client_label, client));
+
+  const tokensFor = (members: FlowSummary[]): OverviewTokens => {
+    const usages = members.flatMap((flow) => flow.usage ? [flow.usage] : []);
+    if (usages.length === 0) {
+      return { samples: 0, prompt: null, completion: null, cached: null, reasoning: null };
+    }
+    const sum = (field: 'prompt' | 'completion' | 'cached' | 'reasoning') =>
+      usages.reduce((total, usage) => total + (usage[field] ?? 0), 0);
+    return {
+      samples: usages.length,
+      prompt: sum('prompt'),
+      completion: sum('completion'),
+      cached: usages.every((usage) => usage.cached !== undefined && usage.cached !== null) ? sum('cached') : null,
+      reasoning: usages.every((usage) => usage.reasoning !== undefined && usage.reasoning !== null) ? sum('reasoning') : null,
+    };
+  };
+
+  const costFor = (members: FlowSummary[]): OverviewCost => {
+    const priced = members.filter((flow) => flow.cost !== undefined && flow.cost !== null);
+    if (priced.length === 0) return { samples: 0, total_usd: null, confidence: 'unavailable' };
+    const hasEstimate = priced.some((flow) => flow.cost_confidence !== 'confident')
+      || members.some((flow) => flow.usage && (flow.cost === undefined || flow.cost === null));
+    return {
+      samples: priced.length,
+      total_usd: priced.reduce((total, flow) => total + (flow.cost ?? 0), 0),
+      confidence: hasEstimate ? 'estimated' : 'confident',
+    };
+  };
+
+  const rollup = (keyFor: (flow: FlowSummary) => string): OverviewDimensionRollup[] => {
+    const groups = new Map<string, FlowSummary[]>();
+    for (const flow of flows) {
+      const key = keyFor(flow);
+      groups.set(key, [...(groups.get(key) ?? []), flow]);
+    }
+    return [...groups.entries()]
+      .map(([key, members]) => ({ key, requests: members.length, tokens: tokensFor(members), cost: costFor(members) }))
+      .sort((left, right) => right.requests - left.requests || left.key.localeCompare(right.key));
+  };
+
+  const failures = new Map<string, FlowSummary[]>();
+  for (const flow of flows) {
+    if (flow.status === 'completed') continue;
+    const reason = [...(flow.attempts ?? [])].reverse().find((attempt) => attempt.status === 'failed')?.error_class
+      ?? (flow.status === 'cancelled' ? 'terminal' : 'other');
+    failures.set(reason, [...(failures.get(reason) ?? []), flow]);
+  }
+  const failureRollups = [...failures.entries()]
+    .map(([key, members]) => ({ key, requests: members.length, tokens: tokensFor(members), cost: costFor(members) }))
+    .sort((left, right) => right.requests - left.requests || left.key.localeCompare(right.key));
+
+  const contextSamples = flows.flatMap((flow) => {
+    const limit = CATALOG.find((entry) => entry.id === flow.model_served)?.context_limit;
+    return flow.usage && limit && limit > 0 ? [{ input: flow.usage.prompt, limit }] : [];
+  });
+  const contextLimit = contextSamples.length > 0
+    ? Math.min(...contextSamples.map((sample) => sample.limit))
+    : null;
+  const contextInput = contextSamples.length > 0
+    ? contextSamples.reduce((total, sample) => total + sample.input, 0)
+    : null;
+  const contextPressure = contextSamples.length > 0
+    ? contextSamples.reduce((total, sample) => total + sample.input / sample.limit, 0) / contextSamples.length * 100
+    : null;
+
+  const seriesBySecond = new Map<number, FlowSummary[]>();
+  for (const flow of flows) {
+    const at = Math.floor((flow.finished_ms ?? flow.started_ms) / 1000) * 1000;
+    seriesBySecond.set(at, [...(seriesBySecond.get(at) ?? []), flow]);
+  }
+
+  const tokens = tokensFor(flows);
+  const cost = costFor(flows);
+  return {
+    generated_at_ms: generatedAt,
+    metrics_seq: 1,
+    scope: {
+      window,
+      requested_at_ms: requestedAt,
+      selected_at_ms: requestedAt ?? generatedAt,
+      status,
+      model,
+      upstream,
+      client,
+    },
+    data_quality: 'measured',
+    overflow: {
+      dimension_limit: 64,
+      slot_folded_samples: 0,
+      aggregate_folded_samples: 0,
+      provider_folded_samples: 0,
+      overflowed: false,
+    },
+    totals: { requests: flows.length, tokens, cost },
+    requested_models: rollup((flow) => flow.model_requested ?? 'unknown'),
+    served_models: rollup((flow) => flow.model_served ?? 'unknown'),
+    providers: rollup((flow) => flow.upstream_target ?? 'unknown'),
+    clients: rollup((flow) => flow.client_label ?? 'unknown'),
+    failures: failureRollups,
+    context: {
+      data_quality: contextSamples.length === 0
+        ? 'unavailable'
+        : contextSamples.length < flows.length ? 'partial' : 'derived',
+      samples: contextSamples.length,
+      unavailable_samples: Math.max(0, flows.length - contextSamples.length),
+      effective_route_limit_min: contextLimit,
+      input_tokens: contextInput,
+      average_pressure_pct: contextPressure,
+    },
+    tokens,
+    cost,
+    cost_series: [...seriesBySecond.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([at_ms, members]) => ({ at_ms, data_quality: 'measured', requests: members.length, cost: costFor(members) })),
+    provider_attempts_global: {
+      scope: 'global',
+      data_quality: Object.keys(PER_PROVIDER).length > 0 ? 'derived' : 'unavailable',
+      providers: Object.values(PER_PROVIDER),
+    },
+  };
+}
+
 function buildTopology(): TopologyResponse {
   return {
     topology_seq: 1,
@@ -284,6 +433,7 @@ function buildTopology(): TopologyResponse {
 function buildSnapshot(): SnapshotFrame {
   return {
     type: 'snapshot',
+      schema_version: 2,
     cursors: { flow_seq: 3, metrics_seq: 1, topology_seq: 1, monitor_seq: 5 },
     flows: seedFlows(),
     metrics: buildMetrics(),
@@ -342,7 +492,10 @@ export function buildUsageFrame(seq: number, apiCallId = 'api_001'): DashboardFr
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-LLMConduit-Dashboard-Schema': '2',
+    },
   });
 }
 
@@ -404,6 +557,7 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     return detail ? json(detail) : json({ error: 'unknown api_call_id' }, 404);
   }
   if (path === '/dashboard/api/metrics') return json(buildMetrics());
+  if (path === '/dashboard/api/overview') return json(buildOverview(qs));
   if (path === '/dashboard/api/topology') return json(buildTopology());
   if (path === '/dashboard/api/catalog') return json(CATALOG);
   if (path === '/dashboard/api/snapshot') {
@@ -415,6 +569,14 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
       summaries: seedFlows(),
       metrics: buildMetrics(),
       topology: buildTopology(),
+      history: {
+        oldest_at_ms: atMs - 60 * 60 * 1000,
+        newest_at_ms: atMs,
+        retained_bytes: 1024 * 1024,
+        quota_bytes: 64 * 1024 * 1024,
+        retained_cuts: 720,
+      },
+      flow_summaries_truncated: false,
     };
     return json(snap);
   }
@@ -437,6 +599,7 @@ function buildFlowDetail(id: string): FlowDetail | null {
   if (!base) return null;
   return {
     flow_seq: 3,
+    revision: base.revision,
     api_call_id: base.api_call_id,
     response_id: base.response_id,
     inbound_body: { model: base.model_requested, messages: [{ role: 'user', content: 'Hi' }] },
@@ -452,6 +615,9 @@ function buildFlowDetail(id: string): FlowDetail | null {
     upstream_target: base.upstream_target,
     usage: base.usage,
     status: base.status,
+    // The replay body and this monitor cursor come from the same transcript
+    // snapshot. Live segments at or below it have already been materialized.
+    deltas_through_monitor_seq: 5,
     deltas: [
       { sequence: 1, kind: 'response.created', payload: {}, ts_ms: base.started_ms },
       { sequence: 2, kind: 'response.delta', payload: { text: 'Hello' }, ts_ms: base.started_ms + 200 },
@@ -550,20 +716,23 @@ export class MockWebSocket implements WsLike {
     // not only off the REST detail). Anchored to a single `started` so the phases stay
     // monotonic (ingress ≤ … ≤ finalize).
     const started = Date.now() - 3100;
+    const base = seedFlows().find((flow) => flow.api_call_id === 'api_001')!;
     return {
       domain: 'flow',
       seq: ++this.seq.flow,
       batch: [{
+        ...base,
         type: 'flow_status',
-        api_call_id: 'api_001',
-        response_id: 'resp_001',
+        phase: 'terminal',
+        revision: base.revision + 1,
         status: 'completed',
-        model_requested: 'gpt-4o',
-        model_served: 'llama-3.1-70b',
-        upstream_target: 'vllm-a',
         usage: { prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 0 },
         started_ms: started,
+        finished_ms: started + 3100,
         elapsed_ms: 3100,
+        terminal_reason: 'response.completed',
+        cost: 0.0071,
+        cost_confidence: 'estimated',
         ingress_ms: started,
         normalization_done_ms: started + 30,
         routing_decision_ms: started + 50,

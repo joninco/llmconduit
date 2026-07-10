@@ -1,0 +1,1054 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SnapshotResponse",
+  "description": "`GET /dashboard/api/snapshot?at=<unix_ms>` — a body-free frozen cut. Mirrors\nthe frozen `SnapshotResponse`: the per-domain `cursors`, the cut instant, the\nbody-free flow summaries (priced), and the metrics/topology cuts reshaped into\ntheir REST bodies (`null` when the cut is empty for that domain).",
+  "type": "object",
+  "properties": {
+    "at_ms": {
+      "type": "integer",
+      "format": "uint128",
+      "minimum": 0
+    },
+    "cursors": {
+      "$ref": "#/$defs/SeqCursors"
+    },
+    "flow_summaries_truncated": {
+      "description": "Whether this selected cut dropped its oldest flow summaries to fit the quota.",
+      "type": "boolean"
+    },
+    "history": {
+      "description": "Bounds and memory use of the retained historical-cut ring.",
+      "$ref": "#/$defs/SnapshotHistoryMetadata"
+    },
+    "metrics": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/MetricsSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "summaries": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/FlowRow"
+      }
+    },
+    "topology": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TopologySnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "cursors",
+    "at_ms",
+    "summaries",
+    "metrics",
+    "topology",
+    "history",
+    "flow_summaries_truncated"
+  ],
+  "$defs": {
+    "Attempt": {
+      "description": "Gap 03 — one upstream dispatch attempt's full provenance: WHICH provider, WHAT model,\nHOW LONG it took, WHEN the first wire byte arrived, and the OUTCOME. The failover loop\nrecords one per provider it tries (failed ones + the served one); a non-failover\n(bare-leaf / single-upstream / routing-with-no-fallback) flow records exactly one.\n\nAll timestamps are MEASURED epoch-ms (`now_ms`). `first_upstream_byte_ms` is the wire\ninstant the attempt's FIRST chunk arrived — `None` when the attempt never received\nresponse headers / a first chunk (a connect/timeout/non-2xx failure), so an unmeasured\nfirst-byte time is `None`, NEVER `0` (don't-lie-with-zeros). `error_class` /\n`failover_reason` are `None` on the served attempt and are BOUNDED taxonomic codes\n(never raw upstream text) on a failed attempt — they ride the body-free summary, so\nraw error bodies stay behind spec 05's gated seam. Snake_case + `skip_serializing_if`\nso a `None` field is absent on the wire.",
+      "type": "object",
+      "properties": {
+        "end_ms": {
+          "description": "Epoch-ms the attempt resolved (served first chunk, or failed). Always measured.",
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "error_class": {
+          "description": "Bounded taxonomic failure code; `None` on the served attempt.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttemptErrorClass"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failover_reason": {
+          "description": "Bounded taxonomic failover reason; `None` on the served attempt.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AttemptFailoverReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "first_upstream_byte_ms": {
+          "description": "Epoch-ms the FIRST chunk arrived on the wire for this attempt. `None` when the\nattempt never received a first chunk (failed before response headers) — NEVER `0`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "model": {
+          "description": "The model actually sent on the wire for this attempt (post provider-remap), when\nknown. `None` when the attempt failed before the on-wire model was finalized.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "description": "The provider name this attempt dispatched to (the failover provider's name, the\nrouting route's name, or the synthetic `\"primary\"` for a bare single upstream).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "start_ms": {
+          "description": "Epoch-ms the attempt began (the dispatch was issued). Always measured.",
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "status": {
+          "description": "Served vs failed.",
+          "$ref": "#/$defs/AttemptStatus"
+        }
+      },
+      "required": [
+        "start_ms",
+        "end_ms",
+        "status"
+      ]
+    },
+    "AttemptErrorClass": {
+      "description": "Gap 03 — a BOUNDED, sanitized, taxonomic failure code for a failed attempt. This is\nNOT raw upstream error text (which stays behind spec 05's separately-gated seam): it\nis a fixed enum so the body-free summary can never become a backdoor for an\nunbounded/secret-bearing upstream error body. `error_class` is `None` on the served\nattempt (don't-lie-with-zeros for the success case). Serializes snake_case.",
+      "oneOf": [
+        {
+          "description": "The upstream connection or request transport failed before any response.",
+          "type": "string",
+          "const": "connect"
+        },
+        {
+          "description": "The upstream returned a non-2xx HTTP status (a provider-failure-shaped 4xx/5xx).",
+          "type": "string",
+          "const": "http_status"
+        },
+        {
+          "description": "The attempt timed out waiting for the response / first chunk.",
+          "type": "string",
+          "const": "timeout"
+        },
+        {
+          "description": "The response began but the first chunk could not be read/parsed (stream error\nbefore the first chunk, or the stream ended before any chunk).",
+          "type": "string",
+          "const": "stream"
+        },
+        {
+          "description": "A same-provider terminal failure surfaced as-is (e.g. a context-window overflow\nthat persisted after the leaf's shrink-and-retry — failover does NOT retry it on\nanother provider; AGENTS.md). Carried for provenance even though it ends the flow.",
+          "type": "string",
+          "const": "terminal"
+        },
+        {
+          "description": "Any other failover-eligible upstream error not covered above.",
+          "type": "string",
+          "const": "other"
+        }
+      ]
+    },
+    "AttemptFailoverReason": {
+      "description": "Gap 03 — a BOUNDED, sanitized, taxonomic reason a failed attempt triggered failover\nto the next provider. Like [`AttemptErrorClass`], this is a fixed enum — never raw\nupstream text — so it is safe on the body-free summary. `None` on the served attempt\n(it did not fail over). Serializes snake_case.",
+      "oneOf": [
+        {
+          "description": "The provider failed before the first chunk and failover moved to the next.",
+          "type": "string",
+          "const": "provider_failed"
+        },
+        {
+          "description": "The provider rejected this particular request; failover advanced without\ntreating the provider as unhealthy or starting its cooldown.",
+          "type": "string",
+          "const": "request_rejected"
+        },
+        {
+          "description": "The provider's failure was same-provider terminal — failover did NOT advance\n(recorded so the trace shows WHY no further provider was tried).",
+          "type": "string",
+          "const": "terminal_no_failover"
+        }
+      ]
+    },
+    "AttemptStatus": {
+      "description": "Gap 03 — the outcome of one upstream dispatch attempt. Snake_case on the wire so\nthe body-free [`SnapshotFlowSummary`] carries it to the failover/attempt-trace UI\n(spec 11) and the per-provider metrics aggregation (spec 12).",
+      "oneOf": [
+        {
+          "description": "This attempt produced the first chunk on the wire — it is the SERVING attempt.",
+          "type": "string",
+          "const": "served"
+        },
+        {
+          "description": "This attempt failed before producing a chunk (connect error, non-2xx, timeout,\nor a parse/stream error before the first chunk). Failover then tried the next.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    },
+    "ClientSource": {
+      "description": "Gap 04 — the PROVENANCE of a flow's `client_label`: WHICH non-secret signal the\nattribution was derived from. Tagged so the dashboard (spec 15) can render the\nweaker User-Agent fallback DIFFERENTLY from the stronger key-hash / configured-id\nattribution — a `user_agent`-sourced label is NOT an identity claim. Serializes\nsnake_case; `Deserialize` so the body-free [`SnapshotFlowSummary`] round-trips on\nthe WS/snapshot wire (AGENTS.md: no new wire field without a round-trip test).\n\nPriority order (strongest → weakest), honored by [`ClientAttribution::derive`]:\n`KeyHash` → `ConfiguredHeader` → `UserAgent`. There is NO proxy auth-principal\nsource today (the proxy forwards keys, it does not authenticate a principal), so\none is deliberately absent until such a seam exists (spec 04 / Codex review).",
+      "oneOf": [
+        {
+          "description": "Derived from a non-reversible SHA-256 digest of the inbound API key (the raw\nkey is NEVER stored/emitted; only a short hex prefix of its hash becomes the\nlabel). The strongest attribution seam: the same caller key groups stably.",
+          "type": "string",
+          "const": "key_hash"
+        },
+        {
+          "description": "Derived from an operator-configured NON-SECRET request header (e.g.\n`x-client-id`) — an explicit caller-supplied identity. Stronger than UA, but\ncaller-asserted (unverified), so weaker than the key-hash.",
+          "type": "string",
+          "const": "configured_header"
+        },
+        {
+          "description": "Derived from the `User-Agent` header. A WEAK, labelled fallback only — NOT an\nidentity model (any caller can spoof it). Present so a flow with no key and no\nconfigured id still shows SOMETHING, clearly tagged as the weakest source.",
+          "type": "string",
+          "const": "user_agent"
+        }
+      ]
+    },
+    "CostConfidence": {
+      "description": "Gap 07 — the CONFIDENCE tier of a flow's `cost`, so an operator can tell a trusted\nfigure from a best-effort estimate from an honest gap. Emitted alongside `cost` on\nevery flow row + detail (and aggregated onto the metrics windows). Serializes\nsnake_case to mirror the data-quality vocabulary the frontend already uses\n(`measured`/`derived`/`estimated`/`unavailable`).",
+      "oneOf": [
+        {
+          "description": "The model is priced AND every billed token class has a known rate: the prompt\n(input) + completion (output) rates always exist when priced, and cached tokens\neither were reported as `0` (nothing billed at the cache rate) OR the model has\na CONFIGURED cached rate. The dollar figure is trustworthy.",
+          "type": "string",
+          "const": "confident"
+        },
+        {
+          "description": "The model is priced but a billed class would fall back to an APPROXIMATE rate:\ncached tokens were reported `> 0` (or are UNAVAILABLE) while the model has NO\nconfigured cached rate, so those tokens silently bill at the default `0.0`\n(an undercount). The figure is a best-effort ESTIMATE — surfaced as such.",
+          "type": "string",
+          "const": "estimated"
+        },
+        {
+          "description": "No price is configured for the served model: there is NO cost (the row reports\n`cost: null`), so the figure is UNAVAILABLE — never a fabricated `0`. The\nDEFAULT: a window/flow with nothing priced makes no confident claim.",
+          "type": "string",
+          "const": "unavailable"
+        }
+      ]
+    },
+    "FlowRow": {
+      "description": "One row in the flow table (`GET /dashboard/api/flows`) — the body-free\n[`SnapshotFlowSummary`](crate::dashboard_flow::SnapshotFlowSummary) fields PLUS\nthe D13 `cost` roll-up (usage × the served model's price). Mirrors the frozen\n`FlowSummary` (types.ts) exactly: the `Option` fields use `skip_serializing_if`\nto match the frontend's optional-key validators, EXCEPT `usage` (serialized as\n`null` when absent — the frontend accepts absent/null/usage) and `cost`\n(`null`-not-absent when the served model has no configured price).",
+      "type": "object",
+      "properties": {
+        "api_call_id": {
+          "type": "string"
+        },
+        "attempts": {
+          "description": "Gap 10b — the gap-03 per-attempt failover trace projected onto the row (spec 11's\nstepper reads the whole list; spec 10 reads the served attempt's\n`first_upstream_byte_ms`). Each [`Attempt`] is body-free scalar provenance + bounded\ntaxonomic codes — never a raw upstream error body. `skip_serializing_if =\nVec::is_empty` so a flow with no recorded attempt OMITS the key (the frontend's\n`attempts?` is absent), matching the body-free summary's wire shape.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Attempt"
+          }
+        },
+        "client_label": {
+          "description": "Gap 04 — the STABLE, NON-SECRET client attribution label (key-hash `key-<hex>`\ndisplay id / configured caller-id / User-Agent fallback), projected from the\nflow record/summary. `skip_serializing_if` so an unattributed flow OMITS the key\n(absent ⇒ renders `—`, never a fabricated id). Additive/optional: the frontend\nignores it until the client-attribution UI (gap 15). The raw key is never here —\nonly the one-way hash prefix ever existed as a label.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_source": {
+          "description": "Gap 04 — the [`ClientSource`] the label was derived from (so the weak\n`user_agent` fallback is distinguishable from a key-hash / configured-id). `None`\n(absent) exactly when `client_label` is `None`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "cost": {
+          "description": "USD cost of the flow (usage × the served model's [`ModelPrice`]). `null`\nwhen no price is configured for `model_served` — never a fabricated zero.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "cost_confidence": {
+          "description": "Gap 07 — the [`CostConfidence`] of `cost`: `confident` (priced + every billed\nclass has a known rate), `estimated` (a class falls back to the default `0.0`\ncached rate / cached unreported), or `unavailable` (unpriced ⇒ `cost: null`).\nAlways present so the frontend can label an `estimated` figure as such and\ndistinguish an `unavailable` cost from a measured `$0.00`.",
+          "$ref": "#/$defs/CostConfidence"
+        },
+        "elapsed_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "finalize_ms": {
+          "description": "Terminal finalize — stamped when the flow reaches its terminal state\n(`finalize`), for EVERY terminal (completed, failed, cancelled). Always `Some`\nonce the flow is terminal; the right edge of the waterfall.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "finished_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "first_content_delta_ms": {
+          "description": "True TTFT — the wall-clock instant the FIRST canonical **content** SSE delta was\nemitted to the client. NOT reasoning, tool-argument, refusal, or signature\ndeltas: a stream that emits reasoning/tool deltas before content does NOT stamp\nthis early (first-write-wins on the content arm only). `None` if the flow errored\nbefore any content delta.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "first_upstream_byte_ms": {
+          "description": "Gap 10b — the gap-03 flow-level wire time-to-first-byte (the served attempt's first\non-wire chunk). Distinct from `first_content_delta_ms` (the first content delta to\nthe CLIENT). `None` ⇒ absent ⇒ renders `—` downstream, NEVER `0`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "ingress_ms": {
+          "description": "Request ingress — when the FlowStore first `open`ed the record (≈ `started_ms`).\nAlways `Some` once a record exists; the explicit phase value the waterfall\nanchors the other phases against.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "method": {
+          "type": "string"
+        },
+        "model_requested": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_served": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "normalization_done_ms": {
+          "description": "Inbound→canonical normalization settled — stamped when the engine captures the\nnormalized canonical body (`set_normalized`). `None` if the flow errored before\nnormalization (an extractor/JSON rejection caught by the L0 guard).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "response_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "description": "Per-flow optimistic-concurrency version from the authoritative FlowStore.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "routing_decision_ms": {
+          "description": "Upstream routing/lowering decision — stamped when the engine commits the actual\non-wire upstream request (`set_upstream` at the leaf). `None` if the flow never\nreached the wire (pre-spawn lowering/budget failure, replay-only).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "started_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/FlowStatus"
+        },
+        "stream_end_ms": {
+          "description": "Stream completion — stamped when `run_turn` finishes emitting the terminal\n`response.completed`/`response.incomplete`. `None` if the flow errored or was\ncancelled mid-stream.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "terminal_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "upstream_target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uri": {
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FlowUsage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "revision",
+        "api_call_id",
+        "method",
+        "uri",
+        "usage",
+        "status",
+        "started_ms",
+        "cost",
+        "cost_confidence"
+      ]
+    },
+    "FlowStatus": {
+      "description": "Lifecycle status of a flow. `Open` at creation; D3 moves it to a terminal\nstate. Serializes snake_case for the dashboard REST/WS surface.",
+      "type": "string",
+      "enum": [
+        "open",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "FlowUsage": {
+      "description": "Token usage attached to a flow once the upstream response reports it.\n\nGap 07 — usage CONFIDENCE. `prompt`/`completion`/`total` are the core counts the\nupstream always reports. `cached`/`reasoning` are OPTIONAL token classes the\nupstream may or may not break out: a `0` and \"the upstream never reported this\nclass\" are DIFFERENT facts. They are therefore `Option<i64>` — `Some(0)` is a\nprovider-reported zero (e.g. \"0 cache hits this turn\"), `None` is UNAVAILABLE\n(the upstream omitted `prompt_tokens_details`/`completion_tokens_details`). Serialized\nwith `skip_serializing_if` so an unreported class is ABSENT on the wire (the\nfrontend renders `—`), never a fabricated `0` (don't-lie-with-zeros). The\ndistinction is load-bearing for cost confidence: a `cached` charge against a\nmodel with no configured cache rate (or an unreported `cached`) is `estimated`,\nnot `confident`.",
+      "type": "object",
+      "properties": {
+        "cached": {
+          "description": "Cache-read prompt tokens. `Some(n)` measured (incl. a reported `0`); `None`\nwhen the upstream did not report a cached breakdown (UNAVAILABLE, not `0`).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "completion": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "prompt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "reasoning": {
+          "description": "Reasoning (thinking) tokens. `Some(n)` measured (incl. a reported `0`); `None`\nwhen the upstream did not report reasoning details (UNAVAILABLE, not `0`).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "total": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "prompt",
+        "completion",
+        "total"
+      ]
+    },
+    "MetricWindow": {
+      "description": "One sliding-window metric tile. Same fields as the headline tile.\n\n`samples` is the count of TERMINAL (finalized) flows that fell in the window —\nthe data-quality signal the frontend uses to tell a genuine measured `0` from an\n`unavailable` gap (gap 01 / \"don't lie with zeros\"). When `samples == 0` the\nlatency/tok-s/cost/error-% fields are NOT measurable (no finalized flow fed them),\nso the strip renders them `—`; `reqs_per_sec` (a genuine `0` for an idle window)\nand `active_streams` (live open-flow count) stay numeric. The field is a finite\n`u64`, so it never violates the frozen finite-number wire contract.",
+      "type": "object",
+      "properties": {
+        "active_streams": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cost_confidence": {
+          "description": "Gap 07 — the aggregate [`CostConfidence`](crate::dashboard_api::CostConfidence)\nof this window's `cost_per_min`. `unavailable` when nothing in the window is\npriced (`priced_samples == 0` ⇒ `cost_per_min` renders `—`); `estimated` when\nANY priced bucket would bill cached tokens at the default `0.0` (cached `> 0` or\nUNREPORTED against a model with no configured cache rate) — no silently-confident\ntotal; `confident` only when every priced bucket's billed classes have known\nrates. Surfaced so the strip can LABEL an estimated cost as such.",
+          "$ref": "#/$defs/CostConfidence"
+        },
+        "cost_per_min": {
+          "type": "number",
+          "format": "double"
+        },
+        "error_pct": {
+          "type": "number",
+          "format": "double"
+        },
+        "p50": {
+          "type": "number",
+          "format": "double"
+        },
+        "p95": {
+          "type": "number",
+          "format": "double"
+        },
+        "p99": {
+          "type": "number",
+          "format": "double"
+        },
+        "priced_samples": {
+          "description": "Count of usage-bearing terminal flows whose served model has a configured price\n(gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no\nPRICED usage in the window ⇒ `cost_per_min` renders `—`, distinguishing an\nunpriced model from a genuine measured `$0.00`. All three are finite `u64`s, so\nthey never violate the frozen finite-number wire contract.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reqs_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "samples": {
+          "description": "Terminal-flow sample count in this window (the measured/unavailable signal for\nlatency + error-%). `0` ⇒ no finalized flow fed the latency/error fields ⇒ they\nrender `—`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "usage_samples": {
+          "description": "Count of those terminal flows that reported token usage (gap 01 review round 1,\nfinding 3) — the SEPARATE `tokens_per_sec` measurability denominator. Token and\ncost availability are NOT the same as `samples`: a window can have `samples > 0`\nyet `usage_samples == 0` (every finalized flow omitted usage), in which case\n`tokens_per_sec`/`cost_per_min` are unmeasurable and render `—`, never a fake `0`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "reqs_per_sec",
+        "active_streams",
+        "error_pct",
+        "p50",
+        "p95",
+        "p99",
+        "tokens_per_sec",
+        "cost_per_min",
+        "samples",
+        "usage_samples",
+        "priced_samples",
+        "cost_confidence"
+      ]
+    },
+    "MetricWindows": {
+      "description": "The three sliding windows (`m1`/`m5`/`h1`) of a [`MetricTick`].",
+      "type": "object",
+      "properties": {
+        "h1": {
+          "$ref": "#/$defs/MetricWindow"
+        },
+        "m1": {
+          "$ref": "#/$defs/MetricWindow"
+        },
+        "m5": {
+          "$ref": "#/$defs/MetricWindow"
+        }
+      },
+      "required": [
+        "m1",
+        "m5",
+        "h1"
+      ]
+    },
+    "MetricsSnapshot": {
+      "description": "The full `/api/metrics`-shaped snapshot body (the flat tile + the three\nwindows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live\n[`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.",
+      "type": "object",
+      "properties": {
+        "active_streams": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cost_confidence": {
+          "description": "Headline (`m1`) aggregate cost confidence (gap 07), mirrored from\n`windows.m1.cost_confidence` — so the headline `$/min` is labelled estimated\nwhen any priced bucket bills cached at the default `0.0`.",
+          "$ref": "#/$defs/CostConfidence"
+        },
+        "cost_per_min": {
+          "type": "number",
+          "format": "double"
+        },
+        "error_pct": {
+          "type": "number",
+          "format": "double"
+        },
+        "metrics_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "p50": {
+          "type": "number",
+          "format": "double"
+        },
+        "p95": {
+          "type": "number",
+          "format": "double"
+        },
+        "p99": {
+          "type": "number",
+          "format": "double"
+        },
+        "priced_samples": {
+          "description": "Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability\ndenominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reqs_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "samples": {
+          "description": "Terminal-flow sample count of the headline (`m1`) window — the\nmeasured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "usage_samples": {
+          "description": "Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability\ndenominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "windows": {
+          "$ref": "#/$defs/MetricWindows"
+        }
+      },
+      "required": [
+        "metrics_seq",
+        "reqs_per_sec",
+        "active_streams",
+        "error_pct",
+        "p50",
+        "p95",
+        "p99",
+        "tokens_per_sec",
+        "cost_per_min",
+        "samples",
+        "usage_samples",
+        "priced_samples",
+        "cost_confidence",
+        "windows"
+      ]
+    },
+    "ModelPrice": {
+      "description": "One model's billing rates (T13/D13), per 1k tokens. Field names mirror the\nFROZEN frontend `ModelPrice` contract (`dashboard-frontend/src/api/types.ts`)\nbyte-for-byte so the `/dashboard/api/topology` `price_table` validates. All\nthree rates are finite (the frontend `isModelPrice` guard rejects NaN/Inf);\n`cached_per_1k` defaults to `0.0` when a config entry omits it. This is the\nSINGLE `ModelPrice` definition for the crate — the dashboard WS topology\nsnapshot re-exports it so REST + WS agree on the wire shape.\n\nGap 07 — cached-price PRESENCE seam. `cached_per_1k` keeps its existing numeric\ntype (`f64`, default `0.0`), but a `0.0` is AMBIGUOUS: \"the provider charges 0\nfor cache reads\" is indistinguishable from \"the config entry omitted the rate\".\nThe ADDITIVE `cached_price_configured` boolean records which it is — set `true`\nonly when the source actually carried a `cached_per_1k` key (decided in the\ncustom [`Deserialize`] below). Downstream cost-CONFIDENCE (`dashboard_api`)\nconsumes THIS flag, NOT the numeric `0.0`: a flow that billed cached tokens at a\nCONFIGURED rate is `confident`, one that fell back to the default `0.0` is\n`estimated`. The flag is serialized additively (the frontend `isModelPrice`\naccepts it); `cached_per_1k` stays `number` so the topology/Sankey price table is\nNOT a second contract migration (spec 07 item 3).",
+      "type": "object",
+      "properties": {
+        "cached_per_1k": {
+          "description": "USD per 1k CACHED (cache-read) prompt tokens. Defaults to `0.0` when the\nconfig entry omits it (a provider with no cache discount). PRESERVES its\nnumeric type (gap 07) — presence is carried by `cached_price_configured`, not\nby nulling this field.",
+          "type": "number",
+          "format": "double"
+        },
+        "cached_price_configured": {
+          "description": "Gap 07 — whether `cached_per_1k` was EXPLICITLY configured (a `cached_per_1k`\nkey was present in the source), distinguishing a real configured `0.0`\ncache-read rate from an OMITTED one (which also defaults to `0.0`). The\ncost-confidence seam reads this so a default-`0.0` cached charge is flagged\n`estimated`, never silently `confident`. Additive on the wire.",
+          "type": "boolean",
+          "default": false
+        },
+        "input_per_1k": {
+          "description": "USD per 1k PROMPT (input) tokens.",
+          "type": "number",
+          "format": "double"
+        },
+        "output_per_1k": {
+          "description": "USD per 1k COMPLETION (output) tokens.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "input_per_1k",
+        "output_per_1k",
+        "cached_per_1k",
+        "cached_price_configured"
+      ]
+    },
+    "ProviderErrorDistribution": {
+      "description": "Gap 12 — the bounded per-error-class failure tally for one provider (a window, or a\nsingle slot). The key space is the FIXED [`AttemptErrorClass`] taxonomy (6 bounded\nsnake_case codes from gap 03 — NEVER raw upstream text), so this is a fixed-size\ncounter array, not an unbounded map. `skip_serializing_if` keeps a `0` class ABSENT\non the wire — the distribution lists only the classes a provider actually hit. A\nper-class `0` here is honest (that class did not occur); the don't-lie-with-zeros\nrule lives at the PROVIDER level (a provider with NO samples in the window is absent\nfrom the per-provider report entirely, never a fabricated all-zero distribution).",
+      "type": "object",
+      "properties": {
+        "connect": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "http_status": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "other": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "terminal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "timeout": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "ProviderLatency": {
+      "description": "Gap 12 — the public per-provider latency + error-distribution DTO (additive on the\nD4 topology node; consumed by spec 13). Percentiles are `derived` ms over the\nprovider's ATTEMPT-latency histogram (a FAILED primary's latency is included — spec\n12 — so final-served latency alone cannot hide an unhealthy provider). `error_rate`\nis the percentage of the provider's attempts that FAILED. A provider with zero\nin-window samples is ABSENT (don't-lie-with-zeros), so a present DTO always has\n`samples >= 1`. All floats are finite (the frozen finite-number wire contract).",
+      "type": "object",
+      "properties": {
+        "data_quality": {
+          "description": "DQ tag — always `derived` for a present entry (the `unavailable` case is absence).",
+          "$ref": "#/$defs/ProviderMetricQuality"
+        },
+        "error_rate": {
+          "description": "Percentage of attempts that failed (`failed / samples × 100`). A genuine MEASURED\n`0.0` for an all-served provider (distinct from the `unavailable`/absent case).",
+          "type": "number",
+          "format": "double"
+        },
+        "errors": {
+          "description": "Bounded per-class failure tally (gap 03 taxonomy). Absent classes are omitted.",
+          "$ref": "#/$defs/ProviderErrorDistribution"
+        },
+        "failed": {
+          "description": "Of `samples`, the count that FAILED before serving (failed primaries included).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "p50": {
+          "description": "`derived` p50 attempt latency (ms).",
+          "type": "number",
+          "format": "double"
+        },
+        "p95": {
+          "description": "`derived` p95 attempt latency (ms).",
+          "type": "number",
+          "format": "double"
+        },
+        "p99": {
+          "description": "`derived` p99 attempt latency (ms).",
+          "type": "number",
+          "format": "double"
+        },
+        "provider": {
+          "description": "The provider label these metrics are for (the bounded provider/route id, or the\n`__other__` overflow bucket once the per-slot provider cap is exceeded).",
+          "type": "string"
+        },
+        "samples": {
+          "description": "Total ATTEMPTS to this provider in the window (served + failed) — the per-provider\nmeasurability denominator. Always `>= 1` (a zero-sample provider is absent).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "served": {
+          "description": "Of `samples`, the count that SERVED (produced the first chunk).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "provider",
+        "data_quality",
+        "samples",
+        "served",
+        "failed",
+        "p50",
+        "p95",
+        "p99",
+        "error_rate",
+        "errors"
+      ]
+    },
+    "ProviderMetricQuality": {
+      "description": "Gap 12 — the data-quality tag for a per-provider metric. Every per-provider latency\nfigure is `derived` (computed from the provider's own attempt-latency histogram). The\n`unavailable` case (a provider with no in-window samples) is represented by the\nABSENCE of a [`ProviderLatency`] entirely, not by a variant here — so a present DTO is\nalways a real `derived` measurement (don't-lie-with-zeros). Serializes snake_case to\nmatch the cross-cutting DQ-tag contract.",
+      "type": "string",
+      "enum": [
+        "derived"
+      ]
+    },
+    "ProviderStatus": {
+      "description": "Per-provider serving status for the topology map (D4). `Cooling` while inside\nthe failure cooldown window; `Down` once a cooling provider has also crossed\n[`DOWN_THRESHOLD`] consecutive failures; `Healthy` otherwise.",
+      "type": "string",
+      "enum": [
+        "healthy",
+        "cooling",
+        "down"
+      ]
+    },
+    "SeqCursors": {
+      "description": "The four per-domain cursors carried on the initial [`SnapshotMessage`] — the\n`{flow,metrics,topology,monitor}` sequences the SPA installs as its dedup\nbaseline (`commitSnapshot` in `dashboard-frontend/src/api/ws.ts`). Serializes\nsnake_case to the frozen `SeqCursors` contract.",
+      "type": "object",
+      "properties": {
+        "flow_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "metrics_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "monitor_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "topology_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "flow_seq",
+        "metrics_seq",
+        "topology_seq",
+        "monitor_seq"
+      ]
+    },
+    "SnapshotHistoryMetadata": {
+      "description": "Public, body-free description of the retained snapshot history. The selected cut's\n[`DashboardSnapshot::flow_summaries_truncated`] flag is intentionally per-cut; this\nstruct describes the ring itself so a later API projection can expose both without\nreaching into MetricsLayer internals.",
+      "type": "object",
+      "properties": {
+        "newest_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "oldest_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "quota_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "retained_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "retained_cuts": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "oldest_at_ms",
+        "newest_at_ms",
+        "retained_bytes",
+        "quota_bytes",
+        "retained_cuts"
+      ]
+    },
+    "TopologyEdge": {
+      "description": "A topology edge (gateway → provider). The aggregate throughput/token/cost\nrates are D5/D13 roll-ups; until a price/throughput aggregation feeds them\nthey serialize as `0.0` (the contract requires the keys present + finite, not\na specific value), so the byte-shape is exact while the rich values land in\nD13.",
+      "type": "object",
+      "properties": {
+        "cost_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "from": {
+          "type": "string"
+        },
+        "throughput": {
+          "type": "number",
+          "format": "double"
+        },
+        "to": {
+          "type": "string"
+        },
+        "tokens_per_sec": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "throughput",
+        "tokens_per_sec",
+        "cost_per_sec"
+      ]
+    },
+    "TopologyNode": {
+      "description": "A topology node — the D4 `ProviderHealth` shape, except `catalog_size` is\nflattened from `Option<u64>` to a non-null `u64` (defaulting `None → 0`): the\nfrozen frontend contract validates `catalog_size` as a required unsigned int\n(NOT nullable), unlike the other `Option` fields which serde emits as `null`.\nEvery other field mirrors `ProviderHealth` exactly (keys always present, the\nnullable ones as JSON `null`).",
+      "type": "object",
+      "properties": {
+        "base_url": {
+          "type": "string"
+        },
+        "catalog_fetched_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "catalog_size": {
+          "description": "Flattened from `ProviderHealth::catalog_size: Option<u64>` to a required\nnon-null count (`None → 0`) per the frozen contract.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "consecutive_failures": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cooling_until_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "failover_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "per_provider": {
+          "description": "Gap 12 — the ADDITIVE per-provider latency (p50/p95/p99) + error distribution for\nthis provider over the m1 window, aggregated off the evict-safe per-attempt trace\n(spec 03), NOT the point-in-time `ProviderHealth` counters. `None`/ABSENT when the\nprovider had ZERO attempt samples in the window (don't-lie-with-zeros — the\nfrontend renders `—`, never a fabricated `0ms`/`0%`). `skip_serializing_if` keeps\nthe field off the wire entirely for a no-sample node, so the EXISTING frozen\n`TopologyNode` contract (D9/D10/D12) is undisturbed; spec 13 reads this field. The\nLIVE WS topology frame leaves it `None` (the WS frame does not join metrics, like\nits `0.0` edge rates) — it is populated only on the REST `/topology` + `/snapshot`\nreshape, which already join the m1 window.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderLatency"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "route": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "served_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ProviderStatus"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "route",
+        "base_url",
+        "status",
+        "cooling_until_ms",
+        "last_error",
+        "served_count",
+        "failover_count",
+        "consecutive_failures",
+        "catalog_fetched_ms",
+        "catalog_size"
+      ]
+    },
+    "TopologySnapshot": {
+      "description": "The full `/api/topology`-shaped snapshot body (nodes + edges + the price table)\nPLUS its `topology_seq` cursor. Mirrors the frontend `TopologyResponse`. The\nprice table is empty until D13 wires the price config; an empty map satisfies\nthe frontend `isPriceTable` guard (vacuously every value is a finite price).",
+      "type": "object",
+      "properties": {
+        "edges": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TopologyEdge"
+          }
+        },
+        "nodes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TopologyNode"
+          }
+        },
+        "price_table": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ModelPrice"
+          }
+        },
+        "topology_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "topology_seq",
+        "nodes",
+        "edges",
+        "price_table"
+      ]
+    }
+  }
+}

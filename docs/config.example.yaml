@@ -1,0 +1,388 @@
+# =============================================================================
+# llmconduit configuration
+# =============================================================================
+# Path: ~/.config/llmconduit/config.yaml
+#
+# This file is GENERATED -- matches the PersistedConfig struct layout in
+# src/config.rs. Edit the code, then regenerate this doc by running:
+#   for doc in routes adapters engine config config.example.yaml \
+#           upstream tools observability dashboard cli funciones; do
+#     echo "==> regenerating... $doc"
+#   done
+#
+# Environment overrides (LLMCONDUIT_*) take precedence over every value here.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# LISTEN ADDRESS
+# ---------------------------------------------------------------------------
+# bind_addr: "127.0.0.1:4000"                    # default
+
+# ---------------------------------------------------------------------------
+# SINGLE-UPSTREAM MODE (no `upstreams:` list, no `model_routes:`)
+# ---------------------------------------------------------------------------
+# When `upstreams:` and `model_routes:` are both absent (or empty), the config
+# acts as a simple single-backend proxy. These fields configure that backend:
+#
+# upstream_base_url: "http://127.0.0.1:8000/v1"   # default
+# upstream_api_key: "sk-..."                      # or set OPENAI_API_KEY env
+# upstream_model: "gpt-4o"                        # model id sent upstream (default: request model)
+# upstream_request_log_path: "/var/log/llmconduit/requests.jsonl"
+
+# ---------------------------------------------------------------------------
+# ROUTING MODE: `upstreams:` list
+# ---------------------------------------------------------------------------
+# When `upstreams:` is non-empty, the gateway operates in routing mode: the
+# request model is matched to an upstream by catalog id. The top-level single-
+# upstream fields above are IGNORED in this mode (each upstream carries its own
+# config). Name is auto-generated as "upstream-N" if omitted.
+#
+upstreams:
+  - name: "local-vllm"
+    upstream_base_url: "http://localhost:8000/v1"
+
+    # Log all requests/responses sent to this upstream (JSONL, append-only).
+    upstream_request_log_path: "/var/log/llmconduit/local-vllm.jsonl"
+
+    # Optional nested fallback upstreams: if the primary upstream fails (non-
+    # 2xx / connection error / SSE failure), the engine retries each fallback
+    # in order before giving up.
+    fallback_upstreams:
+      - upstream_base_url: "http://localhost:8001/v1"
+        exposed_model: "gpt-4o-mini"          # model id advertised to the client
+        # upstream_api_key: "sk-..."
+        # upstream_model: "gpt-4o-mini-custom"  # override backend model id
+        # upstream_chat_kwargs:
+        #   temperature: 0.3
+
+    # Default upstream_chat_kwargs merged into every request to this upstream.
+    # Client-provided values override these (client-wins merge).
+    # upstream_chat_kwargs:
+    #   temperature: 0.7
+
+  - name: "openai"
+    upstream_base_url: "https://api.openai.com/v1"
+    upstream_api_key: "sk-..."                # or use OPENAI_API_KEY env
+    # upstream_model: "gpt-4o"                # override request model id
+    # upstream_request_log_path: "/var/log/llmconduit/openai.jsonl"
+    # fallback_upstreams: []                  # optional nested fallbacks
+
+# ---------------------------------------------------------------------------
+# AD-HOC MODEL ROUTES (G7)
+# ---------------------------------------------------------------------------
+# Map request model names (or glob patterns) directly to a synthetic upstream.
+# Declaration order matters -- the first glob match wins. An exact catalog id
+# still beats a route, and a route beats the canonical-key/default fallback.
+#
+# Each value is either a bare URL string or a table with optional
+# `upstream_base_url`/`url` and optional `upstream_model`/`model`.
+#
+model_routes:
+  claude-opus-*: "http://localhost:8000/v1"               # bare URL form
+  claude-sonnet-4:
+    upstream_base_url: "http://10.0.0.1:8000/v1"
+    upstream_model: "sonnet-4-custom"                     # optional model remap
+
+# ---------------------------------------------------------------------------
+# FALLBACK UPSTREAMS (non-routing mode)
+# ---------------------------------------------------------------------------
+# When `upstreams:` is empty, these are tried in order if the primary
+# single-upstream fails. Each fallback has its own API key and model.
+#
+# fallback_upstreams:
+#   - upstream_base_url: "http://backup:8000/v1"
+#     upstream_api_key: "sk-backup"
+#     exposed_model: "backup-model"
+
+# Cooldown (seconds) before retrying a failed upstream.
+upstream_failure_cooldown_secs: 30             # default
+
+# ---------------------------------------------------------------------------
+# PER-MODEL PROFILES
+# ---------------------------------------------------------------------------
+# Profiles attach sampling defaults, role-routing rules, template-family
+# overrides, reasoning-effort maps, capability advertisements, and more to a
+# RESOLVED upstream model id.
+#
+# Keyed by model id (case-insensitive fallback). The `*` wildcard profile
+# catches any model without an exact match.
+#
+# Template inheritance: a profile can list `extends: [template-name]` to
+# inherit from a `model_profile_templates` entry. Fields merge depth-wise;
+# the child overrides the parent.
+#
+model_profiles:
+  # ---- DeepSeek profile ----
+  # DeepSeek's template expects `developer` messages and rejects unknown roles.
+  deepseek-chat:
+    template_family: deepseek
+    upstream_chat_kwargs:
+      temperature: 1.0
+      top_p: 1.0
+    # Route first system message to developer, reject trailing/interleaved
+    # system messages, rewrite inline system to developer role.
+    roles:
+      merge_adjacent:
+        - "developer"
+      "*": { action: "reject" }                     # reject unknown roles
+      user: {}
+      assistant: {}
+      tool: {}
+      developer: {}
+      system:
+        - when: "leading"
+        - when: "inline"
+          action: "rewrite"
+          target_role: "developer"
+
+  # ---- OpenAI GPT-4o profile ----
+  gpt-4o:
+    upstream_chat_kwargs:
+      temperature: 0.7
+    roles:
+      system: {}
+
+  # ---- GLM profile with reasoning effort mapping ----
+  # GLM's chat template reads reasoning effort from chat_template_kwargs, not
+  # from the top-level reasoning_effort field. Map Claude's effort ladder onto
+  # GLM's vocabulary.
+  glm-5:
+    template_family: kimi
+    upstream_chat_kwargs:
+      temperature: 1.0
+      top_p: 1.0
+      chat_template_kwargs:
+        clear_thinking: false                    # preserve CoT across turns
+    reasoning_effort_default: max                # GLM's template default
+    reasoning_effort_map:
+      none:   { chat_template_kwargs: { enable_thinking: false } }
+      low:    { chat_template_kwargs: { reasoning_effort: high } }
+      medium: { chat_template_kwargs: { reasoning_effort: high } }
+      high:   { chat_template_kwargs: { reasoning_effort: high } }
+      xhigh:  { chat_template_kwargs: { reasoning_effort: max } }
+      max:    { chat_template_kwargs: { reasoning_effort: max } }
+
+  # ---- Upstream-compatible reasoning_effort (typed shorthand) ----
+  # Alternative to the fragment-based `reasoning_effort_map` above. Accepts
+  # the same map levels but wraps each value as `{reasoning_effort: <value>}`
+  # and adds a dynamic thinking kwarg. Mutually exclusive with the fragment
+  # form -- only one of `reasoning_effort` or `reasoning_effort_map` may be set.
+  #
+  # claude-opus-4:
+  #   reasoning_effort:
+  #     default: "high"
+  #     map:
+  #       none: "low"
+  #       low: "medium"
+  #       medium: "high"
+  #       high: "high"
+  #       xhigh: "max"
+  #       max: "max"
+  #     thinking_param_name: "enable_thinking"
+  #     thinking_param_value_on: true
+  #     thinking_param_value_off: false
+
+  # ---- Profile with capability overrides ----
+  # Override what /v1/models advertises for this model. Unconfigured keys
+  # retain the upstream default. Each cap accepts a bare boolean as shorthand
+  # for `{supported: true}`.
+  # claude-opus-4:
+  #   capabilities:
+  #     image_input: true
+  #     thinking:
+  #       supported: true
+  #       types: [enabled]
+  #     effort:
+  #       supported: true
+  #       levels: [low, medium, high]
+  #     context_management:
+  #       supported: true
+  #       features: [clear_thinking_20251015, clear_tool_uses_20250919, compact_20260112]
+
+  # ---- Native-vision override (G4) ----
+  # `native_vision: true` forces the image agent OFF for this profile (the
+  # backend is multimodal). `false` forces text-only even for models the
+  # family sniff would treat as native-vision. `None` defers to name autodetection.
+  # claude-opus-4:
+  #   native_vision: true
+
+  # ---- Wildcard catch-all ----
+  # Applies to any model without an exact profile.
+  "*":
+    roles:
+      "*": { action: accept }
+
+# ---------------------------------------------------------------------------
+# MODEL PROFILE TEMPLATES
+# ---------------------------------------------------------------------------
+# Named templates that profiles can inherit from via `extends:`. Reduces
+# duplication when many models share the same basic setup.
+#
+model_profile_templates:
+  deepseek-base:
+    template_family: deepseek
+    upstream_chat_kwargs:
+      temperature: 1.0
+    roles:
+      "*": { action: reject }
+      user: {}
+      assistant: {}
+      developer: {}
+
+# Then: model_profiles.deepseek-r1: { extends: ["deepseek-base"], ... }
+
+# ---------------------------------------------------------------------------
+# GLOBAL CHAT KWARGS
+# ---------------------------------------------------------------------------
+# Base-layer kwargs merged into every upstream request (under per-profile
+# kwargs). Client-wins merge: client > profile > global.
+#
+# upstream_chat_kwargs:
+#   max_tokens: 4096
+#   temperature: 0.5
+
+# ---------------------------------------------------------------------------
+# GLOBAL TEMPLATE FAMILY OVERRIDE
+# ---------------------------------------------------------------------------
+# Force a chat-template contract for ALL models, regardless of name-based
+# auto-detection. Recognized values: "deepseek", "kimi". Profile-level
+# template_family overrides this. Unrecognized values are silently ignored
+# (falls back to name auto-detection).
+#
+# template_family: "deepseek"
+
+# ---------------------------------------------------------------------------
+# SYSTEM PROMPT PREFIX
+# ---------------------------------------------------------------------------
+# Prepended to every system/developer turn. Useful for an invisible system
+# instruction before the user's first message.
+#
+# system_prompt_prefix: "You are a helpful assistant running through llmconduit."
+
+# ---------------------------------------------------------------------------
+# REQUEST LOGGING
+# ---------------------------------------------------------------------------
+# Single-file append-only JSONL log of ALL upstream requests (in non-routing
+# mode or for route paths). In routing mode, each upstream carries its own log
+# path -- the top-level path is then only used by route paths.
+#
+# upstream_request_log_path: "/var/log/llmconduit/requests.jsonl"
+# debug_log_max_age_hours: 24                 # auto-rotate log files older than N hours
+
+# ---------------------------------------------------------------------------
+# PER-TURN DEBUG CAPTURE (F1)
+# ---------------------------------------------------------------------------
+# Writes one <api_call_id>.json per turn with the full inbound request,
+# translated upstream request, raw upstream response, and served response
+# bytes (redacted).
+#
+# turn_capture_dir: "/var/log/llmconduit/turns"
+
+# ---------------------------------------------------------------------------
+# IMAGE AGENT (G4 -- vision offload)
+# ---------------------------------------------------------------------------
+# When the backend cannot natively see images, llmconduit can strip them and
+# forward to a dedicated vision backend. Off by default.
+#
+# image_agent_enabled: true
+# vision_url: "http://vision-backend:8000/v1"
+# vision_model: "gpt-4o"
+# image_cache_max_size: 100                    # LRU capacity (default)
+# image_cache_ttl_secs: 300                    # TTL in seconds (default)
+
+# Policy for residual images reaching a non-native-vision backend:
+#   placeholder -- replace with instructive text (default)
+#   reject      -- fail the turn with 4xx
+unsupported_image_policy: placeholder
+
+# ---------------------------------------------------------------------------
+# WEB SEARCH (Brave API)
+# ---------------------------------------------------------------------------
+# brave_base_url: "https://api.search.brave.com/res/v1"   # default
+# brave_api_key: "sk-..."                                  # or set BRAVE_SEARCH_API_KEY env
+# brave_max_results: 5                                     # default
+
+# ---------------------------------------------------------------------------
+# TIMEOUTS
+# ---------------------------------------------------------------------------
+request_timeout_secs: 60                         # default (per-request upstream timeout)
+connect_timeout_secs: 10                         # default (TCP connect timeout)
+# max_web_search_rounds: 5                       # default
+
+# ---------------------------------------------------------------------------
+# TOKEN / MEMORY / SECURITY LIMITS
+# ---------------------------------------------------------------------------
+# min_completion_tokens: 4096                    # floor for shrink-and-retry (default)
+# max_replay_entries: 1000                       # max conversation replay entries (default)
+
+# SSE frame byte ceiling (G6 DoS guard). An oversized/never-terminated upstream
+# SSE frame is rejected beyond this point before unbounded buffer growth.
+# max_sse_frame_bytes: 8388608                    # 8 MiB (default)
+
+# Inbound request body cap. Requests larger than this get HTTP 413.
+# max_request_body_bytes: 10485760                 # 10 MiB (default)
+
+# ---------------------------------------------------------------------------
+# CONTENT FLATTENING
+# ---------------------------------------------------------------------------
+# Flatten mixed text+image blocks into simple text blocks for non-vision
+# backends. On by default.
+# flatten_content: true
+
+# ---------------------------------------------------------------------------
+# PER-MODEL PRICE TABLE
+# ---------------------------------------------------------------------------
+# Billing rates (USD per 1k tokens) for the dashboard cost rollup. Keyed by
+# served model id (case-insensitive fallback). Can be wholesale-replaced by
+# LLMCONDUIT_PRICE_TABLE_JSON env var. Non-finite rates (NaN/Inf) are silently
+# dropped.
+#
+# price_table:
+#   gpt-4o:
+#     input_per_1k: 2.50
+#     output_per_1k: 10.00
+#     cached_per_1k: 1.25
+#     # cached_price_configured: true   # additive boolean (gap 07); auto-detected
+#   deepseek-chat:
+#     input_per_1k: 0.15
+#     output_per_1k: 0.60
+#   claude-sonnet-4:
+#     input_per_1k: 3.00
+#     output_per_1k: 15.00
+
+# =============================================================================
+# ENVIRONMENT OVERRIDE CHEAT SHEET
+# =============================================================================
+# Env vars matched in `apply_env_overrides` (src/config.rs). YAML field always
+# wins when the env var is unset / empty / unparseable.
+#
+# LLMCONDUIT_BIND_ADDR                     bind_addr
+# LLMCONDUIT_UPSTREAM_BASE_URL             upstream_base_url
+# LLMCONDUIT_UPSTREAM_API_KEY              upstream_api_key
+# LLMCONDUIT_UPSTREAM_MODEL                upstream_model
+# LLMCONDUIT_TEMPLATE_FAMILY               template_family (global)
+# LLMCONDUIT_SYSTEM_PROMPT_PREFIX          system_prompt_prefix
+# LLMCONDUIT_UPSTREAM_REQUEST_LOG_PATH     upstream_request_log_path
+# LLMCONDUIT_TURN_CAPTURE_DIR              turn_capture_dir
+# LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON     upstream_chat_kwargs (JSON map, wholesale replace)
+# LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS  upstream_failure_cooldown_secs
+# LLMCONDUIT_BRAVE_BASE_URL                brave_base_url
+# LLMCONDUIT_BRAVE_MAX_RESULTS             brave_max_results
+# LLMCONDUIT_REQUEST_TIMEOUT_SECS          request_timeout_secs
+# LLMCONDUIT_CONNECT_TIMEOUT_SECS          connect_timeout_secs
+# LLMCONDUIT_MAX_WEB_SEARCH_ROUNDS         max_web_search_rounds
+# LLMCONDUIT_FLATTEN_CONTENT               flatten_content
+# LLMCONDUIT_MAX_REPLAY_ENTRIES            max_replay_entries
+# LLMCONDUIT_DEBUG_LOG_MAX_AGE_HOURS       debug_log_max_age_hours
+# LLMCONDUIT_MIN_COMPLETION_TOKENS         min_completion_tokens
+# LLMCONDUIT_MAX_SSE_FRAME_BYTES           max_sse_frame_bytes
+# LLMCONDUIT_MAX_REQUEST_BODY_BYTES        max_request_body_bytes
+# LLMCONDUIT_IMAGE_AGENT_ENABLED           image_agent_enabled
+# LLMCONDUIT_VISION_URL                    vision_url
+# LLMCONDUIT_VISION_MODEL                  vision_model
+# LLMCONDUIT_IMAGE_CACHE_MAX_SIZE          image_cache_max_size
+# LLMCONDUIT_IMAGE_CACHE_TTL_SECS          image_cache_ttl_secs
+# LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY      unsupported_image_policy (placeholder|reject)
+# LLMCONDUIT_PRICE_TABLE_JSON              price_table (JSON map, wholesale replace)
+# BRAVE_SEARCH_API_KEY                     brave_api_key
+# OPENAI_API_KEY                           upstream_api_key (fallback when no YAML/env-first set)

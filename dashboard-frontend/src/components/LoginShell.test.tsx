@@ -19,16 +19,18 @@ describe('LoginShell', () => {
     expect(screen.getByRole('button', { name: /sign in/i })).toBeInTheDocument();
   });
 
-  it('POSTs /dashboard/login and flips auth on success', async () => {
+  it('POSTs /dashboard/login and reloads the server-authored bootstrap on success', async () => {
     const login = vi.fn().mockResolvedValue(undefined);
+    const onAuthenticated = vi.fn();
     const client = { login } as unknown as DashboardClient;
-    render(<LoginShell client={client} />);
+    render(<LoginShell client={client} onAuthenticated={onAuthenticated} />);
 
     fireEvent.change(screen.getByLabelText('Dashboard token'), { target: { value: 'secret' } });
     fireEvent.click(screen.getByRole('button', { name: /sign in/i }));
 
     await waitFor(() => expect(login).toHaveBeenCalledWith({ token: 'secret' }));
-    await waitFor(() => expect(authStore.getState().authenticated).toBe(true));
+    expect(onAuthenticated).toHaveBeenCalledOnce();
+    expect(authStore.getState().authenticated).toBe(false);
   });
 
   it('shows an error and stays unauthenticated when login rejects', async () => {

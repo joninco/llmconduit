@@ -1726,11 +1726,16 @@ async fn serves_embedded_debug_web_ui_when_enabled() {
     // Loopback + no token env → D7 dev-open mode: `/debug` serves without a
     // login. The client logic now lives in the externalized `/debug/app.js`
     // (D7) so `/debug` can ship a strict `script-src 'self'` CSP.
-    let app = llmconduit::build_app_with_options(
+    let (app, gateway) = llmconduit::build_app_with_gateway_and_options(
         test_config(),
+        None,
         llmconduit::AppOptions {
             with_debug_ui: true,
         },
+    );
+    assert!(
+        gateway.metrics().latest_published_metrics().is_some(),
+        "the DI root installs a shared initial cut synchronously before any REST/WS read"
     );
     let response = app
         .oneshot(
@@ -1896,12 +1901,21 @@ fn authed_router(
     let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(bind, env)
         .expect("auth builds")
         .auth;
-    let gateway = test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default())
-        .as_ref()
-        .clone()
-        .with_dashboard_auth(Some(Arc::clone(&auth)));
+    let gateway = Arc::new(
+        test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default())
+            .as_ref()
+            .clone()
+            .with_dashboard_auth(Some(Arc::clone(&auth)))
+            .with_metrics(llmconduit::metrics::MetricsLayer::new()),
+    );
+    let _ = gateway.metrics().publish_metrics_cut(
+        gateway.flow_store(),
+        &gateway.provider_health_publisher(),
+        gateway.debug_snapshot().last_sequence,
+        false,
+    );
     let router = llmconduit::http::build_router(
-        Arc::new(gateway),
+        gateway,
         llmconduit::http::RouterOptions {
             with_debug_ui: true,
             register_protected_routes: true,
@@ -1912,9 +1926,8 @@ fn authed_router(
 
 /// Like [`authed_router`] but ALSO returns the `Arc<Gateway>` so a D7b test can drive a
 /// real flow (advancing the monitor sequence + the FlowStore independently) and then read
-/// `debug_snapshot().last_sequence` / `flow_store().flow_seq()` to assert the live
-/// `/dashboard/ws` snapshot sources its flow-domain dedup cursor from the MONITOR
-/// sequence (D7b R4 finding 1), not the FlowStore `flow_seq`. The SAME `Arc<Gateway>` is
+/// `flow_store().flow_seq()` to assert the live `/dashboard/ws` snapshot sources its
+/// flow-domain dedup cursor from the authoritative FlowStore. The SAME `Arc<Gateway>` is
 /// shared with the router, so a flow driven through the returned handle is visible to the
 /// socket the router serves.
 fn authed_router_with_gateway(
@@ -1932,7 +1945,14 @@ fn authed_router_with_gateway(
         test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default())
             .as_ref()
             .clone()
-            .with_dashboard_auth(Some(Arc::clone(&auth))),
+            .with_dashboard_auth(Some(Arc::clone(&auth)))
+            .with_metrics(llmconduit::metrics::MetricsLayer::new()),
+    );
+    let _ = gateway.metrics().publish_metrics_cut(
+        gateway.flow_store(),
+        &gateway.provider_health_publisher(),
+        gateway.debug_snapshot().last_sequence,
+        false,
     );
     let router = llmconduit::http::build_router(
         Arc::clone(&gateway),
@@ -2622,17 +2642,11 @@ async fn dashboard_ws_sends_initial_snapshot_frame() {
     server.abort();
 }
 
-/// D7b R4 finding 1 (end-to-end): the live `/dashboard/ws` snapshot sources its
-/// flow-domain dedup cursor from the MONITOR's `last_sequence` (captured atomically with
-/// the transcript), NOT the FlowStore `flow_seq`. Drive a real flow so the monitor
-/// sequence advances (the engine emits RequestUpsert/segments/status/usage), then connect
-/// and assert the snapshot's `cursors.flow_seq` equals `debug_snapshot().last_sequence`.
-/// The flow-domain live frames are stamped with this same monitor clock, so a flow frame
-/// with `seq > last_sequence` applies and one already reflected is deduped — the whole
-/// point of the fix (a delayed monitor update can no longer inherit a newer FlowStore
-/// `record_seq` and dedup-drop the final flow frame).
+/// End-to-end: the live `/dashboard/ws` snapshot sources its flow-domain cursor from
+/// the authoritative FlowStore cut, independently of the monitor transcript cursor.
+/// Drive a real flow, then assert the snapshot baseline equals `flow_store().flow_seq()`.
 #[tokio::test]
-async fn dashboard_ws_snapshot_flow_cursor_is_monitor_last_sequence() {
+async fn dashboard_ws_snapshot_flow_cursor_is_flow_store_sequence() {
     let (app, auth, gateway) =
         authed_router_with_gateway("0.0.0.0:4000".parse().unwrap(), &authed_env());
 
@@ -2648,12 +2662,10 @@ async fn dashboard_ws_snapshot_flow_cursor_is_monitor_last_sequence() {
     let _events = collect_stream(stream).await;
     let _record = d3_await_terminal(&gateway, &api_call_id).await;
 
-    // Read the monitor sequence the snapshot must source its flow cursor from. The flow
-    // had real activity, so this is strictly > 0.
-    let monitor_last_seq = gateway.debug_snapshot().last_sequence;
+    let flow_seq = gateway.flow_store().flow_seq();
     assert!(
-        monitor_last_seq > 0,
-        "the driven flow advanced the monitor sequence past 0"
+        flow_seq > 0,
+        "the driven flow advanced the FlowStore sequence past 0"
     );
 
     let (cookie, _exp) = auth.issue_session();
@@ -2663,13 +2675,64 @@ async fn dashboard_ws_snapshot_flow_cursor_is_monitor_last_sequence() {
     let value: serde_json::Value = serde_json::from_slice(&payload).expect("snapshot is JSON");
     assert_eq!(value["type"], serde_json::json!("snapshot"));
 
-    // The crux: the snapshot's flow-domain dedup baseline is the MONITOR's last_sequence
-    // (the monitor clock the live flow frames are stamped with) — NOT the FlowStore seq.
     assert_eq!(
         value["cursors"]["flow_seq"].as_u64(),
-        Some(monitor_last_seq),
-        "the snapshot flow cursor MUST be the monitor's last_sequence (D7b R4 finding 1)"
+        Some(flow_seq),
+        "the snapshot flow cursor is the authoritative FlowStore cut"
     );
+
+    drop(socket);
+    server.abort();
+}
+
+#[tokio::test]
+async fn dashboard_ws_live_flow_comes_from_authoritative_store_event() {
+    let (app, auth, gateway) =
+        authed_router_with_gateway("0.0.0.0:4000".parse().unwrap(), &authed_env());
+    let (cookie, _exp) = auth.issue_session();
+    let (mut socket, server) = ws_connect(app, &cookie, "https://dash.example.com").await;
+
+    // Drain the required initial snapshot so the server has subscribed and installed
+    // its FlowStore baseline before we mutate the store.
+    let (_, snapshot) = ws_read_frame(&mut socket).await;
+    let snapshot: serde_json::Value = serde_json::from_slice(&snapshot).expect("snapshot JSON");
+    let baseline = snapshot["cursors"]["flow_seq"].as_u64().unwrap();
+
+    gateway.flow_store().open(
+        "api_authoritative".to_string(),
+        "POST".to_string(),
+        "/v1/responses".to_string(),
+        llmconduit::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+        None,
+        llmconduit::dashboard_flow::ClientAttribution::none(),
+    );
+
+    // The retained transcript replay may be queued immediately after the snapshot;
+    // skip monitor frames until the authoritative flow-domain event arrives.
+    let mut flow_frame = None;
+    for _ in 0..4 {
+        let (opcode, payload) = ws_read_frame(&mut socket).await;
+        assert_eq!(opcode, 0x1);
+        let frame: serde_json::Value =
+            serde_json::from_slice(&payload).expect("dashboard frame JSON");
+        if frame["domain"] == serde_json::json!("flow") {
+            flow_frame = Some(frame);
+            break;
+        }
+    }
+    let frame = flow_frame.expect("authoritative flow event after transcript replay");
+    assert_eq!(frame["domain"], serde_json::json!("flow"));
+    assert!(frame["seq"].as_u64().unwrap() > baseline);
+    let live = &frame["batch"][0];
+    assert_eq!(live["type"], serde_json::json!("flow_status"));
+    assert_eq!(live["phase"], serde_json::json!("open"));
+    assert_eq!(live["revision"], serde_json::json!(1));
+    assert_eq!(live["api_call_id"], serde_json::json!("api_authoritative"));
+    assert_eq!(live["method"], serde_json::json!("POST"));
+    assert_eq!(live["uri"], serde_json::json!("/v1/responses"));
+    assert_eq!(live["status"], serde_json::json!("open"));
+    assert!(live.get("cost").is_some(), "full FlowRow carries cost");
+    assert_eq!(live["cost_confidence"], serde_json::json!("unavailable"));
 
     drop(socket);
     server.abort();
@@ -5694,6 +5757,7 @@ async fn d13_routes_absent_without_debug_ui() {
         "/dashboard/api/flows",
         "/dashboard/api/flows/api_x",
         "/dashboard/api/metrics",
+        "/dashboard/api/overview",
         "/dashboard/api/topology",
         "/dashboard/api/catalog",
         "/dashboard/api/snapshot",
@@ -5737,6 +5801,7 @@ async fn d13_routes_present_in_dev_open_with_debug_ui() {
     for uri in [
         "/dashboard/api/flows",
         "/dashboard/api/metrics",
+        "/dashboard/api/overview",
         "/dashboard/api/topology",
         "/dashboard/api/catalog",
         "/dashboard/api/snapshot",
@@ -5881,6 +5946,93 @@ async fn d13_metrics_shape_carries_seq_and_windows() {
             assert!(tile[field].is_number(), "windows.{window} has {field}");
         }
     }
+}
+
+#[tokio::test]
+async fn d13_overview_live_filters_and_historical_cut_use_terminal_facts() {
+    let auth = llmconduit::dashboard_auth::DashboardAuth::from_env(
+        "0.0.0.0:4000".parse().unwrap(),
+        &d13_env(false),
+    )
+    .expect("auth builds")
+    .auth;
+    let gateway = d13_gateway(Arc::new(MockUpstream::default()), Arc::clone(&auth));
+    let app = d13_router(Arc::clone(&gateway));
+    let input = llmconduit::dashboard_flow::TerminalMetricsInputs {
+        model_requested: Some("requested-a".to_string()),
+        model_served: Some("served-a".to_string()),
+        endpoint: "/v1/responses".to_string(),
+        upstream: Some("provider-a".to_string()),
+        client_label: Some("client-a".to_string()),
+        usage: Some(llmconduit::dashboard_flow::FlowUsage {
+            prompt: 128,
+            completion: 32,
+            total: 160,
+            cached: Some(0),
+            reasoning: None,
+        }),
+        failure_reason: llmconduit::dashboard_flow::TerminalReasonClass::Stop,
+        cost_usd: Some(0.125),
+        cost_confidence: llmconduit::dashboard_flow::TerminalCostConfidence::Confident,
+        effective_route_limit: Some(8_192),
+        ..Default::default()
+    };
+    gateway.metrics().record_terminal_inputs(
+        llmconduit::dashboard_flow::FlowStatus::Completed,
+        12,
+        &input,
+    );
+    gateway.metrics().publish_metrics_cut(
+        gateway.flow_store(),
+        &gateway.provider_health_publisher(),
+        gateway.debug_snapshot().last_sequence,
+        false,
+    );
+
+    let live = d13_json(
+        d13_authed_get(
+            &app,
+            &auth,
+            "/dashboard/api/overview?window=m5&model=%20served-a%20&upstream=%20provider-a%20&client=%20client-a%20&status=%20COMPLETED%20",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(live["scope"]["window"], "m5");
+    assert_eq!(live["scope"]["status"], "completed");
+    assert_eq!(live["scope"]["model"], "served-a");
+    assert_eq!(live["scope"]["upstream"], "provider-a");
+    assert_eq!(live["scope"]["client"], "client-a");
+    assert_eq!(live["totals"]["requests"], 1);
+    assert_eq!(live["cost"]["total_usd"], 0.125);
+    assert_eq!(live["cost"]["confidence"], "confident");
+    assert_eq!(live["context"]["effective_route_limit_min"], 8_192);
+    assert_eq!(live["tokens"]["reasoning"], serde_json::Value::Null);
+    assert_eq!(live["provider_attempts_global"]["scope"], "global");
+
+    let cut = gateway
+        .metrics()
+        .snapshot(gateway.flow_store(), &gateway.provider_health_publisher())
+        .expect("historical cut");
+    let historical = d13_json(
+        d13_authed_get(
+            &app,
+            &auth,
+            &format!(
+                "/dashboard/api/overview?window=m1&at={}&model=served-a",
+                cut.taken_at_ms
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        historical["scope"]["selected_at_ms"].as_u64(),
+        Some(cut.taken_at_ms as u64)
+    );
+    assert_eq!(historical["metrics_seq"], cut.cursors.metrics_seq);
+    assert_eq!(historical["totals"]["requests"], 1);
+    assert_eq!(historical["cost"]["total_usd"], 0.125);
 }
 
 #[tokio::test]
@@ -6121,6 +6273,12 @@ async fn d13_flows_filters_and_carries_flow_seq_and_cost() {
         .iter()
         .find(|row| row["api_call_id"] == serde_json::json!(completed))
         .expect("completed row present");
+    assert!(
+        completed_row["revision"]
+            .as_u64()
+            .is_some_and(|value| value > 0),
+        "flow rows carry the authoritative per-flow revision"
+    );
     let cost = completed_row["cost"].as_f64().expect("cost priced");
     assert!(
         (cost - 0.425).abs() < 1e-9,
@@ -6371,6 +6529,7 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
     );
 
     // (2) `/flows/:id` shows the THREE bodies + usage + deltas + flow_seq.
+    let expected_delta_watermark = gateway.debug_snapshot().last_sequence;
     let detail =
         d13_json(d13_get(&app, &format!("/dashboard/api/flows/{api_call_id}")).await).await;
     assert!(
@@ -6378,6 +6537,15 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
         "detail carries the flow cursor"
     );
     assert_eq!(detail["api_call_id"], serde_json::json!(api_call_id));
+    assert!(
+        detail["revision"].as_u64().is_some_and(|value| value > 0),
+        "detail carries the same authoritative revision domain"
+    );
+    assert_eq!(
+        detail["deltas_through_monitor_seq"],
+        serde_json::json!(expected_delta_watermark),
+        "detail exposes the monitor cursor of the same snapshot that supplied deltas"
+    );
     // The two on-wire bodies D2 captures: the INBOUND request (middleware) and the
     // UPSTREAM chat body (the leaf). Both are parsed JSON objects in the detail.
     assert!(
@@ -6450,6 +6618,16 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
         "the upstream reported cached ⇒ a present measured value, not absent"
     );
 
+    // Flush the same process-wide immutable cut the one-second publisher emits in
+    // production. Keeping this deterministic avoids a wall-clock sleep/race in the
+    // integration test while preserving the published-cut-only REST contract.
+    gateway.metrics().publish_metrics_cut(
+        gateway.flow_store(),
+        &gateway.provider_health_publisher(),
+        gateway.debug_snapshot().last_sequence,
+        false,
+    );
+
     // (3) `/metrics` populated — the completed flow bumped the rings.
     let metrics = d13_json(d13_get(&app, "/dashboard/api/metrics").await).await;
     assert!(
@@ -6467,6 +6645,21 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
         metrics["windows"]["m1"]["cost_confidence"],
         serde_json::json!("confident")
     );
+
+    // The exact Overview is fed by the same evict-safe terminal payload and retains
+    // the terminal-time price rather than repricing the flow at read time.
+    let overview = d13_json(
+        d13_get(
+            &app,
+            "/dashboard/api/overview?window=m1&model=glm-5.1&status=completed",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(overview["totals"]["requests"], 1);
+    assert_eq!(overview["cost"]["confidence"], "confident");
+    assert!(overview["cost"]["total_usd"].as_f64().is_some());
+    assert_eq!(overview["served_models"][0]["key"], "glm-5.1");
 
     // (4) `/topology` populated — price table + a topology_seq cursor.
     let topology = d13_json(d13_get(&app, "/dashboard/api/topology").await).await;

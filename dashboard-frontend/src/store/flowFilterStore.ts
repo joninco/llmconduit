@@ -14,11 +14,14 @@
  */
 import { createStore } from 'zustand/vanilla';
 import { EMPTY_FILTERS, type FlowFilters } from '../components/FlowTable/filterTypes';
+import { clearHashFilters, readHashScope, updateHashScope } from '../router/useHashRoute';
 
 export interface FlowFilterState {
   filters: FlowFilters;
   /** Replace the whole filter set (the FlowTable's FilterBar onChange; it owns chip toggles). */
   setFilters: (next: FlowFilters) => void;
+  /** Browser back/forward hydration; does not write the hash again. */
+  hydrate: (next: FlowFilters) => void;
   /**
    * Cross-link from a topology node: SET the upstream filter to that target (finding 10). A
    * cross-link is "click here → SEE those flows", so it deterministically SETS the facet — it does
@@ -33,17 +36,40 @@ export interface FlowFilterState {
   clear: () => void;
 }
 
+const initialScope = readHashScope();
+
 export const flowFilterStore = createStore<FlowFilterState>((set) => ({
-  filters: EMPTY_FILTERS,
-  setFilters: (filters) => set({ filters }),
+  filters: {
+    status: initialScope.status,
+    model: initialScope.model,
+    upstream: initialScope.upstream,
+    client: initialScope.client,
+  },
+  setFilters: (filters) => {
+    set({ filters });
+    updateHashScope(filters);
+  },
+  hydrate: (filters) => set({ filters }),
   // Cross-link setters are DETERMINISTIC (finding 10): a click SETS the facet so the table always
   // lands filtered to what was clicked. (The FilterBar owns the toggle-off-on-repeat chip behavior.)
-  setUpstream: (upstream) => set((s) => ({ filters: { ...s.filters, upstream } })),
-  setModel: (model) => set((s) => ({ filters: { ...s.filters, model } })),
+  setUpstream: (upstream) => {
+    set((s) => ({ filters: { ...s.filters, upstream } }));
+    updateHashScope({ upstream });
+  },
+  setModel: (model) => {
+    set((s) => ({ filters: { ...s.filters, model } }));
+    updateHashScope({ model });
+  },
   // Gap 15: a "by client" roll-up click SETS the client facet so the table lands scoped to that
   // client (the FilterBar owns the toggle-off-on-repeat chip behavior, like the other facets).
-  setClient: (client) => set((s) => ({ filters: { ...s.filters, client } })),
-  clear: () => set({ filters: EMPTY_FILTERS }),
+  setClient: (client) => {
+    set((s) => ({ filters: { ...s.filters, client } }));
+    updateHashScope({ client });
+  },
+  clear: () => {
+    set({ filters: EMPTY_FILTERS });
+    clearHashFilters();
+  },
 }));
 
 export type FlowFilterStore = typeof flowFilterStore;

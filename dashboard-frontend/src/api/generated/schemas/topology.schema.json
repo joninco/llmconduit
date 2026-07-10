@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TopologySnapshot",
+  "description": "The full `/api/topology`-shaped snapshot body (nodes + edges + the price table)\nPLUS its `topology_seq` cursor. Mirrors the frontend `TopologyResponse`. The\nprice table is empty until D13 wires the price config; an empty map satisfies\nthe frontend `isPriceTable` guard (vacuously every value is a finite price).",
+  "type": "object",
+  "properties": {
+    "edges": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TopologyEdge"
+      }
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TopologyNode"
+      }
+    },
+    "price_table": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelPrice"
+      }
+    },
+    "topology_seq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "topology_seq",
+    "nodes",
+    "edges",
+    "price_table"
+  ],
+  "$defs": {
+    "ModelPrice": {
+      "description": "One model's billing rates (T13/D13), per 1k tokens. Field names mirror the\nFROZEN frontend `ModelPrice` contract (`dashboard-frontend/src/api/types.ts`)\nbyte-for-byte so the `/dashboard/api/topology` `price_table` validates. All\nthree rates are finite (the frontend `isModelPrice` guard rejects NaN/Inf);\n`cached_per_1k` defaults to `0.0` when a config entry omits it. This is the\nSINGLE `ModelPrice` definition for the crate — the dashboard WS topology\nsnapshot re-exports it so REST + WS agree on the wire shape.\n\nGap 07 — cached-price PRESENCE seam. `cached_per_1k` keeps its existing numeric\ntype (`f64`, default `0.0`), but a `0.0` is AMBIGUOUS: \"the provider charges 0\nfor cache reads\" is indistinguishable from \"the config entry omitted the rate\".\nThe ADDITIVE `cached_price_configured` boolean records which it is — set `true`\nonly when the source actually carried a `cached_per_1k` key (decided in the\ncustom [`Deserialize`] below). Downstream cost-CONFIDENCE (`dashboard_api`)\nconsumes THIS flag, NOT the numeric `0.0`: a flow that billed cached tokens at a\nCONFIGURED rate is `confident`, one that fell back to the default `0.0` is\n`estimated`. The flag is serialized additively (the frontend `isModelPrice`\naccepts it); `cached_per_1k` stays `number` so the topology/Sankey price table is\nNOT a second contract migration (spec 07 item 3).",
+      "type": "object",
+      "properties": {
+        "cached_per_1k": {
+          "description": "USD per 1k CACHED (cache-read) prompt tokens. Defaults to `0.0` when the\nconfig entry omits it (a provider with no cache discount). PRESERVES its\nnumeric type (gap 07) — presence is carried by `cached_price_configured`, not\nby nulling this field.",
+          "type": "number",
+          "format": "double"
+        },
+        "cached_price_configured": {
+          "description": "Gap 07 — whether `cached_per_1k` was EXPLICITLY configured (a `cached_per_1k`\nkey was present in the source), distinguishing a real configured `0.0`\ncache-read rate from an OMITTED one (which also defaults to `0.0`). The\ncost-confidence seam reads this so a default-`0.0` cached charge is flagged\n`estimated`, never silently `confident`. Additive on the wire.",
+          "type": "boolean",
+          "default": false
+        },
+        "input_per_1k": {
+          "description": "USD per 1k PROMPT (input) tokens.",
+          "type": "number",
+          "format": "double"
+        },
+        "output_per_1k": {
+          "description": "USD per 1k COMPLETION (output) tokens.",
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "input_per_1k",
+        "output_per_1k",
+        "cached_per_1k",
+        "cached_price_configured"
+      ]
+    },
+    "ProviderErrorDistribution": {
+      "description": "Gap 12 — the bounded per-error-class failure tally for one provider (a window, or a\nsingle slot). The key space is the FIXED [`AttemptErrorClass`] taxonomy (6 bounded\nsnake_case codes from gap 03 — NEVER raw upstream text), so this is a fixed-size\ncounter array, not an unbounded map. `skip_serializing_if` keeps a `0` class ABSENT\non the wire — the distribution lists only the classes a provider actually hit. A\nper-class `0` here is honest (that class did not occur); the don't-lie-with-zeros\nrule lives at the PROVIDER level (a provider with NO samples in the window is absent\nfrom the per-provider report entirely, never a fabricated all-zero distribution).",
+      "type": "object",
+      "properties": {
+        "connect": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "http_status": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "other": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "terminal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "timeout": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "ProviderLatency": {
+      "description": "Gap 12 — the public per-provider latency + error-distribution DTO (additive on the\nD4 topology node; consumed by spec 13). Percentiles are `derived` ms over the\nprovider's ATTEMPT-latency histogram (a FAILED primary's latency is included — spec\n12 — so final-served latency alone cannot hide an unhealthy provider). `error_rate`\nis the percentage of the provider's attempts that FAILED. A provider with zero\nin-window samples is ABSENT (don't-lie-with-zeros), so a present DTO always has\n`samples >= 1`. All floats are finite (the frozen finite-number wire contract).",
+      "type": "object",
+      "properties": {
+        "data_quality": {
+          "description": "DQ tag — always `derived` for a present entry (the `unavailable` case is absence).",
+          "$ref": "#/$defs/ProviderMetricQuality"
+        },
+        "error_rate": {
+          "description": "Percentage of attempts that failed (`failed / samples × 100`). A genuine MEASURED\n`0.0` for an all-served provider (distinct from the `unavailable`/absent case).",
+          "type": "number",
+          "format": "double"
+        },
+        "errors": {
+          "description": "Bounded per-class failure tally (gap 03 taxonomy). Absent classes are omitted.",
+          "$ref": "#/$defs/ProviderErrorDistribution"
+        },
+        "failed": {
+          "description": "Of `samples`, the count that FAILED before serving (failed primaries included).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "p50": {
+          "description": "`derived` p50 attempt latency (ms).",
+          "type": "number",
+          "format": "double"
+        },
+        "p95": {
+          "description": "`derived` p95 attempt latency (ms).",
+          "type": "number",
+          "format": "double"
+        },
+        "p99": {
+          "description": "`derived` p99 attempt latency (ms).",
+          "type": "number",
+          "format": "double"
+        },
+        "provider": {
+          "description": "The provider label these metrics are for (the bounded provider/route id, or the\n`__other__` overflow bucket once the per-slot provider cap is exceeded).",
+          "type": "string"
+        },
+        "samples": {
+          "description": "Total ATTEMPTS to this provider in the window (served + failed) — the per-provider\nmeasurability denominator. Always `>= 1` (a zero-sample provider is absent).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "served": {
+          "description": "Of `samples`, the count that SERVED (produced the first chunk).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "provider",
+        "data_quality",
+        "samples",
+        "served",
+        "failed",
+        "p50",
+        "p95",
+        "p99",
+        "error_rate",
+        "errors"
+      ]
+    },
+    "ProviderMetricQuality": {
+      "description": "Gap 12 — the data-quality tag for a per-provider metric. Every per-provider latency\nfigure is `derived` (computed from the provider's own attempt-latency histogram). The\n`unavailable` case (a provider with no in-window samples) is represented by the\nABSENCE of a [`ProviderLatency`] entirely, not by a variant here — so a present DTO is\nalways a real `derived` measurement (don't-lie-with-zeros). Serializes snake_case to\nmatch the cross-cutting DQ-tag contract.",
+      "type": "string",
+      "enum": [
+        "derived"
+      ]
+    },
+    "ProviderStatus": {
+      "description": "Per-provider serving status for the topology map (D4). `Cooling` while inside\nthe failure cooldown window; `Down` once a cooling provider has also crossed\n[`DOWN_THRESHOLD`] consecutive failures; `Healthy` otherwise.",
+      "type": "string",
+      "enum": [
+        "healthy",
+        "cooling",
+        "down"
+      ]
+    },
+    "TopologyEdge": {
+      "description": "A topology edge (gateway → provider). The aggregate throughput/token/cost\nrates are D5/D13 roll-ups; until a price/throughput aggregation feeds them\nthey serialize as `0.0` (the contract requires the keys present + finite, not\na specific value), so the byte-shape is exact while the rich values land in\nD13.",
+      "type": "object",
+      "properties": {
+        "cost_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "from": {
+          "type": "string"
+        },
+        "throughput": {
+          "type": "number",
+          "format": "double"
+        },
+        "to": {
+          "type": "string"
+        },
+        "tokens_per_sec": {
+          "type": "number",
+          "format": "double"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "throughput",
+        "tokens_per_sec",
+        "cost_per_sec"
+      ]
+    },
+    "TopologyNode": {
+      "description": "A topology node — the D4 `ProviderHealth` shape, except `catalog_size` is\nflattened from `Option<u64>` to a non-null `u64` (defaulting `None → 0`): the\nfrozen frontend contract validates `catalog_size` as a required unsigned int\n(NOT nullable), unlike the other `Option` fields which serde emits as `null`.\nEvery other field mirrors `ProviderHealth` exactly (keys always present, the\nnullable ones as JSON `null`).",
+      "type": "object",
+      "properties": {
+        "base_url": {
+          "type": "string"
+        },
+        "catalog_fetched_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "catalog_size": {
+          "description": "Flattened from `ProviderHealth::catalog_size: Option<u64>` to a required\nnon-null count (`None → 0`) per the frozen contract.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "consecutive_failures": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cooling_until_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "failover_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string"
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "per_provider": {
+          "description": "Gap 12 — the ADDITIVE per-provider latency (p50/p95/p99) + error distribution for\nthis provider over the m1 window, aggregated off the evict-safe per-attempt trace\n(spec 03), NOT the point-in-time `ProviderHealth` counters. `None`/ABSENT when the\nprovider had ZERO attempt samples in the window (don't-lie-with-zeros — the\nfrontend renders `—`, never a fabricated `0ms`/`0%`). `skip_serializing_if` keeps\nthe field off the wire entirely for a no-sample node, so the EXISTING frozen\n`TopologyNode` contract (D9/D10/D12) is undisturbed; spec 13 reads this field. The\nLIVE WS topology frame leaves it `None` (the WS frame does not join metrics, like\nits `0.0` edge rates) — it is populated only on the REST `/topology` + `/snapshot`\nreshape, which already join the m1 window.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderLatency"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "route": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "served_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ProviderStatus"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "route",
+        "base_url",
+        "status",
+        "cooling_until_ms",
+        "last_error",
+        "served_count",
+        "failover_count",
+        "consecutive_failures",
+        "catalog_fetched_ms",
+        "catalog_size"
+      ]
+    }
+  }
+}

@@ -61,6 +61,19 @@ describe('RadialTopology — click → filter wiring', () => {
     fireEvent.click(node);
     expect(onSelect).toHaveBeenCalledWith('openai');
   });
+
+  it('exposes provider nodes as labelled buttons activated by Enter/Space', () => {
+    const onSelect = vi.fn();
+    const { container } = render(<RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={onSelect} />);
+    const node = container.querySelector('[data-node-id="openai"]')!;
+    expect(node.getAttribute('role')).toBe('button');
+    expect(node.getAttribute('tabindex')).toBe('0');
+    expect(node.getAttribute('aria-label')).toMatch(/openai provider.*down status/i);
+    fireEvent.keyDown(node, { key: 'Enter' });
+    fireEvent.keyDown(node, { key: ' ' });
+    expect(onSelect).toHaveBeenNthCalledWith(1, 'openai');
+    expect(onSelect).toHaveBeenNthCalledWith(2, 'openai');
+  });
 });
 
 describe('RadialTopology — cooldown tooltip hover reporting', () => {
@@ -75,6 +88,16 @@ describe('RadialTopology — cooldown tooltip hover reporting', () => {
     expect(typeof arg.x).toBe('number');
     expect(typeof arg.y).toBe('number');
     fireEvent.mouseLeave(container.querySelector('[data-node-id="vllm-b"]')!);
+    expect(onHover).toHaveBeenLastCalledWith(null);
+  });
+
+  it('focus opens the same provider tooltip channel and blur closes it', () => {
+    const onHover = vi.fn();
+    const { container } = render(<RadialTopology nodes={NODES} edges={EDGES} onSelectUpstream={() => {}} onHover={onHover} />);
+    const node = container.querySelector('[data-node-id="vllm-a"]')!;
+    fireEvent.focus(node);
+    expect(onHover.mock.calls.at(-1)?.[0]?.id).toBe('vllm-a');
+    fireEvent.blur(node);
     expect(onHover).toHaveBeenLastCalledWith(null);
   });
 });

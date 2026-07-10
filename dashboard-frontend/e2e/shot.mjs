@@ -44,7 +44,7 @@ await page.addInitScript(seedAndFreeze, FIXED_NOW);
 await page.goto(BASE, { waitUntil: 'networkidle' });
 await page.locator('input').first().fill('dev-token');
 await page.getByRole('button', { name: /sign in/i }).click();
-await page.getByRole('button', { name: 'Flows', exact: true }).waitFor();
+await page.getByRole('tab', { name: 'Flows', exact: true }).waitFor();
 
 for (const name of targets) {
   const tab = TABS[name];
@@ -52,7 +52,7 @@ for (const name of targets) {
     console.log('skip unknown view:', name);
     continue;
   }
-  await page.getByRole('navigation').getByRole('button', { name: tab, exact: true }).click();
+  await page.getByRole('navigation').getByRole('tab', { name: tab, exact: true }).click();
   await page.waitForTimeout(1000);
   const out = `/tmp/argus-${name}.png`;
   await page.screenshot({ path: out });

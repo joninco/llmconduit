@@ -11,11 +11,29 @@ import {
 } from './ws.fixtures';
 import { dashboardStore } from '../store/dashboardStore';
 import { isDashboardFrame, isSnapshotFrame, isDebugWsMessage } from './types';
-import type { DashboardFrame, SnapshotFrame } from './types';
+import type { DashboardFrame, FlowStatusPayload, SnapshotFrame } from './types';
+
+function flowPayload(over: Partial<FlowStatusPayload> = {}): FlowStatusPayload {
+  return {
+    type: 'flow_status',
+    phase: 'progress',
+    revision: 1,
+    api_call_id: 'a',
+    method: 'POST',
+    uri: '/v1/responses',
+    status: 'open',
+    usage: null,
+    started_ms: 1,
+    cost: null,
+    cost_confidence: 'unavailable',
+    ...over,
+  };
+}
 
 function snapshot(): SnapshotFrame {
   return {
     type: 'snapshot',
+      schema_version: 2,
     cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
     flows: [],
     metrics: null,
@@ -66,9 +84,32 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     const frame = buildMonitorFrame(6, 'resp_X'); // 5 sibling DebugWsMessages under one seq
     expect(frame.batch).toHaveLength(5);
 
+    let storeMutations = 0;
+    const unsubscribe = dashboardStore.subscribe(() => { storeMutations += 1; });
     expect(socket.applyFrame(frame)).toBe(true);
+    unsubscribe();
     expect(dashboardStore.getState().monitor).toHaveLength(5);
+    expect(dashboardStore.getState().monitorSeqs).toEqual([6, 6, 6, 6, 6]);
+    expect(dashboardStore.getState().riverFold.rivers.get('resp_X')?.output).toBe('Hello, world');
+    // One cursor mutation + ONE atomic monitor-batch mutation. The old loop performed one ring
+    // clone/store notification per sibling (six mutations total for this five-payload frame).
+    expect(storeMutations).toBe(2);
     expect(socket.getCursors().monitor).toBe(6);
+  });
+
+  it('does not resurrect an evicted row with a frame older than REST reconciliation', () => {
+    // `/flows` observed a server-side removal at seq 8. The socket's private cursor can still be 0
+    // when a delayed seq-7 frame was already in flight; store-cursor dedup must reject it.
+    dashboardStore.getState().setCursor('flow_seq', 8);
+    const delayed: DashboardFrame = {
+      domain: 'flow',
+      seq: 7,
+      batch: [flowPayload({ api_call_id: 'evicted', revision: 2 })],
+    };
+
+    expect(socket.applyFrame(delayed)).toBe(false);
+    expect(dashboardStore.getState().flows.has('evicted')).toBe(false);
+    expect(dashboardStore.getState().cursors.flow_seq).toBe(8);
   });
 
   it('decodes the GOLDEN nested Monitor fixture (the exact D7 bytes) → all 5 apply, incl. the usage sibling', () => {
@@ -138,7 +179,7 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     })).toBe(true);
     expect(isDashboardFrame({
       domain: 'flow', seq: 1,
-      batch: [{ type: 'flow_status', api_call_id: 'api_x', status: 'open', usage: null, started_ms: 1 }],
+      batch: [flowPayload({ api_call_id: 'api_x' })],
     })).toBe(true);
     // api_call_id MISSING (only the superseded response_id) → REJECTED.
     expect(isDashboardFrame({
@@ -198,10 +239,10 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     const flowFrame: DashboardFrame = {
       domain: 'flow',
       seq: 1,
-      batch: [{
-        type: 'flow_status', api_call_id: 'api_1', status: 'open',
-        model_served: 'm', upstream_target: 'u', usage: null, started_ms: 1000, elapsed_ms: 100,
-      }],
+      batch: [flowPayload({
+        api_call_id: 'api_1', model_served: 'm', upstream_target: 'u', started_ms: 1000,
+        elapsed_ms: 100,
+      })],
     };
     expect(socket.applyFrame(flowFrame)).toBe(true);
     expect(dashboardStore.getState().flowOrder).toContain('api_1');
@@ -213,7 +254,7 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     // Seed a flow so usage can patch it (keyed by api_call_id).
     socket.applyFrame({
       domain: 'flow', seq: 1,
-      batch: [{ type: 'flow_status', api_call_id: 'api_001', status: 'open', model_served: 'm', upstream_target: 'u', usage: null, started_ms: 1000, elapsed_ms: 10 }],
+      batch: [flowPayload({ api_call_id: 'api_001', model_served: 'm', upstream_target: 'u', started_ms: 1000, elapsed_ms: 10 })],
     });
     expect(socket.applyFrame(buildUsageFrame(2, 'api_001'))).toBe(true);
     expect(dashboardStore.getState().flows.get('api_001')?.usage).toEqual({
@@ -224,7 +265,7 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
   it('a usage frame with UNREPORTED cached/reasoning does not store a fabricated 0 (gap 07 finding 1)', () => {
     socket.applyFrame({
       domain: 'flow', seq: 1,
-      batch: [{ type: 'flow_status', api_call_id: 'api_u', status: 'open', model_served: 'm', upstream_target: 'u', usage: null, started_ms: 1000, elapsed_ms: 10 }],
+      batch: [flowPayload({ api_call_id: 'api_u', model_served: 'm', upstream_target: 'u', started_ms: 1000, elapsed_ms: 10 })],
     });
     // A usage frame that OMITS cached/reasoning (the upstream never broke them out).
     expect(socket.applyFrame({
@@ -273,15 +314,29 @@ describe('DashboardSocket — malformed frames do NOT mutate cursor or store (fi
     expect(dashboardStore.getState().flows.size).toBe(0);
   });
 
+  it('surfaces a malformed root snapshot as a fatal contract error', () => {
+    socket.handleParsed({
+      type: 'snapshot',
+      schema_version: 2,
+      cursors: { flow_seq: 1 },
+      flows: [],
+      metrics: null,
+      topology: null,
+    });
+    expect(dashboardStore.getState().connection).toBe('error');
+    expect(dashboardStore.getState().fatalError).toContain('WebSocket snapshot');
+  });
+
   it('fires onFrameApplied ONLY for accepted frames', () => {
     const onFrameApplied = vi.fn();
     const s = new DashboardSocket({ store: dashboardStore, onFrameApplied });
     s.handleParsed(snapshot());
-    s.applyFrame(buildMonitorFrame(6)); // accepted
-    s.applyFrame(buildMonitorFrame(6)); // duplicate → dropped
+    const accepted = buildMonitorFrame(6);
+    s.applyFrame(accepted); // accepted
+    s.applyFrame(accepted); // duplicate → dropped
     s.applyFrame(JSON.parse(MALFORMED_FRAME_JSON)); // invalid → dropped
     expect(onFrameApplied).toHaveBeenCalledTimes(1);
-    expect(onFrameApplied).toHaveBeenCalledWith('monitor');
+    expect(onFrameApplied).toHaveBeenCalledWith(accepted);
   });
 });
 
@@ -289,11 +344,20 @@ describe('frame validation — enums, unsigned-int seq, domain↔payload compati
   const goodFlow: DashboardFrame = {
     domain: 'flow',
     seq: 1,
-    batch: [{ type: 'flow_status', api_call_id: 'a', status: 'open', usage: null, started_ms: 1 }],
+    batch: [flowPayload()],
   };
 
   it('accepts a well-formed frame', () => {
     expect(isDashboardFrame(goodFlow)).toBe(true);
+  });
+
+  it('requires the authoritative mutation phase, row revision, and complete row fields', () => {
+    const { phase: _phase, ...withoutPhase } = flowPayload();
+    const { revision: _revision, ...withoutRevision } = flowPayload();
+    const { method: _method, ...withoutMethod } = flowPayload();
+    expect(isDashboardFrame({ domain: 'flow', seq: 1, batch: [withoutPhase] })).toBe(false);
+    expect(isDashboardFrame({ domain: 'flow', seq: 1, batch: [withoutRevision] })).toBe(false);
+    expect(isDashboardFrame({ domain: 'flow', seq: 1, batch: [withoutMethod] })).toBe(false);
   });
 
   it('rejects a NEGATIVE seq', () => {
@@ -321,7 +385,7 @@ describe('frame validation — enums, unsigned-int seq, domain↔payload compati
   it('rejects a flow_status payload under the TOPOLOGY domain', () => {
     expect(isDashboardFrame({
       domain: 'topology', seq: 1,
-      batch: [{ type: 'flow_status', api_call_id: 'a', status: 'open', usage: null, started_ms: 1 }],
+      batch: [flowPayload()],
     })).toBe(false);
   });
 
@@ -341,8 +405,9 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
   it('accepts a fully-valid snapshot', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
-      flows: [{ api_call_id: 'a', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1, cost_confidence: 'unavailable' }],
+      flows: [{ revision: 1, api_call_id: 'a', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1, usage: null, cost: null, cost_confidence: 'unavailable' }],
       metrics: null, topology: null,
     })).toBe(true);
   });
@@ -350,6 +415,7 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
   it('rejects a snapshot whose cursors are not all unsigned ints', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: -1, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [], metrics: null, topology: null,
     })).toBe(false);
@@ -358,8 +424,9 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
   it('rejects a snapshot with an invalid summary (bad status)', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
-      flows: [{ api_call_id: 'a', method: 'POST', uri: '/x', status: 'bogus', started_ms: 1 }],
+      flows: [{ revision: 1, api_call_id: 'a', method: 'POST', uri: '/x', status: 'bogus', started_ms: 1 }],
       metrics: null, topology: null,
     })).toBe(false);
   });
@@ -372,6 +439,7 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
     const badMetrics = { metrics_seq: 1, reqs_per_sec: 1, active_streams: 1, error_pct: 0, p50: 1, p95: 1, p99: 1, tokens_per_sec: 1, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1, windows: { m1: badWindow, m5: badWindow, h1: badWindow } };
     expect(isSnapshotFrame({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 1, topology_seq: 0, monitor_seq: 0 },
       flows: [], metrics: badMetrics, topology: null,
     })).toBe(false);
@@ -411,28 +479,28 @@ describe('gap 07 — usage confidence wire validation', () => {
   it('accepts a flow_status whose usage omits cached/reasoning (unreported ⇒ absent)', () => {
     expect(isDashboardFrame({
       domain: 'flow', seq: 1,
-      batch: [{ type: 'flow_status', api_call_id: 'a', status: 'completed', started_ms: 1,
-        usage: { prompt: 100, completion: 40, total: 140 } }],
+      batch: [flowPayload({ status: 'completed', usage: { prompt: 100, completion: 40, total: 140 } })],
     })).toBe(true);
     // A present measured `0` for cached/reasoning is likewise accepted (distinct from absent).
     expect(isDashboardFrame({
       domain: 'flow', seq: 1,
-      batch: [{ type: 'flow_status', api_call_id: 'a', status: 'completed', started_ms: 1,
-        usage: { prompt: 100, completion: 40, total: 140, cached: 0, reasoning: 0 } }],
+      batch: [flowPayload({ status: 'completed', usage: { prompt: 100, completion: 40, total: 140, cached: 0, reasoning: 0 } })],
     })).toBe(true);
   });
 
   // A snapshot summary MUST carry the per-flow cost_confidence tag, and it must be a valid enum.
   it('rejects a snapshot summary MISSING cost_confidence; rejects a bad enum value', () => {
-    const base = { api_call_id: 'a', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 1 };
+    const base = { revision: 1, api_call_id: 'a', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 1, usage: null, cost: null };
     expect(isSnapshotFrame({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [base], // cost_confidence absent → rejected
       metrics: null, topology: null,
     })).toBe(false);
     expect(isSnapshotFrame({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [{ ...base, cost_confidence: 'bogus' }], // invalid enum → rejected
       metrics: null, topology: null,
@@ -440,6 +508,7 @@ describe('gap 07 — usage confidence wire validation', () => {
     // A valid tag is accepted.
     expect(isSnapshotFrame({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [{ ...base, cost_confidence: 'estimated' }],
       metrics: null, topology: null,
@@ -478,6 +547,7 @@ describe('ProviderHealth + price_table validation (findings 2 + 4)', () => {
   it('accepts a topology snapshot whose price_table entries are complete ModelPrice', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [],
       metrics: null,
@@ -489,6 +559,7 @@ describe('ProviderHealth + price_table validation (findings 2 + 4)', () => {
   it('rejects a price_table entry MISSING cached_price_configured (gap 07 presence flag)', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [],
       metrics: null,
@@ -500,6 +571,7 @@ describe('ProviderHealth + price_table validation (findings 2 + 4)', () => {
   it('rejects a price_table entry with a non-finite number (finding 4)', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [],
       metrics: null,
@@ -510,6 +582,7 @@ describe('ProviderHealth + price_table validation (findings 2 + 4)', () => {
   it('rejects a price_table entry missing a field (finding 4)', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [],
       metrics: null,
@@ -649,15 +722,40 @@ describe('DashboardSocket — auth failure vs transient blip + reconnect (findin
     expect(pendingTimers.length).toBeGreaterThan(0);
   });
 
-  it('a clean close (code 1000) does NOT bounce or reconnect', () => {
+  it('a REMOTE clean close (code 1000) reconnects; only local disconnect is terminal', () => {
     const onUnauthorized = vi.fn();
     const { setTimer, clearTimer } = makeTimers();
     const socket = new DashboardSocket({ store: dashboardStore, factory: () => new FakeSocket(), onUnauthorized, setTimer, clearTimer });
     socket.connect();
     FakeSocket.instances[0]!.onclose?.({ code: 1000 });
     expect(onUnauthorized).not.toHaveBeenCalled();
-    expect(dashboardStore.getState().connection).toBe('closed');
-    expect(pendingTimers).toHaveLength(0);
+    expect(dashboardStore.getState().connection).toBe('connecting');
+    expect(pendingTimers.length).toBeGreaterThan(0);
+    flushTimers();
+    expect(FakeSocket.instances).toHaveLength(2);
+  });
+
+  it('reconnects a half-open socket after 15 seconds without a frame', () => {
+    const { setTimer, clearTimer } = makeTimers();
+    const socket = new DashboardSocket({
+      store: dashboardStore,
+      factory: () => new FakeSocket(),
+      setTimer,
+      clearTimer,
+    });
+    socket.connect();
+    const stale = FakeSocket.instances[0]!;
+    stale.onopen?.({});
+    expect(pendingTimers).toHaveLength(1); // watchdog
+
+    const watchdog = pendingTimers.shift()!;
+    watchdog();
+    expect(stale.closed).toBe(true);
+    expect(dashboardStore.getState().connection).toBe('connecting');
+    expect(pendingTimers).toHaveLength(1); // reconnect backoff
+
+    pendingTimers.shift()!();
+    expect(FakeSocket.instances).toHaveLength(2);
   });
 
   it('disconnect() cancels a pending reconnect (no socket re-open)', async () => {
@@ -746,11 +844,45 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     expect(socket.shadowBufferLength()).toBe(0);
   });
 
+  it('keeps the historical cut visible after buffer overflow and resnapshots on LIVE', () => {
+    dashboardStore.getState().reset();
+    FakeSocket.instances = [];
+    const bounded = new DashboardSocket({
+      store: dashboardStore,
+      factory: () => new FakeSocket(),
+      shadowLimits: { bytes: 1024 * 1024, frames: 1, ageMs: 300_000 },
+      watchdogMs: 0,
+    });
+    bounded.handleParsed(snapshot());
+    bounded.seek();
+    dashboardStore.getState().applySeekCut({
+      rows: [{ revision: 1, api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 10, cost_confidence: 'unavailable' }],
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      atMs: 10,
+      monitorSeq: 0,
+      metrics: null,
+      topology: null,
+    });
+    bounded.handleParsed({ domain: 'flow', seq: 1, batch: [flowPayload({ api_call_id: 'api_1', started_ms: 11 })] });
+    bounded.handleParsed({ domain: 'flow', seq: 2, batch: [flowPayload({ api_call_id: 'api_2', started_ms: 12 })] });
+
+    expect(bounded.requiresResync()).toBe(true);
+    expect(dashboardStore.getState().resyncRequired).toBe(true);
+    expect(dashboardStore.getState().connection).toBe('seeking');
+    expect(dashboardStore.getState().flows.has('api_frozen')).toBe(true);
+
+    bounded.live();
+    expect(bounded.requiresResync()).toBe(false);
+    expect(dashboardStore.getState().resyncRequired).toBe(false);
+    expect(dashboardStore.getState().connection).toBe('connecting');
+    expect(FakeSocket.instances).toHaveLength(1); // fresh connection must begin with a snapshot
+  });
+
   it('live() restores the up-to-date live baseline (frozen applySeekCut cut is gone, nothing rewound) (R2 finding 1)', () => {
     // A live flow row exists before seeking.
     const liveFlow: DashboardFrame = {
       domain: 'flow', seq: 1,
-      batch: [{ type: 'flow_status', api_call_id: 'api_live', status: 'open', usage: null, started_ms: 1000 }],
+      batch: [flowPayload({ api_call_id: 'api_live', started_ms: 1000 })],
     };
     expect(socket.applyFrame(liveFlow)).toBe(true);
     expect(dashboardStore.getState().flows.has('api_live')).toBe(true);
@@ -764,7 +896,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // (`api_frozen`, no `api_live`) and flips `connection='seeking'` — exactly what `applySeekCut`
     // does on the real snapshot resolve.
     dashboardStore.getState().applySeekCut({
-      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
+      rows: [{ revision: 1, api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       atMs: 500, monitorSeq: 0, metrics: null, topology: null,
     });
@@ -776,7 +908,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // cut). Its seq must be > the live cursor so it is not deduped on replay.
     const bufferedFlow: DashboardFrame = {
       domain: 'flow', seq: 2,
-      batch: [{ type: 'flow_status', api_call_id: 'api_buffered', status: 'open', usage: null, started_ms: 2000 }],
+      batch: [flowPayload({ api_call_id: 'api_buffered', started_ms: 2000 })],
     };
     socket.handleParsed(bufferedFlow);
     expect(socket.shadowBufferLength()).toBe(1);
@@ -806,14 +938,14 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // A live flow row + advanced cursor exist before seeking (the baseline to restore).
     const liveFlow: DashboardFrame = {
       domain: 'flow', seq: 1,
-      batch: [{ type: 'flow_status', api_call_id: 'api_live', status: 'open', usage: null, started_ms: 1000 }],
+      batch: [flowPayload({ api_call_id: 'api_live', started_ms: 1000 })],
     };
     expect(socket.applyFrame(liveFlow)).toBe(true);
 
     // Drag-start: pause + capture the live baseline, then land the FROZEN cut ('seeking').
     socket.seek();
     dashboardStore.getState().applySeekCut({
-      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
+      rows: [{ revision: 1, api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       atMs: 500, monitorSeq: 0, metrics: null, topology: null,
     });
@@ -822,7 +954,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // A live frame arrives mid-seek and shadow-buffers (replayed on resume).
     const bufferedFlow: DashboardFrame = {
       domain: 'flow', seq: 2,
-      batch: [{ type: 'flow_status', api_call_id: 'api_buffered', status: 'open', usage: null, started_ms: 2000 }],
+      batch: [flowPayload({ api_call_id: 'api_buffered', started_ms: 2000 })],
     };
     socket.handleParsed(bufferedFlow);
 
@@ -856,14 +988,14 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // A live row + advanced cursor exist before seeking.
     const liveFlow: DashboardFrame = {
       domain: 'flow', seq: 1,
-      batch: [{ type: 'flow_status', api_call_id: 'api_live', status: 'open', usage: null, started_ms: 1000 }],
+      batch: [flowPayload({ api_call_id: 'api_live', started_ms: 1000 })],
     };
     expect(socket.applyFrame(liveFlow)).toBe(true);
 
     // Drag-start: pause, then land the FROZEN cut ('seeking') via the real Scrubber path.
     socket.seek();
     dashboardStore.getState().applySeekCut({
-      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
+      rows: [{ revision: 1, api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       atMs: 500, monitorSeq: 0, metrics: null, topology: null,
     });
@@ -873,8 +1005,9 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // the frozen cut. It carries the authoritative live rows (`api_snap`) + cursors + metrics.
     const reconnectSnap: SnapshotFrame = {
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 5, metrics_seq: 5, topology_seq: 5, monitor_seq: 5 },
-      flows: [{ api_call_id: 'api_snap', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 3000, cost_confidence: 'unavailable' }],
+      flows: [{ revision: 1, api_call_id: 'api_snap', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 3000, usage: null, cost: null, cost_confidence: 'unavailable' }],
       metrics: METRICS_SNAP,
       topology: null,
     };
@@ -888,7 +1021,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // staged snapshot). Its seq must be > the staged snapshot's cursor so it is not deduped.
     const bufferedFlow: DashboardFrame = {
       domain: 'flow', seq: 6,
-      batch: [{ type: 'flow_status', api_call_id: 'api_buffered', status: 'open', usage: null, started_ms: 4000 }],
+      batch: [flowPayload({ api_call_id: 'api_buffered', started_ms: 4000 })],
     };
     socket.handleParsed(bufferedFlow);
     expect(socket.shadowBufferLength()).toBe(1);
@@ -941,6 +1074,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // A reconnect delivers a FRESH snapshot (different cut: empty flows, new cursors).
     const reconnectSnap: SnapshotFrame = {
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 99, metrics_seq: 99, topology_seq: 99, monitor_seq: 99 },
       flows: [], metrics: null, topology: null,
     };
@@ -979,7 +1113,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // seekAtMs/seekMonitorSeq and flips connection='seeking'.
     s.seek();
     dashboardStore.getState().applySeekCut({
-      rows: [{ api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
+      rows: [{ revision: 1, api_call_id: 'api_frozen', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 500, cost_confidence: 'unavailable' }],
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 42 },
       atMs: 500, monitorSeq: 42, metrics: null, topology: null,
     });
@@ -1010,6 +1144,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // The reconnected socket's snapshot is STAGED (not applied over the frozen cut).
     const reconnectSnap: SnapshotFrame = {
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 7, metrics_seq: 7, topology_seq: 7, monitor_seq: 7 },
       flows: [], metrics: null, topology: null,
     };

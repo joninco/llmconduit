@@ -107,7 +107,7 @@ export function River({ river, exiting = false }: { river: RiverData; exiting?: 
               {showReasoning ? '▾ reasoning' : '▸ reasoning'}
             </button>
             {showReasoning && (
-              <p className="mt-1 whitespace-pre-wrap break-words text-text-muted/80" data-testid="river-reasoning">
+              <p className="mt-1 border-l border-line pl-2 italic whitespace-pre-wrap break-words text-text-muted" data-testid="river-reasoning">
                 {river.reasoning}
               </p>
             )}

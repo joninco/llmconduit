@@ -63,6 +63,13 @@ describe('AttemptTrace component (gap 11)', () => {
     expect(getByTestId('attempt-failover-0').textContent).toContain('failover');
   });
 
+  it('labels a request-intrinsic rejection without exposing free-form error text', () => {
+    const rejected: Attempt = { ...FAILED_A, failover_reason: 'request_rejected' };
+    const { getByTestId } = renderTrace([rejected, SERVED_B]);
+    fireEvent.click(getByTestId('attempt-toggle-0'));
+    expect(getByTestId('attempt-failover-0').textContent).toBe('request rejected → failover');
+  });
+
   it('a SINGLE attempt renders one node + the "no failover" label (no fake chain)', () => {
     const { getByTestId, queryByTestId } = renderTrace([SERVED_B]);
     expect(getByTestId('attempt-trace').getAttribute('data-failover')).toBe('false');

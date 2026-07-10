@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { act, cleanup, fireEvent, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, waitFor, within } from '@testing-library/react';
 import { FlowTable } from './FlowTable';
 import { dashboardStore } from '../../store/dashboardStore';
 import { makeFlow, renderWithQuery, resetWorld, seedFlows } from '../testHarness';
+import { getConnection } from '../../api/connection';
+import { flowFilterStore } from '../../store/flowFilterStore';
 
 /**
  * jsdom reports zero layout, so `@tanstack/react-virtual` would render an empty window. We stub a
@@ -49,6 +51,19 @@ afterEach(() => {
 
 function noop() {}
 
+function useNarrowViewport(): void {
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    matches: query === '(max-width: 1023px)',
+    media: query,
+    onchange: null,
+    addEventListener() {},
+    removeEventListener() {},
+    addListener() {},
+    removeListener() {},
+    dispatchEvent: () => false,
+  }));
+}
+
 describe('FlowTable — virtualization', () => {
   it('renders only a windowed SLICE of 10k rows (not 10k DOM nodes)', () => {
     const flows = Array.from({ length: 10_000 }, (_, i) =>
@@ -64,6 +79,80 @@ describe('FlowTable — virtualization', () => {
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.length).toBeLessThan(200);
     void getByTestId('flow-table-scroll');
+  });
+
+  it('uses fixed-height virtualized cards below lg without rendering the desktop grid', () => {
+    useNarrowViewport();
+    const flows = Array.from({ length: 10_000 }, (_, i) =>
+      makeFlow({ api_call_id: `api_mobile_${String(i).padStart(5, '0')}`, started_ms: 1_700_000_000_000 + i }),
+    );
+    seedFlows(flows);
+
+    const { getByRole, getAllByTestId, queryByRole } = renderWithQuery(
+      <FlowTable selectedId={null} onSelect={noop} />,
+    );
+
+    expect(getByRole('list', { name: 'Flows' })).toBeTruthy();
+    expect(queryByRole('grid', { name: 'Flows' })).toBeNull();
+    expect(queryByRole('columnheader')).toBeNull();
+    const cards = getAllByTestId('flow-card');
+    expect(cards.length).toBeGreaterThan(0);
+    expect(cards.length).toBeLessThan(200);
+    expect(getAllByTestId('flow-row')[0]?.style.height).toBe('144px');
+  });
+});
+
+describe('FlowTable — desktop ARIA grid keyboard model', () => {
+  function renderGrid(onSelect = vi.fn()) {
+    seedFlows([
+      makeFlow({ api_call_id: 'api_keyboard_1', started_ms: 1_700_000_000_003 }),
+      makeFlow({ api_call_id: 'api_keyboard_2', started_ms: 1_700_000_000_002 }),
+      makeFlow({ api_call_id: 'api_keyboard_3', started_ms: 1_700_000_000_001 }),
+    ]);
+    const rendered = renderWithQuery(<FlowTable selectedId={null} onSelect={onSelect} />);
+    const grid = rendered.getByRole('grid', { name: 'Flows' });
+    const rows = within(grid)
+      .getAllByRole('row')
+      .filter((row) => row.tagName === 'BUTTON') as HTMLButtonElement[];
+    return { ...rendered, grid, rows, onSelect };
+  }
+
+  it('exposes headers, grid cells, total row count, and one-based ARIA row indexes', () => {
+    const { grid, rows } = renderGrid();
+    expect(grid.getAttribute('aria-colcount')).toBe('10');
+    expect(grid.getAttribute('aria-rowcount')).toBe('4');
+    expect(within(grid).getAllByRole('columnheader')).toHaveLength(10);
+    expect(rows).toHaveLength(3);
+    expect(rows.map((row) => row.getAttribute('aria-rowindex'))).toEqual(['2', '3', '4']);
+    rows.forEach((row) => expect(within(row).getAllByRole('gridcell')).toHaveLength(10));
+  });
+
+  it('roves one row tab stop with arrows/Home/End and activates with Enter/Space', () => {
+    const { rows, onSelect } = renderGrid();
+    const [first, second, third] = rows;
+    expect(first?.tabIndex).toBe(0);
+    expect(second?.tabIndex).toBe(-1);
+    expect(third?.tabIndex).toBe(-1);
+
+    act(() => first?.focus());
+    fireEvent.keyDown(first!, { key: 'ArrowDown' });
+    expect(document.activeElement).toBe(second);
+    expect(second?.tabIndex).toBe(0);
+    expect(first?.tabIndex).toBe(-1);
+
+    fireEvent.keyDown(second!, { key: 'End' });
+    expect(document.activeElement).toBe(third);
+    fireEvent.keyDown(third!, { key: 'Home' });
+    expect(document.activeElement).toBe(first);
+    fireEvent.keyDown(first!, { key: 'ArrowRight' });
+    expect(document.activeElement).toBe(second);
+    fireEvent.keyDown(second!, { key: 'ArrowLeft' });
+    expect(document.activeElement).toBe(first);
+
+    fireEvent.keyDown(first!, { key: 'Enter' });
+    fireEvent.keyDown(first!, { key: ' ' });
+    expect(onSelect).toHaveBeenNthCalledWith(1, first?.title);
+    expect(onSelect).toHaveBeenNthCalledWith(2, first?.title);
   });
 });
 
@@ -105,8 +194,19 @@ describe('FlowTable — live WS update + interactions', () => {
     // A flow_status frame completes the flow.
     act(() => {
       dashboardStore.getState().patchFlowStatus({
-        type: 'flow_status', api_call_id: 'api_live', status: 'completed',
-        model_served: 'm', upstream_target: 'u', usage: null, started_ms: 1_700_000_000_000, elapsed_ms: 1200,
+        ...makeFlow({
+          revision: 2,
+          api_call_id: 'api_live',
+          status: 'completed',
+          model_served: 'm',
+          upstream_target: 'u',
+          started_ms: 1_700_000_000_000,
+          elapsed_ms: 1200,
+        }),
+        type: 'flow_status',
+        phase: 'terminal',
+        usage: null,
+        cost: null,
       });
     });
     expect(within(getAllByTestId('flow-row')[0]!).getByText('2xx')).toBeTruthy();
@@ -205,5 +305,48 @@ describe('FlowTable — live WS update + interactions', () => {
     fireEvent.click(chip);
     expect(getAllByTestId('flow-row')).toHaveLength(2);
     expect(getByTestId('flow-count').textContent).toContain('2 / 3');
+  });
+});
+
+describe('FlowTable — loading, failure, empty, and filtered-empty states', () => {
+  it('shows loading before either REST or live data establishes a row set', () => {
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})));
+    const { getByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    expect(getByTestId('flow-table-loading').textContent).toContain('Loading flows');
+  });
+
+  it('shows a retryable transport failure instead of calling it an empty result', async () => {
+    const fetchMock = vi.fn(async () => new Response('', { status: 503 }));
+    vi.stubGlobal('fetch', fetchMock);
+    getConnection().queryClient.setDefaultOptions({ queries: { retry: false } });
+    const { getByTestId, getByRole } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+
+    await waitFor(() => expect(getByTestId('flow-table-error')).toBeTruthy());
+    expect(getByTestId('flow-table-error').textContent).not.toContain('No flows');
+    const calls = fetchMock.mock.calls.length;
+    fireEvent.click(getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(fetchMock.mock.calls.length).toBeGreaterThan(calls));
+  });
+
+  it('distinguishes an honest unfiltered empty result from filtered-empty', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.includes('/catalog') ? [] : { flows: [], total: 0, flow_seq: 0 };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-LLMConduit-Dashboard-Schema': '2',
+        },
+      });
+    }));
+    const { getByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    await waitFor(() => expect(getByTestId('flow-table-empty').textContent).toContain('No flows yet'));
+
+    act(() => {
+      seedFlows([makeFlow({ api_call_id: 'only-complete', status: 'completed' })]);
+      flowFilterStore.getState().setFilters({ status: 'failed', model: null, upstream: null, client: null });
+    });
+    await waitFor(() => expect(getByTestId('flow-table-filtered-empty').textContent).toContain('No flows match'));
   });
 });

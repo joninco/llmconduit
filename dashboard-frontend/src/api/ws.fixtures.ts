@@ -79,15 +79,25 @@ export const GOLDEN_FLOW_STATUS_FRAME_JSON = JSON.stringify({
   batch: [
     {
       type: 'flow_status',
+      phase: 'terminal',
+      revision: 7,
       api_call_id: 'api_001',
       response_id: 'resp_001',
+      method: 'POST',
+      uri: '/v1/responses',
       status: 'completed',
       model_requested: 'gpt-4o',
       model_served: 'llama-3.1-70b',
       upstream_target: 'vllm-a',
       usage: { prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 0 },
       started_ms: 1718900000000,
+      finished_ms: 1718900003100,
       elapsed_ms: 3100,
+      terminal_reason: 'response.completed',
+      cost: 0.0071,
+      cost_confidence: 'estimated',
+      client_label: 'key-9f3a1c0b2d4e',
+      client_source: 'key_hash',
     },
   ],
 });
@@ -156,4 +166,5 @@ export const GOLDEN_BOOTSTRAP = {
   authenticated: true,
   csrf_token: 'csrf-abc123',
   mutations_enabled: true,
+  schema_version: 2,
 } as const;

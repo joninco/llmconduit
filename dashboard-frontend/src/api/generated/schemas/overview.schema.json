@@ -1,0 +1,547 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OverviewResponse",
+  "description": "`GET /dashboard/api/overview`: an immutable exact-window rollup. The aggregate is\nflattened so the wire reads naturally (`totals`, `served_models`, `cost_series`, …)\nwhile the calculation remains owned by MetricsLayer for both live and historical\ncuts.",
+  "type": "object",
+  "properties": {
+    "clients": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OverviewDimensionRollup"
+      }
+    },
+    "context": {
+      "$ref": "#/$defs/OverviewContextRollup"
+    },
+    "cost": {
+      "$ref": "#/$defs/OverviewCost"
+    },
+    "cost_series": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OverviewCostPoint"
+      }
+    },
+    "data_quality": {
+      "$ref": "#/$defs/OverviewDataQuality"
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OverviewDimensionRollup"
+      }
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "format": "uint128",
+      "minimum": 0
+    },
+    "metrics_seq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "overflow": {
+      "$ref": "#/$defs/OverviewOverflowMetadata"
+    },
+    "provider_attempts_global": {
+      "$ref": "#/$defs/OverviewProviderAttempts"
+    },
+    "providers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OverviewDimensionRollup"
+      }
+    },
+    "requested_models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OverviewDimensionRollup"
+      }
+    },
+    "scope": {
+      "$ref": "#/$defs/OverviewScope"
+    },
+    "served_models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OverviewDimensionRollup"
+      }
+    },
+    "tokens": {
+      "$ref": "#/$defs/OverviewTokens"
+    },
+    "totals": {
+      "$ref": "#/$defs/OverviewTotals"
+    }
+  },
+  "required": [
+    "generated_at_ms",
+    "metrics_seq",
+    "scope",
+    "data_quality",
+    "overflow",
+    "totals",
+    "requested_models",
+    "served_models",
+    "providers",
+    "clients",
+    "failures",
+    "context",
+    "tokens",
+    "cost",
+    "cost_series",
+    "provider_attempts_global"
+  ],
+  "$defs": {
+    "OverviewContextRollup": {
+      "type": "object",
+      "properties": {
+        "average_pressure_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "data_quality": {
+          "$ref": "#/$defs/OverviewDataQuality"
+        },
+        "effective_route_limit_min": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "input_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "unavailable_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "data_quality",
+        "samples",
+        "unavailable_samples",
+        "effective_route_limit_min",
+        "input_tokens",
+        "average_pressure_pct"
+      ]
+    },
+    "OverviewCost": {
+      "type": "object",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/TerminalCostConfidence"
+        },
+        "samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "total_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "samples",
+        "total_usd",
+        "confidence"
+      ]
+    },
+    "OverviewCostPoint": {
+      "type": "object",
+      "properties": {
+        "at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "cost": {
+          "$ref": "#/$defs/OverviewCost"
+        },
+        "data_quality": {
+          "$ref": "#/$defs/OverviewDataQuality"
+        },
+        "requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "at_ms",
+        "data_quality",
+        "requests",
+        "cost"
+      ]
+    },
+    "OverviewDataQuality": {
+      "description": "Cross-cutting quality tag for Overview values. `partial` is explicit whenever a\nbounded slot/union folded dimensions into `__other__`; missing source facts are\n`unavailable`, never fabricated zeroes.",
+      "type": "string",
+      "enum": [
+        "measured",
+        "derived",
+        "partial",
+        "unavailable"
+      ]
+    },
+    "OverviewDimensionRollup": {
+      "type": "object",
+      "properties": {
+        "cost": {
+          "$ref": "#/$defs/OverviewCost"
+        },
+        "key": {
+          "type": "string"
+        },
+        "requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens": {
+          "$ref": "#/$defs/OverviewTokens"
+        }
+      },
+      "required": [
+        "key",
+        "requests",
+        "tokens",
+        "cost"
+      ]
+    },
+    "OverviewMetricScope": {
+      "type": "string",
+      "enum": [
+        "global"
+      ]
+    },
+    "OverviewOverflowMetadata": {
+      "type": "object",
+      "properties": {
+        "aggregate_folded_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "dimension_limit": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "overflowed": {
+          "type": "boolean"
+        },
+        "provider_folded_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "slot_folded_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "dimension_limit",
+        "slot_folded_samples",
+        "aggregate_folded_samples",
+        "provider_folded_samples",
+        "overflowed"
+      ]
+    },
+    "OverviewProviderAttempts": {
+      "type": "object",
+      "properties": {
+        "data_quality": {
+          "$ref": "#/$defs/OverviewDataQuality"
+        },
+        "providers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ProviderLatency"
+          }
+        },
+        "scope": {
+          "$ref": "#/$defs/OverviewMetricScope"
+        }
+      },
+      "required": [
+        "scope",
+        "data_quality",
+        "providers"
+      ]
+    },
+    "OverviewScope": {
+      "type": "object",
+      "properties": {
+        "client": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requested_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "selected_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "upstream": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "window": {
+          "$ref": "#/$defs/OverviewWindow"
+        }
+      },
+      "required": [
+        "window",
+        "requested_at_ms",
+        "selected_at_ms",
+        "status",
+        "model",
+        "upstream",
+        "client"
+      ]
+    },
+    "OverviewTokens": {
+      "type": "object",
+      "properties": {
+        "cached": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "completion": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "prompt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "reasoning": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "samples",
+        "prompt",
+        "completion",
+        "cached",
+        "reasoning"
+      ]
+    },
+    "OverviewTotals": {
+      "type": "object",
+      "properties": {
+        "cost": {
+          "$ref": "#/$defs/OverviewCost"
+        },
+        "requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens": {
+          "$ref": "#/$defs/OverviewTokens"
+        }
+      },
+      "required": [
+        "requests",
+        "tokens",
+        "cost"
+      ]
+    },
+    "OverviewWindow": {
+      "description": "Exact server-side Overview window. Kept to the three MetricsLayer ring spans so a\nlive and historical request always selects the same retained population.",
+      "type": "string",
+      "enum": [
+        "m1",
+        "m5",
+        "h1"
+      ]
+    },
+    "ProviderErrorDistribution": {
+      "description": "Gap 12 — the bounded per-error-class failure tally for one provider (a window, or a\nsingle slot). The key space is the FIXED [`AttemptErrorClass`] taxonomy (6 bounded\nsnake_case codes from gap 03 — NEVER raw upstream text), so this is a fixed-size\ncounter array, not an unbounded map. `skip_serializing_if` keeps a `0` class ABSENT\non the wire — the distribution lists only the classes a provider actually hit. A\nper-class `0` here is honest (that class did not occur); the don't-lie-with-zeros\nrule lives at the PROVIDER level (a provider with NO samples in the window is absent\nfrom the per-provider report entirely, never a fabricated all-zero distribution).",
+      "type": "object",
+      "properties": {
+        "connect": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "http_status": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "other": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stream": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "terminal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "timeout": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      }
+    },
+    "ProviderLatency": {
+      "description": "Gap 12 — the public per-provider latency + error-distribution DTO (additive on the\nD4 topology node; consumed by spec 13). Percentiles are `derived` ms over the\nprovider's ATTEMPT-latency histogram (a FAILED primary's latency is included — spec\n12 — so final-served latency alone cannot hide an unhealthy provider). `error_rate`\nis the percentage of the provider's attempts that FAILED. A provider with zero\nin-window samples is ABSENT (don't-lie-with-zeros), so a present DTO always has\n`samples >= 1`. All floats are finite (the frozen finite-number wire contract).",
+      "type": "object",
+      "properties": {
+        "data_quality": {
+          "description": "DQ tag — always `derived` for a present entry (the `unavailable` case is absence).",
+          "$ref": "#/$defs/ProviderMetricQuality"
+        },
+        "error_rate": {
+          "description": "Percentage of attempts that failed (`failed / samples × 100`). A genuine MEASURED\n`0.0` for an all-served provider (distinct from the `unavailable`/absent case).",
+          "type": "number",
+          "format": "double"
+        },
+        "errors": {
+          "description": "Bounded per-class failure tally (gap 03 taxonomy). Absent classes are omitted.",
+          "$ref": "#/$defs/ProviderErrorDistribution"
+        },
+        "failed": {
+          "description": "Of `samples`, the count that FAILED before serving (failed primaries included).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "p50": {
+          "description": "`derived` p50 attempt latency (ms).",
+          "type": "number",
+          "format": "double"
+        },
+        "p95": {
+          "description": "`derived` p95 attempt latency (ms).",
+          "type": "number",
+          "format": "double"
+        },
+        "p99": {
+          "description": "`derived` p99 attempt latency (ms).",
+          "type": "number",
+          "format": "double"
+        },
+        "provider": {
+          "description": "The provider label these metrics are for (the bounded provider/route id, or the\n`__other__` overflow bucket once the per-slot provider cap is exceeded).",
+          "type": "string"
+        },
+        "samples": {
+          "description": "Total ATTEMPTS to this provider in the window (served + failed) — the per-provider\nmeasurability denominator. Always `>= 1` (a zero-sample provider is absent).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "served": {
+          "description": "Of `samples`, the count that SERVED (produced the first chunk).",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "provider",
+        "data_quality",
+        "samples",
+        "served",
+        "failed",
+        "p50",
+        "p95",
+        "p99",
+        "error_rate",
+        "errors"
+      ]
+    },
+    "ProviderMetricQuality": {
+      "description": "Gap 12 — the data-quality tag for a per-provider metric. Every per-provider latency\nfigure is `derived` (computed from the provider's own attempt-latency histogram). The\n`unavailable` case (a provider with no in-window samples) is represented by the\nABSENCE of a [`ProviderLatency`] entirely, not by a variant here — so a present DTO is\nalways a real `derived` measurement (don't-lie-with-zeros). Serializes snake_case to\nmatch the cross-cutting DQ-tag contract.",
+      "type": "string",
+      "enum": [
+        "derived"
+      ]
+    },
+    "TerminalCostConfidence": {
+      "description": "Confidence attached to a terminal-time price. This lives with the evict-safe\nterminal payload (rather than the REST projection) so historical overview cuts keep\nthe rate table decision that was true when the request finished.",
+      "type": "string",
+      "enum": [
+        "confident",
+        "estimated",
+        "unavailable"
+      ]
+    }
+  }
+}

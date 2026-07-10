@@ -44,6 +44,7 @@ use std::sync::atomic::AtomicU8;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 /// Record cap: reuse the monitor's `REQUEST_EVENT_LIMIT` (512) so the dashboard
@@ -55,6 +56,10 @@ const FLOW_TTL_MS: u128 = crate::monitor::DEBUG_HISTORY_RETENTION_MS;
 /// exceeded, the OLDEST bodies are evicted first (body `Arc` → `None`) until the
 /// store is back under quota; the record survives as a body-free summary.
 const DEFAULT_SUMMARY_QUOTA_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bounded authoritative-flow mutation fanout. A slow dashboard socket must
+/// resnapshot instead of making request processing retain an unbounded event log.
+const FLOW_MUTATION_CHANNEL_CAPACITY: usize = 1024;
 
 /// Hard cap on a single captured body (inbound/normalized/upstream). The streaming
 /// serializer stops writing once it has emitted this many bytes, so peak retained
@@ -201,13 +206,36 @@ impl Default for AbortHub {
 
 /// Lifecycle status of a flow. `Open` at creation; D3 moves it to a terminal
 /// state. Serializes snake_case for the dashboard REST/WS surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowStatus {
     Open,
     Completed,
     Failed,
     Cancelled,
+}
+
+/// Coarse lifecycle phase attached to every authoritative live-flow mutation.
+/// The vocabulary is deliberately bounded: usage and all non-terminal enrichment
+/// are `progress`, while the exactly-once final store mutation is `terminal`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowMutationPhase {
+    Open,
+    Progress,
+    Terminal,
+}
+
+/// One versioned mutation published by [`DashboardFlowStore`]. `seq` is the
+/// process-wide FlowStore domain cursor and `revision` is monotonic for this flow.
+/// The record is the exact post-mutation `Arc` installed under the store mutex, so
+/// consumers never re-read a later state and stamp it with an older event cursor.
+#[derive(Debug, Clone)]
+pub struct FlowMutation {
+    pub seq: u64,
+    pub revision: u64,
+    pub phase: FlowMutationPhase,
+    pub record: Arc<FlowRecord>,
 }
 
 /// Token usage attached to a flow once the upstream response reports it.
@@ -223,7 +251,7 @@ pub enum FlowStatus {
 /// distinction is load-bearing for cost confidence: a `cached` charge against a
 /// model with no configured cache rate (or an unreported `cached`) is `estimated`,
 /// not `confident`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct FlowUsage {
     pub prompt: i64,
     pub completion: i64,
@@ -249,7 +277,9 @@ pub struct FlowUsage {
 /// `KeyHash` → `ConfiguredHeader` → `UserAgent`. There is NO proxy auth-principal
 /// source today (the proxy forwards keys, it does not authenticate a principal), so
 /// one is deliberately absent until such a seam exists (spec 04 / Codex review).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientSource {
     /// Derived from a non-reversible SHA-256 digest of the inbound API key (the raw
@@ -459,7 +489,9 @@ fn key_hash_label(raw_key: &str) -> String {
 /// Gap 03 — the outcome of one upstream dispatch attempt. Snake_case on the wire so
 /// the body-free [`SnapshotFlowSummary`] carries it to the failover/attempt-trace UI
 /// (spec 11) and the per-provider metrics aggregation (spec 12).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptStatus {
     /// This attempt produced the first chunk on the wire — it is the SERVING attempt.
@@ -474,7 +506,9 @@ pub enum AttemptStatus {
 /// is a fixed enum so the body-free summary can never become a backdoor for an
 /// unbounded/secret-bearing upstream error body. `error_class` is `None` on the served
 /// attempt (don't-lie-with-zeros for the success case). Serializes snake_case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptErrorClass {
     /// The upstream connection or request transport failed before any response.
@@ -494,11 +528,93 @@ pub enum AttemptErrorClass {
     Other,
 }
 
+/// Bounded terminal reason retained by the evict-safe metrics payload. Raw terminal
+/// messages are intentionally never metric dimensions: provider text and arbitrary
+/// gateway errors would create unbounded cardinality. A failed attempt's structured
+/// error class wins; otherwise only the protocol's fixed finish-reason vocabulary is
+/// admitted and everything else folds into `unclassified`.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalReasonClass {
+    Connect,
+    HttpStatus,
+    Timeout,
+    Stream,
+    Terminal,
+    Other,
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    #[default]
+    Unclassified,
+}
+
+impl TerminalReasonClass {
+    fn from_terminal(terminal_reason: Option<&str>, attempts: &[Attempt]) -> TerminalReasonClass {
+        if let Some(class) = attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.status == AttemptStatus::Failed)
+            .and_then(|attempt| attempt.error_class)
+        {
+            return match class {
+                AttemptErrorClass::Connect => Self::Connect,
+                AttemptErrorClass::HttpStatus => Self::HttpStatus,
+                AttemptErrorClass::Timeout => Self::Timeout,
+                AttemptErrorClass::Stream => Self::Stream,
+                AttemptErrorClass::Terminal => Self::Terminal,
+                AttemptErrorClass::Other => Self::Other,
+            };
+        }
+        match terminal_reason
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("stop" | "response.completed") => Self::Stop,
+            Some("length" | "response.incomplete") => Self::Length,
+            Some("tool_calls") => Self::ToolCalls,
+            Some("content_filter") => Self::ContentFilter,
+            Some("other") => Self::Other,
+            _ => Self::Unclassified,
+        }
+    }
+}
+
+/// Confidence attached to a terminal-time price. This lives with the evict-safe
+/// terminal payload (rather than the REST projection) so historical overview cuts keep
+/// the rate table decision that was true when the request finished.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCostConfidence {
+    Confident,
+    Estimated,
+    #[default]
+    Unavailable,
+}
+
 /// Gap 03 — a BOUNDED, sanitized, taxonomic reason a failed attempt triggered failover
 /// to the next provider. Like [`AttemptErrorClass`], this is a fixed enum — never raw
 /// upstream text — so it is safe on the body-free summary. `None` on the served attempt
 /// (it did not fail over). Serializes snake_case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AttemptFailoverReason {
     /// The provider failed before the first chunk and failover moved to the next.
@@ -524,7 +640,7 @@ pub enum AttemptFailoverReason {
 /// (never raw upstream text) on a failed attempt — they ride the body-free summary, so
 /// raw error bodies stay behind spec 05's gated seam. Snake_case + `skip_serializing_if`
 /// so a `None` field is absent on the wire.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct Attempt {
     /// The provider name this attempt dispatched to (the failover provider's name, the
     /// routing route's name, or the synthetic `"primary"` for a bare single upstream).
@@ -589,17 +705,28 @@ impl Attempt {
 /// guard makes the authoritative metrics layer independent of FlowStore retention.
 /// `endpoint` is the inbound route; `upstream` is the serving provider/route label;
 /// all are owned values (not borrows) so the snapshot survives any eviction.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TerminalMetricsInputs {
+    pub model_requested: Option<String>,
     pub model_served: Option<String>,
     pub endpoint: String,
     pub upstream: Option<String>,
+    pub client_label: Option<String>,
     pub usage: Option<FlowUsage>,
     /// Gap 03 — the per-attempt trace, read off the shared `ServingToken` at finalize
     /// alongside `usage`. Carried on the evict-safe terminal payload (NOT only the
     /// FlowStore record) so spec 12 can aggregate per-provider metrics without
     /// re-reading the evictable record. Empty when the flow recorded no attempt.
     pub attempts: Vec<Attempt>,
+    /// Bounded taxonomy derived once at finalize; never raw terminal text.
+    pub failure_reason: TerminalReasonClass,
+    /// USD priced against the model table at the terminal seam. `None` when usage,
+    /// served model, or a configured price is unavailable.
+    pub cost_usd: Option<f64>,
+    pub cost_confidence: TerminalCostConfidence,
+    /// Conservative minimum context window across the route's candidate set. `None`
+    /// means the routing/catalog sources did not advertise a usable limit.
+    pub effective_route_limit: Option<i64>,
 }
 
 /// Request-extension newtype carrying the `api_call_id` minted by `log_api_call`
@@ -705,6 +832,10 @@ pub struct FlowRecord {
     /// the post-bump `seq`; this field is NOT counted in `summary_bytes` (a fixed-size
     /// `u64`, not a heap scalar).
     pub record_seq: u64,
+    /// Per-flow optimistic-concurrency version. Starts at 1 on open and advances
+    /// exactly once for each successful record mutation, independent of mutations
+    /// to sibling flows.
+    pub revision: u64,
     pub api_call_id: String,
     pub response_id: Option<String>,
     pub method: String,
@@ -719,8 +850,8 @@ pub struct FlowRecord {
     /// Capped + redacted upstream chat body (set by D2).
     pub upstream_body: Option<Arc<[u8]>>,
     /// Gap 05 — the capped + redacted upstream RESPONSE/ERROR body (set by
-    /// [`set_upstream_response`](DashboardFlowStore::set_upstream_response) at the leaf
-    /// when a turn fails with a non-2xx). OPTIONAL and OFF by default: populated ONLY
+    /// the L1 guard's atomic terminal mutation when a turn fails with a non-2xx).
+    /// OPTIONAL and OFF by default: populated ONLY
     /// when the SEPARATE [`ENV_CAPTURE_UPSTREAM_RESPONSE`] gate is on (distinct from the
     /// debug-UI gate that arms request capture) AND the upstream actually returned an
     /// error body. Tri-state, don't-lie-with-zeros: `None` ⇒ capture disabled OR no
@@ -793,7 +924,9 @@ pub struct FlowRecord {
 /// OPTIONAL measured epoch-ms timestamp; `None` ⇒ the phase did not occur ⇒
 /// serialized absent (the `skip_serializing_if` below) so the don't-lie-with-zeros
 /// rule holds: a missing phase is NEVER coerced to `0`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct PhaseTimings {
     /// Request ingress — when the FlowStore first `open`ed the record (≈ `started_ms`).
     /// Always `Some` once a record exists; the explicit phase value the waterfall
@@ -966,6 +1099,7 @@ impl FlowRecord {
 /// forbidden (135 GiB worst case; AGENTS.md don't-rule).
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotFlowSummary {
+    pub revision: u64,
     pub api_call_id: String,
     pub response_id: Option<String>,
     pub method: String,
@@ -1010,6 +1144,7 @@ pub struct SnapshotFlowSummary {
 impl SnapshotFlowSummary {
     fn from_record(record: &FlowRecord) -> Self {
         Self {
+            revision: record.revision,
             api_call_id: record.api_call_id.clone(),
             response_id: record.response_id.clone(),
             method: record.method.clone(),
@@ -1090,6 +1225,10 @@ pub struct DashboardFlowStore {
     response_capture_enabled: bool,
     state: Arc<Mutex<DashboardFlowState>>,
     summary_quota_bytes: usize,
+    /// Present only for an enabled dashboard store. Keeping the channel behind an
+    /// `Option` preserves the disabled hot path: no broadcast ring is allocated and
+    /// mutators never attempt a send when `--with-debug-ui` is off.
+    mutations: Option<Arc<broadcast::Sender<FlowMutation>>>,
 }
 
 impl DashboardFlowStore {
@@ -1098,11 +1237,13 @@ impl DashboardFlowStore {
     /// [`ENV_CAPTURE_UPSTREAM_RESPONSE`] env flag is an explicit affirmative (OFF by
     /// default) — request capture does not imply response capture.
     pub fn new() -> Self {
+        let (mutations, _) = broadcast::channel(FLOW_MUTATION_CHANNEL_CAPACITY);
         Self {
             enabled: true,
             response_capture_enabled: capture_response_env_flag(),
             state: Arc::new(Mutex::new(DashboardFlowState::default())),
             summary_quota_bytes: DEFAULT_SUMMARY_QUOTA_BYTES,
+            mutations: Some(Arc::new(mutations)),
         }
     }
 
@@ -1114,6 +1255,7 @@ impl DashboardFlowStore {
             response_capture_enabled: false,
             state: Arc::new(Mutex::new(DashboardFlowState::default())),
             summary_quota_bytes: DEFAULT_SUMMARY_QUOTA_BYTES,
+            mutations: None,
         }
     }
 
@@ -1123,11 +1265,13 @@ impl DashboardFlowStore {
     /// capture-ON and capture-OFF branches without mutating the environment.
     #[cfg(test)]
     pub(crate) fn new_with_response_capture(response_capture_enabled: bool) -> Self {
+        let (mutations, _) = broadcast::channel(FLOW_MUTATION_CHANNEL_CAPACITY);
         Self {
             enabled: true,
             response_capture_enabled,
             state: Arc::new(Mutex::new(DashboardFlowState::default())),
             summary_quota_bytes: DEFAULT_SUMMARY_QUOTA_BYTES,
+            mutations: Some(Arc::new(mutations)),
         }
     }
 
@@ -1152,6 +1296,36 @@ impl DashboardFlowStore {
             return 0;
         }
         self.lock().seq
+    }
+
+    /// Subscribe to authoritative post-mutation records. `None` is the disabled
+    /// store's zero-allocation signal; dashboard sockets are created only for an
+    /// enabled store and subscribe before taking their initial snapshot.
+    pub fn subscribe(&self) -> Option<broadcast::Receiver<FlowMutation>> {
+        self.mutations.as_ref().map(|sender| sender.subscribe())
+    }
+
+    /// Publish the record currently installed for `id`. Callers invoke this while
+    /// holding the FlowStore mutex, immediately after mutation/cap enforcement, so
+    /// the event body and cursor are one critical-section result. Broadcast send is
+    /// synchronous and bounded; no receiver means a cheap ignored error.
+    fn publish_locked(&self, state: &DashboardFlowState, id: &str, phase: FlowMutationPhase) {
+        let Some(sender) = &self.mutations else {
+            return;
+        };
+        let Some(api_call_id) = state.resolve_id(id) else {
+            return;
+        };
+        let Some(record) = state.by_id.get(&api_call_id).cloned() else {
+            return;
+        };
+        let event = FlowMutation {
+            seq: record.record_seq,
+            revision: record.revision,
+            phase,
+            record,
+        };
+        let _ = sender.send(event);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, DashboardFlowState> {
@@ -1188,6 +1362,8 @@ impl DashboardFlowStore {
             // Placeholder — `insert` stamps the post-bump global `seq` so the record's
             // watermark reflects THIS insert (D7b R2 finding 1).
             record_seq: 0,
+            // Placeholder — `insert` stamps revision 1 together with `record_seq`.
+            revision: 0,
             api_call_id: cap_scalar(api_call_id.clone()),
             response_id: None,
             method: cap_scalar(method),
@@ -1230,8 +1406,10 @@ impl DashboardFlowStore {
         };
         let mut state = self.lock();
         state.prune_expired(now);
-        state.insert(cap_scalar(api_call_id), Arc::new(record));
+        let stored_id = cap_scalar(api_call_id);
+        state.insert(stored_id.clone(), Arc::new(record));
         state.enforce_caps(self.summary_quota_bytes);
+        self.publish_locked(&state, &stored_id, FlowMutationPhase::Open);
     }
 
     /// Atomically bind a `response_id` to its flow's `api_call_id` (D1 R1 #8):
@@ -1261,6 +1439,7 @@ impl DashboardFlowStore {
             record.response_id = Some(response_id.clone());
         });
         state.enforce_caps(self.summary_quota_bytes);
+        self.publish_locked(&state, &api_call_id, FlowMutationPhase::Progress);
     }
 
     /// Attach the upstream target + served model identity + upstream body (D2). The
@@ -1295,6 +1474,7 @@ impl DashboardFlowStore {
             }
         });
         state.enforce_caps(self.summary_quota_bytes);
+        self.publish_locked(&state, id, FlowMutationPhase::Progress);
     }
 
     /// Gap 05 — attach the upstream RESPONSE/ERROR body to a flow's record. NO-OP
@@ -1326,6 +1506,7 @@ impl DashboardFlowStore {
             record.upstream_response = Some(response.clone());
         });
         state.enforce_caps(self.summary_quota_bytes);
+        self.publish_locked(&state, id, FlowMutationPhase::Progress);
     }
 
     /// Attach the canonical/normalized body + requested model (D2). The body is a
@@ -1357,6 +1538,7 @@ impl DashboardFlowStore {
             }
         });
         state.enforce_caps(self.summary_quota_bytes);
+        self.publish_locked(&state, api_call_id, FlowMutationPhase::Progress);
     }
 
     /// Mark a flow terminal (D3). Stamps `status`, `finished_ms`, `elapsed_ms`
@@ -1377,11 +1559,42 @@ impl DashboardFlowStore {
         terminal_reason: Option<String>,
         serving_provider: Option<String>,
     ) {
+        self.finalize_atomic(
+            api_call_id,
+            status,
+            terminal_reason,
+            serving_provider,
+            Vec::new(),
+            None,
+            None,
+        );
+    }
+
+    /// Commit the complete terminal record in one FlowStore mutation. This is the
+    /// L1 guard's terminal seam: status/timing, attempts, wire first-byte, and the
+    /// final attempt's pending response body become visible together under one
+    /// `record_seq`/`revision`, followed by one terminal broadcast.
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_atomic(
+        &self,
+        api_call_id: &str,
+        status: FlowStatus,
+        terminal_reason: Option<String>,
+        serving_provider: Option<String>,
+        attempts: Vec<Attempt>,
+        first_upstream_byte_ms: Option<u128>,
+        pending_response_body: Option<CapturedResponseBody>,
+    ) {
         if !self.enabled {
             return;
         }
         let terminal_reason = terminal_reason.map(cap_scalar);
         let serving_provider = serving_provider.map(cap_scalar);
+        let upstream_response = if self.is_response_capture_enabled() {
+            pending_response_body.map(CapturedResponseBody::into_record)
+        } else {
+            None
+        };
         let now = now_ms();
         let mut state = self.lock();
         state.prune_expired(now);
@@ -1402,8 +1615,20 @@ impl DashboardFlowStore {
             if record.upstream_target.is_none() && serving_provider.is_some() {
                 record.upstream_target = serving_provider.clone();
             }
+            if !attempts.is_empty() {
+                record.attempts = attempts.clone();
+            }
+            if record.first_upstream_byte_ms.is_none()
+                && let Some(byte_ms) = first_upstream_byte_ms
+            {
+                record.first_upstream_byte_ms = Some(byte_ms);
+            }
+            if let Some(response) = upstream_response.clone() {
+                record.upstream_response = Some(response);
+            }
         });
         state.enforce_caps(self.summary_quota_bytes);
+        self.publish_locked(&state, api_call_id, FlowMutationPhase::Terminal);
     }
 
     /// Attach token usage (D3). UPSERT semantics: the caller passes the running
@@ -1418,6 +1643,7 @@ impl DashboardFlowStore {
         state.update(api_call_id, |record| {
             record.usage = Some(usage);
         });
+        self.publish_locked(&state, api_call_id, FlowMutationPhase::Progress);
     }
 
     /// Gap 03 — thread the per-attempt failover trace + the flow-level wire
@@ -1457,6 +1683,7 @@ impl DashboardFlowStore {
             }
         });
         state.enforce_caps(self.summary_quota_bytes);
+        self.publish_locked(&state, api_call_id, FlowMutationPhase::Progress);
     }
 
     /// Gap 02 — stamp the **routing decision** phase: the engine resolved the served
@@ -1479,6 +1706,7 @@ impl DashboardFlowStore {
         state.update(api_call_id, |record| {
             record.phases.stamp_routing(now);
         });
+        self.publish_locked(&state, api_call_id, FlowMutationPhase::Progress);
     }
 
     /// Gap 02 — stamp the **first content delta** phase (true TTFT): the wall-clock
@@ -1504,6 +1732,7 @@ impl DashboardFlowStore {
         state.update(id, |record| {
             record.phases.stamp_first_content_delta(now);
         });
+        self.publish_locked(&state, id, FlowMutationPhase::Progress);
     }
 
     /// Gap 02 — stamp the **stream end** phase: the engine reached the terminal
@@ -1523,6 +1752,7 @@ impl DashboardFlowStore {
         state.update(id, |record| {
             record.phases.stamp_stream_end(now);
         });
+        self.publish_locked(&state, id, FlowMutationPhase::Progress);
     }
 
     /// Mint the D3 **L0 middleware guard** for a freshly `open`ed flow (the
@@ -1571,10 +1801,14 @@ impl DashboardFlowStore {
         // Read the claim Arc + the inbound route in ONE lock: the record provably
         // exists here, so capturing `uri` now makes the metrics `endpoint` evict-safe
         // (D5 R3 MEDIUM) — it no longer depends on the record surviving until finalize.
-        let (claim, endpoint) = {
+        let (claim, endpoint, client_label) = {
             let state = self.lock();
             let record = state.by_id.get(api_call_id)?;
-            (record.claim.clone(), record.uri.clone())
+            (
+                record.claim.clone(),
+                record.uri.clone(),
+                record.client_label.clone(),
+            )
         };
         // CAS OpenL0 → ClaimedL1. Only the winner gets a guard.
         claim
@@ -1600,6 +1834,9 @@ impl DashboardFlowStore {
             serving,
             started: Instant::now(),
             endpoint,
+            client_label,
+            model_requested: Mutex::new(None),
+            effective_route_limit: Mutex::new(None),
             terminal_metrics: Mutex::new(None),
             abort_hub: abort_hub.clone(),
             abort_token,
@@ -1609,17 +1846,25 @@ impl DashboardFlowStore {
     /// Live records, newest-first. Empty when disabled. Prunes expired records
     /// first (D1 R1 #7 — TTL no longer depends on `open` traffic).
     pub fn list(&self) -> Vec<Arc<FlowRecord>> {
+        self.list_with_seq().0
+    }
+
+    /// Live records and the FlowStore cursor from one mutex acquisition. REST list
+    /// responses use this pair so no mutation can land between building the rows and
+    /// reading their dedup watermark. Empty/zero when disabled.
+    pub fn list_with_seq(&self) -> (Vec<Arc<FlowRecord>>, u64) {
         if !self.enabled {
-            return Vec::new();
+            return (Vec::new(), 0);
         }
         let mut state = self.lock();
         state.prune_expired(now_ms());
-        state
+        let records = state
             .order
             .iter()
             .rev()
             .filter_map(|id| state.by_id.get(id).cloned())
-            .collect()
+            .collect();
+        (records, state.seq)
     }
 
     /// Resolve a single record by `api_call_id` OR `response_id` (via the link
@@ -1845,6 +2090,16 @@ pub struct TelemetryGuard {
     /// the record provably exists). The metrics `endpoint` dimension reads from this
     /// owned copy, so it survives a later TTL prune / cap eviction of the record.
     endpoint: String,
+    /// Claim-time non-secret attribution copied from the record so cap/TTL eviction
+    /// cannot erase the terminal overview's client dimension.
+    client_label: Option<String>,
+    /// The engine stamps the canonical requested model immediately after claim. Kept
+    /// separate from the evictable record because normalization may complete after the
+    /// record has already been pruned under extreme concurrency.
+    model_requested: Mutex<Option<String>>,
+    /// Conservative candidate-set context floor discovered during routing. Multiple
+    /// tool-loop turns retain the smallest observed positive limit.
+    effective_route_limit: Mutex<Option<i64>>,
     /// D5 R3 (MEDIUM): the metrics inputs the engine records at the terminal seam,
     /// assembled at finalize from the guard's OWN evict-safe sources — the captured
     /// `endpoint` + the shared `ServingToken` (which carries the resolved
@@ -1892,6 +2147,35 @@ impl TelemetryGuard {
     /// that want the guard-relative value.)
     pub fn elapsed(&self) -> std::time::Duration {
         self.started.elapsed()
+    }
+
+    /// Stamp the request model onto the guard's evict-safe metrics context. First
+    /// non-empty value wins; the scalar is capped identically to the FlowStore field.
+    pub fn set_model_requested(&self, model: Option<String>) {
+        let Some(model) = model.filter(|model| !model.trim().is_empty()) else {
+            return;
+        };
+        let mut stored = self
+            .model_requested
+            .lock()
+            .expect("telemetry guard requested-model lock poisoned");
+        if stored.is_none() {
+            *stored = Some(cap_scalar(model));
+        }
+    }
+
+    /// Record the effective route limit used by context budgeting. The smallest
+    /// positive value wins across tool-loop turns, preserving the conservative route
+    /// ceiling rather than silently upgrading it later.
+    pub fn set_effective_route_limit(&self, limit: Option<i64>) {
+        let Some(limit) = limit.filter(|limit| *limit > 0) else {
+            return;
+        };
+        let mut stored = self
+            .effective_route_limit
+            .lock()
+            .expect("telemetry guard route-limit lock poisoned");
+        *stored = Some(stored.map_or(limit, |current| current.min(limit)));
     }
 
     /// The metrics inputs the guard assembled at finalize (D5 R3 MEDIUM), or `None` if
@@ -1942,43 +2226,51 @@ impl TelemetryGuard {
             // Gap 03: the per-attempt trace + flow-level wire-first-byte ride the SAME
             // evict-safe `ServingToken` as `usage`, so the terminal metrics payload (spec
             // 12's source) carries every attempt even if the FlowStore record is
-            // pruned/evicted before finalize. Snapshot them here, BEFORE the
-            // `store.finalize`/`record_attempts` below, so the payload is independent of
+            // pruned/evicted before finalize. Snapshot them before the one atomic
+            // terminal store mutation, so the metrics payload remains independent of
             // whether the record still exists.
             let (attempts, first_upstream_byte_ms) = self.serving.attempts_snapshot();
+            let failure_reason =
+                TerminalReasonClass::from_terminal(terminal_reason.as_deref(), &attempts);
+            let model_requested = self
+                .model_requested
+                .lock()
+                .expect("telemetry guard requested-model lock poisoned")
+                .clone();
+            let effective_route_limit = *self
+                .effective_route_limit
+                .lock()
+                .expect("telemetry guard route-limit lock poisoned");
             *self
                 .terminal_metrics
                 .lock()
                 .expect("telemetry guard terminal-metrics lock poisoned") =
                 Some(TerminalMetricsInputs {
+                    model_requested,
                     model_served,
                     endpoint: self.endpoint.clone(),
                     upstream: serving.clone(),
+                    client_label: self.client_label.clone(),
                     usage,
                     attempts: attempts.clone(),
+                    failure_reason,
+                    cost_usd: None,
+                    cost_confidence: TerminalCostConfidence::Unavailable,
+                    effective_route_limit,
                 });
-            self.store
-                .finalize(&self.api_call_id, status, terminal_reason, serving);
-            // Gap 03: ALSO thread the attempt trace onto the FlowStore record (the
-            // attempt-trace UI reads the record/summary). Same evict-safe source; a
-            // pruned/evicted record makes this a no-op, but the terminal payload above
-            // still carries the attempts for metrics.
-            self.store
-                .record_attempts(&self.api_call_id, attempts, first_upstream_byte_ms);
-            // Gap 05 round-1 review (F1): commit the turn's PENDING upstream RESPONSE/ERROR
-            // body — staged on the shared `ServingToken` by the leaf's terminal-error sites
-            // — onto the FlowStore record HERE, at finalize, AFTER the failover layer has
-            // decided the turn's FINAL outcome. The token holds a body IFF the turn
-            // ultimately FAILED with a captured error body: a provider that served the turn
-            // CLEARED it (so a successful turn commits `None` — no stale earlier-attempt
-            // error body), while an all-providers-fail turn carries the LAST attempt's body.
-            // `take` moves it out so a re-finalize cannot re-commit. `set_upstream_response`
-            // is itself gated on the response-capture flag (and no-ops on a pruned/evicted
-            // record), so when capture is off this is a cheap no-op — the leaf staged nothing
-            // anyway.
-            self.store.set_upstream_response(
+            // Snapshot the final attempt body before taking the store lock. The FlowStore
+            // commits it together with status + attempts + wire-first-byte below, so a
+            // socket can never observe a terminal row missing its final trace/body and no
+            // three-step sequence churn occurs.
+            let pending_response_body = self.serving.take_pending_response_body();
+            self.store.finalize_atomic(
                 &self.api_call_id,
-                self.serving.take_pending_response_body(),
+                status,
+                terminal_reason,
+                serving,
+                attempts,
+                first_upstream_byte_ms,
+                pending_response_body,
             );
             // D6: drop the kill token from the AbortHub on the SAME CAS-winning path
             // that finalizes the record — so EVERY terminal (explicit Completed/Failed
@@ -2019,7 +2311,9 @@ impl DashboardFlowState {
         // Stamp the record's own watermark with the post-bump global seq. The Arc is
         // freshly minted by `open` (refcount 1), so `make_mut` mutates in place without
         // a clone.
-        Arc::make_mut(&mut record).record_seq = self.seq;
+        let record_mut = Arc::make_mut(&mut record);
+        record_mut.record_seq = self.seq;
+        record_mut.revision = 1;
         self.live_summary_bytes = self
             .live_summary_bytes
             .saturating_add(record.summary_bytes());
@@ -2064,6 +2358,7 @@ impl DashboardFlowState {
         // mutation seq, not a later global value bumped by unrelated flows.
         self.seq = self.seq.saturating_add(1);
         next.record_seq = self.seq;
+        next.revision = existing.revision.saturating_add(1);
         self.by_id.insert(api_call_id, Arc::new(next));
     }
 
@@ -2455,6 +2750,68 @@ mod tests {
             .map(|record| record.api_call_id.clone())
             .collect();
         assert_eq!(ids, vec!["api_2", "api_1", "api_0"]);
+    }
+
+    #[test]
+    fn authoritative_mutations_publish_monotonic_seq_revision_and_phase() {
+        let store = DashboardFlowStore::new();
+        let mut rx = store.subscribe().expect("enabled publisher");
+
+        open_simple(&store, "api_1");
+        let opened = rx.try_recv().expect("open mutation");
+        assert_eq!(opened.phase, FlowMutationPhase::Open);
+        assert_eq!(opened.seq, 1);
+        assert_eq!(opened.revision, 1);
+        assert_eq!(opened.record.status, FlowStatus::Open);
+
+        store.set_normalized("api_1", Some("requested".to_string()), None);
+        let progress = rx.try_recv().expect("progress mutation");
+        assert_eq!(progress.phase, FlowMutationPhase::Progress);
+        assert_eq!(progress.seq, 2);
+        assert_eq!(progress.revision, 2);
+        assert_eq!(
+            progress.record.model_requested.as_deref(),
+            Some("requested")
+        );
+
+        let usage = FlowUsage {
+            prompt: 10,
+            completion: 4,
+            total: 14,
+            cached: None,
+            reasoning: Some(2),
+        };
+        store.record_usage("api_1", usage);
+        let usage_event = rx.try_recv().expect("usage mutation");
+        assert_eq!(usage_event.phase, FlowMutationPhase::Progress);
+        assert_eq!(usage_event.seq, 3);
+        assert_eq!(usage_event.revision, 3);
+        assert_eq!(usage_event.record.usage, Some(usage));
+
+        store.finalize("api_1", FlowStatus::Completed, None, None);
+        let terminal = rx.try_recv().expect("terminal mutation");
+        assert_eq!(terminal.phase, FlowMutationPhase::Terminal);
+        assert_eq!(terminal.seq, 4);
+        assert_eq!(terminal.revision, 4);
+        assert_eq!(terminal.record.status, FlowStatus::Completed);
+        assert!(terminal.record.finished_ms.is_some());
+
+        let (records, seq) = store.list_with_seq();
+        assert_eq!(seq, terminal.seq, "rows and cursor share one store cut");
+        assert_eq!(records[0].revision, terminal.revision);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn disabled_store_allocates_no_mutation_publisher() {
+        let store = DashboardFlowStore::disabled();
+        assert!(store.subscribe().is_none());
+        let (records, seq) = store.list_with_seq();
+        assert!(records.is_empty());
+        assert_eq!(seq, 0);
     }
 
     #[test]
@@ -2932,6 +3289,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn terminal_metrics_capture_overview_dimensions_and_bound_failure_reason() {
+        let store = DashboardFlowStore::new();
+        store.open(
+            "api_overview".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            no_headers(),
+            None,
+            ClientAttribution {
+                label: Some("key-deadbeef0123".to_string()),
+                source: Some(ClientSource::KeyHash),
+            },
+        );
+        let token = serving();
+        token.set_model_served("served-model");
+        token.set_provider("provider-a");
+        token.record_attempt(failed_attempt("provider-a", AttemptErrorClass::Timeout));
+        let guard = store
+            .engine_guard("api_overview", token, &AbortHub::new())
+            .expect("claim");
+        guard.set_model_requested(Some("requested-model".to_string()));
+        guard.set_effective_route_limit(Some(32_768));
+        guard.set_effective_route_limit(Some(16_384));
+        guard.finalize(
+            FlowStatus::Failed,
+            Some("arbitrary provider error with unbounded text".to_string()),
+        );
+        let inputs = guard.terminal_metrics().expect("terminal inputs");
+        assert_eq!(inputs.model_requested.as_deref(), Some("requested-model"));
+        assert_eq!(inputs.model_served.as_deref(), Some("served-model"));
+        assert_eq!(inputs.client_label.as_deref(), Some("key-deadbeef0123"));
+        assert_eq!(inputs.effective_route_limit, Some(16_384));
+        assert_eq!(inputs.failure_reason, TerminalReasonClass::Timeout);
+        assert!(
+            inputs.cost_usd.is_none(),
+            "engine prices after guard finalize"
+        );
+        assert_eq!(inputs.cost_confidence, TerminalCostConfidence::Unavailable);
+    }
+
     /// Gap 12 acceptance: a flow whose FlowStore record is EVICTED before finalize still
     /// counts its FAILED-PRIMARY provider in the per-provider metrics. The attempt trace
     /// rides the SAME evict-safe terminal payload as `usage`/`upstream` (read off the
@@ -3366,6 +3764,55 @@ mod tests {
         assert_eq!(inputs.attempts[1].provider.as_deref(), Some("backup"));
     }
 
+    #[test]
+    fn guard_terminal_record_is_one_atomic_mutation_and_broadcast() {
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        let mut rx = store.subscribe().expect("enabled publisher");
+        open_simple(&store, "api_1");
+        let opened = rx.try_recv().expect("open event");
+
+        let token = serving();
+        token.record_attempt(failed_attempt("primary", AttemptErrorClass::HttpStatus));
+        token.record_attempt(served_attempt("backup", Some(220)));
+        token.set_pending_response_body(capture_response_body(
+            br#"{"error":{"message":"final backend failure"}}"#,
+        ));
+        let guard = store
+            .engine_guard("api_1", Arc::clone(&token), &AbortHub::new())
+            .expect("claim");
+        let before_seq = store.flow_seq();
+
+        guard.finalize(FlowStatus::Failed, Some("all providers failed".to_string()));
+
+        let terminal = rx.try_recv().expect("one terminal event");
+        assert_eq!(terminal.phase, FlowMutationPhase::Terminal);
+        assert_eq!(terminal.seq, before_seq + 1, "terminal bumps flow seq once");
+        assert_eq!(
+            terminal.revision,
+            opened.revision + 1,
+            "terminal bumps this flow revision once"
+        );
+        assert_eq!(terminal.record.status, FlowStatus::Failed);
+        assert_eq!(terminal.record.attempts.len(), 2);
+        assert_eq!(terminal.record.first_upstream_byte_ms, Some(220));
+        let body = terminal
+            .record
+            .upstream_response
+            .as_ref()
+            .expect("pending response body committed in terminal record");
+        assert!(String::from_utf8_lossy(&body.bytes).contains("final backend failure"));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let stored = store.detail("api_1").expect("terminal record");
+        assert_eq!(stored.record_seq, terminal.seq);
+        assert_eq!(stored.revision, terminal.revision);
+        assert_eq!(stored.attempts, terminal.record.attempts);
+        assert!(stored.upstream_response.is_some());
+    }
+
     /// Evict-safe acceptance: when the FlowStore record is EVICTED before finalize, the
     /// terminal payload STILL carries ALL attempts (spec 12 aggregates from it without
     /// re-reading the gone record). Asserted for both eviction mechanisms.
@@ -3448,10 +3895,8 @@ mod tests {
     #[test]
     fn summary_quota_evicts_oldest_bodies_keeping_records() {
         let store = DashboardFlowStore {
-            enabled: true,
-            response_capture_enabled: false,
-            state: Arc::new(Mutex::new(DashboardFlowState::default())),
             summary_quota_bytes: 4 * 1024,
+            ..DashboardFlowStore::new_with_response_capture(false)
         };
         let body = vec![b'a'; 2048];
         let json = {
@@ -3493,10 +3938,8 @@ mod tests {
         // the quota, so the counted scalars force api_0's BODY to be shed while api_1
         // (under-quota by itself) survives.
         let store = DashboardFlowStore {
-            enabled: true,
-            response_capture_enabled: false,
-            state: Arc::new(Mutex::new(DashboardFlowState::default())),
             summary_quota_bytes: 16 * 1024,
+            ..DashboardFlowStore::new_with_response_capture(false)
         };
         // api_0: a ~10 KiB body (JSON array of many short strings; none individually
         // capped, so the captured body is genuinely large), no large scalars.
@@ -3554,11 +3997,9 @@ mod tests {
         // quota — scalar/header-only records dominate — evict OLDEST WHOLE records
         // until under quota, so the quota is a HARD bound.
         let store = DashboardFlowStore {
-            enabled: true,
-            response_capture_enabled: false,
-            state: Arc::new(Mutex::new(DashboardFlowState::default())),
             // ~10 capped-scalar records fit; many more must force whole-record eviction.
             summary_quota_bytes: 64 * 1024,
+            ..DashboardFlowStore::new_with_response_capture(false)
         };
         let mut headers = HeaderMap::new();
         // A ~4 KiB header value (capped to SCALAR_CAP) so each record is header-heavy

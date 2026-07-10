@@ -132,6 +132,26 @@ describe('StatsStrip — chips', () => {
   });
 });
 
+describe('StatsStrip — connection semantics', () => {
+  it('distinguishes initial loading, stale reconnect, and transport failure', () => {
+    const { getByTestId } = renderWithQuery(<StatsStrip />);
+    act(() => dashboardStore.getState().setConnection('connecting'));
+    expect(getByTestId('connection-state').textContent).toBe('connecting');
+    expect(getByTestId('connection-state').getAttribute('data-stale')).toBeNull();
+
+    pushMetrics(metrics(1));
+    act(() => {
+      dashboardStore.getState().setConnection('live');
+      dashboardStore.getState().setConnection('connecting');
+    });
+    expect(getByTestId('connection-state').textContent).toContain('reconnecting · stale');
+    expect(getByTestId('connection-state').getAttribute('data-stale')).toBe('true');
+
+    act(() => dashboardStore.getState().setConnection('error'));
+    expect(getByTestId('connection-state').textContent).toBe('error');
+  });
+});
+
 describe('StatsStrip — seek isolation (D11 R5)', () => {
   it('reads the FROZEN snapshot value while seeking, flat delta, then returns to live on resume', () => {
     const { getByTestId } = renderWithQuery(<StatsStrip />);

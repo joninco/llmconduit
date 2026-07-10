@@ -42,7 +42,12 @@ export function resetWorld(opts: { mock?: boolean } = {}): void {
   if (opts.mock) {
     delete window.__LLMCONDUIT_DASHBOARD__;
   } else {
-    window.__LLMCONDUIT_DASHBOARD__ = { authenticated: true, csrf_token: 'test-csrf', mutations_enabled: true };
+    window.__LLMCONDUIT_DASHBOARD__ = {
+      authenticated: true,
+      csrf_token: 'test-csrf',
+      mutations_enabled: true,
+      schema_version: 2,
+    };
   }
 }
 
@@ -66,11 +71,14 @@ export function seedFlows(flows: FlowSummary[]): void {
 /** A minimal valid `FlowSummary` for table tests. */
 export function makeFlow(over: Partial<FlowSummary> = {}): FlowSummary {
   return {
+    revision: 1,
     api_call_id: `api_${Math.random().toString(36).slice(2, 8)}`,
     method: 'POST',
     uri: '/v1/responses',
     status: 'completed',
     started_ms: 1_700_000_000_000,
+    usage: null,
+    cost: null,
     // Gap 07: every row carries a cost-confidence tag; default to `unavailable` (no price).
     cost_confidence: 'unavailable',
     ...over,

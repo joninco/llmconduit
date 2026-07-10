@@ -11,7 +11,7 @@ import type { Attempt, FlowStatusPayload, FlowSummary, ProviderHealth, SeqCursor
 
 const CURSORS: SeqCursors = { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 };
 function flow(id: string): FlowSummary {
-  return { api_call_id: id, method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1, cost_confidence: 'unavailable' };
+  return { revision: 1, api_call_id: id, method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1, cost_confidence: 'unavailable' };
 }
 function node(id: string): ProviderHealth {
   return {
@@ -175,14 +175,7 @@ describe('dashboardStore — seedTopology seq reconciliation (finding 6)', () =>
   });
 });
 
-/**
- * Gap 10b (review round 1, finding 1) — `patchFlowStatus` must THREAD the projected spine fields
- * (gap-02 phase epochs + gap-03 `attempts`/`first_upstream_byte_ms`) off the live `flow_status`
- * frame onto the store row, so the measured latency waterfall + attempt trace light up for a LIVE
- * flow. A later frame that OMITS a field must NOT erase an earlier-known value (progressive frames),
- * and an absent phase must stay ABSENT (never a fabricated `0`).
- */
-describe('dashboardStore — patchFlowStatus threads projected spine fields (gap 10b finding 1)', () => {
+describe('dashboardStore — authoritative revisioned flow rows', () => {
   beforeEach(() => dashboardStore.getState().reset());
 
   const SERVED: Attempt = {
@@ -194,12 +187,16 @@ describe('dashboardStore — patchFlowStatus threads projected spine fields (gap
     status: 'served',
   };
 
-  /** A `flow_status` frame carrying the spine fields (omitted keys fall back to defaults below). */
+  /** One complete post-mutation FlowRow with the WS-only discriminants attached. */
   function frame(over: Partial<FlowStatusPayload> = {}): FlowStatusPayload {
     return {
       type: 'flow_status',
+      phase: 'progress',
+      revision: 1,
       api_call_id: 'api_spine',
       response_id: null,
+      method: 'POST',
+      uri: '/v1/responses',
       status: 'open',
       model_requested: null,
       model_served: null,
@@ -207,13 +204,23 @@ describe('dashboardStore — patchFlowStatus threads projected spine fields (gap
       usage: null,
       started_ms: 1_700_000_000_000,
       elapsed_ms: null,
+      cost: null,
+      cost_confidence: 'unavailable',
       ...over,
     };
   }
 
-  it('lands phases / attempts / first_upstream_byte_ms from a flow_status frame into the store', () => {
+  it('installs the complete row without losing cost, attribution, phases, or attempts', () => {
     dashboardStore.getState().patchFlowStatus(
       frame({
+        revision: 7,
+        phase: 'terminal',
+        status: 'completed',
+        usage: { prompt: 100, completion: 40, total: 140 },
+        cost: 0.42,
+        cost_confidence: 'estimated',
+        client_label: 'key-abc123',
+        client_source: 'key_hash',
         ingress_ms: 1_700_000_000_000,
         normalization_done_ms: 1_700_000_000_050,
         routing_decision_ms: 1_700_000_000_090,
@@ -226,6 +233,12 @@ describe('dashboardStore — patchFlowStatus threads projected spine fields (gap
     );
 
     const row = dashboardStore.getState().flows.get('api_spine');
+    expect(row?.revision).toBe(7);
+    expect(row?.status).toBe('completed');
+    expect(row?.cost).toBe(0.42);
+    expect(row?.cost_confidence).toBe('estimated');
+    expect(row?.client_label).toBe('key-abc123');
+    expect(row?.client_source).toBe('key_hash');
     expect(row?.ingress_ms).toBe(1_700_000_000_000);
     expect(row?.normalization_done_ms).toBe(1_700_000_000_050);
     expect(row?.routing_decision_ms).toBe(1_700_000_000_090);
@@ -234,80 +247,83 @@ describe('dashboardStore — patchFlowStatus threads projected spine fields (gap
     expect(row?.finalize_ms).toBe(1_700_000_001_100);
     expect(row?.first_upstream_byte_ms).toBe(1_700_000_000_350);
     expect(row?.attempts).toEqual([SERVED]);
+    expect(row).not.toHaveProperty('type');
+    expect(row).not.toHaveProperty('phase');
   });
 
-  it('a later frame OMITTING a field KEEPS the prior known value (progressive frames)', () => {
-    // Frame 1 establishes the early phases + the attempt trace.
-    dashboardStore.getState().patchFlowStatus(
-      frame({
-        ingress_ms: 1_700_000_000_000,
-        routing_decision_ms: 1_700_000_000_090,
-        first_content_delta_ms: 1_700_000_000_500,
-        attempts: [SERVED],
-        first_upstream_byte_ms: 1_700_000_000_350,
-      }),
-    );
-    // Frame 2 is the terminal frame: it adds `stream_end_ms`/`finalize_ms` but OMITS the earlier
-    // phase epochs + attempts (a real progressive stream does not re-send every field each frame).
-    dashboardStore.getState().patchFlowStatus(
-      frame({
-        status: 'completed',
-        stream_end_ms: 1_700_000_001_000,
-        finalize_ms: 1_700_000_001_100,
-        elapsed_ms: 1_100,
-      }),
-    );
+  it('ignores a delayed lower revision and accepts an equal-revision authoritative replacement', () => {
+    dashboardStore.getState().patchFlowStatus(frame({ revision: 4, status: 'completed', cost: 0.4, cost_confidence: 'confident' }));
+    dashboardStore.getState().patchFlowStatus(frame({ revision: 3, status: 'open', cost: null }));
+    expect(dashboardStore.getState().flows.get('api_spine')?.status).toBe('completed');
 
+    dashboardStore.getState().patchFlowStatus(frame({ revision: 4, status: 'failed', terminal_reason: 'authoritative replacement' }));
     const row = dashboardStore.getState().flows.get('api_spine');
-    // The new terminal fields landed…
-    expect(row?.status).toBe('completed');
-    expect(row?.stream_end_ms).toBe(1_700_000_001_000);
-    expect(row?.finalize_ms).toBe(1_700_000_001_100);
-    // …and the earlier-known fields were NOT erased by the omitting frame.
-    expect(row?.ingress_ms).toBe(1_700_000_000_000);
-    expect(row?.routing_decision_ms).toBe(1_700_000_000_090);
-    expect(row?.first_content_delta_ms).toBe(1_700_000_000_500);
-    expect(row?.first_upstream_byte_ms).toBe(1_700_000_000_350);
-    expect(row?.attempts).toEqual([SERVED]);
+    expect(row?.status).toBe('failed');
+    expect(row?.terminal_reason).toBe('authoritative replacement');
+    expect(row?.cost).toBeNull();
   });
 
-  it('an absent phase stays ABSENT (never a fabricated 0)', () => {
-    dashboardStore.getState().patchFlowStatus(frame({ ingress_ms: 1_700_000_000_000 }));
+  it('replaces rather than field-merges a newer complete revision', () => {
+    dashboardStore.getState().patchFlowStatus(frame({ revision: 1, attempts: [SERVED], cost: 1, cost_confidence: 'confident' }));
+    dashboardStore.getState().patchFlowStatus(frame({ revision: 2, attempts: [], cost: null, cost_confidence: 'unavailable' }));
     const row = dashboardStore.getState().flows.get('api_spine');
-    // The unmeasured phases are absent/undefined — NOT `0` (the honesty invariant).
-    expect(row?.first_content_delta_ms ?? null).toBeNull();
-    expect(row?.finalize_ms ?? null).toBeNull();
-    expect(row?.first_upstream_byte_ms ?? null).toBeNull();
-    expect(row?.first_content_delta_ms).not.toBe(0);
-    expect(row?.attempts ?? null).toBeNull();
+    expect(row?.revision).toBe(2);
+    expect(row?.attempts).toEqual([]);
+    expect(row?.cost).toBeNull();
+    expect(row?.cost_confidence).toBe('unavailable');
   });
 
-  // Gap 10b review round 2 — `attempts` is an ARRAY: a LATER frame carrying an EMPTY `attempts: []`
-  // (the "no attempt recorded yet" serialization) must NOT erase an earlier-known NON-EMPTY trace.
-  // The old `p.attempts ?? prev?.attempts` only fell back on null/undefined, so a `[]` would wipe it;
-  // `pickAttempts` treats a later empty array as "no update".
-  it('a later frame with an EMPTY attempts[] does NOT erase a prior non-empty trace', () => {
-    // Frame 1 establishes the failover trace.
-    dashboardStore.getState().patchFlowStatus(frame({ attempts: [SERVED] }));
-    expect(dashboardStore.getState().flows.get('api_spine')?.attempts).toEqual([SERVED]);
-    // Frame 2 carries an EMPTY attempts list (a snapshot/projection that recorded none this frame).
-    dashboardStore.getState().patchFlowStatus(frame({ status: 'completed', attempts: [] }));
+  it('clears stale pricing when a legacy standalone usage frame changes usage', () => {
+    dashboardStore.getState().patchFlowStatus(frame({
+      revision: 1,
+      usage: { prompt: 10, completion: 2, total: 12 },
+      cost: 0.25,
+      cost_confidence: 'confident',
+    }));
+    dashboardStore.getState().patchUsage('api_spine', { prompt: 20, completion: 5, total: 25 });
     const row = dashboardStore.getState().flows.get('api_spine');
-    expect(row?.status).toBe('completed'); // the new status landed…
-    expect(row?.attempts).toEqual([SERVED]); // …but the known trace was NOT erased by the empty [].
+    expect(row?.usage?.total).toBe(25);
+    expect(row?.cost).toBeNull();
+    expect(row?.cost_confidence).toBe('unavailable');
+  });
+});
+
+describe('dashboardStore — bounded flow retention and REST removal reconciliation', () => {
+  beforeEach(() => dashboardStore.getState().reset());
+
+  it('removes a stale open row when a strictly newer `/flows` cut omits it', () => {
+    dashboardStore.getState().upsertFlow(flow('stale-open'));
+    dashboardStore.getState().upsertFlow(flow('retained'));
+    dashboardStore.getState().setCursor('flow_seq', 3);
+
+    dashboardStore.getState().reconcileFlowRows([flow('retained')], 4);
+
+    const state = dashboardStore.getState();
+    expect([...state.flows.keys()]).toEqual(['retained']);
+    expect(state.flowOrder).toEqual(['retained']);
+    expect(state.cursors.flow_seq).toBe(4);
   });
 
-  it('a later frame with a NON-EMPTY attempts[] UPDATES the prior trace (real failover progression)', () => {
-    const FAILED: Attempt = {
-      provider: 'vllm-a', model: 'llama-3.1-70b',
-      start_ms: 1_700_000_000_000, end_ms: 1_700_000_000_080,
-      status: 'failed', error_class: 'http_status',
-    };
-    // Frame 1: only the failed attempt is known so far.
-    dashboardStore.getState().patchFlowStatus(frame({ attempts: [FAILED] }));
-    expect(dashboardStore.getState().flows.get('api_spine')?.attempts).toEqual([FAILED]);
-    // Frame 2: the full trace (failover then served) — a non-empty later frame WINS.
-    dashboardStore.getState().patchFlowStatus(frame({ attempts: [FAILED, SERVED] }));
-    expect(dashboardStore.getState().flows.get('api_spine')?.attempts).toEqual([FAILED, SERVED]);
+  it('ignores stale/equal REST cuts and never moves the flow cursor backwards', () => {
+    dashboardStore.getState().upsertFlow(flow('live'));
+    dashboardStore.getState().setCursor('flow_seq', 7);
+
+    dashboardStore.getState().reconcileFlowRows([], 7);
+    dashboardStore.getState().reconcileFlowRows([], 6);
+
+    expect(dashboardStore.getState().flows.has('live')).toBe(true);
+    expect(dashboardStore.getState().cursors.flow_seq).toBe(7);
+  });
+
+  it('caps live WS-only rows to the server FlowStore count bound', () => {
+    for (let index = 0; index < 513; index += 1) {
+      dashboardStore.getState().upsertFlow(flow(`api_${index}`));
+    }
+
+    const state = dashboardStore.getState();
+    expect(state.flows.size).toBe(512);
+    expect(state.flowOrder).toHaveLength(512);
+    expect(state.flows.has('api_0')).toBe(false);
+    expect(state.flows.has('api_512')).toBe(true);
   });
 });

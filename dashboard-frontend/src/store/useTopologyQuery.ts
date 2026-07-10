@@ -37,6 +37,8 @@ export type PerProviderById = Record<string, ProviderLatency>;
 export interface TopologyQueryResult {
   /** Per-provider metrics keyed by provider id, from the LIVE REST read (absent ⇒ no in-window data). */
   perProviderById: PerProviderById;
+  loadState: 'loading' | 'ready' | 'error';
+  retry: () => void;
 }
 
 export function useTopologyQuery(): TopologyQueryResult {
@@ -72,5 +74,9 @@ export function useTopologyQuery(): TopologyQueryResult {
     return map;
   }, [seeking, data]);
 
-  return { perProviderById };
+  return {
+    perProviderById,
+    loadState: seeking ? 'ready' : query.isError ? 'error' : query.isPending ? 'loading' : 'ready',
+    retry: () => { void query.refetch(); },
+  };
 }

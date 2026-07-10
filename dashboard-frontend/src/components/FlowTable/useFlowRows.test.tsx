@@ -4,6 +4,7 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { renderHook, waitFor, act, cleanup } from '@testing-library/react';
 import { useFlowRows } from './useFlowRows';
 import { EMPTY_FILTERS } from './filterTypes';
+import type { FlowFilters } from './filterTypes';
 import { getConnection } from '../../api/connection';
 import { dashboardStore } from '../../store/dashboardStore';
 import { makeFlow, resetWorld, seedFlows } from '../testHarness';
@@ -17,21 +18,27 @@ import type { FlowSummary, FlowsResponse } from '../../api/types';
  */
 
 /** Render `useFlowRows` inside the connection's QueryClient (built fresh per `getConnection`). */
-function renderRows() {
+function renderRows(filters: FlowFilters = EMPTY_FILTERS) {
   const { queryClient } = getConnection();
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
   );
-  return renderHook(() => useFlowRows(EMPTY_FILTERS), { wrapper });
+  return renderHook(() => useFlowRows(filters), { wrapper });
 }
 
 /** A `fetch` stub answering ONLY `/flows` with the given list; everything else 404s. */
-function stubFlowsFetch(flows: FlowSummary[]): void {
-  const body: FlowsResponse = { flows, total: flows.length, flow_seq: 1 };
+function stubFlowsFetch(flows: FlowSummary[], flowSeq = 0): void {
+  const body: FlowsResponse = { flows, total: flows.length, flow_seq: flowSeq };
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/flows')) {
-      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-LLMConduit-Dashboard-Schema': '2',
+        },
+      });
     }
     return new Response('{}', { status: 404 });
   }));
@@ -54,7 +61,7 @@ describe('useFlowRows — REST query enabled for the real backend (finding 2)', 
   });
 });
 
-describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () => {
+describe('useFlowRows — complete rows reconcile by revision', () => {
   beforeEach(() => resetWorld());
   afterEach(() => {
     cleanup();
@@ -62,92 +69,62 @@ describe('useFlowRows — live row retains REST roll-up fields (finding 5)', () 
     vi.restoreAllMocks();
   });
 
-  it('keeps the REST cost / terminal_reason when the live row lacks them', async () => {
-    // REST row carries the server roll-up; the live store row (same id) does NOT (a flow_status
-    // patch defaults cost/terminal_reason to null until a frame carries them).
-    stubFlowsFetch([
-      makeFlow({ api_call_id: 'api_live', status: 'completed', cost: 0.42, terminal_reason: 'response.completed' }),
-    ]);
-    seedFlows([makeFlow({ api_call_id: 'api_live', status: 'open', cost: null, terminal_reason: null })]);
-
+  it('uses a strictly newer REST row as one coherent state', async () => {
+    stubFlowsFetch([makeFlow({
+      revision: 3,
+      api_call_id: 'api_revision',
+      status: 'completed',
+      usage: { prompt: 20, completion: 4, total: 24 },
+      cost: 0.42,
+      cost_confidence: 'estimated',
+      terminal_reason: 'response.completed',
+      client_label: 'key-new',
+    })]);
+    seedFlows([makeFlow({
+      revision: 2,
+      api_call_id: 'api_revision',
+      status: 'open',
+      usage: { prompt: 10, completion: 0, total: 10 },
+      cost: null,
+      client_label: 'key-old',
+    })]);
     const { result } = renderRows();
-    // Once the REST list resolves, the merged row exposes the server roll-up…
-    await waitFor(() => {
-      const row = result.current.rows.find((r) => r.api_call_id === 'api_live');
-      expect(row?.cost).toBe(0.42);
-    });
-    const row = result.current.rows.find((r) => r.api_call_id === 'api_live');
-    // …and the terminal-absorbing heal adopts the REST terminal status over the stale live
-    // `open` (a flow never goes terminal→open; see the mergeLiveWithRest field policy).
+    await waitFor(() => expect(result.current.rows.find((row) => row.api_call_id === 'api_revision')?.revision).toBe(3));
+    const row = result.current.rows.find((candidate) => candidate.api_call_id === 'api_revision');
     expect(row?.status).toBe('completed');
-    expect(row?.terminal_reason).toBe('response.completed');
-  });
-
-  it('a live cost is NOT overwritten by the REST roll-up (live wins when present)', async () => {
-    stubFlowsFetch([makeFlow({ api_call_id: 'api_live2', status: 'completed', cost: 0.42 })]);
-    seedFlows([makeFlow({ api_call_id: 'api_live2', status: 'open', cost: 0.99 })]);
-    const { result } = renderRows();
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
-    // Let the REST data settle into the merge.
-    await act(async () => { await Promise.resolve(); });
-    const row = dashboardStore.getState().flows.get('api_live2');
-    expect(row?.cost).toBe(0.99); // store untouched
-    const merged = result.current.rows.find((r) => r.api_call_id === 'api_live2');
-    expect(merged?.cost).toBe(0.99); // live roll-up preferred over REST
-  });
-
-  // Gap 07 review round 1, finding 4 — a WS-created row defaults `cost_confidence` to the store
-  // `unavailable`; the REST roll-up backfills the REAL tag ALONGSIDE the REST cost.
-  it('backfills the REST cost_confidence onto a WS row stuck at the unavailable default', async () => {
-    // REST row carries the server cost + its confidence tag.
-    stubFlowsFetch([
-      makeFlow({ api_call_id: 'api_cc', status: 'completed', cost: 0.42, cost_confidence: 'estimated' }),
-    ]);
-    // A WS-created row: a flow_status patch minted it with cost null + the default `unavailable`.
-    act(() =>
-      dashboardStore.getState().patchFlowStatus({
-        type: 'flow_status',
-        api_call_id: 'api_cc',
-        response_id: null,
-        status: 'open',
-        model_requested: null,
-        model_served: null,
-        upstream_target: null,
-        usage: null,
-        started_ms: 1_700_000_000_000,
-        elapsed_ms: null,
-      }),
-    );
-    // Sanity: the WS row really starts at the unavailable default before REST merges.
-    expect(dashboardStore.getState().flows.get('api_cc')?.cost_confidence).toBe('unavailable');
-
-    const { result } = renderRows();
-    await waitFor(() => {
-      const r = result.current.rows.find((row) => row.api_call_id === 'api_cc');
-      expect(r?.cost).toBe(0.42);
-    });
-    const row = result.current.rows.find((r) => r.api_call_id === 'api_cc');
-    // The confidence tag is backfilled with the cost (no longer stuck at `unavailable`)…
+    expect(row?.usage?.total).toBe(24);
+    expect(row?.cost).toBe(0.42);
     expect(row?.cost_confidence).toBe('estimated');
-    // …and the terminal-absorbing heal adopts the REST terminal status too.
-    expect(row?.status).toBe('completed');
+    expect(row?.client_label).toBe('key-new');
   });
 
-  // The confidence tag is PAIRED with the cost source: when the LIVE row authored a real cost, its
-  // own tag wins over the REST roll-up (so the dollar figure + label stay consistent).
-  it('keeps the LIVE cost_confidence when the live row authored the cost', async () => {
-    stubFlowsFetch([makeFlow({ api_call_id: 'api_cc2', status: 'completed', cost: 0.42, cost_confidence: 'estimated' })]);
-    seedFlows([makeFlow({ api_call_id: 'api_cc2', status: 'open', cost: 0.99, cost_confidence: 'confident' })]);
+  it('keeps the live row when its revision is newer or equal', async () => {
+    stubFlowsFetch([makeFlow({ revision: 4, api_call_id: 'api_live', status: 'failed', cost: 1 })]);
+    seedFlows([makeFlow({ revision: 5, api_call_id: 'api_live', status: 'completed', cost: 2, cost_confidence: 'confident' })]);
     const { result } = renderRows();
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
     await act(async () => { await Promise.resolve(); });
-    const merged = result.current.rows.find((r) => r.api_call_id === 'api_cc2');
-    expect(merged?.cost).toBe(0.99); // live cost wins
-    expect(merged?.cost_confidence).toBe('confident'); // its paired tag wins too
+    const row = result.current.rows.find((candidate) => candidate.api_call_id === 'api_live');
+    expect(row?.revision).toBe(5);
+    expect(row?.status).toBe('completed');
+    expect(row?.cost).toBe(2);
+  });
+
+  it('removes rows absent from a strictly newer authoritative REST cut', async () => {
+    const retained = makeFlow({ api_call_id: 'api_retained', revision: 2, status: 'completed' });
+    stubFlowsFetch([retained], 5);
+    seedFlows([
+      retained,
+      makeFlow({ api_call_id: 'api_evicted_open', revision: 1, status: 'open' }),
+    ]);
+
+    const { result } = renderRows();
+    await waitFor(() => expect(result.current.rows.map((row) => row.api_call_id)).toEqual(['api_retained']));
+    expect(dashboardStore.getState().cursors.flow_seq).toBe(5);
   });
 });
 
-describe('useFlowRows — terminal REST status heals a stale live `open` row (absorbing state)', () => {
+describe('useFlowRows — provider-attempt drilldown', () => {
   beforeEach(() => resetWorld());
   afterEach(() => {
     cleanup();
@@ -155,222 +132,20 @@ describe('useFlowRows — terminal REST status heals a stale live `open` row (ab
     vi.restoreAllMocks();
   });
 
-  /** Render + wait until the merged row for `id` reports `status`. */
-  async function expectHealedStatus(id: string, status: FlowSummary['status']) {
-    const { result } = renderRows();
-    await waitFor(() => {
-      const row = result.current.rows.find((r) => r.api_call_id === id);
-      expect(row?.status).toBe(status);
-    });
-  }
+  it('matches a failed primary attempt even when a different provider served the flow', async () => {
+    stubFlowsFetch([]);
+    seedFlows([makeFlow({
+      api_call_id: 'api_failover',
+      upstream_target: 'provider-b',
+      attempts: [
+        { provider: 'provider-a', model: 'm', start_ms: 1, end_ms: 2, status: 'failed', error_class: 'timeout' },
+        { provider: 'provider-b', model: 'm', start_ms: 3, end_ms: 4, status: 'served' },
+      ],
+    })]);
 
-  it('adopts a REST `failed` over a live `open` (missed terminal frame)', async () => {
-    stubFlowsFetch([makeFlow({ api_call_id: 'api_heal_f', status: 'failed', terminal_reason: 'boom' })]);
-    seedFlows([makeFlow({ api_call_id: 'api_heal_f', status: 'open', terminal_reason: null })]);
-    await expectHealedStatus('api_heal_f', 'failed');
-    // The store row itself is untouched — the heal happens in the merge only.
-    expect(dashboardStore.getState().flows.get('api_heal_f')?.status).toBe('open');
-  });
-
-  it('adopts a REST `cancelled` over a live `open` (cancel emits no terminal frame)', async () => {
-    stubFlowsFetch([makeFlow({ api_call_id: 'api_heal_c', status: 'cancelled' })]);
-    seedFlows([makeFlow({ api_call_id: 'api_heal_c', status: 'open' })]);
-    await expectHealedStatus('api_heal_c', 'cancelled');
-  });
-
-  it('a live TERMINAL status is never overwritten by a differing REST status (live freshest)', async () => {
-    stubFlowsFetch([makeFlow({ api_call_id: 'api_heal_t', status: 'failed' })]);
-    seedFlows([makeFlow({ api_call_id: 'api_heal_t', status: 'completed' })]);
-    // Wait for the REST list to land, then confirm the live terminal stands.
-    const { result } = renderRows();
+    const { result } = renderRows({ ...EMPTY_FILTERS, upstream: 'provider-a' });
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
-    await waitFor(() => {
-      const row = result.current.rows.find((r) => r.api_call_id === 'api_heal_t');
-      expect(row?.status).toBe('completed');
-    });
-  });
-
-  it('both `open` stays `open` (no fabricated terminal)', async () => {
-    stubFlowsFetch([makeFlow({ api_call_id: 'api_heal_o', status: 'open' })]);
-    seedFlows([makeFlow({ api_call_id: 'api_heal_o', status: 'open' })]);
-    const { result } = renderRows();
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
-    await waitFor(() => {
-      const row = result.current.rows.find((r) => r.api_call_id === 'api_heal_o');
-      expect(row?.status).toBe('open');
-    });
-  });
-});
-
-describe('useFlowRows — a WS-created row backfills REST-authoritative fields (finding 3)', () => {
-  beforeEach(() => resetWorld());
-  afterEach(() => {
-    cleanup();
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
-  });
-
-  it('fills endpoint/method/uri + finished/elapsed/cost/terminal from REST, keeping live status/usage', async () => {
-    // The REST row is the authoritative request line + roll-up.
-    stubFlowsFetch([
-      makeFlow({
-        api_call_id: 'api_ws',
-        method: 'POST',
-        uri: '/v1/responses',
-        upstream_target: 'openai',
-        status: 'completed',
-        finished_ms: 1_700_000_005_000,
-        elapsed_ms: 5_000,
-        cost: 0.5,
-        terminal_reason: 'response.completed',
-      }),
-    ]);
-    // A WS-CREATED row: minted by a `flow_status` patch BEFORE the REST list arrived, so it carries
-    // PLACEHOLDER method ('POST') + uri ('') and null roll-up fields, with a live 'open' status.
-    act(() =>
-      dashboardStore.getState().patchFlowStatus({
-        type: 'flow_status',
-        api_call_id: 'api_ws',
-        response_id: null,
-        status: 'open',
-        model_requested: null,
-        model_served: null,
-        upstream_target: null,
-        usage: { prompt: 11, completion: 0, total: 11, cached: 0, reasoning: 0 },
-        started_ms: 1_700_000_000_000,
-        elapsed_ms: null,
-      }),
-    );
-    // Sanity: the WS placeholder row really has an empty uri before REST merges.
-    expect(dashboardStore.getState().flows.get('api_ws')?.uri).toBe('');
-
-    const { result } = renderRows();
-    await waitFor(() => {
-      const r = result.current.rows.find((row) => row.api_call_id === 'api_ws');
-      expect(r?.uri).toBe('/v1/responses');
-    });
-    const row = result.current.rows.find((r) => r.api_call_id === 'api_ws');
-    // REST-authoritative request line + roll-up are backfilled…
-    expect(row?.method).toBe('POST');
-    expect(row?.uri).toBe('/v1/responses');
-    expect(row?.upstream_target).toBe('openai');
-    expect(row?.finished_ms).toBe(1_700_000_005_000);
-    expect(row?.elapsed_ms).toBe(5_000);
-    expect(row?.cost).toBe(0.5);
-    expect(row?.terminal_reason).toBe('response.completed');
-    // The heal adopts the REST terminal status (absorbing); live usage still wins.
-    expect(row?.status).toBe('completed');
-    expect(row?.usage?.prompt).toBe(11);
-    // The store itself is untouched (merge is view-only).
-    expect(dashboardStore.getState().flows.get('api_ws')?.uri).toBe('');
-  });
-});
-
-describe('useFlowRows — live row backfills REST-projected spine fields (gap 10b finding 2)', () => {
-  beforeEach(() => resetWorld());
-  afterEach(() => {
-    cleanup();
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
-  });
-
-  const SERVED = {
-    provider: 'openai',
-    model: 'gpt-4o',
-    start_ms: 1_700_000_000_100,
-    end_ms: 1_700_000_000_400,
-    first_upstream_byte_ms: 1_700_000_000_350,
-    status: 'served' as const,
-  };
-
-  it('backfills the REST-projected phases/attempts onto a live row that lacks them (not discarded)', async () => {
-    // The REST `/flows` row now projects the gap-02/03 spine. The live store row (same id) was
-    // minted by a `flow_status` patch BEFORE the projection arrived, so it carries NO spine.
-    stubFlowsFetch([
-      makeFlow({
-        api_call_id: 'api_spine',
-        status: 'completed',
-        ingress_ms: 1_700_000_000_000,
-        first_content_delta_ms: 1_700_000_000_500,
-        finalize_ms: 1_700_000_001_100,
-        attempts: [SERVED],
-        first_upstream_byte_ms: 1_700_000_000_350,
-      }),
-    ]);
-    seedFlows([makeFlow({ api_call_id: 'api_spine', status: 'open' })]);
-
-    const { result } = renderRows();
-    // Once REST resolves, the merged row exposes the projected spine — if `shallowEqualSummary`
-    // ignored these fields the merge would have returned the live row UNCHANGED and discarded them.
-    await waitFor(() => {
-      const r = result.current.rows.find((row) => row.api_call_id === 'api_spine');
-      expect(r?.first_content_delta_ms).toBe(1_700_000_000_500);
-    });
-    const row = result.current.rows.find((r) => r.api_call_id === 'api_spine');
-    expect(row?.ingress_ms).toBe(1_700_000_000_000);
-    expect(row?.finalize_ms).toBe(1_700_000_001_100);
-    expect(row?.first_upstream_byte_ms).toBe(1_700_000_000_350);
-    expect(row?.attempts).toEqual([SERVED]);
-    // …and the terminal-absorbing heal adopts the REST terminal status.
-    expect(row?.status).toBe('completed');
-  });
-
-  it('a live spine value WINS over the REST projection (live-first)', async () => {
-    // REST projects one `first_content_delta_ms`; the live row carries a fresher (different) one.
-    stubFlowsFetch([
-      makeFlow({ api_call_id: 'api_spine2', status: 'completed', first_content_delta_ms: 1_700_000_000_500 }),
-    ]);
-    seedFlows([makeFlow({ api_call_id: 'api_spine2', status: 'open', first_content_delta_ms: 1_700_000_000_222 })]);
-    const { result } = renderRows();
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
-    await act(async () => { await Promise.resolve(); });
-    const row = result.current.rows.find((r) => r.api_call_id === 'api_spine2');
-    expect(row?.first_content_delta_ms).toBe(1_700_000_000_222); // live wins
-  });
-
-  // Gap 10b review round 2 — an EMPTY live `attempts: []` (a snapshot's "no attempt recorded yet")
-  // must NOT block the REST `/flows` backfill of a POPULATED trace. The old `live.attempts ?? rest`
-  // treated `[]` as authoritative; `pickAttempts` lets the non-empty REST list win.
-  it('an empty live attempts[] does NOT block the populated REST attempts backfill', async () => {
-    stubFlowsFetch([
-      makeFlow({ api_call_id: 'api_att', status: 'completed', attempts: [SERVED], first_upstream_byte_ms: SERVED.first_upstream_byte_ms }),
-    ]);
-    // The live store row carries an EMPTY attempts list (the snapshot serialization for "none yet").
-    seedFlows([makeFlow({ api_call_id: 'api_att', status: 'open', attempts: [] })]);
-
-    const { result } = renderRows();
-    await waitFor(() => {
-      const r = result.current.rows.find((row) => row.api_call_id === 'api_att');
-      expect(r?.attempts).toEqual([SERVED]);
-    });
-    const row = result.current.rows.find((r) => r.api_call_id === 'api_att');
-    expect(row?.attempts).toEqual([SERVED]); // REST trace surfaced, not the empty live []
-    expect(row?.status).toBe('completed'); // terminal-absorbing heal
-  });
-
-  it('a NON-EMPTY live attempts[] WINS over the REST projection (live-first)', async () => {
-    const FAILED = { provider: 'vllm-a', model: 'llama-3.1-70b', start_ms: 1_700_000_000_000, end_ms: 1_700_000_000_080, status: 'failed' as const, error_class: 'http_status' as const };
-    stubFlowsFetch([makeFlow({ api_call_id: 'api_att2', status: 'completed', attempts: [SERVED] })]);
-    // The live row carries a fuller (2-attempt) failover trace — it must win over the single REST one.
-    seedFlows([makeFlow({ api_call_id: 'api_att2', status: 'open', attempts: [FAILED, SERVED] })]);
-    const { result } = renderRows();
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
-    await act(async () => { await Promise.resolve(); });
-    const row = result.current.rows.find((r) => r.api_call_id === 'api_att2');
-    expect(row?.attempts).toEqual([FAILED, SERVED]); // live (non-empty) wins
-  });
-
-  it('both sides empty/absent ⇒ no attempts (honestly absent, no fabricated entry)', async () => {
-    stubFlowsFetch([makeFlow({ api_call_id: 'api_att3', status: 'completed', attempts: [] })]);
-    seedFlows([makeFlow({ api_call_id: 'api_att3', status: 'open', attempts: [] })]);
-    const { result } = renderRows();
-    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
-    await act(async () => { await Promise.resolve(); });
-    const row = result.current.rows.find((r) => r.api_call_id === 'api_att3');
-    // Both empty ⇒ the merged row reports NO trace: an empty (or absent) list, never a fabricated
-    // attempt. (When nothing changed the merge returns the live row unchanged, preserving its `[]`;
-    // either way `[]`/absent both mean "no attempts" to the gap-10/11 consumers.)
-    expect(row?.attempts ?? []).toEqual([]);
+    expect(result.current.rows.map((row) => row.api_call_id)).toEqual(['api_failover']);
   });
 });
 

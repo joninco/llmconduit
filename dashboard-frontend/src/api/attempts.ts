@@ -3,12 +3,10 @@
  *
  * `attempts[]` (gap 03 / 11) CANNOT be merged with the scalar `fresh ?? fallback` rule the phase
  * epochs use, because an EMPTY array is the SERIALIZATION for "no attempt recorded yet": a snapshot
- * summary (and the store's `flow_status` projection) emits `attempts: []` rather than OMITTING the
+ * summary/detail projection may emit `attempts: []` rather than OMITTING the
  * field. `??` only falls back on `null`/`undefined`, so it would treat that `[]` as authoritative
  * and DROP a populated trace coming from the other source (gap 10b review round 2):
- *  - useFlowRows merge: a live/snapshot row's `[]` would block the REST `/flows` backfill.
  *  - FlowDetail spine merge: a live `[]` would suppress the populated REST detail attempts.
- *  - patchFlowStatus reducer: a LATER frame's `[]` would erase an earlier-known non-empty trace.
  *
  * Honest semantics (NON-EMPTY wins, otherwise backfill; both empty/absent ⇒ honestly absent):
  *  - a NON-EMPTY `fresh` list is the freshest authoritative trace ⇒ it wins.

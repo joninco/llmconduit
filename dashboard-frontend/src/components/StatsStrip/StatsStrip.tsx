@@ -21,7 +21,7 @@
  *
  * Always rendered at the top of `App.tsx` (above the Scrubber).
  */
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import type { MetricsResponse } from '../../api/types';
 import { useDashboard } from '../../store/hooks';
@@ -42,10 +42,15 @@ import {
   type WindowKey,
 } from './metricHistory';
 import { deriveChips, deltaGlyph, type ChipDescriptor } from './chips';
+import { updateHashScope, useHashScope } from '../../router/useHashRoute';
 
 export function StatsStrip() {
-  const [window, setWindow] = useState<WindowKey>('m1');
+  const scope = useHashScope();
+  const window = scope.window as WindowKey;
   const connection = useDashboard((s) => s.connection);
+  const hasDashboardData = useDashboard((s) =>
+    s.metrics !== null || s.flows.size > 0 || s.topologyNodes.length > 0,
+  );
   const seeking = connection === 'seeking';
   // The FROZEN store metrics while seeking — the snapshot cut `applySeekCut` installed. Read as the
   // chip CURRENT VALUE (per window) so the strip reads as-of the seeked moment, while the sparkline
@@ -78,18 +83,18 @@ export function StatsStrip() {
   // delta is FLAT while seeking (`prev = null`): a point-in-time snapshot is not a live trend, so a
   // direction arrow would be misleading. Live → the ring's latest/previous drive value + delta.
   const liveCur = latest(history, window);
-  const cur = seeking ? (seekMetrics?.windows[window] ?? liveCur) : liveCur;
+  const cur = seeking ? (seekMetrics?.windows[window] ?? null) : liveCur;
   const prev = seeking ? null : previous(history, window);
   const chips = useMemo(() => deriveChips(cur, prev), [cur, prev]);
 
   return (
-    <Panel className="m-4 mb-0 flex items-center gap-1 px-2 py-1" data-testid="stats-strip">
+    <Panel className="m-2 mb-0 flex snap-x snap-mandatory items-center gap-1 overflow-x-auto px-2 py-1 sm:m-4 sm:mb-0" data-testid="stats-strip">
       {chips.map((chip) => (
         <ChipCell key={chip.key} chip={chip} series={seriesFor(history, window, chip.key)} />
       ))}
       <div className="ml-auto flex items-center gap-2 pr-1">
-        <WindowSelector value={window} onChange={setWindow} />
-        <ConnectionDot state={connection} />
+        <WindowSelector value={window} onChange={(next) => updateHashScope({ window: next })} />
+        <ConnectionDot state={connection} hasData={hasDashboardData} />
       </div>
     </Panel>
   );
@@ -122,7 +127,7 @@ function ChipCell({ chip, series }: { chip: ChipDescriptor; series: number[] }) 
   const qualityText = QUALITY_LABEL[chip.quality];
   return (
     <div
-      className="flex flex-col gap-1 border-l border-line/50 px-3 py-1 first:border-l-0"
+      className="flex shrink-0 snap-start flex-col gap-1 border-l border-line/50 px-3 py-1 first:border-l-0"
       data-testid={`chip-${chip.key}`}
       // Provenance exposed to the DOM (finding 4): tests + tooling can assert the tag, and
       // the `title` gives operators a hover hint. EVERY chip carries one of
@@ -162,7 +167,7 @@ function WindowSelector({ value, onChange }: { value: WindowKey; onChange: (w: W
           aria-pressed={value === w}
           className={cn(
             'px-2 py-1 text-xs tabular-nums transition-colors',
-            value === w ? 'bg-accent/20 text-accent' : 'bg-transparent text-text-muted hover:text-text',
+            value === w ? 'bg-accent/20 text-text' : 'bg-transparent text-text-muted hover:text-text',
           )}
         >
           {WINDOW_LABELS[w]}
@@ -172,16 +177,21 @@ function WindowSelector({ value, onChange }: { value: WindowKey; onChange: (w: W
   );
 }
 
-function ConnectionDot({ state }: { state: string }) {
+function ConnectionDot({ state, hasData }: { state: string; hasData: boolean }) {
   const color =
     state === 'live' ? 'bg-status-healthy'
     : state === 'connecting' || state === 'seeking' ? 'bg-status-cooling'
     : state === 'error' ? 'bg-status-down'
     : 'bg-text-muted';
+  const label = state === 'connecting' && hasData ? 'reconnecting · stale' : state;
   return (
-    <span className="flex items-center gap-2 text-[10px] uppercase tracking-[0.14em] text-text-muted">
+    <span
+      className="flex items-center gap-2 text-[10px] uppercase tracking-[0.14em] text-text-muted"
+      data-testid="connection-state"
+      data-stale={state === 'connecting' && hasData ? 'true' : undefined}
+    >
       <span className={`h-2 w-2 rounded-full ${color}`} aria-hidden />
-      {state}
+      {label}
     </span>
   );
 }

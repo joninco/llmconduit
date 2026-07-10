@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DashboardBootstrap",
+  "description": "CSP-safe bootstrap injected into the authenticated dashboard shell.",
+  "type": "object",
+  "properties": {
+    "authenticated": {
+      "type": "boolean"
+    },
+    "csrf_token": {
+      "type": "string"
+    },
+    "mutations_enabled": {
+      "type": "boolean"
+    },
+    "schema_version": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "authenticated",
+    "csrf_token",
+    "mutations_enabled",
+    "schema_version"
+  ]
+}

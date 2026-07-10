@@ -12,8 +12,8 @@
  *    WHOLESALE (the entire batch); `seq > last_seq[domain]` is processed and advances the
  *    cursor. The Monitor frame carries ONE envelope per `DebugUpdate` (its `batch` = all
  *    sibling `DebugWsMessage`s under one `sequence`), so no sibling is ever dropped.
- *  - feed the zustand dashboard store; notify `onFrameApplied(domain)` AFTER an accepted
- *    frame so the composition root can drive TanStack Query invalidation (finding 10).
+ *  - feed the zustand dashboard store; notify `onFrameApplied(frame)` AFTER an accepted
+ *    frame so the composition root can narrowly invalidate terminal-flow detail reads.
  *  - auth failure vs. transient blip (finding 7): an EXPLICIT `4401` close → bounce to
  *    login. Any OTHER abnormal close/error is treated as a transient network blip: the
  *    socket schedules a reconnect (capped backoff) AND, to detect a silently-expired
@@ -36,13 +36,24 @@ import type {
 } from './types';
 import { assertNever, isDashboardFrame, isSnapshotFrame } from './types';
 import { dashboardStore, type LiveBaseline } from '../store/dashboardStore';
+import { assertDashboardSchemaVersion, DashboardSchemaMismatchError } from './schemaVersion';
 
-/** Clean WS close code (RFC 6455 §7.4.1). Anything else after open == abnormal. */
+/** Clean WS close code (RFC 6455 §7.4.1). A REMOTE 1000 is still reconnectable. */
 const WS_NORMAL_CLOSE = 1000;
 /** Our convention for an explicit auth/expiry close from the server (→ bounce to login). */
 const WS_AUTH_CLOSE = 4401;
+/** Client-side close used when the no-frame watchdog declares the transport stale. */
+const WS_STALE_CLOSE = 4000;
 /** Reconnect backoff schedule (ms) for transient blips; index clamps at the last entry. */
 const RECONNECT_BACKOFF_MS = [500, 1000, 2000, 5000, 10000];
+/** A connected socket that delivers no frame for this long is considered half-open. */
+const NO_FRAME_WATCHDOG_MS = 15_000;
+/** The seek feed is bounded independently by bytes, frames, and elapsed wall time. */
+const SHADOW_MAX_BYTES = 8 * 1024 * 1024;
+const SHADOW_MAX_FRAMES = 5_000;
+const SHADOW_MAX_AGE_MS = 5 * 60 * 1_000;
+/** Large replays yield between batches so returning LIVE cannot monopolize the main thread. */
+const REPLAY_BATCH_FRAMES = 250;
 
 /** Minimal structural subset of `WebSocket` we depend on (eases mocking). */
 export interface WsLike {
@@ -62,7 +73,7 @@ export interface DashboardSocketOptions {
   /** Called ONLY on a confirmed auth failure (explicit 4401 close, or a probe `401`). */
   onUnauthorized?: () => void;
   /** Fired AFTER an accepted (post-dedup) frame so the caller can invalidate REST queries. */
-  onFrameApplied?: (domain: Domain) => void;
+  onFrameApplied?: (frame: DashboardFrame) => void;
   /**
    * Protected-endpoint auth probe used after a TRANSIENT abnormal close (finding 7).
    * Resolves `true` if the session is still valid (→ reconnect), `false` if it returned
@@ -76,6 +87,14 @@ export interface DashboardSocketOptions {
   clearTimer?: (h: ReturnType<typeof setTimeout>) => void;
   /** Store the socket feeds. Defaults to the singleton dashboard store. */
   store?: typeof dashboardStore;
+  /** No-frame timeout. Set to 0 only in deterministic tests that do not model time. */
+  watchdogMs?: number;
+  /** Clock and animation-frame seams for bounded seek/replay tests. */
+  now?: () => number;
+  raf?: (cb: () => void) => number;
+  cancelRaf?: (handle: number) => void;
+  /** Override only for deterministic boundary tests; production uses the fixed safe limits. */
+  shadowLimits?: { bytes: number; frames: number; ageMs: number };
 }
 
 type LastSeq = Record<Domain, number>;
@@ -84,12 +103,17 @@ export class DashboardSocket {
   private readonly url: string;
   private readonly factory: WebSocketFactory;
   private readonly onUnauthorized: (() => void) | undefined;
-  private readonly onFrameApplied: ((domain: Domain) => void) | undefined;
+  private readonly onFrameApplied: ((frame: DashboardFrame) => void) | undefined;
   private readonly probeAuth: (() => Promise<boolean>) | undefined;
   private readonly autoReconnect: boolean;
   private readonly setTimer: (cb: () => void, ms: number) => ReturnType<typeof setTimeout>;
   private readonly clearTimer: (h: ReturnType<typeof setTimeout>) => void;
   private readonly store: typeof dashboardStore;
+  private readonly watchdogMs: number;
+  private readonly now: () => number;
+  private readonly raf: (cb: () => void) => number;
+  private readonly cancelRaf: (handle: number) => void;
+  private readonly shadowLimits: { bytes: number; frames: number; ageMs: number };
 
   private ws: WsLike | null = null;
   /** Monotonic id of the CURRENT socket; stale-callback guard compares against it. */
@@ -101,6 +125,9 @@ export class DashboardSocket {
   /** Consecutive transient reconnect attempts (drives the backoff index). */
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchdogNonce = 0;
+  private replayFrame: number | null = null;
 
   /** Per-domain dedup cursors. */
   private lastSeq: LastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0 };
@@ -110,6 +137,9 @@ export class DashboardSocket {
   /** Time-travel: when paused, live frames are buffered here instead of applied. */
   private paused = false;
   private shadowBuffer: DashboardFrame[] = [];
+  private shadowBufferBytes = 0;
+  private shadowBufferStartedAtMs: number | null = null;
+  private resyncRequired = false;
   /**
    * A snapshot that arrived from a RECONNECT while seeking (finding 6). It is STAGED here
    * rather than applied, so a reconnect-during-seek does not clobber the frozen historical
@@ -136,6 +166,19 @@ export class DashboardSocket {
     this.setTimer = opts.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
     this.clearTimer = opts.clearTimer ?? ((h) => clearTimeout(h));
     this.store = opts.store ?? dashboardStore;
+    this.watchdogMs = opts.watchdogMs ?? NO_FRAME_WATCHDOG_MS;
+    this.now = opts.now ?? (() => Date.now());
+    this.raf = opts.raf ?? ((cb) => (typeof requestAnimationFrame === 'function'
+      ? requestAnimationFrame(cb)
+      : (setTimeout(cb, 0) as unknown as number)));
+    this.cancelRaf = opts.cancelRaf ?? ((handle) => (typeof cancelAnimationFrame === 'function'
+      ? cancelAnimationFrame(handle)
+      : clearTimeout(handle)));
+    this.shadowLimits = opts.shadowLimits ?? {
+      bytes: SHADOW_MAX_BYTES,
+      frames: SHADOW_MAX_FRAMES,
+      ageMs: SHADOW_MAX_AGE_MS,
+    };
   }
 
   /** Opens the socket and wires handlers. Idempotent if already connected. */
@@ -159,10 +202,14 @@ export class DashboardSocket {
       if (!isCurrent()) return;
       // A successful open clears the transient-reconnect backoff.
       this.reconnectAttempts = 0;
+      this.armWatchdog(ws, gen);
       // Live state begins after the snapshot is applied; marked 'live' there.
     };
     ws.onmessage = (ev) => {
       if (!isCurrent()) return;
+      // Any received frame proves the transport is alive, even if contract validation later drops
+      // it. Re-arm before parsing so a malformed application frame cannot create a reconnect loop.
+      this.armWatchdog(ws, gen);
       this.handleRaw(ev.data);
     };
     ws.onclose = (ev) => {
@@ -175,12 +222,10 @@ export class DashboardSocket {
       if (code === WS_AUTH_CLOSE) {
         // EXPLICIT auth/expiry close → confirmed auth failure → bounce to login.
         this.bounceToLogin();
-      } else if (code === undefined || code === WS_NORMAL_CLOSE) {
-        // Clean close (our own disconnect, or server 1000) — do not reconnect.
-        this.store.getState().setConnection('closed');
       } else {
-        // ABNORMAL close (e.g. 1006): a transient network blip OR a silently-expired
-        // session. Do NOT log out blindly (finding 7) — probe + reconnect.
+        // Every REMOTE close, including code 1000, is reconnectable. `disconnect()` detaches the
+        // handlers and bumps the generation before issuing its own 1000, so only a remote clean
+        // close reaches this branch. Probe before reconnecting to distinguish expiry from a blip.
         this.handleTransientDrop();
       }
     };
@@ -199,6 +244,7 @@ export class DashboardSocket {
   /** Closes the socket and resets dedup/snapshot/buffer/reconnect state. */
   disconnect(): void {
     this.stopped = true;
+    this.clearWatchdog();
     if (this.reconnectTimer !== null) {
       this.clearTimer(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -217,9 +263,15 @@ export class DashboardSocket {
     }
     this.snapshotApplied = false;
     this.paused = false;
-    this.shadowBuffer = [];
+    this.clearShadowBuffer();
     this.pendingSnapshot = null;
     this.liveBaseline = null;
+    this.resyncRequired = false;
+    this.store.getState().setResyncRequired(false);
+    if (this.replayFrame !== null) {
+      this.cancelRaf(this.replayFrame);
+      this.replayFrame = null;
+    }
     this.reconnectAttempts = 0;
     this.lastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0 };
   }
@@ -281,8 +333,44 @@ export class DashboardSocket {
     }, delay);
   }
 
+  /** Re-arm the half-open transport watchdog after open and after every received frame. */
+  private armWatchdog(ws: WsLike, gen: number): void {
+    this.clearWatchdog();
+    if (this.watchdogMs <= 0) return;
+    const nonce = ++this.watchdogNonce;
+    this.watchdogTimer = this.setTimer(() => {
+      this.watchdogTimer = null;
+      if (
+        nonce !== this.watchdogNonce
+        || this.stopped
+        || this.ws !== ws
+        || this.generation !== gen
+      ) return;
+      // A browser can leave a TCP connection half-open indefinitely. Detach first so the close we
+      // initiate cannot race the transient-drop path, then reconnect through the normal probe flow.
+      this.detach(ws);
+      this.ws = null;
+      this.closedCleanly = true;
+      try {
+        ws.close(WS_STALE_CLOSE, 'dashboard no-frame timeout');
+      } catch {
+        // The transport is already unusable; the reconnect path below is still correct.
+      }
+      this.handleTransientDrop();
+    }, this.watchdogMs);
+  }
+
+  private clearWatchdog(): void {
+    this.watchdogNonce += 1;
+    if (this.watchdogTimer !== null) {
+      this.clearTimer(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
   /** Detaches all handlers from a socket so it can never call back into the instance. */
   private detach(ws: WsLike): void {
+    this.clearWatchdog();
     ws.onopen = null;
     ws.onmessage = null;
     ws.onclose = null;
@@ -311,6 +399,9 @@ export class DashboardSocket {
     // drag must NOT recapture — by then the store may already hold the frozen cut.
     if (!this.paused) {
       this.liveBaseline = this.store.getState().captureLiveBaseline();
+      this.clearShadowBuffer();
+      this.resyncRequired = false;
+      this.store.getState().setResyncRequired(false);
     }
     this.paused = true;
   }
@@ -339,6 +430,18 @@ export class DashboardSocket {
     this.pendingSnapshot = null;
     const baseline = this.liveBaseline;
     this.liveBaseline = null;
+    if (this.resyncRequired && !staged) {
+      // The historical cut stays intact until LIVE is explicitly selected. At that point the
+      // incomplete shadow feed cannot be trusted, so discard it and force a new snapshot-bearing
+      // connection instead of replaying a partial continuation.
+      this.clearShadowBuffer();
+      this.resyncRequired = false;
+      this.store.getState().setResyncRequired(false);
+      this.forceFreshSnapshot();
+      return;
+    }
+    this.resyncRequired = false;
+    this.store.getState().setResyncRequired(false);
     if (staged) {
       this.commitSnapshot(staged); // resets store + cursors, marks live, drains early frames
     } else if (baseline) {
@@ -347,10 +450,8 @@ export class DashboardSocket {
       this.store.getState().restoreLiveBaseline(baseline);
     }
     const buffered = this.shadowBuffer;
-    this.shadowBuffer = [];
-    for (const frame of buffered) {
-      this.applyFrame(frame);
-    }
+    this.clearShadowBuffer();
+    this.replayBuffered(buffered);
     // Degenerate fallback only (no staged snapshot, no baseline). The re-baseline paths above
     // already flipped to live atomically, so this is a no-op there (re-applying 'live' won't bump
     // the epoch — see setConnection).
@@ -363,6 +464,75 @@ export class DashboardSocket {
 
   shadowBufferLength(): number {
     return this.shadowBuffer.length;
+  }
+
+  requiresResync(): boolean {
+    return this.resyncRequired;
+  }
+
+  /** Append a seek frame unless one of the independent memory/time bounds is exhausted. */
+  private bufferFrame(frame: DashboardFrame): void {
+    if (this.resyncRequired) return;
+    const now = this.now();
+    const started = this.shadowBufferStartedAtMs ?? now;
+    const bytes = encodedFrameBytes(frame);
+    if (
+      this.shadowBuffer.length >= this.shadowLimits.frames
+      || this.shadowBufferBytes + bytes > this.shadowLimits.bytes
+      || now - started > this.shadowLimits.ageMs
+    ) {
+      this.resyncRequired = true;
+      this.store.getState().setResyncRequired(true);
+      return;
+    }
+    if (this.shadowBufferStartedAtMs === null) this.shadowBufferStartedAtMs = now;
+    this.shadowBuffer.push(frame);
+    this.shadowBufferBytes += bytes;
+  }
+
+  private clearShadowBuffer(): void {
+    this.shadowBuffer = [];
+    this.shadowBufferBytes = 0;
+    this.shadowBufferStartedAtMs = null;
+  }
+
+  /** Apply a bounded feed in small batches; small feeds complete in the first synchronous batch. */
+  private replayBuffered(frames: DashboardFrame[]): void {
+    if (this.replayFrame !== null) {
+      this.cancelRaf(this.replayFrame);
+      this.replayFrame = null;
+    }
+    let offset = 0;
+    const drain = () => {
+      this.replayFrame = null;
+      const end = Math.min(frames.length, offset + REPLAY_BATCH_FRAMES);
+      while (offset < end) this.applyFrame(frames[offset++]!);
+      if (offset < frames.length && !this.stopped) this.replayFrame = this.raf(drain);
+    };
+    drain();
+  }
+
+  /** Tear down the current transport and reconnect immediately so the first frame is a snapshot. */
+  private forceFreshSnapshot(): void {
+    if (this.replayFrame !== null) {
+      this.cancelRaf(this.replayFrame);
+      this.replayFrame = null;
+    }
+    const ws = this.ws;
+    if (ws) {
+      this.detach(ws);
+      this.ws = null;
+      this.generation += 1;
+      try {
+        ws.close(WS_STALE_CLOSE, 'dashboard seek buffer overflow');
+      } catch {
+        // A closed transport still permits opening its replacement below.
+      }
+    }
+    this.snapshotApplied = false;
+    this.lastSeq = { flow: 0, metrics: 0, topology: 0, monitor: 0 };
+    this.store.getState().setConnection('connecting');
+    this.connect();
   }
 
   // -- Decode + dispatch ----------------------------------------------------
@@ -384,6 +554,27 @@ export class DashboardSocket {
    * before anything mutates. Anything that fails validation is dropped silently.
    */
   handleParsed(parsed: unknown): void {
+    if (isSnapshotCandidate(parsed)) {
+      try {
+        assertDashboardSchemaVersion(parsed.schema_version, 'WebSocket snapshot');
+      } catch (error) {
+        if (error instanceof DashboardSchemaMismatchError) {
+          this.disconnect();
+          this.store.getState().setConnection('error');
+          if (!error.reloadRequested) this.store.getState().setFatalError(error.message);
+          return;
+        }
+        throw error;
+      }
+      if (!isSnapshotFrame(parsed)) {
+        // A malformed ROOT snapshot cannot be treated like an ordinary dropped live frame: there
+        // is no trustworthy baseline to connect to. Surface the contract failure explicitly.
+        this.disconnect();
+        this.store.getState().setConnection('error');
+        this.store.getState().setFatalError('dashboard contract validation failed: WebSocket snapshot');
+        return;
+      }
+    }
     if (isSnapshotFrame(parsed)) {
       this.applySnapshotMessage(parsed);
       return;
@@ -395,11 +586,11 @@ export class DashboardSocket {
     const frame: DashboardFrame = parsed;
     // A live frame before the snapshot is buffered until the snapshot lands.
     if (!this.snapshotApplied) {
-      this.shadowBuffer.push(frame);
+      this.bufferFrame(frame);
       return;
     }
     if (this.paused) {
-      this.shadowBuffer.push(frame);
+      this.bufferFrame(frame);
       return;
     }
     this.applyFrame(frame);
@@ -440,13 +631,15 @@ export class DashboardSocket {
       monitor: snap.cursors.monitor_seq,
     };
     this.snapshotApplied = true;
+    this.resyncRequired = false;
+    this.store.getState().setResyncRequired(false);
 
     // Drain any pre-snapshot frames that arrived early.
     const early = this.shadowBuffer;
-    this.shadowBuffer = [];
+    this.clearShadowBuffer();
     for (const frame of early) {
       if (!this.paused) this.applyFrame(frame);
-      else this.shadowBuffer.push(frame);
+      else this.bufferFrame(frame);
     }
   }
 
@@ -464,7 +657,12 @@ export class DashboardSocket {
       return false;
     }
     const valid: DashboardFrame = frame;
-    const cursor = this.lastSeq[valid.domain];
+    const cursorKey = domainToCursorKey(valid.domain);
+    // REST `/flows` reconciliation may advance the authoritative flow cursor when it observes a
+    // TTL/count/quota removal that has no row-shaped WS event. Include the store cursor in dedup so
+    // a delayed pre-removal frame cannot resurrect that row after reconciliation.
+    const cursor = Math.max(this.lastSeq[valid.domain], this.store.getState().cursors[cursorKey]);
+    this.lastSeq[valid.domain] = cursor;
     // (2) Whole-frame dedup: a stale or duplicate seq drops the ENTIRE batch.
     if (valid.seq <= cursor) {
       return false;
@@ -472,11 +670,19 @@ export class DashboardSocket {
     // (3) Accept: advance cursor, apply every payload (no sibling dropped), then notify.
     this.lastSeq[valid.domain] = valid.seq;
     const store = this.store.getState();
-    store.setCursor(domainToCursorKey(valid.domain), valid.seq);
-    for (const payload of valid.batch) {
-      this.applyPayload(payload);
+    store.setCursor(cursorKey, valid.seq);
+    if (valid.domain === 'monitor') {
+      // Validation already proved domain↔payload compatibility. Apply the entire originating
+      // DebugUpdate in ONE store mutation so a replay batch does not clone both monitor rings once
+      // per sibling; every message receives the frame's one monitor-domain seq stamp.
+      store.pushMonitorBatch(
+        valid.batch.flatMap((payload) => payload.type === 'monitor' ? [payload.message] : []),
+        valid.seq,
+      );
+    } else {
+      for (const payload of valid.batch) this.applyPayload(payload);
     }
-    this.onFrameApplied?.(valid.domain);
+    this.onFrameApplied?.(valid);
     return true;
   }
 
@@ -532,6 +738,10 @@ export class DashboardSocket {
   }
 }
 
+function isSnapshotCandidate(value: unknown): value is { type: 'snapshot'; schema_version?: unknown } {
+  return typeof value === 'object' && value !== null && (value as { type?: unknown }).type === 'snapshot';
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -556,4 +766,17 @@ function defaultWsUrl(): string {
   if (typeof window === 'undefined') return 'ws://localhost/dashboard/ws';
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${window.location.host}/dashboard/ws`;
+}
+
+/** Conservative UTF-8 size of one decoded frame for the seek shadow-buffer quota. */
+function encodedFrameBytes(frame: DashboardFrame): number {
+  try {
+    const json = JSON.stringify(frame);
+    if (typeof TextEncoder === 'function') return new TextEncoder().encode(json).byteLength;
+    // UTF-16 code units are an upper bound for ASCII and a useful fallback on very old engines.
+    return json.length * 2;
+  } catch {
+    // A validated frame is JSON-shaped, but fail closed if a host object ever slips through.
+    return SHADOW_MAX_BYTES + 1;
+  }
 }

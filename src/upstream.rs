@@ -193,7 +193,7 @@ fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptError
 /// Per-provider serving status for the topology map (D4). `Cooling` while inside
 /// the failure cooldown window; `Down` once a cooling provider has also crossed
 /// [`DOWN_THRESHOLD`] consecutive failures; `Healthy` otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStatus {
     Healthy,
@@ -299,7 +299,7 @@ struct CatalogMeta {
 /// change. Published on a coalesced 1 s tick AND a cooldown-deadline wake (so an
 /// IDLE cooling→Healthy transition flips with no traffic); the atomics underneath
 /// update continuously, and the snapshot reads them at publication time.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ProviderHealthSnapshot {
     pub version: u64,
     pub providers: Vec<ProviderHealth>,

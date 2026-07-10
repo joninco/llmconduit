@@ -45,6 +45,7 @@ const ERROR_CLASS_LABEL: Record<AttemptErrorClass, string> = {
 /** Human-readable label for a bounded taxonomic `failover_reason` (spec 03 enum). */
 const FAILOVER_REASON_LABEL: Record<AttemptFailoverReason, string> = {
   provider_failed: 'provider failed → failover',
+  request_rejected: 'request rejected → failover',
   terminal_no_failover: 'terminal — no failover',
 };
 

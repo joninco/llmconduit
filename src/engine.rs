@@ -845,27 +845,31 @@ impl Gateway {
         // attribution + final cumulative usage at finalize, from its claim-captured
         // endpoint + the shared ServingToken — so this is evict-safe (no `detail()`
         // re-read of a possibly-pruned record).
-        let Some(inputs) = guard.terminal_metrics() else {
+        let Some(mut inputs) = guard.terminal_metrics() else {
             return;
         };
+        // Price exactly once at terminal time. Historical overview cuts retain this
+        // value and confidence, so a later config reload cannot silently reprice past
+        // traffic. Missing usage/model/rate remains honestly unavailable.
+        if let (Some(model), Some(usage)) = (inputs.model_served.as_deref(), inputs.usage)
+            && let Some(price) = self.price_for(model)
+        {
+            inputs.cost_usd = Some(crate::dashboard_api::cost_for_usage(usage, price));
+            inputs.cost_confidence = match usage.cached {
+                Some(0) => crate::dashboard_flow::TerminalCostConfidence::Confident,
+                Some(_) | None if price.cached_price_configured => {
+                    crate::dashboard_flow::TerminalCostConfidence::Confident
+                }
+                Some(_) | None => crate::dashboard_flow::TerminalCostConfidence::Estimated,
+            };
+        }
         // D5 R1 #2: record the terminal response AND the flow's FINAL cumulative token
         // usage in ONE atomic metrics call (single lock, single epoch/slot), into the
         // SAME `{status, model, endpoint, upstream}` bucket — so a concurrent 5 s
         // snapshot can never split the count and the tokens across two different 1 s
         // slots.
-        self.metrics.record_terminal(
-            status,
-            inputs.model_served.as_deref(),
-            &inputs.endpoint,
-            inputs.upstream.as_deref(),
-            elapsed_ms,
-            inputs.usage,
-            // Gap 12: the evict-safe per-attempt trace (spec 03) feeds the per-provider
-            // latency/error rings off the SAME terminal payload as `usage` — NOT a
-            // re-read of the evictable FlowStore record, so a failed primary on a flow
-            // whose record was pruned/evicted before finalize is still counted.
-            &inputs.attempts,
-        );
+        self.metrics
+            .record_terminal_inputs(status, elapsed_ms, &inputs);
     }
 
     /// Attach the D7 dashboard auth context (built from the environment in the
@@ -1228,6 +1232,9 @@ impl Gateway {
             self.flow_store()
                 .engine_guard(id, Arc::clone(&serving_token), self.abort_hub())
         });
+        if let Some(guard) = &telemetry_guard {
+            guard.set_model_requested(Some(request.model.clone()));
+        }
         // D6: the flow's cancellation token. The L1 guard registered it in the AbortHub
         // under `api_call_id` (so the kill route can flip it) and exposes a clone here;
         // the engine composes it with every `tx.closed()` client-hangup check below so a
@@ -1479,6 +1486,9 @@ impl Gateway {
         let mut limit = candidate_context_floor(&candidate_plan);
         if limit.is_none() && self.config.is_plain_single_provider() {
             limit = self.upstream_model_context_limit(&resolved_model).await;
+        }
+        if let Some(guard) = &telemetry_guard {
+            guard.set_effective_route_limit(limit);
         }
         // C3: compute the estimate UNCONDITIONALLY now, not only when a context
         // `limit` is known -- it also rides the `response.created` SSE event

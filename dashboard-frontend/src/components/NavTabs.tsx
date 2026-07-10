@@ -1,6 +1,7 @@
 import { ROUTES, navigate, type RouteName } from '../router/useHashRoute';
 import { Button } from './ui/Button';
 import { cn } from '../lib/cn';
+import { useRef, type KeyboardEvent } from 'react';
 
 const LABELS: Record<RouteName, string> = {
   flows: 'Flows',
@@ -27,8 +28,23 @@ function ArgusEye({ className }: { className?: string }) {
 }
 
 export function NavTabs({ active, onLogout }: { active: RouteName; onLogout: () => void }) {
+  const tabs = useRef<Array<HTMLButtonElement | null>>([]);
+
+  function onTabKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number): void {
+    let next = index;
+    if (event.key === 'ArrowRight') next = (index + 1) % ROUTES.length;
+    else if (event.key === 'ArrowLeft') next = (index - 1 + ROUTES.length) % ROUTES.length;
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = ROUTES.length - 1;
+    else return;
+    event.preventDefault();
+    const route = ROUTES[next]!;
+    navigate(route);
+    requestAnimationFrame(() => tabs.current[next]?.focus());
+  }
+
   return (
-    <nav className="flex items-center gap-6 border-b border-line bg-panel px-5 py-2.5">
+    <nav className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line bg-panel px-3 py-2.5 sm:flex-nowrap sm:px-5">
       {/* Masthead: the Argus eye + tracked wordmark; llmconduit rides below as the eyebrow. */}
       <div className="flex items-center gap-2.5 pr-1">
         <ArgusEye className="argus-eye h-[18px] w-[18px] text-accent" />
@@ -39,14 +55,19 @@ export function NavTabs({ active, onLogout }: { active: RouteName; onLogout: () 
           </div>
         </div>
       </div>
-      <div className="flex items-center gap-1">
-        {ROUTES.map((r) => (
+      <div className="order-3 flex w-full snap-x snap-mandatory items-center gap-1 overflow-x-auto sm:order-none sm:w-auto" role="tablist" aria-label="Dashboard views">
+        {ROUTES.map((r, index) => (
           <button
             key={r}
+            ref={(element) => { tabs.current[index] = element; }}
             onClick={() => navigate(r)}
+            onKeyDown={(event) => onTabKeyDown(event, index)}
+            role="tab"
+            aria-selected={r === active}
             aria-current={r === active ? 'page' : undefined}
+            tabIndex={r === active ? 0 : -1}
             className={cn(
-              'rounded-md px-3 py-1.5 text-xs font-medium uppercase tracking-[0.14em] transition-colors',
+              'shrink-0 snap-start rounded-md px-3 py-1.5 text-xs font-medium uppercase tracking-[0.14em] transition-colors',
               r === active
                 ? 'bg-accent/12 text-accent'
                 : 'text-text-muted hover:bg-line/40 hover:text-text',

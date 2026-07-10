@@ -28,6 +28,13 @@ import type { SnapshotResponse } from '../../api/types';
 
 /** Snapshot bucket granularity (ms). D5 snapshots are 5 s-coordinated; 1 s keys are ample. */
 export const BUCKET_MS = 1000;
+export const SNAPSHOT_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+export const SNAPSHOT_CACHE_MAX_CUTS = 16;
+
+interface CachedSnapshot {
+  response: SnapshotResponse;
+  bytes: number;
+}
 
 export interface SnapshotControllerOptions {
   /** Fetch a snapshot as of `atMs`. Injected (real: `client.snapshot`). */
@@ -42,6 +49,8 @@ export interface SnapshotControllerOptions {
   cancelRaf?: (handle: number) => void;
   /** LRU capacity (distinct second-buckets retained). */
   cacheCapacity?: number;
+  /** Total serialized-size quota across retained cuts. */
+  cacheMaxBytes?: number;
 }
 
 /** Bucket a timestamp to the controller's granularity (the LRU key). */
@@ -56,9 +65,13 @@ export class SnapshotController {
   private readonly raf: (cb: () => void) => number;
   private readonly cancelRaf: (handle: number) => void;
   private readonly cacheCapacity: number;
+  private readonly cacheMaxBytes: number;
 
-  /** LRU of bucket → snapshot (insertion-ordered Map; re-insert on hit to mark MRU). */
-  private readonly cache = new Map<number, SnapshotResponse>();
+  /** LRU keyed by the ACTUAL snapshot cut returned by the server, never the requested instant. */
+  private readonly cache = new Map<number, CachedSnapshot>();
+  /** Requested second bucket → returned cut time. Aliases carry no response/body allocation. */
+  private readonly aliases = new Map<number, number>();
+  private cacheBytes = 0;
   /** The latest requested bucket (the one a coalesced frame will fetch + deliver). */
   private pendingBucket: number | null = null;
   /**
@@ -90,7 +103,8 @@ export class SnapshotController {
     this.onError = opts.onError ?? (() => {});
     this.raf = opts.raf ?? ((cb) => (typeof requestAnimationFrame !== 'undefined' ? requestAnimationFrame(cb) : (setTimeout(cb, 16) as unknown as number)));
     this.cancelRaf = opts.cancelRaf ?? ((h) => (typeof cancelAnimationFrame !== 'undefined' ? cancelAnimationFrame(h) : clearTimeout(h)));
-    this.cacheCapacity = opts.cacheCapacity ?? 64;
+    this.cacheCapacity = opts.cacheCapacity ?? SNAPSHOT_CACHE_MAX_CUTS;
+    this.cacheMaxBytes = opts.cacheMaxBytes ?? SNAPSHOT_CACHE_MAX_BYTES;
   }
 
   /** Total fetches issued (test seam: asserts rapid drags coalesce, NO per-event storm). */
@@ -100,7 +114,15 @@ export class SnapshotController {
 
   /** True if a bucket is cached (test/diagnostic). */
   has(tsMs: number): boolean {
-    return this.cache.has(bucketOf(tsMs));
+    return this.lookup(bucketOf(tsMs)) !== null;
+  }
+
+  retainedBytes(): number {
+    return this.cacheBytes;
+  }
+
+  cachedCuts(): number {
+    return this.cache.size;
   }
 
   /**
@@ -115,10 +137,10 @@ export class SnapshotController {
     // (finding 3) Mark latest BEFORE the cache check: a cache HIT must move the marker too, else a
     // slower in-flight OLDER fetch would still see itself as latest and overwrite this newer cut.
     this.pendingBucket = bucket;
-    const cached = this.cache.get(bucket);
+    const cached = this.lookup(bucket);
     if (cached) {
-      this.touch(bucket, cached);
-      this.deliverIfLatest(bucket, cached);
+      this.promote(cached.key, cached.entry);
+      this.deliverIfLatest(bucket, cached.entry.response);
       return;
     }
     this.scheduleFrame();
@@ -138,15 +160,15 @@ export class SnapshotController {
     const bucket = this.pendingBucket;
     if (bucket === null) return;
     // If the latest target became cached (a prior fetch landed on it) deliver it without refetch.
-    const cached = this.cache.get(bucket);
+    const cached = this.lookup(bucket);
     if (cached) {
-      this.touch(bucket, cached);
+      this.promote(cached.key, cached.entry);
       // (D11 R4 finding 2) This coalesced frame is reached via `settle()` after a stale in-flight
       // fetch resolves. If the latest target was ALREADY delivered (e.g. a `requestAt` cache hit
       // served it while the stale fetch was outstanding), do NOT re-deliver — re-firing the same
       // cut re-installs the frozen seek view and double-bumps the store's `connEpoch`. A genuinely
       // new target (not yet delivered) still delivers here.
-      if (this.lastDelivered !== bucket) this.deliverIfLatest(bucket, cached);
+      if (this.lastDelivered !== bucket) this.deliverIfLatest(bucket, cached.entry.response);
       return;
     }
     // (finding 2) STRICTLY one in flight: while ANY request is outstanding, do not start another —
@@ -168,10 +190,10 @@ export class SnapshotController {
         // `settle` (which would clear the in-flight slot a newer cycle now owns). It is still cached
         // (a future drag back can reuse it) but otherwise dropped.
         if (gen !== this.generation) {
-          this.touch(bucket, resp);
+          this.remember(bucket, resp);
           return;
         }
-        this.touch(bucket, resp);
+        this.remember(bucket, resp);
         // (finding 3) Deliver only if this bucket is STILL the latest requested; a newer drag (or a
         // newer cached delivery) that moved `pendingBucket` wins, and this stale response is dropped.
         this.deliverIfLatest(bucket, resp);
@@ -200,7 +222,7 @@ export class SnapshotController {
     // (D11 R4 finding 2) If the newer pending bucket is ALREADY cached AND already delivered, there
     // is nothing left to do — scheduling a follow-up frame would only re-run `runPending` to
     // re-deliver the same cached cut (double-bumping the store's `connEpoch`). Skip it.
-    if (this.lastDelivered === next && this.cache.has(next)) return;
+    if (this.lastDelivered === next && this.lookup(next) !== null) return;
     this.scheduleFrame();
   }
 
@@ -217,15 +239,49 @@ export class SnapshotController {
     this.onSnapshot(resp);
   }
 
-  /** Insert/refresh a cache entry as MRU and evict the LRU beyond capacity. */
-  private touch(bucket: number, resp: SnapshotResponse): void {
-    if (this.cache.has(bucket)) this.cache.delete(bucket);
-    this.cache.set(bucket, resp);
-    while (this.cache.size > this.cacheCapacity) {
+  private lookup(bucket: number): { key: number; entry: CachedSnapshot } | null {
+    const key = this.aliases.get(bucket) ?? (this.cache.has(bucket) ? bucket : null);
+    if (key === null) return null;
+    const entry = this.cache.get(key);
+    if (!entry) {
+      this.aliases.delete(bucket);
+      return null;
+    }
+    return { key, entry };
+  }
+
+  /** Cache by the returned cut time, record the request alias, then enforce both hard limits. */
+  private remember(requestBucket: number, response: SnapshotResponse): void {
+    const key = Number.isFinite(response.at_ms) ? response.at_ms : requestBucket;
+    const bytes = snapshotBytes(response);
+    this.aliases.set(requestBucket, key);
+    const old = this.cache.get(key);
+    if (old) {
+      this.cacheBytes -= old.bytes;
+      this.cache.delete(key);
+    }
+    // A single cut larger than the whole quota is useful to the current caller but not retained.
+    if (bytes > this.cacheMaxBytes) {
+      this.aliases.delete(requestBucket);
+      return;
+    }
+    this.cache.set(key, { response, bytes });
+    this.cacheBytes += bytes;
+    while (this.cache.size > this.cacheCapacity || this.cacheBytes > this.cacheMaxBytes) {
       const oldest = this.cache.keys().next().value as number | undefined;
       if (oldest === undefined) break;
+      const evicted = this.cache.get(oldest)!;
       this.cache.delete(oldest);
+      this.cacheBytes -= evicted.bytes;
+      for (const [alias, target] of this.aliases) {
+        if (target === oldest) this.aliases.delete(alias);
+      }
     }
+  }
+
+  private promote(key: number, entry: CachedSnapshot): void {
+    this.cache.delete(key);
+    this.cache.set(key, entry);
   }
 
   /**
@@ -251,5 +307,16 @@ export class SnapshotController {
     // landed on before — the resume discarded the frozen cut, so re-seeking it is a real delivery
     // (D11 R4 finding 2).
     this.lastDelivered = null;
+  }
+}
+
+function snapshotBytes(response: SnapshotResponse): number {
+  try {
+    const json = JSON.stringify(response);
+    return typeof TextEncoder === 'function'
+      ? new TextEncoder().encode(json).byteLength
+      : json.length * 2;
+  } catch {
+    return Number.POSITIVE_INFINITY;
   }
 }

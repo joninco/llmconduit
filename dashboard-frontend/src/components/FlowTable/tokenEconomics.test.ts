@@ -14,6 +14,7 @@ const PRICE_TABLE: Record<string, ModelPrice> = {
 
 function flow(over: Partial<FlowSummary> = {}): FlowSummary {
   return {
+    revision: 1,
     api_call_id: 'api_x',
     method: 'POST',
     uri: '/v1/responses',

@@ -44,13 +44,20 @@ import {
 import { SnapshotController } from './snapshotController';
 
 const HILL_H = 40;
+const KEYBOARD_STEP = 0.01;
+const KEYBOARD_PAGE = 0.1;
 
 export function Scrubber({ socket }: { socket: DashboardSocket }) {
   const { client } = getConnection();
   const connection = useDashboard((s) => s.connection);
   const seeking = connection === 'seeking';
   const seekAtMs = useDashboard((s) => s.seekAtMs);
+  const resyncRequired = useDashboard((s) => s.resyncRequired);
   const reduced = prefersReducedMotion();
+  // The drag instant BEFORE the frozen cut lands. It also lets a failed seek offer an exact retry.
+  const [dragAtMs, setDragAtMs] = useState<number | null>(null);
+  const [seekError, setSeekError] = useState<string | null>(null);
+  const lastRequestedAtRef = useRef<number | null>(null);
 
   // reqs/s ring (held in a ref). `useMetricStream` folds EVERY distinct store sample (deduped by
   // seq, no sample lost to render batching) and bumps `version` so the hill re-renders. Each tick
@@ -91,6 +98,14 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
         // The cut is now exposed; drop the local pre-fetch drag marker (the frozen `seekAtMs`
         // drives the playhead from here).
         setDragAtMs(null);
+        setSeekError(null);
+      },
+      onError: () => {
+        // A failed cut must never strand the socket paused on an uncommitted seek. Restore the
+        // captured live baseline immediately; the retained target remains available for Retry.
+        socket.live();
+        setDragAtMs(null);
+        setSeekError('Historical snapshot unavailable.');
       },
     });
   }
@@ -106,7 +121,6 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   // store is intentionally NOT yet `'seeking'` (rows stay live), so the playhead can't read
   // `seekAtMs`. This local marker tracks the drag so the playhead follows immediately; it is
   // cleared once the cut installs (`seekAtMs` takes over) or on resume.
-  const [dragAtMs, setDragAtMs] = useState<number | null>(null);
   // A seek is PENDING once the user starts dragging (socket paused) until the cut lands or resume.
   // Drives the LIVE toggle so the user can always bail out of an in-flight seek.
   const pendingSeek = dragAtMs !== null && !seeking;
@@ -128,6 +142,22 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   }, [fracFromClientX]);
 
   /**
+   * Begin/continue a seek at an explicit retained-history instant. Pointer and keyboard input share
+   * this path so both pause live application, update the pending playhead, and use the controller's
+   * bounded/coalesced snapshot fetch behavior.
+   */
+  const seekToTime = useCallback(
+    (t: number) => {
+      if (!socket.isPaused()) socket.seek();
+      lastRequestedAtRef.current = t;
+      setSeekError(null);
+      setDragAtMs(t);
+      controller.requestAt(t);
+    },
+    [controller, socket],
+  );
+
+  /**
    * Begin/continue a seek at the pointer's time. PAUSES live applying (shadow-buffer) but does NOT
    * expose `'seeking'` — only the atomic `applySeekCut` (when the fetch resolves) does, so the store
    * never reads `seeking` with live rows (finding 1). The local `dragAtMs` tracks the playhead in
@@ -136,11 +166,9 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   const seekToClientX = useCallback(
     (clientX: number) => {
       const t = timeFromClientX(clientX);
-      if (!socket.isPaused()) socket.seek(); // pause applying live frames (shadow-buffer)
-      setDragAtMs(t); // local playhead marker; NO store `seeking` flip until the cut lands
-      controller.requestAt(t); // rAF-throttled + LRU-cached fetch of the frozen cut
+      seekToTime(t);
     },
-    [controller, socket, timeFromClientX],
+    [seekToTime, timeFromClientX],
   );
 
   const onPointerDown = useCallback(
@@ -174,8 +202,14 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   const goLive = useCallback(() => {
     controller.cancel();
     setDragAtMs(null); // drop any in-flight drag marker
+    setSeekError(null);
     socket.live();
   }, [controller, socket]);
+
+  const retrySeek = useCallback(() => {
+    const at = lastRequestedAtRef.current;
+    if (at !== null) seekToTime(at);
+  }, [seekToTime]);
 
   // The playhead position (fraction): the frozen `seekAtMs` once the cut lands, else the in-flight
   // drag marker (`dragAtMs`) so the playhead follows the drag before the fetch resolves; live (no
@@ -191,6 +225,51 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   }, [playheadAtMs, ring]);
 
   const hillPath = useMemo(() => buildHillPath(ring, HILL_H), [ring]);
+  const playheadPercent = Math.round(playheadFrac * 100);
+  const bounds = reqsBounds(ring);
+  const sliderValueText = playheadAtMs === null
+    ? bounds
+      ? `Live, newest retained sample at ${fmtClock(bounds.tEnd)}`
+      : 'Live, no retained history'
+    : `Historical view at ${fmtClock(playheadAtMs)}, ${playheadPercent} percent through retained history`;
+
+  const onTrackKeyDown = useCallback(
+    (event: React.KeyboardEvent<HTMLDivElement>) => {
+      let nextFrac: number;
+      switch (event.key) {
+        case 'ArrowLeft':
+        case 'ArrowDown':
+          nextFrac = playheadFrac - KEYBOARD_STEP;
+          break;
+        case 'ArrowRight':
+        case 'ArrowUp':
+          nextFrac = playheadFrac + KEYBOARD_STEP;
+          break;
+        case 'PageDown':
+          nextFrac = playheadFrac - KEYBOARD_PAGE;
+          break;
+        case 'PageUp':
+          nextFrac = playheadFrac + KEYBOARD_PAGE;
+          break;
+        case 'Home':
+          nextFrac = 0;
+          break;
+        case 'End':
+          nextFrac = 1;
+          break;
+        default:
+          return;
+      }
+      event.preventDefault();
+      const retained = reqsBounds(ringRef.current);
+      if (!retained || retained.tEnd === retained.t0) return;
+      nextFrac = Math.min(1, Math.max(0, nextFrac));
+      if (Math.abs(nextFrac - playheadFrac) < Number.EPSILON) return;
+      const t = xToTime(ringRef.current, nextFrac);
+      if (t !== null && Number.isFinite(t)) seekToTime(t);
+    },
+    [playheadFrac, seekToTime],
+  );
 
   return (
     <div className="mx-4 mt-2 flex items-center gap-3 rounded-md border border-line bg-panel px-3 py-2" data-testid="scrubber">
@@ -224,9 +303,12 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
         aria-label="time-travel scrubber"
         aria-valuemin={0}
         aria-valuemax={100}
-        aria-valuenow={Math.round(playheadFrac * 100)}
+        aria-valuenow={playheadPercent}
+        aria-valuetext={sliderValueText}
+        aria-orientation="horizontal"
         tabIndex={0}
-        className="relative h-10 flex-1 cursor-pointer select-none rounded bg-panel-raised"
+        className="relative h-10 flex-1 cursor-pointer select-none rounded bg-panel-raised focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        onKeyDown={onTrackKeyDown}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
@@ -271,7 +353,16 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
 
       {/* Seek state readout: shadow-buffer depth + the body-free tradeoff note. */}
       <span className="tabular-nums text-xs text-text-muted" data-testid="scrubber-status">
-        {seeking && seekAtMs !== null ? (
+        {resyncRequired ? (
+          <span className="text-status-cooling">resync required · select LIVE</span>
+        ) : seekError ? (
+          <span className="inline-flex items-center gap-2 text-status-down" role="alert">
+            {seekError}
+            <button type="button" className="rounded px-1 underline focus-visible:ring-2 focus-visible:ring-accent" onClick={retrySeek}>
+              Retry
+            </button>
+          </span>
+        ) : seeking && seekAtMs !== null ? (
           <span title="Snapshot is body-free (D5): stats render as-of; request/response bodies render live.">
             as of {fmtClock(seekAtMs)} · buffered {socket.shadowBufferLength()}
           </span>

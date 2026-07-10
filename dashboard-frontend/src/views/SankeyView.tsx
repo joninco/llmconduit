@@ -134,7 +134,7 @@ function SankeyChrome({
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col p-4" data-testid="sankey-view">
-      <header className="mb-3 flex items-center gap-3">
+      <header className="mb-2 flex flex-wrap items-center gap-3">
         <h2 className="text-base font-semibold text-text">Token Sankey</h2>
         <p className="text-sm text-text-muted">client → gateway → model · band = tokens/30s · click a band to filter flows</p>
         {/* Gap 07: `$`/min honors `cost_confidence` + the priced denominator — `—/min` for an
@@ -161,6 +161,15 @@ function SankeyChrome({
           </span>
         )}
       </header>
+      <div className="mb-2 flex items-center gap-2 text-[10px] text-text-muted" aria-label="Band cost legend" data-testid="sankey-cost-legend">
+        <span>cost</span>
+        <span className="h-2.5 w-7 rounded-sm border border-line bg-accent" aria-hidden />
+        <span>lower</span>
+        <span className="h-2.5 w-7 rounded-sm border-2 border-dashed border-meta bg-accent/40" aria-hidden />
+        <span>mixed</span>
+        <span className="h-2.5 w-7 rounded-sm border border-line bg-status-down" aria-hidden />
+        <span>higher</span>
+      </div>
       <Panel className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4">
         {model.links.length === 0 ? (
           <p className="text-sm text-text-muted" data-testid="sankey-empty">No token flow in the last 30s.</p>
@@ -168,6 +177,40 @@ function SankeyChrome({
           <TokenSankey model={model} onSelectModel={onSelect} />
         )}
       </Panel>
+      {model.links.length > 0 && (
+        <div className="mt-3 max-h-40 shrink-0 overflow-auto rounded border border-line" data-testid="sankey-companion-table">
+          <table className="w-full text-left text-xs">
+            <caption className="sr-only">Token lanes with volume and terminal-time configured cost</caption>
+            <thead className="sticky top-0 bg-panel text-text-muted">
+              <tr>
+                <th className="px-2 py-1.5" scope="col">Lane</th>
+                <th className="px-2 py-1.5 text-right" scope="col">Tokens / 30s</th>
+                <th className="px-2 py-1.5 text-right" scope="col">Cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              {model.nodes.filter((node) => node.model).map((node) => {
+                const lane = model.links.find((link) => link.target === node.id);
+                return (
+                  <tr key={node.id} className="border-t border-line">
+                    <th className="px-2 py-1" scope="row">
+                      <button
+                        type="button"
+                        className="rounded text-accent underline-offset-2 hover:underline"
+                        onClick={() => onSelect(node.model!, node.upstream ?? null)}
+                      >
+                        {node.label}
+                      </button>
+                    </th>
+                    <td className="px-2 py-1 text-right tabular-nums">{Math.round(lane?.value ?? 0).toLocaleString()}</td>
+                    <td className="px-2 py-1 text-right tabular-nums">${(lane?.cost ?? 0).toFixed(4)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

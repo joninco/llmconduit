@@ -15,51 +15,31 @@
 //! `DebugUpdate` (`seq = DebugUpdate.sequence`, `batch` = its messages), and
 //! whole-frame dedup then drops a WHOLE stale update, never a live sibling.
 //!
-//! ## Domain routing (the contract reconciliation)
-//! The frozen wire contract keys `usage`/`flow_status` payloads by `api_call_id`
-//! (the authoritative flow key) plus an optional `response_id`. The monitor's
-//! own `DebugWsMessage::Usage` / `RequestStatus` carry ONLY a `response_id`, so a
-//! raw monitor message cannot satisfy the contract directly. The frame builder
-//! therefore SPLITS each `DebugUpdate`:
-//! - `DebugWsMessage::Usage` → a flow-domain [`DashboardPayload::Usage`] (the
-//!   `api_call_id` + `model_served` recovered from the [`crate::dashboard_flow::DashboardFlowStore`]
-//!   by `response_id` via its link index). The core `prompt`/`completion`/`total` come
-//!   from the monitor message; the OPTIONAL `cached`/`reasoning` come from the resolved
-//!   [`crate::dashboard_flow::FlowRecord::usage`] so an unreported class is honestly
-//!   ABSENT, not the monitor message's integer-only `0` (gap 07 review round 1).
-//! - `DebugWsMessage::RequestStatus` → a flow-domain [`DashboardPayload::FlowStatus`]
-//!   (same FlowStore lookup for the authoritative key + served identity + usage).
-//! - every OTHER `DebugWsMessage` → a monitor-domain [`DashboardPayload::Monitor`]
-//!   (the real message NESTED under `message`, itself still `type`-tagged).
-//!
-//! If the FlowStore cannot resolve a `response_id` (debug UI's store disabled, or
-//! the flow already evicted), the Usage/RequestStatus message falls back to a
-//! monitor-domain `Monitor` payload so no transcript data is dropped — the
-//! dedicated flow arms are an enrichment, never a lossy filter.
+//! ## Domain routing
+//! Monitor and flow state use independent authoritative publishers. Every
+//! `DebugUpdate` remains transcript-only in the Monitor domain, including its raw
+//! usage/status messages. Flow-domain rows come directly from the FlowStore's
+//! versioned mutation channel, carrying the exact post-mutation record plus its
+//! global flow cursor and per-flow revision. No socket-time monitor→store join can
+//! race terminal finalization or stamp a later record with an older event cursor.
 //!
 //! ## Sourcing each `DashboardPayload` arm
 //! - `Monitor` ← `MonitorHub` (`DebugUpdate` batch), 1:1, nested + tagged.
-//! - `Usage` ← the monitor `Usage` message, keyed via the FlowStore (D1/D3).
-//! - `FlowStatus` ← the monitor `RequestStatus` message, joined to the FlowStore
-//!   record (D1) for `api_call_id`/`model_served`/`usage`/timing.
-//! - `MetricTick` ← a periodic tick off the [`crate::metrics::MetricsLayer`] view
-//!   (D5), `seq = metrics_seq`, flattened to the `/api/metrics` shape.
-//! - `TopologyUpdate` ← `Gateway::provider_health_publisher().latest()` (D4),
+//! - `FlowStatus` ← authoritative FlowStore mutation, projected as a full `FlowRow`.
+//! - `MetricTick` ← the process-wide immutable metrics publisher cut (D5),
+//!   `seq = metrics presentation seq`, flattened to the `/api/metrics` shape.
+//! - `TopologyUpdate` ← the topology Arc carried by that same coordinated cut,
 //!   `seq = ProviderHealthSnapshot.version`.
 //!
 //! ## `/debug/ws` is UNCHANGED
 //! The bare `DebugWsMessage` contract on `/debug/ws` (debug_ui.rs) is untouched —
 //! the batched envelope is dashboard-only.
 
-use crate::dashboard_flow::Attempt;
 use crate::dashboard_flow::DashboardFlowStore;
-use crate::dashboard_flow::FlowRecord;
-use crate::dashboard_flow::FlowStatus;
-use crate::dashboard_flow::FlowUsage;
-use crate::dashboard_flow::PhaseTimings;
+use crate::dashboard_flow::FlowMutation;
+use crate::dashboard_flow::FlowMutationPhase;
 use crate::engine::Gateway;
 use crate::metrics::MetricsView;
-use crate::monitor::DebugRequestStatus;
 use crate::monitor::DebugUpdate;
 use crate::monitor::DebugWsMessage;
 use crate::upstream::ProviderHealthSnapshot;
@@ -90,17 +70,10 @@ use tokio::sync::broadcast;
 /// expired session is never mistaken for a network blip and silently reconnected.
 const WS_AUTH_CLOSE_CODE: u16 = 4401;
 
-/// How often the Metrics domain emits a [`DashboardPayload::MetricTick`]. One per
-/// second mirrors the dashboard's live stats cadence; the frame is skipped when
-/// the metrics sequence has not advanced (no new samples), so an idle gateway
-/// does not spam identical ticks.
-const METRIC_TICK_INTERVAL: Duration = Duration::from_secs(1);
-
-/// How often the topology poller checks `provider_health_publisher().latest()`
-/// for a new version. The publisher has no broadcast channel, so the socket polls
-/// its monotonic `version`; a frame is emitted ONLY when the version advanced
-/// (per-domain dedup makes a duplicate harmless, but skipping saves a send).
-const TOPOLOGY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Explicit reconnectable close for a lagged bounded publisher. RFC 6455 code
+/// 1013 asks the client to retry later; reconnect takes a fresh authoritative
+/// snapshot instead of continuing after a cursor gap.
+const WS_TRANSIENT_CLOSE_CODE: u16 = 1013;
 
 // ---------------------------------------------------------------------------
 // Wire envelope — the BATCHED DashboardFrame (matches the D9 golden fixtures
@@ -110,7 +83,7 @@ const TOPOLOGY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// The four per-domain cursors the dashboard tracks. Each [`DashboardFrame`]
 /// carries exactly one, and the client dedups whole frames per-domain
 /// (`seq <= last_seq[domain]` drops the batch). Serializes snake_case.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Domain {
     Flow,
@@ -124,7 +97,7 @@ pub enum Domain {
 /// batch of payloads. Per-domain whole-frame dedup on the client drops the WHOLE
 /// `batch` when `seq <= last_seq[domain]`, so a batched Monitor frame never loses
 /// a sibling to dedup.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct DashboardFrame {
     pub domain: Domain,
     pub seq: u64,
@@ -135,7 +108,7 @@ pub struct DashboardFrame {
 /// `{flow,metrics,topology,monitor}` sequences the SPA installs as its dedup
 /// baseline (`commitSnapshot` in `dashboard-frontend/src/api/ws.ts`). Serializes
 /// snake_case to the frozen `SeqCursors` contract.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SeqCursors {
     pub flow_seq: u64,
@@ -147,7 +120,7 @@ pub struct SeqCursors {
 /// The full `/api/metrics`-shaped snapshot body (the flat tile + the three
 /// windows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live
 /// [`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct MetricsSnapshot {
     pub metrics_seq: u64,
     pub reqs_per_sec: f64,
@@ -178,7 +151,7 @@ pub struct MetricsSnapshot {
 /// PLUS its `topology_seq` cursor. Mirrors the frontend `TopologyResponse`. The
 /// price table is empty until D13 wires the price config; an empty map satisfies
 /// the frontend `isPriceTable` guard (vacuously every value is a finite price).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct TopologySnapshot {
     pub topology_seq: u64,
     pub nodes: Vec<TopologyNode>,
@@ -203,11 +176,14 @@ pub use crate::config::ModelPrice;
 /// baseline in one atomic install (`restoreLiveSnapshot`); subsequent live frames
 /// build on it. Internally tagged `type:"snapshot"` to match the frozen
 /// `SnapshotFrame` discriminant.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SnapshotMessage {
     /// Discriminant — always `"snapshot"`; the SPA routes on it.
     #[serde(rename = "type")]
     pub kind: SnapshotTag,
+    /// Dashboard contract version. The SPA verifies this before installing any
+    /// cursor or opening the live pipeline.
+    pub schema_version: u32,
     pub cursors: SeqCursors,
     /// Wire-facing flow ROWS (gap 10b `FlowRow`), NOT raw `SnapshotFlowSummary`s: the SPA's
     /// `isSnapshotFrame` validates every row with the same guard as `/flows` (gap 07 requires
@@ -223,7 +199,7 @@ pub struct SnapshotMessage {
 
 /// The literal `"snapshot"` tag for [`SnapshotMessage::kind`] (a unit enum so the
 /// value is fixed at the type level and serializes to exactly that string).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotTag {
     Snapshot,
@@ -234,14 +210,16 @@ pub enum SnapshotTag {
 /// [`DebugWsMessage`] under `message` — it is NOT flattened (both carry `type`).
 /// The `usage`/`flow_status` arms are keyed by `api_call_id` (authoritative) with
 /// an optional secondary `response_id`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DashboardPayload {
     /// One per `DebugWsMessage` in the originating `DebugUpdate` batch; the real
     /// message is nested under `message` (itself `type`-tagged).
     Monitor { message: DebugWsMessage },
-    /// Per-flow cumulative token usage (flow domain). Keyed by `api_call_id`;
-    /// `response_id` is an optional secondary correlation.
+    /// Schema-v1-compatible cumulative usage arm. New sockets do not emit this
+    /// separately: each authoritative `FlowStatus` carries the full row including
+    /// usage. Retaining the arm keeps additive schema-v2 compatibility for recorded
+    /// frames and older clients.
     ///
     /// Gap 07 review round 1, finding 1 — `cached`/`reasoning` are `Option<i64>`
     /// serialized with `skip_serializing_if`, mirroring [`FlowUsage`] (and the frontend
@@ -270,47 +248,16 @@ pub enum DashboardPayload {
     },
     /// The flat `/api/metrics`-shaped metric tile (metrics domain).
     MetricTick(MetricTick),
-    /// Per-flow lifecycle status (flow domain). Keyed by `api_call_id`; carries
-    /// the served identity + cumulative usage + timing.
-    ///
-    /// Gap 10b — the spine fields that are meaningful PROGRESSIVELY for a LIVE flow ride
-    /// here too: the gap-02 `phases` (the phases reached SO FAR — `#[serde(flatten)]` as
-    /// sibling scalar fields, mirroring `SnapshotFlowSummary`), the gap-03 `attempts` (the
-    /// attempts recorded so far — empty until finalize threads them onto the record, hence
-    /// `skip_serializing_if = Vec::is_empty`), and the gap-03 `first_upstream_byte_ms` (wire
-    /// TTFB once the serving attempt's first chunk arrives). All projected from the live
-    /// [`FlowRecord`] — no recompute. Each is OPTIONAL/absent when not yet measured, so a
-    /// live row lights up its latency waterfall / attempt stepper incrementally and an
-    /// unmeasured phase/attempt is ABSENT, never `0` (don't-lie-with-zeros).
+    /// Authoritative per-flow mutation. The complete [`FlowRow`] is flattened to
+    /// preserve the schema-v1 field locations while adding revision/cost/attribution
+    /// and the bounded mutation `phase`. It is built from the exact record snapshot
+    /// carried by the FlowStore broadcast, never by joining a monitor event later.
     FlowStatus {
-        api_call_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        response_id: Option<String>,
-        status: FlowStatus,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_requested: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        model_served: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        upstream_target: Option<String>,
-        usage: Option<FlowUsage>,
-        started_ms: u128,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        elapsed_ms: Option<u128>,
-        /// Gap 10b — the gap-02 per-phase timestamps reached so far, flattened as sibling
-        /// scalar fields (`ingress_ms`/`first_content_delta_ms`/…). `skip_serializing_if`
-        /// per-field ⇒ an unreached phase is ABSENT, never `0`.
+        phase: FlowMutationPhase,
+        /// Flattening keeps `api_call_id`, status, usage, timing, and all previous
+        /// flow-status keys at their established top-level wire locations.
         #[serde(flatten)]
-        phases: PhaseTimings,
-        /// Gap 10b — the gap-03 per-attempt failover trace recorded so far (empty until the
-        /// L1 guard threads the attempts onto the record at finalize). Body-free scalar
-        /// provenance; `skip_serializing_if = Vec::is_empty` ⇒ absent while empty.
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        attempts: Vec<Attempt>,
-        /// Gap 10b — the gap-03 flow-level wire TTFB (the serving attempt's first on-wire
-        /// chunk), once measured. `None` ⇒ absent ⇒ renders `—`, never `0`.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        first_upstream_byte_ms: Option<u128>,
+        row: Box<crate::dashboard_api::FlowRow>,
     },
     /// The provider topology cut (topology domain): nodes (D4 `ProviderHealth`,
     /// `catalog_size` flattened to a non-null count) + gateway→provider edges.
@@ -324,7 +271,7 @@ pub enum DashboardPayload {
 /// `/dashboard/api/metrics` REST body (sans cursor). The top level repeats the
 /// `m1` window's fields (the dashboard's headline tile) and nests all three
 /// windows under `windows`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct MetricTick {
     pub reqs_per_sec: f64,
     pub active_streams: u64,
@@ -351,7 +298,7 @@ pub struct MetricTick {
 }
 
 /// The three sliding windows (`m1`/`m5`/`h1`) of a [`MetricTick`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct MetricWindows {
     pub m1: MetricWindow,
     pub m5: MetricWindow,
@@ -367,7 +314,7 @@ pub struct MetricWindows {
 /// so the strip renders them `—`; `reqs_per_sec` (a genuine `0` for an idle window)
 /// and `active_streams` (live open-flow count) stay numeric. The field is a finite
 /// `u64`, so it never violates the frozen finite-number wire contract.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct MetricWindow {
     pub reqs_per_sec: f64,
     pub active_streams: u64,
@@ -409,7 +356,7 @@ pub struct MetricWindow {
 /// (NOT nullable), unlike the other `Option` fields which serde emits as `null`.
 /// Every other field mirrors `ProviderHealth` exactly (keys always present, the
 /// nullable ones as JSON `null`).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct TopologyNode {
     pub id: String,
     pub name: String,
@@ -488,7 +435,7 @@ impl TopologyNode {
 /// they serialize as `0.0` (the contract requires the keys present + finite, not
 /// a specific value), so the byte-shape is exact while the rich values land in
 /// D13.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct TopologyEdge {
     pub from: String,
     pub to: String,
@@ -501,338 +448,45 @@ pub struct TopologyEdge {
 // Frame builders (pure + unit-testable)
 // ---------------------------------------------------------------------------
 
-/// Build the dashboard frames for ONE monitor [`DebugUpdate`]. The update's
-/// `sequence` is the Monitor domain cursor: a SINGLE monitor frame carries EVERY
-/// original [`DebugWsMessage`] sibling under that one `seq`, so whole-frame dedup
-/// drops a stale WHOLE update, never a live sibling.
-///
-/// ## Sibling-no-drop (D7b R1 finding 2): enrichment is ADDITIVE, not a move
-/// EVERY original message ALWAYS rides the monitor batch as a
-/// [`DashboardPayload::Monitor`] — `Usage`/`RequestStatus` are NOT removed from it.
-/// On top of that, a resolvable `Usage`/`RequestStatus` ALSO yields a flow-domain
-/// enrichment payload (`usage`/`flow_status` keyed by `api_call_id` recovered from
-/// `flow_store`). So a `DebugUpdate` still becomes ONE Monitor frame containing all
-/// its siblings, PLUS any additive flow-domain enrichment frame.
-///
-/// ## Monitor-sequence flow seq — NOT the FlowStore `record_seq` (D7b R4 finding 1)
-/// The flow enrichment frame is stamped with the ORIGINATING `update.sequence` — the
-/// monitor's MONOTONIC, event-ordered broadcast cursor — NOT the FlowStore
-/// `record_seq` read at socket-drain time. The `record_seq` is the WRONG clock for
-/// these monitor-derived live frames: it is read when the update is DRAINED off the
-/// broadcast channel, which RACES the async engine mutation, so a delayed/older
-/// monitor update can read a `record_seq` already bumped by a LATER mutation —
-/// inheriting a final seq and dedup-dropping the genuinely final flow frame. Because
-/// the monitor broadcast is strictly ordered, an OLDER update carries a SMALLER
-/// `update.sequence` than a NEWER one, so the flow frame seqs are monotonic with the
-/// event order: no leapfrog, no dropped final frame. The flow frame and the monitor
-/// frame for one update therefore share `update.sequence` (in their own domains).
-///
-/// ## Per-record coalescing + alias MERGE (D7b R3/R4 finding 2)
-/// Each `response_id` resolves to its FlowStore [`FlowRecord`] (recovering the
-/// authoritative `api_call_id`). Multiple `response_id`s can ALIAS to ONE record
-/// (one `api_call_id`); their intents are MERGED by `api_call_id` (latest `Usage`
-/// wins, latest `RequestStatus` wins) so the SECOND alias's usage/status is NEVER
-/// discarded — both fold onto ONE flow frame built from a SINGLE record snapshot
-/// (carrying that record's LATEST `usage`/status/timing). The monitor token values
-/// still ride the per-record `usage` payload, keeping the enrichment additive over
-/// what the monitor reported.
-///
-/// Returns the frames in batch order: the flow enrichment frame (when any) followed
-/// by the single monitor frame (always, when the update has any messages).
+/// Build the single transcript-domain frame for one monitor update. Monitor
+/// messages are no longer joined back to FlowStore records; usage/status remain in
+/// the transcript exactly as `/debug/ws` emitted them, while authoritative flow
+/// rows arrive independently from [`FlowMutation`] broadcasts.
 pub fn frames_for_update(
     update: &DebugUpdate,
-    flow_store: &DashboardFlowStore,
+    _flow_store: &DashboardFlowStore,
 ) -> Vec<DashboardFrame> {
-    let mut monitor_batch: Vec<DashboardPayload> = Vec::new();
-    // Per-`response_id` enrichment INTENTS gathered during the message walk, in
-    // first-seen order. The actual `{record, seq}` read happens ONCE per response_id
-    // AFTER the walk (R3), so an older event cannot read a different (newer) same-
-    // record seq than a later event for that record.
-    let mut intents: Vec<FlowEnrichIntent> = Vec::new();
-    let mut intent_index: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-
-    for message in &update.messages {
-        // EVERY original message ALWAYS stays in the monitor batch (finding 2 —
-        // sibling-no-drop). The flow arms below are ADDITIVE enrichment.
-        monitor_batch.push(DashboardPayload::Monitor {
-            message: message.clone(),
-        });
-        match message {
-            DebugWsMessage::Usage {
-                response_id,
-                prompt,
-                completion,
-                total,
-                // `cached`/`reasoning` from the monitor message are the BARE integer-only
-                // contract (an unreported class is `0` here). The dashboard `Usage`
-                // payload sources its OPTIONAL cached/reasoning from `FlowRecord.usage`
-                // instead (gap 07 review round 1, finding 1), so the monitor's collapsed
-                // values are intentionally NOT carried onto the enrichment intent.
-                ..
-            } => {
-                let intent = intent_for(&mut intents, &mut intent_index, response_id);
-                // Latest Usage wins for a repeated response_id within one update.
-                intent.usage = Some(UsageTokens {
-                    prompt: *prompt,
-                    completion: *completion,
-                    total: *total,
-                });
-            }
-            DebugWsMessage::RequestStatus {
-                response_id,
-                status,
-                completed_at_ms,
-                ..
-            } => {
-                let intent = intent_for(&mut intents, &mut intent_index, response_id);
-                // Latest status (+ its fallback timestamp) wins for a repeated response_id.
-                intent.status_completed_at_ms = Some(*completed_at_ms);
-                intent.monitor_status = Some(*status);
-            }
-            _ => {}
-        }
+    if update.messages.is_empty() {
+        return Vec::new();
     }
-
-    // Resolve each intent's `response_id` to its FlowStore record, then MERGE intents
-    // that ALIAS to the SAME record (one `api_call_id`) so two `response_id`s mapping to
-    // one record do NOT discard the second's usage/status (D7b R4 finding 2): the latest
-    // `Usage` + latest `RequestStatus` across all aliases fold onto ONE merged entry, and
-    // the frame is built from a SINGLE record snapshot (the first resolved per record).
-    let merged = merge_intents_by_record(&intents, flow_store);
-    let mut flow_batch: Vec<DashboardPayload> = Vec::new();
-    for merged in &merged {
-        if let Some(tokens) = merged.usage {
-            // Gap 07 review round 1, finding 1: the always-present core counts
-            // (`prompt`/`completion`/`total`) ride the monitor's freshest cumulative
-            // values, but the OPTIONAL `cached`/`reasoning` come from the authoritative
-            // `FlowRecord.usage` (honest `Option<i64>`) so an UNREPORTED class serializes
-            // ABSENT — never the monitor message's collapsed `0` (a measured-zero lie).
-            // The record is the SAME snapshot `flow_status` is built from, so the two flow
-            // payloads agree. When the record has no usage yet, both optionals are `None`
-            // (absent), which is correct: the class is unreported on this flow so far.
-            let (cached, reasoning) = merged
-                .record
-                .usage
-                .map_or((None, None), |usage| (usage.cached, usage.reasoning));
-            flow_batch.push(DashboardPayload::Usage {
-                api_call_id: merged.record.api_call_id.clone(),
-                response_id: Some(merged.response_id.clone()),
-                prompt: tokens.prompt,
-                completion: tokens.completion,
-                total: tokens.total,
-                cached,
-                reasoning,
-            });
-        }
-        if let Some(completed_at_ms) = merged.status_completed_at_ms {
-            flow_batch.push(flow_status_payload(
-                &merged.record,
-                completed_at_ms,
-                merged.monitor_status,
-            ));
-        }
-    }
-
-    let mut frames = Vec::new();
-    if !flow_batch.is_empty() {
-        // Stamp with the ORIGINATING monitor `update.sequence` (D7b R4 finding 1) — the
-        // strictly-ordered broadcast cursor — NOT a FlowStore `record_seq` read at drain
-        // time (which races the async engine mutation and can inherit a LATER mutation's
-        // seq, dedup-dropping the final frame). Per-domain dedup is the client's job; the
-        // server just stamps the correct `{domain, seq}`.
-        frames.push(DashboardFrame {
-            domain: Domain::Flow,
-            seq: update.sequence,
-            batch: flow_batch,
-        });
-    }
-    if !monitor_batch.is_empty() {
-        frames.push(DashboardFrame {
-            domain: Domain::Monitor,
-            seq: update.sequence,
-            batch: monitor_batch,
-        });
-    }
-    frames
+    vec![DashboardFrame {
+        domain: Domain::Monitor,
+        seq: update.sequence,
+        batch: update
+            .messages
+            .iter()
+            .cloned()
+            .map(|message| DashboardPayload::Monitor { message })
+            .collect(),
+    }]
 }
 
-/// The always-present monitor-reported cumulative token counts carried by a `usage`
-/// enrichment payload. The optional `cached`/`reasoning` classes are NOT here: the
-/// dashboard `Usage` payload sources those from the authoritative [`FlowRecord::usage`]
-/// (gap 07 review round 1, finding 1) so an unreported class is honestly absent, not the
-/// monitor message's collapsed `0`.
-#[derive(Debug, Clone, Copy)]
-struct UsageTokens {
-    prompt: i64,
-    completion: i64,
-    total: i64,
-}
-
-/// A pending flow-domain enrichment for ONE `response_id`, accumulated across the
-/// messages of a single `DebugUpdate` BEFORE the record is resolved. Both arms
-/// COALESCE onto the same intent so repeated messages for one `response_id` fold
-/// together; aliasing `response_id`s are then merged by `api_call_id` downstream.
-#[derive(Debug, Clone)]
-struct FlowEnrichIntent {
-    response_id: String,
-    /// The latest monitor `Usage` token counts seen for this response_id (if any).
-    usage: Option<UsageTokens>,
-    /// The latest monitor `RequestStatus` completion stamp (if a status was seen);
-    /// the inner `Option` is the message's own `completed_at_ms` (may be `None`).
-    status_completed_at_ms: Option<Option<u128>>,
-    /// The latest monitor `RequestStatus`'s own lifecycle status. Carried so the
-    /// payload build can close the finalize race: the engine emits the terminal
-    /// monitor event BEFORE the L1 guard commits the FlowStore record terminal, so
-    /// a record snapshot read at drain time can still say `Open` on the flow's LAST
-    /// frame (which would freeze the UI row at "running" — there is no later flow
-    /// frame to correct it).
-    monitor_status: Option<DebugRequestStatus>,
-}
-
-/// Get the mutable [`FlowEnrichIntent`] for `response_id`, creating it (preserving
-/// first-seen order) on first sight. Keyed so repeated messages for one response_id
-/// fold onto a single intent.
-fn intent_for<'a>(
-    intents: &'a mut Vec<FlowEnrichIntent>,
-    index: &mut std::collections::HashMap<String, usize>,
-    response_id: &str,
-) -> &'a mut FlowEnrichIntent {
-    let pos = *index.entry(response_id.to_string()).or_insert_with(|| {
-        intents.push(FlowEnrichIntent {
-            response_id: response_id.to_string(),
-            usage: None,
-            status_completed_at_ms: None,
-            monitor_status: None,
-        });
-        intents.len() - 1
-    });
-    &mut intents[pos]
-}
-
-/// One flow-domain enrichment after per-`response_id` intents have been RESOLVED and
-/// MERGED by the authoritative `api_call_id` (D7b R4 finding 2). All `response_id`s
-/// that alias to the same record fold into ONE of these, carrying the latest `Usage`
-/// and the latest `RequestStatus` stamp seen across the aliases, so neither alias's
-/// payload is lost and the frame is built from the ONE retained `record` snapshot.
-struct MergedRecordIntent {
-    /// The single FlowStore record snapshot all aliases resolved to (the first
-    /// resolution per `api_call_id`). The `usage`/`flow_status` payloads are built
-    /// from THIS one snapshot, so they never mix two reads of the record.
-    record: Arc<FlowRecord>,
-    /// The first-seen `response_id` for this record — carried as the `usage` payload's
-    /// optional secondary correlation (the authoritative key is `record.api_call_id`).
-    response_id: String,
-    /// Latest monitor `Usage` token counts across all aliasing `response_id`s.
-    usage: Option<UsageTokens>,
-    /// Latest monitor `RequestStatus` completion stamp across all aliases (the inner
-    /// `Option` is the message's own `completed_at_ms`, which may be `None`).
-    status_completed_at_ms: Option<Option<u128>>,
-    /// Latest monitor `RequestStatus` lifecycle status across all aliases (moves in
-    /// lockstep with `status_completed_at_ms` — both come from the same message).
-    monitor_status: Option<DebugRequestStatus>,
-}
-
-/// Resolve each per-`response_id` [`FlowEnrichIntent`] to its FlowStore record and MERGE
-/// the intents that alias to the SAME record (one `api_call_id`) into one
-/// [`MergedRecordIntent`] each (D7b R4 finding 2). Two `response_id`s for one record no
-/// longer DISCARD the second alias's usage/status — the latest `Usage` + latest
-/// `RequestStatus` across the aliases fold onto the single merged entry, and the entry
-/// retains the FIRST record snapshot so each record's frame is built from ONE snapshot.
-/// First-seen `api_call_id` order is preserved. An intent whose `response_id` no longer
-/// resolves (record pruned/evicted, or store disabled) is skipped, exactly as before —
-/// the message still rode the monitor batch, so no transcript data is lost.
-fn merge_intents_by_record(
-    intents: &[FlowEnrichIntent],
-    flow_store: &DashboardFlowStore,
-) -> Vec<MergedRecordIntent> {
-    let mut merged: Vec<MergedRecordIntent> = Vec::new();
-    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for intent in intents {
-        let Some(record) = flow_store.detail(&intent.response_id) else {
-            continue;
-        };
-        let slot = *index.entry(record.api_call_id.clone()).or_insert_with(|| {
-            merged.push(MergedRecordIntent {
-                record: Arc::clone(&record),
-                response_id: intent.response_id.clone(),
-                usage: None,
-                status_completed_at_ms: None,
-                monitor_status: None,
-            });
-            merged.len() - 1
-        });
-        let entry = &mut merged[slot];
-        // Latest non-empty wins across aliases (intents are in first-seen message order).
-        if intent.usage.is_some() {
-            entry.usage = intent.usage;
-        }
-        if intent.status_completed_at_ms.is_some() {
-            entry.status_completed_at_ms = intent.status_completed_at_ms;
-            entry.monitor_status = intent.monitor_status;
-        }
-    }
-    merged
-}
-
-/// Build a flow-domain `FlowStatus` payload from the authoritative FlowStore
-/// [`FlowRecord`] (D1): the `api_call_id` (authoritative key), the served identity,
-/// cumulative usage, timing, AND the lifecycle `status` all come from the record.
-///
-/// The status is taken from `record.status` (the FlowStore [`FlowStatus`], which
-/// HAS a `Cancelled` variant) rather than re-derived from the monitor message's
-/// `DebugRequestStatus` (which has only running/completed/failed) — D7b R1 finding
-/// 4: a client hang-up the FlowStore finalized `Cancelled` must serialize
-/// `cancelled`, not be flattened to `failed`. The monitor `completed_at_ms` is used
-/// ONLY as a fallback to derive `elapsed_ms` when the record has not finalized its
-/// own measured elapsed yet.
-///
-/// EXCEPTION — the finalize race: the engine emits the terminal monitor event
-/// (`Completed`/`Failed`, engine.rs) BEFORE the spawned L1 guard commits the
-/// FlowStore record terminal, so the record snapshot joined at drain time can
-/// still read `Open` on the flow's LAST monitor update. Serializing that stale
-/// `open` freezes the UI row at "running" forever — no later flow frame exists to
-/// correct it (the FlowStore finalize itself emits no monitor event). When the
-/// record snapshot is still `Open` AND the monitor message carries a TERMINAL
-/// status, project the monitor's terminal status instead. A record that already
-/// finalized (`Completed`/`Failed`/`Cancelled`) always wins — in particular the
-/// D7b R1 finding-4 `Cancelled` case is untouched (its record is finalized by the
-/// time its frame builds, so the override never fires for it).
-fn flow_status_payload(
-    record: &FlowRecord,
-    completed_at_ms: Option<u128>,
-    monitor_status: Option<DebugRequestStatus>,
-) -> DashboardPayload {
-    // Prefer the record's measured elapsed; fall back to a wall-clock delta from
-    // the monitor's completion stamp (when the record has not finalized yet).
-    let elapsed_ms = record
-        .elapsed_ms
-        .or_else(|| completed_at_ms.map(|done| done.saturating_sub(record.started_ms)));
-    let status = match (record.status, monitor_status) {
-        // Finalize race: monitor says terminal, record not finalized yet.
-        (FlowStatus::Open, Some(DebugRequestStatus::Completed)) => FlowStatus::Completed,
-        (FlowStatus::Open, Some(DebugRequestStatus::Failed)) => FlowStatus::Failed,
-        // Everything else: the record is authoritative (D7b R1 finding 4).
-        (status, _) => status,
-    };
-    DashboardPayload::FlowStatus {
-        api_call_id: record.api_call_id.clone(),
-        response_id: record.response_id.clone(),
-        status,
-        model_requested: record.model_requested.clone(),
-        model_served: record.model_served.clone(),
-        upstream_target: record.upstream_target.clone(),
-        usage: record.usage,
-        started_ms: record.started_ms,
-        elapsed_ms,
-        // Gap 10b: project the gap-02 phases + gap-03 attempts/wire-TTFB reached so far
-        // from the SAME record snapshot the rest of this payload is built from (no second
-        // read, no recompute). `PhaseTimings` is `Copy`; the attempts vec is cloned. A
-        // not-yet-reached phase / not-yet-recorded attempt stays absent on the wire so the
-        // live row lights up incrementally and never shows a fabricated `0`.
-        phases: record.phases,
-        attempts: record.attempts.clone(),
-        first_upstream_byte_ms: record.first_upstream_byte_ms,
+/// Project one authoritative FlowStore mutation to the complete row payload used
+/// by REST and snapshots. Pricing happens against the gateway configuration at send
+/// time, while every flow field comes from the exact record `Arc` in the event.
+fn frame_for_flow_mutation(event: &FlowMutation, gateway: &Gateway) -> DashboardFrame {
+    debug_assert_eq!(event.seq, event.record.record_seq);
+    debug_assert_eq!(event.revision, event.record.revision);
+    DashboardFrame {
+        domain: Domain::Flow,
+        seq: event.seq,
+        batch: vec![DashboardPayload::FlowStatus {
+            phase: event.phase,
+            row: Box::new(crate::dashboard_api::FlowRow::from_record(
+                &event.record,
+                gateway,
+            )),
+        }],
     }
 }
 
@@ -845,6 +499,7 @@ fn flow_status_payload(
 /// result is always `> last_emitted`, keeping the metrics domain's `{domain, seq}` cursor
 /// monotonic WITHOUT a global watermark (AGENTS.md). `saturating_add` guards the (absurd)
 /// `u64::MAX` edge so the cursor never wraps.
+#[cfg(test)]
 fn next_metrics_cursor(view_seq: u64, last_emitted: u64) -> u64 {
     view_seq.max(last_emitted.saturating_add(1))
 }
@@ -966,11 +621,9 @@ fn topology_snapshot(snapshot: &ProviderHealthSnapshot) -> TopologySnapshot {
 /// MUST send FIRST (D7b R1 finding 1) — before any live [`DashboardFrame`]. The SPA
 /// buffers every frame until this lands, so it seeds the whole baseline atomically:
 /// the four per-domain cursors, the body-free flow rows, and the metrics/topology
-/// cuts. The metrics/topology cursors come from the SAME reads that built those bodies;
-/// the `flow_seq` cursor is the MONITOR's atomically-captured `last_sequence` (D7b R4
-/// finding 1) — live flow frames are stamped with the monitor `update.sequence`, so the
-/// flow + monitor domains dedup against the SAME monotonic clock (the flow `flows` body
-/// still comes from the FlowStore).
+/// cuts. Every cursor comes from the same authoritative read that built its domain
+/// body; `flow_seq` is the FlowStore mutation cursor and is independent of the
+/// monitor transcript cursor.
 fn snapshot_message(
     flows: Vec<crate::dashboard_api::FlowRow>,
     flow_seq: u64,
@@ -980,6 +633,7 @@ fn snapshot_message(
 ) -> SnapshotMessage {
     SnapshotMessage {
         kind: SnapshotTag::Snapshot,
+        schema_version: crate::dashboard_contracts::DASHBOARD_SCHEMA_VERSION,
         cursors: SeqCursors {
             flow_seq,
             metrics_seq: metrics.as_ref().map_or(0, |m| m.metrics_seq),
@@ -1031,12 +685,18 @@ pub async fn dashboard_ws(
 
 /// Drive one `/dashboard/ws` connection: send the INITIAL `type:"snapshot"` message
 /// FIRST (the SPA buffers every live frame until it lands — D7b R1 finding 1), then
-/// replay the retained monitor transcript as batched frames, then multiplex the live
-/// monitor broadcast, the periodic metric tick, and the topology poller — all racing
-/// the cookie-`exp` close timer so nothing is delivered past expiry.
+/// replay the retained monitor transcript as batched frames, then multiplex the
+/// authoritative flow publisher, live monitor transcript, and shared metrics/topology
+/// publisher — all racing the cookie-`exp` close timer.
 /// `session_exp == u64::MAX` (dev-open) yields an effectively-infinite timer.
 async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp: u64) {
     let flow_store = gateway.flow_store().clone();
+    let Some(mut flow_rx) = flow_store.subscribe() else {
+        return;
+    };
+    let Some(mut metrics_rx) = gateway.metrics().subscribe_published_metrics() else {
+        return;
+    };
     let mut monitor_rx = gateway.subscribe_monitor();
     let snapshot = gateway.debug_snapshot();
 
@@ -1056,7 +716,7 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // The SPA gates ALL live frames behind `snapshotApplied`, so this MUST precede
     // every `DashboardFrame`. It seeds the dedup cursors + flow rows + metrics/
     // topology baseline atomically. The metrics/topology cursors here are the live
-    // watermarks the loop below resumes from, so the next periodic tick is the first
+    // watermarks the loop below resumes from, so the next published cut is the first
     // NEW frame (no redundant baseline frame, no self-dedup). The monitor cursor is
     // 0: the snapshot body carries NO transcript, so the retained-transcript replay
     // below (seq = `last_sequence`) is ACCEPTED, seeding the inspector history.
@@ -1064,79 +724,50 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     // (D7b R2 finding 2) Each domain's body + its dedup cursor are captured ATOMICALLY
     // (one lock hold per store), so the snapshot never pairs an older body with a newer
     // cursor — which would permanently dedup-drop that mutation's own live frame:
-    //  - metrics:  `view_with_seq()`         (view + metrics_seq under one metrics lock)
-    //  - flows:    `snapshot_summaries_with_seq()` (the body-free flow SUMMARIES under
-    //              one FlowStore lock — its FlowStore `seq` is NOT the WS flow cursor).
-    //  - topology: ONE `latest()` read       (the `version` lives INSIDE the snapshot)
-    //
-    // (D7b R4 finding 1) The flow-domain DEDUP cursor is the MONITOR's `last_sequence`
-    // captured ATOMICALLY with the transcript inside `debug_snapshot()` — NOT the
-    // FlowStore `record_seq`/`flow_seq`. Live flow enrichment frames are stamped with the
-    // originating monitor `update.sequence` (strictly ordered), so a live flow frame with
-    // `seq > last_sequence` applies and one already reflected (`seq <= last_sequence`) is
-    // deduped. This keeps the flow + monitor domains on the SAME monitor clock, so a
-    // delayed monitor update can never inherit a newer FlowStore mutation seq and
-    // dedup-drop the final flow frame. The flow SUMMARIES still come from the FlowStore.
-    let (metrics_view, metrics_seq) = gateway.metrics().view_with_seq();
-    // The raw VIEW seq last observed off the metrics ring — used to detect whether the
-    // aggregated tile changed (a terminal finalized).
-    let mut last_metrics_seq = metrics_seq;
-    // Gap 01 review round 1 (finding 1): `active_streams` changes while a request is
-    // IN FLIGHT, but the metrics ring `metrics_seq` only advances at terminal finalize,
-    // so a tick gated solely on `seq != last_metrics_seq` never re-emits for an
-    // active-count change — the strip's live count freezes at the snapshot value until
-    // the next finalize. We therefore ALSO emit when the live `active_streams` count
-    // changes, sampled at tick time. Track the active count carried by THIS snapshot so
-    // the first such change is detected.
-    let snapshot_active = crate::dashboard_api::active_stream_count(&gateway);
-    let mut last_active = snapshot_active;
-    // The MONOTONIC metrics-domain wire cursor we have emitted (per-domain `{domain,
-    // seq}`, NOT a global watermark — AGENTS.md). It starts at the snapshot's
-    // `metrics_seq` baseline and only ever increases. An active-only change (no view-seq
-    // bump) nudges it forward by 1 via `next_metrics_cursor`, and a real view-seq bump
-    // takes the max — so every emitted frame carries a STRICTLY GREATER `seq` than the
-    // last, which the client's `seq <= cursor` whole-frame dedup (and the `metrics_seq`
-    // sample dedup) both accept. This is what lets a same-view-seq active change reach
-    // the strip (the client previously dropped same-seq metrics frames).
-    let mut last_emitted_metrics_seq = metrics_seq;
-    // Gap 01: build the metrics baseline from the SAME honest tile the REST read +
-    // live tick use — real `active_streams` (live open-flow count) + priced
-    // `cost_per_min`/`tokens_per_sec`/true rates — so the strip is honest from the
-    // first frame, not a raw-count/`0.0` placeholder.
-    let metrics = Some(metrics_snapshot(
-        &metrics_view,
-        metrics_seq,
-        snapshot_active,
-        gateway.price_table(),
-    ));
-    let topo = gateway.provider_health_publisher().latest();
-    let mut last_topology_version = topo.version;
-    let topology = Some(topology_snapshot(&topo));
-    // Body-free flow summaries from the FlowStore; the FlowStore `seq` is discarded — the
-    // flow-domain WS dedup cursor is the monitor's `last_sequence` (finding 1), captured
-    // atomically with the transcript below. Projected through `FlowRow::from_summary` (the
-    // SAME wire shape as the REST `/flows` + `/snapshot` reads) — the SPA validates every
-    // snapshot row with the gap-07 guard (`cost_confidence` required), so a raw summary here
-    // fails `isSnapshotFrame` and bricks the client at `connecting` once any flow exists.
-    let (flow_summaries, _flow_store_seq) = flow_store.snapshot_summaries_with_seq();
+    //  - metrics/topology: one immutable process-published cut (shared with REST)
+    //  - flows:    `snapshot_summaries_with_seq()` (body + authoritative FlowStore
+    //              cursor under one lock; subscription happened before this read).
+    // Subscribe BEFORE reading the baseline: a cut racing this read remains pending on
+    // the watch receiver. The process publisher is the only presentation-seq allocator.
+    let published = metrics_rx.borrow_and_update().clone();
+    let (metrics, topology, mut last_topology_version) = if let Some(cut) = published {
+        (
+            Some(metrics_snapshot(
+                &cut.view,
+                cut.cursors.metrics_seq,
+                cut.active_streams,
+                gateway.price_table(),
+            )),
+            Some(topology_snapshot(&cut.topology)),
+            cut.topology.version,
+        )
+    } else {
+        // Manually-constructed gateways can omit the DI bootstrap cut. Absence is an
+        // explicit unavailable baseline; never recompute stores or mint a presentation
+        // cursor outside the sole process publisher. The watch receiver will deliver
+        // the first real cut when one is published.
+        (None, None, 0)
+    };
+    // Body-free flow summaries AND their authoritative FlowStore cursor are captured
+    // under one lock. The receiver was subscribed first, so mutations racing this read
+    // are either included in the snapshot (and deduped by this baseline) or queued with
+    // a strictly newer FlowStore sequence.
+    let (flow_summaries, flow_store_seq) = flow_store.snapshot_summaries_with_seq();
     let flow_rows: Vec<crate::dashboard_api::FlowRow> = flow_summaries
         .iter()
         .map(|summary| crate::dashboard_api::FlowRow::from_summary(summary, &gateway))
         .collect();
     let initial = snapshot_message(
         flow_rows,
-        // Flow dedup baseline = the monitor's atomically-captured sequence (finding 1).
-        snapshot.last_sequence,
+        flow_store_seq,
         metrics,
         topology,
         // monitor baseline 0 — the transcript rides the replay frame below.
         0,
     );
-    // Replay the retained monitor transcript as ONE batched monitor frame (its messages
-    // share `snapshot.last_sequence`). The flow enrichment frames it emits are stamped at
-    // `update.sequence == snapshot.last_sequence` == the flow dedup baseline, so the
-    // client dedups them (the snapshot already carries those flows) — only the
-    // monitor-domain transcript frame advances the (snapshot-0) monitor cursor.
+    // Replay the retained monitor transcript as one monitor-only frame. Flow rows are
+    // never reconstructed from this transcript; the FlowStore snapshot/event stream is
+    // their sole authority.
     let snapshot_update = DebugUpdate {
         sequence: snapshot.last_sequence,
         messages: snapshot.messages.clone(),
@@ -1152,17 +783,6 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
         }
         SendOutcome::Failed => return,
     }
-
-    let mut metric_ticker = tokio::time::interval(METRIC_TICK_INTERVAL);
-    metric_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // The first `interval` tick fires immediately; consume it so the loop's first
-    // metric frame is a genuinely NEW sample, not an instant re-send of the metrics
-    // baseline already carried by the initial snapshot (its `metrics_seq` seeds
-    // `last_metrics_seq`, so the loop emits only once the seq advances).
-    metric_ticker.tick().await;
-    let mut topology_ticker = tokio::time::interval(TOPOLOGY_POLL_INTERVAL);
-    topology_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    topology_ticker.tick().await;
 
     loop {
         tokio::select! {
@@ -1184,6 +804,30 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                 }
                 // Non-terminal inbound (data/ping/pong): ignore, keep serving.
             }
+            // Prefer authoritative row mutations over transcript traffic when both
+            // channels are ready; a token-heavy monitor stream must not starve the
+            // terminal FlowStore record.
+            received = flow_rx.recv() => {
+                match received {
+                    Ok(event) if event.seq <= flow_store_seq => {}
+                    Ok(event) => {
+                        let frame = frame_for_flow_mutation(&event, &gateway);
+                        match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
+                            SendOutcome::Completed => {}
+                            SendOutcome::Expired => {
+                                send_auth_close(&mut sink).await;
+                                return;
+                            }
+                            SendOutcome::Failed => return,
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        send_transient_close(&mut sink, "flow lag; resnapshot required").await;
+                        return;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
             received = monitor_rx.recv() => {
                 match received {
                     // Dedup at the source against the replayed snapshot: an update
@@ -1201,49 +845,39 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                             SendOutcome::Failed => return,
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => return,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        send_transient_close(&mut sink, "monitor lag; resnapshot required").await;
+                        return;
+                    }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
-            _ = metric_ticker.tick() => {
-                // Atomic view + seq (D7b R2 finding 2): pair the tile body with its own
-                // ring cursor. `active_streams` is sampled AT tick time from the live
-                // FlowStore — the honest in-flight count for THIS frame.
-                let (view, seq) = gateway.metrics().view_with_seq();
-                let active = crate::dashboard_api::active_stream_count(&gateway);
-                // Gap 01 finding 1: emit when EITHER the aggregated view changed
-                // (`seq` advanced at a terminal finalize) OR the live open-flow count
-                // changed (a request started/ended mid-flight, which does NOT bump the
-                // ring seq). Without the active-count clause, an in-flight count change
-                // never reaches the strip until the next finalize.
-                if seq != last_metrics_seq || active != last_active {
-                    last_metrics_seq = seq;
-                    last_active = active;
-                    // Stamp a STRICTLY-MONOTONIC metrics-domain cursor: the real view
-                    // seq, or (for an active-only change that did not advance it) one
-                    // past the last emitted cursor. Either way `> last_emitted`, so the
-                    // client accepts the frame instead of dropping it as a same-seq dup.
-                    let emit_seq = next_metrics_cursor(seq, last_emitted_metrics_seq);
-                    last_emitted_metrics_seq = emit_seq;
-                    // Gap 01: the live tick carries the live open-flow count + price table
-                    // so `active_streams`/`cost_per_min`/`tokens_per_sec`/true rates are
-                    // real (not the old hard-coded `0.0`).
-                    let frame = metric_tick_frame(&view, emit_seq, active, gateway.price_table());
-                    match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
-                        SendOutcome::Completed => {}
-                        SendOutcome::Expired => {
-                            send_auth_close(&mut sink).await;
-                            return;
-                        }
-                        SendOutcome::Failed => return,
-                    }
+            changed = metrics_rx.changed() => {
+                if changed.is_err() {
+                    return;
                 }
-            }
-            _ = topology_ticker.tick() => {
-                let snapshot = gateway.provider_health_publisher().latest();
-                if snapshot.version != last_topology_version {
-                    last_topology_version = snapshot.version;
-                    let frame = topology_frame(&snapshot);
+                // Clone the immutable shared cut before awaiting sends; never hold a watch borrow
+                // across an await. One cut feeds metrics and any topology generation it contains.
+                let Some(cut) = metrics_rx.borrow_and_update().clone() else {
+                    continue;
+                };
+                let frame = metric_tick_frame(
+                    &cut.view,
+                    cut.cursors.metrics_seq,
+                    cut.active_streams,
+                    gateway.price_table(),
+                );
+                match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
+                    SendOutcome::Completed => {}
+                    SendOutcome::Expired => {
+                        send_auth_close(&mut sink).await;
+                        return;
+                    }
+                    SendOutcome::Failed => return,
+                }
+                if cut.topology.version != last_topology_version {
+                    last_topology_version = cut.topology.version;
+                    let frame = topology_frame(&cut.topology);
                     match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
                         SendOutcome::Completed => {}
                         SendOutcome::Expired => {
@@ -1271,10 +905,24 @@ fn auth_close_frame() -> Message {
     }))
 }
 
+/// Reconnectable close used when a bounded broadcast receiver falls behind. The
+/// reason names the lost domain for diagnostics; reconnect always begins with a
+/// new multi-domain snapshot, so no partial replay is attempted.
+fn transient_close_frame(reason: &'static str) -> Message {
+    Message::Close(Some(CloseFrame {
+        code: WS_TRANSIENT_CLOSE_CODE,
+        reason: reason.into(),
+    }))
+}
+
 /// Send the [`auth_close_frame`] on EVERY expiry path (finding 3). Best-effort: the
 /// peer may already be gone, and errors are ignored since we are tearing down anyway.
 async fn send_auth_close(sink: &mut SplitSink<WebSocket, Message>) {
     let _ = sink.send(auth_close_frame()).await;
+}
+
+async fn send_transient_close(sink: &mut SplitSink<WebSocket, Message>, reason: &'static str) {
+    let _ = sink.send(transient_close_frame(reason)).await;
 }
 
 /// Classify an inbound WS poll (`stream.next()`) into "stop serving?" (D7b R2 finding
@@ -1428,6 +1076,9 @@ fn session_remaining(session_exp: u64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dashboard_flow::FlowStatus;
+    use crate::dashboard_flow::FlowUsage;
+    use crate::dashboard_flow::PhaseTimings;
     use crate::dashboard_flow::capture_body;
     use crate::dashboard_flow::redact_headers;
     use crate::monitor::DebugRequest;
@@ -1442,6 +1093,32 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    fn test_flow_row(api_call_id: &str, status: FlowStatus) -> crate::dashboard_api::FlowRow {
+        crate::dashboard_api::FlowRow {
+            revision: 1,
+            api_call_id: api_call_id.to_string(),
+            response_id: None,
+            method: "POST".to_string(),
+            uri: "/v1/responses".to_string(),
+            model_requested: None,
+            model_served: None,
+            upstream_target: None,
+            usage: None,
+            status,
+            started_ms: 1_000,
+            finished_ms: None,
+            elapsed_ms: None,
+            terminal_reason: None,
+            client_label: None,
+            client_source: None,
+            cost: None,
+            cost_confidence: crate::dashboard_api::CostConfidence::Unavailable,
+            phases: PhaseTimings::default(),
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
+        }
     }
 
     // -- the batched-envelope no-drop invariant (the key fix) --------------
@@ -1527,648 +1204,50 @@ mod tests {
         );
     }
 
-    /// With a live FlowStore record (linked `response_id → api_call_id`), a monitor
-    /// `Usage`/`RequestStatus` yields an ADDITIVE flow-domain `usage`/`flow_status`
-    /// enrichment payload keyed by `api_call_id` — WITHOUT being removed from the
-    /// monitor batch (D7b R1 finding 2: the monitor frame still carries ALL THREE
-    /// original siblings, sibling-no-drop). The flow `status` is the record's
-    /// `FlowStatus` (here `Open` — the record was opened, never finalized), not the
-    /// monitor message's `Completed` (finding 4).
     #[test]
-    fn usage_status_enrich_flow_domain_additively_without_dropping_monitor_siblings() {
+    fn linked_monitor_usage_and_status_remain_transcript_only() {
         let store = DashboardFlowStore::new();
         store.open(
-            "api_001".to_string(),
+            "api_1".to_string(),
             "POST".to_string(),
             "/v1/responses".to_string(),
             redact_headers(&HeaderMap::new()),
-            Some(capture_body(b"{}")),
-            crate::dashboard_flow::ClientAttribution::none(),
-        );
-        store.link("resp_001".to_string(), "api_001".to_string());
-        // Gap 07 review round 1, finding 1: the dashboard `Usage` payload sources its
-        // OPTIONAL cached/reasoning from the authoritative `FlowRecord.usage`, NOT from
-        // the monitor message. Seed the record with cached REPORTED (`Some(128)`) but
-        // reasoning UNREPORTED (`None`) so the payload proves BOTH directions: a present
-        // class carries its value, an absent class stays absent (never a fake `0`).
-        store.record_usage(
-            "api_001",
-            FlowUsage {
-                prompt: 812,
-                completion: 240,
-                total: 1052,
-                cached: Some(128),
-                reasoning: None,
-            },
-        );
-
-        let update = DebugUpdate {
-            sequence: 4,
-            messages: vec![
-                DebugWsMessage::SegmentAppend {
-                    response_id: "resp_001".to_string(),
-                    segment: DebugSegment {
-                        timestamp_ms: 1,
-                        kind: DebugSegmentKind::Output,
-                        text: "hi".to_string(),
-                    },
-                },
-                DebugWsMessage::Usage {
-                    response_id: "resp_001".to_string(),
-                    prompt: 812,
-                    completion: 240,
-                    total: 1052,
-                    // The monitor message COLLAPSES an unreported class to `0` (the bare
-                    // `/debug/ws` contract). The dashboard payload must NOT echo this `0`
-                    // for `reasoning` — it sources reasoning from the record (`None`).
-                    cached: 128,
-                    reasoning: 0,
-                },
-                DebugWsMessage::RequestStatus {
-                    response_id: "resp_001".to_string(),
-                    status: DebugRequestStatus::Completed,
-                    completed_at_ms: Some(1718900000003),
-                    error: None,
-                },
-            ],
-        };
-        let frames = frames_for_update(&update, &store);
-        // An additive flow frame (usage + status) AND a monitor frame (ALL 3 originals).
-        assert_eq!(frames.len(), 2);
-        let flow = frames
-            .iter()
-            .find(|f| f.domain == Domain::Flow)
-            .expect("flow frame");
-        assert_eq!(flow.batch.len(), 2, "usage + flow_status enrichment");
-        match &flow.batch[0] {
-            DashboardPayload::Usage {
-                api_call_id,
-                response_id,
-                total,
-                cached,
-                reasoning,
-                ..
-            } => {
-                assert_eq!(
-                    api_call_id, "api_001",
-                    "keyed by api_call_id, not response_id"
-                );
-                assert_eq!(response_id.as_deref(), Some("resp_001"));
-                assert_eq!(*total, 1052);
-                // cached came from the RECORD (`Some(128)`), not the monitor `i64`.
-                assert_eq!(*cached, Some(128));
-                // reasoning was UNREPORTED on the record ⇒ absent (NOT the monitor's `0`).
-                assert_eq!(
-                    *reasoning, None,
-                    "an unreported reasoning class is absent, not the monitor message's 0"
-                );
-            }
-            other => panic!("expected usage payload, got {other:?}"),
-        }
-        // The unreported `reasoning` serializes ABSENT (don't-lie-with-zeros); the
-        // reported `cached` serializes as its value.
-        let usage_json = serde_json::to_value(&flow.batch[0]).expect("serialize usage");
-        assert_eq!(usage_json["cached"], serde_json::json!(128));
-        assert!(
-            usage_json.get("reasoning").is_none(),
-            "unreported reasoning is omitted on the wire, never a fabricated 0"
-        );
-        match &flow.batch[1] {
-            DashboardPayload::FlowStatus {
-                api_call_id,
-                status,
-                ..
-            } => {
-                assert_eq!(api_call_id, "api_001");
-                // The record snapshot still reads `Open` but the monitor message is a
-                // TERMINAL `Completed` — the finalize-race override projects the terminal
-                // status (see `terminal_monitor_status_overrides_stale_open_record`; the
-                // finding-4 `Cancelled` case is `cancelled_flow_serializes_cancelled_not_failed`).
-                assert_eq!(*status, FlowStatus::Completed);
-            }
-            other => panic!("expected flow_status payload, got {other:?}"),
-        }
-        let monitor = frames
-            .iter()
-            .find(|f| f.domain == Domain::Monitor)
-            .expect("monitor frame");
-        assert_eq!(
-            monitor.batch.len(),
-            3,
-            "sibling-no-drop: ALL three originals stay in the monitor batch"
-        );
-        // The enrichment is ADDITIVE — the usage + status messages are STILL present
-        // in the monitor batch, not moved out of it.
-        let monitor_kinds: Vec<&DebugWsMessage> = monitor
-            .batch
-            .iter()
-            .map(|p| match p {
-                DashboardPayload::Monitor { message } => message,
-                other => panic!("monitor batch must hold only Monitor payloads, got {other:?}"),
-            })
-            .collect();
-        assert!(
-            monitor_kinds
-                .iter()
-                .any(|m| matches!(m, DebugWsMessage::Usage { .. })),
-            "the Usage sibling is retained in the monitor batch"
-        );
-        assert!(
-            monitor_kinds
-                .iter()
-                .any(|m| matches!(m, DebugWsMessage::RequestStatus { .. })),
-            "the RequestStatus sibling is retained in the monitor batch"
-        );
-    }
-
-    /// D7b R1 finding 4: a flow the FlowStore finalized `Cancelled` (client hang-up)
-    /// serializes `status: "cancelled"`, NOT flattened to `failed`. The monitor
-    /// `RequestStatus` only carries `failed`/`completed`/`running`, so the payload
-    /// MUST take its status from the record's `FlowStatus` (which has `Cancelled`).
-    #[test]
-    fn cancelled_flow_serializes_cancelled_not_failed() {
-        let store = DashboardFlowStore::new();
-        store.open(
-            "api_cxl".to_string(),
-            "POST".to_string(),
-            "/v1/responses".to_string(),
-            redact_headers(&HeaderMap::new()),
-            Some(capture_body(b"{}")),
-            crate::dashboard_flow::ClientAttribution::none(),
-        );
-        store.link("resp_cxl".to_string(), "api_cxl".to_string());
-        // The FlowStore finalizes the flow Cancelled (the D3 client-hangup terminal).
-        store.finalize(
-            "api_cxl",
-            FlowStatus::Cancelled,
-            Some("client-hangup".to_string()),
             None,
-        );
-
-        let update = DebugUpdate {
-            sequence: 7,
-            messages: vec![DebugWsMessage::RequestStatus {
-                response_id: "resp_cxl".to_string(),
-                // The monitor's closest status is Failed — but the record says Cancelled.
-                status: DebugRequestStatus::Failed,
-                completed_at_ms: Some(20),
-                error: Some("client-hangup".to_string()),
-            }],
-        };
-        let frames = frames_for_update(&update, &store);
-        let flow = frames
-            .iter()
-            .find(|f| f.domain == Domain::Flow)
-            .expect("flow frame");
-        let status = flow
-            .batch
-            .iter()
-            .find_map(|p| match p {
-                DashboardPayload::FlowStatus { status, .. } => Some(*status),
-                _ => None,
-            })
-            .expect("flow_status payload");
-        assert_eq!(
-            status,
-            FlowStatus::Cancelled,
-            "record's Cancelled wins over the monitor's Failed"
-        );
-        // And it serializes to the snake_case wire string the frontend expects.
-        let value = serde_json::to_value(flow).expect("serialize");
-        let wire_status = &value["batch"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["type"] == "flow_status")
-            .unwrap()["status"];
-        assert_eq!(*wire_status, serde_json::json!("cancelled"));
-    }
-
-    /// The finalize race: the engine emits the terminal monitor `Completed`/`Failed`
-    /// BEFORE the spawned L1 guard commits the FlowStore record terminal, so the
-    /// record snapshot joined at drain time can still read `Open` on the flow's LAST
-    /// monitor update. Serializing that stale `open` froze the UI row at "running"
-    /// forever (no later flow frame corrects it — FlowStore finalize emits no monitor
-    /// event). The monitor's own TERMINAL status must win over a still-`Open` record
-    /// snapshot; a `Running` status must NOT override (a genuinely open flow stays
-    /// open, e.g. on snapshot replay).
-    #[test]
-    fn terminal_monitor_status_overrides_stale_open_record() {
-        let payload_status = |messages: Vec<DebugWsMessage>, store: &DashboardFlowStore| {
-            let update = DebugUpdate {
-                sequence: 9,
-                messages,
-            };
-            let frames = frames_for_update(&update, store);
-            let flow = frames
-                .iter()
-                .find(|f| f.domain == Domain::Flow)
-                .expect("flow frame");
-            flow.batch
-                .iter()
-                .find_map(|p| match p {
-                    DashboardPayload::FlowStatus {
-                        status, elapsed_ms, ..
-                    } => Some((*status, *elapsed_ms)),
-                    _ => None,
-                })
-                .expect("flow_status payload")
-        };
-        let open_store = |api: &str, resp: &str| {
-            let store = DashboardFlowStore::new();
-            store.open(
-                api.to_string(),
-                "POST".to_string(),
-                "/v1/messages".to_string(),
-                redact_headers(&HeaderMap::new()),
-                Some(capture_body(b"{}")),
-                crate::dashboard_flow::ClientAttribution::none(),
-            );
-            store.link(resp.to_string(), api.to_string());
-            // NO finalize — the record snapshot still reads `Open` (the race window).
-            store
-        };
-
-        // Monitor `Completed` beats the stale `Open` snapshot…
-        let store = open_store("api_race_c", "resp_race_c");
-        let (status, elapsed_ms) = payload_status(
-            vec![DebugWsMessage::RequestStatus {
-                response_id: "resp_race_c".to_string(),
-                status: DebugRequestStatus::Completed,
-                completed_at_ms: Some(u128::MAX),
-                error: None,
-            }],
-            &store,
-        );
-        assert_eq!(
-            status,
-            FlowStatus::Completed,
-            "monitor Completed wins over the un-finalized Open snapshot"
-        );
-        // …and the monitor stamp still backs the elapsed fallback (record has none yet).
-        assert!(
-            elapsed_ms.is_some(),
-            "elapsed falls back to the monitor stamp"
-        );
-
-        // …monitor `Failed` too…
-        let store = open_store("api_race_f", "resp_race_f");
-        let (status, _) = payload_status(
-            vec![DebugWsMessage::RequestStatus {
-                response_id: "resp_race_f".to_string(),
-                status: DebugRequestStatus::Failed,
-                completed_at_ms: Some(u128::MAX),
-                error: Some("boom".to_string()),
-            }],
-            &store,
-        );
-        assert_eq!(
-            status,
-            FlowStatus::Failed,
-            "monitor Failed wins over the un-finalized Open snapshot"
-        );
-
-        // …but `Running` never overrides: a genuinely open flow stays `open`.
-        let store = open_store("api_race_r", "resp_race_r");
-        let (status, _) = payload_status(
-            vec![DebugWsMessage::RequestStatus {
-                response_id: "resp_race_r".to_string(),
-                status: DebugRequestStatus::Running,
-                completed_at_ms: None,
-                error: None,
-            }],
-            &store,
-        );
-        assert_eq!(
-            status,
-            FlowStatus::Open,
-            "a Running status leaves the open record untouched"
-        );
-    }
-
-    /// D7b R4 finding 1: the flow enrichment frame is stamped with the ORIGINATING
-    /// monitor `update.sequence` — NOT the FlowStore `record_seq` read at socket-drain
-    /// time. The `record_seq` is the wrong clock: it is read when the update is drained,
-    /// which RACES the async engine mutation, so a delayed update could read a seq already
-    /// bumped by a later mutation. Here MANY unrelated flows (and the record itself)
-    /// mutate the store AFTER the update's monitor sequence is fixed, advancing the
-    /// FlowStore `record_seq`/`flow_seq` far past the update's sequence — yet the frame is
-    /// stamped with `update.sequence`, provably independent of the FlowStore counters.
-    #[test]
-    fn flow_frame_seq_is_originating_monitor_sequence_not_record_seq() {
-        let store = DashboardFlowStore::new();
-        store.open(
-            "api_a".to_string(),
-            "POST".to_string(),
-            "/v1/responses".to_string(),
-            redact_headers(&HeaderMap::new()),
-            Some(capture_body(b"{}")),
             crate::dashboard_flow::ClientAttribution::none(),
         );
-        store.link("resp_a".to_string(), "api_a".to_string());
-
-        // The update's monitor sequence is fixed (the strictly-ordered broadcast cursor).
+        store.link("resp_1".to_string(), "api_1".to_string());
         let update = DebugUpdate {
-            sequence: 3,
-            messages: vec![DebugWsMessage::RequestStatus {
-                response_id: "resp_a".to_string(),
-                status: DebugRequestStatus::Completed,
-                completed_at_ms: Some(5),
-                error: None,
-            }],
-        };
-
-        // Now the record itself AND many unrelated flows mutate AFTER the monitor sequence
-        // was fixed, driving BOTH the record's own `record_seq` and the global `flow_seq`
-        // far past `update.sequence` (modelling the drain-race: a delayed update read at
-        // this instant would have inherited a much newer FlowStore seq). Several
-        // `record_usage` upserts on `api_a` climb its OWN per-record watermark; the
-        // unrelated opens climb the global cursor.
-        for i in 0..6 {
-            store.record_usage(
-                "api_a",
-                FlowUsage {
-                    prompt: i,
-                    completion: i,
-                    total: 2 * i,
-                    cached: Some(0),
-                    reasoning: Some(0),
-                },
-            );
-            store.open(
-                format!("api_other_{i}"),
-                "POST".to_string(),
-                "/v1/responses".to_string(),
-                redact_headers(&HeaderMap::new()),
-                Some(capture_body(b"{}")),
-                crate::dashboard_flow::ClientAttribution::none(),
-            );
-        }
-        store.finalize(
-            "api_a",
-            FlowStatus::Completed,
-            Some("done".to_string()),
-            None,
-        );
-        let (_rec, record_seq_now) = store.detail_with_seq("resp_a").expect("flow A resolves");
-        assert!(
-            record_seq_now > update.sequence,
-            "the record's own FlowStore record_seq ({record_seq_now}) advanced past the \
-             update's monitor sequence ({}) — the drain-race the fix neutralizes",
-            update.sequence
-        );
-        assert!(
-            store.flow_seq() > update.sequence,
-            "the global FlowStore cursor also advanced past the update's monitor sequence"
-        );
-
-        let frames = frames_for_update(&update, &store);
-        let flow = frames
-            .iter()
-            .find(|f| f.domain == Domain::Flow)
-            .expect("flow frame");
-        // The crux: the frame carries the ORIGINATING monitor sequence (3), NOT the
-        // drain-time FlowStore `record_seq` (which leapfrogged to `record_seq_now`).
-        assert_eq!(
-            flow.seq, update.sequence,
-            "flow frame seq == the originating monitor update.sequence, not the FlowStore record_seq"
-        );
-        assert_ne!(
-            flow.seq, record_seq_now,
-            "the frame did NOT inherit the (newer) drain-time FlowStore record_seq"
-        );
-    }
-
-    /// D7b R4: multiple events for the SAME record within one `DebugUpdate` (a `Usage`
-    /// AND a `RequestStatus`) COALESCE onto ONE flow frame built from a SINGLE record
-    /// snapshot, stamped with the update's monitor sequence. Both enrichment payloads
-    /// ride that one frame keyed by the authoritative `api_call_id`.
-    #[test]
-    fn same_record_events_coalesce_to_one_frame_at_update_sequence() {
-        let store = DashboardFlowStore::new();
-        store.open(
-            "api_a".to_string(),
-            "POST".to_string(),
-            "/v1/responses".to_string(),
-            redact_headers(&HeaderMap::new()),
-            Some(capture_body(b"{}")),
-            crate::dashboard_flow::ClientAttribution::none(),
-        );
-        store.link("resp_a".to_string(), "api_a".to_string());
-
-        // One update carrying BOTH a Usage and a RequestStatus for the SAME record.
-        let update = DebugUpdate {
-            sequence: 3,
+            sequence: 44,
             messages: vec![
                 DebugWsMessage::Usage {
-                    response_id: "resp_a".to_string(),
-                    prompt: 11,
-                    completion: 6,
-                    total: 17,
-                    cached: 1,
-                    reasoning: 0,
-                },
-                DebugWsMessage::RequestStatus {
-                    response_id: "resp_a".to_string(),
-                    status: DebugRequestStatus::Completed,
-                    completed_at_ms: Some(99),
-                    error: None,
-                },
-            ],
-        };
-        let frames = frames_for_update(&update, &store);
-        // Exactly ONE flow frame (coalesced), plus the monitor frame.
-        let flow_frames: Vec<&DashboardFrame> =
-            frames.iter().filter(|f| f.domain == Domain::Flow).collect();
-        assert_eq!(
-            flow_frames.len(),
-            1,
-            "same-record events coalesce to ONE frame"
-        );
-        let flow = flow_frames[0];
-        // Its seq is the update's monitor sequence — one frame, one seq, both payloads.
-        assert_eq!(
-            flow.seq, update.sequence,
-            "frame seq is the originating monitor update.sequence"
-        );
-        // Both the usage AND the flow_status enrichment ride that single frame, keyed by
-        // the authoritative api_call_id — derived from the one snapshot, sharing one seq.
-        assert_eq!(
-            flow.batch.len(),
-            2,
-            "usage + flow_status, both for the one record"
-        );
-        assert!(
-            flow.batch
-                .iter()
-                .any(|p| matches!(p, DashboardPayload::Usage { api_call_id, .. } if api_call_id == "api_a")),
-            "the usage payload is present, keyed by api_call_id"
-        );
-        assert!(
-            flow.batch
-                .iter()
-                .any(|p| matches!(p, DashboardPayload::FlowStatus { api_call_id, .. } if api_call_id == "api_a")),
-            "the flow_status payload is present, keyed by api_call_id"
-        );
-    }
-
-    /// D7b R4 finding 2: when TWO DISTINCT alias ids resolve to ONE record (same
-    /// `api_call_id`), the second alias's payload is MERGED, NOT discarded. One message
-    /// keys off the `api_call_id` itself (`detail` resolves it directly) carrying the
-    /// `Usage`; the other keys off the LINKED `response_id` carrying the `RequestStatus`
-    /// — both resolve to the one record. The merged frame MUST carry BOTH payloads (no
-    /// payload lost), built from a SINGLE record snapshot (one frame). This is the exact
-    /// regression: the old code read the record twice and dropped the second alias's
-    /// payload when its `api_call_id` was already seen.
-    #[test]
-    fn two_aliases_to_one_record_merge_both_payloads_into_one_frame() {
-        let store = DashboardFlowStore::new();
-        store.open(
-            "api_a".to_string(),
-            "POST".to_string(),
-            "/v1/responses".to_string(),
-            redact_headers(&HeaderMap::new()),
-            Some(capture_body(b"{}")),
-            crate::dashboard_flow::ClientAttribution::none(),
-        );
-        // `resp_1` links to `api_a`. Now BOTH `"api_a"` (the id itself) and `"resp_1"`
-        // (the linked response_id) resolve to the SAME record — two DISTINCT alias ids.
-        store.link("resp_1".to_string(), "api_a".to_string());
-
-        let update = DebugUpdate {
-            sequence: 7,
-            messages: vec![
-                // Alias #1: keyed by the api_call_id itself — carries the Usage.
-                DebugWsMessage::Usage {
-                    response_id: "api_a".to_string(),
-                    prompt: 1,
-                    completion: 2,
-                    total: 3,
+                    response_id: "resp_1".to_string(),
+                    prompt: 2,
+                    completion: 3,
+                    total: 5,
                     cached: 0,
                     reasoning: 0,
                 },
-                // Alias #2: keyed by the linked response_id — carries the RequestStatus.
                 DebugWsMessage::RequestStatus {
                     response_id: "resp_1".to_string(),
                     status: DebugRequestStatus::Completed,
-                    completed_at_ms: Some(42),
+                    completed_at_ms: Some(9),
                     error: None,
                 },
             ],
         };
+
         let frames = frames_for_update(&update, &store);
-        let flow_frames: Vec<&DashboardFrame> =
-            frames.iter().filter(|f| f.domain == Domain::Flow).collect();
-        assert_eq!(
-            flow_frames.len(),
-            1,
-            "two aliases to one record → exactly ONE flow frame"
-        );
-        let flow = flow_frames[0];
-        assert_eq!(flow.seq, 7, "stamped with the monitor update.sequence");
-        // BOTH payloads present — the second alias was MERGED, not discarded.
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].domain, Domain::Monitor);
+        assert_eq!(frames[0].seq, 44);
+        assert_eq!(frames[0].batch.len(), 2);
         assert!(
-            flow.batch
+            frames[0]
+                .batch
                 .iter()
-                .any(|p| matches!(p, DashboardPayload::Usage { api_call_id, .. } if api_call_id == "api_a")),
-            "the usage payload (alias #1) survives the merge"
-        );
-        assert!(
-            flow.batch
-                .iter()
-                .any(|p| matches!(p, DashboardPayload::FlowStatus { api_call_id, .. } if api_call_id == "api_a")),
-            "the status payload (alias #2) survives the merge — not discarded as a dup record"
-        );
-        assert_eq!(
-            flow.batch.len(),
-            2,
-            "exactly the two merged payloads (usage + flow_status), one record snapshot"
+                .all(|payload| matches!(payload, DashboardPayload::Monitor { .. }))
         );
     }
-
-    /// D7b R4 finding 1 (the drain-race / leapfrog regression): an OLDER monitor update
-    /// (smaller `sequence`) processed AFTER a later same-record mutation does NOT inherit
-    /// a newer seq, so the FINAL update's frame (larger `sequence`) is strictly newer and
-    /// the client's per-domain dedup (`seq <= last_seq` drops) ACCEPTS it. Because the
-    /// monitor broadcast is strictly ordered, the older update's `sequence` is fixed BELOW
-    /// the newer one regardless of when each is drained or how the FlowStore mutated.
-    #[test]
-    fn older_update_does_not_inherit_newer_seq_or_drop_final_frame() {
-        let store = DashboardFlowStore::new();
-        store.open(
-            "api_a".to_string(),
-            "POST".to_string(),
-            "/v1/responses".to_string(),
-            redact_headers(&HeaderMap::new()),
-            Some(capture_body(b"{}")),
-            crate::dashboard_flow::ClientAttribution::none(),
-        );
-        store.link("resp_a".to_string(), "api_a".to_string());
-
-        // The OLDER monitor update (sequence 1).
-        let older_update = DebugUpdate {
-            sequence: 1,
-            messages: vec![DebugWsMessage::Usage {
-                response_id: "resp_a".to_string(),
-                prompt: 1,
-                completion: 1,
-                total: 2,
-                cached: 0,
-                reasoning: 0,
-            }],
-        };
-        // The record mutates AGAIN (a genuinely-later flow event) — driving its FlowStore
-        // record_seq strictly past the older update's monitor sequence. Under the OLD
-        // (record_seq) scheme, draining the older update NOW would inherit this newer seq
-        // and dedup-drop the final frame. Under monitor-sequence stamping it cannot.
-        store.finalize(
-            "api_a",
-            FlowStatus::Completed,
-            Some("done".to_string()),
-            None,
-        );
-        // Drain the OLDER update only NOW (after the later mutation) — the drain-race.
-        let older_seq = frames_for_update(&older_update, &store)
-            .iter()
-            .find(|f| f.domain == Domain::Flow)
-            .expect("older flow frame")
-            .seq;
-
-        // The FINAL monitor update (sequence 2 — strictly after the older one).
-        let final_update = DebugUpdate {
-            sequence: 2,
-            messages: vec![DebugWsMessage::RequestStatus {
-                response_id: "resp_a".to_string(),
-                status: DebugRequestStatus::Completed,
-                completed_at_ms: Some(50),
-                error: None,
-            }],
-        };
-        let final_seq = frames_for_update(&final_update, &store)
-            .iter()
-            .find(|f| f.domain == Domain::Flow)
-            .expect("final flow frame")
-            .seq;
-
-        // The crux: the older update carried its OWN smaller monitor sequence (1), not the
-        // newer mutation's leapfrogged FlowStore seq, so the final frame (2) is strictly
-        // newer and the client's `seq <= last_seq` dedup ACCEPTS it (no drop).
-        assert_eq!(
-            older_seq, 1,
-            "older frame stamped with its own monitor sequence"
-        );
-        assert_eq!(
-            final_seq, 2,
-            "final frame stamped with its own monitor sequence"
-        );
-        assert!(
-            final_seq > older_seq,
-            "the newer/final flow frame's seq ({final_seq}) is strictly greater than the \
-             older update's seq ({older_seq}) — so it is not dedup-dropped"
-        );
-    }
-
-    // -- byte-for-byte fixture parity (the D9 golden fixtures) -------------
 
     /// The serialized Monitor frame matches `GOLDEN_MONITOR_FRAME_JSON` exactly:
     /// `domain:"monitor"`, `seq:6`, a 4-element batch of `monitor` payloads each
@@ -2365,31 +1444,27 @@ mod tests {
     /// `started_ms`, `elapsed_ms`.
     #[test]
     fn flow_status_frame_matches_golden_fixture_bytes() {
+        let mut row = test_flow_row("api_001", FlowStatus::Completed);
+        row.revision = 9;
+        row.response_id = Some("resp_001".to_string());
+        row.model_requested = Some("gpt-4o".to_string());
+        row.model_served = Some("llama-3.1-70b".to_string());
+        row.upstream_target = Some("vllm-a".to_string());
+        row.usage = Some(FlowUsage {
+            prompt: 812,
+            completion: 512,
+            total: 1324,
+            cached: Some(128),
+            reasoning: Some(0),
+        });
+        row.started_ms = 1718900000000;
+        row.elapsed_ms = Some(3100);
         let frame = DashboardFrame {
             domain: Domain::Flow,
             seq: 5,
             batch: vec![DashboardPayload::FlowStatus {
-                api_call_id: "api_001".to_string(),
-                response_id: Some("resp_001".to_string()),
-                status: FlowStatus::Completed,
-                model_requested: Some("gpt-4o".to_string()),
-                model_served: Some("llama-3.1-70b".to_string()),
-                upstream_target: Some("vllm-a".to_string()),
-                usage: Some(FlowUsage {
-                    prompt: 812,
-                    completion: 512,
-                    total: 1324,
-                    cached: Some(128),
-                    reasoning: Some(0),
-                }),
-                started_ms: 1718900000000,
-                elapsed_ms: Some(3100),
-                // Gap 10b: the spine fields are absent on this golden fixture (an all-`None`
-                // `PhaseTimings` + an empty attempts vec + `None` TTFB), so they `skip` and
-                // the wire bytes stay byte-for-byte identical to `GOLDEN_FLOW_STATUS_FRAME_JSON`.
-                phases: PhaseTimings::default(),
-                attempts: Vec::new(),
-                first_upstream_byte_ms: None,
+                phase: FlowMutationPhase::Terminal,
+                row: Box::new(row),
             }],
         };
         let got: serde_json::Value = serde_json::to_value(&frame).expect("serialize");
@@ -2399,6 +1474,8 @@ mod tests {
             "batch": [
                 {
                     "type": "flow_status",
+                    "phase": "terminal",
+                    "revision": 9,
                     "api_call_id": "api_001",
                     "response_id": "resp_001",
                     "status": "completed",
@@ -2407,7 +1484,11 @@ mod tests {
                     "upstream_target": "vllm-a",
                     "usage": { "prompt": 812, "completion": 512, "total": 1324, "cached": 128, "reasoning": 0 },
                     "started_ms": 1718900000000u64,
-                    "elapsed_ms": 3100
+                    "elapsed_ms": 3100,
+                    "method": "POST",
+                    "uri": "/v1/responses",
+                    "cost": null,
+                    "cost_confidence": "unavailable"
                 }
             ]
         });
@@ -2447,19 +1528,17 @@ mod tests {
         };
 
         // PRESENT: a live flow that has reached first content + recorded its serving attempt.
+        let mut present_row = test_flow_row("api_001", FlowStatus::Open);
+        present_row.response_id = Some("resp_001".to_string());
+        present_row.model_served = Some("llama-3.1-70b".to_string());
+        present_row.upstream_target = Some("vllm-a".to_string());
+        present_row.elapsed_ms = Some(500);
+        present_row.phases = phases;
+        present_row.attempts = vec![attempt.clone()];
+        present_row.first_upstream_byte_ms = Some(1_220);
         let present = DashboardPayload::FlowStatus {
-            api_call_id: "api_001".to_string(),
-            response_id: Some("resp_001".to_string()),
-            status: FlowStatus::Open,
-            model_requested: None,
-            model_served: Some("llama-3.1-70b".to_string()),
-            upstream_target: Some("vllm-a".to_string()),
-            usage: None,
-            started_ms: 1_000,
-            elapsed_ms: Some(500),
-            phases,
-            attempts: vec![attempt.clone()],
-            first_upstream_byte_ms: Some(1_220),
+            phase: FlowMutationPhase::Progress,
+            row: Box::new(present_row),
         };
         let value = serde_json::to_value(&present).expect("serialize present payload");
         // Phases flattened as sibling scalars next to `type` (NOT nested).
@@ -2486,18 +1565,8 @@ mod tests {
 
         // ABSENT: a freshly-opened flow with no spine measured yet omits every spine key.
         let absent = DashboardPayload::FlowStatus {
-            api_call_id: "api_002".to_string(),
-            response_id: None,
-            status: FlowStatus::Open,
-            model_requested: None,
-            model_served: None,
-            upstream_target: None,
-            usage: None,
-            started_ms: 1_000,
-            elapsed_ms: None,
-            phases: PhaseTimings::default(),
-            attempts: Vec::new(),
-            first_upstream_byte_ms: None,
+            phase: FlowMutationPhase::Open,
+            row: Box::new(test_flow_row("api_002", FlowStatus::Open)),
         };
         let value = serde_json::to_value(&absent).expect("serialize absent payload");
         let obj = value.as_object().expect("object");
@@ -2757,6 +1826,7 @@ mod tests {
             .snapshot_summaries()
             .iter()
             .map(|s| crate::dashboard_api::FlowRow {
+                revision: s.revision,
                 api_call_id: s.api_call_id.clone(),
                 response_id: s.response_id.clone(),
                 method: s.method.clone(),
@@ -3093,6 +2163,17 @@ mod tests {
                 assert!(!frame.reason.is_empty(), "a human-readable reason is set");
             }
             other => panic!("expected a Close(Some(_)) frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn broadcast_lag_close_is_explicitly_reconnectable() {
+        match transient_close_frame("flow lag; resnapshot required") {
+            Message::Close(Some(frame)) => {
+                assert_eq!(frame.code, 1013);
+                assert_eq!(frame.reason.to_string(), "flow lag; resnapshot required");
+            }
+            other => panic!("expected explicit transient Close(Some), got {other:?}"),
         }
     }
 

@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MetricsSnapshot",
+  "description": "The full `/api/metrics`-shaped snapshot body (the flat tile + the three\nwindows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live\n[`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.",
+  "type": "object",
+  "properties": {
+    "active_streams": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "cost_confidence": {
+      "description": "Headline (`m1`) aggregate cost confidence (gap 07), mirrored from\n`windows.m1.cost_confidence` — so the headline `$/min` is labelled estimated\nwhen any priced bucket bills cached at the default `0.0`.",
+      "$ref": "#/$defs/CostConfidence"
+    },
+    "cost_per_min": {
+      "type": "number",
+      "format": "double"
+    },
+    "error_pct": {
+      "type": "number",
+      "format": "double"
+    },
+    "metrics_seq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "p50": {
+      "type": "number",
+      "format": "double"
+    },
+    "p95": {
+      "type": "number",
+      "format": "double"
+    },
+    "p99": {
+      "type": "number",
+      "format": "double"
+    },
+    "priced_samples": {
+      "description": "Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability\ndenominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "reqs_per_sec": {
+      "type": "number",
+      "format": "double"
+    },
+    "samples": {
+      "description": "Terminal-flow sample count of the headline (`m1`) window — the\nmeasured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "tokens_per_sec": {
+      "type": "number",
+      "format": "double"
+    },
+    "usage_samples": {
+      "description": "Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability\ndenominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "windows": {
+      "$ref": "#/$defs/MetricWindows"
+    }
+  },
+  "required": [
+    "metrics_seq",
+    "reqs_per_sec",
+    "active_streams",
+    "error_pct",
+    "p50",
+    "p95",
+    "p99",
+    "tokens_per_sec",
+    "cost_per_min",
+    "samples",
+    "usage_samples",
+    "priced_samples",
+    "cost_confidence",
+    "windows"
+  ],
+  "$defs": {
+    "CostConfidence": {
+      "description": "Gap 07 — the CONFIDENCE tier of a flow's `cost`, so an operator can tell a trusted\nfigure from a best-effort estimate from an honest gap. Emitted alongside `cost` on\nevery flow row + detail (and aggregated onto the metrics windows). Serializes\nsnake_case to mirror the data-quality vocabulary the frontend already uses\n(`measured`/`derived`/`estimated`/`unavailable`).",
+      "oneOf": [
+        {
+          "description": "The model is priced AND every billed token class has a known rate: the prompt\n(input) + completion (output) rates always exist when priced, and cached tokens\neither were reported as `0` (nothing billed at the cache rate) OR the model has\na CONFIGURED cached rate. The dollar figure is trustworthy.",
+          "type": "string",
+          "const": "confident"
+        },
+        {
+          "description": "The model is priced but a billed class would fall back to an APPROXIMATE rate:\ncached tokens were reported `> 0` (or are UNAVAILABLE) while the model has NO\nconfigured cached rate, so those tokens silently bill at the default `0.0`\n(an undercount). The figure is a best-effort ESTIMATE — surfaced as such.",
+          "type": "string",
+          "const": "estimated"
+        },
+        {
+          "description": "No price is configured for the served model: there is NO cost (the row reports\n`cost: null`), so the figure is UNAVAILABLE — never a fabricated `0`. The\nDEFAULT: a window/flow with nothing priced makes no confident claim.",
+          "type": "string",
+          "const": "unavailable"
+        }
+      ]
+    },
+    "MetricWindow": {
+      "description": "One sliding-window metric tile. Same fields as the headline tile.\n\n`samples` is the count of TERMINAL (finalized) flows that fell in the window —\nthe data-quality signal the frontend uses to tell a genuine measured `0` from an\n`unavailable` gap (gap 01 / \"don't lie with zeros\"). When `samples == 0` the\nlatency/tok-s/cost/error-% fields are NOT measurable (no finalized flow fed them),\nso the strip renders them `—`; `reqs_per_sec` (a genuine `0` for an idle window)\nand `active_streams` (live open-flow count) stay numeric. The field is a finite\n`u64`, so it never violates the frozen finite-number wire contract.",
+      "type": "object",
+      "properties": {
+        "active_streams": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cost_confidence": {
+          "description": "Gap 07 — the aggregate [`CostConfidence`](crate::dashboard_api::CostConfidence)\nof this window's `cost_per_min`. `unavailable` when nothing in the window is\npriced (`priced_samples == 0` ⇒ `cost_per_min` renders `—`); `estimated` when\nANY priced bucket would bill cached tokens at the default `0.0` (cached `> 0` or\nUNREPORTED against a model with no configured cache rate) — no silently-confident\ntotal; `confident` only when every priced bucket's billed classes have known\nrates. Surfaced so the strip can LABEL an estimated cost as such.",
+          "$ref": "#/$defs/CostConfidence"
+        },
+        "cost_per_min": {
+          "type": "number",
+          "format": "double"
+        },
+        "error_pct": {
+          "type": "number",
+          "format": "double"
+        },
+        "p50": {
+          "type": "number",
+          "format": "double"
+        },
+        "p95": {
+          "type": "number",
+          "format": "double"
+        },
+        "p99": {
+          "type": "number",
+          "format": "double"
+        },
+        "priced_samples": {
+          "description": "Count of usage-bearing terminal flows whose served model has a configured price\n(gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no\nPRICED usage in the window ⇒ `cost_per_min` renders `—`, distinguishing an\nunpriced model from a genuine measured `$0.00`. All three are finite `u64`s, so\nthey never violate the frozen finite-number wire contract.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "reqs_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "samples": {
+          "description": "Terminal-flow sample count in this window (the measured/unavailable signal for\nlatency + error-%). `0` ⇒ no finalized flow fed the latency/error fields ⇒ they\nrender `—`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "usage_samples": {
+          "description": "Count of those terminal flows that reported token usage (gap 01 review round 1,\nfinding 3) — the SEPARATE `tokens_per_sec` measurability denominator. Token and\ncost availability are NOT the same as `samples`: a window can have `samples > 0`\nyet `usage_samples == 0` (every finalized flow omitted usage), in which case\n`tokens_per_sec`/`cost_per_min` are unmeasurable and render `—`, never a fake `0`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "reqs_per_sec",
+        "active_streams",
+        "error_pct",
+        "p50",
+        "p95",
+        "p99",
+        "tokens_per_sec",
+        "cost_per_min",
+        "samples",
+        "usage_samples",
+        "priced_samples",
+        "cost_confidence"
+      ]
+    },
+    "MetricWindows": {
+      "description": "The three sliding windows (`m1`/`m5`/`h1`) of a [`MetricTick`].",
+      "type": "object",
+      "properties": {
+        "h1": {
+          "$ref": "#/$defs/MetricWindow"
+        },
+        "m1": {
+          "$ref": "#/$defs/MetricWindow"
+        },
+        "m5": {
+          "$ref": "#/$defs/MetricWindow"
+        }
+      },
+      "required": [
+        "m1",
+        "m5",
+        "h1"
+      ]
+    }
+  }
+}

@@ -819,7 +819,7 @@ fn has_valid_session_key(env: &DashboardEnv) -> bool {
 // Login / logout handlers
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LoginRequest {
     pub token: String,
 }

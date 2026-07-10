@@ -8,14 +8,13 @@ export const FIXED_NOW = Date.UTC(2026, 5, 21, 14, 20, 0); // 2026-06-21T14:20:0
 
 export type ViewName = 'flows' | 'topology' | 'sankey' | 'theater' | 'overview';
 
-/** Each view: the nav-tab label to click + a route-specific "ready" marker (text/regex). */
-export const VIEWS: { name: ViewName; tab: string; ready: string | RegExp }[] = [
-  { name: 'flows', tab: 'Flows', ready: '/v1/responses' },
-  { name: 'topology', tab: 'Topology', ready: /click a node to filter flows/i },
-  { name: 'sankey', tab: 'Sankey', ready: /Token Sankey/i },
-  { name: 'theater', tab: 'Theater', ready: /No active streams/i },
-  // Gap 16 — the control-room overview (the 5th route). Its masthead text is the ready marker.
-  { name: 'overview', tab: 'Overview', ready: /control room/i },
+/** Each view: the nav-tab label to click + a stable route root (independent of live/empty state). */
+export const VIEWS: { name: ViewName; tab: string; testId: string }[] = [
+  { name: 'flows', tab: 'Flows', testId: 'flows-view' },
+  { name: 'topology', tab: 'Topology', testId: 'topology-view' },
+  { name: 'sankey', tab: 'Sankey', testId: 'sankey-view' },
+  { name: 'theater', tab: 'Theater', testId: 'theater-view' },
+  { name: 'overview', tab: 'Overview', testId: 'overview-view' },
 ];
 
 /**
@@ -55,13 +54,13 @@ export async function login(page: Page): Promise<void> {
   await page.locator('input').first().fill('dev-token');
   await page.getByRole('button', { name: /sign in/i }).click();
   // Auth flips -> the nav tabs render.
-  await expect(page.getByRole('button', { name: 'Flows', exact: true })).toBeVisible();
+  await expect(page.getByRole('tab', { name: 'Flows', exact: true })).toBeVisible();
 }
 
-/** Click a nav tab and wait for that view's route-specific ready marker. */
-export async function openView(page: Page, view: { tab: string; ready: string | RegExp }): Promise<void> {
-  await page.getByRole('navigation').getByRole('button', { name: view.tab, exact: true }).click();
-  await expect(page.getByText(view.ready).first()).toBeVisible();
+/** Click a nav tab and wait for that view's route root. */
+export async function openView(page: Page, view: { tab: string; testId: string }): Promise<void> {
+  await page.getByRole('navigation').getByRole('tab', { name: view.tab, exact: true }).click();
+  await expect(page.getByTestId(view.testId).first()).toBeVisible();
   await page.waitForLoadState('networkidle');
   // Self-hosted webfonts must paint before the pixel baseline, else metrics differ run-to-run.
   await page.evaluate(() => document.fonts.ready.then(() => undefined));

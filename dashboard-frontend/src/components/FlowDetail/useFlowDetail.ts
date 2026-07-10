@@ -19,6 +19,7 @@ import { getConnection, queryKeys } from '../../api/connection';
 import { UnauthorizedError } from '../../api/client';
 import { useAuth, useDashboard } from '../../store/hooks';
 import { dashboardStore } from '../../store/dashboardStore';
+import { canRollbackOptimisticKill } from '../../store/optimisticKill';
 
 export type KillState =
   | { phase: 'idle' }
@@ -88,7 +89,11 @@ export function useFlowDetail(apiCallId: string | null): FlowDetailView {
 
   const killMutation = useMutation({
     mutationFn: (id: string) => client.kill(id),
-    onMutate: (id: string): { prev: FlowSummary | undefined; gen: number } => {
+    onMutate: (id: string): {
+      prev: FlowSummary | undefined;
+      optimistic: FlowSummary | undefined;
+      gen: number;
+    } => {
       setKillState({ phase: 'killing' });
       // Bind this mutation to the MONOTONIC connection-transition generation at dispatch (finding 1).
       // If ANY boundary is crossed before the request resolves (live→seek, seek→live, teardown, or a
@@ -101,20 +106,23 @@ export function useFlowDetail(apiCallId: string | null): FlowDetailView {
       const prev = dashboardStore.getState().flows.get(id);
       if (prev) {
         const patch: FlowStatusPayload = {
+          ...prev,
           type: 'flow_status',
-          api_call_id: id,
-          response_id: prev.response_id ?? null,
+          phase: 'progress',
+          // Give the local state its own optimistic version. A lower delayed server row is ignored;
+          // an authoritative server row at this version may replace it and suppress rollback.
+          revision: prev.revision + 1,
           status: 'cancelled',
-          model_requested: prev.model_requested ?? null,
-          model_served: prev.model_served ?? null,
-          upstream_target: prev.upstream_target ?? null,
           usage: prev.usage ?? null,
-          started_ms: prev.started_ms,
-          elapsed_ms: prev.elapsed_ms ?? null,
+          cost: prev.cost ?? null,
         };
         dashboardStore.getState().patchFlowStatus(patch);
       }
-      return { prev, gen };
+      return {
+        prev,
+        optimistic: dashboardStore.getState().flows.get(id),
+        gen,
+      };
     },
     onError: (err: unknown, _id, ctx) => {
       // GENERATION GUARD (finding 1) — checked FIRST, before any store mutation. If the app crossed
@@ -134,8 +142,21 @@ export function useFlowDetail(apiCallId: string | null): FlowDetailView {
         setKillState({ phase: 'error', message: 'session expired' });
         return;
       }
-      // Same generation (still the live store this row belongs to): undo the optimistic flip.
-      if (ctx.prev) dashboardStore.getState().upsertFlow(ctx.prev);
+      // Same connection generation is necessary but not sufficient: a newer authoritative event
+      // may already have replaced this flow. Roll back only while our exact optimistic version/state
+      // remains current, otherwise restoring `prev` would erase real progress or a terminal result.
+      const state = dashboardStore.getState();
+      if (
+        ctx.prev
+        && canRollbackOptimisticKill({
+          dispatchEpoch: ctx.gen,
+          currentEpoch: state.connEpoch,
+          current: state.flows.get(ctx.prev.api_call_id),
+          optimistic: ctx.optimistic,
+        })
+      ) {
+        state.upsertFlow(ctx.prev);
+      }
       if (isForbidden(err)) {
         // 403 = mutations disabled / bad CSRF (D7). Distinct UI from a generic failure.
         setKillState({ phase: 'forbidden' });
@@ -150,7 +171,7 @@ export function useFlowDetail(apiCallId: string | null): FlowDetailView {
       // detail query for a flow absent from the current cut must not be invalidated/refetched into
       // it. Reflect the killed state for the user but make NO store/query effect.
       if (!ctx || ctx.gen !== currentGen()) return;
-      void queryClient.invalidateQueries({ queryKey: queryKeys.flowDetail(id) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.flowDetail(id), exact: true });
     },
   });
 

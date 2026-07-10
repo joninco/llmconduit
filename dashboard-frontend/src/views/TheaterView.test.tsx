@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { StrictMode } from 'react';
-import { act, cleanup, render, fireEvent, within } from '@testing-library/react';
+import { act, cleanup, render, fireEvent, waitFor, within } from '@testing-library/react';
 import { TheaterView } from './TheaterView';
 import { River } from '../components/viz/River';
 import { buildRivers } from '../components/viz/riverModel';
@@ -114,13 +114,27 @@ describe('TheaterView — live rivers from segment_append, auto-grid, fullscreen
     expect(getByTestId('theater-grid').getAttribute('data-cols')).toBe('3');
   });
 
-  it('fullscreen toggle flips the container into the fixed overlay', () => {
+  it('fullscreen uses a modal dialog, handles the native Escape/cancel path, and restores focus', async () => {
     const { getByTestId } = render(<TheaterView />);
     pushMonitor([upsert('r1', 'm'), seg('r1', 'output', 'a', 1000)]);
     const view = getByTestId('theater-view');
     expect(view.getAttribute('data-fullscreen')).toBeNull();
-    fireEvent.click(getByTestId('theater-fullscreen-toggle'));
-    expect(getByTestId('theater-view').getAttribute('data-fullscreen')).toBe('true');
+    const trigger = getByTestId('theater-fullscreen-toggle');
+    act(() => trigger.focus());
+    fireEvent.click(trigger);
+
+    const dialog = getByTestId('theater-view') as HTMLDialogElement;
+    expect(dialog.tagName).toBe('DIALOG');
+    expect(dialog.open).toBe(true);
+    expect(dialog.getAttribute('data-fullscreen')).toBe('true');
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+
+    // Browsers dispatch `cancel` when Escape is pressed on a modal dialog. The handler prevents the
+    // implicit close, exits through React state, then focuses the logical fullscreen trigger again.
+    fireEvent(dialog, new Event('cancel', { bubbles: false, cancelable: true }));
+    await waitFor(() => expect(getByTestId('theater-view').tagName).toBe('DIV'));
+    const restoredTrigger = getByTestId('theater-fullscreen-toggle');
+    await waitFor(() => expect(document.activeElement).toBe(restoredTrigger));
   });
 
   it('keeps the FULL stream text past the monitor ring cap — no tokens deleted from the top', () => {
@@ -285,7 +299,7 @@ describe('TheaterView — SEEK shows historical summaries, NOT a live river', ()
   function frozenFlow(over: Partial<FlowSummary>): FlowSummary {
     return {
       api_call_id: 'api_x', method: 'POST', uri: '/v1/responses', status: 'completed',
-      started_ms: 1_700_000_000_000, cost_confidence: 'unavailable', ...over,
+      started_ms: 1_700_000_000_000, revision: 1, cost_confidence: 'unavailable', ...over,
     };
   }
 

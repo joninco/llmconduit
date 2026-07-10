@@ -17,13 +17,18 @@
  * while seeking; on LIVE it is the raw selection again. We do NOT rewrite the hash itself, so
  * leaving seek re-reveals the same drill-down if the flow reappears in the live store.
  */
-import { useEffect } from 'react';
+import { lazy, Suspense, useEffect } from 'react';
 import { FlowTable } from '../components/FlowTable/FlowTable';
-import { FlowDetail } from '../components/FlowDetail/FlowDetail';
 import { FailureTaxonomy } from '../components/FlowTable/FailureTaxonomy';
 import { useDashboard } from '../store/hooks';
 import { navigate, useHashDetail } from '../router/useHashRoute';
 import { cn } from '../lib/cn';
+
+// The inspector pulls in highlight.js and the JSON/diff machinery. Keep that cost behind
+// the row-selection boundary so the Flows route itself remains light.
+const FlowDetail = lazy(() =>
+  import('../components/FlowDetail/FlowDetail').then((module) => ({ default: module.FlowDetail })),
+);
 
 export function FlowsView() {
   const selectedId = useHashDetail();
@@ -50,12 +55,20 @@ export function FlowsView() {
           the operator sees "what is failing and why, in aggregate" before drilling one red row. The
           panel renders only when flows are observed (else it's absent — don't-lie-with-zeros).
           Kept MOUNTED (hidden) while the drill-down is open so table state survives dismiss. */}
-      <div className={cn('min-h-0 min-w-0 flex-1 flex-col', effectiveId ? 'hidden' : 'flex')}>
+      <div className={cn('min-h-0 min-w-0 flex-1 flex-col overflow-y-auto lg:overflow-hidden', effectiveId ? 'hidden' : 'flex')}>
         <FailureTaxonomy />
         <FlowTable selectedId={effectiveId} onSelect={(id) => navigate('flows', id)} />
       </div>
       {effectiveId && (
-        <FlowDetail key={effectiveId} apiCallId={effectiveId} onClose={() => navigate('flows')} />
+        <Suspense
+          fallback={
+            <div className="flex min-h-0 flex-1 items-center justify-center text-sm text-text-muted" role="status">
+              Loading flow detail…
+            </div>
+          }
+        >
+          <FlowDetail key={effectiveId} apiCallId={effectiveId} onClose={() => navigate('flows')} />
+        </Suspense>
       )}
     </div>
   );

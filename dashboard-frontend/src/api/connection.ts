@@ -4,9 +4,9 @@
  * views consume the stores (live state) + a TanStack Query client (REST cache) that this
  * module configures with the mock/real client.
  *
- * WS-driven invalidation (finding 10): after an ACCEPTED (post-dedup) frame, the socket
- * fires `onFrameApplied(domain)`; we map the domain → the affected query keys and
- * invalidate them so the REST cache refetches the authoritative shape.
+ * WS-driven invalidation: accepted complete flow rows patch the list cache in-place through the
+ * store. Only terminal mutations invalidate that flow's body-bearing detail read; progress/usage
+ * never fan out across the list/detail family.
  */
 import { QueryClient } from '@tanstack/react-query';
 import { DashboardClient, readCsrfCookie } from './client';
@@ -15,14 +15,28 @@ import { mockFetch, mockWsFactory } from './mock';
 import { isMockEnabled, readBootstrap } from '../config/env';
 import { authStore } from '../store/authStore';
 import { dashboardStore } from '../store/dashboardStore';
+import { flowFilterStore } from '../store/flowFilterStore';
+import { resetHashScope } from '../router/useHashRoute';
 import { startSankeyFold, __resetSankeyFold } from '../store/useSankeyWindow';
-import type { Domain } from './types';
+import type { DashboardBootstrap, DashboardFrame, OverviewQuery } from './types';
+import { DashboardSchemaMismatchError, DASHBOARD_SCHEMA_VERSION } from './schemaVersion';
+import { DashboardContractError } from './validation';
 
 /** Stable query keys; the WS invalidation + the views both reference these. */
 export const queryKeys = {
   flows: ['flows'] as const,
   flowDetail: (id: string) => ['flows', id] as const,
   metrics: ['metrics'] as const,
+  overviewRoot: ['overview'] as const,
+  overview: (query: OverviewQuery) => [
+    'overview',
+    query.window,
+    query.at ?? null,
+    query.status ?? null,
+    query.model ?? null,
+    query.upstream ?? null,
+    query.client ?? null,
+  ] as const,
   topology: ['topology'] as const,
   catalog: ['catalog'] as const,
 } as const;
@@ -51,7 +65,20 @@ export function getConnection(): Connection {
   if (singleton) return singleton;
 
   const mock = isMockEnabled();
-  const boot = readBootstrap();
+  let boot: DashboardBootstrap;
+  try {
+    boot = readBootstrap();
+  } catch (error) {
+    // Bootstrap validation runs before a REST client exists. Route persistent version/root-contract
+    // failures into the same explicit fatal shell used by asynchronous API reads.
+    surfaceDashboardFatal(error);
+    boot = {
+      authenticated: false,
+      csrf_token: null,
+      mutations_enabled: false,
+      schema_version: DASHBOARD_SCHEMA_VERSION,
+    };
+  }
 
   // Seed auth store from the bootstrap (D7 double-submit CSRF + auth state).
   authStore.getState().setAuthenticated(boot.authenticated);
@@ -79,12 +106,13 @@ export function getConnection(): Connection {
     // Dynamic: cookie-first, bootstrap fallback — read fresh on every kill.
     getCsrfToken: resolveCsrfToken,
     onUnauthorized,
+    onFatal: surfaceDashboardFatal,
   });
 
   const socket = new DashboardSocket({
     factory: mock ? mockWsFactory : undefined,
     onUnauthorized,
-    onFrameApplied: (domain) => invalidateForDomain(queryClient, domain),
+    onFrameApplied: (frame) => invalidateForFrame(queryClient, frame),
     // Finding 7: after a transient WS drop, probe a protected endpoint — only a 401
     // bounces to login; otherwise the socket reconnects.
     probeAuth: () => client.probeAuth(),
@@ -101,6 +129,17 @@ export function getConnection(): Connection {
   return singleton;
 }
 
+/** Low-level API modules report fatal roots through this composition-root callback (no store cycle). */
+function surfaceDashboardFatal(error: unknown): void {
+  if (
+    error instanceof DashboardContractError
+    || (error instanceof DashboardSchemaMismatchError && !error.reloadRequested)
+  ) {
+    dashboardStore.getState().setConnection('error');
+    dashboardStore.getState().setFatalError(error.message);
+  }
+}
+
 /**
  * Centralized session teardown (finding 1). Disconnects the WS, CLEARS the TanStack Query
  * cache (which holds bodies/headers/usage), and resets BOTH zustand stores to their
@@ -113,18 +152,33 @@ export function teardownSession(): void {
     singleton.queryClient.clear();
   }
   dashboardStore.getState().reset();
+  flowFilterStore.getState().hydrate({ status: null, model: null, upstream: null, client: null });
+  resetHashScope();
   authStore.getState().reset();
 }
 
-/** Maps an accepted WS domain to the REST queries it invalidates. */
-function invalidateForDomain(queryClient: QueryClient, domain: Domain): void {
-  switch (domain) {
+/** Maps an accepted WS frame to the smallest REST query set that can actually be stale. */
+function invalidateForFrame(queryClient: QueryClient, frame: DashboardFrame): void {
+  switch (frame.domain) {
     case 'flow':
-      // A flow frame changes the list AND whatever detail is open.
-      void queryClient.invalidateQueries({ queryKey: queryKeys.flows });
+      // Full live rows already patched the list store. Only a terminal transition can finish body,
+      // header, delta, or error capture, so refresh exactly that flow's detail query. A Set avoids
+      // duplicate invalidations if a future batched frame repeats the same terminal row.
+      for (const id of new Set(
+        frame.batch.flatMap((payload) =>
+          payload.type === 'flow_status' && payload.phase === 'terminal'
+            ? [payload.api_call_id]
+            : []),
+      )) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.flowDetail(id), exact: true });
+      }
       return;
     case 'metrics':
       void queryClient.invalidateQueries({ queryKey: queryKeys.metrics });
+      // The process-level metrics publisher owns Overview cuts too. Refresh every mounted
+      // Overview scope from the same presentation tick; historical keys retain their explicit
+      // `at`, so even an incidental refetch can only return that retained cut, never live data.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.overviewRoot });
       // Gap 13: the REST `/topology` node's per_provider tile (p50/p95/p99 + error rate) is JOINED
       // from the SAME m1 metrics window (Rust `from_health_with_metrics`), but the live WS
       // `topology_update` frame carries `per_provider` ABSENT — so without this the per-provider

@@ -34,6 +34,26 @@ pre,
   font-family: var(--font-mono);
 }
 
+/* One high-contrast keyboard-focus language across native controls and custom
+   SVG/tab surfaces. Shape/offset keeps it visible in forced-colors mode too. */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid rgb(var(--color-accent));
+  outline-offset: 2px;
+}
+
+@media (forced-colors: active) {
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline-color: Highlight;
+  }
+}
+
+/* SVG groups do not consistently paint CSS outlines. Give interactive topology
+   nodes an explicit inner focus stroke in the same accent language. */
+.topo-interactive-node:focus-visible > circle:first-of-type {
+  stroke: rgb(var(--color-accent));
+  stroke-width: 4;
+}
+
 /* Masthead — the Argus eye keeps a slow, vigilant watch (the one ambient brand motion).
    Cut to static by the prefers-reduced-motion block at the bottom of this file. */
 @keyframes argus-watch {
@@ -81,20 +101,20 @@ pre,
   animation: sankey-dash 1.4s linear infinite;
 }
 
-/* Theater — a river tile lingers in, then the entrance settles (linger-then-fade-in). */
+/* Theater — move a river tile gently into place without fading its text through low-contrast
+   intermediate states. */
 @keyframes river-enter {
-  from { opacity: 0; transform: translateY(6px); }
-  to { opacity: 1; transform: translateY(0); }
+  from { transform: translateY(6px); }
+  to { transform: translateY(0); }
 }
 .river-tile {
   animation: river-enter 0.45s ease-out both;
 }
-/* Theater — a terminated river lingers, then fades out before removal (finding 4). The `exiting`
-   class swaps the entrance for the fade; under prefers-reduced-motion the global clamp collapses
-   this to ~instant, so the tile still leaves cleanly without a visible animation. */
+/* A terminated river shifts out before removal. Keeping opacity at 1 preserves readable contrast
+   throughout the transition; reduced-motion still clamps this to an effectively instant exit. */
 @keyframes river-exit {
-  from { opacity: 1; transform: translateY(0); }
-  to { opacity: 0; transform: translateY(6px); }
+  from { transform: translateY(0) scale(1); }
+  to { transform: translateY(6px) scale(0.98); }
 }
 .river-tile-exiting {
   animation: river-exit 0.4s ease-in both;

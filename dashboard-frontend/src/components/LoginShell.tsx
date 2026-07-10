@@ -6,10 +6,15 @@
 import { useState, type FormEvent } from 'react';
 import { Panel } from './ui/Panel';
 import { Button } from './ui/Button';
-import { authStore } from '../store/authStore';
 import type { DashboardClient } from '../api/client';
 
-export function LoginShell({ client }: { client: DashboardClient }) {
+export function LoginShell({
+  client,
+  onAuthenticated = () => window.location.reload(),
+}: {
+  client: DashboardClient;
+  onAuthenticated?: () => void;
+}) {
   const [token, setToken] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -20,8 +25,9 @@ export function LoginShell({ client }: { client: DashboardClient }) {
     setError(null);
     try {
       await client.login({ token });
-      // Server set the session cookie; reflect it in the store to mount the dashboard.
-      authStore.getState().setAuthenticated(true);
+      // Re-read the server-authored bootstrap so the new CSRF token, mutation
+      // policy, and schema version enter the app as one coherent session cut.
+      onAuthenticated();
     } catch {
       setError('Invalid token.');
     } finally {

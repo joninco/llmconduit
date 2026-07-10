@@ -4,6 +4,30 @@ import { DashboardClient } from './client';
 import { mockKillLog, buildMonitorFrame } from './mock';
 import { authStore } from '../store/authStore';
 import { dashboardStore } from '../store/dashboardStore';
+import type { FlowStatusPayload } from './types';
+import { flowFilterStore } from '../store/flowFilterStore';
+import { assertDashboardSchemaVersion } from './schemaVersion';
+import { DashboardContractError } from './validation';
+
+function flowPayload(over: Partial<FlowStatusPayload> = {}): FlowStatusPayload {
+  return {
+    type: 'flow_status',
+    phase: 'progress',
+    revision: 1,
+    api_call_id: 'api_r1',
+    method: 'POST',
+    uri: '/v1/responses',
+    status: 'open',
+    model_served: 'm',
+    upstream_target: 'u',
+    usage: null,
+    started_ms: 1000,
+    elapsed_ms: 5,
+    cost: null,
+    cost_confidence: 'unavailable',
+    ...over,
+  };
+}
 
 function clearCsrfCookie(): void {
   document.cookie = 'llmconduit_csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT';
@@ -47,26 +71,50 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
   });
   afterEach(() => resetConnection());
 
-  it('an ACCEPTED flow frame invalidates the flows query', () => {
+  it('open/progress and standalone usage patch the row without invalidating list or detail queries', () => {
     const { socket, queryClient } = getConnection();
     const spy = vi.spyOn(queryClient, 'invalidateQueries');
     // Prime snapshot so live frames apply.
     socket.handleParsed({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [], metrics: null, topology: null,
     });
     socket.applyFrame({
       domain: 'flow', seq: 1,
-      batch: [{ type: 'flow_status', api_call_id: 'api_r1', status: 'open', model_served: 'm', upstream_target: 'u', usage: null, started_ms: 1000, elapsed_ms: 5 }],
+      batch: [flowPayload()],
     });
-    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.flows });
+    socket.applyFrame({
+      domain: 'flow', seq: 2,
+      batch: [{ type: 'usage', api_call_id: 'api_r1', prompt: 1, completion: 2, total: 3 }],
+    });
+    expect(spy).not.toHaveBeenCalled();
   });
 
-  it('a metrics frame invalidates BOTH /metrics AND /topology (gap 13: per_provider joins the m1 window)', () => {
+  it('a terminal row invalidates exactly that flow detail, never the flow-list family', () => {
+    const { socket, queryClient } = getConnection();
+    const spy = vi.spyOn(queryClient, 'invalidateQueries');
+    socket.handleParsed({
+      type: 'snapshot',
+      schema_version: 2,
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      flows: [], metrics: null, topology: null,
+    });
+    socket.applyFrame({
+      domain: 'flow', seq: 1,
+      batch: [flowPayload({ phase: 'terminal', revision: 2, status: 'completed' })],
+    });
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.flowDetail('api_r1'), exact: true });
+    expect(spy).not.toHaveBeenCalledWith({ queryKey: queryKeys.flows });
+  });
+
+  it('a metrics frame invalidates metrics, exact Overview cuts, and topology provider health', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [], metrics: null, topology: null,
     });
@@ -81,9 +129,10 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
       domain: 'metrics', seq: 1,
       batch: [{ type: 'metric_tick', ...w, windows: { m1: w, m5: w, h1: w } }],
     });
-    // The metrics tick must refresh the metrics tiles AND the REST /topology per_provider join —
-    // otherwise the per-provider tile/node emphasis stay STALE until an unrelated topology change.
+    // One publisher tick advances the global strip, every mounted exact Overview scope, and the
+    // compatibility /topology provider join together.
     expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.metrics });
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.overviewRoot });
     expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.topology });
   });
 
@@ -91,6 +140,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 5, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [], metrics: null, topology: null,
     });
@@ -98,7 +148,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     // seq 5 <= cursor 5 → dropped, no invalidation.
     socket.applyFrame({
       domain: 'flow', seq: 5,
-      batch: [{ type: 'flow_status', api_call_id: 'api_r1', status: 'open', model_served: 'm', upstream_target: 'u', usage: null, started_ms: 1000, elapsed_ms: 5 }],
+      batch: [flowPayload()],
     });
     expect(spy).not.toHaveBeenCalled();
   });
@@ -107,6 +157,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [], metrics: null, topology: null,
     });
@@ -126,6 +177,7 @@ describe('teardownSession — clears cache + resets stores + disconnects WS (fin
     queryClient.setQueryData(queryKeys.flows, { flows: [], total: 0, flow_seq: 1 });
     socket.handleParsed({
       type: 'snapshot',
+      schema_version: 2,
       cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 5 },
       flows: [], metrics: null, topology: null,
     });
@@ -133,6 +185,8 @@ describe('teardownSession — clears cache + resets stores + disconnects WS (fin
     authStore.getState().setAuthenticated(true);
     authStore.getState().setCsrfToken('secret-token');
     authStore.getState().setMutationsEnabled(true);
+    flowFilterStore.getState().setFilters({ status: 'failed', model: 'm', upstream: 'u', client: 'c' });
+    window.location.hash = '#/flows/api_secret?window=h1&status=failed&client=c';
     const clearSpy = vi.spyOn(queryClient, 'clear');
     const disconnectSpy = vi.spyOn(socket, 'disconnect');
 
@@ -151,6 +205,8 @@ describe('teardownSession — clears cache + resets stores + disconnects WS (fin
     expect(authStore.getState().authenticated).toBe(false);
     expect(authStore.getState().csrfToken).toBeNull();
     expect(authStore.getState().mutationsEnabled).toBe(false);
+    expect(flowFilterStore.getState().filters).toEqual({ status: null, model: null, upstream: null, client: null });
+    expect(window.location.hash).toBe('#/overview');
   });
 
   it('a real 401 from a client read routes through teardownSession (wired onUnauthorized)', async () => {
@@ -160,6 +216,8 @@ describe('teardownSession — clears cache + resets stores + disconnects WS (fin
     queryClient.setQueryData(queryKeys.metrics, { metrics_seq: 1 });
     authStore.getState().setAuthenticated(true);
     authStore.getState().setCsrfToken('secret');
+    flowFilterStore.getState().setModel('private-model');
+    window.location.hash = '#/flows/private-id?model=private-model';
     const fetch401: typeof globalThis.fetch = async () => new Response('no', { status: 401 });
     const client = new DashboardClient({ fetchImpl: fetch401, onUnauthorized: teardownSession });
     await expect(client.metrics()).rejects.toBeTruthy(); // 401 → UnauthorizedError
@@ -167,5 +225,51 @@ describe('teardownSession — clears cache + resets stores + disconnects WS (fin
     expect(queryClient.getQueryData(queryKeys.metrics)).toBeUndefined();
     expect(authStore.getState().authenticated).toBe(false);
     expect(authStore.getState().csrfToken).toBeNull();
+    expect(flowFilterStore.getState().filters).toEqual({ status: null, model: null, upstream: null, client: null });
+    expect(window.location.hash).toBe('#/overview');
+  });
+});
+
+describe('connection — fatal REST roots surface through dashboardStore', () => {
+  beforeEach(() => {
+    resetConnection();
+    dashboardStore.getState().reset();
+    sessionStorage.clear();
+    window.__LLMCONDUIT_DASHBOARD__ = {
+      authenticated: true,
+      csrf_token: 'csrf',
+      mutations_enabled: false,
+      schema_version: 2,
+    };
+  });
+  afterEach(() => {
+    resetConnection();
+    delete window.__LLMCONDUIT_DASHBOARD__;
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  it('turns a REST contract failure into the explicit fatal shell state', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', {
+      status: 200,
+      headers: { 'X-LLMConduit-Dashboard-Schema': '2' },
+    })));
+    const { client } = getConnection();
+
+    await expect(client.metrics()).rejects.toBeInstanceOf(DashboardContractError);
+    expect(dashboardStore.getState().connection).toBe('error');
+    expect(dashboardStore.getState().fatalError).toContain('contract validation failed');
+  });
+
+  it('turns a repeated same-source schema mismatch into the explicit upgrade state', async () => {
+    expect(() => assertDashboardSchemaVersion(1, 'REST /metrics', () => {})).toThrow();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', {
+      status: 200,
+      headers: { 'X-LLMConduit-Dashboard-Schema': '1' },
+    })));
+    const { client } = getConnection();
+
+    await expect(client.metrics()).rejects.toThrow(/upgrade required/);
+    expect(dashboardStore.getState().fatalError).toContain('upgrade required');
   });
 });

@@ -24,7 +24,7 @@ export function TopologyView() {
   // Seed nodes/edges/prices from `/topology` (LIVE-only; never overwrites a seek cut) — finding 5.
   // Gap 13: it ALSO returns the per-provider latency/error map off the LIVE REST data (the
   // authoritative per-provider source live; the WS topology frame carries `per_provider` ABSENT).
-  const { perProviderById } = useTopologyQuery();
+  const { perProviderById, loadState, retry } = useTopologyQuery();
   const nodes = useDashboard((s) => s.topologyNodes);
   const edges = useDashboard((s) => s.topologyEdges);
   const seeking = useDashboard((s) => s.connection === 'seeking');
@@ -85,9 +85,26 @@ export function TopologyView() {
           </span>
         )}
       </header>
+      {loadState === 'error' && nodes.length > 0 && !seeking && (
+        <div className="mb-3 flex items-center gap-3 rounded border border-status-cooling/40 bg-status-cooling/10 px-3 py-2 text-xs" role="alert" data-testid="topology-stale">
+          <span>Provider topology could not refresh. Showing the last available state.</span>
+          <button type="button" className="ml-auto text-accent underline" onClick={retry}>Retry</button>
+        </div>
+      )}
       <Panel className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4">
         {nodes.length === 0 ? (
-          <p className="text-sm text-text-muted" data-testid="topology-empty">No providers reporting yet.</p>
+          loadState === 'loading' && !seeking ? (
+            <p className="text-sm text-text-muted" role="status" data-testid="topology-loading">Loading provider topology…</p>
+          ) : loadState === 'error' && !seeking ? (
+            <div className="text-center text-sm text-status-down" role="alert" data-testid="topology-error">
+              <p>Provider topology could not be loaded.</p>
+              <button type="button" className="mt-2 text-accent underline" onClick={retry}>Retry</button>
+            </div>
+          ) : (
+            <p className="text-sm text-text-muted" data-testid="topology-empty">
+              {seeking ? 'No providers in this historical snapshot.' : 'No providers configured or reporting.'}
+            </p>
+          )
         ) : (
           <RadialTopology
             nodes={nodes}
@@ -98,6 +115,40 @@ export function TopologyView() {
           />
         )}
       </Panel>
+      {nodes.length > 0 && (
+        <div className="mt-3 max-h-40 shrink-0 overflow-auto rounded border border-line" data-testid="topology-companion-table">
+          <table className="w-full text-left text-xs">
+            <caption className="sr-only">Provider topology and global attempt health</caption>
+            <thead className="sticky top-0 bg-panel text-text-muted">
+              <tr>
+                <th className="px-2 py-1.5" scope="col">Provider</th>
+                <th className="px-2 py-1.5" scope="col">Status</th>
+                <th className="px-2 py-1.5 text-right" scope="col">Attempts</th>
+                <th className="px-2 py-1.5 text-right" scope="col">p95</th>
+                <th className="px-2 py-1.5 text-right" scope="col">Errors</th>
+              </tr>
+            </thead>
+            <tbody>
+              {nodes.map((node) => {
+                const health = perProviderFor(node.id);
+                return (
+                  <tr key={node.id} className="border-t border-line">
+                    <th className="px-2 py-1" scope="row">
+                      <button type="button" className="rounded text-accent underline-offset-2 hover:underline" onClick={() => onSelectUpstream(node.id)}>
+                        {node.name}
+                      </button>
+                    </th>
+                    <td className="px-2 py-1">{node.status}</td>
+                    <td className="px-2 py-1 text-right tabular-nums">{health?.samples ?? '—'}</td>
+                    <td className="px-2 py-1 text-right tabular-nums">{health ? `${Math.round(health.p95)} ms` : '—'}</td>
+                    <td className="px-2 py-1 text-right tabular-nums">{health ? `${health.error_rate.toFixed(1)}%` : '—'}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
       {hover && hoverHealth && (
         <CooldownTooltip health={hoverHealth} x={hover.x} y={hover.y} nowMs={clock} perProvider={perProviderFor(hover.id)} />
       )}

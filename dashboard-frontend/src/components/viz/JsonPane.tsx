@@ -9,11 +9,12 @@
  * filters to matching lines plus their ancestors (auto-expanded), flagging matches.
  *
  * Rendered with React (not the old imperative highlight build) so the fold chevrons + search state
- * are ordinary event handlers; highlight.js still colors each line (per-line `__html`). The DOM
- * contract is unchanged — `jsonpane-{code,scroll,empty}-<label>` and `.json-line[data-path]`
- * (`[data-diff]` when tinted) — so the diff/scroll-sync tests hold.
+ * are ordinary event handlers. The final rows are fixed-height virtualized: only the viewport plus
+ * overscan mounts a `JsonRow`, so highlight.js runs only for visible lines. The DOM contract remains
+ * `jsonpane-{code,scroll,empty}-<label>` and `.json-line[data-path]` (`[data-diff]` when tinted).
  */
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState, type MutableRefObject } from 'react';
+import { observeElementRect, useVirtualizer, type Rect, type Virtualizer } from '@tanstack/react-virtual';
 import hljs from 'highlight.js/lib/core';
 import json from 'highlight.js/lib/languages/json';
 import { colors } from '../../design/tokens';
@@ -61,6 +62,25 @@ function tintFor(kind: DiffKind | undefined, side: DiffSide): string | undefined
 
 const PAD_BASE = 6;
 const PER_DEPTH = 12;
+const ROW_HEIGHT = 20;
+const VERTICAL_PADDING = 8;
+const OVERSCAN = 10;
+/** Bound the expanded/search result surface even though only a viewport-sized slice reaches DOM. */
+export const JSON_RENDER_LINE_CAP = 10_000;
+const INITIAL_RECT = { width: 640, height: 320 };
+
+/** Keep SSR/jsdom and temporarily hidden split panes useful until a non-zero resize arrives. */
+function observePaneRect(
+  instance: Virtualizer<HTMLDivElement, Element>,
+  callback: (rect: Rect) => void,
+): (() => void) | undefined {
+  return observeElementRect(instance, (rect) => {
+    callback({
+      width: rect.width > 0 ? rect.width : INITIAL_RECT.width,
+      height: rect.height > 0 ? rect.height : INITIAL_RECT.height,
+    });
+  });
+}
 
 export interface JsonPaneProps {
   value: unknown;
@@ -101,6 +121,29 @@ export function JsonPane({
     () => computeRows(lines, model, collapsed, query),
     [lines, model, collapsed, query],
   );
+  const renderedRows = rows.length > JSON_RENDER_LINE_CAP
+    ? rows.slice(0, JSON_RENDER_LINE_CAP)
+    : rows;
+  const lineModelOverCap = lines.length > JSON_RENDER_LINE_CAP;
+  const omittedVisibleRows = rows.length - renderedRows.length;
+
+  const internalScrollRef = useRef<HTMLDivElement | null>(null);
+  const setScrollElement = useCallback(
+    (node: HTMLDivElement | null) => {
+      internalScrollRef.current = node;
+      if (scrollRef) (scrollRef as MutableRefObject<HTMLDivElement | null>).current = node;
+    },
+    [scrollRef],
+  );
+  const virtualizer = useVirtualizer({
+    count: renderedRows.length,
+    getScrollElement: () => internalScrollRef.current,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: OVERSCAN,
+    initialRect: INITIAL_RECT,
+    observeElementRect: observePaneRect,
+    getItemKey: (index) => renderedRows[index]?.index ?? index,
+  });
 
   const searching = query.trim().length > 0;
 
@@ -149,6 +192,17 @@ export function JsonPane({
           )}
         </span>
         <span className="flex items-center gap-1">
+          {lineModelOverCap && (
+            <span
+              role="status"
+              className="shrink-0 rounded-sm bg-status-cooling/15 px-1 font-mono text-[9px] tracking-normal text-status-cooling"
+              data-testid={`jsonpane-render-cap-${label}`}
+              title={`${lines.length.toLocaleString()} source lines exceed the ${JSON_RENDER_LINE_CAP.toLocaleString()}-line render cap`}
+            >
+              render cap · {JSON_RENDER_LINE_CAP.toLocaleString()}
+              {omittedVisibleRows > 0 ? ` · ${omittedVisibleRows.toLocaleString()} omitted` : ''}
+            </span>
+          )}
           {hasValue && !searching && model.containerPaths.length > 0 && (
             <button
               type="button"
@@ -174,26 +228,49 @@ export function JsonPane({
         </span>
       </div>
       <div
-        ref={scrollRef}
+        ref={setScrollElement}
         onScroll={onScroll}
         className="min-h-0 flex-1 overflow-auto bg-panel"
         data-testid={`jsonpane-scroll-${label}`}
       >
         {hasValue ? (
           <code
-            className="hljs block py-2 font-mono text-xs leading-relaxed"
+            className="hljs block font-mono text-xs"
             data-testid={`jsonpane-code-${label}`}
+            data-total-lines={lines.length}
+            data-render-lines={renderedRows.length}
+            style={{
+              height: `${virtualizer.getTotalSize() + VERTICAL_PADDING * 2}px`,
+              minWidth: '100%',
+              position: 'relative',
+            }}
           >
-            {rows.map((row) => (
-              <JsonRow
-                key={row.index}
-                row={row}
-                tint={tintFor(diff?.get(row.line.path), side)}
-                diffKind={diff?.get(row.line.path)}
-                searching={searching}
-                onToggle={toggle}
-              />
-            ))}
+            {virtualizer.getVirtualItems().map((item) => {
+              const row = renderedRows[item.index];
+              if (!row) return null;
+              return (
+                <div
+                  key={item.key}
+                  data-virtual-index={item.index}
+                  style={{
+                    height: `${ROW_HEIGHT}px`,
+                    left: 0,
+                    position: 'absolute',
+                    top: 0,
+                    transform: `translateY(${item.start + VERTICAL_PADDING}px)`,
+                    width: '100%',
+                  }}
+                >
+                  <JsonRow
+                    row={row}
+                    tint={tintFor(diff?.get(row.line.path), side)}
+                    diffKind={diff?.get(row.line.path)}
+                    searching={searching}
+                    onToggle={toggle}
+                  />
+                </div>
+              );
+            })}
           </code>
         ) : (
           <div
@@ -228,7 +305,7 @@ function JsonRow({
 
   return (
     <div
-      className={`json-line flex items-start border-l-2 ${isMatch ? 'border-l-status-cooling' : 'border-l-transparent'}`}
+      className={`json-line flex h-5 items-start border-l-2 leading-5 ${isMatch ? 'border-l-status-cooling' : 'border-l-transparent'}`}
       data-path={line.path}
       data-diff={diffKind ? diffKind : undefined}
       style={{ background: tint, paddingLeft: PAD_BASE + line.depth * PER_DEPTH }}
