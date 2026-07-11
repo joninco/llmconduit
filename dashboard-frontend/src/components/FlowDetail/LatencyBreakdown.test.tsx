@@ -108,13 +108,13 @@ describe('LatencyBreakdown component (gap 10)', () => {
     expect(badge?.textContent).toBe('est');
   });
 
-  it('flags a clock-disordered segment with a skew marker (clamped, not negative)', () => {
+  it('flags a clock-disordered segment as unavailable', () => {
     const { getByTestId } = renderModel(
       flow({ ingress_ms: T, normalization_done_ms: T + 100, routing_decision_ms: T + 40 }),
     );
-    // The routing segment is disordered ⇒ a skew marker + a clamped 0ms duration.
+    // Disorder is visible, but never fabricated as a measured 0ms duration.
     expect(getByTestId('latency-skew-routing')).toBeTruthy();
-    expect(getByTestId('latency-dur-routing').textContent).toBe('0ms');
+    expect(getByTestId('latency-dur-routing').textContent).toBe('—');
   });
 
   it('renders an empty bar (no segments) but the whole block when the spine is absent', () => {

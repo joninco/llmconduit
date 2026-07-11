@@ -46,7 +46,7 @@ export function resetWorld(opts: { mock?: boolean } = {}): void {
       authenticated: true,
       csrf_token: 'test-csrf',
       mutations_enabled: true,
-      schema_version: 2,
+      schema_version: 3,
     };
   }
 }
@@ -78,6 +78,8 @@ export function makeFlow(over: Partial<FlowSummary> = {}): FlowSummary {
     status: 'completed',
     started_ms: 1_700_000_000_000,
     usage: null,
+    normalized_usage: null,
+    usage_anomaly_count: 0,
     cost: null,
     // Gap 07: every row carries a cost-confidence tag; default to `unavailable` (no price).
     cost_confidence: 'unavailable',

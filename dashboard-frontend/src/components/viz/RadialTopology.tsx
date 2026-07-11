@@ -314,7 +314,7 @@ export function RadialTopology({
           const t = link.target as TopoNode;
           if (s.x == null || s.y == null || t.x == null || t.y == null) continue;
           const edge = edgeById.get(`${s.id}->${t.id}`);
-          const throughput = edge?.throughput ?? 0;
+          const throughput = edge?.terminal_flows_per_sec ?? 0;
           const line = document.createElementNS(SVG_NS, 'line');
           line.setAttribute('x1', String(s.x));
           line.setAttribute('y1', String(s.y));

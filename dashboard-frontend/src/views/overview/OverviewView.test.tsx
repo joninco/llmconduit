@@ -29,13 +29,15 @@ function response(over: Partial<OverviewResponse> = {}): OverviewResponse {
       client: null,
     },
     data_quality: 'measured',
-    overflow: { dimension_limit: 64, slot_folded_samples: 0, aggregate_folded_samples: 0, provider_folded_samples: 0, overflowed: false },
-    totals: { requests: 3, tokens: TOKENS, cost: COST },
+    overflow: { dimension_limit: 64, slot_folded_samples: 0, aggregate_folded_samples: 0, provider_folded_samples: 0, overflowed: false, unattributable_requests: 0 },
+    totals: { requests: 3, successes: 1, failures: 1, cancellations: 1, tokens: TOKENS, cost: COST },
     requested_models: [rollup('llama-requested')],
     served_models: [rollup('llama-served'), rollup('unpriced', 1, { samples: 0, total_usd: null, confidence: 'unavailable' })],
     providers: [rollup('vllm-a')],
     clients: [rollup('key-a1b2c3')],
     failures: [rollup('timeout', 1, { samples: 0, total_usd: null, confidence: 'unavailable' })],
+    cancellations: [rollup('cancelled', 1, { samples: 0, total_usd: null, confidence: 'unavailable' })],
+    lanes: [],
     context: {
       data_quality: 'partial',
       samples: 2,
@@ -67,12 +69,14 @@ function emptyResponse(over: Partial<OverviewResponse> = {}): OverviewResponse {
   const emptyCost = { samples: 0, total_usd: null, confidence: 'unavailable' } as const;
   return response({
     data_quality: 'unavailable',
-    totals: { requests: 0, tokens: emptyTokens, cost: emptyCost },
+    totals: { requests: 0, successes: 0, failures: 0, cancellations: 0, tokens: emptyTokens, cost: emptyCost },
     requested_models: [],
     served_models: [],
     providers: [],
     clients: [],
     failures: [],
+    cancellations: [],
+    lanes: [],
     context: {
       data_quality: 'unavailable', samples: 0, unavailable_samples: 0,
       effective_route_limit_min: null, input_tokens: null, average_pressure_pct: null,
@@ -145,7 +149,7 @@ describe('OverviewView — exact server rollups and honest quality', () => {
   it('makes bounded overflow explicit and marks otherwise-priced output partial', async () => {
     install(response({
       data_quality: 'partial',
-      overflow: { dimension_limit: 64, slot_folded_samples: 7, aggregate_folded_samples: 3, provider_folded_samples: 2, overflowed: true },
+      overflow: { dimension_limit: 64, slot_folded_samples: 7, aggregate_folded_samples: 3, provider_folded_samples: 2, overflowed: true, unattributable_requests: 10 },
     }));
     const { getByTestId } = renderWithQuery(<OverviewView />);
 

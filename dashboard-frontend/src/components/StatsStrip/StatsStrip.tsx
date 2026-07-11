@@ -93,6 +93,14 @@ export function StatsStrip() {
         <ChipCell key={chip.key} chip={chip} series={seriesFor(history, window, chip.key)} />
       ))}
       <div className="ml-auto flex items-center gap-2 pr-1">
+        <span
+          className="rounded border border-border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted"
+          title="Gateway-wide metrics; URL flow filters do not change these values."
+          aria-label="Global gateway metrics, unaffected by flow filters"
+          data-testid="stats-global-badge"
+        >
+          Global
+        </span>
         <WindowSelector value={window} onChange={(next) => updateHashScope({ window: next })} />
         <ConnectionDot state={connection} hasData={hasDashboardData} />
       </div>
@@ -133,7 +141,8 @@ function ChipCell({ chip, series }: { chip: ChipDescriptor; series: number[] }) 
       // the `title` gives operators a hover hint. EVERY chip carries one of
       // measured/derived/estimated/unavailable.
       data-quality={chip.quality}
-      title={`${chip.label}: ${qualityText}`}
+      title={`${chip.label}: ${qualityText}. ${chip.details}`}
+      aria-description={chip.details}
     >
       <span className="text-[10px] uppercase tracking-[0.14em] text-text-muted">{chip.label}</span>
       <div className="flex items-baseline gap-1">
@@ -142,7 +151,7 @@ function ChipCell({ chip, series }: { chip: ChipDescriptor; series: number[] }) 
           data-testid="chip-value"
           // Make the provenance available to assistive tech without cluttering the visual
           // (the value reads e.g. "142 (derived from finalized-flow samples)").
-          aria-label={`${chip.label} ${chip.value}, ${qualityText}`}
+          aria-label={`${chip.label} ${chip.value}, ${qualityText}. ${chip.details}`}
         >
           {chip.value}
         </span>

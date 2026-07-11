@@ -108,6 +108,10 @@ function epoch(v: number | null | undefined): number | null {
   return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null;
 }
 
+function offset(v: number | null | undefined): number | null {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+}
+
 /** A non-empty trimmed string, else null (so a blank provider/model renders `—`, not empty). */
 function text(v: string | null | undefined): string | null {
   if (typeof v !== 'string') return null;
@@ -147,13 +151,11 @@ function firstByteFigure(startMs: number | null, byteMs: number | null): ByteFig
     };
   }
   if (byteMs < startMs) {
-    // Impossible ordering (first byte before the attempt began): clamp to 0 + FLAG it, exactly like
-    // a disordered duration/segment — a disordered `0` must stay distinct from a real measured `0ms`.
     return {
-      valueMs: 0,
-      quality: 'measured',
+      valueMs: null,
+      quality: 'unavailable',
       disordered: true,
-      detail: 'wire TTFB endpoints out of order (first byte before start) — clamped to 0 (clock skew), not a real 0ms',
+      detail: 'wire TTFB endpoints out of order — legacy wall-clock measurement unavailable',
     };
   }
   return {
@@ -169,6 +171,8 @@ function toNode(attempt: Attempt, index: number): AttemptNode {
   const startMs = epoch(attempt.start_ms);
   const endMs = epoch(attempt.end_ms);
   const byteMs = epoch(attempt.first_upstream_byte_ms);
+  const monotonicDuration = offset(attempt.duration_ms);
+  const monotonicFirstByte = offset(attempt.first_upstream_byte_offset_ms);
   const isServed = attempt.status === 'served';
 
   // Duration: measured from a known ordered pair; disordered ⇒ clamp to 0 + flag (never negative);
@@ -176,12 +180,15 @@ function toNode(attempt: Attempt, index: number): AttemptNode {
   let durationMs: number | null;
   let durationQuality: Quality;
   let disordered = false;
-  if (startMs === null || endMs === null) {
+  if (monotonicDuration !== null) {
+    durationMs = monotonicDuration;
+    durationQuality = 'measured';
+  } else if (startMs === null || endMs === null) {
     durationMs = null;
     durationQuality = 'unavailable';
   } else if (endMs < startMs) {
-    durationMs = 0;
-    durationQuality = 'measured';
+    durationMs = null;
+    durationQuality = 'unavailable';
     disordered = true;
   } else {
     durationMs = endMs - startMs;
@@ -201,7 +208,9 @@ function toNode(attempt: Attempt, index: number): AttemptNode {
     failoverReason: isServed ? null : attempt.failover_reason ?? null,
     durationMs,
     durationQuality,
-    firstByte: firstByteFigure(startMs, byteMs),
+    firstByte: monotonicFirstByte !== null
+      ? { valueMs: monotonicFirstByte, quality: 'measured', disordered: false, detail: 'monotonic wire time-to-first-byte for this attempt' }
+      : firstByteFigure(startMs, byteMs),
     disordered,
   };
 }

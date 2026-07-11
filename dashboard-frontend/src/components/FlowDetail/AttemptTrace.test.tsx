@@ -96,22 +96,22 @@ describe('AttemptTrace component (gap 11)', () => {
     expect(dur.textContent).toBe('0ms');
   });
 
-  it('flags a clock-disordered attempt with a skew marker (clamped, not negative)', () => {
+  it('flags a clock-disordered legacy attempt as unavailable', () => {
     const disordered: Attempt = { ...FAILED_A, start_ms: T + 500, end_ms: T + 100 };
     const { getByTestId } = renderTrace([disordered]);
     expect(getByTestId('attempt-skew-0')).toBeTruthy();
-    expect(getByTestId('attempt-duration-0').textContent).toBe('0ms');
+    expect(getByTestId('attempt-duration-0').textContent).toBe('—');
   });
 
-  it('flags a DISORDERED first byte (byte before start) with a skew marker, not a bare measured 0ms', () => {
+  it('flags a DISORDERED legacy first byte as unavailable', () => {
     // The review MEDIUM: a first byte before the attempt start was clamped to a `measured` 0ms with
     // NO marker — indistinguishable from a real 0. The expanded detail must now show a `skew` flag.
     const skewedByte: Attempt = { ...SERVED_B, start_ms: T + 500, first_upstream_byte_ms: T + 100 };
     const { getByTestId } = renderTrace([skewedByte]);
     fireEvent.click(getByTestId('attempt-toggle-0'));
     const byte = getByTestId('attempt-firstbyte-0');
-    expect(byte.getAttribute('data-quality')).toBe('measured');
-    expect(byte.textContent).toContain('0ms'); // clamped
+    expect(byte.getAttribute('data-quality')).toBe('unavailable');
+    expect(byte.textContent).toContain('—');
     expect(getByTestId('attempt-firstbyte-skew-0')).toBeTruthy(); // FLAGGED — distinct from a real 0
   });
 

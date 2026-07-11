@@ -23,7 +23,7 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 
 /** The extra properties carried on d3-sankey nodes/links (beyond the layout-computed geometry). */
 interface SNode { id: string; label: string; col: 0 | 1 | 2; model?: string; upstream?: string | null }
-interface SLink { cost: number; model?: string; upstream?: string | null }
+interface SLink { cost: number; costAvailable?: boolean; model?: string; upstream?: string | null }
 
 export interface TokenSankeyProps {
   model: SankeyModel;
@@ -99,6 +99,7 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
           target: l.target,
           value: l.value,
           cost: l.cost,
+          costAvailable: l.costAvailable,
           model: l.model,
           upstream: l.upstream,
         }));
@@ -138,7 +139,8 @@ export function TokenSankey({ model, width = DEFAULT_W, height = DEFAULT_H, onSe
             const activate = () => selectRef.current(model, upstream);
             const source = link.source as unknown as SNode;
             const target = link.target as unknown as SNode;
-            const description = `${source.label} to ${target.label} for ${model}${upstream ? ` on ${upstream}` : ''}: ${link.value} tokens, $${sl.cost.toFixed(4)} cost. Activate to filter flows.`;
+            const costDescription = sl.costAvailable === false ? 'unpriced cost' : `$${sl.cost.toFixed(4)} cost`;
+            const description = `${source.label} to ${target.label} for ${model}${upstream ? ` on ${upstream}` : ''}: ${link.value} tokens reported by terminal flows, ${costDescription}. Activate to filter flows.`;
             path.setAttribute('role', 'button');
             path.setAttribute('tabindex', '0');
             path.setAttribute('aria-label', description);

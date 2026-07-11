@@ -4,6 +4,12 @@
   "description": "`GET /dashboard/api/overview`: an immutable exact-window rollup. The aggregate is\nflattened so the wire reads naturally (`totals`, `served_models`, `cost_series`, …)\nwhile the calculation remains owned by MetricsLayer for both live and historical\ncuts.",
   "type": "object",
   "properties": {
+    "cancellations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OverviewDimensionRollup"
+      }
+    },
     "clients": {
       "type": "array",
       "items": {
@@ -35,6 +41,12 @@
       "type": "integer",
       "format": "uint128",
       "minimum": 0
+    },
+    "lanes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/OverviewLaneRollup"
+      }
     },
     "metrics_seq": {
       "type": "integer",
@@ -87,6 +99,8 @@
     "providers",
     "clients",
     "failures",
+    "cancellations",
+    "lanes",
     "context",
     "tokens",
     "cost",
@@ -228,6 +242,35 @@
         "cost"
       ]
     },
+    "OverviewLaneRollup": {
+      "type": "object",
+      "properties": {
+        "cost": {
+          "$ref": "#/$defs/OverviewCost"
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "tokens": {
+          "$ref": "#/$defs/OverviewTokens"
+        }
+      },
+      "required": [
+        "provider",
+        "model",
+        "requests",
+        "tokens",
+        "cost"
+      ]
+    },
     "OverviewMetricScope": {
       "type": "string",
       "enum": [
@@ -259,6 +302,11 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "unattributable_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "required": [
@@ -266,7 +314,8 @@
         "slot_folded_samples",
         "aggregate_folded_samples",
         "provider_folded_samples",
-        "overflowed"
+        "overflowed",
+        "unattributable_requests"
       ]
     },
     "OverviewProviderAttempts": {
@@ -396,10 +445,25 @@
     "OverviewTotals": {
       "type": "object",
       "properties": {
+        "cancellations": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "cost": {
           "$ref": "#/$defs/OverviewCost"
         },
+        "failures": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "successes": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0
@@ -410,6 +474,9 @@
       },
       "required": [
         "requests",
+        "successes",
+        "failures",
+        "cancellations",
         "tokens",
         "cost"
       ]
@@ -484,17 +551,26 @@
         },
         "p50": {
           "description": "`derived` p50 attempt latency (ms).",
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "p95": {
           "description": "`derived` p95 attempt latency (ms).",
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "p99": {
           "description": "`derived` p99 attempt latency (ms).",
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "provider": {
@@ -531,7 +607,8 @@
       "description": "Gap 12 — the data-quality tag for a per-provider metric. Every per-provider latency\nfigure is `derived` (computed from the provider's own attempt-latency histogram). The\n`unavailable` case (a provider with no in-window samples) is represented by the\nABSENCE of a [`ProviderLatency`] entirely, not by a variant here — so a present DTO is\nalways a real `derived` measurement (don't-lie-with-zeros). Serializes snake_case to\nmatch the cross-cutting DQ-tag contract.",
       "type": "string",
       "enum": [
-        "derived"
+        "derived",
+        "partial"
       ]
     },
     "TerminalCostConfidence": {

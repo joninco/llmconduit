@@ -32,6 +32,15 @@
       "description": "Gap 03 — one upstream dispatch attempt's full provenance: WHICH provider, WHAT model,\nHOW LONG it took, WHEN the first wire byte arrived, and the OUTCOME. The failover loop\nrecords one per provider it tries (failed ones + the served one); a non-failover\n(bare-leaf / single-upstream / routing-with-no-fallback) flow records exactly one.\n\nAll timestamps are MEASURED epoch-ms (`now_ms`). `first_upstream_byte_ms` is the wire\ninstant the attempt's FIRST chunk arrived — `None` when the attempt never received\nresponse headers / a first chunk (a connect/timeout/non-2xx failure), so an unmeasured\nfirst-byte time is `None`, NEVER `0` (don't-lie-with-zeros). `error_class` /\n`failover_reason` are `None` on the served attempt and are BOUNDED taxonomic codes\n(never raw upstream text) on a failed attempt — they ride the body-free summary, so\nraw error bodies stay behind spec 05's gated seam. Snake_case + `skip_serializing_if`\nso a `None` field is absent on the wire.",
       "type": "object",
       "properties": {
+        "duration_ms": {
+          "description": "Monotonic attempt duration. New records always populate this; `None` identifies\nlegacy data that must fall back to an ordered epoch pair or stay unavailable.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
         "end_ms": {
           "description": "Epoch-ms the attempt resolved (served first chunk, or failed). Always measured.",
           "type": "integer",
@@ -62,6 +71,15 @@
         },
         "first_upstream_byte_ms": {
           "description": "Epoch-ms the FIRST chunk arrived on the wire for this attempt. `None` when the\nattempt never received a first chunk (failed before response headers) — NEVER `0`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "first_upstream_byte_offset_ms": {
+          "description": "Monotonic response-header offset from attempt start. Unlike the display epoch,\nthis remains valid across wall-clock adjustments.",
           "type": [
             "integer",
             "null"
@@ -224,6 +242,13 @@
             "$ref": "#/$defs/Attempt"
           }
         },
+        "cache_price_impact_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
         "client_label": {
           "description": "Gap 04 — the STABLE, NON-SECRET client attribution label (key-hash `key-<hex>`\ndisplay id / configured caller-id / User-Agent fallback), projected from the\nflow record/summary. `skip_serializing_if` so an unattributed flow OMITS the key\n(absent ⇒ renders `—`, never a fabricated id). Additive/optional: the frontend\nignores it until the client-attribution UI (gap 15). The raw key is never here —\nonly the one-way hash prefix ever existed as a label.",
           "type": [
@@ -254,6 +279,13 @@
           "description": "Gap 07 — the [`CostConfidence`] of `cost`: `confident` (priced + every billed\nclass has a known rate), `estimated` (a class falls back to the default `0.0`\ncached rate / cached unreported), or `unavailable` (unpriced ⇒ `cost: null`).\nAlways present so the frontend can label an `estimated` figure as such and\ndistinguish an `unavailable` cost from a measured `$0.00`.",
           "$ref": "#/$defs/CostConfidence"
         },
+        "effective_route_limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
         "elapsed_ms": {
           "type": [
             "integer",
@@ -264,6 +296,14 @@
         },
         "finalize_ms": {
           "description": "Terminal finalize — stamped when the flow reaches its terminal state\n(`finalize`), for EVERY terminal (completed, failed, cancelled). Always `Some`\nonce the flow is terminal; the right edge of the waterfall.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "finalize_offset_ms": {
           "type": [
             "integer",
             "null"
@@ -288,6 +328,14 @@
           "format": "uint128",
           "minimum": 0
         },
+        "first_content_delta_offset_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
         "first_upstream_byte_ms": {
           "description": "Gap 10b — the gap-03 flow-level wire time-to-first-byte (the served attempt's first\non-wire chunk). Distinct from `first_content_delta_ms` (the first content delta to\nthe CLIENT). `None` ⇒ absent ⇒ renders `—` downstream, NEVER `0`.",
           "type": [
@@ -299,6 +347,15 @@
         },
         "ingress_ms": {
           "description": "Request ingress — when the FlowStore first `open`ed the record (≈ `started_ms`).\nAlways `Some` once a record exists; the explicit phase value the waterfall\nanchors the other phases against.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "ingress_offset_ms": {
+          "description": "Monotonic offset from flow ingress. Present on newly captured records; legacy\nsnapshots without offsets continue to use ordered epoch timestamps as fallback.",
           "type": [
             "integer",
             "null"
@@ -330,6 +387,25 @@
           "format": "uint128",
           "minimum": 0
         },
+        "normalization_done_offset_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "normalized_usage": {
+          "description": "Calculation-only corrected usage; raw provider values remain in `usage`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FlowUsage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "response_id": {
           "type": [
             "string",
@@ -351,6 +427,14 @@
           "format": "uint128",
           "minimum": 0
         },
+        "routing_decision_offset_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
         "started_ms": {
           "type": "integer",
           "format": "uint128",
@@ -361,6 +445,14 @@
         },
         "stream_end_ms": {
           "description": "Stream completion — stamped when `run_turn` finishes emitting the terminal\n`response.completed`/`response.incomplete`. `None` if the flow errored or was\ncancelled mid-stream.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "stream_end_offset_ms": {
           "type": [
             "integer",
             "null"
@@ -392,6 +484,11 @@
               "type": "null"
             }
           ]
+        },
+        "usage_anomaly_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "required": [
@@ -400,6 +497,8 @@
         "method",
         "uri",
         "usage",
+        "normalized_usage",
+        "usage_anomaly_count",
         "status",
         "started_ms",
         "cost",

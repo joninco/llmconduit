@@ -17,7 +17,6 @@ import { authStore } from '../store/authStore';
 import { dashboardStore } from '../store/dashboardStore';
 import { flowFilterStore } from '../store/flowFilterStore';
 import { resetHashScope } from '../router/useHashRoute';
-import { startSankeyFold, __resetSankeyFold } from '../store/useSankeyWindow';
 import type { DashboardBootstrap, DashboardFrame, OverviewQuery } from './types';
 import { DashboardSchemaMismatchError, DASHBOARD_SCHEMA_VERSION } from './schemaVersion';
 import { DashboardContractError } from './validation';
@@ -123,7 +122,6 @@ export function getConnection(): Connection {
   // stamping every delta at its REAL arrival time regardless of which view is mounted. The SankeyView
   // only READS the maintained ring — so usage that grew while the Sankey was unmounted is recorded at
   // its real arrival time and correctly ages out of the 30 s window, never lumped in at remount.
-  startSankeyFold();
 
   singleton = { client, socket, queryClient, mock };
   return singleton;
@@ -202,5 +200,4 @@ export function resetConnection(): void {
   singleton = null;
   // Pair the engine teardown with the singleton reset so a fresh `getConnection()` re-starts it
   // (HMR) and tests don't leak a running fold subscription / accumulated ring across cases.
-  __resetSankeyFold();
 }

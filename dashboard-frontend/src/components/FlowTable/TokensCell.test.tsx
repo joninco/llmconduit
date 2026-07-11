@@ -2,14 +2,6 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { cleanup, fireEvent, render, within } from '@testing-library/react';
 import { TokensCell } from './TokensCell';
 import { makeFlow } from '../testHarness';
-import type { ModelPrice } from '../../api/types';
-
-const PRICE_TABLE: Record<string, ModelPrice> = {
-  // gpt-4o: CONFIGURED cached price (presence) — licenses "$ saved".
-  'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025, cached_price_configured: true },
-  // llama: NO configured cached price — split shows but NO dollar saving.
-  'llama-3.1-70b': { input_per_1k: 0.0008, output_per_1k: 0.0008, cached_per_1k: 0, cached_price_configured: false },
-};
 
 /** Hover the tokens cell to reveal the popover, then return the popover element. */
 function openPopover(container: HTMLElement): HTMLElement {
@@ -26,8 +18,9 @@ describe('TokensCell — token-economics popover (gap 08)', () => {
       model_served: 'gpt-4o',
       cost_confidence: 'confident',
       usage: { prompt: 1000, completion: 200, total: 1200, cached: 250, reasoning: 64 },
+      cache_price_impact_usd: -0.000625,
     });
-    const { container, queryByTestId } = render(<TokensCell flow={flow} priceTable={PRICE_TABLE} />);
+    const { container, queryByTestId } = render(<TokensCell flow={flow} />);
     // No popover until hovered.
     expect(queryByTestId('tokens-popover')).toBeNull();
     const pop = openPopover(container);
@@ -52,7 +45,7 @@ describe('TokensCell — token-economics popover (gap 08)', () => {
       model_served: 'gpt-4o',
       usage: { prompt: 1000, completion: 200, total: 1200 }, // cached/reasoning unreported
     });
-    const { container } = render(<TokensCell flow={flow} priceTable={PRICE_TABLE} />);
+    const { container } = render(<TokensCell flow={flow} />);
     const pop = openPopover(container);
 
     const cached = within(pop).getByTestId('econ-line-cached');
@@ -70,8 +63,9 @@ describe('TokensCell — token-economics popover (gap 08)', () => {
       model_served: 'gpt-4o',
       cost_confidence: 'confident',
       usage: { prompt: 1000, completion: 200, total: 1200, cached: 0, reasoning: 0 },
+      cache_price_impact_usd: 0,
     });
-    const { container } = render(<TokensCell flow={flow} priceTable={PRICE_TABLE} />);
+    const { container } = render(<TokensCell flow={flow} />);
     const pop = openPopover(container);
     const cached = within(pop).getByTestId('econ-line-cached');
     expect(cached.getAttribute('data-quality')).toBe('measured');
@@ -87,7 +81,7 @@ describe('TokensCell — token-economics popover (gap 08)', () => {
       cost_confidence: 'estimated',
       usage: { prompt: 1000, completion: 200, total: 1200, cached: 300 },
     });
-    const { container } = render(<TokensCell flow={flow} priceTable={PRICE_TABLE} />);
+    const { container } = render(<TokensCell flow={flow} />);
     const pop = openPopover(container);
     // Split still shows the measured cached count…
     expect(within(pop).getByTestId('econ-line-cached').textContent).toContain('300');
@@ -99,7 +93,7 @@ describe('TokensCell — token-economics popover (gap 08)', () => {
 
   it('a flow with NO usage renders the plain dual-count and offers no popover', () => {
     const flow = makeFlow({ usage: null });
-    const { container, queryByTestId } = render(<TokensCell flow={flow} priceTable={PRICE_TABLE} />);
+    const { container, queryByTestId } = render(<TokensCell flow={flow} />);
     const cell = within(container).getByTestId('tokens-cell');
     expect(cell.textContent).toContain('—');
     fireEvent.mouseEnter(cell);

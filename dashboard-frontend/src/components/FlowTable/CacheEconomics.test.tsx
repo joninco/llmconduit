@@ -2,12 +2,6 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { cleanup, fireEvent, render, within } from '@testing-library/react';
 import { CacheEconomics } from './CacheEconomics';
 import { makeFlow } from '../testHarness';
-import type { ModelPrice } from '../../api/types';
-
-const PRICE_TABLE: Record<string, ModelPrice> = {
-  'gpt-4o': { input_per_1k: 0.005, output_per_1k: 0.015, cached_per_1k: 0.0025, cached_price_configured: true },
-  'llama-3.1-70b': { input_per_1k: 0.0008, output_per_1k: 0.0008, cached_per_1k: 0, cached_price_configured: false },
-};
 
 /** Expand the collapsed panel and return its table. */
 function expand(container: HTMLElement): HTMLElement {
@@ -23,7 +17,7 @@ describe('CacheEconomics — aggregate cache-hit by model (gap 08)', () => {
       makeFlow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 1000, completion: 100, total: 1100, cached: 200 } }),
       makeFlow({ api_call_id: 'b', model_served: 'llama-3.1-70b', usage: { prompt: 1000, completion: 100, total: 1100 } }), // unreported cached
     ];
-    const { getByTestId, queryByTestId } = render(<CacheEconomics rows={rows} priceTable={PRICE_TABLE} />);
+    const { getByTestId, queryByTestId } = render(<CacheEconomics rows={rows} />);
     // Collapsed: no table yet.
     expect(queryByTestId('cache-economics-table')).toBeNull();
     // 1 of 2 model groups has a measured hit rate (llama never reported cached).
@@ -32,10 +26,10 @@ describe('CacheEconomics — aggregate cache-hit by model (gap 08)', () => {
 
   it('shows a derived hit rate + $ saved for a confident gpt-4o group (no est badge)', () => {
     const rows = [
-      makeFlow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 1000, completion: 100, total: 1100, cached: 200 } }),
-      makeFlow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 1000, completion: 100, total: 1100, cached: 400 } }),
+      makeFlow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 1000, completion: 100, total: 1100, cached: 200 }, cache_price_impact_usd: -0.0005 }),
+      makeFlow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 1000, completion: 100, total: 1100, cached: 400 }, cache_price_impact_usd: -0.001 }),
     ];
-    const { container } = render(<CacheEconomics rows={rows} priceTable={PRICE_TABLE} />);
+    const { container } = render(<CacheEconomics rows={rows} />);
     const table = expand(container);
     const row = within(table).getByTestId('cache-economics-row');
     // (200+400)/(1000+1000) = 30.0%
@@ -53,7 +47,7 @@ describe('CacheEconomics — aggregate cache-hit by model (gap 08)', () => {
       makeFlow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 1000, completion: 100, total: 1100, cached: 100 } }),
       makeFlow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'estimated', usage: { prompt: 1000, completion: 100, total: 1100, cached: 100 } }),
     ];
-    const { container } = render(<CacheEconomics rows={rows} priceTable={PRICE_TABLE} />);
+    const { container } = render(<CacheEconomics rows={rows} />);
     const table = expand(container);
     expect(within(table).getByTestId('agg-est')).toBeTruthy();
   });
@@ -66,10 +60,10 @@ describe('CacheEconomics — aggregate cache-hit by model (gap 08)', () => {
     const rows = [
       // prompt 0 ⇒ hit-rate denominator 0 ⇒ rate unavailable; cached 100 reported with gpt-4o's
       // CONFIGURED price ⇒ a DERIVED `$ saved`. One estimated member ⇒ the group is an estimate.
-      makeFlow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 0, completion: 100, total: 100, cached: 100 } }),
-      makeFlow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'estimated', usage: { prompt: 0, completion: 100, total: 100, cached: 100 } }),
+      makeFlow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 0, completion: 100, total: 100, cached: 100 }, cache_price_impact_usd: -0.00025 }),
+      makeFlow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'estimated', usage: { prompt: 0, completion: 100, total: 100, cached: 100 }, cache_price_impact_usd: -0.00025 }),
     ];
-    const { container } = render(<CacheEconomics rows={rows} priceTable={PRICE_TABLE} />);
+    const { container } = render(<CacheEconomics rows={rows} />);
     const table = expand(container);
     const row = within(table).getByTestId('cache-economics-row');
     // Rate is unavailable (zero denominator) — the badge must NOT be gated on this.
@@ -87,7 +81,7 @@ describe('CacheEconomics — aggregate cache-hit by model (gap 08)', () => {
       makeFlow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'estimated', usage: { prompt: 1000, completion: 100, total: 1100 } }),
       makeFlow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 1000, completion: 100, total: 1100 } }),
     ];
-    const { container } = render(<CacheEconomics rows={rows} priceTable={PRICE_TABLE} />);
+    const { container } = render(<CacheEconomics rows={rows} />);
     const table = expand(container);
     const row = within(table).getByTestId('cache-economics-row');
     expect(within(row).getByTestId('agg-hit-rate').getAttribute('data-quality')).toBe('unavailable');
@@ -98,7 +92,7 @@ describe('CacheEconomics — aggregate cache-hit by model (gap 08)', () => {
     const rows = [
       makeFlow({ api_call_id: 'a', model_served: 'llama-3.1-70b', usage: { prompt: 1000, completion: 100, total: 1100 } }),
     ];
-    const { container } = render(<CacheEconomics rows={rows} priceTable={PRICE_TABLE} />);
+    const { container } = render(<CacheEconomics rows={rows} />);
     const table = expand(container);
     const rate = within(table).getByTestId('agg-hit-rate');
     expect(rate.getAttribute('data-quality')).toBe('unavailable');
@@ -110,7 +104,7 @@ describe('CacheEconomics — aggregate cache-hit by model (gap 08)', () => {
   });
 
   it('renders an empty state when there is no model usage', () => {
-    const { container, getByTestId } = render(<CacheEconomics rows={[]} priceTable={PRICE_TABLE} />);
+    const { container, getByTestId } = render(<CacheEconomics rows={[]} />);
     expect(getByTestId('cache-economics-summary').textContent).toContain('no models');
     fireEvent.click(within(container).getByTestId('cache-economics-toggle'));
     expect(getByTestId('cache-economics-empty')).toBeTruthy();

@@ -235,14 +235,12 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     expect(getByTestId('deltas-panel').textContent).not.toContain('BASEBASE');
   });
 
-  it('detail cost roll-up shows even when the live row carries no cost (finding 4)', async () => {
-    // api_001's live row (seeded in beforeEach) has NO cost/usage; the mock /flows/:id detail
-    // carries the server roll-up cost. The header must surface that roll-up, not "—".
+  it('an open flow has no terminal-time cost yet', async () => {
+    // api_001 is open, so neither its row nor detail can claim a terminal-time price.
     const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
-    // Wait for the detail query (with the roll-up cost) to resolve.
+    // Wait for the detail query to resolve.
     await waitFor(() => expect(getByTestId('jsonpane-code-A · inbound').querySelectorAll('.json-line').length).toBeGreaterThan(0));
-    // The seeded mock detail cost for api_001 is 0.0061 → formatted into the cost/elapsed cell.
-    await waitFor(() => expect(getByTestId('flow-detail').textContent).toContain('$0.0061'));
+    await waitFor(() => expect(getByTestId('detail-cost').textContent).toContain('—'));
   });
 
   it('kill button is gated OFF (disabled, no POST) when mutations are disabled', async () => {
@@ -304,6 +302,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
         cost_confidence: 'confident',
         // 250 cached of 1000 prompt ⇒ 25.0% hit; saved = (250/1000)*(0.005-0.0025) = 0.000625.
         usage: { prompt: 1000, completion: 200, total: 1200, cached: 250, reasoning: 0 },
+        cache_price_impact_usd: -0.000625,
       }),
     ]);
     act(() => dashboardStore.getState().seedTopology({
@@ -456,6 +455,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
         // PROMPT 64000 / 128000 ⇒ 50.0% (spec 09: prompt ÷ max_context). The completion 4000 is
         // IGNORED — the (buggy) total-based numerator would have read 68000/128000 = 53.1%.
         usage: { prompt: 64000, completion: 4000, total: 68000, cached: 0, reasoning: 0 },
+        effective_route_limit: 128000,
       }),
     ]);
     const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g09" onClose={noop} />);

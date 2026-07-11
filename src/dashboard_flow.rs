@@ -266,6 +266,50 @@ pub struct FlowUsage {
     pub reasoning: Option<i64>,
 }
 
+/// Calculation-only normalized usage. The raw provider values remain on
+/// [`FlowUsage`] for diagnostics; aggregates and pricing consume this corrected copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NormalizedUsage {
+    pub usage: FlowUsage,
+    /// Number of bounded anomaly classes observed: negative count, total mismatch,
+    /// and invalid cached/reasoning subclass.
+    pub anomaly_count: u64,
+}
+
+pub fn normalize_usage(raw: FlowUsage) -> NormalizedUsage {
+    let mut anomaly_count = 0u64;
+    let negative = raw.prompt < 0
+        || raw.completion < 0
+        || raw.total < 0
+        || raw.cached.is_some_and(|value| value < 0)
+        || raw.reasoning.is_some_and(|value| value < 0);
+    anomaly_count += u64::from(negative);
+
+    let prompt = raw.prompt.max(0);
+    let completion = raw.completion.max(0);
+    let total = prompt.saturating_add(completion);
+    if raw.total != total {
+        anomaly_count += 1;
+    }
+
+    let cached = raw.cached.map(|value| value.clamp(0, prompt));
+    let reasoning = raw.reasoning.map(|value| value.clamp(0, completion));
+    if cached != raw.cached || reasoning != raw.reasoning {
+        anomaly_count += 1;
+    }
+
+    NormalizedUsage {
+        usage: FlowUsage {
+            prompt,
+            completion,
+            total,
+            cached,
+            reasoning,
+        },
+        anomaly_count,
+    }
+}
+
 /// Gap 04 — the PROVENANCE of a flow's `client_label`: WHICH non-secret signal the
 /// attribution was derived from. Tagged so the dashboard (spec 15) can render the
 /// weaker User-Agent fallback DIFFERENTLY from the stronger key-hash / configured-id
@@ -654,10 +698,18 @@ pub struct Attempt {
     pub start_ms: u128,
     /// Epoch-ms the attempt resolved (served first chunk, or failed). Always measured.
     pub end_ms: u128,
+    /// Monotonic attempt duration. New records always populate this; `None` identifies
+    /// legacy data that must fall back to an ordered epoch pair or stay unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u128>,
     /// Epoch-ms the FIRST chunk arrived on the wire for this attempt. `None` when the
     /// attempt never received a first chunk (failed before response headers) — NEVER `0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_upstream_byte_ms: Option<u128>,
+    /// Monotonic response-header offset from attempt start. Unlike the display epoch,
+    /// this remains valid across wall-clock adjustments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_upstream_byte_offset_ms: Option<u128>,
     /// Served vs failed.
     pub status: AttemptStatus,
     /// Bounded taxonomic failure code; `None` on the served attempt.
@@ -724,6 +776,9 @@ pub struct TerminalMetricsInputs {
     /// served model, or a configured price is unavailable.
     pub cost_usd: Option<f64>,
     pub cost_confidence: TerminalCostConfidence,
+    /// Signed cached-rate impact relative to ordinary input pricing. Negative means
+    /// cache reads saved money; positive means the configured cache rate costs more.
+    pub cache_price_impact_usd: Option<f64>,
     /// Conservative minimum context window across the route's candidate set. `None`
     /// means the routing/catalog sources did not advertise a usable limit.
     pub effective_route_limit: Option<i64>,
@@ -866,6 +921,12 @@ pub struct FlowRecord {
     pub model_served: Option<String>,
     pub upstream_target: Option<String>,
     pub usage: Option<FlowUsage>,
+    /// Cost fixed at the terminal seam; never recomputed from a later price table.
+    pub terminal_cost_usd: Option<f64>,
+    pub terminal_cost_confidence: TerminalCostConfidence,
+    pub cache_price_impact_usd: Option<f64>,
+    /// Conservative route limit fixed with the terminal record.
+    pub effective_route_limit: Option<i64>,
     pub status: FlowStatus,
     pub started_at: Instant,
     pub started_ms: u128,
@@ -881,10 +942,9 @@ pub struct FlowRecord {
     /// via [`PhaseTimings::stamp`]: the outer replay/tool `loop` in `run_turn` and the
     /// per-delta `OutputTextDelta` arm fire their seams repeatedly, but only the FIRST
     /// observation stamps — so `first_content_delta_ms` marks the first content token
-    /// the client saw, not a later one, and a multi-turn flow does not re-stamp. The
-    /// stamp also CLAMPS each value up to the latest already-recorded phase, so the
-    /// fields are monotonic (`ingress ≤ normalization ≤ routing ≤ first_content_delta
-    /// ≤ stream_end ≤ finalize`) even if the wall clock steps backwards between seams.
+    /// the client saw, not a later one, and a multi-turn flow does not re-stamp. A
+    /// backwards wall-clock step remains visible as disorder so duration consumers
+    /// return unavailable instead of fabricating a measured `0 ms`.
     pub phases: PhaseTimings,
     /// Gap 03 — the per-attempt failover trace: one [`Attempt`] per upstream dispatch the
     /// failover loop tried (failed providers + the served one), or exactly one for a
@@ -933,16 +993,24 @@ pub struct PhaseTimings {
     /// anchors the other phases against.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ingress_ms: Option<u128>,
+    /// Monotonic offset from flow ingress. Present on newly captured records; legacy
+    /// snapshots without offsets continue to use ordered epoch timestamps as fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_offset_ms: Option<u128>,
     /// Inbound→canonical normalization settled — stamped when the engine captures the
     /// normalized canonical body (`set_normalized`). `None` if the flow errored before
     /// normalization (an extractor/JSON rejection caught by the L0 guard).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub normalization_done_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub normalization_done_offset_ms: Option<u128>,
     /// Upstream routing/lowering decision — stamped when the engine commits the actual
     /// on-wire upstream request (`set_upstream` at the leaf). `None` if the flow never
     /// reached the wire (pre-spawn lowering/budget failure, replay-only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_decision_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_decision_offset_ms: Option<u128>,
     /// True TTFT — the wall-clock instant the FIRST canonical **content** SSE delta was
     /// emitted to the client. NOT reasoning, tool-argument, refusal, or signature
     /// deltas: a stream that emits reasoning/tool deltas before content does NOT stamp
@@ -950,85 +1018,88 @@ pub struct PhaseTimings {
     /// before any content delta.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_content_delta_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_content_delta_offset_ms: Option<u128>,
     /// Stream completion — stamped when `run_turn` finishes emitting the terminal
     /// `response.completed`/`response.incomplete`. `None` if the flow errored or was
     /// cancelled mid-stream.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_end_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_end_offset_ms: Option<u128>,
     /// Terminal finalize — stamped when the flow reaches its terminal state
     /// (`finalize`), for EVERY terminal (completed, failed, cancelled). Always `Some`
     /// once the flow is terminal; the right edge of the waterfall.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finalize_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finalize_offset_ms: Option<u128>,
 }
 
 impl PhaseTimings {
-    /// First-write-wins + monotonic stamp of one phase. No-op if the field is already
-    /// `Some` (so the per-delta content arm and the replay/tool `loop` stamp only the
-    /// FIRST observation). When it does write, the value is CLAMPED up to the latest
-    /// already-recorded phase so the bundle stays monotonic even across a backwards
-    /// wall-clock step — the seams fire in causal order, so the floor is the max of the
-    /// existing measured phases (`ingress ≤ … ≤ finalize`).
-    fn stamp(field: &mut Option<u128>, latest_prior: Option<u128>, now: u128) {
+    /// First-write-wins wall-clock display stamp. Clock disorder is preserved so duration
+    /// consumers can mark it unavailable; coercing it to the prior epoch fabricates 0 ms.
+    fn stamp(field: &mut Option<u128>, now: u128) {
         if field.is_some() {
             return;
         }
-        *field = Some(match latest_prior {
-            Some(floor) => now.max(floor),
-            None => now,
-        });
-    }
-
-    /// The latest (largest) measured phase so far — the monotonic floor for the next
-    /// stamp. `None` only before any phase is recorded.
-    fn latest(&self) -> Option<u128> {
-        [
-            self.ingress_ms,
-            self.normalization_done_ms,
-            self.routing_decision_ms,
-            self.first_content_delta_ms,
-            self.stream_end_ms,
-            self.finalize_ms,
-        ]
-        .into_iter()
-        .flatten()
-        .max()
+        *field = Some(now);
     }
 
     /// Stamp `ingress` (record open).
     fn stamp_ingress(&mut self, now: u128) {
-        let floor = self.latest();
-        Self::stamp(&mut self.ingress_ms, floor, now);
+        Self::stamp(&mut self.ingress_ms, now);
+        Self::stamp(&mut self.ingress_offset_ms, 0);
     }
 
     /// Stamp `normalization_done` (canonical body captured).
     fn stamp_normalization(&mut self, now: u128) {
-        let floor = self.latest();
-        Self::stamp(&mut self.normalization_done_ms, floor, now);
+        Self::stamp(&mut self.normalization_done_ms, now);
+    }
+
+    fn stamp_normalization_at(&mut self, now: u128, offset_ms: u128) {
+        self.stamp_normalization(now);
+        Self::stamp(&mut self.normalization_done_offset_ms, offset_ms);
     }
 
     /// Stamp `routing_decision` (on-wire upstream committed).
     fn stamp_routing(&mut self, now: u128) {
-        let floor = self.latest();
-        Self::stamp(&mut self.routing_decision_ms, floor, now);
+        Self::stamp(&mut self.routing_decision_ms, now);
+    }
+
+    fn stamp_routing_at(&mut self, now: u128, offset_ms: u128) {
+        self.stamp_routing(now);
+        Self::stamp(&mut self.routing_decision_offset_ms, offset_ms);
     }
 
     /// Stamp `first_content_delta` (first canonical CONTENT SSE delta to the client).
     fn stamp_first_content_delta(&mut self, now: u128) {
-        let floor = self.latest();
-        Self::stamp(&mut self.first_content_delta_ms, floor, now);
+        Self::stamp(&mut self.first_content_delta_ms, now);
+    }
+
+    fn stamp_first_content_delta_at(&mut self, now: u128, offset_ms: u128) {
+        self.stamp_first_content_delta(now);
+        Self::stamp(&mut self.first_content_delta_offset_ms, offset_ms);
     }
 
     /// Stamp `stream_end` (terminal SSE emitted).
     fn stamp_stream_end(&mut self, now: u128) {
-        let floor = self.latest();
-        Self::stamp(&mut self.stream_end_ms, floor, now);
+        Self::stamp(&mut self.stream_end_ms, now);
+    }
+
+    fn stamp_stream_end_at(&mut self, now: u128, offset_ms: u128) {
+        self.stamp_stream_end(now);
+        Self::stamp(&mut self.stream_end_offset_ms, offset_ms);
     }
 
     /// Stamp `finalize` (flow reached a terminal state).
     fn stamp_finalize(&mut self, now: u128) {
-        let floor = self.latest();
-        Self::stamp(&mut self.finalize_ms, floor, now);
+        Self::stamp(&mut self.finalize_ms, now);
+    }
+
+    fn stamp_finalize_at(&mut self, now: u128, offset_ms: u128) {
+        self.stamp_finalize(now);
+        Self::stamp(&mut self.finalize_offset_ms, offset_ms);
     }
 }
 
@@ -1108,6 +1179,10 @@ pub struct SnapshotFlowSummary {
     pub model_served: Option<String>,
     pub upstream_target: Option<String>,
     pub usage: Option<FlowUsage>,
+    pub terminal_cost_usd: Option<f64>,
+    pub terminal_cost_confidence: TerminalCostConfidence,
+    pub cache_price_impact_usd: Option<f64>,
+    pub effective_route_limit: Option<i64>,
     pub status: FlowStatus,
     pub started_ms: u128,
     pub finished_ms: Option<u128>,
@@ -1153,6 +1228,10 @@ impl SnapshotFlowSummary {
             model_served: record.model_served.clone(),
             upstream_target: record.upstream_target.clone(),
             usage: record.usage,
+            terminal_cost_usd: record.terminal_cost_usd,
+            terminal_cost_confidence: record.terminal_cost_confidence,
+            cache_price_impact_usd: record.cache_price_impact_usd,
+            effective_route_limit: record.effective_route_limit,
             status: record.status,
             started_ms: record.started_ms,
             finished_ms: record.finished_ms,
@@ -1353,6 +1432,53 @@ impl DashboardFlowStore {
         inbound_body: Option<CapturedBody>,
         client: ClientAttribution,
     ) {
+        self.open_inner(
+            api_call_id,
+            method,
+            uri,
+            headers,
+            inbound_body,
+            client,
+            None,
+        );
+    }
+
+    /// Open a flow and record its accepted-start metric under the fixed
+    /// FlowStore→Metrics lock order. The middleware uses this atomic seam so a
+    /// publisher cannot observe the active record without its arrival counter.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_and_record_accepted(
+        &self,
+        api_call_id: String,
+        method: String,
+        uri: String,
+        headers: CapturedHeaders,
+        inbound_body: Option<CapturedBody>,
+        client: ClientAttribution,
+        metrics: &crate::metrics::MetricsLayer,
+    ) {
+        self.open_inner(
+            api_call_id,
+            method,
+            uri,
+            headers,
+            inbound_body,
+            client,
+            Some(metrics),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_inner(
+        &self,
+        api_call_id: String,
+        method: String,
+        uri: String,
+        headers: CapturedHeaders,
+        inbound_body: Option<CapturedBody>,
+        client: ClientAttribution,
+        metrics: Option<&crate::metrics::MetricsLayer>,
+    ) {
         if !self.enabled {
             return;
         }
@@ -1380,6 +1506,10 @@ impl DashboardFlowStore {
             model_served: None,
             upstream_target: None,
             usage: None,
+            terminal_cost_usd: None,
+            terminal_cost_confidence: TerminalCostConfidence::Unavailable,
+            cache_price_impact_usd: None,
+            effective_route_limit: None,
             status: FlowStatus::Open,
             started_at: Instant::now(),
             started_ms: now,
@@ -1409,6 +1539,9 @@ impl DashboardFlowStore {
         let stored_id = cap_scalar(api_call_id);
         state.insert(stored_id.clone(), Arc::new(record));
         state.enforce_caps(self.summary_quota_bytes);
+        if let Some(metrics) = metrics {
+            metrics.record_accepted();
+        }
         self.publish_locked(&state, &stored_id, FlowMutationPhase::Open);
     }
 
@@ -1529,7 +1662,9 @@ impl DashboardFlowStore {
             // Gap 02: capturing the normalized canonical body IS the
             // normalization-settled seam. First-write-wins so the outer replay/tool
             // `loop` (which re-lowers per round) does not re-stamp.
-            record.phases.stamp_normalization(now);
+            record
+                .phases
+                .stamp_normalization_at(now, record.started_at.elapsed().as_millis());
             if model_requested.is_some() {
                 record.model_requested = model_requested.clone();
             }
@@ -1567,6 +1702,10 @@ impl DashboardFlowStore {
             Vec::new(),
             None,
             None,
+            None,
+            TerminalCostConfidence::Unavailable,
+            None,
+            None,
         );
     }
 
@@ -1584,6 +1723,10 @@ impl DashboardFlowStore {
         attempts: Vec<Attempt>,
         first_upstream_byte_ms: Option<u128>,
         pending_response_body: Option<CapturedResponseBody>,
+        terminal_cost_usd: Option<f64>,
+        terminal_cost_confidence: TerminalCostConfidence,
+        cache_price_impact_usd: Option<f64>,
+        effective_route_limit: Option<i64>,
     ) {
         if !self.enabled {
             return;
@@ -1601,12 +1744,13 @@ impl DashboardFlowStore {
         state.update(api_call_id, |record| {
             record.status = status;
             record.finished_ms = Some(now);
-            record.elapsed_ms = Some(record.started_at.elapsed().as_millis());
+            let elapsed_ms = record.started_at.elapsed().as_millis();
+            record.elapsed_ms = Some(elapsed_ms);
             // Gap 02: stamp the `finalize` phase for EVERY terminal (completed, failed,
             // cancelled). First-write-wins: the D3 CAS guard already makes the explicit
             // finalize win, but stamping is idempotent so a store-level re-finalize keeps
             // the first terminal instant.
-            record.phases.stamp_finalize(now);
+            record.phases.stamp_finalize_at(now, elapsed_ms);
             if terminal_reason.is_some() {
                 record.terminal_reason = terminal_reason.clone();
             }
@@ -1626,6 +1770,10 @@ impl DashboardFlowStore {
             if let Some(response) = upstream_response.clone() {
                 record.upstream_response = Some(response);
             }
+            record.terminal_cost_usd = terminal_cost_usd;
+            record.terminal_cost_confidence = terminal_cost_confidence;
+            record.cache_price_impact_usd = cache_price_impact_usd;
+            record.effective_route_limit = effective_route_limit;
         });
         state.enforce_caps(self.summary_quota_bytes);
         self.publish_locked(&state, api_call_id, FlowMutationPhase::Terminal);
@@ -1704,7 +1852,9 @@ impl DashboardFlowStore {
         let mut state = self.lock();
         state.prune_expired(now);
         state.update(api_call_id, |record| {
-            record.phases.stamp_routing(now);
+            record
+                .phases
+                .stamp_routing_at(now, record.started_at.elapsed().as_millis());
         });
         self.publish_locked(&state, api_call_id, FlowMutationPhase::Progress);
     }
@@ -1730,7 +1880,9 @@ impl DashboardFlowStore {
         let mut state = self.lock();
         state.prune_expired(now);
         state.update(id, |record| {
-            record.phases.stamp_first_content_delta(now);
+            record
+                .phases
+                .stamp_first_content_delta_at(now, record.started_at.elapsed().as_millis());
         });
         self.publish_locked(&state, id, FlowMutationPhase::Progress);
     }
@@ -1750,7 +1902,9 @@ impl DashboardFlowStore {
         let mut state = self.lock();
         state.prune_expired(now);
         state.update(id, |record| {
-            record.phases.stamp_stream_end(now);
+            record
+                .phases
+                .stamp_stream_end_at(now, record.started_at.elapsed().as_millis());
         });
         self.publish_locked(&state, id, FlowMutationPhase::Progress);
     }
@@ -1837,6 +1991,8 @@ impl DashboardFlowStore {
             client_label,
             model_requested: Mutex::new(None),
             effective_route_limit: Mutex::new(None),
+            terminal_pricing: Mutex::new((None, TerminalCostConfidence::Unavailable)),
+            terminal_cache_price_impact: Mutex::new(None),
             terminal_metrics: Mutex::new(None),
             abort_hub: abort_hub.clone(),
             abort_token,
@@ -2100,6 +2256,10 @@ pub struct TelemetryGuard {
     /// Conservative candidate-set context floor discovered during routing. Multiple
     /// tool-loop turns retain the smallest observed positive limit.
     effective_route_limit: Mutex<Option<i64>>,
+    /// Price result prepared immediately before finalize and committed in the same
+    /// FlowStore mutation as status/timing/usage.
+    terminal_pricing: Mutex<(Option<f64>, TerminalCostConfidence)>,
+    terminal_cache_price_impact: Mutex<Option<f64>>,
     /// D5 R3 (MEDIUM): the metrics inputs the engine records at the terminal seam,
     /// assembled at finalize from the guard's OWN evict-safe sources — the captured
     /// `endpoint` + the shared `ServingToken` (which carries the resolved
@@ -2178,6 +2338,31 @@ impl TelemetryGuard {
         *stored = Some(stored.map_or(limit, |current| current.min(limit)));
     }
 
+    /// Snapshot the final served identity and raw usage for terminal-time pricing.
+    pub fn terminal_pricing_basis(&self) -> (Option<String>, Option<FlowUsage>) {
+        self.serving.metrics_snapshot()
+    }
+
+    /// Stage the terminal-time price before [`finalize`](Self::finalize). The CAS-winning
+    /// finalize persists it atomically with the terminal record and metrics payload.
+    pub fn set_terminal_pricing(&self, cost_usd: Option<f64>, confidence: TerminalCostConfidence) {
+        *self
+            .terminal_pricing
+            .lock()
+            .expect("telemetry guard terminal-pricing lock poisoned") = (
+            cost_usd.filter(|cost| cost.is_finite() && *cost >= 0.0),
+            confidence,
+        );
+    }
+
+    pub fn set_terminal_cache_price_impact(&self, impact_usd: Option<f64>) {
+        *self
+            .terminal_cache_price_impact
+            .lock()
+            .expect("telemetry guard terminal cache-impact lock poisoned") =
+            impact_usd.filter(|impact| impact.is_finite());
+    }
+
     /// The metrics inputs the guard assembled at finalize (D5 R3 MEDIUM), or `None` if
     /// the guard has not finalized yet. Once the guard finalizes this is always `Some`
     /// — it is built from the guard's OWN sources (claim-captured endpoint + the shared
@@ -2241,6 +2426,14 @@ impl TelemetryGuard {
                 .effective_route_limit
                 .lock()
                 .expect("telemetry guard route-limit lock poisoned");
+            let (cost_usd, cost_confidence) = *self
+                .terminal_pricing
+                .lock()
+                .expect("telemetry guard terminal-pricing lock poisoned");
+            let cache_price_impact_usd = *self
+                .terminal_cache_price_impact
+                .lock()
+                .expect("telemetry guard terminal cache-impact lock poisoned");
             *self
                 .terminal_metrics
                 .lock()
@@ -2254,8 +2447,9 @@ impl TelemetryGuard {
                     usage,
                     attempts: attempts.clone(),
                     failure_reason,
-                    cost_usd: None,
-                    cost_confidence: TerminalCostConfidence::Unavailable,
+                    cost_usd,
+                    cost_confidence,
+                    cache_price_impact_usd,
                     effective_route_limit,
                 });
             // Snapshot the final attempt body before taking the store lock. The FlowStore
@@ -2271,6 +2465,10 @@ impl TelemetryGuard {
                 attempts,
                 first_upstream_byte_ms,
                 pending_response_body,
+                cost_usd,
+                cost_confidence,
+                cache_price_impact_usd,
+                effective_route_limit,
             );
             // D6: drop the kill token from the AbortHub on the SAME CAS-winning path
             // that finalizes the record — so EVERY terminal (explicit Completed/Failed
@@ -3405,7 +3603,9 @@ mod tests {
             model: Some("served-m".to_string()),
             start_ms: 100,
             end_ms: 200,
+            duration_ms: Some(100),
             first_upstream_byte_ms: byte_ms,
+            first_upstream_byte_offset_ms: byte_ms.map(|byte| byte.saturating_sub(100)),
             status: AttemptStatus::Served,
             error_class: None,
             failover_reason: None,
@@ -3418,7 +3618,9 @@ mod tests {
             model: Some("m".to_string()),
             start_ms: 10,
             end_ms: 50,
+            duration_ms: Some(40),
             first_upstream_byte_ms: None,
+            first_upstream_byte_offset_ms: None,
             status: AttemptStatus::Failed,
             error_class: Some(class),
             failover_reason: Some(AttemptFailoverReason::ProviderFailed),
@@ -3748,6 +3950,9 @@ mod tests {
         let guard = store
             .engine_guard("api_1", Arc::clone(&token), &AbortHub::new())
             .expect("claim");
+        guard.set_effective_route_limit(Some(8_192));
+        guard.set_terminal_pricing(Some(0.125), TerminalCostConfidence::Confident);
+        guard.set_terminal_cache_price_impact(Some(-0.025));
         guard.finalize(FlowStatus::Completed, None);
 
         // (1) The record carries the full trace + the served attempt's wire first-byte.
@@ -3756,12 +3961,24 @@ mod tests {
         assert_eq!(record.attempts[0].status, AttemptStatus::Failed);
         assert_eq!(record.attempts[1].status, AttemptStatus::Served);
         assert_eq!(record.first_upstream_byte_ms, Some(220));
+        assert_eq!(record.terminal_cost_usd, Some(0.125));
+        assert_eq!(
+            record.terminal_cost_confidence,
+            TerminalCostConfidence::Confident
+        );
+        assert_eq!(record.cache_price_impact_usd, Some(-0.025));
+        assert_eq!(record.effective_route_limit, Some(8_192));
+        let summary = SnapshotFlowSummary::from_record(&record);
+        assert_eq!(summary.terminal_cost_usd, Some(0.125));
+        assert_eq!(summary.effective_route_limit, Some(8_192));
 
         // (2) The evict-safe terminal payload carries the SAME attempts (spec 12's source).
         let inputs = guard.terminal_metrics().expect("terminal metrics");
         assert_eq!(inputs.attempts.len(), 2);
         assert_eq!(inputs.attempts[0].provider.as_deref(), Some("primary"));
         assert_eq!(inputs.attempts[1].provider.as_deref(), Some("backup"));
+        assert_eq!(inputs.cost_usd, Some(0.125));
+        assert_eq!(inputs.cache_price_impact_usd, Some(-0.025));
     }
 
     #[test]
@@ -4777,25 +4994,15 @@ mod tests {
     }
 
     #[test]
-    fn phase_stamp_clamps_monotonic_against_backwards_clock() {
-        // PhaseTimings::stamp clamps a value UP to the latest prior phase, so even if
-        // the wall clock steps backwards between seams the bundle stays monotonic.
+    fn phase_stamp_preserves_backwards_clock_for_unavailable_duration() {
         let mut p = PhaseTimings::default();
         p.stamp_ingress(1_000);
         p.stamp_normalization(900); // clock went backwards
-        assert_eq!(
-            p.normalization_done_ms,
-            Some(1_000),
-            "a backwards clock is clamped up to the prior phase floor"
-        );
+        assert_eq!(p.normalization_done_ms, Some(900));
         p.stamp_routing(2_000);
         assert_eq!(p.routing_decision_ms, Some(2_000));
         p.stamp_first_content_delta(1_500); // backwards again
-        assert_eq!(
-            p.first_content_delta_ms,
-            Some(2_000),
-            "clamped to the latest (routing) floor"
-        );
+        assert_eq!(p.first_content_delta_ms, Some(1_500));
     }
 
     #[test]
@@ -4837,11 +5044,20 @@ mod tests {
                 "unmeasured phase `{field}` must be ABSENT, not serialized: {json}"
             );
         }
-        // And there is no `:0` masquerading as a phase value (the sentinel we forbid).
-        assert!(
-            !json.contains("_ms\":0"),
-            "no phase serialized as the zero sentinel: {json}"
-        );
+        // The ingress monotonic offset is a genuine measured zero. No unmeasured phase
+        // offset is serialized as that sentinel.
+        for field in [
+            "normalization_done_offset_ms",
+            "routing_decision_offset_ms",
+            "first_content_delta_offset_ms",
+            "stream_end_offset_ms",
+            "finalize_offset_ms",
+        ] {
+            assert!(
+                !json.contains(field),
+                "unmeasured offset `{field}` must be absent"
+            );
+        }
     }
 
     #[test]

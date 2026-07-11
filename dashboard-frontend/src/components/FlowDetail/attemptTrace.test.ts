@@ -30,6 +30,21 @@ const SERVED_B: Attempt = {
 };
 
 describe('attemptTrace — failover chain', () => {
+  it('prefers monotonic duration and first-byte offset over disordered display epochs', () => {
+    const node = attemptTrace([{
+      ...SERVED_B,
+      start_ms: T + 500,
+      end_ms: T + 100,
+      first_upstream_byte_ms: T + 50,
+      duration_ms: 42,
+      first_upstream_byte_offset_ms: 7,
+    }]).nodes[0]!;
+    expect(node.durationMs).toBe(42);
+    expect(node.firstByte.valueMs).toBe(7);
+    expect(node.disordered).toBe(false);
+    expect(node.firstByte.disordered).toBe(false);
+  });
+
   it('builds one node per attempt, ordered, with the served node marked distinct', () => {
     const trace = attemptTrace([FAILED_A, SERVED_B]);
     expect(trace.hasTrace).toBe(true);
@@ -107,14 +122,14 @@ describe("attemptTrace — don't-lie-with-zeros (the core acceptance)", () => {
     expect(node.firstByte.disordered).toBe(false);
   });
 
-  it('a DISORDERED first byte (byte before start) clamps to 0 + flags skew — NOT a real measured 0', () => {
+  it('a DISORDERED legacy first byte is unavailable and flags skew', () => {
     // first_upstream_byte_ms BEFORE start_ms is impossible — it must be clamped + FLAGGED, not
     // silently reported as a measured `0ms` (the don't-lie-with-zeros MEDIUM on `13c1e5fb`).
     const skewed: Attempt = { ...SERVED_B, start_ms: T + 500, first_upstream_byte_ms: T + 100 };
     const node = attemptTrace([skewed]).nodes[0]!;
-    expect(node.firstByte.valueMs).toBe(0); // clamped, never negative
-    expect(node.firstByte.disordered).toBe(true); // FLAGGED — distinct from a genuine measured 0
-    expect(node.firstByte.quality).toBe('measured'); // the values are real, just out of order
+    expect(node.firstByte.valueMs).toBeNull();
+    expect(node.firstByte.disordered).toBe(true);
+    expect(node.firstByte.quality).toBe('unavailable');
   });
 
   it('an attempt missing an endpoint ⇒ duration UNAVAILABLE (—), never a fabricated 0', () => {
@@ -132,12 +147,12 @@ describe("attemptTrace — don't-lie-with-zeros (the core acceptance)", () => {
     expect(node.firstByte.valueMs).toBeNull();
   });
 
-  it('clock-disordered endpoints clamp the duration to 0 + flag disordered (never negative)', () => {
+  it('clock-disordered legacy endpoints make duration unavailable and flag disorder', () => {
     const disordered: Attempt = { ...FAILED_A, start_ms: T + 500, end_ms: T + 100 };
     const node = attemptTrace([disordered]).nodes[0]!;
-    expect(node.durationMs).toBe(0);
+    expect(node.durationMs).toBeNull();
     expect(node.disordered).toBe(true);
-    expect(node.durationQuality).toBe('measured');
+    expect(node.durationQuality).toBe('unavailable');
   });
 
   it('a blank/whitespace provider or model normalizes to null (renders — , not empty)', () => {

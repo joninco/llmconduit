@@ -16,19 +16,13 @@
  * line, so the breakdown is not mouse-only overall.
  */
 import { useId, useRef, useState } from 'react';
-import type { FlowSummary, ModelPrice } from '../../api/types';
+import type { FlowSummary } from '../../api/types';
 import { fmtTokens } from './format';
 import { tokenEconomics, type EconValue, type TokenEconomics } from './tokenEconomics';
 import { cn } from '../../lib/cn';
 
-export function TokensCell({
-  flow,
-  priceTable,
-}: {
-  flow: FlowSummary;
-  priceTable: Record<string, ModelPrice>;
-}) {
-  const econ = tokenEconomics(flow, priceTable);
+export function TokensCell({ flow }: { flow: FlowSummary }) {
+  const econ = tokenEconomics(flow);
   const tokensIn = flow.usage?.prompt;
   const tokensOut = flow.usage?.completion;
   // A popover is worth offering only when there is usage to break down.

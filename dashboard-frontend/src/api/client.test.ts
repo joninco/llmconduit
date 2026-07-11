@@ -130,7 +130,7 @@ describe('DashboardClient — fatal root contracts', () => {
       onFatal,
       fetchImpl: async () => new Response('{}', {
         status: 200,
-        headers: { 'X-LLMConduit-Dashboard-Schema': '2' },
+        headers: { 'X-LLMConduit-Dashboard-Schema': '3' },
       }),
     });
 
@@ -145,7 +145,7 @@ describe('DashboardClient — fatal root contracts', () => {
       onFatal,
       fetchImpl: async () => new Response(JSON.stringify({ totals: { requests: 'not-a-number' } }), {
         status: 200,
-        headers: { 'X-LLMConduit-Dashboard-Schema': '2' },
+        headers: { 'X-LLMConduit-Dashboard-Schema': '3' },
       }),
     });
 

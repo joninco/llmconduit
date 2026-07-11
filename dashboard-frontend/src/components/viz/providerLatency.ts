@@ -27,7 +27,7 @@ import type { AttemptErrorClass, ProviderErrorDistribution, ProviderLatency } fr
 import { ATTEMPT_ERROR_CLASSES } from '../../api/types';
 
 /** Provenance of a per-provider figure — mirrors the dashboard's measured/derived/unavailable tags. */
-export type Quality = 'measured' | 'derived' | 'estimated' | 'unavailable';
+export type Quality = 'measured' | 'derived' | 'partial' | 'estimated' | 'unavailable';
 
 /** The bounded overflow/sentinel provider keys the metrics layer can emit (spec 12). */
 export const OVERFLOW_PROVIDER_KEY = '__other__';
@@ -160,7 +160,9 @@ export function buildProviderLatency(
 
   // Present ⇒ a real `derived` measurement (`samples >= 1`). Percentiles are `derived`; the error
   // rate is `measured` (a directly-counted failed/total ratio — a real `0%` when all-served).
-  const lat = (ms: number): ProviderFigure => ({ text: fmtProviderLatencyMs(ms), quality: 'derived' });
+  const lat = (ms: number | null): ProviderFigure => ms === null
+    ? UNAVAILABLE_FIGURE
+    : { text: fmtProviderLatencyMs(ms), quality: per.data_quality };
   return {
     available: true,
     providerLabel,
@@ -254,8 +256,8 @@ export function providerNodeEmphasis(per: ProviderLatency | null | undefined): P
   const errorRatePct = per.error_rate;
   const p99Ms = per.p99;
   const errorDegraded = errorRatePct >= DEGRADING_ERROR_RATE_PCT;
-  const latencyDegraded = p99Ms >= DEGRADING_P99_MS;
-  const sizeScale = Math.max(errorSizeScale(errorRatePct), latencySizeScale(p99Ms));
+  const latencyDegraded = p99Ms !== null && p99Ms >= DEGRADING_P99_MS;
+  const sizeScale = Math.max(errorSizeScale(errorRatePct), latencySizeScale(p99Ms ?? 0));
   const state: ProviderEmphasis = errorDegraded || latencyDegraded ? 'degrading' : 'nominal';
   return { state, sizeScale, showErrorRing: errorDegraded, errorRatePct, p99Ms, latencyDegraded };
 }

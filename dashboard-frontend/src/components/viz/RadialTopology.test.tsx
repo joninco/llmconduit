@@ -20,7 +20,7 @@ const NODES: ProviderHealth[] = [
   provider({ id: 'openai', name: 'openai', status: 'down', last_error: '503' }),
 ];
 const EDGES: TopologyEdge[] = [
-  { from: 'gateway', to: 'vllm-a', throughput: 4, tokens_per_sec: 100, cost_per_sec: 0.003 },
+  { from: 'gateway', to: 'vllm-a', attempts_per_sec: 4.1, terminal_flows_per_sec: 4, reported_tokens_per_sec: 100, terminal_cost_per_sec: 0.003 },
 ];
 
 beforeEach(() => {

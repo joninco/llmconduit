@@ -14,16 +14,15 @@
  *  - Cache-hit RATE is `derived` (`cached / prompt`). It is `unavailable` when `cached` is
  *    unreported (you cannot claim a hit rate you did not measure) — NOT counted as a 0% miss.
  *    A reported `cached === 0` is a genuine `0%` (a real miss), distinct from unavailable.
- *  - "$ SAVED" is `derived` and shown ONLY when the served model has a CONFIGURED cached price
- *    (gap-07 `cached_price_configured` PRESENCE flag) AND the cached count is reported. A mere
- *    numeric `cached_per_1k` of `0.0` (the config default for an OMITTED rate) does NOT qualify —
- *    that would fabricate a saving. Absent presence ⇒ the split shows with NO dollar figure.
+ *  - "$ SAVED" is `derived` from the signed cache-price impact persisted by the backend at the
+ *    terminal seam. An absent impact is unavailable; the browser never consults the current price
+ *    table and therefore cannot reprice a historical flow.
  *
  * Cost itself is owned by the backend (`flowModel.flowCost` / the `cost_confidence` tag); this
  * module never re-derives the flow cost. The only `derived` dollar formula here is the documented
- * cache SAVING, which the spec explicitly permits ("`$ saved` `derived`, only when configured").
+ * cache SAVING, which is the negated persisted cost impact.
  */
-import type { FlowSummary, ModelPrice, Usage } from '../../api/types';
+import type { FlowSummary, Usage } from '../../api/types';
 import { fmtCost, fmtTokens } from './format';
 
 /** The data-quality tier of a single token-economics figure (mirrors the cross-cutting rule). */
@@ -68,32 +67,16 @@ function cacheHitRate(usage: Usage): EconValue {
 
 /**
  * The dollars SAVED by serving `cached` prompt tokens at the cached rate instead of the full
- * input rate: `(cached / 1000) * (input_per_1k - cached_per_1k)`. `derived`.
- *
- * Shown ONLY when (spec 08 acceptance):
- *  - the model price exists AND `cached_price_configured` is true (the gap-07 PRESENCE flag) — a
- *    bare numeric `cached_per_1k === 0` from an OMITTED rate does NOT qualify (would fabricate a
- *    saving), and
- *  - the cached count is REPORTED (a finite number) — an unreported class cannot have a saving.
- *
- * A reported `cached === 0` yields a MEASURED `$0.00` saving (a real miss saved nothing), distinct
- * from `unavailable` (`—`). A configured cached rate ABOVE the input rate (pathological) clamps the
- * saving at `0` — caching never costs the operator money in this readout.
+ * input rate. The backend stores cost impact as `(cache rate - input rate) * cached tokens`; this
+ * presentation negates it so positive means saved and negative means caching cost more.
  */
-function cacheSaving(usage: Usage, price: ModelPrice | undefined): EconValue {
-  const cached = usage.cached;
-  // No reported cached count ⇒ no saving to claim.
-  if (cached === null || cached === undefined || !Number.isFinite(cached)) {
+function cacheSaving(cachePriceImpactUsd: number | null | undefined): EconValue {
+  if (cachePriceImpactUsd === null || cachePriceImpactUsd === undefined || !Number.isFinite(cachePriceImpactUsd)) {
     return { value: '—', quality: 'unavailable' };
   }
-  // PRESENCE gate (gap 07): only a CONFIGURED cached price licenses a $ figure — never the
-  // defaulted `0.0`. Without it the split still shows, but with no dollar saving (no fabrication).
-  if (!price || !price.cached_price_configured) {
-    return { value: '—', quality: 'unavailable' };
-  }
-  const perK = Math.max(0, price.input_per_1k - price.cached_per_1k);
-  const saved = (Math.max(0, cached) / 1000) * perK;
-  return { value: fmtCost(saved), quality: 'derived' };
+  // The backend persists signed COST impact (cache rate - input rate). Negate it for
+  // the existing "$ saved" presentation; a cache rate above input becomes negative saving.
+  return { value: fmtCost(-cachePriceImpactUsd), quality: 'derived' };
 }
 
 /**
@@ -123,16 +106,12 @@ export interface TokenEconomics {
  * ⇒ every figure is `unavailable` (`—`), never a fabricated `0`. The price for the SERVED model
  * (the model actually billed) gates the `$ saved` figure via its `cached_price_configured` flag.
  */
-export function tokenEconomics(
-  flow: FlowSummary,
-  priceTable: Record<string, ModelPrice>,
-): TokenEconomics {
+export function tokenEconomics(flow: FlowSummary): TokenEconomics {
   const usage = flow.usage ?? null;
-  const model = flow.model_served ?? flow.model_requested ?? null;
-  const price = model ? priceTable[model] : undefined;
-  const cachedPriceConfigured = price?.cached_price_configured ?? false;
+  const calculationUsage = flow.normalized_usage ?? usage;
+  const cachedPriceConfigured = Number.isFinite(flow.cache_price_impact_usd);
 
-  if (!usage) {
+  if (!usage || !calculationUsage) {
     const na: EconValue = { value: '—', quality: 'unavailable' };
     return {
       prompt: na,
@@ -150,8 +129,8 @@ export function tokenEconomics(
     completion: tokenClass(usage.completion),
     cached: tokenClass(usage.cached),
     reasoning: tokenClass(usage.reasoning),
-    cacheHit: cacheHitRate(usage),
-    saved: cacheSaving(usage, price),
+    cacheHit: cacheHitRate(calculationUsage),
+    saved: cacheSaving(flow.cache_price_impact_usd),
     cachedPriceConfigured,
   };
 }
@@ -213,7 +192,6 @@ export interface CacheAggregateRow {
 export function aggregateCacheByKey(
   flows: FlowSummary[],
   keyOf: (flow: FlowSummary) => string | null | undefined,
-  priceTable: Record<string, ModelPrice>,
 ): CacheAggregateRow[] {
   const groups = new Map<string, CacheAggregate>();
 
@@ -242,7 +220,7 @@ export function aggregateCacheByKey(
     // would let a group with [confident cached + non-confident unreported] render as fully confident.
     if (flow.cost_confidence !== 'confident') agg.confident = false;
 
-    const usage = flow.usage ?? null;
+    const usage = flow.normalized_usage ?? flow.usage ?? null;
     const cached = usage?.cached;
     // A flow contributes to the hit rate ONLY when it reported a finite cached count.
     if (usage && cached !== null && cached !== undefined && Number.isFinite(cached)) {
@@ -250,12 +228,9 @@ export function aggregateCacheByKey(
       agg.cachedTokens += Math.max(0, cached);
       if (Number.isFinite(usage.prompt)) agg.promptTokens += Math.max(0, usage.prompt);
 
-      // $ saved contribution: only with a CONFIGURED cached price (presence), never the default 0.0.
-      const model = flow.model_served ?? flow.model_requested ?? null;
-      const price = model ? priceTable[model] : undefined;
-      if (price && price.cached_price_configured) {
-        const perK = Math.max(0, price.input_per_1k - price.cached_per_1k);
-        agg.savedDollars += (Math.max(0, cached) / 1000) * perK;
+      // Terminal-time signed impact is authoritative; never reprice this flow in the browser.
+      if (Number.isFinite(flow.cache_price_impact_usd)) {
+        agg.savedDollars += -(flow.cache_price_impact_usd ?? 0);
         agg.savedConfigured = true;
       }
     }

@@ -10,7 +10,7 @@
 - **`MetricsLayer`** (line 1113): aggregated request stats + coordinated snapshot store.
   - `MetricsLayer::new()` (line 1132): enabled instance with full snapshot quota.
   - `MetricsLayer::disabled()` (line 1142): zero-overhead no-op when `--with-debug-ui` is off.
-- Three ring buffers at 1 s resolution: 1m (60 slots), 5m (300 slots), 1h (3600 slots). Each slot is a `Bucket` keyed by `{status_class, model, endpoint, upstream}` with a 30-bucket log-spaced latency histogram and summed token counters.
+- Three ring buffers at 1 s resolution: 1m (60 slots), 5m (300 slots), 1h (3600 slots). Each slot is keyed by `{status_class, model, endpoint, upstream}` with a fixed 128-bucket logarithmic latency histogram, normalized token counters, anomaly counts, and terminal-time cost.
 - **`record_response`** (line 1168): called once per flow at the engine D3 terminal finalize seam — the single CAS-guarded choke point.
 - **`record_usage`** (line 1191): token counters, same bucket key, called alongside `record_response`.
 - **5-second snapshot task** (line 23): coordinated atomic cut across FlowStore, MetricsLayer, and topology store producing a body-free `DashboardSnapshot` (line 818).

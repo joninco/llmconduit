@@ -68,7 +68,7 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   const fold = useCallback((sample: MetricsResponse) => {
     const t = Math.max(Date.now(), lastStampRef.current + 1);
     lastStampRef.current = t;
-    ringRef.current = appendReqs(ringRef.current, t, sample.reqs_per_sec);
+    ringRef.current = appendReqs(ringRef.current, t, sample.windows.m1.accepted_per_sec);
   }, []);
   const { version } = useMetricStream(fold);
   // `version` is read so this body re-runs after each ring fold; `ringRef.current` is reassigned a

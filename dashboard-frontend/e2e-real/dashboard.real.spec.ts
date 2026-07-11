@@ -5,7 +5,9 @@ const TOKEN = 'real-host-token';
 async function login(page: Page): Promise<void> {
   await page.goto('/dashboard', { waitUntil: 'networkidle' });
   await page.getByLabel(/access token/i).fill(TOKEN);
+  const reloaded = page.waitForNavigation({ waitUntil: 'networkidle' });
   await page.getByRole('button', { name: /sign in/i }).click();
+  await reloaded;
   await expect(page.getByRole('navigation')).toBeVisible();
 }
 
@@ -20,7 +22,7 @@ test('real embedded host: auth, CSP/assets, API flow, WS, seek, logout and relog
 
   await login(page);
   const bootstrap = await page.evaluate(() => window.__LLMCONDUIT_DASHBOARD__);
-  expect(bootstrap).toMatchObject({ authenticated: true, mutations_enabled: true, schema_version: 2 });
+  expect(bootstrap).toMatchObject({ authenticated: true, mutations_enabled: true, schema_version: 3 });
   expect((await page.context().cookies()).some((cookie) => cookie.name === 'llmconduit_session')).toBe(true);
 
   const assetPath = await page.locator('script[type="module"][src]').getAttribute('src');
@@ -49,10 +51,36 @@ test('real embedded host: auth, CSP/assets, API flow, WS, seek, logout and relog
 
   const flowsResponse = await page.request.get('/dashboard/api/flows');
   expect(flowsResponse.status()).toBe(200);
-  expect(flowsResponse.headers()['x-llmconduit-dashboard-schema']).toBe('2');
+  expect(flowsResponse.headers()['x-llmconduit-dashboard-schema']).toBe('3');
   const flows = await flowsResponse.json();
   expect(flows.flow_seq).toBeGreaterThan(0);
   expect(flows.flows.some((flow: { model_served?: string }) => flow.model_served === 'mock-model')).toBe(true);
+
+  // Reconcile the authenticated server-authored aggregates against the controlled upstream
+  // ledger above: one accepted/successful terminal with exactly 7 prompt + 3 completion tokens.
+  let metrics: { windows: { m1: { accepted_requests: number; terminal_requests: number; successes: number; reported_tokens_per_sec: number | null } } } | null = null;
+  await expect.poll(async () => {
+    const response = await page.request.get('/dashboard/api/metrics');
+    expect(response.headers()['x-llmconduit-dashboard-schema']).toBe('3');
+    metrics = await response.json();
+    return [metrics!.windows.m1.accepted_requests, metrics!.windows.m1.terminal_requests];
+  }).toEqual([1, 1]);
+  const [overviewResponse, topologyResponse] = await Promise.all([
+    page.request.get('/dashboard/api/overview?window=m1'),
+    page.request.get('/dashboard/api/topology'),
+  ]);
+  for (const response of [overviewResponse, topologyResponse]) {
+    expect(response.status()).toBe(200);
+    expect(response.headers()['x-llmconduit-dashboard-schema']).toBe('3');
+  }
+  expect(metrics!.windows.m1.successes).toBe(1);
+  expect(metrics!.windows.m1.reported_tokens_per_sec).toBeGreaterThan(0);
+  const overview = await overviewResponse.json();
+  expect(overview.totals).toMatchObject({ requests: 1, successes: 1, failures: 0, cancellations: 0 });
+  expect(overview.tokens).toMatchObject({ samples: 1, prompt: 7, completion: 3 });
+  const topology = await topologyResponse.json();
+  expect(Array.isArray(topology.nodes)).toBe(true);
+  expect(Array.isArray(topology.edges)).toBe(true);
 
   await page.getByRole('tab', { name: 'Flows' }).click();
   await expect(page.getByTestId('flow-row').filter({ hasText: 'mock-model' }).first()).toBeVisible();

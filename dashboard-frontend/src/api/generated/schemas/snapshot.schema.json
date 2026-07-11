@@ -61,6 +61,15 @@
       "description": "Gap 03 — one upstream dispatch attempt's full provenance: WHICH provider, WHAT model,\nHOW LONG it took, WHEN the first wire byte arrived, and the OUTCOME. The failover loop\nrecords one per provider it tries (failed ones + the served one); a non-failover\n(bare-leaf / single-upstream / routing-with-no-fallback) flow records exactly one.\n\nAll timestamps are MEASURED epoch-ms (`now_ms`). `first_upstream_byte_ms` is the wire\ninstant the attempt's FIRST chunk arrived — `None` when the attempt never received\nresponse headers / a first chunk (a connect/timeout/non-2xx failure), so an unmeasured\nfirst-byte time is `None`, NEVER `0` (don't-lie-with-zeros). `error_class` /\n`failover_reason` are `None` on the served attempt and are BOUNDED taxonomic codes\n(never raw upstream text) on a failed attempt — they ride the body-free summary, so\nraw error bodies stay behind spec 05's gated seam. Snake_case + `skip_serializing_if`\nso a `None` field is absent on the wire.",
       "type": "object",
       "properties": {
+        "duration_ms": {
+          "description": "Monotonic attempt duration. New records always populate this; `None` identifies\nlegacy data that must fall back to an ordered epoch pair or stay unavailable.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
         "end_ms": {
           "description": "Epoch-ms the attempt resolved (served first chunk, or failed). Always measured.",
           "type": "integer",
@@ -91,6 +100,15 @@
         },
         "first_upstream_byte_ms": {
           "description": "Epoch-ms the FIRST chunk arrived on the wire for this attempt. `None` when the\nattempt never received a first chunk (failed before response headers) — NEVER `0`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "first_upstream_byte_offset_ms": {
+          "description": "Monotonic response-header offset from attempt start. Unlike the display epoch,\nthis remains valid across wall-clock adjustments.",
           "type": [
             "integer",
             "null"
@@ -253,6 +271,13 @@
             "$ref": "#/$defs/Attempt"
           }
         },
+        "cache_price_impact_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
         "client_label": {
           "description": "Gap 04 — the STABLE, NON-SECRET client attribution label (key-hash `key-<hex>`\ndisplay id / configured caller-id / User-Agent fallback), projected from the\nflow record/summary. `skip_serializing_if` so an unattributed flow OMITS the key\n(absent ⇒ renders `—`, never a fabricated id). Additive/optional: the frontend\nignores it until the client-attribution UI (gap 15). The raw key is never here —\nonly the one-way hash prefix ever existed as a label.",
           "type": [
@@ -283,6 +308,13 @@
           "description": "Gap 07 — the [`CostConfidence`] of `cost`: `confident` (priced + every billed\nclass has a known rate), `estimated` (a class falls back to the default `0.0`\ncached rate / cached unreported), or `unavailable` (unpriced ⇒ `cost: null`).\nAlways present so the frontend can label an `estimated` figure as such and\ndistinguish an `unavailable` cost from a measured `$0.00`.",
           "$ref": "#/$defs/CostConfidence"
         },
+        "effective_route_limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
         "elapsed_ms": {
           "type": [
             "integer",
@@ -293,6 +325,14 @@
         },
         "finalize_ms": {
           "description": "Terminal finalize — stamped when the flow reaches its terminal state\n(`finalize`), for EVERY terminal (completed, failed, cancelled). Always `Some`\nonce the flow is terminal; the right edge of the waterfall.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "finalize_offset_ms": {
           "type": [
             "integer",
             "null"
@@ -317,6 +357,14 @@
           "format": "uint128",
           "minimum": 0
         },
+        "first_content_delta_offset_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
         "first_upstream_byte_ms": {
           "description": "Gap 10b — the gap-03 flow-level wire time-to-first-byte (the served attempt's first\non-wire chunk). Distinct from `first_content_delta_ms` (the first content delta to\nthe CLIENT). `None` ⇒ absent ⇒ renders `—` downstream, NEVER `0`.",
           "type": [
@@ -328,6 +376,15 @@
         },
         "ingress_ms": {
           "description": "Request ingress — when the FlowStore first `open`ed the record (≈ `started_ms`).\nAlways `Some` once a record exists; the explicit phase value the waterfall\nanchors the other phases against.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "ingress_offset_ms": {
+          "description": "Monotonic offset from flow ingress. Present on newly captured records; legacy\nsnapshots without offsets continue to use ordered epoch timestamps as fallback.",
           "type": [
             "integer",
             "null"
@@ -359,6 +416,25 @@
           "format": "uint128",
           "minimum": 0
         },
+        "normalization_done_offset_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "normalized_usage": {
+          "description": "Calculation-only corrected usage; raw provider values remain in `usage`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FlowUsage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "response_id": {
           "type": [
             "string",
@@ -380,6 +456,14 @@
           "format": "uint128",
           "minimum": 0
         },
+        "routing_decision_offset_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
         "started_ms": {
           "type": "integer",
           "format": "uint128",
@@ -390,6 +474,14 @@
         },
         "stream_end_ms": {
           "description": "Stream completion — stamped when `run_turn` finishes emitting the terminal\n`response.completed`/`response.incomplete`. `None` if the flow errored or was\ncancelled mid-stream.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "stream_end_offset_ms": {
           "type": [
             "integer",
             "null"
@@ -421,6 +513,11 @@
               "type": "null"
             }
           ]
+        },
+        "usage_anomaly_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "required": [
@@ -429,6 +526,8 @@
         "method",
         "uri",
         "usage",
+        "normalized_usage",
+        "usage_anomaly_count",
         "status",
         "started_ms",
         "cost",
@@ -484,79 +583,185 @@
         "total"
       ]
     },
+    "MetricQuality": {
+      "type": "string",
+      "enum": [
+        "measured",
+        "partial",
+        "unavailable"
+      ]
+    },
     "MetricWindow": {
       "description": "One sliding-window metric tile. Same fields as the headline tile.\n\n`samples` is the count of TERMINAL (finalized) flows that fell in the window —\nthe data-quality signal the frontend uses to tell a genuine measured `0` from an\n`unavailable` gap (gap 01 / \"don't lie with zeros\"). When `samples == 0` the\nlatency/tok-s/cost/error-% fields are NOT measurable (no finalized flow fed them),\nso the strip renders them `—`; `reqs_per_sec` (a genuine `0` for an idle window)\nand `active_streams` (live open-flow count) stay numeric. The field is a finite\n`u64`, so it never violates the frozen finite-number wire contract.",
       "type": "object",
       "properties": {
-        "active_streams": {
+        "accepted_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "accepted_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "active_streams_now": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cancellation_pct": {
+          "type": "number",
+          "format": "double"
+        },
+        "cancellations": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0
         },
         "cost_confidence": {
-          "description": "Gap 07 — the aggregate [`CostConfidence`](crate::dashboard_api::CostConfidence)\nof this window's `cost_per_min`. `unavailable` when nothing in the window is\npriced (`priced_samples == 0` ⇒ `cost_per_min` renders `—`); `estimated` when\nANY priced bucket would bill cached tokens at the default `0.0` (cached `> 0` or\nUNREPORTED against a model with no configured cache rate) — no silently-confident\ntotal; `confident` only when every priced bucket's billed classes have known\nrates. Surfaced so the strip can LABEL an estimated cost as such.",
           "$ref": "#/$defs/CostConfidence"
         },
         "cost_per_min": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "failure_pct": {
           "type": "number",
           "format": "double"
         },
-        "error_pct": {
+        "failures": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "latency_overflow_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "latency_quality": {
+          "$ref": "#/$defs/MetricQuality"
+        },
+        "latency_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_relative_error": {
           "type": "number",
           "format": "double"
         },
-        "p50": {
-          "type": "number",
+        "observed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "p50_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
-        "p95": {
-          "type": "number",
+        "p95_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
-        "p99": {
-          "type": "number",
+        "p99_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "priced_samples": {
-          "description": "Count of usage-bearing terminal flows whose served model has a configured price\n(gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no\nPRICED usage in the window ⇒ `cost_per_min` renders `—`, distinguishing an\nunpriced model from a genuine measured `$0.00`. All three are finite `u64`s, so\nthey never violate the frozen finite-number wire contract.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0
         },
-        "reqs_per_sec": {
-          "type": "number",
+        "quantile_method": {
+          "$ref": "#/$defs/QuantileMethod"
+        },
+        "reported_tokens_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
-        "samples": {
-          "description": "Terminal-flow sample count in this window (the measured/unavailable signal for\nlatency + error-%). `0` ⇒ no finalized flow fed the latency/error fields ⇒ they\nrender `—`.",
+        "successes": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0
         },
-        "tokens_per_sec": {
+        "terminal_per_sec": {
           "type": "number",
           "format": "double"
+        },
+        "terminal_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "usage_anomaly_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         },
         "usage_samples": {
-          "description": "Count of those terminal flows that reported token usage (gap 01 review round 1,\nfinding 3) — the SEPARATE `tokens_per_sec` measurability denominator. Token and\ncost availability are NOT the same as `samples`: a window can have `samples > 0`\nyet `usage_samples == 0` (every finalized flow omitted usage), in which case\n`tokens_per_sec`/`cost_per_min` are unmeasurable and render `—`, never a fake `0`.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "warm": {
+          "type": "boolean"
+        },
+        "window_seconds": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0
         }
       },
       "required": [
-        "reqs_per_sec",
-        "active_streams",
-        "error_pct",
-        "p50",
-        "p95",
-        "p99",
-        "tokens_per_sec",
-        "cost_per_min",
-        "samples",
+        "window_seconds",
+        "observed_seconds",
+        "warm",
+        "accepted_requests",
+        "accepted_per_sec",
+        "terminal_requests",
+        "terminal_per_sec",
+        "successes",
+        "failures",
+        "failure_pct",
+        "cancellations",
+        "cancellation_pct",
+        "active_streams_now",
+        "latency_samples",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "quantile_method",
+        "max_relative_error",
+        "latency_overflow_count",
+        "latency_quality",
         "usage_samples",
+        "reported_tokens_per_sec",
+        "usage_anomaly_count",
         "priced_samples",
+        "cost_per_min",
         "cost_confidence"
+      ]
+    },
+    "MetricWindowName": {
+      "type": "string",
+      "enum": [
+        "m1"
       ]
     },
     "MetricWindows": {
@@ -583,62 +788,15 @@
       "description": "The full `/api/metrics`-shaped snapshot body (the flat tile + the three\nwindows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live\n[`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.",
       "type": "object",
       "properties": {
-        "active_streams": {
+        "generated_at_ms": {
           "type": "integer",
-          "format": "uint64",
+          "format": "uint128",
           "minimum": 0
         },
-        "cost_confidence": {
-          "description": "Headline (`m1`) aggregate cost confidence (gap 07), mirrored from\n`windows.m1.cost_confidence` — so the headline `$/min` is labelled estimated\nwhen any priced bucket bills cached at the default `0.0`.",
-          "$ref": "#/$defs/CostConfidence"
-        },
-        "cost_per_min": {
-          "type": "number",
-          "format": "double"
-        },
-        "error_pct": {
-          "type": "number",
-          "format": "double"
+        "headline_window": {
+          "$ref": "#/$defs/MetricWindowName"
         },
         "metrics_seq": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "p50": {
-          "type": "number",
-          "format": "double"
-        },
-        "p95": {
-          "type": "number",
-          "format": "double"
-        },
-        "p99": {
-          "type": "number",
-          "format": "double"
-        },
-        "priced_samples": {
-          "description": "Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability\ndenominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "reqs_per_sec": {
-          "type": "number",
-          "format": "double"
-        },
-        "samples": {
-          "description": "Terminal-flow sample count of the headline (`m1`) window — the\nmeasured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.",
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "tokens_per_sec": {
-          "type": "number",
-          "format": "double"
-        },
-        "usage_samples": {
-          "description": "Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability\ndenominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).",
           "type": "integer",
           "format": "uint64",
           "minimum": 0
@@ -649,18 +807,8 @@
       },
       "required": [
         "metrics_seq",
-        "reqs_per_sec",
-        "active_streams",
-        "error_pct",
-        "p50",
-        "p95",
-        "p99",
-        "tokens_per_sec",
-        "cost_per_min",
-        "samples",
-        "usage_samples",
-        "priced_samples",
-        "cost_confidence",
+        "generated_at_ms",
+        "headline_window",
         "windows"
       ]
     },
@@ -757,17 +905,26 @@
         },
         "p50": {
           "description": "`derived` p50 attempt latency (ms).",
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "p95": {
           "description": "`derived` p95 attempt latency (ms).",
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "p99": {
           "description": "`derived` p99 attempt latency (ms).",
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "provider": {
@@ -804,7 +961,8 @@
       "description": "Gap 12 — the data-quality tag for a per-provider metric. Every per-provider latency\nfigure is `derived` (computed from the provider's own attempt-latency histogram). The\n`unavailable` case (a provider with no in-window samples) is represented by the\nABSENCE of a [`ProviderLatency`] entirely, not by a variant here — so a present DTO is\nalways a real `derived` measurement (don't-lie-with-zeros). Serializes snake_case to\nmatch the cross-cutting DQ-tag contract.",
       "type": "string",
       "enum": [
-        "derived"
+        "derived",
+        "partial"
       ]
     },
     "ProviderStatus": {
@@ -814,6 +972,12 @@
         "healthy",
         "cooling",
         "down"
+      ]
+    },
+    "QuantileMethod": {
+      "type": "string",
+      "enum": [
+        "log_histogram_nearest_rank"
       ]
     },
     "SeqCursors": {
@@ -896,31 +1060,42 @@
       "description": "A topology edge (gateway → provider). The aggregate throughput/token/cost\nrates are D5/D13 roll-ups; until a price/throughput aggregation feeds them\nthey serialize as `0.0` (the contract requires the keys present + finite, not\na specific value), so the byte-shape is exact while the rich values land in\nD13.",
       "type": "object",
       "properties": {
-        "cost_per_sec": {
+        "attempts_per_sec": {
           "type": "number",
           "format": "double"
         },
         "from": {
           "type": "string"
         },
-        "throughput": {
+        "reported_tokens_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "terminal_cost_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "terminal_flows_per_sec": {
           "type": "number",
           "format": "double"
         },
         "to": {
           "type": "string"
-        },
-        "tokens_per_sec": {
-          "type": "number",
-          "format": "double"
         }
       },
       "required": [
         "from",
         "to",
-        "throughput",
-        "tokens_per_sec",
-        "cost_per_sec"
+        "attempts_per_sec",
+        "terminal_flows_per_sec",
+        "reported_tokens_per_sec",
+        "terminal_cost_per_sec"
       ]
     },
     "TopologyNode": {

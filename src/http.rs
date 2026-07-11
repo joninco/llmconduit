@@ -238,7 +238,8 @@ async fn dashboard_api_no_store(response: Response) -> Response {
     let mut response = crate::dashboard_auth::no_store(response);
     response.headers_mut().insert(
         axum::http::HeaderName::from_static(crate::dashboard_contracts::DASHBOARD_SCHEMA_HEADER),
-        HeaderValue::from_static("2"),
+        HeaderValue::from_str(&crate::dashboard_contracts::DASHBOARD_SCHEMA_VERSION.to_string())
+            .expect("dashboard schema version is a valid header value"),
     );
     response
 }
@@ -599,13 +600,14 @@ async fn log_api_call(
             dashboard_client_header().as_deref(),
         );
         let headers_redacted = crate::dashboard_flow::redact_headers(&headers);
-        gateway.flow_store().open(
+        gateway.flow_store().open_and_record_accepted(
             api_call_id.clone(),
             method.to_string(),
             uri.path().to_string(),
             headers_redacted,
             inbound_body,
             client,
+            gateway.metrics(),
         );
         gateway.flow_store().middleware_guard(&api_call_id)
     } else {

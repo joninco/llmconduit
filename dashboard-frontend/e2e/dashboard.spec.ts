@@ -30,7 +30,7 @@ test.describe('Argus dashboard', () => {
 
     // tok/s + $/min + active are the fields the OLD WS tile hard-coded to 0 — they must
     // now carry real values (the mock seeds them > 0), proving live flows reach the strip.
-    for (const key of ['active_streams', 'tokens_per_sec', 'cost_per_min', 'reqs_per_sec']) {
+    for (const key of ['active_streams_now', 'reported_tokens_per_sec', 'cost_per_min', 'accepted_per_sec']) {
       const value = page.getByTestId(`chip-${key}`).getByTestId('chip-value');
       await expect(value).toBeVisible();
       const text = (await value.textContent())?.trim() ?? '';
@@ -43,10 +43,10 @@ test.describe('Argus dashboard', () => {
     // is fully measured, so directly-counted metrics read `measured`, sample-derived ones
     // `derived`, and the priced cost `estimated` (labelled as such, per the plan).
     const quality = (key: string) => page.getByTestId(`chip-${key}`).getAttribute('data-quality');
-    expect(await quality('reqs_per_sec')).toBe('measured');
-    expect(await quality('active_streams')).toBe('measured');
-    expect(await quality('p50')).toBe('derived');
-    expect(await quality('tokens_per_sec')).toBe('derived');
+    expect(await quality('accepted_per_sec')).toBe('measured');
+    expect(await quality('active_streams_now')).toBe('measured');
+    expect(await quality('p50_ms')).toBe('derived');
+    expect(await quality('reported_tokens_per_sec')).toBe('derived');
     expect(await quality('cost_per_min')).toBe('estimated');
 
     expect(consoleErrors, 'console errors on the stats strip').toEqual([]);
@@ -97,7 +97,7 @@ test.describe('Argus dashboard', () => {
 
     // api_001 is served by llama-3.1-70b (catalog context_limit 131072) + reports usage → the
     // inspector gauge reads a DERIVED utilization, not `—`.
-    const known = page.getByTestId('flow-row').filter({ hasText: '/v1/responses' }).first();
+    const known = page.getByTestId('flow-row').filter({ hasText: 'llama-3.1-70b' }).filter({ hasText: '2xx' }).first();
     await known.click();
     await expect(page.getByTestId('flow-detail')).toBeVisible();
     const gauge = page.getByTestId('context-gauge');
@@ -675,7 +675,7 @@ test.describe('Argus dashboard', () => {
 
     // Restore both: click the chrome strip; drag the drawer splitter back down.
     await page.getByTestId('shell-chrome-strip').click();
-    await expect(page.getByTestId('chip-reqs_per_sec')).toBeVisible();
+    await expect(page.getByTestId('chip-accepted_per_sec')).toBeVisible();
     const d2 = (await page.getByTestId('split-drawer').boundingBox())!;
     await page.mouse.move(d2.x + 400, d2.y + 1);
     await page.mouse.down();

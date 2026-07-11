@@ -21,6 +21,24 @@ function seg(model: ReturnType<typeof latencyBreakdown>, id: string) {
 }
 
 describe('latencyBreakdown — honest per-flow phase decomposition (gap 10)', () => {
+  it('prefers monotonic phase offsets when display epochs are disordered', () => {
+    const m = latencyBreakdown(flow({
+      ingress_ms: T,
+      normalization_done_ms: T - 10,
+      first_content_delta_ms: T - 20,
+      stream_end_ms: T - 30,
+      ingress_offset_ms: 0,
+      normalization_done_offset_ms: 12,
+      first_content_delta_offset_ms: 40,
+      stream_end_offset_ms: 140,
+      usage: { prompt: 1, completion: 10, total: 11 },
+    }));
+    expect(seg(m, 'queue')).toMatchObject({ durationMs: 12, quality: 'measured', disordered: false });
+    expect(seg(m, 'generation')).toMatchObject({ durationMs: 100, quality: 'measured', disordered: false });
+    expect(m.ttft).toMatchObject({ valueMs: 40, quality: 'measured' });
+    expect(m.rate.tokensPerSec).toBe(100);
+  });
+
   it('all phases present ⇒ a full breakdown with correct measured sub-durations', () => {
     const f = flow({
       started_ms: T,
@@ -157,18 +175,15 @@ describe('latencyBreakdown — honest per-flow phase decomposition (gap 10)', ()
     expect(seg(m, 'upstream')).toMatchObject({ durationMs: 160, quality: 'measured' }); // routing(100)→TTFB(260)
   });
 
-  it('disordered timestamps (end < start) clamp to 0 + flag, NEVER negative', () => {
-    // routing BEFORE normalization (clock skew) ⇒ the routing segment clamps to 0 + disordered.
+  it('disordered timestamps (end < start) are unavailable, never measured zero', () => {
     const m = latencyBreakdown(
       flow({ ingress_ms: T, normalization_done_ms: T + 100, routing_decision_ms: T + 40 }),
       [],
     );
     const routing = seg(m, 'routing');
-    expect(routing.durationMs).toBe(0); // clamped, NOT -60
+    expect(routing.durationMs).toBeNull();
     expect(routing.disordered).toBe(true);
-    expect(routing.durationMs).toBeGreaterThanOrEqual(0);
-    // The clamped 0 is a REAL (disordered) segment, distinct from unavailable.
-    expect(routing.quality).not.toBe('unavailable');
+    expect(routing.quality).toBe('unavailable');
   });
 
   it('a genuine measured ~0ms phase is DISTINCT from unavailable (0 vs null)', () => {

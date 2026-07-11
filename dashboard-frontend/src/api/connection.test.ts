@@ -21,6 +21,8 @@ function flowPayload(over: Partial<FlowStatusPayload> = {}): FlowStatusPayload {
     model_served: 'm',
     upstream_target: 'u',
     usage: null,
+    normalized_usage: null,
+    usage_anomaly_count: 0,
     started_ms: 1000,
     elapsed_ms: 5,
     cost: null,
@@ -77,7 +79,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     // Prime snapshot so live frames apply.
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 2,
+      schema_version: 3,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [], metrics: null, topology: null,
     });
@@ -97,7 +99,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const spy = vi.spyOn(queryClient, 'invalidateQueries');
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 2,
+      schema_version: 3,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [], metrics: null, topology: null,
     });
@@ -114,20 +116,26 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 2,
+      schema_version: 3,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [], metrics: null, topology: null,
     });
     const spy = vi.spyOn(queryClient, 'invalidateQueries');
     // A minimal valid `metric_tick` (the per-domain validator requires the full shape).
     const w = {
-      reqs_per_sec: 1, active_streams: 0, error_pct: 0, p50: 10, p95: 20, p99: 30,
-      tokens_per_sec: 5, cost_per_min: 0, samples: 1, usage_samples: 1, priced_samples: 1,
+      window_seconds: 60, observed_seconds: 60, warm: true,
+      accepted_requests: 1,
+      accepted_per_sec: 1, active_streams_now: 0, failure_pct: 0, p50_ms: 10, p95_ms: 20, p99_ms: 30,
+      terminal_requests: 1, terminal_per_sec: 1, successes: 1, failures: 0,
+      cancellations: 0, cancellation_pct: 0,
+      quantile_method: 'log_histogram_nearest_rank' as const, max_relative_error: 0.062,
+      latency_overflow_count: 0, latency_quality: 'measured' as const, usage_anomaly_count: 0,
+      reported_tokens_per_sec: 5, cost_per_min: 0, latency_samples: 1, usage_samples: 1, priced_samples: 1,
       cost_confidence: 'estimated' as const,
     };
     socket.applyFrame({
       domain: 'metrics', seq: 1,
-      batch: [{ type: 'metric_tick', ...w, windows: { m1: w, m5: w, h1: w } }],
+      batch: [{ type: 'metric_tick', generated_at_ms: 1000, headline_window: 'm1', windows: { m1: w, m5: w, h1: w } }],
     });
     // One publisher tick advances the global strip, every mounted exact Overview scope, and the
     // compatibility /topology provider join together.
@@ -140,7 +148,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 2,
+      schema_version: 3,
       cursors: { flow_seq: 5, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [], metrics: null, topology: null,
     });
@@ -157,7 +165,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 2,
+      schema_version: 3,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
       flows: [], metrics: null, topology: null,
     });
@@ -177,7 +185,7 @@ describe('teardownSession — clears cache + resets stores + disconnects WS (fin
     queryClient.setQueryData(queryKeys.flows, { flows: [], total: 0, flow_seq: 1 });
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 2,
+      schema_version: 3,
       cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 5 },
       flows: [], metrics: null, topology: null,
     });
@@ -239,7 +247,7 @@ describe('connection — fatal REST roots surface through dashboardStore', () =>
       authenticated: true,
       csrf_token: 'csrf',
       mutations_enabled: false,
-      schema_version: 2,
+      schema_version: 3,
     };
   });
   afterEach(() => {
@@ -252,7 +260,7 @@ describe('connection — fatal REST roots surface through dashboardStore', () =>
   it('turns a REST contract failure into the explicit fatal shell state', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', {
       status: 200,
-      headers: { 'X-LLMConduit-Dashboard-Schema': '2' },
+      headers: { 'X-LLMConduit-Dashboard-Schema': '3' },
     })));
     const { client } = getConnection();
 

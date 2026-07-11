@@ -5918,32 +5918,34 @@ async fn d13_metrics_shape_carries_seq_and_windows() {
         body["metrics_seq"].is_u64(),
         "metrics carries its domain cursor"
     );
-    for field in [
-        "reqs_per_sec",
-        "active_streams",
-        "error_pct",
-        "p50",
-        "p95",
-        "p99",
-        "tokens_per_sec",
-        "cost_per_min",
-    ] {
-        assert!(body[field].is_number(), "metrics headline tile has {field}");
-    }
+    assert_eq!(body["headline_window"], serde_json::json!("m1"));
+    assert!(
+        body.get("reqs_per_sec").is_none(),
+        "v3 has no duplicated headline fields"
+    );
     for window in ["m1", "m5", "h1"] {
         let tile = &body["windows"][window];
         assert!(tile.is_object(), "windows.{window} present");
         for field in [
-            "reqs_per_sec",
-            "active_streams",
-            "error_pct",
-            "p50",
-            "p95",
-            "p99",
-            "tokens_per_sec",
-            "cost_per_min",
+            "accepted_per_sec",
+            "terminal_per_sec",
+            "active_streams_now",
+            "failure_pct",
+            "cancellation_pct",
         ] {
             assert!(tile[field].is_number(), "windows.{window} has {field}");
+        }
+        for field in [
+            "p50_ms",
+            "p95_ms",
+            "p99_ms",
+            "reported_tokens_per_sec",
+            "cost_per_min",
+        ] {
+            assert!(
+                tile[field].is_number() || tile[field].is_null(),
+                "windows.{window} has nullable {field}"
+            );
         }
     }
 }
@@ -6634,16 +6636,11 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
         metrics["metrics_seq"].as_u64().unwrap() > 0,
         "the finalized flow advanced metrics_seq"
     );
-    // Gap 07: the headline + m1 window carry the aggregate cost confidence (confident —
-    // the only priced bucket bills cached at a configured rate).
-    assert_eq!(
-        metrics["cost_confidence"],
-        serde_json::json!("confident"),
-        "aggregate cost confidence rides the metrics body"
-    );
+    // The v3 headline is the named m1 window; no values are duplicated at top level.
     assert_eq!(
         metrics["windows"]["m1"]["cost_confidence"],
-        serde_json::json!("confident")
+        serde_json::json!("confident"),
+        "aggregate cost confidence rides the headline window"
     );
 
     // The exact Overview is fed by the same evict-safe terminal payload and retains
@@ -6751,7 +6748,7 @@ async fn d13_historical_snapshot_active_streams_is_frozen_to_the_cut() {
     // The historical `?at=` reflects the FROZEN cut: 1 active stream.
     let snapshot = d13_json(d13_get(&app, &format!("/dashboard/api/snapshot?at={at}")).await).await;
     assert_eq!(
-        snapshot["metrics"]["active_streams"],
+        snapshot["metrics"]["windows"]["m1"]["active_streams_now"],
         serde_json::json!(1),
         "historical snapshot active_streams is the FROZEN cut's open count (1), not now"
     );
@@ -6759,7 +6756,7 @@ async fn d13_historical_snapshot_active_streams_is_frozen_to_the_cut() {
     // The LIVE `/metrics` reflects NOW: the flow finalized, so 0 active streams.
     let metrics = d13_json(d13_get(&app, "/dashboard/api/metrics").await).await;
     assert_eq!(
-        metrics["active_streams"],
+        metrics["windows"]["m1"]["active_streams_now"],
         serde_json::json!(0),
         "live metrics active_streams reflects the finalized flow (0), proving the \
          snapshot's 1 came from the cut, not the live store"

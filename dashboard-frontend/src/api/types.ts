@@ -100,20 +100,26 @@ export const CLIENT_SOURCES: readonly ClientSource[] = ['key_hash', 'configured_
 export interface PhaseTimings {
   /** Request ingress (≈ `started_ms`); the left edge the waterfall anchors against. */
   ingress_ms?: number | null;
+  ingress_offset_ms?: number | null;
   /** Inbound→canonical normalization settled. Absent if the flow errored pre-normalization. */
   normalization_done_ms?: number | null;
+  normalization_done_offset_ms?: number | null;
   /** Upstream routing/lowering decision committed. Absent if the flow never reached the wire. */
   routing_decision_ms?: number | null;
+  routing_decision_offset_ms?: number | null;
   /**
    * True client TTFT — the first canonical **content** SSE delta to the client (NOT reasoning,
    * tool-argument, refusal, or signature deltas). Absent if the flow errored before any content.
    * When present ⇒ the breakdown labels TTFT **measured**.
    */
   first_content_delta_ms?: number | null;
+  first_content_delta_offset_ms?: number | null;
   /** Stream completion (terminal `response.completed`/`incomplete`). Absent on a mid-stream error. */
   stream_end_ms?: number | null;
+  stream_end_offset_ms?: number | null;
   /** Terminal finalize (every terminal: completed/failed/cancelled); the right edge. */
   finalize_ms?: number | null;
+  finalize_offset_ms?: number | null;
 }
 
 /** Gap 03 — one upstream dispatch attempt's outcome (Rust `AttemptStatus`, snake_case). */
@@ -167,8 +173,8 @@ export const ATTEMPT_FAILOVER_REASONS: readonly AttemptFailoverReason[] = [
  * provider's own attempt-latency histogram). The `unavailable` case (no in-window samples)
  * is the ABSENCE of the whole `ProviderLatency`, not a variant here.
  */
-export type ProviderMetricQuality = 'derived';
-export const PROVIDER_METRIC_QUALITIES: readonly ProviderMetricQuality[] = ['derived'];
+export type ProviderMetricQuality = 'derived' | 'partial';
+export const PROVIDER_METRIC_QUALITIES: readonly ProviderMetricQuality[] = ['derived', 'partial'];
 
 /**
  * Gap 12 — the bounded per-error-class failure tally for one provider (Rust
@@ -213,11 +219,11 @@ export interface ProviderLatency {
   /** Of `samples`, the count that FAILED before serving (failed primaries included). */
   failed: number;
   /** `derived` p50 attempt latency (ms). */
-  p50: number;
+  p50: number | null;
   /** `derived` p95 attempt latency (ms). */
-  p95: number;
+  p95: number | null;
   /** `derived` p99 attempt latency (ms). */
-  p99: number;
+  p99: number | null;
   /** Percentage of attempts that failed (`failed / samples × 100`); a MEASURED `0.0` is real. */
   error_rate: number;
   /** Bounded per-class failure tally (gap 03 taxonomy); absent classes omitted. */
@@ -241,8 +247,12 @@ export interface Attempt {
   start_ms: number;
   /** Epoch-ms the attempt resolved (served first chunk, or failed). Always measured. */
   end_ms: number;
+  /** Monotonic duration; absent only on legacy snapshots. */
+  duration_ms?: number | null;
   /** Epoch-ms the FIRST wire chunk arrived for this attempt; `null`/absent when none did (never `0`). */
   first_upstream_byte_ms?: number | null;
+  /** Monotonic response-header offset from this attempt's start. */
+  first_upstream_byte_offset_ms?: number | null;
   status: AttemptStatus;
   error_class?: AttemptErrorClass | null;
   failover_reason?: AttemptFailoverReason | null;
@@ -425,64 +435,39 @@ export interface UsagePayload {
 
 /** Sliding-window metric tiles (mirrors `/dashboard/api/metrics`, sans cursor). */
 export interface MetricWindow {
-  reqs_per_sec: number;
-  active_streams: number;
-  error_pct: number;
-  p50: number;
-  p95: number;
-  p99: number;
-  tokens_per_sec: number;
-  cost_per_min: number;
-  /**
-   * Count of TERMINAL (finalized) flows in this window — the data-quality signal for
-   * LATENCY + error-% (gap 01). When `samples === 0` the latency/error-% fields were
-   * never MEASURED (no finalized flow fed them), so the strip renders them `unavailable`
-   * (`—`); `reqs_per_sec` (a genuine `0` for an idle window) and `active_streams` (live
-   * open-flow count) stay numeric. A finite `u64` on the wire.
-   */
-  samples: number;
-  /**
-   * Count of those terminal flows that reported token usage (gap 01 review round 1,
-   * finding 3) — the SEPARATE `tokens_per_sec` measurability denominator. Token/cost
-   * availability is NOT the same as `samples`: a window can have `samples > 0` yet
-   * `usage_samples === 0` (every finalized flow omitted usage), and then `tokens_per_sec`
-   * is unmeasurable → it renders `—`, NEVER a fabricated `0`. A finite `u64`.
-   */
+  window_seconds: number;
+  observed_seconds: number;
+  warm: boolean;
+  accepted_requests: number;
+  accepted_per_sec: number;
+  terminal_requests: number;
+  terminal_per_sec: number;
+  successes: number;
+  failures: number;
+  failure_pct: number;
+  cancellations: number;
+  cancellation_pct: number;
+  active_streams_now: number;
+  latency_samples: number;
+  p50_ms: number | null;
+  p95_ms: number | null;
+  p99_ms: number | null;
+  quantile_method: 'log_histogram_nearest_rank';
+  max_relative_error: number;
+  latency_overflow_count: number;
+  latency_quality: 'measured' | 'partial' | 'unavailable';
   usage_samples: number;
-  /**
-   * Count of usage-bearing terminal flows whose served model has a configured price
-   * (gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no PRICED
-   * usage in the window ⇒ `cost_per_min` renders `—`, distinguishing an unpriced model
-   * from a genuine measured `$0.00`. A finite `u64`.
-   */
+  reported_tokens_per_sec: number | null;
+  usage_anomaly_count?: number;
   priced_samples: number;
-  /**
-   * Gap 07 — the AGGREGATE confidence of this window's `cost_per_min`. `unavailable` when
-   * nothing is priced (`cost_per_min` renders `—`); `estimated` when ANY priced bucket bills
-   * cached at the default `0.0` (no silently-confident total — labelled in the strip);
-   * `confident` only when every priced bucket's billed classes have known rates.
-   */
+  cost_per_min: number | null;
   cost_confidence: CostConfidence;
 }
 
 export interface MetricTickPayload {
   type: 'metric_tick';
-  reqs_per_sec: number;
-  active_streams: number;
-  error_pct: number;
-  p50: number;
-  p95: number;
-  p99: number;
-  tokens_per_sec: number;
-  cost_per_min: number;
-  /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
-  samples: number;
-  /** Headline (`m1`) usage-sample count — the tok/s denominator (finding 3). */
-  usage_samples: number;
-  /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
-  priced_samples: number;
-  /** Headline (`m1`) aggregate cost confidence (gap 07) — labels the headline `$/min`. */
-  cost_confidence: CostConfidence;
+  generated_at_ms: number;
+  headline_window: 'm1';
   windows: {
     m1: MetricWindow;
     m5: MetricWindow;
@@ -628,6 +613,11 @@ export interface FlowSummary extends PhaseTimings {
   model_served?: string | null;
   upstream_target?: string | null;
   usage?: Usage | null;
+  /** Corrected calculation copy; `usage` above remains the raw provider report. */
+  normalized_usage?: Usage | null;
+  usage_anomaly_count?: number;
+  effective_route_limit?: number | null;
+  cache_price_impact_usd?: number | null;
   status: FlowStatus;
   started_ms: number;
   finished_ms?: number | null;
@@ -700,6 +690,7 @@ export type OverviewTokens = import('./generated/contracts').OverviewTokens;
 export type OverviewDimensionRollup = import('./generated/contracts').OverviewDimensionRollup;
 export type OverviewContextRollup = import('./generated/contracts').OverviewContextRollup;
 export type OverviewCostPoint = import('./generated/contracts').OverviewCostPoint;
+export type OverviewLaneRollup = import('./generated/contracts').OverviewLaneRollup;
 export type OverviewResponse = import('./generated/contracts').OverviewResponse;
 
 /** `GET /dashboard/api/overview` query. `at` selects the nearest retained historical cut. */
@@ -755,6 +746,10 @@ export interface FlowDetail extends PhaseTimings {
   model_served?: string | null;
   upstream_target?: string | null;
   usage?: Usage | null;
+  normalized_usage?: Usage | null;
+  usage_anomaly_count?: number;
+  effective_route_limit?: number | null;
+  cache_price_impact_usd?: number | null;
   status: FlowStatus;
   /**
    * Monitor-domain cursor of the single transcript snapshot that produced `deltas`.
@@ -806,22 +801,8 @@ export interface FlowUpstreamResponse {
 /** `GET /dashboard/api/metrics` */
 export interface MetricsResponse {
   metrics_seq: number;
-  reqs_per_sec: number;
-  active_streams: number;
-  error_pct: number;
-  p50: number;
-  p95: number;
-  p99: number;
-  tokens_per_sec: number;
-  cost_per_min: number;
-  /** Headline (`m1`) terminal-flow sample count — mirrors `windows.m1.samples`. */
-  samples: number;
-  /** Headline (`m1`) usage-sample count — the tok/s denominator (finding 3). */
-  usage_samples: number;
-  /** Headline (`m1`) priced-usage-sample count — the $/min denominator (finding 3). */
-  priced_samples: number;
-  /** Headline (`m1`) aggregate cost confidence (gap 07) — labels the headline `$/min`. */
-  cost_confidence: CostConfidence;
+  generated_at_ms: number;
+  headline_window: 'm1';
   windows: {
     m1: MetricWindow;
     m5: MetricWindow;
@@ -832,9 +813,10 @@ export interface MetricsResponse {
 export interface TopologyEdge {
   from: string;
   to: string;
-  throughput: number;
-  tokens_per_sec: number;
-  cost_per_sec: number;
+  attempts_per_sec: number;
+  terminal_flows_per_sec: number;
+  reported_tokens_per_sec: number | null;
+  terminal_cost_per_sec: number | null;
 }
 
 export interface ModelPrice {
@@ -961,6 +943,9 @@ function isNullableStr(v: unknown): v is string | null {
 function isNullableUint(v: unknown): v is number | null {
   return v === null || isUint(v);
 }
+function isNullableNum(v: unknown): v is number | null {
+  return v === null || isNum(v);
+}
 
 const DOMAINS: readonly Domain[] = ['flow', 'metrics', 'topology', 'monitor'];
 export function isDomain(v: unknown): v is Domain {
@@ -982,8 +967,8 @@ export function isAttempt(v: unknown): v is Attempt {
   return (
     isObj(v) &&
     isOptStr(v.provider) && isOptStr(v.model) &&
-    isUint(v.start_ms) && isUint(v.end_ms) &&
-    isOptUint(v.first_upstream_byte_ms) &&
+    isUint(v.start_ms) && isUint(v.end_ms) && isOptUint(v.duration_ms) &&
+    isOptUint(v.first_upstream_byte_ms) && isOptUint(v.first_upstream_byte_offset_ms) &&
     isOneOf(v.status, ATTEMPT_STATUSES) &&
     (v.error_class === undefined || v.error_class === null || isOneOf(v.error_class, ATTEMPT_ERROR_CLASSES)) &&
     (v.failover_reason === undefined || v.failover_reason === null || isOneOf(v.failover_reason, ATTEMPT_FAILOVER_REASONS))
@@ -1005,11 +990,17 @@ function isOptAttempts(v: unknown): boolean {
 function isOptPhaseTimings(v: Record<string, unknown>): boolean {
   return (
     isOptUint(v.ingress_ms) &&
+    isOptUint(v.ingress_offset_ms) &&
     isOptUint(v.normalization_done_ms) &&
+    isOptUint(v.normalization_done_offset_ms) &&
     isOptUint(v.routing_decision_ms) &&
+    isOptUint(v.routing_decision_offset_ms) &&
     isOptUint(v.first_content_delta_ms) &&
+    isOptUint(v.first_content_delta_offset_ms) &&
     isOptUint(v.stream_end_ms) &&
-    isOptUint(v.finalize_ms)
+    isOptUint(v.stream_end_offset_ms) &&
+    isOptUint(v.finalize_ms) &&
+    isOptUint(v.finalize_offset_ms)
   );
 }
 
@@ -1031,14 +1022,16 @@ function isOptUsage(v: unknown): boolean {
 
 function isMetricWindow(v: unknown): v is MetricWindow {
   return (
-    isObj(v) && isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-    // The three per-metric measurability denominators are non-negative integer counts
-    // (gap 01): `samples` (latency/error), `usage_samples` (tok/s), `priced_samples`
-    // ($/min). All REQUIRED — the Rust tile always emits them.
-    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
-    // Gap 07: the aggregate cost-confidence tag is REQUIRED on every window.
-    isCostConfidence(v.cost_confidence)
+    isObj(v) && isUint(v.window_seconds) && isUint(v.observed_seconds) && typeof v.warm === 'boolean' &&
+    isUint(v.accepted_requests) && isNum(v.accepted_per_sec) &&
+    isUint(v.terminal_requests) && isNum(v.terminal_per_sec) &&
+    isUint(v.successes) && isUint(v.failures) && isNum(v.failure_pct) &&
+    isUint(v.cancellations) && isNum(v.cancellation_pct) && isUint(v.active_streams_now) &&
+    isUint(v.latency_samples) && isNullableNum(v.p50_ms) && isNullableNum(v.p95_ms) && isNullableNum(v.p99_ms) &&
+    v.quantile_method === 'log_histogram_nearest_rank' && isNum(v.max_relative_error) &&
+    isUint(v.latency_overflow_count) && isOneOf(v.latency_quality, ['measured', 'partial', 'unavailable'] as const) &&
+    isUint(v.usage_samples) && isNullableNum(v.reported_tokens_per_sec) && isUint(v.usage_anomaly_count) &&
+    isUint(v.priced_samples) && isNullableNum(v.cost_per_min) && isCostConfidence(v.cost_confidence)
   );
 }
 function isMetricWindows(v: unknown): boolean {
@@ -1070,7 +1063,7 @@ export function isProviderLatency(v: unknown): v is ProviderLatency {
     isStr(v.provider) &&
     isOneOf(v.data_quality, PROVIDER_METRIC_QUALITIES) &&
     isUint(v.samples) && isUint(v.served) && isUint(v.failed) &&
-    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.error_rate) &&
+    isNullableNum(v.p50) && isNullableNum(v.p95) && isNullableNum(v.p99) && isNum(v.error_rate) &&
     isProviderErrorDistribution(v.errors)
   );
 }
@@ -1111,7 +1104,9 @@ function isProviderHealth(v: unknown): v is ProviderHealth {
   );
 }
 function isTopologyEdge(v: unknown): v is TopologyEdge {
-  return isObj(v) && isStr(v.from) && isStr(v.to) && isNum(v.throughput) && isNum(v.tokens_per_sec) && isNum(v.cost_per_sec);
+  return isObj(v) && isStr(v.from) && isStr(v.to) &&
+    isNum(v.attempts_per_sec) && isNum(v.terminal_flows_per_sec) &&
+    isNullableNum(v.reported_tokens_per_sec) && isNullableNum(v.terminal_cost_per_sec);
 }
 
 /** Validates a complete `ModelPrice` with FINITE numbers (rejects NaN/Inf/missing) — finding 4.
@@ -1226,10 +1221,7 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
       );
     case 'metric_tick':
       return (
-        isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-        isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-        isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
-        isCostConfidence(v.cost_confidence) && isMetricWindows(v.windows)
+        isUint(v.generated_at_ms) && v.headline_window === 'm1' && isMetricWindows(v.windows)
       );
     case 'flow_status':
       return (
@@ -1271,7 +1263,8 @@ export function isFlowSummary(v: unknown): v is FlowSummary {
     isStr(v.api_call_id) && isOptStr(v.response_id) &&
     isStr(v.method) && isStr(v.uri) &&
     isOptStr(v.model_requested) && isOptStr(v.model_served) && isOptStr(v.upstream_target) &&
-    isOptUsage(v.usage) &&
+    isOptUsage(v.usage) && isOptUsage(v.normalized_usage) && isUint(v.usage_anomaly_count) &&
+    isOptNum(v.effective_route_limit) && isOptNum(v.cache_price_impact_usd) &&
     isOneOf(v.status, FLOW_STATUSES) &&
     isUint(v.started_ms) && isOptUint(v.finished_ms) && isOptUint(v.elapsed_ms) &&
     isOptStr(v.terminal_reason) && (v.cost === undefined || v.cost === null || isNum(v.cost)) &&
@@ -1296,10 +1289,7 @@ function isOptClientSource(v: unknown): boolean {
 export function isMetricsResponse(v: unknown): v is MetricsResponse {
   return (
     isObj(v) && isUint(v.metrics_seq) &&
-    isNum(v.reqs_per_sec) && isNum(v.active_streams) && isNum(v.error_pct) &&
-    isNum(v.p50) && isNum(v.p95) && isNum(v.p99) && isNum(v.tokens_per_sec) && isNum(v.cost_per_min) &&
-    isUint(v.samples) && isUint(v.usage_samples) && isUint(v.priced_samples) &&
-    isCostConfidence(v.cost_confidence) && isMetricWindows(v.windows)
+    isUint(v.generated_at_ms) && v.headline_window === 'm1' && isMetricWindows(v.windows)
   );
 }
 

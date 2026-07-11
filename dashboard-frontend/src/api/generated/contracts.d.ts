@@ -35,6 +35,17 @@ export type FlowStatus = "open" | "completed" | "failed" | "cancelled";
  * one is deliberately absent until such a seam exists (spec 04 / Codex review).
  */
 export type ClientSource = "key_hash" | "configured_header" | "user_agent";
+export type MetricWindowName = "m1";
+/**
+ * Gap 07 — the CONFIDENCE tier of a flow's `cost`, so an operator can tell a trusted
+ * figure from a best-effort estimate from an honest gap. Emitted alongside `cost` on
+ * every flow row + detail (and aggregated onto the metrics windows). Serializes
+ * snake_case to mirror the data-quality vocabulary the frontend already uses
+ * (`measured`/`derived`/`estimated`/`unavailable`).
+ */
+export type CostConfidence = "confident" | "estimated" | "unavailable";
+export type MetricQuality = "measured" | "partial" | "unavailable";
+export type QuantileMethod = "log_histogram_nearest_rank";
 /**
  * Confidence attached to a terminal-time price. This lives with the evict-safe
  * terminal payload (rather than the REST projection) so historical overview cuts keep
@@ -101,6 +112,7 @@ export type DashboardPayload =
        * `attempts?` is absent), matching the body-free summary's wire shape.
        */
       attempts?: Attempt[];
+      cache_price_impact_usd?: number | null;
       /**
        * Gap 04 — the STABLE, NON-SECRET client attribution label (key-hash `key-<hex>`
        * display id / configured caller-id / User-Agent fallback), projected from the
@@ -122,13 +134,14 @@ export type DashboardPayload =
        */
       cost: number | null;
       /**
-       * Gap 07 — the [`CostConfidence`] of `cost`: `confident` (priced + every billed
-       * class has a known rate), `estimated` (a class falls back to the default `0.0`
-       * cached rate / cached unreported), or `unavailable` (unpriced ⇒ `cost: null`).
-       * Always present so the frontend can label an `estimated` figure as such and
-       * distinguish an `unavailable` cost from a measured `$0.00`.
+       * Gap 07 — the CONFIDENCE tier of a flow's `cost`, so an operator can tell a trusted
+       * figure from a best-effort estimate from an honest gap. Emitted alongside `cost` on
+       * every flow row + detail (and aggregated onto the metrics windows). Serializes
+       * snake_case to mirror the data-quality vocabulary the frontend already uses
+       * (`measured`/`derived`/`estimated`/`unavailable`).
        */
       cost_confidence: "confident" | "estimated" | "unavailable";
+      effective_route_limit?: number | null;
       elapsed_ms?: number | null;
       /**
        * Terminal finalize — stamped when the flow reaches its terminal state
@@ -136,6 +149,7 @@ export type DashboardPayload =
        * once the flow is terminal; the right edge of the waterfall.
        */
       finalize_ms?: number | null;
+      finalize_offset_ms?: number | null;
       finished_ms?: number | null;
       /**
        * True TTFT — the wall-clock instant the FIRST canonical **content** SSE delta was
@@ -145,6 +159,7 @@ export type DashboardPayload =
        * before any content delta.
        */
       first_content_delta_ms?: number | null;
+      first_content_delta_offset_ms?: number | null;
       /**
        * Gap 10b — the gap-03 flow-level wire time-to-first-byte (the served attempt's first
        * on-wire chunk). Distinct from `first_content_delta_ms` (the first content delta to
@@ -157,6 +172,11 @@ export type DashboardPayload =
        * anchors the other phases against.
        */
       ingress_ms?: number | null;
+      /**
+       * Monotonic offset from flow ingress. Present on newly captured records; legacy
+       * snapshots without offsets continue to use ordered epoch timestamps as fallback.
+       */
+      ingress_offset_ms?: number | null;
       method: string;
       model_requested?: string | null;
       model_served?: string | null;
@@ -166,6 +186,11 @@ export type DashboardPayload =
        * normalization (an extractor/JSON rejection caught by the L0 guard).
        */
       normalization_done_ms?: number | null;
+      normalization_done_offset_ms?: number | null;
+      /**
+       * Calculation-only corrected usage; raw provider values remain in `usage`.
+       */
+      normalized_usage: FlowUsage | null;
       phase: FlowMutationPhase;
       response_id?: string | null;
       /**
@@ -178,6 +203,7 @@ export type DashboardPayload =
        * reached the wire (pre-spawn lowering/budget failure, replay-only).
        */
       routing_decision_ms?: number | null;
+      routing_decision_offset_ms?: number | null;
       started_ms: number;
       status: FlowStatus;
       /**
@@ -186,11 +212,13 @@ export type DashboardPayload =
        * cancelled mid-stream.
        */
       stream_end_ms?: number | null;
+      stream_end_offset_ms?: number | null;
       terminal_reason?: string | null;
       type: "flow_status";
       upstream_target?: string | null;
       uri: string;
       usage: FlowUsage | null;
+      usage_anomaly_count: number;
     }
   | {
       edges: TopologyEdge[];
@@ -330,6 +358,7 @@ export interface FlowDetailBody {
    * attempt OMITS the key (matches the frontend's optional `attempts?`).
    */
   attempts?: Attempt[];
+  cache_price_impact_usd?: number | null;
   cost: number | null;
   /**
    * Gap 07 — the [`CostConfidence`] of `cost` (confident/estimated/unavailable),
@@ -346,6 +375,7 @@ export interface FlowDetailBody {
    * repeated or same-millisecond content.
    */
   deltas_through_monitor_seq: number;
+  effective_route_limit?: number | null;
   elapsed_ms?: number | null;
   /**
    * Terminal finalize — stamped when the flow reaches its terminal state
@@ -353,6 +383,7 @@ export interface FlowDetailBody {
    * once the flow is terminal; the right edge of the waterfall.
    */
   finalize_ms?: number | null;
+  finalize_offset_ms?: number | null;
   finished_ms?: number | null;
   /**
    * True TTFT — the wall-clock instant the FIRST canonical **content** SSE delta was
@@ -362,6 +393,7 @@ export interface FlowDetailBody {
    * before any content delta.
    */
   first_content_delta_ms?: number | null;
+  first_content_delta_offset_ms?: number | null;
   /**
    * Gap 10b — the gap-03 flow-level wire time-to-first-byte (the served attempt's first
    * on-wire chunk). Distinct from `first_content_delta_ms` (first content delta to the
@@ -385,6 +417,11 @@ export interface FlowDetailBody {
    * anchors the other phases against.
    */
   ingress_ms?: number | null;
+  /**
+   * Monotonic offset from flow ingress. Present on newly captured records; legacy
+   * snapshots without offsets continue to use ordered epoch timestamps as fallback.
+   */
+  ingress_offset_ms?: number | null;
   model_requested?: string | null;
   model_served?: string | null;
   /**
@@ -393,12 +430,14 @@ export interface FlowDetailBody {
    * normalization (an extractor/JSON rejection caught by the L0 guard).
    */
   normalization_done_ms?: number | null;
+  normalization_done_offset_ms?: number | null;
   /**
    * The captured CANONICAL/normalized body (D2), parsed. Absent when evicted.
    */
   normalized?: {
     [k: string]: unknown;
   };
+  normalized_usage: FlowUsage | null;
   response_id?: string | null;
   revision: number;
   /**
@@ -407,6 +446,7 @@ export interface FlowDetailBody {
    * reached the wire (pre-spawn lowering/budget failure, replay-only).
    */
   routing_decision_ms?: number | null;
+  routing_decision_offset_ms?: number | null;
   started_ms: number;
   status: FlowStatus;
   /**
@@ -415,6 +455,7 @@ export interface FlowDetailBody {
    * cancelled mid-stream.
    */
   stream_end_ms?: number | null;
+  stream_end_offset_ms?: number | null;
   terminal_reason?: string | null;
   /**
    * The captured UPSTREAM on-wire chat body (D2), parsed. Absent when evicted.
@@ -437,6 +478,7 @@ export interface FlowDetailBody {
   upstream_response?: FlowUpstreamResponse | null;
   upstream_target?: string | null;
   usage: FlowUsage | null;
+  usage_anomaly_count: number;
 }
 /**
  * Gap 03 — one upstream dispatch attempt's full provenance: WHICH provider, WHAT model,
@@ -455,6 +497,11 @@ export interface FlowDetailBody {
  */
 export interface Attempt {
   /**
+   * Monotonic attempt duration. New records always populate this; `None` identifies
+   * legacy data that must fall back to an ordered epoch pair or stay unavailable.
+   */
+  duration_ms?: number | null;
+  /**
    * Epoch-ms the attempt resolved (served first chunk, or failed). Always measured.
    */
   end_ms: number;
@@ -471,6 +518,11 @@ export interface Attempt {
    * attempt never received a first chunk (failed before response headers) — NEVER `0`.
    */
   first_upstream_byte_ms?: number | null;
+  /**
+   * Monotonic response-header offset from attempt start. Unlike the display epoch,
+   * this remains valid across wall-clock adjustments.
+   */
+  first_upstream_byte_offset_ms?: number | null;
   /**
    * The model actually sent on the wire for this attempt (post provider-remap), when
    * known. `None` when the attempt failed before the on-wire model was finalized.
@@ -502,6 +554,36 @@ export interface FlowDelta {
   payload?: unknown;
   sequence: number;
   ts_ms?: number | null;
+}
+/**
+ * Token usage attached to a flow once the upstream response reports it.
+ *
+ * Gap 07 — usage CONFIDENCE. `prompt`/`completion`/`total` are the core counts the
+ * upstream always reports. `cached`/`reasoning` are OPTIONAL token classes the
+ * upstream may or may not break out: a `0` and "the upstream never reported this
+ * class" are DIFFERENT facts. They are therefore `Option<i64>` — `Some(0)` is a
+ * provider-reported zero (e.g. "0 cache hits this turn"), `None` is UNAVAILABLE
+ * (the upstream omitted `prompt_tokens_details`/`completion_tokens_details`). Serialized
+ * with `skip_serializing_if` so an unreported class is ABSENT on the wire (the
+ * frontend renders `—`), never a fabricated `0` (don't-lie-with-zeros). The
+ * distinction is load-bearing for cost confidence: a `cached` charge against a
+ * model with no configured cache rate (or an unreported `cached`) is `estimated`,
+ * not `confident`.
+ */
+export interface FlowUsage {
+  /**
+   * Cache-read prompt tokens. `Some(n)` measured (incl. a reported `0`); `None`
+   * when the upstream did not report a cached breakdown (UNAVAILABLE, not `0`).
+   */
+  cached?: number | null;
+  completion: number;
+  prompt: number;
+  /**
+   * Reasoning (thinking) tokens. `Some(n)` measured (incl. a reported `0`); `None`
+   * when the upstream did not report reasoning details (UNAVAILABLE, not `0`).
+   */
+  reasoning?: number | null;
+  total: number;
 }
 /**
  * Gap 05 — the captured upstream RESPONSE/ERROR body projected onto the live
@@ -536,36 +618,6 @@ export interface FlowUpstreamResponse {
   truncated: boolean;
 }
 /**
- * Token usage attached to a flow once the upstream response reports it.
- *
- * Gap 07 — usage CONFIDENCE. `prompt`/`completion`/`total` are the core counts the
- * upstream always reports. `cached`/`reasoning` are OPTIONAL token classes the
- * upstream may or may not break out: a `0` and "the upstream never reported this
- * class" are DIFFERENT facts. They are therefore `Option<i64>` — `Some(0)` is a
- * provider-reported zero (e.g. "0 cache hits this turn"), `None` is UNAVAILABLE
- * (the upstream omitted `prompt_tokens_details`/`completion_tokens_details`). Serialized
- * with `skip_serializing_if` so an unreported class is ABSENT on the wire (the
- * frontend renders `—`), never a fabricated `0` (don't-lie-with-zeros). The
- * distinction is load-bearing for cost confidence: a `cached` charge against a
- * model with no configured cache rate (or an unreported `cached`) is `estimated`,
- * not `confident`.
- */
-export interface FlowUsage {
-  /**
-   * Cache-read prompt tokens. `Some(n)` measured (incl. a reported `0`); `None`
-   * when the upstream did not report a cached breakdown (UNAVAILABLE, not `0`).
-   */
-  cached?: number | null;
-  completion: number;
-  prompt: number;
-  /**
-   * Reasoning (thinking) tokens. `Some(n)` measured (incl. a reported `0`); `None`
-   * when the upstream did not report reasoning details (UNAVAILABLE, not `0`).
-   */
-  reasoning?: number | null;
-  total: number;
-}
-/**
  * `GET /dashboard/api/flows` — the paged flow list + total + the FlowStore
  * domain cursor. Matches the frozen `FlowsResponse`.
  */
@@ -597,6 +649,7 @@ export interface FlowRow {
    * `attempts?` is absent), matching the body-free summary's wire shape.
    */
   attempts?: Attempt[];
+  cache_price_impact_usd?: number | null;
   /**
    * Gap 04 — the STABLE, NON-SECRET client attribution label (key-hash `key-<hex>`
    * display id / configured caller-id / User-Agent fallback), projected from the
@@ -625,6 +678,7 @@ export interface FlowRow {
    * distinguish an `unavailable` cost from a measured `$0.00`.
    */
   cost_confidence: "confident" | "estimated" | "unavailable";
+  effective_route_limit?: number | null;
   elapsed_ms?: number | null;
   /**
    * Terminal finalize — stamped when the flow reaches its terminal state
@@ -632,6 +686,7 @@ export interface FlowRow {
    * once the flow is terminal; the right edge of the waterfall.
    */
   finalize_ms?: number | null;
+  finalize_offset_ms?: number | null;
   finished_ms?: number | null;
   /**
    * True TTFT — the wall-clock instant the FIRST canonical **content** SSE delta was
@@ -641,6 +696,7 @@ export interface FlowRow {
    * before any content delta.
    */
   first_content_delta_ms?: number | null;
+  first_content_delta_offset_ms?: number | null;
   /**
    * Gap 10b — the gap-03 flow-level wire time-to-first-byte (the served attempt's first
    * on-wire chunk). Distinct from `first_content_delta_ms` (the first content delta to
@@ -653,6 +709,11 @@ export interface FlowRow {
    * anchors the other phases against.
    */
   ingress_ms?: number | null;
+  /**
+   * Monotonic offset from flow ingress. Present on newly captured records; legacy
+   * snapshots without offsets continue to use ordered epoch timestamps as fallback.
+   */
+  ingress_offset_ms?: number | null;
   method: string;
   model_requested?: string | null;
   model_served?: string | null;
@@ -662,6 +723,11 @@ export interface FlowRow {
    * normalization (an extractor/JSON rejection caught by the L0 guard).
    */
   normalization_done_ms?: number | null;
+  normalization_done_offset_ms?: number | null;
+  /**
+   * Calculation-only corrected usage; raw provider values remain in `usage`.
+   */
+  normalized_usage: FlowUsage | null;
   response_id?: string | null;
   /**
    * Per-flow optimistic-concurrency version from the authoritative FlowStore.
@@ -673,6 +739,7 @@ export interface FlowRow {
    * reached the wire (pre-spawn lowering/budget failure, replay-only).
    */
   routing_decision_ms?: number | null;
+  routing_decision_offset_ms?: number | null;
   started_ms: number;
   status: FlowStatus;
   /**
@@ -681,10 +748,12 @@ export interface FlowRow {
    * cancelled mid-stream.
    */
   stream_end_ms?: number | null;
+  stream_end_offset_ms?: number | null;
   terminal_reason?: string | null;
   upstream_target?: string | null;
   uri: string;
   usage: FlowUsage | null;
+  usage_anomaly_count: number;
 }
 /**
  * Successful `POST /dashboard/api/flows/:id/kill` response.
@@ -702,36 +771,9 @@ export interface LoginRequest {
  * [`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.
  */
 export interface MetricsSnapshot {
-  active_streams: number;
-  /**
-   * Headline (`m1`) aggregate cost confidence (gap 07), mirrored from
-   * `windows.m1.cost_confidence` — so the headline `$/min` is labelled estimated
-   * when any priced bucket bills cached at the default `0.0`.
-   */
-  cost_confidence: "confident" | "estimated" | "unavailable";
-  cost_per_min: number;
-  error_pct: number;
+  generated_at_ms: number;
+  headline_window: MetricWindowName;
   metrics_seq: number;
-  p50: number;
-  p95: number;
-  p99: number;
-  /**
-   * Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability
-   * denominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).
-   */
-  priced_samples: number;
-  reqs_per_sec: number;
-  /**
-   * Terminal-flow sample count of the headline (`m1`) window — the
-   * measured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.
-   */
-  samples: number;
-  tokens_per_sec: number;
-  /**
-   * Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability
-   * denominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).
-   */
-  usage_samples: number;
   windows: MetricWindows;
 }
 /**
@@ -754,46 +796,33 @@ export interface MetricWindows {
  * `u64`, so it never violates the frozen finite-number wire contract.
  */
 export interface MetricWindow {
-  active_streams: number;
-  /**
-   * Gap 07 — the aggregate [`CostConfidence`](crate::dashboard_api::CostConfidence)
-   * of this window's `cost_per_min`. `unavailable` when nothing in the window is
-   * priced (`priced_samples == 0` ⇒ `cost_per_min` renders `—`); `estimated` when
-   * ANY priced bucket would bill cached tokens at the default `0.0` (cached `> 0` or
-   * UNREPORTED against a model with no configured cache rate) — no silently-confident
-   * total; `confident` only when every priced bucket's billed classes have known
-   * rates. Surfaced so the strip can LABEL an estimated cost as such.
-   */
-  cost_confidence: "confident" | "estimated" | "unavailable";
-  cost_per_min: number;
-  error_pct: number;
-  p50: number;
-  p95: number;
-  p99: number;
-  /**
-   * Count of usage-bearing terminal flows whose served model has a configured price
-   * (gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no
-   * PRICED usage in the window ⇒ `cost_per_min` renders `—`, distinguishing an
-   * unpriced model from a genuine measured `$0.00`. All three are finite `u64`s, so
-   * they never violate the frozen finite-number wire contract.
-   */
+  accepted_per_sec: number;
+  accepted_requests: number;
+  active_streams_now: number;
+  cancellation_pct: number;
+  cancellations: number;
+  cost_confidence: CostConfidence;
+  cost_per_min: number | null;
+  failure_pct: number;
+  failures: number;
+  latency_overflow_count: number;
+  latency_quality: MetricQuality;
+  latency_samples: number;
+  max_relative_error: number;
+  observed_seconds: number;
+  p50_ms: number | null;
+  p95_ms: number | null;
+  p99_ms: number | null;
   priced_samples: number;
-  reqs_per_sec: number;
-  /**
-   * Terminal-flow sample count in this window (the measured/unavailable signal for
-   * latency + error-%). `0` ⇒ no finalized flow fed the latency/error fields ⇒ they
-   * render `—`.
-   */
-  samples: number;
-  tokens_per_sec: number;
-  /**
-   * Count of those terminal flows that reported token usage (gap 01 review round 1,
-   * finding 3) — the SEPARATE `tokens_per_sec` measurability denominator. Token and
-   * cost availability are NOT the same as `samples`: a window can have `samples > 0`
-   * yet `usage_samples == 0` (every finalized flow omitted usage), in which case
-   * `tokens_per_sec`/`cost_per_min` are unmeasurable and render `—`, never a fake `0`.
-   */
+  quantile_method: QuantileMethod;
+  reported_tokens_per_sec: number | null;
+  successes: number;
+  terminal_per_sec: number;
+  terminal_requests: number;
+  usage_anomaly_count: number;
   usage_samples: number;
+  warm: boolean;
+  window_seconds: number;
 }
 /**
  * `GET /dashboard/api/overview`: an immutable exact-window rollup. The aggregate is
@@ -802,6 +831,7 @@ export interface MetricWindow {
  * cuts.
  */
 export interface OverviewResponse {
+  cancellations: OverviewDimensionRollup[];
   clients: OverviewDimensionRollup[];
   context: OverviewContextRollup;
   cost: OverviewCost;
@@ -809,6 +839,7 @@ export interface OverviewResponse {
   data_quality: OverviewDataQuality;
   failures: OverviewDimensionRollup[];
   generated_at_ms: number;
+  lanes: OverviewLaneRollup[];
   metrics_seq: number;
   overflow: OverviewOverflowMetadata;
   provider_attempts_global: OverviewProviderAttempts;
@@ -851,12 +882,20 @@ export interface OverviewCostPoint {
   data_quality: OverviewDataQuality;
   requests: number;
 }
+export interface OverviewLaneRollup {
+  cost: OverviewCost;
+  model: string;
+  provider: string;
+  requests: number;
+  tokens: OverviewTokens;
+}
 export interface OverviewOverflowMetadata {
   aggregate_folded_samples: number;
   dimension_limit: number;
   overflowed: boolean;
   provider_folded_samples: number;
   slot_folded_samples: number;
+  unattributable_requests: number;
 }
 export interface OverviewProviderAttempts {
   data_quality: OverviewDataQuality;
@@ -876,7 +915,7 @@ export interface ProviderLatency {
   /**
    * DQ tag — always `derived` for a present entry (the `unavailable` case is absence).
    */
-  data_quality: "derived";
+  data_quality: "derived" | "partial";
   /**
    * Percentage of attempts that failed (`failed / samples × 100`). A genuine MEASURED
    * `0.0` for an all-served provider (distinct from the `unavailable`/absent case).
@@ -890,15 +929,15 @@ export interface ProviderLatency {
   /**
    * `derived` p50 attempt latency (ms).
    */
-  p50: number;
+  p50: number | null;
   /**
    * `derived` p95 attempt latency (ms).
    */
-  p95: number;
+  p95: number | null;
   /**
    * `derived` p99 attempt latency (ms).
    */
-  p99: number;
+  p99: number | null;
   /**
    * The provider label these metrics are for (the bounded provider/route id, or the
    * `__other__` overflow bucket once the per-slot provider cap is exceeded).
@@ -935,8 +974,11 @@ export interface OverviewScope {
   window: OverviewWindow;
 }
 export interface OverviewTotals {
+  cancellations: number;
   cost: OverviewCost;
+  failures: number;
   requests: number;
+  successes: number;
   tokens: OverviewTokens;
 }
 /**
@@ -1001,11 +1043,12 @@ export interface TopologySnapshot {
  * D13.
  */
 export interface TopologyEdge {
-  cost_per_sec: number;
+  attempts_per_sec: number;
   from: string;
-  throughput: number;
+  reported_tokens_per_sec: number | null;
+  terminal_cost_per_sec: number | null;
+  terminal_flows_per_sec: number;
   to: string;
-  tokens_per_sec: number;
 }
 /**
  * A topology node — the D4 `ProviderHealth` shape, except `catalog_size` is

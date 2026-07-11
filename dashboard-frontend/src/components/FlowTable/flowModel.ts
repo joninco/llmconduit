@@ -7,7 +7,7 @@
  * fields) and may be absent until D2/D3 attach them. Every derivation here tolerates the
  * partially-populated row a live `flow_status` produces before usage/target arrive.
  */
-import type { CostConfidence, FlowStatus, FlowSummary, ModelPrice, Usage } from '../../api/types';
+import type { CostConfidence, FlowStatus, FlowSummary } from '../../api/types';
 import { fmtCost } from './format';
 
 /** Coarse status bucket used for the colored chip (running / 2xx / 4xx / 5xx). */
@@ -53,11 +53,11 @@ export function costDisplay(cost: number | null, confidence: CostConfidence): Co
  * ⇒ unavailable.
  */
 export function costPerMinDisplay(
-  metrics: { cost_per_min: number; priced_samples: number; cost_confidence: CostConfidence } | null,
+  metrics: { cost_per_min: number | null; priced_samples: number; cost_confidence: CostConfidence } | null,
 ): CostDisplay {
   // No window, nothing priced, or an explicitly-unavailable aggregate ⇒ unavailable (`—/min`),
   // distinguishing an unpriced/idle window from a genuine measured `$0.00/min`.
-  if (!metrics || metrics.priced_samples === 0 || metrics.cost_confidence === 'unavailable') {
+  if (!metrics || metrics.cost_per_min === null || metrics.priced_samples === 0 || metrics.cost_confidence === 'unavailable') {
     return { value: '—', estimated: false, confidence: 'unavailable' };
   }
   return {
@@ -99,34 +99,13 @@ export function shortId(apiCallId: string): string {
 }
 
 /**
- * Cost in dollars for a flow. Prefers the server roll-up (`flow.cost`, D5/D13). When that is
- * absent (live row before the roll-up, or mock without a precomputed cost) it is computed from
- * `usage` × the price table for the SERVED model (the model actually billed). Cached prompt
- * tokens are priced at the cached rate and subtracted from the prompt rate. Returns `null` when
- * neither a roll-up nor a usable (usage + price) pair exists, so the column can render "—".
+ * Terminal-time cost in dollars for a flow. Reads only the persisted server value: browser-side
+ * repricing would make historical rows change after a configuration reload. Open/unpriced flows
+ * therefore return `null` and render `—`.
  */
-export function flowCost(flow: FlowSummary, priceTable: Record<string, ModelPrice>): number | null {
+export function flowCost(flow: FlowSummary): number | null {
   if (typeof flow.cost === 'number' && Number.isFinite(flow.cost)) return flow.cost;
-  if (!flow.usage) return null;
-  const model = flow.model_served ?? flow.model_requested;
-  if (!model) return null;
-  const price = priceTable[model];
-  if (!price) return null;
-  return computeCost(flow.usage, price);
-}
-
-/** usage × price (per-1k rates). Cached prompt tokens billed at the cached rate.
- * Gap 07: an UNREPORTED (`null`/absent) cached count bills as 0 cached tokens — the whole
- * prompt then bills at the input rate (matching the Rust `cost_for_usage`). The honest
- * confidence of that figure rides `cost_confidence`, not this dollar number. */
-export function computeCost(usage: Usage, price: ModelPrice): number {
-  const cached = Math.max(0, usage.cached ?? 0);
-  const billablePrompt = Math.max(0, usage.prompt - cached);
-  return (
-    (billablePrompt / 1000) * price.input_per_1k +
-    (cached / 1000) * price.cached_per_1k +
-    (usage.completion / 1000) * price.output_per_1k
-  );
+  return null;
 }
 
 /** Elapsed ms for the row: explicit `elapsed_ms`, else `finished-started`, else live `now-started`. */

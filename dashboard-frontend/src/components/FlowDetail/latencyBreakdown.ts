@@ -24,8 +24,7 @@
  *  - "phase didn't happen / unmeasured" (`unavailable`) is DISTINCT from "phase took ~0ms"
  *    (`measured`/`derived`, `durationMs === 0`): the former carries no bar width + reads `—`; the
  *    latter is a real (possibly hairline) segment that reads `0ms`.
- *  - NO negative durations: clocks that disorder (end < start) are CLAMPED to 0 and FLAGGED
- *    (`disordered`) rather than rendered negative.
+ *  - Clock disorder (end < start) is unavailable and flagged, never converted to measured 0 ms.
  *  - NO fabricated total: the wall-clock total is itself derived from a known pair (ingress→the
  *    latest known right edge); when no usable span exists it is `unavailable` (`—`).
  *  - Every segment is TAGGED `measured | derived | estimated | unavailable`; an `estimated`
@@ -120,11 +119,17 @@ export type SpineFlow = Pick<
   FlowSummary & FlowDetail,
   | 'started_ms'
   | 'ingress_ms'
+  | 'ingress_offset_ms'
   | 'normalization_done_ms'
+  | 'normalization_done_offset_ms'
   | 'routing_decision_ms'
+  | 'routing_decision_offset_ms'
   | 'first_content_delta_ms'
+  | 'first_content_delta_offset_ms'
   | 'stream_end_ms'
+  | 'stream_end_offset_ms'
   | 'finalize_ms'
+  | 'finalize_offset_ms'
   | 'finished_ms'
   | 'elapsed_ms'
   | 'attempts'
@@ -137,6 +142,21 @@ function epoch(v: number | null | undefined): number | null {
   // A real wall-clock epoch is a large positive integer; treat a non-finite or non-positive value
   // as "unmeasured" (the Rust side never emits `0` for an occurred phase — `skip_serializing_if`).
   return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null;
+}
+
+function offset(v: number | null | undefined): number | null {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+}
+
+function preferMonotonic(
+  startOffset: number | null,
+  endOffset: number | null,
+  startEpoch: number | null,
+  endEpoch: number | null,
+): [number | null, number | null] {
+  return startOffset !== null && endOffset !== null
+    ? [startOffset, endOffset]
+    : [startEpoch, endEpoch];
 }
 
 /**
@@ -159,8 +179,7 @@ function span(
   }
   const raw = endMs - startMs;
   if (raw < 0) {
-    // Clock disorder: clamp to 0 + flag, NEVER render a negative duration (DQ invariant).
-    return { id, label, durationMs: 0, quality, disordered: true, detail: `${okDetail} (clock skew: clamped)` };
+    return { id, label, durationMs: null, quality: 'unavailable', disordered: true, detail: `${okDetail} (clock disorder: unavailable)` };
   }
   return { id, label, durationMs: raw, quality, disordered: false, detail: okDetail };
 }
@@ -206,6 +225,16 @@ export function latencyBreakdown(
   const firstContent = flow ? epoch(flow.first_content_delta_ms) : null;
   const streamEnd = flow ? epoch(flow.stream_end_ms) : null;
   const finalize = flow ? epoch(flow.finalize_ms) : null;
+  const ingressOffset = flow ? offset(flow.ingress_offset_ms) : null;
+  const normalizeOffset = flow ? offset(flow.normalization_done_offset_ms) : null;
+  const routingOffset = flow ? offset(flow.routing_decision_offset_ms) : null;
+  const firstContentOffset = flow ? offset(flow.first_content_delta_offset_ms) : null;
+  const streamEndOffset = flow ? offset(flow.stream_end_offset_ms) : null;
+  const finalizeOffset = flow ? offset(flow.finalize_offset_ms) : null;
+  const queuePair = preferMonotonic(ingressOffset, normalizeOffset, ingress, normalize);
+  const routingPair = preferMonotonic(normalizeOffset, routingOffset, normalize, routing);
+  const generationPair = preferMonotonic(firstContentOffset, streamEndOffset, firstContent, streamEnd);
+  const finalizePair = preferMonotonic(streamEndOffset, finalizeOffset, streamEnd, finalize);
 
   // Wire TTFB: the served attempt's first byte, else the flow-level `first_upstream_byte_ms`.
   const served = flow ? servedAttempt(flow.attempts) : null;
@@ -217,8 +246,8 @@ export function latencyBreakdown(
     span(
       'queue',
       'queue · normalize',
-      ingress,
-      normalize,
+      queuePair[0],
+      queuePair[1],
       'measured',
       'ingress → normalization',
       'unavailable — normalization not reached (errored before normalize, or unmeasured)',
@@ -226,8 +255,8 @@ export function latencyBreakdown(
     span(
       'routing',
       'routing',
-      normalize,
-      routing,
+      routingPair[0],
+      routingPair[1],
       'measured',
       'normalization → routing decision',
       'unavailable — routing decision not reached (never lowered to the wire, or unmeasured)',
@@ -272,8 +301,8 @@ export function latencyBreakdown(
     span(
       'generation',
       'generation (stream)',
-      firstContent,
-      streamEnd,
+      generationPair[0],
+      generationPair[1],
       'measured',
       'first content delta → stream end',
       'unavailable — stream did not complete after first content (errored/cancelled, or unmeasured)',
@@ -281,8 +310,8 @@ export function latencyBreakdown(
     span(
       'finalize',
       'finalize',
-      streamEnd,
-      finalize,
+      finalizePair[0],
+      finalizePair[1],
       'measured',
       'stream end → finalize',
       'unavailable — finalize not reached after stream end (or unmeasured)',
@@ -298,28 +327,40 @@ export function latencyBreakdown(
   // normalize. We use the latest present one so an in-flight/errored flow still shows a bounded
   // span (e.g. ingress→first_content for a still-streaming turn), but only from KNOWN epochs.
   const rightEdge = finalize ?? streamEnd ?? firstContent ?? upstreamByte ?? routing ?? normalize;
-  const total: Figure = ingress !== null && rightEdge !== null
+  const monotonicElapsed = flow && typeof flow.elapsed_ms === 'number' && Number.isFinite(flow.elapsed_ms) && flow.elapsed_ms >= 0
+    ? flow.elapsed_ms
+    : null;
+  const totalDelta = orderedDelta(ingress, rightEdge);
+  const total: Figure = monotonicElapsed !== null
+    ? { valueMs: monotonicElapsed, quality: 'measured', detail: 'backend monotonic terminal elapsed duration' }
+    : totalDelta !== null
     ? {
-        valueMs: Math.max(0, rightEdge - ingress),
+        valueMs: totalDelta,
         quality: 'measured',
         detail: 'wall-clock from ingress to the latest measured phase',
       }
     : { valueMs: null, quality: 'unavailable', detail: 'total unavailable — no measured span yet' };
 
   // ---- TTFT: measured from first_content, else the derived first-visible-activity fallback ----
-  const ttft = computeTtft(ingress, startedMs, firstContent, monitorOutputs);
+  const ttft = computeTtft(
+    ingressOffset !== null && firstContentOffset !== null ? ingressOffset : ingress,
+    startedMs,
+    ingressOffset !== null && firstContentOffset !== null ? firstContentOffset : firstContent,
+    monitorOutputs,
+  );
 
   // ---- Wire TTFB relative to ingress (gap 03) ----
-  const ttfb: Figure = ingress !== null && upstreamByte !== null
+  const ttfbDelta = orderedDelta(ingress, upstreamByte);
+  const ttfb: Figure = ttfbDelta !== null
     ? {
-        valueMs: Math.max(0, upstreamByte - ingress),
+        valueMs: ttfbDelta,
         quality: 'measured',
         detail: 'wire time-to-first-byte: ingress → the served attempt’s first upstream byte',
       }
     : { valueMs: null, quality: 'unavailable', detail: 'wire TTFB unavailable — no upstream first byte measured' };
 
   // ---- Stream tok/s (derived) ----
-  const rate = computeRate(flow?.usage, firstContent, streamEnd);
+  const rate = computeRate(flow?.usage, generationPair[0], generationPair[1]);
 
   return { total, ttft, ttfb, rate, segments, knownSpanMs };
 }
@@ -333,8 +374,12 @@ function computeTtft(
 ): Figure {
   // 1. MEASURED — the true client TTFT (first content delta), relative to ingress (gap 02).
   if (ingress !== null && firstContent !== null) {
+    const delta = orderedDelta(ingress, firstContent);
+    if (delta === null) {
+      return { valueMs: null, quality: 'unavailable', detail: 'TTFT unavailable — disordered wall-clock timestamps' };
+    }
     return {
-      valueMs: Math.max(0, firstContent - ingress),
+      valueMs: delta,
       quality: 'measured',
       detail: 'true TTFT: ingress → first content delta to the client (measured)',
     };
@@ -345,14 +390,23 @@ function computeTtft(
   const firstOutput = firstOutputEpoch(monitorOutputs);
   const anchor = startedMs ?? ingress;
   if (anchor !== null && firstOutput !== null) {
+    const delta = orderedDelta(anchor, firstOutput);
+    if (delta === null) {
+      return { valueMs: null, quality: 'unavailable', detail: 'visible-activity latency unavailable — disordered timestamps' };
+    }
     return {
-      valueMs: Math.max(0, firstOutput - anchor),
+      valueMs: delta,
       quality: 'estimated',
       detail: 'first-visible-activity latency (derived from the first monitor output segment — not upstream first byte)',
     };
   }
   // 3. UNAVAILABLE — no measured TTFT and no visible activity yet (`—`, never a fabricated 0).
   return { valueMs: null, quality: 'unavailable', detail: 'TTFT unavailable — no first content delta and no visible activity' };
+}
+
+function orderedDelta(start: number | null, end: number | null): number | null {
+  if (start === null || end === null || end < start) return null;
+  return end - start;
 }
 
 /** tok/s figure (derived): completion ÷ (stream_end − first_content) seconds; else unavailable. */

@@ -90,6 +90,8 @@ export const GOLDEN_FLOW_STATUS_FRAME_JSON = JSON.stringify({
       model_served: 'llama-3.1-70b',
       upstream_target: 'vllm-a',
       usage: { prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 0 },
+      normalized_usage: { prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 0 },
+      usage_anomaly_count: 0,
       started_ms: 1718900000000,
       finished_ms: 1718900003100,
       elapsed_ms: 3100,
@@ -103,23 +105,28 @@ export const GOLDEN_FLOW_STATUS_FRAME_JSON = JSON.stringify({
 });
 
 /** A `metric_tick` frame (metrics domain). */
+const metricWindow = (window_seconds: number, accepted_per_sec: number) => ({
+  window_seconds, observed_seconds: window_seconds, warm: true,
+  accepted_requests: 252, accepted_per_sec, terminal_requests: 250, terminal_per_sec: 4.1,
+  successes: 246, failures: 3, failure_pct: 1.2, cancellations: 1, cancellation_pct: 0.4,
+  active_streams_now: 3, latency_samples: 250, p50_ms: 180, p95_ms: 920, p99_ms: 1840,
+  quantile_method: 'log_histogram_nearest_rank', max_relative_error: 0.062,
+  latency_overflow_count: 0, latency_quality: 'measured', usage_samples: 250,
+  reported_tokens_per_sec: 142, usage_anomaly_count: 0, priced_samples: 240,
+  cost_per_min: 0.21, cost_confidence: 'estimated',
+});
 export const GOLDEN_METRIC_TICK_FRAME_JSON = JSON.stringify({
   domain: 'metrics',
   seq: 2,
   batch: [
     {
       type: 'metric_tick',
-      reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
-      p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
-      // The three per-metric measurability denominators (gap 01): `samples` (latency/error),
-      // `usage_samples` (tok/s), `priced_samples` ($/min). The headline mirrors the m1 window.
-      // Matches the Rust golden-shape test byte-for-byte.
-      // Gap 07: the aggregate cost-confidence tag (mirrors the Rust golden-shape test).
-      samples: 252, usage_samples: 250, priced_samples: 240, cost_confidence: 'estimated',
+      generated_at_ms: 1718900000000,
+      headline_window: 'm1',
       windows: {
-        m1: { reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1, p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21, samples: 252, usage_samples: 250, priced_samples: 240, cost_confidence: 'estimated' },
-        m5: { reqs_per_sec: 3.8, active_streams: 3, error_pct: 1.0, p50: 175, p95: 900, p99: 1800, tokens_per_sec: 128, cost_per_min: 0.19, samples: 1140, usage_samples: 1130, priced_samples: 1100, cost_confidence: 'estimated' },
-        h1: { reqs_per_sec: 2.9, active_streams: 2, error_pct: 0.8, p50: 160, p95: 850, p99: 1700, tokens_per_sec: 100, cost_per_min: 0.15, samples: 10440, usage_samples: 10400, priced_samples: 10000, cost_confidence: 'estimated' },
+        m1: metricWindow(60, 4.2),
+        m5: metricWindow(300, 3.8),
+        h1: metricWindow(3600, 2.9),
       },
     },
   ],
@@ -141,7 +148,7 @@ export const GOLDEN_TOPOLOGY_FRAME_JSON = JSON.stringify({
         },
       ],
       edges: [
-        { from: 'gateway', to: 'vllm-a', throughput: 4.2, tokens_per_sec: 142, cost_per_sec: 0.003 },
+        { from: 'gateway', to: 'vllm-a', attempts_per_sec: 4.3, terminal_flows_per_sec: 4.2, reported_tokens_per_sec: 142, terminal_cost_per_sec: 0.003 },
       ],
     },
   ],
@@ -166,5 +173,5 @@ export const GOLDEN_BOOTSTRAP = {
   authenticated: true,
   csrf_token: 'csrf-abc123',
   mutations_enabled: true,
-  schema_version: 2,
+  schema_version: 3,
 } as const;

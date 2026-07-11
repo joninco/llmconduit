@@ -1,9 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import type { FlowSummary, ModelPrice } from '../../api/types';
+import type { FlowSummary } from '../../api/types';
 import {
   statusClass,
   flowCost,
-  computeCost,
   costDisplay,
   costPerMinDisplay,
   elapsedMs,
@@ -39,37 +38,18 @@ describe('statusClass — running / 2xx / 4xx / 5xx', () => {
   });
 });
 
-describe('flowCost — server roll-up preferred, else usage × price', () => {
-  const price: Record<string, ModelPrice> = {
-    'llama-3.1-70b': { input_per_1k: 0.001, output_per_1k: 0.002, cached_per_1k: 0.0005, cached_price_configured: true },
-  };
+describe('flowCost — persisted terminal value only', () => {
   it('prefers the precomputed flow.cost', () => {
-    expect(flowCost(flow({ cost: 0.42 }), price)).toBe(0.42);
+    expect(flowCost(flow({ cost: 0.42 }))).toBe(0.42);
   });
-  it('computes from usage × served-model price when cost is absent', () => {
+  it('does not reprice from current usage and model when cost is absent', () => {
     const f = flow({ cost: null, model_served: 'llama-3.1-70b', usage: { prompt: 1000, completion: 500, total: 1500, cached: 200, reasoning: 0 } });
     // billable prompt 800 @0.001 + cached 200 @0.0005 + completion 500 @0.002 = 0.0008+0.0001+0.001
-    expect(flowCost(f, price)).toBeCloseTo(0.0019, 6);
+    expect(flowCost(f)).toBeNull();
   });
   it('returns null when no roll-up and no usable price', () => {
-    expect(flowCost(flow({ cost: null, model_served: 'unknown', usage: { prompt: 1, completion: 1, total: 2, cached: 0, reasoning: 0 } }), price)).toBeNull();
-    expect(flowCost(flow({ cost: null, usage: null }), price)).toBeNull();
-  });
-});
-
-describe('computeCost', () => {
-  it('prices cached prompt tokens at the cached rate', () => {
-    const c = computeCost({ prompt: 2000, completion: 0, total: 2000, cached: 1000, reasoning: 0 }, { input_per_1k: 0.01, output_per_1k: 0, cached_per_1k: 0.001, cached_price_configured: true });
-    // 1000 billable @0.01 + 1000 cached @0.001 = 0.01 + 0.001
-    expect(c).toBeCloseTo(0.011, 6);
-  });
-
-  // Gap 07: an UNREPORTED cached count (absent/null) bills as 0 cached tokens — the whole
-  // prompt then bills at the input rate (matching the Rust `cost_for_usage`).
-  it('bills the whole prompt at the input rate when cached is unreported', () => {
-    const c = computeCost({ prompt: 2000, completion: 0, total: 2000 }, { input_per_1k: 0.01, output_per_1k: 0, cached_per_1k: 0.001, cached_price_configured: false });
-    // cached unreported ⇒ 0 cached tokens ⇒ 2000 billable @0.01 = 0.02 (nothing at cache rate).
-    expect(c).toBeCloseTo(0.02, 6);
+    expect(flowCost(flow({ cost: null, model_served: 'unknown', usage: { prompt: 1, completion: 1, total: 2, cached: 0, reasoning: 0 } }))).toBeNull();
+    expect(flowCost(flow({ cost: null, usage: null }))).toBeNull();
   });
 });
 

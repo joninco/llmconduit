@@ -11,7 +11,7 @@
  */
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import type { FlowSummary, ModelPrice } from '../../api/types';
+import type { FlowSummary } from '../../api/types';
 import { useDashboard, useFlowFilter } from '../../store/hooks';
 import { flowFilterStore } from '../../store/flowFilterStore';
 import { cn } from '../../lib/cn';
@@ -98,7 +98,6 @@ export function FlowTable({
   const filters = useFlowFilter((s) => s.filters);
   const setFilters = flowFilterStore.getState().setFilters;
   const { rows, total, models, upstreams, clients, loadState, retry } = useFlowRows(filters);
-  const priceTable = useDashboard((s) => s.priceTable);
   // Gap 09: the per-model context-window capacities (gap-06 nullable `context_limit`), for the
   // aggregate context-pressure stat. A `null`/absent window is UNKNOWN ⇒ that flow is excluded from
   // the pressure figures (never a fabricated 0%/100%).
@@ -241,7 +240,6 @@ export function FlowTable({
                   {narrow ? (
                     <FlowCard
                       flow={flow}
-                      priceTable={priceTable}
                       nowMs={seekAtMs ?? Date.now()}
                       selected={flow.api_call_id === selectedId}
                       onSelect={onSelect}
@@ -251,7 +249,6 @@ export function FlowTable({
                       buttonRef={(node) => registerRow(flow.api_call_id, node)}
                       flow={flow}
                       index={vi.index}
-                      priceTable={priceTable}
                       nowMs={seekAtMs ?? Date.now()}
                       selected={flow.api_call_id === selectedId}
                       active={vi.index === activeIndex}
@@ -281,7 +278,7 @@ export function FlowTable({
       {/* Gap 08: the AGGREGATE cache-hit rate / "$ saved" by model, rolled up over the SAME filtered
           rows the table shows. A collapsed secondary surface under the table (never inside the
           virtualized scroll container, so it does not affect row layout). */}
-      <CacheEconomics rows={rows} priceTable={priceTable} />
+      <CacheEconomics rows={rows} />
       {/* Gap 15: the AGGREGATE "by client" roll-up — cost / errors / latency per non-secret client
           (key-hash / configured-id / weak-UA), over the SAME filtered rows. A collapsed secondary
           surface under the table; its rows cross-link into the per-client filter. */}
@@ -356,7 +353,6 @@ function FlowRow({
   buttonRef,
   flow,
   index,
-  priceTable,
   nowMs,
   selected,
   active,
@@ -367,7 +363,6 @@ function FlowRow({
   buttonRef: (node: HTMLButtonElement | null) => void;
   flow: FlowSummary;
   index: number;
-  priceTable: Record<string, ModelPrice>;
   /** Reference instant for an OPEN row's elapsed: the frozen cut `at_ms` while seeking, else now. */
   nowMs: number;
   selected: boolean;
@@ -382,7 +377,7 @@ function FlowRow({
   // Gap 07: derive the dollar STRING and the `estimated` flag TOGETHER from the cost + the per-flow
   // `cost_confidence`, so an `estimated` row is visibly labelled and an `unavailable` one renders
   // `—` (never a fabricated `$0.00`) — the same contract the StatsStrip $/min chip + FlowDetail use.
-  const cost = costDisplay(flowCost(flow, priceTable), flow.cost_confidence);
+  const cost = costDisplay(flowCost(flow), flow.cost_confidence);
 
   return (
     <button
@@ -427,7 +422,7 @@ function FlowRow({
       <span role="gridcell">
         <StatusChip status={flow.status} terminalReason={flow.terminal_reason} />
       </span>
-      <span role="gridcell"><TokensCell flow={flow} priceTable={priceTable} /></span>
+      <span role="gridcell"><TokensCell flow={flow} /></span>
       <span role="gridcell" className="flex items-center justify-end gap-1 text-right tabular-nums text-meta">
         <span data-testid="flow-cost" data-confidence={cost.confidence}>{cost.value}</span>
         {/* Gap 07: an `estimated` per-flow cost MUST be labelled (the cross-cutting rule) — a
@@ -455,13 +450,11 @@ function FlowRow({
  */
 function FlowCard({
   flow,
-  priceTable,
   nowMs,
   selected,
   onSelect,
 }: {
   flow: FlowSummary;
-  priceTable: Record<string, ModelPrice>;
   nowMs: number;
   selected: boolean;
   onSelect: (id: string) => void;
@@ -469,7 +462,7 @@ function FlowCard({
   const klass = statusClass(flow.status, flow.terminal_reason);
   const isError = klass === 'client-error' || klass === 'server-error';
   const failover = isFailover(flow);
-  const cost = costDisplay(flowCost(flow, priceTable), flow.cost_confidence);
+  const cost = costDisplay(flowCost(flow), flow.cost_confidence);
 
   return (
     <button
@@ -515,7 +508,7 @@ function FlowCard({
       <span className="grid grid-cols-3 items-end gap-2 text-[10px] uppercase tracking-wide text-text-muted">
         <span className="min-w-0">
           <span className="block">tokens</span>
-          <TokensCell flow={flow} priceTable={priceTable} />
+          <TokensCell flow={flow} />
         </span>
         <span className="text-right">
           <span className="block">cost</span>

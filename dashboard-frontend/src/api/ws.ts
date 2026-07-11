@@ -708,19 +708,8 @@ export class DashboardSocket {
       case 'metric_tick':
         store.setMetrics({
           metrics_seq: this.lastSeq.metrics,
-          reqs_per_sec: payload.reqs_per_sec,
-          active_streams: payload.active_streams,
-          error_pct: payload.error_pct,
-          p50: payload.p50,
-          p95: payload.p95,
-          p99: payload.p99,
-          tokens_per_sec: payload.tokens_per_sec,
-          cost_per_min: payload.cost_per_min,
-          samples: payload.samples,
-          usage_samples: payload.usage_samples,
-          priced_samples: payload.priced_samples,
-          // Gap 07: thread the aggregate cost confidence from the tick to the store.
-          cost_confidence: payload.cost_confidence,
+          generated_at_ms: payload.generated_at_ms,
+          headline_window: payload.headline_window,
           windows: payload.windows,
         });
         return;

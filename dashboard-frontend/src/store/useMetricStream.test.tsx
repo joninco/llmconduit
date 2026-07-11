@@ -5,13 +5,20 @@ import { dashboardStore, type LiveBaseline } from './dashboardStore';
 import type { MetricsResponse } from '../api/types';
 
 function metrics(seq: number, reqs: number): MetricsResponse {
-  const w = { reqs_per_sec: reqs, active_streams: 1, error_pct: 0, p50: 1, p95: 2, p99: 3, tokens_per_sec: 10, cost_per_min: 0.1, samples: 5, usage_samples: 5, priced_samples: 5, cost_confidence: 'estimated' as const };
-  return { metrics_seq: seq, ...w, windows: { m1: { ...w }, m5: { ...w }, h1: { ...w } } };
+  const w = { window_seconds: 60, observed_seconds: 60, warm: true, accepted_requests: 5,
+    accepted_per_sec: reqs, terminal_requests: 5, terminal_per_sec: reqs, successes: 5,
+    failures: 0, failure_pct: 0, cancellations: 0, cancellation_pct: 0, active_streams_now: 1,
+    latency_samples: 5, p50_ms: 1, p95_ms: null, p99_ms: null,
+    quantile_method: 'log_histogram_nearest_rank' as const, max_relative_error: 0.062,
+    latency_overflow_count: 0, latency_quality: 'measured' as const, usage_samples: 5,
+    reported_tokens_per_sec: 10, usage_anomaly_count: 0, priced_samples: 5,
+    cost_per_min: 0.1, cost_confidence: 'estimated' as const };
+  return { metrics_seq: seq, generated_at_ms: seq * 1000, headline_window: 'm1', windows: { m1: { ...w }, m5: { ...w, window_seconds: 300 }, h1: { ...w, window_seconds: 3600 } } };
 }
 
-/** A probe component that records every folded sample's reqs_per_sec. */
+/** A probe component that records every folded sample's accepted_per_sec. */
 function Probe({ folded, seed }: { folded: number[]; seed?: MetricsResponse | null }) {
-  useMetricStream((s) => folded.push(s.reqs_per_sec), seed);
+  useMetricStream((s) => folded.push(s.windows.m1.accepted_per_sec), seed);
   return null;
 }
 
@@ -44,7 +51,7 @@ describe('useMetricStream', () => {
     expect(folded).toEqual([1, 2]);
   });
 
-  it('primes from the seed only while the ring is empty (no stale seed after live samples)', () => {
+  it('primes from the seed only while the ring is empty (no stale seed after live latency_samples)', () => {
     const folded: number[] = [];
     // Seed (seq 1) primes the empty ring.
     const { rerender } = render(<Probe folded={folded} seed={metrics(1, 11)} />);

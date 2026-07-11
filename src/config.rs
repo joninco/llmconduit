@@ -707,10 +707,13 @@ impl ModelPrice {
     /// `/dashboard/api/topology` price table on the wire. Config load uses this to
     /// REJECT a malformed entry so the in-memory table only ever holds finite prices
     /// (D13 R1 MED).
-    fn is_finite(&self) -> bool {
+    fn is_valid(&self) -> bool {
         self.input_per_1k.is_finite()
             && self.output_per_1k.is_finite()
             && self.cached_per_1k.is_finite()
+            && self.input_per_1k >= 0.0
+            && self.output_per_1k >= 0.0
+            && self.cached_per_1k >= 0.0
     }
 }
 
@@ -770,14 +773,14 @@ impl<'de> Deserialize<'de> for ModelPrice {
 /// the frozen finite-number contract the frontend `isModelPrice` guard rejects).
 fn retain_finite_prices(table: &mut HashMap<String, ModelPrice>) {
     table.retain(|model, price| {
-        let finite = price.is_finite();
-        if !finite {
+        let valid = price.is_valid();
+        if !valid {
             tracing::warn!(
                 model = %model,
-                "dropping price_table entry with non-finite rate (NaN/Inf)"
+                "dropping price_table entry with negative or non-finite rate"
             );
         }
-        finite
+        valid
     });
 }
 
@@ -4552,8 +4555,8 @@ model_profiles:
         }
     }
 
-    /// D13 R1 MED: a price entry carrying a NON-finite rate (NaN / ±∞) is REJECTED at
-    /// config load so the in-memory table only ever holds finite prices — `serde_json`
+    /// A price entry carrying a negative or non-finite rate is rejected at config
+    /// load so the in-memory table only ever holds valid prices — `serde_json`
     /// serializes NaN/Inf as `null`, which would silently corrupt the
     /// `/dashboard/api/topology` price table and violate the frozen finite-number
     /// `ModelPrice` contract. Both the YAML load and the env override drop the bad
@@ -4602,6 +4605,10 @@ model_profiles:
                 cached_price_configured: true,
             },
         );
+        table.insert(
+            "negative-output".to_string(),
+            ModelPrice::without_cached(1.0, -2.0),
+        );
         retain_finite_prices(&mut table);
         assert!(table.contains_key("finite"), "a finite price survives");
         assert!(
@@ -4611,6 +4618,10 @@ model_profiles:
         assert!(
             !table.contains_key("inf-cached"),
             "an ∞ rate in any field drops the entry"
+        );
+        assert!(
+            !table.contains_key("negative-output"),
+            "a negative rate in any field drops the entry"
         );
     }
 

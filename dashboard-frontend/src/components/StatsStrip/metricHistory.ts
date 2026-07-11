@@ -18,13 +18,15 @@ export const WINDOW_LABELS: Record<WindowKey, string> = { m1: '1m', m5: '5m', h1
 
 /** The chip metrics, in strip display order. Each maps to a `MetricWindow` field. */
 export type MetricKey =
-  | 'reqs_per_sec'
-  | 'active_streams'
-  | 'error_pct'
-  | 'p50'
-  | 'p95'
-  | 'p99'
-  | 'tokens_per_sec'
+  | 'accepted_per_sec'
+  | 'terminal_per_sec'
+  | 'active_streams_now'
+  | 'failure_pct'
+  | 'cancellation_pct'
+  | 'p50_ms'
+  | 'p95_ms'
+  | 'p99_ms'
+  | 'reported_tokens_per_sec'
   | 'cost_per_min';
 
 /**
@@ -39,17 +41,19 @@ export type MetricKey =
  * Lives here (the pure history module) so both the sparkline (`seriesFor`) and the chip
  * value (`deriveChips`) read one source — and so there is no chips↔history import cycle.
  */
-export type Availability = 'always' | 'samples' | 'usage' | 'priced';
+export type Availability = 'always' | 'terminal' | 'latency50' | 'latency95' | 'latency99' | 'usage' | 'priced';
 
 /** Each metric's measurability denominator (gap 01 finding 3). */
 export const METRIC_AVAILABILITY: Record<MetricKey, Availability> = {
-  reqs_per_sec: 'always',
-  active_streams: 'always',
-  error_pct: 'samples',
-  p50: 'samples',
-  p95: 'samples',
-  p99: 'samples',
-  tokens_per_sec: 'usage',
+  accepted_per_sec: 'always',
+  terminal_per_sec: 'always',
+  active_streams_now: 'always',
+  failure_pct: 'terminal',
+  cancellation_pct: 'terminal',
+  p50_ms: 'latency50',
+  p95_ms: 'latency95',
+  p99_ms: 'latency99',
+  reported_tokens_per_sec: 'usage',
   cost_per_min: 'priced',
 };
 
@@ -58,12 +62,13 @@ function denominatorFor(window: MetricWindow, availability: Availability): numbe
   switch (availability) {
     case 'always':
       return Number.POSITIVE_INFINITY; // never gated
-    case 'samples':
-      return window.samples;
-    case 'usage':
-      return window.usage_samples;
-    case 'priced':
-      return window.priced_samples;
+    case 'terminal':
+      return window.terminal_requests;
+    case 'latency50': return window.latency_samples >= 2 ? 1 : 0;
+    case 'latency95': return window.latency_samples >= 20 ? 1 : 0;
+    case 'latency99': return window.latency_samples >= 100 ? 1 : 0;
+    case 'usage': return window.usage_samples;
+    case 'priced': return window.priced_samples;
   }
 }
 
@@ -74,7 +79,8 @@ function denominatorFor(window: MetricWindow, availability: Availability): numbe
  */
 export function metricUnavailable(window: MetricWindow | null, metric: MetricKey): boolean {
   if (!window) return true;
-  return denominatorFor(window, METRIC_AVAILABILITY[metric]) === 0;
+  if (denominatorFor(window, METRIC_AVAILABILITY[metric]) === 0) return true;
+  return window[metric] === null;
 }
 
 /** Sparkline depth (samples retained per window). Spec: 60-sample sparklines. */
@@ -126,7 +132,10 @@ export function appendTick(
  * `active_streams` are never gated, so their series is the raw values.
  */
 export function seriesFor(history: MetricHistory, window: WindowKey, metric: MetricKey): number[] {
-  return history[window].map((w) => (metricUnavailable(w, metric) ? NaN : w[metric]));
+  return history[window].map((w) => {
+    const value = w[metric];
+    return metricUnavailable(w, metric) || value === null ? NaN : value;
+  });
 }
 
 /** The newest sample for a window (the live chip VALUE), or null before any tick. */

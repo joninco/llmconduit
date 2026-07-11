@@ -1,5 +1,5 @@
 /**
- * Exact Overview control room. Every flow rollup comes from the immutable server-side
+ * Terminal Overview control room. Every flow rollup comes from the immutable server-side
  * `/dashboard/api/overview` cut selected by the shared URL window/filters and, while seeking,
  * the retained `at` instant. Provider attempts are deliberately global and labelled as such.
  */
@@ -49,6 +49,7 @@ export function OverviewView() {
   const seeking = useDashboard((state) => state.connection === 'seeking');
   const seekAtMs = useDashboard((state) => state.seekAtMs);
   const { client } = getConnection();
+  const openOnly = hashScope.status === 'open';
 
   const request = useMemo<OverviewQuery>(() => ({
     window: hashScope.window,
@@ -62,6 +63,7 @@ export function OverviewView() {
   const overview = useQuery({
     queryKey: queryKeys.overview(request),
     queryFn: () => client.overview(request),
+    enabled: !openOnly,
   });
 
   return (
@@ -69,7 +71,7 @@ export function OverviewView() {
       <div className="mb-3 flex flex-wrap items-baseline gap-x-2 gap-y-1">
         <h1 className="text-sm font-semibold uppercase tracking-[0.18em] text-text">control room</h1>
         <span className="text-[10px] uppercase tracking-[0.14em] text-text-muted">
-          exact {hashScope.window} rollups · server cut
+          terminal {hashScope.window} rollups · server cut
         </span>
         {seeking && (
           <span className="text-[10px] text-status-cooling" data-testid="overview-frozen">
@@ -78,13 +80,18 @@ export function OverviewView() {
         )}
       </div>
 
-      {overview.isPending && !overview.data ? (
+      {openOnly ? (
+        <Panel className="p-6 text-center" data-testid="overview-open-unavailable" role="status">
+          <p className="text-sm text-status-cooling">Terminal analytics unavailable for open-only scope.</p>
+          <p className="mt-1 text-xs text-text-muted">Active-now remains available in the Global metrics strip.</p>
+        </Panel>
+      ) : overview.isPending && !overview.data ? (
         <Panel className="p-6 text-center text-sm text-text-muted" data-testid="overview-loading" role="status">
-          Loading exact overview…
+          Loading terminal overview…
         </Panel>
       ) : overview.isError || !overview.data ? (
         <Panel className="flex flex-col items-center gap-2 p-6 text-center" data-testid="overview-error" role="alert">
-          <p className="text-sm text-status-down">The exact overview could not be loaded.</p>
+          <p className="text-sm text-status-down">The terminal overview could not be loaded.</p>
           <p className="max-w-xl text-xs text-text-muted">{errorMessage(overview.error)}</p>
           <button type="button" className={cn(ROW_BUTTON, 'w-auto px-3')} onClick={() => void overview.refetch()}>
             Retry
@@ -119,6 +126,9 @@ function OverviewContent({ response }: { response: OverviewResponse }) {
           Provider attempts · Global
         </span>
         <span className="font-mono tabular-nums text-text-muted">{response.totals.requests} terminal flows</span>
+        <span className="font-mono tabular-nums text-text-muted">
+          {response.totals.successes} success · {response.totals.failures} fail · {response.totals.cancellations} cancel
+        </span>
         <span className="ml-auto font-mono tabular-nums text-text-muted">
           cut {formatCut(response.scope.selected_at_ms ?? response.generated_at_ms)} · seq {response.metrics_seq}
         </span>
@@ -184,7 +194,8 @@ function OverviewContent({ response }: { response: OverviewResponse }) {
 
 function CostSeriesTile({ response }: { response: OverviewResponse }) {
   const points = response.cost_series.map((point) =>
-    point.cost.samples > 0 && point.cost.total_usd !== null ? point.cost.total_usd : null);
+    point.requests === 0 ? 0
+      : point.cost.samples > 0 && point.cost.total_usd !== null ? point.cost.total_usd : null);
   const quality = costQuality(response.cost, response.data_quality);
   const available = response.cost.samples > 0 && response.cost.total_usd !== null;
   return (
@@ -205,7 +216,7 @@ function CostSeriesTile({ response }: { response: OverviewResponse }) {
         </div>
         <div className="ml-auto min-w-36 flex-1">
           {points.length > 0 ? (
-            <Sparkline data={points} label="Exact scoped cost per one-second server slot" />
+            <Sparkline data={points} label="Scoped terminal cost per deterministic server bin" />
           ) : (
             <p className="text-right text-xs italic text-text-muted" data-quality="unavailable">No priced series points · {DASH}</p>
           )}
@@ -218,7 +229,7 @@ function CostSeriesTile({ response }: { response: OverviewResponse }) {
 function ProviderAttemptsTile({ response }: { response: OverviewResponse }) {
   const aggregate = response.provider_attempts_global;
   const providers = [...aggregate.providers]
-    .sort((a, b) => b.error_rate - a.error_rate || b.p99 - a.p99)
+    .sort((a, b) => b.error_rate - a.error_rate || (b.p99 ?? -1) - (a.p99 ?? -1))
     .slice(0, TOP_ROWS);
   const available = providers.length > 0;
   return (
@@ -367,7 +378,7 @@ function ClientTile({ response }: { response: OverviewResponse }) {
   const rows = [...response.clients].sort((a, b) => b.requests - a.requests).slice(0, TOP_ROWS);
   return (
     <Panel className="flex flex-col gap-2 p-3" data-testid="overview-clients" data-available={String(rows.length > 0)} data-quality={response.data_quality}>
-      <span className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">clients · exact scoped rollup</span>
+      <span className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">clients · scoped terminal rollup</span>
       {rows.length === 0 ? (
         <p className="px-1 py-2 text-xs italic text-text-muted" data-testid="overview-clients-unavailable" data-quality="unavailable">No attributed client samples · {DASH}</p>
       ) : (
@@ -444,7 +455,7 @@ function TokenMixTile({ tokens, quality }: { tokens: OverviewTokens; quality: Ov
   return (
     <Panel className="flex flex-col gap-2 p-3" data-testid="overview-token-mix" data-available={String(available)} data-quality={available ? quality : 'unavailable'}>
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">token mix · exact totals</span>
+        <span className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">token mix · terminal totals</span>
         <span className="font-mono text-[9px] tabular-nums text-text-muted">{tokens.samples} usage samples</span>
       </div>
       {!available ? (

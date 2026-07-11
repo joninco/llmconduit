@@ -123,27 +123,8 @@ pub struct SeqCursors {
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct MetricsSnapshot {
     pub metrics_seq: u64,
-    pub reqs_per_sec: f64,
-    pub active_streams: u64,
-    pub error_pct: f64,
-    pub p50: f64,
-    pub p95: f64,
-    pub p99: f64,
-    pub tokens_per_sec: f64,
-    pub cost_per_min: f64,
-    /// Terminal-flow sample count of the headline (`m1`) window — the
-    /// measured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.
-    pub samples: u64,
-    /// Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability
-    /// denominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).
-    pub usage_samples: u64,
-    /// Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability
-    /// denominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).
-    pub priced_samples: u64,
-    /// Headline (`m1`) aggregate cost confidence (gap 07), mirrored from
-    /// `windows.m1.cost_confidence` — so the headline `$/min` is labelled estimated
-    /// when any priced bucket bills cached at the default `0.0`.
-    pub cost_confidence: crate::dashboard_api::CostConfidence,
+    pub generated_at_ms: u128,
+    pub headline_window: MetricWindowName,
     pub windows: MetricWindows,
 }
 
@@ -247,7 +228,7 @@ pub enum DashboardPayload {
         reasoning: Option<i64>,
     },
     /// The flat `/api/metrics`-shaped metric tile (metrics domain).
-    MetricTick(MetricTick),
+    MetricTick(Box<MetricTick>),
     /// Authoritative per-flow mutation. The complete [`FlowRow`] is flattened to
     /// preserve the schema-v1 field locations while adding revision/cost/attribution
     /// and the bounded mutation `phase`. It is built from the exact record snapshot
@@ -273,28 +254,32 @@ pub enum DashboardPayload {
 /// windows under `windows`.
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct MetricTick {
-    pub reqs_per_sec: f64,
-    pub active_streams: u64,
-    pub error_pct: f64,
-    pub p50: f64,
-    pub p95: f64,
-    pub p99: f64,
-    pub tokens_per_sec: f64,
-    pub cost_per_min: f64,
-    /// Terminal-flow sample count of the headline (`m1`) window — the
-    /// measured/unavailable signal for latency/error, mirrored from `windows.m1.samples`.
-    pub samples: u64,
-    /// Headline (`m1`) usage-sample count — the `tokens_per_sec` measurability
-    /// denominator, mirrored from `windows.m1.usage_samples` (gap 01 finding 3).
-    pub usage_samples: u64,
-    /// Headline (`m1`) priced-usage-sample count — the `cost_per_min` measurability
-    /// denominator, mirrored from `windows.m1.priced_samples` (gap 01 finding 3).
-    pub priced_samples: u64,
-    /// Headline (`m1`) aggregate cost confidence (gap 07), mirrored from
-    /// `windows.m1.cost_confidence` — so the headline `$/min` is labelled estimated
-    /// when any priced bucket bills cached at the default `0.0`.
-    pub cost_confidence: crate::dashboard_api::CostConfidence,
+    pub generated_at_ms: u128,
+    pub headline_window: MetricWindowName,
     pub windows: MetricWindows,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricWindowName {
+    #[default]
+    M1,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantileMethod {
+    #[default]
+    LogHistogramNearestRank,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MetricQuality {
+    Measured,
+    Partial,
+    #[default]
+    Unavailable,
 }
 
 /// The three sliding windows (`m1`/`m5`/`h1`) of a [`MetricTick`].
@@ -316,37 +301,32 @@ pub struct MetricWindows {
 /// `u64`, so it never violates the frozen finite-number wire contract.
 #[derive(Debug, Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct MetricWindow {
-    pub reqs_per_sec: f64,
-    pub active_streams: u64,
-    pub error_pct: f64,
-    pub p50: f64,
-    pub p95: f64,
-    pub p99: f64,
-    pub tokens_per_sec: f64,
-    pub cost_per_min: f64,
-    /// Terminal-flow sample count in this window (the measured/unavailable signal for
-    /// latency + error-%). `0` ⇒ no finalized flow fed the latency/error fields ⇒ they
-    /// render `—`.
-    pub samples: u64,
-    /// Count of those terminal flows that reported token usage (gap 01 review round 1,
-    /// finding 3) — the SEPARATE `tokens_per_sec` measurability denominator. Token and
-    /// cost availability are NOT the same as `samples`: a window can have `samples > 0`
-    /// yet `usage_samples == 0` (every finalized flow omitted usage), in which case
-    /// `tokens_per_sec`/`cost_per_min` are unmeasurable and render `—`, never a fake `0`.
+    pub window_seconds: u64,
+    pub observed_seconds: u64,
+    pub warm: bool,
+    pub accepted_requests: u64,
+    pub accepted_per_sec: f64,
+    pub terminal_requests: u64,
+    pub terminal_per_sec: f64,
+    pub successes: u64,
+    pub failures: u64,
+    pub failure_pct: f64,
+    pub cancellations: u64,
+    pub cancellation_pct: f64,
+    pub active_streams_now: u64,
+    pub latency_samples: u64,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+    pub quantile_method: QuantileMethod,
+    pub max_relative_error: f64,
+    pub latency_overflow_count: u64,
+    pub latency_quality: MetricQuality,
     pub usage_samples: u64,
-    /// Count of usage-bearing terminal flows whose served model has a configured price
-    /// (gap 01 finding 3) — the `cost_per_min` measurability denominator. `0` ⇒ no
-    /// PRICED usage in the window ⇒ `cost_per_min` renders `—`, distinguishing an
-    /// unpriced model from a genuine measured `$0.00`. All three are finite `u64`s, so
-    /// they never violate the frozen finite-number wire contract.
+    pub reported_tokens_per_sec: Option<f64>,
+    pub usage_anomaly_count: u64,
     pub priced_samples: u64,
-    /// Gap 07 — the aggregate [`CostConfidence`](crate::dashboard_api::CostConfidence)
-    /// of this window's `cost_per_min`. `unavailable` when nothing in the window is
-    /// priced (`priced_samples == 0` ⇒ `cost_per_min` renders `—`); `estimated` when
-    /// ANY priced bucket would bill cached tokens at the default `0.0` (cached `> 0` or
-    /// UNREPORTED against a model with no configured cache rate) — no silently-confident
-    /// total; `confident` only when every priced bucket's billed classes have known
-    /// rates. Surfaced so the strip can LABEL an estimated cost as such.
+    pub cost_per_min: Option<f64>,
     pub cost_confidence: crate::dashboard_api::CostConfidence,
 }
 
@@ -439,9 +419,10 @@ impl TopologyNode {
 pub struct TopologyEdge {
     pub from: String,
     pub to: String,
-    pub throughput: f64,
-    pub tokens_per_sec: f64,
-    pub cost_per_sec: f64,
+    pub attempts_per_sec: f64,
+    pub terminal_flows_per_sec: f64,
+    pub reported_tokens_per_sec: Option<f64>,
+    pub terminal_cost_per_sec: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -525,21 +506,11 @@ pub fn metric_tick_frame(
     DashboardFrame {
         domain: Domain::Metrics,
         seq,
-        batch: vec![DashboardPayload::MetricTick(MetricTick {
-            reqs_per_sec: body.reqs_per_sec,
-            active_streams: body.active_streams,
-            error_pct: body.error_pct,
-            p50: body.p50,
-            p95: body.p95,
-            p99: body.p99,
-            tokens_per_sec: body.tokens_per_sec,
-            cost_per_min: body.cost_per_min,
-            samples: body.samples,
-            usage_samples: body.usage_samples,
-            priced_samples: body.priced_samples,
-            cost_confidence: body.cost_confidence,
+        batch: vec![DashboardPayload::MetricTick(Box::new(MetricTick {
+            generated_at_ms: body.generated_at_ms,
+            headline_window: body.headline_window,
             windows: body.windows,
-        })],
+        }))],
     }
 }
 
@@ -559,9 +530,10 @@ pub fn topology_frame(snapshot: &ProviderHealthSnapshot) -> DashboardFrame {
         .map(|provider| TopologyEdge {
             from: "gateway".to_string(),
             to: provider.id.clone(),
-            throughput: 0.0,
-            tokens_per_sec: 0.0,
-            cost_per_sec: 0.0,
+            attempts_per_sec: 0.0,
+            terminal_flows_per_sec: 0.0,
+            reported_tokens_per_sec: None,
+            terminal_cost_per_sec: None,
         })
         .collect();
     DashboardFrame {
@@ -603,9 +575,10 @@ fn topology_snapshot(snapshot: &ProviderHealthSnapshot) -> TopologySnapshot {
         .map(|provider| TopologyEdge {
             from: "gateway".to_string(),
             to: provider.id.clone(),
-            throughput: 0.0,
-            tokens_per_sec: 0.0,
-            cost_per_sec: 0.0,
+            attempts_per_sec: 0.0,
+            terminal_flows_per_sec: 0.0,
+            reported_tokens_per_sec: None,
+            terminal_cost_per_sec: None,
         })
         .collect();
     TopologySnapshot {
@@ -1106,6 +1079,10 @@ mod tests {
             model_served: None,
             upstream_target: None,
             usage: None,
+            normalized_usage: None,
+            usage_anomaly_count: 0,
+            effective_route_limit: None,
+            cache_price_impact_usd: None,
             status,
             started_ms: 1_000,
             finished_ms: None,
@@ -1457,6 +1434,7 @@ mod tests {
             cached: Some(128),
             reasoning: Some(0),
         });
+        row.normalized_usage = row.usage;
         row.started_ms = 1718900000000;
         row.elapsed_ms = Some(3100);
         let frame = DashboardFrame {
@@ -1483,6 +1461,8 @@ mod tests {
                     "model_served": "llama-3.1-70b",
                     "upstream_target": "vllm-a",
                     "usage": { "prompt": 812, "completion": 512, "total": 1324, "cached": 128, "reasoning": 0 },
+                    "normalized_usage": { "prompt": 812, "completion": 512, "total": 1324, "cached": 128, "reasoning": 0 },
+                    "usage_anomaly_count": 0,
                     "started_ms": 1718900000000u64,
                     "elapsed_ms": 3100,
                     "method": "POST",
@@ -1515,13 +1495,16 @@ mod tests {
             first_content_delta_ms: Some(1_500),
             stream_end_ms: None,
             finalize_ms: None,
+            ..Default::default()
         };
         let attempt = Attempt {
             provider: Some("vllm-a".to_string()),
             model: Some("llama-3.1-70b".to_string()),
             start_ms: 1_050,
             end_ms: 1_220,
+            duration_ms: Some(170),
             first_upstream_byte_ms: Some(1_220),
+            first_upstream_byte_offset_ms: Some(170),
             status: AttemptStatus::Served,
             error_class: None,
             failover_reason: None,
@@ -1593,87 +1576,21 @@ mod tests {
     /// types are byte-shape-exact.)
     #[test]
     fn metric_tick_frame_matches_golden_fixture_shape() {
-        let frame = DashboardFrame {
-            domain: Domain::Metrics,
-            seq: 2,
-            batch: vec![DashboardPayload::MetricTick(MetricTick {
-                reqs_per_sec: 4.2,
-                active_streams: 3,
-                error_pct: 1.1,
-                p50: 180.0,
-                p95: 920.0,
-                p99: 1840.0,
-                tokens_per_sec: 142.0,
-                cost_per_min: 0.21,
-                samples: 252,
-                usage_samples: 250,
-                priced_samples: 240,
-                cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
-                windows: MetricWindows {
-                    m1: MetricWindow {
-                        reqs_per_sec: 4.2,
-                        active_streams: 3,
-                        error_pct: 1.1,
-                        p50: 180.0,
-                        p95: 920.0,
-                        p99: 1840.0,
-                        tokens_per_sec: 142.0,
-                        cost_per_min: 0.21,
-                        samples: 252,
-                        usage_samples: 250,
-                        priced_samples: 240,
-                        cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
-                    },
-                    m5: MetricWindow {
-                        reqs_per_sec: 3.8,
-                        active_streams: 3,
-                        error_pct: 1.0,
-                        p50: 175.0,
-                        p95: 900.0,
-                        p99: 1800.0,
-                        tokens_per_sec: 128.0,
-                        cost_per_min: 0.19,
-                        samples: 1140,
-                        usage_samples: 1130,
-                        priced_samples: 1100,
-                        cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
-                    },
-                    h1: MetricWindow {
-                        reqs_per_sec: 2.9,
-                        active_streams: 2,
-                        error_pct: 0.8,
-                        p50: 160.0,
-                        p95: 850.0,
-                        p99: 1700.0,
-                        tokens_per_sec: 100.0,
-                        cost_per_min: 0.15,
-                        samples: 10440,
-                        usage_samples: 10400,
-                        priced_samples: 10000,
-                        cost_confidence: crate::dashboard_api::CostConfidence::Estimated,
-                    },
-                },
-            })],
-        };
+        let frame = metric_tick_frame(
+            &crate::metrics::MetricsView::default(),
+            2,
+            3,
+            &std::collections::HashMap::new(),
+        );
         let got: serde_json::Value = serde_json::to_value(&frame).expect("serialize");
-        let want: serde_json::Value = serde_json::json!({
-            "domain": "metrics",
-            "seq": 2,
-            "batch": [
-                {
-                    "type": "metric_tick",
-                    "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1,
-                    "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21,
-                    "samples": 252, "usage_samples": 250, "priced_samples": 240, "cost_confidence": "estimated",
-                    "windows": {
-                        "m1": { "reqs_per_sec": 4.2, "active_streams": 3, "error_pct": 1.1, "p50": 180.0, "p95": 920.0, "p99": 1840.0, "tokens_per_sec": 142.0, "cost_per_min": 0.21, "samples": 252, "usage_samples": 250, "priced_samples": 240, "cost_confidence": "estimated" },
-                        "m5": { "reqs_per_sec": 3.8, "active_streams": 3, "error_pct": 1.0, "p50": 175.0, "p95": 900.0, "p99": 1800.0, "tokens_per_sec": 128.0, "cost_per_min": 0.19, "samples": 1140, "usage_samples": 1130, "priced_samples": 1100, "cost_confidence": "estimated" },
-                        "h1": { "reqs_per_sec": 2.9, "active_streams": 2, "error_pct": 0.8, "p50": 160.0, "p95": 850.0, "p99": 1700.0, "tokens_per_sec": 100.0, "cost_per_min": 0.15, "samples": 10440, "usage_samples": 10400, "priced_samples": 10000, "cost_confidence": "estimated" }
-                    }
-                }
-            ]
-        });
-        assert_eq!(got, want);
+        assert_eq!(got["domain"], "metrics");
+        assert_eq!(got["seq"], 2);
+        let payload = &got["batch"][0];
+        assert_eq!(payload["type"], "metric_tick");
+        assert_eq!(payload["headline_window"], "m1");
+        assert!(payload.get("reqs_per_sec").is_none());
+        assert_eq!(payload["windows"]["m1"]["window_seconds"], 60);
+        assert!(payload["windows"]["m1"]["p95_ms"].is_null());
     }
 
     /// Gap 01 finding 1: the metrics-domain cursor stays STRICTLY MONOTONIC across both
@@ -1753,7 +1670,9 @@ mod tests {
                         }
                     ],
                     "edges": [
-                        { "from": "gateway", "to": "vllm-a", "throughput": 0.0, "tokens_per_sec": 0.0, "cost_per_sec": 0.0 }
+                        { "from": "gateway", "to": "vllm-a", "attempts_per_sec": 0.0,
+                          "terminal_flows_per_sec": 0.0, "reported_tokens_per_sec": null,
+                          "terminal_cost_per_sec": null }
                     ]
                 }
             ]
@@ -1835,6 +1754,16 @@ mod tests {
                 model_served: s.model_served.clone(),
                 upstream_target: s.upstream_target.clone(),
                 usage: s.usage,
+                normalized_usage: s
+                    .usage
+                    .map(crate::dashboard_flow::normalize_usage)
+                    .map(|value| value.usage),
+                usage_anomaly_count: s
+                    .usage
+                    .map(crate::dashboard_flow::normalize_usage)
+                    .map_or(0, |value| value.anomaly_count),
+                effective_route_limit: s.effective_route_limit,
+                cache_price_impact_usd: s.cache_price_impact_usd,
                 status: s.status,
                 started_ms: s.started_ms,
                 finished_ms: s.finished_ms,

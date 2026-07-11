@@ -183,7 +183,7 @@ DashboardFrame { domain, seq, batch: Vec<DashboardPayload> }
 |-|-|-|
 | `monitor` | `{message: DebugWsMessage}` | MonitorHub broadcast, 1:1 (sibling-no-drop) |
 | `usage` | `{api_call_id, response_id?, prompt, completion, total, cached?, reasoning?}` | Monitor `Usage` enriched via FlowStore |
-| `metric_tick` | `{reqs_per_sec, active_streams, error_pct, p50, p95, p99, tok/s, $/min, samples, usage_samples, priced_samples, cost_confidence, windows: {m1, m5, h1}}` | MetricsLayer tick, 1 s interval |
+| `metric_tick` | `{generated_at_ms, headline_window: "m1", windows: {m1, m5, h1}}`; each window carries accepted/terminal rates, active-now, separate failure/cancellation percentages, nullable percentile/token/cost values, coverage, and quality | MetricsLayer tick, 1 s interval |
 | `flow_status` | `{api_call_id, response_id?, status, model_requested?, model_served?, upstream_target?, usage?, started_ms, elapsed_ms?, phases, attempts, first_upstream_byte_ms?}` | Monitor `RequestStatus` enriched via FlowStore |
 | `topology_update` | `{nodes, edges}` | ProviderHealthSnapshot poll, 2 s interval |
 
@@ -199,11 +199,11 @@ DashboardFrame { domain, seq, batch: Vec<DashboardPayload> }
 
 - `SeqCursors` (line 139) — dedup baseline.
 - `MetricsSnapshot` (line 150) — REST-shaped metrics cut.
-- `MetricWindow` (line 365) — one sliding window: req/s, active, error%, p50/p95/p99, tok/s, $/min, samples, usage_samples, priced_samples, cost_confidence.
+- `MetricWindow` (line 365) — one sliding window using the schema-v3 fields documented in `dashboard-metrics.md`.
 - `MetricWindows` (line 349) — `{m1, m5, h1}`.
 - `TopologySnapshot` (line 181) — `{topology_seq, nodes, edges, price_table}`.
 - `TopologyNode` (line 407) — provider node with gap-12 per_provider metrics.
-- `TopologyEdge` (line 486) — `{from, to, throughput, tok/s, $/s}`.
+- `TopologyEdge` (line 486) — `{from, to, attempts_per_sec, terminal_flows_per_sec, reported_tokens_per_sec, terminal_cost_per_sec}`.
 
 ### Key functions
 

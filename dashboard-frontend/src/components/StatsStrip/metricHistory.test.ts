@@ -10,14 +10,19 @@ import {
 } from './metricHistory';
 
 function win(over: Partial<MetricWindow> = {}): MetricWindow {
-  // Fully-measured default: the three denominators mirror `samples` unless overridden.
-  const samples = over.samples ?? 252;
+  // Fully-measured default: the three denominators mirror `latency_samples` unless overridden.
+  const latency_samples = over.latency_samples ?? 252;
   return {
-    reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
-    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
-    samples,
-    usage_samples: samples,
-    priced_samples: samples,
+    window_seconds: 60, observed_seconds: 60, warm: true, accepted_requests: 252,
+    accepted_per_sec: 4.2, active_streams_now: 3, failure_pct: 1.1,
+    terminal_requests: latency_samples, terminal_per_sec: 4.2, successes: latency_samples,
+    failures: 0, cancellations: 0, cancellation_pct: 0,
+    p50_ms: 180, p95_ms: 920, p99_ms: 1840, reported_tokens_per_sec: 142, cost_per_min: 0.21,
+    quantile_method: 'log_histogram_nearest_rank', max_relative_error: 0.062,
+    latency_overflow_count: 0, latency_quality: 'measured', usage_anomaly_count: 0,
+    latency_samples,
+    usage_samples: latency_samples,
+    priced_samples: latency_samples,
     cost_confidence: 'estimated',
     ...over,
   };
@@ -31,32 +36,32 @@ describe('metricHistory', () => {
   it('emptyHistory starts with empty rings', () => {
     const h = emptyHistory();
     expect(h.m1).toEqual([]);
-    expect(seriesFor(h, 'm1', 'reqs_per_sec')).toEqual([]);
+    expect(seriesFor(h, 'm1', 'accepted_per_sec')).toEqual([]);
     expect(latest(h, 'm1')).toBeNull();
     expect(previous(h, 'm1')).toBeNull();
   });
 
   it('appendTick folds one sample per window, newest last', () => {
     let h = emptyHistory();
-    h = appendTick(h, tick({ m1: { reqs_per_sec: 1 } }));
-    h = appendTick(h, tick({ m1: { reqs_per_sec: 2 } }));
-    expect(seriesFor(h, 'm1', 'reqs_per_sec')).toEqual([1, 2]);
-    expect(latest(h, 'm1')?.reqs_per_sec).toBe(2);
-    expect(previous(h, 'm1')?.reqs_per_sec).toBe(1);
+    h = appendTick(h, tick({ m1: { accepted_per_sec: 1 } }));
+    h = appendTick(h, tick({ m1: { accepted_per_sec: 2 } }));
+    expect(seriesFor(h, 'm1', 'accepted_per_sec')).toEqual([1, 2]);
+    expect(latest(h, 'm1')?.accepted_per_sec).toBe(2);
+    expect(previous(h, 'm1')?.accepted_per_sec).toBe(1);
   });
 
   it('extracts the per-metric series independently per window', () => {
     let h = emptyHistory();
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 10 }, h1: { tokens_per_sec: 99 } }));
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 20 }, h1: { tokens_per_sec: 88 } }));
-    expect(seriesFor(h, 'm1', 'tokens_per_sec')).toEqual([10, 20]);
-    expect(seriesFor(h, 'h1', 'tokens_per_sec')).toEqual([99, 88]);
+    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 10 }, h1: { reported_tokens_per_sec: 99 } }));
+    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 20 }, h1: { reported_tokens_per_sec: 88 } }));
+    expect(seriesFor(h, 'm1', 'reported_tokens_per_sec')).toEqual([10, 20]);
+    expect(seriesFor(h, 'h1', 'reported_tokens_per_sec')).toEqual([99, 88]);
   });
 
   it('caps each ring at HISTORY_DEPTH (oldest evicted)', () => {
     let h = emptyHistory();
-    for (let i = 0; i < HISTORY_DEPTH + 25; i++) h = appendTick(h, tick({ m1: { p95: i } }));
-    const series = seriesFor(h, 'm1', 'p95');
+    for (let i = 0; i < HISTORY_DEPTH + 25; i++) h = appendTick(h, tick({ m1: { p95_ms: i } }));
+    const series = seriesFor(h, 'm1', 'p95_ms');
     expect(series).toHaveLength(HISTORY_DEPTH);
     // Last value is the most recent; first is exactly DEPTH back (oldest dropped).
     expect(series[series.length - 1]).toBe(HISTORY_DEPTH + 24);
@@ -76,10 +81,10 @@ describe('metricHistory', () => {
     let h = emptyHistory();
     // Sample A: usage reported → real tok/s (142). Sample B: NO usage (usage_samples 0)
     // with a raw 0 tok/s on the wire. Sample C: usage again → real tok/s (50).
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 142, usage_samples: 5, priced_samples: 5 } }));
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 0, usage_samples: 0, priced_samples: 0 } }));
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 50, usage_samples: 5, priced_samples: 5 } }));
-    const series = seriesFor(h, 'm1', 'tokens_per_sec');
+    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 142, usage_samples: 5, priced_samples: 5 } }));
+    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 0, usage_samples: 0, priced_samples: 0 } }));
+    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 50, usage_samples: 5, priced_samples: 5 } }));
+    const series = seriesFor(h, 'm1', 'reported_tokens_per_sec');
     expect(series).toHaveLength(3);
     expect(series[0]).toBe(142);
     expect(Number.isNaN(series[1])).toBe(true); // GAP, not a fabricated 0
@@ -88,17 +93,17 @@ describe('metricHistory', () => {
 
   it('never gaps req/s — a genuine idle 0 is plotted (it is not sample-derived)', () => {
     let h = emptyHistory();
-    // Even with zero samples (nothing finalized), req/s is a real measured rate.
-    h = appendTick(h, tick({ m1: { reqs_per_sec: 0, samples: 0, usage_samples: 0, priced_samples: 0 } }));
-    h = appendTick(h, tick({ m1: { reqs_per_sec: 2.5, samples: 0, usage_samples: 0, priced_samples: 0 } }));
-    const series = seriesFor(h, 'm1', 'reqs_per_sec');
+    // Even with zero latency_samples (nothing finalized), req/s is a real measured rate.
+    h = appendTick(h, tick({ m1: { accepted_per_sec: 0, latency_samples: 0, usage_samples: 0, priced_samples: 0 } }));
+    h = appendTick(h, tick({ m1: { accepted_per_sec: 2.5, latency_samples: 0, usage_samples: 0, priced_samples: 0 } }));
+    const series = seriesFor(h, 'm1', 'accepted_per_sec');
     expect(series).toEqual([0, 2.5]); // both plotted, no NaN gap
   });
 
   it('gaps cost_per_min when pricing is missing but plots tok/s when usage is present', () => {
     let h = emptyHistory();
-    h = appendTick(h, tick({ m1: { tokens_per_sec: 142, cost_per_min: 0, samples: 4, usage_samples: 4, priced_samples: 0 } }));
+    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 142, cost_per_min: 0, latency_samples: 4, usage_samples: 4, priced_samples: 0 } }));
     expect(Number.isNaN(seriesFor(h, 'm1', 'cost_per_min')[0])).toBe(true); // unpriced → gap
-    expect(seriesFor(h, 'm1', 'tokens_per_sec')[0]).toBe(142); // usage present → plotted
+    expect(seriesFor(h, 'm1', 'reported_tokens_per_sec')[0]).toBe(142); // usage present → plotted
   });
 });

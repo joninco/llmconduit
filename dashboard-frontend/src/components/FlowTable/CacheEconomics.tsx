@@ -20,23 +20,21 @@
  * overall reported-sample coverage so an operator sees at a glance whether caching is measurable.
  */
 import { useMemo, useState } from 'react';
-import type { FlowSummary, ModelPrice } from '../../api/types';
+import type { FlowSummary } from '../../api/types';
 import { aggregateCacheByKey, type CacheAggregateRow } from './tokenEconomics';
 import { cn } from '../../lib/cn';
 
 export function CacheEconomics({
   rows,
-  priceTable,
 }: {
   rows: FlowSummary[];
-  priceTable: Record<string, ModelPrice>;
 }) {
   const [open, setOpen] = useState(false);
   // Group by the SERVED model (the model actually billed); fall back to requested when the served
   // identity is not yet known. Flows with no model at all are dropped by `aggregateCacheByKey`.
   const aggregates = useMemo(
-    () => aggregateCacheByKey(rows, (f) => f.model_served ?? f.model_requested, priceTable),
-    [rows, priceTable],
+    () => aggregateCacheByKey(rows, (f) => f.model_served ?? f.model_requested),
+    [rows],
   );
 
   // Overall coverage: how many model groups have ANY measured cache-hit rate (reported cached).

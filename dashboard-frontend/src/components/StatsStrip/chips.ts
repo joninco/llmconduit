@@ -7,7 +7,6 @@
  */
 import type { CostConfidence, MetricWindow } from '../../api/types';
 import { colors } from '../../design/tokens';
-import { fmtTokens } from '../FlowTable/format';
 import { metricUnavailable, type MetricKey } from './metricHistory';
 
 /** Error-% threshold above which the err chip turns red (spec: "red above threshold"). */
@@ -46,14 +45,38 @@ export interface ChipDescriptor {
   quality: MetricQuality;
   /** uPlot stroke as hex for the sparkline (mirrors `stroke`, kept explicit for clarity). */
   sparkStroke: string;
+  /** Accessible formula, coverage, sample count, and approximation summary. */
+  details: string;
+}
+
+function metricDetails(window: MetricWindow | null, key: MetricKey): string {
+  if (!window) return 'No metric window has been published.';
+  const coverage = `${window.observed_seconds}/${window.window_seconds}s observed${window.warm ? ', warm' : ', warming'}`;
+  switch (key) {
+    case 'accepted_per_sec': return `accepted starts / observed seconds; ${window.accepted_requests} starts; ${coverage}`;
+    case 'terminal_per_sec': return `terminal flows / observed seconds; ${window.terminal_requests} terminals; ${coverage}`;
+    case 'active_streams_now': return `open flows at the published cut; ${window.active_streams_now} active; global scope`;
+    case 'failure_pct': return `failures / terminal flows × 100; ${window.failures}/${window.terminal_requests} terminals; cancellations excluded`;
+    case 'cancellation_pct': return `cancellations / terminal flows × 100; ${window.cancellations}/${window.terminal_requests} terminals`;
+    case 'p50_ms':
+    case 'p95_ms':
+    case 'p99_ms': return `${key.slice(0, 3)} nearest-rank logarithmic histogram; ${window.latency_samples} latency samples; max relative error ${(window.max_relative_error * 100).toFixed(1)}%; ${window.latency_quality}`;
+    case 'reported_tokens_per_sec': return `normalized prompt + completion / observed seconds; ${window.usage_samples} usage samples, ${window.usage_anomaly_count} anomalies; subsets counted once; ${coverage}`;
+    case 'cost_per_min': return `persisted terminal cost / observed minutes; ${window.priced_samples}/${window.terminal_requests} priced terminals; ${window.cost_confidence}; ${coverage}`;
+  }
 }
 
 /** Round-trip-safe compact rate (`4.2`, `142`, `1.2k`). */
 function fmtRate(n: number): string {
   if (!Number.isFinite(n)) return '—';
+  if (n === 0) return '0.0';
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   if (n >= 100) return String(Math.round(n));
-  return n.toFixed(1);
+  if (n >= 1) return n.toFixed(1);
+  if (n >= 0.1) return n.toFixed(2);
+  if (n >= 0.01) return n.toFixed(3);
+  if (n >= 0.001) return n.toFixed(4);
+  return n.toPrecision(2);
 }
 
 /** Latency ms → integer ms (`920`). */
@@ -120,13 +143,15 @@ interface MetricSpec {
 }
 
 const METRIC_SPECS: readonly MetricSpec[] = [
-  { key: 'reqs_per_sec', label: 'req/s', fmt: fmtRate, stroke: colors.accent, accent: 'accent', quality: 'measured' },
-  { key: 'active_streams', label: 'active', fmt: fmtRate, stroke: colors.accent, accent: 'text', quality: 'measured' },
-  { key: 'error_pct', label: 'err %', fmt: fmtPct, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
-  { key: 'p50', label: 'p50 ms', fmt: fmtMs, stroke: colors.statusHealthy, accent: 'text', quality: 'derived' },
-  { key: 'p95', label: 'p95 ms', fmt: fmtMs, stroke: colors.statusCooling, accent: 'text', quality: 'derived' },
-  { key: 'p99', label: 'p99 ms', fmt: fmtMs, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
-  { key: 'tokens_per_sec', label: 'tok/s', fmt: fmtTokens, stroke: colors.statusHealthy, accent: 'healthy', quality: 'derived' },
+  { key: 'accepted_per_sec', label: 'inbound/s', fmt: fmtRate, stroke: colors.accent, accent: 'accent', quality: 'measured' },
+  { key: 'terminal_per_sec', label: 'done/s', fmt: fmtRate, stroke: colors.accent, accent: 'text', quality: 'measured' },
+  { key: 'active_streams_now', label: 'active now', fmt: fmtRate, stroke: colors.accent, accent: 'text', quality: 'measured' },
+  { key: 'failure_pct', label: 'fail %', fmt: fmtPct, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
+  { key: 'cancellation_pct', label: 'cancel %', fmt: fmtPct, stroke: colors.statusCooling, accent: 'text', quality: 'derived' },
+  { key: 'p50_ms', label: 'p50 e2e ms', fmt: fmtMs, stroke: colors.statusHealthy, accent: 'text', quality: 'derived' },
+  { key: 'p95_ms', label: 'p95 e2e ms', fmt: fmtMs, stroke: colors.statusCooling, accent: 'text', quality: 'derived' },
+  { key: 'p99_ms', label: 'p99 e2e ms', fmt: fmtMs, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
+  { key: 'reported_tokens_per_sec', label: 'reported tok/s', fmt: fmtRate, stroke: colors.statusHealthy, accent: 'healthy', quality: 'derived' },
   // $/min: the static tier here is a FALLBACK only — its real quality is derived per-sample from
   // the backend `cost_confidence` (gap 07 finding 5, see `costQuality`), so a confident aggregate
   // reads `derived` and an estimated one reads `estimated` (no longer always `estimated`).
@@ -156,16 +181,18 @@ export function deriveChips(cur: MetricWindow | null, prev: MetricWindow | null)
   return METRIC_SPECS.map((spec): ChipDescriptor => {
     // Unmeasurable when there is no window, or this metric's own denominator is 0.
     const unavailable = metricUnavailable(cur, spec.key);
-    const value = unavailable || !cur ? UNAVAILABLE : spec.fmt(cur[spec.key]);
+    const currentValue = cur?.[spec.key] ?? null;
+    const previousValue = prev?.[spec.key] ?? undefined;
+    const value = unavailable || currentValue === null ? UNAVAILABLE : spec.fmt(currentValue);
     // The err% chip turns red ABOVE the threshold — but only when it is actually MEASURED
     // (an unavailable err% carries no threshold accent); others keep their static accent.
     const accent: ChipDescriptor['accent'] =
-      !unavailable && cur && spec.key === 'error_pct' && cur.error_pct > ERROR_PCT_THRESHOLD ? 'down' : spec.accent;
+      !unavailable && cur && spec.key === 'failure_pct' && cur.failure_pct > ERROR_PCT_THRESHOLD ? 'down' : spec.accent;
     // No trend direction for an unavailable value, nor across the genuine→unavailable boundary
     // (the previous sample being unavailable for THIS metric makes the delta meaningless).
     const prevUnavailable = metricUnavailable(prev, spec.key);
-    const delta = !unavailable && cur && !prevUnavailable
-      ? deltaDir(cur[spec.key], prev?.[spec.key])
+    const delta = !unavailable && currentValue !== null && !prevUnavailable
+      ? deltaDir(currentValue, previousValue ?? undefined)
       : 'flat';
     // Provenance (finding 4): `unavailable` when `—`, else the metric's intrinsic tier — EXCEPT
     // the cost chip, whose tier is the AGGREGATE `cost_confidence` the backend reports (gap 07
@@ -189,6 +216,7 @@ export function deriveChips(cur: MetricWindow | null, prev: MetricWindow | null)
       delta,
       quality,
       sparkStroke: spec.stroke,
+      details: metricDetails(cur, spec.key),
     };
   });
 }

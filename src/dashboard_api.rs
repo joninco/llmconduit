@@ -97,6 +97,13 @@ pub struct FlowRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_target: Option<String>,
     pub usage: Option<FlowUsage>,
+    /// Calculation-only corrected usage; raw provider values remain in `usage`.
+    pub normalized_usage: Option<FlowUsage>,
+    pub usage_anomaly_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_route_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_price_impact_usd: Option<f64>,
     pub status: FlowStatus,
     pub started_ms: u128,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,9 +162,10 @@ pub struct FlowRow {
 impl FlowRow {
     /// Build a row from a live [`FlowRecord`], pricing it via the gateway's price
     /// table keyed by the SERVED model (the backend that actually answered).
-    pub(crate) fn from_record(record: &FlowRecord, gateway: &Gateway) -> Self {
-        let (cost, cost_confidence) =
-            flow_cost_and_confidence(record.model_served.as_deref(), record.usage, gateway);
+    pub(crate) fn from_record(record: &FlowRecord, _gateway: &Gateway) -> Self {
+        let normalized = record.usage.map(crate::dashboard_flow::normalize_usage);
+        let cost = record.terminal_cost_usd;
+        let cost_confidence = record.terminal_cost_confidence.into();
         Self {
             revision: record.revision,
             api_call_id: record.api_call_id.clone(),
@@ -168,6 +176,10 @@ impl FlowRow {
             model_served: record.model_served.clone(),
             upstream_target: record.upstream_target.clone(),
             usage: record.usage,
+            normalized_usage: normalized.map(|value| value.usage),
+            usage_anomaly_count: normalized.map_or(0, |value| value.anomaly_count),
+            effective_route_limit: record.effective_route_limit,
+            cache_price_impact_usd: record.cache_price_impact_usd,
             status: record.status,
             started_ms: record.started_ms,
             finished_ms: record.finished_ms,
@@ -196,10 +208,11 @@ impl FlowRow {
     /// summary has no live `FlowRecord`, so this prices off its own `model_served` + `usage`.
     pub(crate) fn from_summary(
         summary: &crate::dashboard_flow::SnapshotFlowSummary,
-        gateway: &Gateway,
+        _gateway: &Gateway,
     ) -> Self {
-        let (cost, cost_confidence) =
-            flow_cost_and_confidence(summary.model_served.as_deref(), summary.usage, gateway);
+        let normalized = summary.usage.map(crate::dashboard_flow::normalize_usage);
+        let cost = summary.terminal_cost_usd;
+        let cost_confidence = summary.terminal_cost_confidence.into();
         Self {
             revision: summary.revision,
             api_call_id: summary.api_call_id.clone(),
@@ -210,6 +223,10 @@ impl FlowRow {
             model_served: summary.model_served.clone(),
             upstream_target: summary.upstream_target.clone(),
             usage: summary.usage,
+            normalized_usage: normalized.map(|value| value.usage),
+            usage_anomaly_count: normalized.map_or(0, |value| value.anomaly_count),
+            effective_route_limit: summary.effective_route_limit,
+            cache_price_impact_usd: summary.cache_price_impact_usd,
             status: summary.status,
             started_ms: summary.started_ms,
             finished_ms: summary.finished_ms,
@@ -337,6 +354,12 @@ pub struct FlowDetailBody {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_target: Option<String>,
     pub usage: Option<FlowUsage>,
+    pub normalized_usage: Option<FlowUsage>,
+    pub usage_anomaly_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_route_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_price_impact_usd: Option<f64>,
     pub status: FlowStatus,
     /// Monitor-domain watermark of the single transcript snapshot used to build
     /// `deltas`. [`FlowDelta::sequence`] remains a per-flow replay ordinal and is
@@ -498,6 +521,7 @@ pub struct OverviewResponse {
 /// the JSON: `serde_json::to_vec` ERRORS on a non-finite float, which would 500 the
 /// whole `/flows` (or snapshot) read. A non-finite cost collapses to `0.0` instead.
 pub fn cost_for_usage(usage: FlowUsage, price: ModelPrice) -> f64 {
+    let usage = crate::dashboard_flow::normalize_usage(usage).usage;
     // Gap 07: an UNREPORTED cached count (`None`) bills as 0 cached tokens — the whole
     // prompt then bills at the input rate (the confidence tier flags this as `estimated`
     // when no cached rate is configured; the dollar figure stays a best-effort number).
@@ -538,6 +562,16 @@ pub enum CostConfidence {
     Unavailable,
 }
 
+impl From<crate::dashboard_flow::TerminalCostConfidence> for CostConfidence {
+    fn from(value: crate::dashboard_flow::TerminalCostConfidence) -> Self {
+        match value {
+            crate::dashboard_flow::TerminalCostConfidence::Confident => Self::Confident,
+            crate::dashboard_flow::TerminalCostConfidence::Estimated => Self::Estimated,
+            crate::dashboard_flow::TerminalCostConfidence::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
 /// Gap 07 — classify a flow's cost confidence from its served model's price PRESENCE
 /// + the cached-token report. The rules (spec 07 acceptance):
 /// - unpriced model ⇒ [`CostConfidence::Unavailable`] (cost is `None`, never `0`).
@@ -547,6 +581,7 @@ pub enum CostConfidence {
 /// - priced AND (`cached == Some(n>0)` OR `cached == None`) AND NOT
 ///   `cached_price_configured` ⇒ `Estimated` (those cached tokens would bill at the
 ///   default `0.0` — an undercount, so NOT a silently-`confident` total).
+#[cfg(test)]
 fn cost_confidence(price: Option<ModelPrice>, usage: Option<FlowUsage>) -> CostConfidence {
     let Some(price) = price else {
         return CostConfidence::Unavailable;
@@ -579,31 +614,8 @@ fn finite(value: f64) -> f64 {
     if value.is_finite() { value } else { 0.0 }
 }
 
-/// Gap 07 — price a flow AND tag its [`CostConfidence`] together, so the two can never
-/// disagree: cost is `Some` exactly when a served model + usage + a configured price
-/// all exist, and the confidence is then `Confident`/`Estimated` per the cached-rate
-/// presence; whenever cost is `None` (unpriced/no-usage/no-model) the confidence is
-/// `Unavailable` (don't-lie-with-zeros: an absent cost is never a confident `0`).
-fn flow_cost_and_confidence(
-    model_served: Option<&str>,
-    usage: Option<FlowUsage>,
-    gateway: &Gateway,
-) -> (Option<f64>, CostConfidence) {
-    let price = model_served.and_then(|model| gateway.price_for(model));
-    match (price, usage) {
-        // Priced AND usage present: a real cost, tagged confident/estimated by the
-        // cached-rate presence.
-        (Some(price), Some(usage)) => (
-            Some(cost_for_usage(usage, price)),
-            cost_confidence(Some(price), Some(usage)),
-        ),
-        // Unpriced, OR no usage to bill: no cost, so UNAVAILABLE (never a fake 0).
-        _ => (None, CostConfidence::Unavailable),
-    }
-}
-
-/// The total token throughput of one window (prompt + completion + cached +
-/// reasoning across every bucket) — the numerator for `tokens_per_sec`.
+/// Canonical token throughput is prompt + completion. Cached and reasoning are
+/// diagnostic subsets and must never be added a second time.
 fn window_total_tokens(report: &WindowReport) -> i64 {
     report
         .buckets
@@ -612,98 +624,14 @@ fn window_total_tokens(report: &WindowReport) -> i64 {
             counts
                 .prompt_tokens
                 .saturating_add(counts.completion_tokens)
-                .saturating_add(counts.cached_tokens)
-                .saturating_add(counts.reasoning_tokens)
         })
         .fold(0i64, i64::saturating_add)
-}
-
-/// The total USD cost of one window: every bucket's tokens priced by its OWN
-/// served model (`BucketKey.model`). Buckets whose model has no configured price
-/// contribute nothing. The basis for `cost_per_min` (this ÷ window minutes).
-fn window_total_cost(report: &WindowReport, prices: &HashMap<String, ModelPrice>) -> f64 {
-    report
-        .buckets
-        .iter()
-        .filter_map(|(key, counts)| {
-            price_lookup(prices, &key.model).map(|price| {
-                cost_for_usage(
-                    FlowUsage {
-                        prompt: counts.prompt_tokens,
-                        completion: counts.completion_tokens,
-                        // The bucket sums are concrete aggregates (gap 07): the cached/
-                        // reasoning totals are `Some` measured values, not unreported.
-                        cached: Some(counts.cached_tokens),
-                        reasoning: Some(counts.reasoning_tokens),
-                        total: 0,
-                    },
-                    price,
-                )
-            })
-        })
-        .sum()
-}
-
-/// Gap 07 — the AGGREGATE [`CostConfidence`] of one window's `cost_per_min`. An
-/// aggregate touching ANY non-confident component is itself `estimated` (spec 07:
-/// "no silently-confident totals"):
-/// - NO priced bucket (nothing to bill) ⇒ `Unavailable` (`cost_per_min` renders `—`).
-/// - A priced bucket would bill cached at the default `0.0` — i.e. it billed cached
-///   tokens (`cached_tokens > 0`) OR a usage-bearing flow left cached UNREPORTED
-///   (`unreported_cached_samples > 0`) — while that model has NO configured cached
-///   rate ⇒ `Estimated`.
-/// - An UNPRICED but USAGE-BEARING bucket (`usage_samples > 0`, no configured price)
-///   COEXISTS with priced buckets ⇒ `Estimated` (gap 07 review round 1, finding 2). Its
-///   real spend is OMITTED from `cost_per_min` entirely (unpriced ⇒ contributes `0`), so
-///   the reported total is a PARTIAL undercount of the window's true cost — exactly the
-///   kind of silently-confident total the spec forbids. It is NOT `unavailable` (some
-///   buckets ARE priced, so `cost_per_min` is a real number that renders), just an
-///   incomplete one. A usage-LESS unpriced bucket (a flow that reported no tokens, e.g. a
-///   failure) adds no missing cost, so it does NOT taint the window.
-/// - Otherwise (every priced bucket either bills no cached tokens AND had none
-///   unreported or has a configured cached rate, AND no unpriced bucket bore usage) ⇒
-///   `Confident`.
-fn window_cost_confidence(
-    report: &WindowReport,
-    prices: &HashMap<String, ModelPrice>,
-) -> CostConfidence {
-    let mut any_priced = false;
-    let mut any_estimated = false;
-    // Tracked SEPARATELY from `any_estimated` because an unpriced usage-bearing bucket
-    // only forces `estimated` when a priced bucket ALSO exists (a window that is ALL
-    // unpriced stays `unavailable` — nothing was billed at all).
-    let mut unpriced_usage_bearing = false;
-    for (key, counts) in &report.buckets {
-        let Some(price) = price_lookup(prices, &key.model) else {
-            // Unpriced bucket: its cost is OMITTED from the window total. If it carried
-            // real usage, the total is a partial undercount — flag it (resolved against
-            // `any_priced` below). A usage-less unpriced bucket adds no missing cost.
-            if counts.usage_samples > 0 {
-                unpriced_usage_bearing = true;
-            }
-            continue;
-        };
-        any_priced = true;
-        // This priced bucket bills cached at the default 0.0 when it has cached tokens
-        // (or a flow that didn't report cached) AND no configured cache rate.
-        let bills_unknown_cached = counts.cached_tokens > 0 || counts.unreported_cached_samples > 0;
-        if bills_unknown_cached && !price.cached_price_configured {
-            any_estimated = true;
-        }
-    }
-    // An unpriced usage-bearing bucket taints the total ONLY when something priced
-    // contributes to it (otherwise the window is `unavailable`, handled below).
-    let partial_from_unpriced = any_priced && unpriced_usage_bearing;
-    match (any_priced, any_estimated || partial_from_unpriced) {
-        (false, _) => CostConfidence::Unavailable,
-        (true, true) => CostConfidence::Estimated,
-        (true, false) => CostConfidence::Confident,
-    }
 }
 
 /// Exact-then-case-insensitive price lookup over a raw price map, mirroring
 /// [`crate::config::Config::price_for`] (used where only the map is in hand, e.g.
 /// pricing a snapshot cut's metrics buckets).
+#[cfg(test)]
 fn price_lookup(prices: &HashMap<String, ModelPrice>, model: &str) -> Option<ModelPrice> {
     prices.get(model).copied().or_else(|| {
         prices
@@ -723,58 +651,75 @@ fn rest_window_tile(
     report: &WindowReport,
     window_secs: f64,
     active_streams: u64,
-    prices: &HashMap<String, ModelPrice>,
+    _prices: &HashMap<String, ModelPrice>,
 ) -> MetricWindow {
     let percentiles = report.percentiles();
     let total = report.total_count();
-    let errors: u64 = report
-        .buckets
-        .iter()
-        .filter(|(key, _)| key.status == StatusClass::Error)
-        .map(|(_, counts)| counts.count)
-        .fold(0u64, u64::saturating_add);
-    let error_pct = if total > 0 {
-        (errors as f64) / (total as f64) * 100.0
-    } else {
-        0.0
+    let count_status = |status| {
+        report
+            .buckets
+            .iter()
+            .filter(|(key, _)| key.status == status)
+            .map(|(_, counts)| counts.count)
+            .fold(0u64, u64::saturating_add)
     };
-    let reqs_per_sec = total as f64 / window_secs;
-    let tokens_per_sec = window_total_tokens(report) as f64 / window_secs;
-    let cost_per_min = window_total_cost(report, prices) / (window_secs / 60.0);
-    // Per-metric measurability denominators (gap 01 review round 1, finding 3): token
-    // and cost availability are SEPARATE from latency/error. `usage_samples` counts
-    // terminal flows that reported usage; `priced_samples` the subset whose served
-    // model has a configured price (derived HERE, where the price table lives, so
-    // `metrics.rs` stays price-agnostic). A window can have `samples > 0` (latency
-    // measured) yet `usage_samples == 0` (no flow reported tokens) → `tokens_per_sec`
-    // renders `—`; or `usage_samples > 0` yet `priced_samples == 0` (only unpriced
-    // models) → `cost_per_min` renders `—`, distinguishing "unpriced" from `$0.00`.
+    let successes = count_status(StatusClass::Success);
+    let failures = count_status(StatusClass::Error);
+    let cancellations = count_status(StatusClass::Cancelled);
+    let denominator = report.observed_seconds.max(1).min(window_secs as u64) as f64;
     let usage_samples = report.usage_sample_count();
-    let priced_samples = report.priced_sample_count(|model| price_lookup(prices, model).is_some());
-    // Gap 07: the aggregate cost confidence for this window's `cost_per_min` — `estimated`
-    // when any priced bucket would silently bill cached at the default `0.0`, so the strip
-    // labels the headline `$/min` rather than presenting a possibly-undercounted total as
-    // confident.
-    let cost_confidence = window_cost_confidence(report, prices);
-    // Every float is `finite`-guarded: a non-finite value would make
-    // `serde_json::to_vec` error and 500 the `/metrics` read.
+    let priced_samples = report.terminal_priced_samples();
+    let percentage = |count: u64| {
+        if total == 0 {
+            0.0
+        } else {
+            count as f64 / total as f64 * 100.0
+        }
+    };
+    let latency_value = |minimum: u64, value: f64| (total >= minimum).then_some(finite(value));
+    let latency_quality = if total == 0 {
+        crate::dashboard_ws::MetricQuality::Unavailable
+    } else if report.histogram.is_partial() {
+        crate::dashboard_ws::MetricQuality::Partial
+    } else {
+        crate::dashboard_ws::MetricQuality::Measured
+    };
+    let cost_confidence = if priced_samples == 0 {
+        CostConfidence::Unavailable
+    } else if report.terminal_cost_is_estimated() {
+        CostConfidence::Estimated
+    } else {
+        CostConfidence::Confident
+    };
     MetricWindow {
-        reqs_per_sec: finite(reqs_per_sec),
-        active_streams,
-        error_pct: finite(error_pct),
-        p50: finite(percentiles.p50),
-        p95: finite(percentiles.p95),
-        p99: finite(percentiles.p99),
-        tokens_per_sec: finite(tokens_per_sec),
-        cost_per_min: finite(cost_per_min),
-        // `total` is the count of TERMINAL flows in the window — the latency/error
-        // measured/unavailable signal. `0` here ≠ "zero throughput"; it means NO
-        // finalized flow fed the latency/error fields, so the frontend renders those
-        // `—` (while `reqs_per_sec`'s genuine `0` stays a `0`). Token/cost availability
-        // use the separate denominators above.
-        samples: total,
+        window_seconds: window_secs as u64,
+        observed_seconds: report.observed_seconds.min(window_secs as u64),
+        warm: report.observed_seconds >= window_secs as u64,
+        accepted_requests: report.accepted_requests,
+        accepted_per_sec: finite(report.accepted_requests as f64 / denominator),
+        terminal_requests: total,
+        terminal_per_sec: finite(total as f64 / denominator),
+        successes,
+        failures,
+        failure_pct: finite(percentage(failures)),
+        cancellations,
+        cancellation_pct: finite(percentage(cancellations)),
+        active_streams_now: active_streams,
+        latency_samples: total,
+        p50_ms: latency_value(2, percentiles.p50),
+        p95_ms: latency_value(20, percentiles.p95),
+        p99_ms: latency_value(100, percentiles.p99),
+        quantile_method: crate::dashboard_ws::QuantileMethod::LogHistogramNearestRank,
+        max_relative_error: crate::metrics::HISTOGRAM_MAX_RELATIVE_ERROR,
+        latency_overflow_count: report.histogram.overflow_count(),
+        latency_quality,
         usage_samples,
+        reported_tokens_per_sec: (usage_samples > 0)
+            .then_some(finite(window_total_tokens(report) as f64 / denominator)),
+        usage_anomaly_count: report.usage_anomaly_count(),
         priced_samples,
+        cost_per_min: (priced_samples > 0)
+            .then_some(finite(report.terminal_cost_usd() / (denominator / 60.0))),
         cost_confidence,
     }
 }
@@ -795,18 +740,8 @@ pub fn metrics_body(
     let h1 = rest_window_tile(&view.window_1h, WINDOW_1H_SECS, active_streams, prices);
     MetricsSnapshot {
         metrics_seq,
-        reqs_per_sec: m1.reqs_per_sec,
-        active_streams: m1.active_streams,
-        error_pct: m1.error_pct,
-        p50: m1.p50,
-        p95: m1.p95,
-        p99: m1.p99,
-        tokens_per_sec: m1.tokens_per_sec,
-        cost_per_min: m1.cost_per_min,
-        samples: m1.samples,
-        usage_samples: m1.usage_samples,
-        priced_samples: m1.priced_samples,
-        cost_confidence: m1.cost_confidence,
+        generated_at_ms: view.generated_at_ms,
+        headline_window: crate::dashboard_ws::MetricWindowName::M1,
         windows: MetricWindows { m1, m5, h1 },
     }
 }
@@ -835,13 +770,14 @@ pub fn topology_body(
         .providers
         .iter()
         .map(|provider| {
-            let (reqs, tokens, cost) = upstream_edge_rates(&provider.id, window_1m, prices);
+            let (attempts, terminals, tokens, cost) = upstream_edge_rates(&provider.id, window_1m);
             TopologyEdge {
                 from: "gateway".to_string(),
                 to: provider.id.clone(),
-                throughput: reqs,
-                tokens_per_sec: tokens,
-                cost_per_sec: cost,
+                attempts_per_sec: attempts,
+                terminal_flows_per_sec: terminals,
+                reported_tokens_per_sec: tokens,
+                terminal_cost_per_sec: cost,
             }
         })
         .collect();
@@ -863,11 +799,12 @@ pub fn topology_body(
 fn upstream_edge_rates(
     upstream_id: &str,
     window_1m: &WindowReport,
-    prices: &HashMap<String, ModelPrice>,
-) -> (f64, f64, f64) {
+) -> (f64, f64, Option<f64>, Option<f64>) {
     let mut reqs = 0u64;
     let mut tokens = 0i64;
     let mut cost = 0.0f64;
+    let mut usage_samples = 0u64;
+    let mut priced_samples = 0u64;
     for (key, counts) in &window_1m.buckets {
         if key.upstream != upstream_id {
             continue;
@@ -875,27 +812,20 @@ fn upstream_edge_rates(
         reqs = reqs.saturating_add(counts.count);
         tokens = tokens
             .saturating_add(counts.prompt_tokens)
-            .saturating_add(counts.completion_tokens)
-            .saturating_add(counts.cached_tokens)
-            .saturating_add(counts.reasoning_tokens);
-        if let Some(price) = price_lookup(prices, &key.model) {
-            cost += cost_for_usage(
-                FlowUsage {
-                    prompt: counts.prompt_tokens,
-                    completion: counts.completion_tokens,
-                    // Concrete bucket aggregates → measured `Some` (gap 07).
-                    cached: Some(counts.cached_tokens),
-                    reasoning: Some(counts.reasoning_tokens),
-                    total: 0,
-                },
-                price,
-            );
-        }
+            .saturating_add(counts.completion_tokens);
+        usage_samples = usage_samples.saturating_add(counts.usage_samples);
+        priced_samples = priced_samples.saturating_add(counts.priced_samples);
+        cost += counts.terminal_cost_usd;
     }
+    let denominator = window_1m.observed_seconds.clamp(1, 60) as f64;
+    let attempts = window_1m
+        .provider_latency(upstream_id)
+        .map_or(0, |latency| latency.samples);
     (
-        finite(reqs as f64 / WINDOW_1M_SECS),
-        finite(tokens as f64 / WINDOW_1M_SECS),
-        finite(cost / WINDOW_1M_SECS),
+        finite(attempts as f64 / denominator),
+        finite(reqs as f64 / denominator),
+        (usage_samples > 0).then_some(finite(tokens as f64 / denominator)),
+        (priced_samples > 0).then_some(finite(cost / denominator)),
     )
 }
 
@@ -1073,11 +1003,9 @@ pub async fn dashboard_flow_detail(
             &serde_json::json!({ "error": "no flow for that id" }),
         );
     };
-    let (cost, cost_confidence) = flow_cost_and_confidence(
-        record.model_served.as_deref(),
-        record.usage,
-        gateway.as_ref(),
-    );
+    let normalized = record.usage.map(crate::dashboard_flow::normalize_usage);
+    let cost = record.terminal_cost_usd;
+    let cost_confidence = record.terminal_cost_confidence.into();
     // One MonitorHub snapshot supplies BOTH the replay and its coverage watermark.
     // `FlowDelta.sequence` is only a per-flow ordinal; the separate monitor cursor is
     // what lets the SPA place live `segment_append`s after this replay exactly.
@@ -1119,6 +1047,10 @@ pub async fn dashboard_flow_detail(
         model_served: record.model_served.clone(),
         upstream_target: record.upstream_target.clone(),
         usage: record.usage,
+        normalized_usage: normalized.map(|value| value.usage),
+        usage_anomaly_count: normalized.map_or(0, |value| value.anomaly_count),
+        effective_route_limit: record.effective_route_limit,
+        cache_price_impact_usd: record.cache_price_impact_usd,
         status: record.status,
         deltas_through_monitor_seq,
         deltas,
@@ -1171,6 +1103,17 @@ pub async fn dashboard_overview(
     Query(query): Query<OverviewQuery>,
 ) -> Response {
     let (status, status_scope) = normalize_overview_status(query.status.as_deref());
+    if status == Some(FlowStatus::Open) {
+        return json_no_store(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &serde_json::json!({
+                "error": {
+                    "code": "terminal_analytics_unavailable_for_open_scope",
+                    "message": "terminal analytics unavailable for open-only scope"
+                }
+            }),
+        );
+    }
     let model = clean_overview_filter(query.model);
     let upstream = clean_overview_filter(query.upstream);
     let client = clean_overview_filter(query.client);
@@ -1551,6 +1494,28 @@ mod tests {
         }
     }
 
+    fn record_terminal_cost(
+        metrics: &crate::metrics::MetricsLayer,
+        model: &str,
+        usage: Option<FlowUsage>,
+        cost_usd: Option<f64>,
+        confidence: crate::dashboard_flow::TerminalCostConfidence,
+    ) {
+        metrics.record_terminal_inputs(
+            crate::dashboard_flow::FlowStatus::Completed,
+            900,
+            &crate::dashboard_flow::TerminalMetricsInputs {
+                model_served: Some(model.to_string()),
+                endpoint: "/v1/responses".to_string(),
+                upstream: Some("vllm-a".to_string()),
+                usage,
+                cost_usd,
+                cost_confidence: confidence,
+                ..Default::default()
+            },
+        );
+    }
+
     /// The cost model splits prompt into uncached (input rate) + cached (cache
     /// rate) and bills completion at the output rate. 90 uncached prompt @ 2.0/1k
     /// + 10 cached @ 0.5/1k + 40 completion @ 6.0/1k = 0.18 + 0.005 + 0.24 = 0.425.
@@ -1561,15 +1526,14 @@ mod tests {
     }
 
     /// `cached > prompt` (a transient/odd report) never yields a negative input
-    /// charge — the uncached prompt floors at 0, so the whole prompt bills at the
-    /// (cheaper) cache rate rather than producing a negative number.
+    /// charge or bills more cached tokens than the canonical prompt volume.
     #[test]
     fn cost_for_usage_clamps_cached_over_prompt() {
         let cost = cost_for_usage(usage(10, 0, 50), price(2.0, 6.0, 0.5));
-        // uncached = max(10 - 50, 0) = 0; cached billed = 50/1000*0.5 = 0.025.
+        // cached clamps to prompt=10; 10/1000*0.5 = 0.005.
         assert!(
-            (cost - 0.025).abs() < 1e-9,
-            "cost {cost} == 0.025 (no negative)"
+            (cost - 0.005).abs() < 1e-9,
+            "cost {cost} == 0.005 (bounded subset)"
         );
     }
 
@@ -1614,14 +1578,18 @@ mod tests {
         use crate::metrics::MetricsLayer;
         let metrics = MetricsLayer::new();
         // One completed flow on a priced model: 1000 prompt + 500 completion tokens.
-        metrics.record_terminal(
+        metrics.record_terminal_inputs(
             FS::Completed,
-            Some("glm-5.1"),
-            "/v1/responses",
-            Some("vllm-a"),
             1200,
-            Some(usage(1000, 500, 0)),
-            &[],
+            &crate::dashboard_flow::TerminalMetricsInputs {
+                model_served: Some("glm-5.1".into()),
+                endpoint: "/v1/responses".into(),
+                upstream: Some("vllm-a".into()),
+                usage: Some(usage(1000, 500, 0)),
+                cost_usd: Some(5.0),
+                cost_confidence: crate::dashboard_flow::TerminalCostConfidence::Confident,
+                ..Default::default()
+            },
         );
         let (view, seq) = metrics.view_with_seq();
         let mut prices = HashMap::new();
@@ -1630,38 +1598,33 @@ mod tests {
         let body = metrics_body(&view, seq, 3, &prices);
 
         // The terminal flow IS counted — the measured/unavailable signal is non-zero.
-        assert_eq!(body.samples, 1, "the finalized flow counts as one sample");
-        assert_eq!(body.windows.m1.samples, 1);
+        assert_eq!(
+            body.windows.m1.terminal_requests, 1,
+            "the finalized flow counts as one terminal sample"
+        );
         // The flow reported usage on a PRICED model → both per-metric denominators are
         // non-zero (gap 01 finding 3): tok/s and $/min are both measurable here.
         assert_eq!(
-            body.usage_samples, 1,
+            body.windows.m1.usage_samples, 1,
             "the usage-bearing flow is a usage sample"
         );
         assert_eq!(body.windows.m1.usage_samples, 1);
-        assert_eq!(body.priced_samples, 1, "priced model → a priced sample");
         assert_eq!(body.windows.m1.priced_samples, 1);
         // active_streams carries the live count (was hard-coded 0 on the WS tile).
-        assert_eq!(body.active_streams, 3, "live open-flow count is carried");
-        // tokens/s + cost/min are REAL (priced), not 0.0. 1500 tok / 60 s = 25 tok/s.
-        assert!(
-            (body.tokens_per_sec - 25.0).abs() < 1e-9,
-            "tok/s {} == 1500/60",
-            body.tokens_per_sec
+        assert_eq!(
+            body.windows.m1.active_streams_now, 3,
+            "live open-flow count is carried"
         );
-        // cost = 1000 prompt @2.0/1k + 500 completion @6.0/1k = 2.0 + 3.0 = 5.0 over
-        // 1 minute → cost_per_min ≈ 5.0.
+        // During warm-up the observed denominator is one second, not a dishonest full minute.
         assert!(
-            (body.cost_per_min - 5.0).abs() < 1e-9,
-            "cost/min {} == 5.0",
-            body.cost_per_min
+            (body.windows.m1.reported_tokens_per_sec.unwrap() - 1500.0).abs() < 1e-9,
+            "warm tok/s uses observed coverage"
         );
-        // req/s is a TRUE per-second rate (1 req / 60 s), not the raw count.
         assert!(
-            (body.reqs_per_sec - (1.0 / 60.0)).abs() < 1e-9,
-            "req/s {} == 1/60",
-            body.reqs_per_sec
+            (body.windows.m1.cost_per_min.unwrap() - 300.0).abs() < 1e-9,
+            "warm cost/min uses observed coverage"
         );
+        assert_eq!(body.windows.m1.terminal_per_sec, 1.0);
     }
 
     /// Gap 01 (don't lie with zeros): an EMPTY window (no finalized flow) reports
@@ -1673,22 +1636,19 @@ mod tests {
         use crate::metrics::MetricsView;
         let body = metrics_body(&MetricsView::default(), 0, 0, &HashMap::new());
         assert_eq!(
-            body.samples, 0,
+            body.windows.m1.terminal_requests, 0,
             "no finalized flow → zero samples (unavailable)"
         );
-        assert_eq!(body.windows.m1.samples, 0);
-        assert_eq!(body.windows.m5.samples, 0);
-        assert_eq!(body.windows.h1.samples, 0);
+        assert_eq!(body.windows.m5.terminal_requests, 0);
+        assert_eq!(body.windows.h1.terminal_requests, 0);
         // The per-metric denominators are zero too → tok/s + $/min are unavailable.
-        assert_eq!(body.usage_samples, 0);
-        assert_eq!(body.priced_samples, 0);
         assert_eq!(body.windows.m1.usage_samples, 0);
         assert_eq!(body.windows.m1.priced_samples, 0);
         // req/s is a genuine measured zero (idle), distinguishable from the unavailable
         // latency/tok-s/cost above precisely BECAUSE samples == 0.
-        assert_eq!(body.reqs_per_sec, 0.0);
-        assert_eq!(body.tokens_per_sec, 0.0);
-        assert_eq!(body.cost_per_min, 0.0);
+        assert_eq!(body.windows.m1.accepted_per_sec, 0.0);
+        assert_eq!(body.windows.m1.reported_tokens_per_sec, None);
+        assert_eq!(body.windows.m1.cost_per_min, None);
     }
 
     /// Gap 01 finding 3 (per-metric availability): a window can have measured LATENCY
@@ -1703,14 +1663,18 @@ mod tests {
         use crate::metrics::MetricsLayer;
         let metrics = MetricsLayer::new();
         // (a) usage on a PRICED model → counts toward samples + usage + priced.
-        metrics.record_terminal(
+        metrics.record_terminal_inputs(
             FS::Completed,
-            Some("glm-5.1"),
-            "/v1/responses",
-            Some("vllm-a"),
             900,
-            Some(usage(1000, 500, 0)),
-            &[],
+            &crate::dashboard_flow::TerminalMetricsInputs {
+                model_served: Some("glm-5.1".into()),
+                endpoint: "/v1/responses".into(),
+                upstream: Some("vllm-a".into()),
+                usage: Some(usage(1000, 500, 0)),
+                cost_usd: Some(5.0),
+                cost_confidence: crate::dashboard_flow::TerminalCostConfidence::Confident,
+                ..Default::default()
+            },
         );
         // (b) NO usage (e.g. an upstream that omitted it) → samples only.
         metrics.record_terminal(
@@ -1739,23 +1703,21 @@ mod tests {
 
         // Latency is measurable for all three finalized flows.
         assert_eq!(
-            body.samples, 3,
+            body.windows.m1.terminal_requests, 3,
             "three finalized flows → latency measurable"
         );
         // Two of the three reported usage → tok/s measurable, but distinct from samples.
         assert_eq!(
-            body.usage_samples, 2,
+            body.windows.m1.usage_samples, 2,
             "two usage-bearing flows → tok/s measurable (≠ samples)"
         );
         // Only one of those two is on a priced model → cost measurable for exactly one.
         assert_eq!(
-            body.priced_samples, 1,
+            body.windows.m1.priced_samples, 1,
             "only the priced-model usage flow → $/min measurable (≠ usage_samples)"
         );
         // The headline mirrors the m1 window's per-metric denominators.
-        assert_eq!(body.windows.m1.samples, 3);
-        assert_eq!(body.windows.m1.usage_samples, 2);
-        assert_eq!(body.windows.m1.priced_samples, 1);
+        assert_eq!(body.windows.m1.terminal_requests, 3);
     }
 
     /// Round-trip (AGENTS.md: no new wire fields without a round-trip test): the new
@@ -1768,14 +1730,18 @@ mod tests {
         use crate::dashboard_flow::FlowStatus as FS;
         use crate::metrics::MetricsLayer;
         let metrics = MetricsLayer::new();
-        metrics.record_terminal(
+        metrics.record_terminal_inputs(
             FS::Completed,
-            Some("glm-5.1"),
-            "/v1/responses",
-            Some("vllm-a"),
             900,
-            Some(usage(1000, 500, 0)),
-            &[],
+            &crate::dashboard_flow::TerminalMetricsInputs {
+                model_served: Some("glm-5.1".into()),
+                endpoint: "/v1/responses".into(),
+                upstream: Some("vllm-a".into()),
+                usage: Some(usage(1000, 500, 0)),
+                cost_usd: Some(5.0),
+                cost_confidence: crate::dashboard_flow::TerminalCostConfidence::Confident,
+                ..Default::default()
+            },
         );
         let (view, seq) = metrics.view_with_seq();
         let mut prices = HashMap::new();
@@ -1785,12 +1751,16 @@ mod tests {
         // Serialize → JSON bytes → re-parse: the fields must survive intact.
         let json = serde_json::to_string(&body).expect("serialize metrics body");
         let value: serde_json::Value = serde_json::from_str(&json).expect("re-parse");
-        // Headline mirrors.
-        assert_eq!(value["usage_samples"], serde_json::json!(1));
-        assert_eq!(value["priced_samples"], serde_json::json!(1));
+        assert!(
+            value.get("usage_samples").is_none(),
+            "v3 has no duplicated headline fields"
+        );
         // Per-window (m1 fed the terminal; m5/h1 share the same epoch ⇒ same counts).
         for window in ["m1", "m5", "h1"] {
-            assert_eq!(value["windows"][window]["samples"], serde_json::json!(1));
+            assert_eq!(
+                value["windows"][window]["latency_samples"],
+                serde_json::json!(1)
+            );
             assert_eq!(
                 value["windows"][window]["usage_samples"],
                 serde_json::json!(1)
@@ -1818,6 +1788,10 @@ mod tests {
                     model_served: None,
                     upstream_target: None,
                     usage: None,
+                    normalized_usage: None,
+                    usage_anomaly_count: 0,
+                    effective_route_limit: None,
+                    cache_price_impact_usd: None,
                     status: FlowStatus::Completed,
                     started_ms: 0,
                     finished_ms: None,
@@ -1860,6 +1834,10 @@ mod tests {
             model_served: None,
             upstream_target: None,
             usage: None,
+            normalized_usage: None,
+            usage_anomaly_count: 0,
+            effective_route_limit: None,
+            cache_price_impact_usd: None,
             status: FlowStatus::Open,
             started_ms: 0,
             finished_ms: None,
@@ -1924,6 +1902,10 @@ mod tests {
             model_served: None,
             upstream_target: None,
             usage: None,
+            normalized_usage: None,
+            usage_anomaly_count: 0,
+            effective_route_limit: None,
+            cache_price_impact_usd: None,
             status: FlowStatus::Failed,
             deltas_through_monitor_seq: 41,
             deltas: Vec::new(),
@@ -2011,7 +1993,9 @@ mod tests {
             model: Some("llama-3.1-70b".to_string()),
             start_ms: 1_000,
             end_ms: 1_220,
+            duration_ms: Some(220),
             first_upstream_byte_ms: Some(1_220),
+            first_upstream_byte_offset_ms: Some(220),
             status: crate::dashboard_flow::AttemptStatus::Served,
             error_class: None,
             failover_reason: None,
@@ -2030,6 +2014,7 @@ mod tests {
             first_content_delta_ms: Some(1_500),
             stream_end_ms: Some(5_320),
             finalize_ms: Some(5_340),
+            ..Default::default()
         }
     }
 
@@ -2053,6 +2038,10 @@ mod tests {
             model_served: None,
             upstream_target: None,
             usage: None,
+            normalized_usage: None,
+            usage_anomaly_count: 0,
+            effective_route_limit: None,
+            cache_price_impact_usd: None,
             status: FlowStatus::Completed,
             started_ms: 1_000,
             finished_ms: None,
@@ -2135,6 +2124,10 @@ mod tests {
             model_served: None,
             upstream_target: None,
             usage: None,
+            normalized_usage: None,
+            usage_anomaly_count: 0,
+            effective_route_limit: None,
+            cache_price_impact_usd: None,
             status: FlowStatus::Completed,
             deltas_through_monitor_seq: 17,
             deltas: Vec::new(),
@@ -2277,6 +2270,10 @@ mod tests {
                 cached,
                 reasoning,
             }),
+            normalized_usage: None,
+            usage_anomaly_count: 0,
+            effective_route_limit: None,
+            cache_price_impact_usd: None,
             status: FlowStatus::Completed,
             started_ms: 0,
             finished_ms: None,
@@ -2390,12 +2387,9 @@ mod tests {
 
         // (a) one priced flow with UNREPORTED cached → estimated aggregate.
         let metrics = MetricsLayer::new();
-        metrics.record_terminal(
-            FS::Completed,
-            Some("priced"),
-            "/v1/responses",
-            Some("vllm-a"),
-            900,
+        record_terminal_cost(
+            &metrics,
+            "priced",
             Some(FlowUsage {
                 prompt: 1000,
                 completion: 500,
@@ -2403,11 +2397,12 @@ mod tests {
                 cached: None, // unreported
                 reasoning: Some(0),
             }),
-            &[],
+            Some(5.0),
+            crate::dashboard_flow::TerminalCostConfidence::Estimated,
         );
         let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
         assert_eq!(
-            body.cost_confidence,
+            body.windows.m1.cost_confidence,
             CostConfidence::Estimated,
             "unreported cached on a no-cache-rate model ⇒ estimated aggregate (summed cached==0)"
         );
@@ -2415,12 +2410,9 @@ mod tests {
 
         // (b) one priced flow with a REPORTED cached=0 → confident aggregate.
         let metrics = MetricsLayer::new();
-        metrics.record_terminal(
-            FS::Completed,
-            Some("priced"),
-            "/v1/responses",
-            Some("vllm-a"),
-            900,
+        record_terminal_cost(
+            &metrics,
+            "priced",
             Some(FlowUsage {
                 prompt: 1000,
                 completion: 500,
@@ -2428,11 +2420,12 @@ mod tests {
                 cached: Some(0), // reported zero
                 reasoning: Some(0),
             }),
-            &[],
+            Some(5.0),
+            crate::dashboard_flow::TerminalCostConfidence::Confident,
         );
         let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
         assert_eq!(
-            body.cost_confidence,
+            body.windows.m1.cost_confidence,
             CostConfidence::Confident,
             "a reported cached=0 keeps the aggregate confident"
         );
@@ -2449,7 +2442,7 @@ mod tests {
             &[],
         );
         let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
-        assert_eq!(body.cost_confidence, CostConfidence::Unavailable);
+        assert_eq!(body.windows.m1.cost_confidence, CostConfidence::Unavailable);
     }
 
     /// Gap 07 review round 1, finding 2 — a MIXED window (one CONFIDENT priced bucket
@@ -2473,12 +2466,9 @@ mod tests {
         // (d) confident priced bucket (reported cached=0, configured cache rate) PLUS an
         // unpriced usage-bearing bucket ⇒ estimated (partial total).
         let metrics = MetricsLayer::new();
-        metrics.record_terminal(
-            FS::Completed,
-            Some("priced"),
-            "/v1/responses",
-            Some("vllm-a"),
-            900,
+        record_terminal_cost(
+            &metrics,
+            "priced",
             Some(FlowUsage {
                 prompt: 1000,
                 completion: 500,
@@ -2486,7 +2476,8 @@ mod tests {
                 cached: Some(0), // reported zero ⇒ this bucket alone is confident
                 reasoning: Some(0),
             }),
-            &[],
+            Some(5.0),
+            crate::dashboard_flow::TerminalCostConfidence::Confident,
         );
         metrics.record_terminal(
             FS::Completed,
@@ -2499,7 +2490,7 @@ mod tests {
         );
         let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
         assert_eq!(
-            body.cost_confidence,
+            body.windows.m1.cost_confidence,
             CostConfidence::Estimated,
             "a priced-confident bucket + an unpriced USAGE-BEARING bucket ⇒ estimated \
              (the unpriced spend is omitted from cost_per_min — a partial total)"
@@ -2508,11 +2499,11 @@ mod tests {
         // The priced bucket makes the total a real number (NOT unavailable): a priced
         // sample exists, so $/min renders.
         assert_eq!(
-            body.priced_samples, 1,
+            body.windows.m1.priced_samples, 1,
             "exactly the priced bucket is countable"
         );
         assert!(
-            body.cost_per_min > 0.0,
+            body.windows.m1.cost_per_min.is_some_and(|cost| cost > 0.0),
             "cost_per_min is a real (if partial) number, so estimated — not unavailable"
         );
 
@@ -2520,12 +2511,9 @@ mod tests {
         // reported — e.g. a failure) ⇒ STILL confident: the unpriced bucket adds no
         // missing cost, so the total is complete.
         let metrics = MetricsLayer::new();
-        metrics.record_terminal(
-            FS::Completed,
-            Some("priced"),
-            "/v1/responses",
-            Some("vllm-a"),
-            900,
+        record_terminal_cost(
+            &metrics,
+            "priced",
             Some(FlowUsage {
                 prompt: 1000,
                 completion: 500,
@@ -2533,7 +2521,8 @@ mod tests {
                 cached: Some(0),
                 reasoning: Some(0),
             }),
-            &[],
+            Some(5.0),
+            crate::dashboard_flow::TerminalCostConfidence::Confident,
         );
         // A terminal flow on an unpriced model that reported NO usage (usage_samples == 0
         // for its bucket): bumps the count but contributes no token throughput/cost.
@@ -2548,7 +2537,7 @@ mod tests {
         );
         let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
         assert_eq!(
-            body.cost_confidence,
+            body.windows.m1.cost_confidence,
             CostConfidence::Confident,
             "a usage-LESS unpriced bucket adds no missing cost ⇒ the window stays confident"
         );
@@ -2593,7 +2582,9 @@ mod tests {
                 model: Some("m".to_string()),
                 start_ms: 1_000,
                 end_ms: 1_080,
+                duration_ms: Some(80),
                 first_upstream_byte_ms: None,
+                first_upstream_byte_offset_ms: None,
                 status: AttemptStatus::Failed,
                 error_class: Some(AttemptErrorClass::HttpStatus),
                 failover_reason: Some(crate::dashboard_flow::AttemptFailoverReason::ProviderFailed),
@@ -2603,7 +2594,9 @@ mod tests {
                 model: Some("m".to_string()),
                 start_ms: 1_000,
                 end_ms: 1_040,
+                duration_ms: Some(40),
                 first_upstream_byte_ms: Some(1_040),
+                first_upstream_byte_offset_ms: Some(40),
                 status: AttemptStatus::Served,
                 error_class: None,
                 failover_reason: None,
@@ -2645,10 +2638,9 @@ mod tests {
         assert_eq!(per_a["failed"], serde_json::json!(1));
         assert_eq!(per_a["error_rate"], serde_json::json!(100.0));
         assert_eq!(per_a["errors"]["http_status"], serde_json::json!(1));
-        assert!(
-            per_a["p99"].as_f64().expect("p99 number") > 0.0,
-            "the failed primary's latency feeds p99"
-        );
+        assert_eq!(per_a["p50"], serde_json::Value::Null);
+        assert_eq!(per_a["p95"], serde_json::Value::Null);
+        assert_eq!(per_a["p99"], serde_json::Value::Null);
 
         // provider-b has NO samples → the field is ABSENT (don't-lie-with-zeros).
         assert!(

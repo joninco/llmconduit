@@ -224,7 +224,25 @@ function seedFlows(): FlowSummary[] {
       client_label: `python-httpx/${'x'.repeat(4096)}`, client_source: 'user_agent',
     });
   }
-  return flows;
+  return flows.map((flow) => {
+    const model = flow.model_served ?? flow.model_requested;
+    const price = model ? PRICE_TABLE[model] : undefined;
+    const cached = flow.usage?.cached;
+    const cacheImpact = flow.status !== 'open' && price?.cached_price_configured && cached !== null && cached !== undefined
+      ? cached / 1000 * (price.cached_per_1k - price.input_per_1k)
+      : undefined;
+    const routeLimit = flow.status !== 'open'
+      ? CATALOG.find((entry) => entry.id === model)?.context_limit ?? undefined
+      : undefined;
+    return {
+      ...flow,
+      normalized_usage: flow.usage,
+      usage_anomaly_count: 0,
+      effective_route_limit: routeLimit,
+      cache_price_impact_usd: cacheImpact,
+      ...(flow.status === 'open' ? { cost: null, cost_confidence: 'unavailable' as const } : {}),
+    };
+  });
 }
 
 /**
@@ -245,13 +263,19 @@ function buildMetrics(): MetricsResponse {
   const win = (m: number) => {
     const samples = Math.round(252 * m);
     return {
-      reqs_per_sec: 4.2 * m, active_streams: Math.round(3 * m), error_pct: 1.1,
-      p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142 * m, cost_per_min: 0.21 * m,
-      samples,
-      // The mock's window is fully measured: every finalized flow reported usage on a
-      // priced model, so all three denominators equal `samples` (tok/s + $/min measurable).
+      window_seconds: 60, observed_seconds: 60, warm: true,
+      accepted_requests: samples + 3, accepted_per_sec: 4.2 * m,
+      terminal_requests: samples, terminal_per_sec: 4.0 * m,
+      successes: Math.max(0, samples - 4), failures: 3, failure_pct: 1.1,
+      cancellations: 1, cancellation_pct: 0.4, active_streams_now: Math.round(3 * m),
+      latency_samples: samples, p50_ms: 180, p95_ms: 920, p99_ms: 1840,
+      quantile_method: 'log_histogram_nearest_rank' as const, max_relative_error: 0.062,
+      latency_overflow_count: 0, latency_quality: 'measured' as const,
       usage_samples: samples,
+      reported_tokens_per_sec: 142 * m,
+      usage_anomaly_count: 0,
       priced_samples: samples,
+      cost_per_min: 0.21 * m,
       // Gap 07: the priced llama model has no configured cache rate (and the seed flow on it
       // bills/omits cached) ⇒ the aggregate $/min is an ESTIMATE, labelled as such.
       cost_confidence: 'estimated' as const,
@@ -260,13 +284,9 @@ function buildMetrics(): MetricsResponse {
   const m1 = win(1);
   return {
     metrics_seq: 1,
-    reqs_per_sec: 4.2, active_streams: 3, error_pct: 1.1,
-    p50: 180, p95: 920, p99: 1840, tokens_per_sec: 142, cost_per_min: 0.21,
-    samples: m1.samples,
-    usage_samples: m1.usage_samples,
-    priced_samples: m1.priced_samples,
-    cost_confidence: m1.cost_confidence,
-    windows: { m1, m5: win(0.9), h1: win(0.7) },
+    generated_at_ms: Date.now(),
+    headline_window: 'm1',
+    windows: { m1, m5: { ...win(0.9), window_seconds: 300 }, h1: { ...win(0.7), window_seconds: 3600 } },
   };
 }
 
@@ -366,6 +386,23 @@ function buildOverview(qs: URLSearchParams): OverviewResponse {
 
   const tokens = tokensFor(flows);
   const cost = costFor(flows);
+  const laneGroups = new Map<string, FlowSummary[]>();
+  for (const flow of flows) {
+    const provider = flow.upstream_target ?? 'unknown';
+    const servedModel = flow.model_served ?? 'unknown';
+    const key = `${provider}\u0000${servedModel}`;
+    laneGroups.set(key, [...(laneGroups.get(key) ?? []), flow]);
+  }
+  const lanes = [...laneGroups.entries()].map(([key, members]) => {
+    const [provider = 'unknown', servedModel = 'unknown'] = key.split('\u0000');
+    return {
+      provider,
+      model: servedModel,
+      requests: members.length,
+      tokens: tokensFor(members),
+      cost: costFor(members),
+    };
+  });
   return {
     generated_at_ms: generatedAt,
     metrics_seq: 1,
@@ -385,13 +422,23 @@ function buildOverview(qs: URLSearchParams): OverviewResponse {
       aggregate_folded_samples: 0,
       provider_folded_samples: 0,
       overflowed: false,
+      unattributable_requests: 0,
     },
-    totals: { requests: flows.length, tokens, cost },
+    totals: {
+      requests: flows.length,
+      successes: flows.filter((flow) => flow.status === 'completed').length,
+      failures: flows.filter((flow) => flow.status === 'failed').length,
+      cancellations: flows.filter((flow) => flow.status === 'cancelled').length,
+      tokens,
+      cost,
+    },
     requested_models: rollup((flow) => flow.model_requested ?? 'unknown'),
     served_models: rollup((flow) => flow.model_served ?? 'unknown'),
     providers: rollup((flow) => flow.upstream_target ?? 'unknown'),
     clients: rollup((flow) => flow.client_label ?? 'unknown'),
     failures: failureRollups,
+    cancellations: [],
+    lanes,
     context: {
       data_quality: contextSamples.length === 0
         ? 'unavailable'
@@ -423,8 +470,8 @@ function buildTopology(): TopologyResponse {
     // -zeros). The WS `topology_update` frame strips it (see `topologyFrame`).
     nodes: NODES.map((n) => (PER_PROVIDER[n.id] ? { ...n, per_provider: PER_PROVIDER[n.id] } : n)),
     edges: [
-      { from: 'gateway', to: 'vllm-a', throughput: 4.2, tokens_per_sec: 142, cost_per_sec: 0.003 },
-      { from: 'gateway', to: 'vllm-b', throughput: 1.0, tokens_per_sec: 61, cost_per_sec: 0.001 },
+      { from: 'gateway', to: 'vllm-a', attempts_per_sec: 4.3, terminal_flows_per_sec: 4.2, reported_tokens_per_sec: 142, terminal_cost_per_sec: 0.003 },
+      { from: 'gateway', to: 'vllm-b', attempts_per_sec: 1.1, terminal_flows_per_sec: 1.0, reported_tokens_per_sec: 61, terminal_cost_per_sec: 0.001 },
     ],
     price_table: PRICE_TABLE,
   };
@@ -433,7 +480,7 @@ function buildTopology(): TopologyResponse {
 function buildSnapshot(): SnapshotFrame {
   return {
     type: 'snapshot',
-      schema_version: 2,
+      schema_version: 3,
     cursors: { flow_seq: 3, metrics_seq: 1, topology_seq: 1, monitor_seq: 5 },
     flows: seedFlows(),
     metrics: buildMetrics(),
@@ -494,7 +541,7 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: {
       'Content-Type': 'application/json',
-      'X-LLMConduit-Dashboard-Schema': '2',
+      'X-LLMConduit-Dashboard-Schema': '3',
     },
   });
 }
@@ -614,6 +661,10 @@ function buildFlowDetail(id: string): FlowDetail | null {
     model_served: base.model_served,
     upstream_target: base.upstream_target,
     usage: base.usage,
+    normalized_usage: base.normalized_usage,
+    usage_anomaly_count: base.usage_anomaly_count ?? 0,
+    effective_route_limit: base.effective_route_limit,
+    cache_price_impact_usd: base.cache_price_impact_usd,
     status: base.status,
     // The replay body and this monitor cursor come from the same transcript
     // snapshot. Live segments at or below it have already been materialized.
@@ -727,6 +778,9 @@ export class MockWebSocket implements WsLike {
         revision: base.revision + 1,
         status: 'completed',
         usage: { prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 0 },
+        normalized_usage: { prompt: 812, completion: 512, total: 1324, cached: 128, reasoning: 0 },
+        usage_anomaly_count: 0,
+        effective_route_limit: 131072,
         started_ms: started,
         finished_ms: started + 3100,
         elapsed_ms: 3100,
@@ -754,12 +808,8 @@ export class MockWebSocket implements WsLike {
       seq: ++this.seq.metrics,
       batch: [{
         type: 'metric_tick',
-        reqs_per_sec: m.reqs_per_sec, active_streams: m.active_streams, error_pct: m.error_pct,
-        p50: m.p50, p95: m.p95, p99: m.p99, tokens_per_sec: m.tokens_per_sec, cost_per_min: m.cost_per_min,
-        samples: m.samples,
-        usage_samples: m.usage_samples,
-        priced_samples: m.priced_samples,
-        cost_confidence: m.cost_confidence,
+        generated_at_ms: Date.now(),
+        headline_window: 'm1',
         windows: m.windows,
       }],
     };

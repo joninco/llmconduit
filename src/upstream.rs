@@ -1245,8 +1245,10 @@ impl ReqwestUpstreamClient {
         serving: Option<Arc<ServingToken>>,
         mut stream: UpstreamStream,
         start_ms: u128,
+        started_at: Instant,
         model: String,
         header_byte_ms: Option<u128>,
+        header_byte_offset_ms: Option<u128>,
     ) -> UpstreamStream {
         let Some(serving) = serving else {
             return stream;
@@ -1266,15 +1268,19 @@ impl ReqwestUpstreamClient {
                             model: Some(model.clone()),
                             start_ms,
                             end_ms: now_epoch_ms_u128(),
+                            duration_ms: Some(started_at.elapsed().as_millis()),
                             first_upstream_byte_ms: header_byte_ms,
+                            first_upstream_byte_offset_ms: header_byte_offset_ms,
                             status: crate::dashboard_flow::AttemptStatus::Served,
                             error_class: None,
                             failover_reason: None,
                         }),
                         Err(err) => serving.record_attempt(Self::failed_bare_attempt(
                             start_ms,
+                            started_at,
                             model.clone(),
                             header_byte_ms,
+                            header_byte_offset_ms,
                             err,
                         )),
                     }
@@ -1291,7 +1297,9 @@ impl ReqwestUpstreamClient {
                     model: Some(model.clone()),
                     start_ms,
                     end_ms: now_epoch_ms_u128(),
+                    duration_ms: Some(started_at.elapsed().as_millis()),
                     first_upstream_byte_ms: header_byte_ms,
+                    first_upstream_byte_offset_ms: header_byte_offset_ms,
                     status: crate::dashboard_flow::AttemptStatus::Failed,
                     error_class: Some(crate::dashboard_flow::AttemptErrorClass::Stream),
                     failover_reason: None,
@@ -1308,8 +1316,10 @@ impl ReqwestUpstreamClient {
     /// come from `err` — never raw upstream text.
     fn failed_bare_attempt(
         start_ms: u128,
+        started_at: Instant,
         model: String,
         header_byte_ms: Option<u128>,
+        header_byte_offset_ms: Option<u128>,
         err: &AppError,
     ) -> crate::dashboard_flow::Attempt {
         use crate::dashboard_flow::AttemptFailoverReason;
@@ -1325,7 +1335,9 @@ impl ReqwestUpstreamClient {
             model: Some(model),
             start_ms,
             end_ms: now_epoch_ms_u128(),
+            duration_ms: Some(started_at.elapsed().as_millis()),
             first_upstream_byte_ms: header_byte_ms,
+            first_upstream_byte_offset_ms: header_byte_offset_ms,
             status: AttemptStatus::Failed,
             error_class: Some(classify_attempt_error(err)),
             failover_reason: Some(failover_reason),
@@ -1672,6 +1684,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // that fails AFTER headers (a non-2xx) thus carries a measured byte time; a
         // connect/timeout-before-response leaves it `None` (the slot was never stamped).
         if self.tag_primary_provider {
+            let attempt_started_at = Instant::now();
             let attempt_start_ms = now_epoch_ms_u128();
             let attempt_model = request.model.clone();
             if let Some(serving) = &serving {
@@ -1704,12 +1717,17 @@ impl UpstreamClient for ReqwestUpstreamClient {
                     let header_byte_ms = serving
                         .as_ref()
                         .and_then(|serving| serving.take_attempt_header_byte());
+                    let header_byte_offset_ms = serving
+                        .as_ref()
+                        .and_then(|serving| serving.take_attempt_header_byte_offset());
                     Ok(Self::record_served_attempt_on_first_byte(
                         serving,
                         stream,
                         attempt_start_ms,
+                        attempt_started_at,
                         attempt_model,
                         header_byte_ms,
+                        header_byte_offset_ms,
                     ))
                 }
                 Err(err) => {
@@ -1717,10 +1735,13 @@ impl UpstreamClient for ReqwestUpstreamClient {
                         // `take_attempt_header_byte` is `Some` for an HTTP-status failure
                         // (headers arrived) and `None` for a connect/timeout-before-response.
                         let header_byte_ms = serving.take_attempt_header_byte();
+                        let header_byte_offset_ms = serving.take_attempt_header_byte_offset();
                         serving.record_attempt(Self::failed_bare_attempt(
                             attempt_start_ms,
+                            attempt_started_at,
                             attempt_model,
                             header_byte_ms,
+                            header_byte_offset_ms,
                             &err,
                         ));
                     }
@@ -2123,6 +2144,7 @@ impl FailoverUpstreamClient {
             // code), HOW LONG, and WHAT eventually served. The nested leaf is NOT
             // `tag_primary_provider`-marked, so IT records no attempt — only this loop
             // does, exactly once per provider it tries.
+            let attempt_started_at = Instant::now();
             let attempt_start_ms = now_epoch_ms_u128();
             let attempt_model = provider_request.request.model.clone();
             // Gap 03 round-1 review (F1): arm the per-attempt wire-byte slot on the SHARED
@@ -2165,8 +2187,10 @@ impl FailoverUpstreamClient {
                         backend,
                         provider,
                         attempt_start_ms,
+                        attempt_started_at,
                         attempt_model,
                         header_byte_ms,
+                        Self::take_attempt_header_byte_offset(backend),
                         Some(&err),
                     );
                     return Err(err);
@@ -2179,8 +2203,10 @@ impl FailoverUpstreamClient {
                         backend,
                         provider,
                         attempt_start_ms,
+                        attempt_started_at,
                         attempt_model,
                         header_byte_ms,
+                        Self::take_attempt_header_byte_offset(backend),
                         Some(&err),
                     );
                     last_error = Some(err);
@@ -2195,8 +2221,10 @@ impl FailoverUpstreamClient {
                         backend,
                         provider,
                         attempt_start_ms,
+                        attempt_started_at,
                         attempt_model,
                         header_byte_ms,
+                        Self::take_attempt_header_byte_offset(backend),
                         Some(&err),
                     );
                     last_error = Some(err);
@@ -2235,8 +2263,10 @@ impl FailoverUpstreamClient {
                         backend,
                         provider,
                         attempt_start_ms,
+                        attempt_started_at,
                         attempt_model,
                         header_byte_ms,
+                        Self::take_attempt_header_byte_offset(backend),
                         None,
                     );
                     if provider_index > 0 {
@@ -2263,8 +2293,10 @@ impl FailoverUpstreamClient {
                         backend,
                         provider,
                         attempt_start_ms,
+                        attempt_started_at,
                         attempt_model,
                         header_byte_ms,
+                        Self::take_attempt_header_byte_offset(backend),
                         Some(&err),
                     );
                     last_error = Some(err);
@@ -2287,6 +2319,13 @@ impl FailoverUpstreamClient {
             .and_then(|serving| serving.take_attempt_header_byte())
     }
 
+    fn take_attempt_header_byte_offset(backend: &BackendChatRequest) -> Option<u128> {
+        backend
+            .serving
+            .as_ref()
+            .and_then(|serving| serving.take_attempt_header_byte_offset())
+    }
+
     /// Gap 03: build and push one [`Attempt`](crate::dashboard_flow::Attempt) onto the
     /// flow's shared `ServingToken` (no-op when no token is threaded — tests / non-engine
     /// paths). Round-1 review (F1): `first_upstream_byte_ms` is the TRUE wire TTFB the
@@ -2295,12 +2334,17 @@ impl FailoverUpstreamClient {
     /// connect/timeout-BEFORE-response, never `0` — don't-lie-with-zeros). On a failure,
     /// `err` drives the BOUNDED taxonomic `error_class` + `failover_reason` (never raw
     /// upstream text — those bodies stay spec-05-gated); on a success both are `None`.
+    // Epoch display stamps and monotonic measurements intentionally travel together at
+    // this single attempt-finalization seam so they cannot describe different attempts.
+    #[allow(clippy::too_many_arguments)]
     fn record_attempt(
         backend: &BackendChatRequest,
         provider: &FailoverUpstreamProvider,
         start_ms: u128,
+        started_at: Instant,
         model: String,
         first_upstream_byte_ms: Option<u128>,
+        first_upstream_byte_offset_ms: Option<u128>,
         err: Option<&AppError>,
     ) {
         use crate::dashboard_flow::AttemptFailoverReason;
@@ -2334,7 +2378,9 @@ impl FailoverUpstreamClient {
             model: Some(model),
             start_ms,
             end_ms: now_epoch_ms_u128(),
+            duration_ms: Some(started_at.elapsed().as_millis()),
             first_upstream_byte_ms,
+            first_upstream_byte_offset_ms,
             status,
             error_class,
             failover_reason,
@@ -3466,6 +3512,8 @@ struct ServingInfo {
     /// sequentially (the failover loop awaits each fully before the next), so a single slot
     /// is race-free; it is scratch state, NOT part of the persisted trace.
     attempt_header_byte_ms: Option<u128>,
+    attempt_header_byte_offset_ms: Option<u128>,
+    attempt_started_at: Option<Instant>,
     /// Gap 05 round-1 review (F1): the PENDING upstream RESPONSE/ERROR body for the
     /// TURN — staged here on the shared token instead of committed straight onto the
     /// FlowStore record at the leaf, so the body that finally lands reflects the turn's
@@ -3598,7 +3646,10 @@ impl ServingToken {
     /// `None` (the leaf never reaches the stamp), while an HTTP-status failure — whose
     /// headers DID arrive — carries the real wire byte time.
     pub fn arm_attempt_header_byte(&self) {
-        self.lock().attempt_header_byte_ms = None;
+        let mut info = self.lock();
+        info.attempt_header_byte_ms = None;
+        info.attempt_header_byte_offset_ms = None;
+        info.attempt_started_at = Some(Instant::now());
     }
 
     /// Gap 03 round-1 review (F1): record the epoch-ms the CURRENT attempt's upstream
@@ -3611,6 +3662,9 @@ impl ServingToken {
         let mut info = self.lock();
         if info.attempt_header_byte_ms.is_none() {
             info.attempt_header_byte_ms = Some(ms);
+            info.attempt_header_byte_offset_ms = info
+                .attempt_started_at
+                .map(|started| started.elapsed().as_millis());
         }
     }
 
@@ -3619,6 +3673,10 @@ impl ServingToken {
     /// response failure). The caller uses it as the attempt's `first_upstream_byte_ms`.
     pub fn take_attempt_header_byte(&self) -> Option<u128> {
         self.lock().attempt_header_byte_ms
+    }
+
+    pub fn take_attempt_header_byte_offset(&self) -> Option<u128> {
+        self.lock().attempt_header_byte_offset_ms
     }
 
     /// Gap 05 round-1 review (F1): stage the captured upstream RESPONSE/ERROR `body` of a
@@ -7407,7 +7465,9 @@ mod tests {
             model: Some("m".to_string()),
             start_ms: 10,
             end_ms: 20,
+            duration_ms: Some(10),
             first_upstream_byte_ms: None,
+            first_upstream_byte_offset_ms: None,
             status: AttemptStatus::Failed,
             error_class: Some(AttemptErrorClass::HttpStatus),
             failover_reason: Some(AttemptFailoverReason::ProviderFailed),
@@ -7417,7 +7477,9 @@ mod tests {
             model: Some("m".to_string()),
             start_ms: 21,
             end_ms: 40,
+            duration_ms: Some(19),
             first_upstream_byte_ms: Some(30),
+            first_upstream_byte_offset_ms: Some(9),
             status: AttemptStatus::Served,
             error_class: None,
             failover_reason: None,
@@ -7428,7 +7490,9 @@ mod tests {
             model: Some("m".to_string()),
             start_ms: 41,
             end_ms: 60,
+            duration_ms: Some(19),
             first_upstream_byte_ms: Some(50),
+            first_upstream_byte_offset_ms: Some(9),
             status: AttemptStatus::Served,
             error_class: None,
             failover_reason: None,
@@ -8615,7 +8679,9 @@ mod tests {
             model: Some("m".repeat(SCALAR_CAP * 2)),
             start_ms: 1,
             end_ms: 2,
+            duration_ms: Some(1),
             first_upstream_byte_ms: Some(2),
+            first_upstream_byte_offset_ms: Some(1),
             status: AttemptStatus::Served,
             error_class: None,
             failover_reason: None,

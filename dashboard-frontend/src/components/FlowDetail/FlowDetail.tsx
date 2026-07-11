@@ -105,7 +105,6 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
     useFlowDetail(apiCallId);
   const monitor = useDashboard((s) => s.monitor);
   const monitorSeqs = useDashboard((s) => s.monitorSeqs);
-  const priceTable = useDashboard((s) => s.priceTable);
   // Gap 09: per-model context-window capacities (gap-06 nullable `context_limit`), for the gauge.
   const contextLimits = useCatalog();
   const [tab, setTab] = useState<Tab>('headers');
@@ -340,11 +339,14 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
       model_requested: liveFlow?.model_requested ?? summary?.model_requested ?? null,
       cost_confidence: costConfidence,
     };
-    return { cost: flowCost(merged, priceTable), costConfidence };
-  }, [liveFlow, frozenDetail, apiCallId, status, priceTable]);
+    return { cost: flowCost(merged), costConfidence };
+  }, [liveFlow, frozenDetail, apiCallId, status]);
   // Gap 07 — the cumulative token usage for the breakdown row (freshest: live, then detail):
   // cached/reasoning may be UNREPORTED (null/absent) ⇒ `fmtTokens` renders `—`, never `0`.
   const usage = liveFlow?.usage ?? frozenDetail?.usage ?? null;
+  const normalizedUsage = liveFlow?.normalized_usage ?? frozenDetail?.normalized_usage ?? null;
+  const usageAnomalyCount = liveFlow?.usage_anomaly_count ?? frozenDetail?.usage_anomaly_count ?? 0;
+  const calculationUsage = normalizedUsage ?? usage;
   // Gap 08 — the token-economics breakdown (cache-hit rate + "$ saved by cache"), MIRRORING the
   // FlowTable tokens-cell popover so the inspector line shows the SAME honest figures. Built from
   // the freshest usage + the served model (for the cached-price PRESENCE gate). `usage`/model are
@@ -360,23 +362,28 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
       status: status ?? 'open',
       started_ms: liveFlow?.started_ms ?? frozenDetail?.started_ms ?? 0,
       cost_confidence: 'unavailable',
-      usage,
+      usage: calculationUsage,
+      normalized_usage: calculationUsage,
+      cache_price_impact_usd: liveFlow?.cache_price_impact_usd ?? frozenDetail?.cache_price_impact_usd,
       model_served: model,
     };
-    return tokenEconomics(econFlow, priceTable);
-  }, [liveFlow, frozenDetail, apiCallId, status, usage, priceTable]);
+    return tokenEconomics(econFlow);
+  }, [liveFlow, frozenDetail, apiCallId, status, calculationUsage]);
   // Gap 09 — the context-window utilization for the gauge: the freshest usage (live, then detail)
   // against the SERVED model's `context_limit` (gap-06 nullable catalog). `null` limit (unknown
   // capacity) OR unreported usage ⇒ the gauge renders `—`, never a fabricated 0%/100%. The served
   // model (then requested) is the one actually run, so its window is the relevant ceiling.
   const contextUtil = useMemo<ContextUtilization>(() => {
-    const limit = contextLimitFor(
-      liveFlow?.model_served ?? frozenDetail?.model_served,
-      liveFlow?.model_requested ?? frozenDetail?.model_requested,
-      contextLimits,
-    );
-    return contextUtilization(usage, limit);
-  }, [liveFlow, frozenDetail, usage, contextLimits]);
+    const persistedLimit = liveFlow?.effective_route_limit ?? frozenDetail?.effective_route_limit;
+    const limit = status !== 'open'
+      ? persistedLimit ?? null
+      : persistedLimit ?? contextLimitFor(
+          liveFlow?.model_served ?? frozenDetail?.model_served,
+          liveFlow?.model_requested ?? frozenDetail?.model_requested,
+          contextLimits,
+        );
+    return contextUtilization(calculationUsage, limit);
+  }, [liveFlow, frozenDetail, calculationUsage, contextLimits, status]);
   // Gap 10 — the per-flow LATENCY BREAKDOWN (the phase waterfall + the Timing line). The PRIMARY
   // source is the gap-02 phase epochs + gap-03 served-attempt wire TTFB, read live-first
   // (`liveFlow`) then from the frozen detail (seek). When `first_content_delta_ms` is absent the
@@ -475,6 +482,8 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
             cost={cost}
             costConfidence={costConfidence}
             usage={usage}
+            normalizedUsage={normalizedUsage}
+            usageAnomalyCount={usageAnomalyCount}
             econ={econ}
             contextUtil={contextUtil}
             latency={latency}
@@ -547,6 +556,8 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
             cost={cost}
             costConfidence={costConfidence}
             usage={usage}
+            normalizedUsage={normalizedUsage}
+            usageAnomalyCount={usageAnomalyCount}
             econ={econ}
             contextUtil={contextUtil}
             latency={latency}
@@ -1039,6 +1050,8 @@ function SummaryBand({
   cost,
   costConfidence,
   usage,
+  normalizedUsage,
+  usageAnomalyCount,
   econ,
   contextUtil,
   latency,
@@ -1053,6 +1066,8 @@ function SummaryBand({
   cost: number | null;
   costConfidence: CostConfidence;
   usage: Usage | null;
+  normalizedUsage: Usage | null;
+  usageAnomalyCount: number;
   econ: ReturnType<typeof tokenEconomics>;
   contextUtil: ContextUtilization;
   latency: LatencyBreakdownModel;
@@ -1138,6 +1153,19 @@ function SummaryBand({
           <span className="text-line"> · </span>
           <span title="reasoning tokens (— = upstream did not report)">{fmtTokens(usage?.reasoning)}</span>
         </dd>
+        {usageAnomalyCount > 0 && (
+          <>
+            <dt className="text-status-cooling">usage quality</dt>
+            <dd
+              className="text-status-cooling"
+              data-testid="usage-anomalies"
+              data-quality="partial"
+              title={normalizedUsage ? `calculation copy: ${JSON.stringify(normalizedUsage)}` : undefined}
+            >
+              partial · {usageAnomalyCount} normalized anomaly {usageAnomalyCount === 1 ? 'class' : 'classes'}
+            </dd>
+          </>
+        )}
         {/* Gap 08: the cache economics line, MIRRORING the table tokens-cell popover. The cache-hit
             rate is `derived` (`—` when cached unreported, never a 0% miss); "$ saved" is `derived`
             and shows only with a CONFIGURED cached price (presence) + a reported cached count —

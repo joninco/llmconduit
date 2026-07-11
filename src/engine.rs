@@ -832,6 +832,44 @@ impl Gateway {
     /// disabled OR the guard never finalized a live record (bare/non-instrumented
     /// paths), so it is zero-overhead off the dashboard path. MUST be called AFTER
     /// `guard.finalize(...)` (which assembles the inputs).
+    fn prepare_terminal_pricing(&self, guard: &crate::dashboard_flow::TelemetryGuard) {
+        let (model, usage) = guard.terminal_pricing_basis();
+        let (cost, confidence, cache_impact) = if let (Some(model), Some(usage)) =
+            (model.as_deref(), usage)
+            && let Some(price) = self.price_for(model)
+        {
+            let normalized = crate::dashboard_flow::normalize_usage(usage).usage;
+            let confidence = match usage.cached {
+                Some(0) => crate::dashboard_flow::TerminalCostConfidence::Confident,
+                Some(_) | None if price.cached_price_configured => {
+                    crate::dashboard_flow::TerminalCostConfidence::Confident
+                }
+                Some(_) | None => crate::dashboard_flow::TerminalCostConfidence::Estimated,
+            };
+            let cache_impact = price
+                .cached_price_configured
+                .then(|| {
+                    normalized.cached.map(|cached| {
+                        cached as f64 / 1000.0 * (price.cached_per_1k - price.input_per_1k)
+                    })
+                })
+                .flatten();
+            (
+                Some(crate::dashboard_api::cost_for_usage(usage, price)),
+                confidence,
+                cache_impact,
+            )
+        } else {
+            (
+                None,
+                crate::dashboard_flow::TerminalCostConfidence::Unavailable,
+                None,
+            )
+        };
+        guard.set_terminal_pricing(cost, confidence);
+        guard.set_terminal_cache_price_impact(cache_impact);
+    }
+
     fn record_terminal_metrics(
         &self,
         guard: &crate::dashboard_flow::TelemetryGuard,
@@ -845,24 +883,9 @@ impl Gateway {
         // attribution + final cumulative usage at finalize, from its claim-captured
         // endpoint + the shared ServingToken — so this is evict-safe (no `detail()`
         // re-read of a possibly-pruned record).
-        let Some(mut inputs) = guard.terminal_metrics() else {
+        let Some(inputs) = guard.terminal_metrics() else {
             return;
         };
-        // Price exactly once at terminal time. Historical overview cuts retain this
-        // value and confidence, so a later config reload cannot silently reprice past
-        // traffic. Missing usage/model/rate remains honestly unavailable.
-        if let (Some(model), Some(usage)) = (inputs.model_served.as_deref(), inputs.usage)
-            && let Some(price) = self.price_for(model)
-        {
-            inputs.cost_usd = Some(crate::dashboard_api::cost_for_usage(usage, price));
-            inputs.cost_confidence = match usage.cached {
-                Some(0) => crate::dashboard_flow::TerminalCostConfidence::Confident,
-                Some(_) | None if price.cached_price_configured => {
-                    crate::dashboard_flow::TerminalCostConfidence::Confident
-                }
-                Some(_) | None => crate::dashboard_flow::TerminalCostConfidence::Estimated,
-            };
-        }
         // D5 R1 #2: record the terminal response AND the flow's FINAL cumulative token
         // usage in ONE atomic metrics call (single lock, single epoch/slot), into the
         // SAME `{status, model, endpoint, upstream}` bucket — so a concurrent 5 s
@@ -1312,6 +1335,7 @@ impl Gateway {
         // finalize-then-return on the `?` paths without duplicating the guard plumbing.
         let finalize_pre_spawn_err = |err: AppError| -> AppError {
             if let Some(guard) = &telemetry_guard {
+                self.prepare_terminal_pricing(guard);
                 guard.finalize(
                     crate::dashboard_flow::FlowStatus::Failed,
                     Some(err.to_string()),
@@ -1618,6 +1642,7 @@ impl Gateway {
                 Err(err) => (crate::dashboard_flow::FlowStatus::Failed, err.to_string()),
             };
             if let Some(guard) = &telemetry_guard {
+                gateway.prepare_terminal_pricing(guard);
                 guard.finalize(status, Some(reason.clone()));
                 // D5: record the terminal into the metrics rings (sources served
                 // model + endpoint + upstream + final usage from the guard's own

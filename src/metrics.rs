@@ -9,7 +9,7 @@
 //!   request with the dashboard off does NO ring/histogram work and takes NO lock).
 //! - Per-window RING buffers (1m / 5m / 1h at 1 s resolution = 60 / 300 / 3600
 //!   slots). Each slot is a [`Bucket`] keyed `{status_class, model, endpoint,
-//!   upstream}` plus a 30-bucket log-spaced latency [`Histogram`] and summed token
+//!   upstream}` plus a 128-bucket log-spaced latency [`Histogram`] and summed token
 //!   counters. A slot is reused circularly: when wall-clock advances past a slot's
 //!   epoch second the slot is RESET before the new sample lands, so a window only
 //!   ever aggregates samples from its own time span (no unbounded growth — the rings
@@ -41,6 +41,7 @@ use crate::dashboard_flow::SnapshotFlowSummary;
 use crate::dashboard_flow::TerminalCostConfidence;
 use crate::dashboard_flow::TerminalMetricsInputs;
 use crate::dashboard_flow::TerminalReasonClass;
+use crate::dashboard_flow::normalize_usage;
 use crate::upstream::ProviderHealthPublisher;
 use crate::upstream::ProviderHealthSnapshot;
 use serde::Serialize;
@@ -58,13 +59,14 @@ const WINDOW_5M_SLOTS: usize = 300;
 /// Ring length for the 1-hour window (1 s resolution).
 const WINDOW_1H_SLOTS: usize = 3600;
 
-/// Number of log-spaced latency histogram buckets spanning 1 ms .. 120 s.
-const HISTOGRAM_BUCKETS: usize = 30;
-/// Lowest histogram bucket upper-bound (ms). Samples ≤ this land in bucket 0.
+/// Number of finite log-spaced latency histogram buckets spanning 1 ms .. 1 hour.
+const HISTOGRAM_BUCKETS: usize = 128;
+/// Lowest finite histogram value (ms). Smaller samples land in underflow.
 const HISTOGRAM_MIN_MS: f64 = 1.0;
-/// Highest finite histogram bucket upper-bound (ms) — 120 s. Samples above land in
-/// the final overflow bucket.
-const HISTOGRAM_MAX_MS: f64 = 120_000.0;
+/// Highest finite histogram value (ms). Larger samples land in overflow.
+const HISTOGRAM_MAX_MS: f64 = 3_600_000.0;
+/// Worst-case relative error of an in-range bucket's geometric midpoint.
+pub const HISTOGRAM_MAX_RELATIVE_ERROR: f64 = 0.062;
 
 /// Snapshot ring length: 720 body-free cuts = 12 per minute (one per 5 s) × 60 min.
 const SNAPSHOT_RING_SLOTS: usize = 720;
@@ -83,7 +85,7 @@ pub type PublishedMetricsReceiver = watch::Receiver<Option<Arc<PublishedMetricsC
 /// instead of spawning a new key — so the per-provider view stays useful (the known
 /// providers keep exact stats) while the key space can never exceed
 /// `MAX_TRACKED_PROVIDERS + 1` per slot. Samples-per-provider are bounded by the
-/// fixed-size 30-bucket [`Histogram`] (counts saturate; no per-sample retention).
+/// fixed-size 128-bucket [`Histogram`] (counts saturate; no per-sample retention).
 const MAX_TRACKED_PROVIDERS: usize = 64;
 
 /// Hard cap for overview dimension combinations, INCLUDING the fixed overflow key.
@@ -169,7 +171,7 @@ pub struct BucketKey {
 /// token counters. Latency is aggregated separately in the window-level
 /// [`Histogram`] (a per-key histogram would be 30 buckets × |keys| — wasteful;
 /// p-quantiles are reported window-wide, which is the stats-strip contract).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct BucketCounts {
     pub count: u64,
     pub prompt_tokens: i64,
@@ -197,6 +199,13 @@ pub struct BucketCounts {
     /// window as `estimated` even when `cached_tokens == 0`. Price-agnostic (the cache
     /// RATE presence is joined at render time where the price table lives).
     pub unreported_cached_samples: u64,
+    /// Count of bounded usage anomaly classes corrected before aggregation.
+    pub usage_anomalies: u64,
+    /// Cost fixed at terminal time; historical reads never reprice this value.
+    pub terminal_cost_usd: f64,
+    pub priced_samples: u64,
+    pub estimated_cost_samples: u64,
+    pub unpriced_usage_samples: u64,
 }
 
 impl BucketCounts {
@@ -207,132 +216,173 @@ impl BucketCounts {
     }
 }
 
-/// A 30-bucket log-spaced latency histogram (1 ms .. 120 s) over the in-window
-/// samples, plus p50/p95/p99 via linear interpolation over the cumulative counts.
-/// Counts are `u64`; an empty histogram reports `0.0` for every quantile.
-#[derive(Debug, Clone, Serialize)]
+/// A mergeable fixed-memory latency histogram with 128 finite logarithmic buckets
+/// spanning 1 ms .. 1 hour, plus explicit underflow and overflow counters.
+/// Quantiles use nearest-rank selection and geometric bucket midpoints clamped to
+/// the observed range, so an estimate can never exceed the observed maximum.
+#[derive(Debug, Clone)]
 pub struct Histogram {
-    /// Per-bucket sample counts. `buckets[i]` counts samples whose latency is
-    /// ≤ `bucket_upper_ms(i)` and > `bucket_upper_ms(i - 1)`. The final bucket is
-    /// the `> HISTOGRAM_MAX_MS` overflow bucket.
-    buckets: [u64; HISTOGRAM_BUCKETS],
-    /// Total samples (== sum of `buckets`), retained so quantile math avoids a
-    /// re-sum and the empty case is O(1).
+    buckets: [u32; HISTOGRAM_BUCKETS],
+    underflow: u32,
+    overflow: u32,
     total: u64,
+    observed_min_ms: f64,
+    observed_max_ms: f64,
+    saturated: bool,
+}
+
+impl Serialize for Histogram {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Histogram", 7)?;
+        state.serialize_field("buckets", self.buckets.as_slice())?;
+        state.serialize_field("underflow", &self.underflow)?;
+        state.serialize_field("overflow", &self.overflow)?;
+        state.serialize_field("total", &self.total)?;
+        state.serialize_field(
+            "observed_min_ms",
+            &if self.observed_min_ms.is_finite() {
+                self.observed_min_ms
+            } else {
+                0.0
+            },
+        )?;
+        state.serialize_field("observed_max_ms", &self.observed_max_ms)?;
+        state.serialize_field("saturated", &self.saturated)?;
+        state.end()
+    }
 }
 
 impl Default for Histogram {
     fn default() -> Self {
         Self {
             buckets: [0; HISTOGRAM_BUCKETS],
+            underflow: 0,
+            overflow: 0,
             total: 0,
+            observed_min_ms: f64::INFINITY,
+            observed_max_ms: 0.0,
+            saturated: false,
         }
     }
 }
 
-/// The inclusive upper bound (ms) of histogram bucket `index`. The finite buckets
-/// (indices `0..=HISTOGRAM_BUCKETS-2`, i.e. all but the overflow bucket) are LOG-SPACED
-/// so the FIRST finite upper bound is EXACTLY [`HISTOGRAM_MIN_MS`] (1 ms) and the LAST
-/// is EXACTLY [`HISTOGRAM_MAX_MS`] (120 s); the final bucket is the overflow bucket with
-/// an effectively-infinite bound. Pure function of `index` (no per-instance state), so
-/// the boundary ladder is computed identically at record + quantile time.
-///
-/// The fraction is `index / (HISTOGRAM_BUCKETS - 2)` (Codex D5 R1 #3) — NOT
-/// `(index+1)/(HISTOGRAM_BUCKETS-1)`, which made bucket 0's upper bound ≈ 1.5 ms and
-/// pushed the whole ladder up. With this mapping `index == 0` ⇒ frac 0 ⇒ exactly 1 ms
-/// and `index == HISTOGRAM_BUCKETS-2` ⇒ frac 1 ⇒ exactly 120 s.
 fn bucket_upper_ms(index: usize) -> f64 {
-    if index >= HISTOGRAM_BUCKETS - 1 {
-        return f64::INFINITY;
-    }
     let span = (HISTOGRAM_MAX_MS / HISTOGRAM_MIN_MS).ln();
-    let frac = index as f64 / (HISTOGRAM_BUCKETS - 2) as f64;
+    let frac = (index + 1) as f64 / HISTOGRAM_BUCKETS as f64;
     HISTOGRAM_MIN_MS * (span * frac).exp()
 }
 
-/// The lower bound (ms) of histogram bucket `index` — the previous bucket's upper
-/// bound, or `0.0` for bucket 0. Used as the interpolation floor.
 fn bucket_lower_ms(index: usize) -> f64 {
     if index == 0 {
-        0.0
+        HISTOGRAM_MIN_MS
     } else {
         bucket_upper_ms(index - 1)
     }
 }
 
+fn bucket_midpoint_ms(index: usize) -> f64 {
+    (bucket_lower_ms(index) * bucket_upper_ms(index)).sqrt()
+}
+
 impl Histogram {
     /// Record one latency sample (ms) into its log-spaced bucket.
     fn record(&mut self, elapsed_ms: f64) {
-        let index = self.bucket_index(elapsed_ms);
-        self.buckets[index] = self.buckets[index].saturating_add(1);
-        self.total = self.total.saturating_add(1);
-    }
-
-    /// The bucket index a `elapsed_ms` sample falls into. Linear scan over 30
-    /// buckets is trivial and avoids `ln` rounding mismatches at the boundaries
-    /// that a closed-form inverse could introduce.
-    fn bucket_index(&self, elapsed_ms: f64) -> usize {
         let value = if elapsed_ms.is_finite() {
             elapsed_ms.max(0.0)
         } else {
             HISTOGRAM_MAX_MS + 1.0
         };
-        for index in 0..HISTOGRAM_BUCKETS - 1 {
-            if value <= bucket_upper_ms(index) {
-                return index;
+        self.observed_min_ms = self.observed_min_ms.min(value);
+        self.observed_max_ms = self.observed_max_ms.max(value);
+        let counter = if value < HISTOGRAM_MIN_MS {
+            &mut self.underflow
+        } else if value > HISTOGRAM_MAX_MS {
+            &mut self.overflow
+        } else {
+            let index = self.bucket_index(value);
+            &mut self.buckets[index]
+        };
+        if *counter == u32::MAX {
+            self.saturated = true;
+        } else {
+            *counter += 1;
+        }
+        self.total = self.total.saturating_add(1);
+    }
+
+    /// Find the finite bucket with the same boundary function used by quantiles.
+    fn bucket_index(&self, elapsed_ms: f64) -> usize {
+        let mut low = 0usize;
+        let mut high = HISTOGRAM_BUCKETS;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if elapsed_ms <= bucket_upper_ms(mid) {
+                high = mid;
+            } else {
+                low = mid + 1;
             }
         }
-        HISTOGRAM_BUCKETS - 1
+        low.min(HISTOGRAM_BUCKETS - 1)
     }
 
     /// Merge another histogram into this one (used when collapsing a window's slots
     /// into a single reported histogram).
     fn merge(&mut self, other: &Histogram) {
         for index in 0..HISTOGRAM_BUCKETS {
-            self.buckets[index] = self.buckets[index].saturating_add(other.buckets[index]);
+            let (sum, saturated) = self.buckets[index].overflowing_add(other.buckets[index]);
+            self.buckets[index] = if saturated { u32::MAX } else { sum };
+            self.saturated |= saturated;
         }
+        let (underflow, underflow_saturated) = self.underflow.overflowing_add(other.underflow);
+        self.underflow = if underflow_saturated {
+            u32::MAX
+        } else {
+            underflow
+        };
+        let (overflow, overflow_saturated) = self.overflow.overflowing_add(other.overflow);
+        self.overflow = if overflow_saturated {
+            u32::MAX
+        } else {
+            overflow
+        };
+        self.saturated |= other.saturated || underflow_saturated || overflow_saturated;
         self.total = self.total.saturating_add(other.total);
+        self.observed_min_ms = self.observed_min_ms.min(other.observed_min_ms);
+        self.observed_max_ms = self.observed_max_ms.max(other.observed_max_ms);
     }
 
-    /// The `quantile` (0.0..=1.0) latency in ms via LINEAR INTERPOLATION over the
-    /// cumulative bucket counts. Returns `0.0` for an empty histogram. The target
-    /// rank is `quantile × total`; we walk buckets accumulating counts until the
-    /// rank falls inside a bucket, then interpolate linearly between that bucket's
-    /// lower and upper bound by how far into the bucket the rank lies. The overflow
-    /// bucket (unbounded upper) reports its FINITE lower bound (`HISTOGRAM_MAX_MS`)
-    /// so a p99 dominated by >120 s samples returns 120 s, not infinity.
+    /// The nearest-rank quantile, estimated by the selected bucket's geometric
+    /// midpoint and clamped to observed extrema.
     fn quantile(&self, quantile: f64) -> f64 {
         if self.total == 0 {
             return 0.0;
         }
-        let quantile = quantile.clamp(0.0, 1.0);
-        // Target rank in [0, total]. Using `(total) * q` and walking cumulative
-        // upper edges gives the standard histogram-interpolation estimate.
-        let target = quantile * self.total as f64;
-        let mut cumulative_before = 0u64;
-        for index in 0..HISTOGRAM_BUCKETS {
-            let count = self.buckets[index];
-            if count == 0 {
-                continue;
-            }
-            let cumulative_after = cumulative_before + count;
-            if target <= cumulative_after as f64 {
-                let lower = bucket_lower_ms(index);
-                let upper = bucket_upper_ms(index);
-                // Overflow bucket: report its finite lower bound (120 s), never inf.
-                if !upper.is_finite() {
-                    return lower;
-                }
-                // Linear interpolation: how far into THIS bucket's count the target
-                // rank lies, mapped onto [lower, upper].
-                let into_bucket = (target - cumulative_before as f64).max(0.0);
-                let fraction = (into_bucket / count as f64).clamp(0.0, 1.0);
-                return lower + (upper - lower) * fraction;
-            }
-            cumulative_before = cumulative_after;
+        let target = (quantile.clamp(0.0, 1.0) * self.total as f64)
+            .ceil()
+            .max(1.0) as u64;
+        let mut cumulative = self.underflow as u64;
+        if target <= cumulative {
+            return self.observed_min_ms;
         }
-        // Target beyond all counted buckets (q == 1.0 edge): the max finite bound.
-        bucket_upper_ms(HISTOGRAM_BUCKETS - 2)
+        for index in 0..HISTOGRAM_BUCKETS {
+            cumulative = cumulative.saturating_add(self.buckets[index] as u64);
+            if target <= cumulative {
+                return bucket_midpoint_ms(index).clamp(self.observed_min_ms, self.observed_max_ms);
+            }
+        }
+        self.observed_max_ms
+    }
+
+    pub fn overflow_count(&self) -> u64 {
+        self.overflow as u64
+    }
+
+    pub fn is_partial(&self) -> bool {
+        self.saturated || self.overflow > 0
     }
 }
 
@@ -391,7 +441,7 @@ impl ProviderErrorDistribution {
     }
 }
 
-/// Gap 12 — one provider's per-slot latency + outcome tally: a fixed 30-bucket latency
+/// Gap 12 — one provider's per-slot latency + outcome tally: a fixed 128-bucket latency
 /// [`Histogram`] (REUSED from the global ring — NOT a second percentile implementation)
 /// over the provider's ATTEMPT latencies, the served/failed attempt counts, and the
 /// bounded per-class error distribution. Fixed-size (the histogram is 30 `u64`s, the
@@ -411,8 +461,10 @@ impl ProviderSample {
     /// histogram (so a FAILED primary's latency counts toward its provider — final-served
     /// latency alone would hide an unhealthy provider, spec 12) and its served/failed
     /// outcome + taxonomic error class are tallied.
-    fn record(&mut self, latency_ms: f64, attempt: &Attempt) {
-        self.histogram.record(latency_ms);
+    fn record(&mut self, latency_ms: Option<f64>, attempt: &Attempt) {
+        if let Some(latency_ms) = latency_ms {
+            self.histogram.record(latency_ms);
+        }
         match attempt.status {
             AttemptStatus::Served => self.served = self.served.saturating_add(1),
             AttemptStatus::Failed => {
@@ -432,7 +484,7 @@ impl ProviderSample {
 
     /// Approximate retained bytes of this per-provider sample for the snapshot-memory
     /// quota (mirrors [`BucketCounts::approx_bytes`]). Every field is fixed-size and
-    /// heap-free — the `Histogram` is a `[u64; 30]` array, the served/failed counters are
+    /// heap-free — the `Histogram` is a `[u32; 128]` array, the served/failed counters are
     /// `u64`, and the [`ProviderErrorDistribution`] is six `u64`s — so the full footprint
     /// is the struct size; the provider KEY string bytes are charged at the map level (as
     /// the global `buckets` charges its `BucketKey` strings separately).
@@ -493,6 +545,9 @@ fn overview_key_heap_bytes(key: &OverviewKey) -> usize {
 #[derive(Debug, Clone, Default)]
 struct OverviewCounts {
     requests: u64,
+    successes: u64,
+    failures: u64,
+    cancellations: u64,
     usage_samples: u64,
     prompt_tokens: i64,
     completion_tokens: i64,
@@ -511,8 +566,14 @@ struct OverviewCounts {
 }
 
 impl OverviewCounts {
-    fn record(&mut self, inputs: &TerminalMetricsInputs) {
+    fn record(&mut self, status: FlowStatus, inputs: &TerminalMetricsInputs) {
         self.requests = self.requests.saturating_add(1);
+        match status {
+            FlowStatus::Completed => self.successes = self.successes.saturating_add(1),
+            FlowStatus::Failed => self.failures = self.failures.saturating_add(1),
+            FlowStatus::Cancelled => self.cancellations = self.cancellations.saturating_add(1),
+            FlowStatus::Open => {}
+        }
         if let Some(usage) = inputs.usage {
             self.usage_samples = self.usage_samples.saturating_add(1);
             self.prompt_tokens = self.prompt_tokens.saturating_add(usage.prompt);
@@ -549,6 +610,9 @@ impl OverviewCounts {
 
     fn merge(&mut self, other: &Self) {
         self.requests = self.requests.saturating_add(other.requests);
+        self.successes = self.successes.saturating_add(other.successes);
+        self.failures = self.failures.saturating_add(other.failures);
+        self.cancellations = self.cancellations.saturating_add(other.cancellations);
         self.usage_samples = self.usage_samples.saturating_add(other.usage_samples);
         self.prompt_tokens = self.prompt_tokens.saturating_add(other.prompt_tokens);
         self.completion_tokens = self
@@ -604,6 +668,8 @@ struct OverviewSlotReport {
 #[derive(Debug, Clone, Default)]
 struct Slot {
     epoch_s: u64,
+    /// Accepted inbound inference requests whose FlowStore record opened in this second.
+    accepted_requests: u64,
     buckets: BTreeMap<BucketKey, BucketCounts>,
     histogram: Histogram,
     /// Gap 12 — per-provider attempt tallies, keyed by the attempt's provider label.
@@ -621,6 +687,7 @@ impl Slot {
     /// Reset this slot to represent `epoch_s` with no samples (circular reuse).
     fn reset(&mut self, epoch_s: u64) {
         self.epoch_s = epoch_s;
+        self.accepted_requests = 0;
         self.buckets.clear();
         self.histogram = Histogram::default();
         self.providers.clear();
@@ -658,7 +725,7 @@ impl Slot {
             self.overview_folded_samples = self.overview_folded_samples.saturating_add(1);
             OverviewKey::Other
         };
-        self.overview.entry(key).or_default().record(inputs);
+        self.overview.entry(key).or_default().record(status, inputs);
     }
 }
 
@@ -673,9 +740,12 @@ impl Slot {
 /// cap + overflow); samples-per-provider by the fixed-size histogram.
 fn record_attempts_into_slot(slot: &mut Slot, attempts: &[Attempt]) {
     for attempt in attempts {
-        // `end_ms`/`start_ms` are measured epoch-ms (gap 03 always stamps them). A
-        // non-monotonic pair (clock skew) saturates to 0 ms rather than wrapping.
-        let latency_ms = attempt.end_ms.saturating_sub(attempt.start_ms) as f64;
+        // New captures use monotonic duration. Legacy ordered epochs remain a fallback;
+        // wall-clock disorder is unavailable, never fabricated as measured 0 ms.
+        let latency_ms = attempt
+            .duration_ms
+            .or_else(|| attempt.end_ms.checked_sub(attempt.start_ms))
+            .map(|duration| duration as f64);
         let provider = attempt.provider.as_deref().unwrap_or("unknown");
         slot.provider_sample_mut(provider)
             .record(latency_ms, attempt);
@@ -724,10 +794,12 @@ impl WindowRing {
         let mut overview_slots = Vec::new();
         let mut slot_folded_samples = 0u64;
         let mut aggregate_folded_samples = 0u64;
+        let mut accepted_requests = 0u64;
         for slot in &self.slots {
             if slot.epoch_s < floor || slot.epoch_s > now_epoch_s {
                 continue;
             }
+            accepted_requests = accepted_requests.saturating_add(slot.accepted_requests);
             // Gap 12: merge each in-window slot's per-provider attempt tallies. Each slot
             // is individually capped at `MAX_TRACKED_PROVIDERS + 1` keys, but DISTINCT
             // slots can track DISTINCT provider sets (an attacker rotating provider aliases
@@ -762,6 +834,16 @@ impl WindowRing {
                 entry.unreported_cached_samples = entry
                     .unreported_cached_samples
                     .saturating_add(counts.unreported_cached_samples);
+                entry.usage_anomalies =
+                    entry.usage_anomalies.saturating_add(counts.usage_anomalies);
+                entry.terminal_cost_usd += counts.terminal_cost_usd;
+                entry.priced_samples = entry.priced_samples.saturating_add(counts.priced_samples);
+                entry.estimated_cost_samples = entry
+                    .estimated_cost_samples
+                    .saturating_add(counts.estimated_cost_samples);
+                entry.unpriced_usage_samples = entry
+                    .unpriced_usage_samples
+                    .saturating_add(counts.unpriced_usage_samples);
             }
             if !slot.overview.is_empty() {
                 overview_slots.push(OverviewSlotReport {
@@ -797,6 +879,10 @@ impl WindowRing {
         }
         overview_slots.sort_by_key(|slot| slot.epoch_s);
         WindowReport {
+            accepted_requests,
+            observed_seconds: 0,
+            window_seconds: len,
+            as_of_epoch_s: now_epoch_s,
             buckets,
             histogram,
             providers,
@@ -812,6 +898,14 @@ impl WindowRing {
 /// histogram, from which p50/p95/p99 are reported.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WindowReport {
+    /// Accepted starts in the window. Unlike `total_count`, this includes still-open flows.
+    pub accepted_requests: u64,
+    /// Process coverage at this cut. Renderers cap it to the selected window length.
+    pub observed_seconds: u64,
+    #[serde(skip)]
+    window_seconds: u64,
+    #[serde(skip)]
+    as_of_epoch_s: u64,
     pub buckets: BTreeMap<BucketKey, BucketCounts>,
     pub histogram: Histogram,
     /// Gap 12 — the merged per-provider attempt tallies for the window, keyed by
@@ -861,6 +955,33 @@ impl WindowReport {
             .fold(0u64, u64::saturating_add)
     }
 
+    pub fn usage_anomaly_count(&self) -> u64 {
+        self.buckets
+            .values()
+            .map(|counts| counts.usage_anomalies)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    pub fn terminal_cost_usd(&self) -> f64 {
+        self.buckets
+            .values()
+            .map(|counts| counts.terminal_cost_usd)
+            .sum()
+    }
+
+    pub fn terminal_priced_samples(&self) -> u64 {
+        self.buckets
+            .values()
+            .map(|counts| counts.priced_samples)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    pub fn terminal_cost_is_estimated(&self) -> bool {
+        self.buckets
+            .values()
+            .any(|counts| counts.estimated_cost_samples > 0 || counts.unpriced_usage_samples > 0)
+    }
+
     /// Count of usage-bearing terminal flows whose served model has a configured price
     /// in `prices` (gap 01 finding 3) — the `cost_per_min` measurability denominator.
     /// `0` ⇒ no PRICED usage sample in the window ⇒ the strip renders `cost_per_min` as
@@ -888,6 +1009,7 @@ impl WindowReport {
     pub fn provider_latency(&self, provider: &str) -> Option<ProviderLatency> {
         self.providers
             .get(provider)
+            .filter(|sample| sample.histogram.total > 0)
             .map(|sample| provider_latency_from_sample(provider, sample))
     }
 
@@ -898,6 +1020,7 @@ impl WindowReport {
     pub fn per_provider(&self) -> BTreeMap<String, ProviderLatency> {
         self.providers
             .iter()
+            .filter(|(_, sample)| sample.histogram.total > 0)
             .map(|(provider, sample)| {
                 (
                     provider.clone(),
@@ -914,10 +1037,8 @@ impl WindowReport {
 /// `derived` — never a fabricated zero. `error_rate` is failed / (served + failed).
 fn provider_latency_from_sample(provider: &str, sample: &ProviderSample) -> ProviderLatency {
     let samples = sample.served.saturating_add(sample.failed);
-    let percentiles = ProviderPercentiles {
-        p50: sample.histogram.quantile(0.50),
-        p95: sample.histogram.quantile(0.95),
-        p99: sample.histogram.quantile(0.99),
+    let percentile = |minimum: u64, quantile: f64| {
+        (samples >= minimum).then(|| finite_ms(sample.histogram.quantile(quantile)))
     };
     // `samples >= 1` here (the provider only exists in the map because an attempt landed),
     // so this division is never 0/0; an all-served provider reports `0.0` (a genuine
@@ -933,13 +1054,17 @@ fn provider_latency_from_sample(provider: &str, sample: &ProviderSample) -> Prov
         // Gap 12: every per-provider metric is `derived` (percentiles over the provider's
         // own attempt histogram). The DQ tag travels with the data so the frontend (spec
         // 13) labels it; a zero-sample provider never reaches here (it is absent).
-        data_quality: ProviderMetricQuality::Derived,
+        data_quality: if sample.histogram.is_partial() {
+            ProviderMetricQuality::Partial
+        } else {
+            ProviderMetricQuality::Derived
+        },
         samples,
         served: sample.served,
         failed: sample.failed,
-        p50: finite_ms(percentiles.p50),
-        p95: finite_ms(percentiles.p95),
-        p99: finite_ms(percentiles.p99),
+        p50: percentile(2, 0.50),
+        p95: percentile(20, 0.95),
+        p99: percentile(100, 0.99),
         error_rate: finite_ms(error_rate),
         errors: sample.errors,
     }
@@ -965,6 +1090,7 @@ fn finite_ms(value: f64) -> f64 {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderMetricQuality {
     Derived,
+    Partial,
 }
 
 /// Gap 12 — the public per-provider latency + error-distribution DTO (additive on the
@@ -989,11 +1115,11 @@ pub struct ProviderLatency {
     /// Of `samples`, the count that FAILED before serving (failed primaries included).
     pub failed: u64,
     /// `derived` p50 attempt latency (ms).
-    pub p50: f64,
+    pub p50: Option<f64>,
     /// `derived` p95 attempt latency (ms).
-    pub p95: f64,
+    pub p95: Option<f64>,
     /// `derived` p99 attempt latency (ms).
-    pub p99: f64,
+    pub p99: Option<f64>,
     /// Percentage of attempts that failed (`failed / samples × 100`). A genuine MEASURED
     /// `0.0` for an all-served provider (distinct from the `unavailable`/absent case).
     pub error_rate: f64,
@@ -1070,6 +1196,9 @@ pub struct OverviewCost {
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct OverviewTotals {
     pub requests: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub cancellations: u64,
     pub tokens: OverviewTokens,
     pub cost: OverviewCost,
 }
@@ -1077,6 +1206,15 @@ pub struct OverviewTotals {
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct OverviewDimensionRollup {
     pub key: String,
+    pub requests: u64,
+    pub tokens: OverviewTokens,
+    pub cost: OverviewCost,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct OverviewLaneRollup {
+    pub provider: String,
+    pub model: String,
     pub requests: u64,
     pub tokens: OverviewTokens,
     pub cost: OverviewCost,
@@ -1107,6 +1245,7 @@ pub struct OverviewOverflowMetadata {
     pub aggregate_folded_samples: u64,
     pub provider_folded_samples: u64,
     pub overflowed: bool,
+    pub unattributable_requests: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
@@ -1135,6 +1274,8 @@ pub struct OverviewAggregate {
     pub providers: Vec<OverviewDimensionRollup>,
     pub clients: Vec<OverviewDimensionRollup>,
     pub failures: Vec<OverviewDimensionRollup>,
+    pub cancellations: Vec<OverviewDimensionRollup>,
+    pub lanes: Vec<OverviewLaneRollup>,
     pub context: OverviewContextRollup,
     pub tokens: OverviewTokens,
     pub cost: OverviewCost,
@@ -1150,6 +1291,8 @@ impl WindowReport {
         let mut providers = BTreeMap::<String, OverviewCounts>::new();
         let mut clients = BTreeMap::<String, OverviewCounts>::new();
         let mut failures = BTreeMap::<String, OverviewCounts>::new();
+        let mut cancellations = BTreeMap::<String, OverviewCounts>::new();
+        let mut lanes = BTreeMap::<(String, String), OverviewCounts>::new();
 
         for (key, counts) in &self.overview {
             match key {
@@ -1159,12 +1302,26 @@ impl WindowReport {
                     merge_rollup(&mut served_models, &dimensions.served_model, counts);
                     merge_rollup(&mut providers, &dimensions.upstream, counts);
                     merge_rollup(&mut clients, &dimensions.client, counts);
-                    if dimensions.status != StatusClass::Success {
-                        merge_rollup(
-                            &mut failures,
-                            terminal_reason_label(dimensions.failure_reason),
-                            counts,
-                        );
+                    lanes
+                        .entry((dimensions.upstream.clone(), dimensions.served_model.clone()))
+                        .or_default()
+                        .merge(counts);
+                    match dimensions.status {
+                        StatusClass::Success => {}
+                        StatusClass::Error => {
+                            merge_rollup(
+                                &mut failures,
+                                terminal_reason_label(dimensions.failure_reason),
+                                counts,
+                            );
+                        }
+                        StatusClass::Cancelled => {
+                            merge_rollup(
+                                &mut cancellations,
+                                terminal_reason_label(dimensions.failure_reason),
+                                counts,
+                            );
+                        }
                     }
                 }
                 OverviewKey::Other if filter.is_empty() => {
@@ -1175,6 +1332,10 @@ impl WindowReport {
                     merge_rollup(&mut served_models, OVERVIEW_OTHER, counts);
                     merge_rollup(&mut providers, OVERVIEW_OTHER, counts);
                     merge_rollup(&mut clients, OVERVIEW_OTHER, counts);
+                    lanes
+                        .entry((OVERVIEW_OTHER.to_string(), OVERVIEW_OTHER.to_string()))
+                        .or_default()
+                        .merge(counts);
                 }
                 OverviewKey::Exact(_) | OverviewKey::Other => {}
             }
@@ -1194,11 +1355,28 @@ impl WindowReport {
         } else {
             OverviewDataQuality::Measured
         };
-        let cost_series = self
-            .overview_slots
-            .iter()
-            .filter_map(|slot| {
-                let mut counts = OverviewCounts::default();
+        let bin_seconds: u64 = match self.window_seconds {
+            0..=60 => 1,
+            61..=300 => 5,
+            _ => 60,
+        };
+        let floor = self
+            .as_of_epoch_s
+            .saturating_sub(self.window_seconds.saturating_sub(1));
+        let mut cost_series = Vec::new();
+        let mut bin_start = floor;
+        while bin_start <= self.as_of_epoch_s {
+            let bin_end = bin_start
+                .saturating_add(bin_seconds.saturating_sub(1))
+                .min(self.as_of_epoch_s);
+            let mut counts = OverviewCounts::default();
+            let mut folded = 0u64;
+            for slot in self
+                .overview_slots
+                .iter()
+                .filter(|slot| slot.epoch_s >= bin_start && slot.epoch_s <= bin_end)
+            {
+                folded = folded.saturating_add(slot.folded_samples);
                 for (key, sample) in &slot.entries {
                     match key {
                         OverviewKey::Exact(dimensions) if filter.matches(dimensions) => {
@@ -1208,18 +1386,32 @@ impl WindowReport {
                         OverviewKey::Exact(_) | OverviewKey::Other => {}
                     }
                 }
-                (counts.requests > 0).then(|| OverviewCostPoint {
-                    at_ms: u128::from(slot.epoch_s).saturating_mul(1000),
-                    data_quality: if slot.folded_samples > 0 {
-                        OverviewDataQuality::Partial
-                    } else {
-                        OverviewDataQuality::Measured
-                    },
-                    requests: counts.requests,
-                    cost: overview_cost(&counts),
-                })
-            })
-            .collect();
+            }
+            let cost = if counts.requests == 0 {
+                OverviewCost {
+                    samples: 0,
+                    total_usd: Some(0.0),
+                    confidence: TerminalCostConfidence::Confident,
+                }
+            } else {
+                overview_cost(&counts)
+            };
+            cost_series.push(OverviewCostPoint {
+                at_ms: u128::from(bin_start).saturating_mul(1000),
+                data_quality: if folded > 0 {
+                    OverviewDataQuality::Partial
+                } else {
+                    OverviewDataQuality::Measured
+                },
+                requests: counts.requests,
+                cost,
+            });
+            let next = bin_start.saturating_add(bin_seconds);
+            if next <= bin_start {
+                break;
+            }
+            bin_start = next;
+        }
         let provider_quality = if provider_values.is_empty() {
             OverviewDataQuality::Unavailable
         } else if provider_folded_samples > 0 {
@@ -1237,9 +1429,18 @@ impl WindowReport {
                 aggregate_folded_samples: self.aggregate_folded_samples,
                 provider_folded_samples,
                 overflowed,
+                unattributable_requests: if filter.is_empty() {
+                    0
+                } else {
+                    self.slot_folded_samples
+                        .saturating_add(self.aggregate_folded_samples)
+                },
             },
             totals: OverviewTotals {
                 requests: totals.requests,
+                successes: totals.successes,
+                failures: totals.failures,
+                cancellations: totals.cancellations,
                 tokens: tokens.clone(),
                 cost: cost.clone(),
             },
@@ -1248,6 +1449,17 @@ impl WindowReport {
             providers: rollup_values(providers),
             clients: rollup_values(clients),
             failures: rollup_values(failures),
+            cancellations: rollup_values(cancellations),
+            lanes: lanes
+                .into_iter()
+                .map(|((provider, model), counts)| OverviewLaneRollup {
+                    provider,
+                    model,
+                    requests: counts.requests,
+                    tokens: overview_tokens(&counts),
+                    cost: overview_cost(&counts),
+                })
+                .collect(),
             context: overview_context(&totals, data_quality),
             tokens,
             cost,
@@ -1365,15 +1577,6 @@ fn terminal_reason_label(reason: TerminalReasonClass) -> &'static str {
     }
 }
 
-/// The reported p50/p95/p99 (ms) for a provider — a local triple used to assemble
-/// [`ProviderLatency`] (kept distinct from the window-wide [`Percentiles`] so the
-/// per-provider math is self-documenting).
-struct ProviderPercentiles {
-    p50: f64,
-    p95: f64,
-    p99: f64,
-}
-
 /// The reported p50/p95/p99 latency (ms) for a window.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct Percentiles {
@@ -1388,6 +1591,7 @@ pub struct Percentiles {
 /// cannot pin live state.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MetricsView {
+    pub generated_at_ms: u128,
     pub window_1m: WindowReport,
     pub window_5m: WindowReport,
     pub window_1h: WindowReport,
@@ -1879,6 +2083,7 @@ impl SnapshotRing {
 /// avoiding a third lock.
 #[derive(Debug)]
 struct MetricsState {
+    started_epoch_s: u64,
     ring_1m: WindowRing,
     ring_5m: WindowRing,
     ring_1h: WindowRing,
@@ -1896,6 +2101,7 @@ struct MetricsState {
 impl MetricsState {
     fn new(snapshot_quota_bytes: usize) -> Self {
         Self {
+            started_epoch_s: now_epoch_s(),
             ring_1m: WindowRing::new(WINDOW_1M_SLOTS),
             ring_5m: WindowRing::new(WINDOW_5M_SLOTS),
             ring_1h: WindowRing::new(WINDOW_1H_SLOTS),
@@ -1915,6 +2121,17 @@ impl MetricsState {
 
     fn current_seq(&self) -> u64 {
         self.presentation_seq.max(self.metrics_seq)
+    }
+
+    /// Record one accepted inbound request in every window ring at the FlowStore-open
+    /// seam. This is deliberately separate from terminal recording: a long-running
+    /// request contributes to inbound traffic immediately, not only when it finishes.
+    fn record_accepted(&mut self, epoch_s: u64) {
+        for ring in [&mut self.ring_1m, &mut self.ring_5m, &mut self.ring_1h] {
+            let slot = ring.slot_mut(epoch_s);
+            slot.accepted_requests = slot.accepted_requests.saturating_add(1);
+        }
+        self.metrics_seq = self.metrics_seq.saturating_add(1);
     }
 
     /// Record one terminal response into all three rings at `epoch_s`, bumping
@@ -1947,6 +2164,7 @@ impl MetricsState {
         attempts: &[Attempt],
         overview_inputs: Option<&TerminalMetricsInputs>,
     ) {
+        let normalized_usage = usage.map(normalize_usage);
         for ring in [&mut self.ring_1m, &mut self.ring_5m, &mut self.ring_1h] {
             let slot = ring.slot_mut(epoch_s);
             // Gap 12: fold the per-attempt trace into the per-provider tallies in the SAME
@@ -1968,7 +2186,8 @@ impl MetricsState {
             }
             let entry = slot.buckets.entry(key.clone()).or_default();
             entry.count = entry.count.saturating_add(1);
-            if let Some(usage) = usage {
+            if let Some(normalized) = normalized_usage {
+                let usage = normalized.usage;
                 entry.prompt_tokens = entry.prompt_tokens.saturating_add(usage.prompt);
                 entry.completion_tokens = entry.completion_tokens.saturating_add(usage.completion);
                 // Gap 07: an UNREPORTED (`None`) cached/reasoning class contributes
@@ -1984,11 +2203,31 @@ impl MetricsState {
                 // (gap 01 finding 3). A terminal with `usage == None` increments only
                 // `count`, so `tokens_per_sec` over usage-less flows reads `—`.
                 entry.usage_samples = entry.usage_samples.saturating_add(1);
+                entry.usage_anomalies = entry
+                    .usage_anomalies
+                    .saturating_add(normalized.anomaly_count);
                 // Gap 07: a usage-bearing flow whose `cached` was UNREPORTED preserves
                 // the estimated-cost signal the summed `cached_tokens` would erase.
                 if usage.cached.is_none() {
                     entry.unreported_cached_samples =
                         entry.unreported_cached_samples.saturating_add(1);
+                }
+                match overview_inputs.and_then(|inputs| inputs.cost_usd) {
+                    Some(cost) if cost.is_finite() && cost >= 0.0 => {
+                        entry.terminal_cost_usd += cost;
+                        entry.priced_samples = entry.priced_samples.saturating_add(1);
+                        if overview_inputs.is_some_and(|inputs| {
+                            inputs.cost_confidence == TerminalCostConfidence::Estimated
+                        }) || normalized.anomaly_count > 0
+                        {
+                            entry.estimated_cost_samples =
+                                entry.estimated_cost_samples.saturating_add(1);
+                        }
+                    }
+                    _ => {
+                        entry.unpriced_usage_samples =
+                            entry.unpriced_usage_samples.saturating_add(1);
+                    }
                 }
             }
             slot.histogram.record(elapsed_ms);
@@ -2001,6 +2240,8 @@ impl MetricsState {
     /// slot's token sum equals the window's true token throughput (no per-chunk
     /// over-counting of cumulative values). Bumps `metrics_seq`.
     fn add_tokens(&mut self, epoch_s: u64, key: &BucketKey, usage: FlowUsage) {
+        let normalized = normalize_usage(usage);
+        let usage = normalized.usage;
         for ring in [&mut self.ring_1m, &mut self.ring_5m, &mut self.ring_1h] {
             let slot = ring.slot_mut(epoch_s);
             let entry = slot.buckets.entry(key.clone()).or_default();
@@ -2019,6 +2260,9 @@ impl MetricsState {
             // path (which uses the atomic `record_terminal`) usage is counted exactly
             // once; this keeps the older split path consistent for its callers/tests.
             entry.usage_samples = entry.usage_samples.saturating_add(1);
+            entry.usage_anomalies = entry
+                .usage_anomalies
+                .saturating_add(normalized.anomaly_count);
             // Gap 07: preserve the unreported-cached estimated-cost signal (see
             // `record_terminal`).
             if usage.cached.is_none() {
@@ -2030,13 +2274,20 @@ impl MetricsState {
 
     /// Collapse the three rings into a body-free [`MetricsView`] as of `now_epoch_s`.
     fn view(&self, now_epoch_s: u64) -> MetricsView {
-        let window_1m = self.ring_1m.aggregate(now_epoch_s);
-        let window_5m = self.ring_5m.aggregate(now_epoch_s);
-        let window_1h = self.ring_1h.aggregate(now_epoch_s);
+        let observed_seconds = now_epoch_s
+            .saturating_sub(self.started_epoch_s)
+            .saturating_add(1);
+        let mut window_1m = self.ring_1m.aggregate(now_epoch_s);
+        let mut window_5m = self.ring_5m.aggregate(now_epoch_s);
+        let mut window_1h = self.ring_1h.aggregate(now_epoch_s);
+        window_1m.observed_seconds = observed_seconds;
+        window_5m.observed_seconds = observed_seconds;
+        window_1h.observed_seconds = observed_seconds;
         let percentiles_1m = window_1m.percentiles();
         let percentiles_5m = window_5m.percentiles();
         let percentiles_1h = window_1h.percentiles();
         MetricsView {
+            generated_at_ms: u128::from(now_epoch_s) * 1000,
             window_1m,
             window_5m,
             window_1h,
@@ -2073,6 +2324,17 @@ impl std::fmt::Debug for MetricsLayer {
 }
 
 impl MetricsLayer {
+    /// Record an accepted inference request. The HTTP seam calls this while holding
+    /// the FlowStore lock, preserving the repository-wide FlowStore→Metrics order and
+    /// preventing a published cut from seeing a new active flow without its arrival.
+    pub fn record_accepted(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        let epoch_s = now_epoch_s();
+        self.lock().record_accepted(epoch_s);
+    }
+
     /// Enabled layer (debug UI on). Reads the env-only
     /// [`DASHBOARD_SNAPSHOT_QUOTA_ENV`] value in MiB, defaulting to 64 MiB when it is
     /// absent, blank, invalid, or overflows the host `usize`.
@@ -2839,6 +3101,63 @@ mod tests {
         assert!(metrics.snapshot(&flow, &topo).is_none());
     }
 
+    #[test]
+    fn accepted_start_precedes_terminal_and_is_recorded_under_flow_open() {
+        let metrics = MetricsLayer::new();
+        let flow = DashboardFlowStore::new();
+        flow.open_and_record_accepted(
+            "api_pending".to_string(),
+            "POST".to_string(),
+            "/v1/responses".to_string(),
+            crate::dashboard_flow::redact_headers(&axum::http::HeaderMap::new()),
+            None,
+            crate::dashboard_flow::ClientAttribution::none(),
+            &metrics,
+        );
+        let view = metrics.view();
+        assert_eq!(view.window_1m.accepted_requests, 1);
+        assert_eq!(view.window_1m.total_count(), 0);
+        assert_eq!(
+            flow.snapshot_summaries()
+                .iter()
+                .filter(|summary| summary.status == FlowStatus::Open)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_usage_is_normalized_without_double_counting_subclasses() {
+        let metrics = MetricsLayer::new();
+        metrics.record_terminal(
+            FlowStatus::Completed,
+            Some("served-m"),
+            "/v1/responses",
+            Some("provider-a"),
+            10,
+            Some(FlowUsage {
+                prompt: 100,
+                completion: 20,
+                total: 999,
+                cached: Some(150),
+                reasoning: Some(-4),
+            }),
+            &[],
+        );
+        let view = metrics.view();
+        let counts = view.window_1m.buckets.values().next().expect("bucket");
+        assert_eq!(counts.prompt_tokens, 100);
+        assert_eq!(counts.completion_tokens, 20);
+        assert_eq!(counts.cached_tokens, 100);
+        assert_eq!(counts.reasoning_tokens, 0);
+        assert_eq!(counts.usage_anomalies, 3);
+        assert_eq!(
+            counts.prompt_tokens + counts.completion_tokens,
+            120,
+            "cached/reasoning are subsets, not extra volume"
+        );
+    }
+
     #[tokio::test]
     async fn disabled_metrics_publisher_spawns_no_task() {
         let handle = spawn_metrics_publisher_task(
@@ -3052,40 +3371,42 @@ mod tests {
 
     #[test]
     fn quantile_overflow_bucket_reports_finite_max() {
-        // A sample beyond 120 s lands in the overflow bucket; its quantile reports
-        // the finite max bound (120 s), never infinity.
-        let histogram = histogram_of(&[500_000.0]);
+        let observed = HISTOGRAM_MAX_MS + 500_000.0;
+        let histogram = histogram_of(&[observed]);
         let p99 = histogram.quantile(0.99);
         assert!(p99.is_finite(), "overflow quantile is finite");
-        assert!(
-            (p99 - HISTOGRAM_MAX_MS).abs() < 1.0,
-            "overflow quantile {p99} == finite max {HISTOGRAM_MAX_MS}"
-        );
+        assert_eq!(p99, observed, "overflow quantile uses the observed max");
+        assert_eq!(histogram.overflow_count(), 1);
+        assert!(histogram.is_partial());
     }
 
     #[test]
     fn bucket_boundaries_are_monotonic_and_span_range() {
-        // The log-spaced ladder is strictly increasing and brackets [1ms, 120s].
-        let mut previous = 0.0;
-        for index in 0..HISTOGRAM_BUCKETS - 1 {
+        let mut previous = HISTOGRAM_MIN_MS;
+        for index in 0..HISTOGRAM_BUCKETS {
             let upper = bucket_upper_ms(index);
             assert!(upper > previous, "bucket {index} upper {upper} increasing");
             previous = upper;
         }
-        // D5 R1 #3: the FIRST finite upper bound is EXACTLY 1 ms (not ≈1.5 ms) and the
-        // LAST finite upper bound is EXACTLY 120 s — the endpoints are pinned, with the
-        // ladder log-spaced between them.
         assert!(
-            (bucket_upper_ms(0) - HISTOGRAM_MIN_MS).abs() < 1e-9,
-            "bucket 0 upper {} == exactly 1 ms",
-            bucket_upper_ms(0)
+            (bucket_upper_ms(HISTOGRAM_BUCKETS - 1) - HISTOGRAM_MAX_MS).abs() < 1e-6,
+            "last finite bucket reaches exactly one hour"
         );
+        let ratio = bucket_upper_ms(0) / HISTOGRAM_MIN_MS;
+        let actual_max_error = ratio.sqrt() - 1.0;
+        assert!(actual_max_error <= HISTOGRAM_MAX_RELATIVE_ERROR);
+    }
+
+    #[test]
+    fn nearest_rank_estimates_are_clamped_and_within_relative_error() {
+        let samples = [154.0, 2912.0, 2994.0, 55_312.0];
+        let histogram = histogram_of(&samples);
+        let p50 = histogram.quantile(0.50);
         assert!(
-            (bucket_upper_ms(HISTOGRAM_BUCKETS - 2) - HISTOGRAM_MAX_MS).abs() < 1e-6,
-            "last finite bucket {} == exactly 120 s",
-            bucket_upper_ms(HISTOGRAM_BUCKETS - 2)
+            (p50 - 2912.0).abs() / 2912.0 <= HISTOGRAM_MAX_RELATIVE_ERROR,
+            "p50 {p50} stays inside the documented relative error"
         );
-        assert!(bucket_upper_ms(HISTOGRAM_BUCKETS - 1).is_infinite());
+        assert!(histogram.quantile(0.99) <= 55_312.0);
     }
 
     #[test]
@@ -3328,7 +3649,9 @@ mod tests {
             model: Some("m".to_string()),
             start_ms: 1_000,
             end_ms: 1_000 + latency_ms,
+            duration_ms: Some(latency_ms),
             first_upstream_byte_ms: None,
+            first_upstream_byte_offset_ms: None,
             status: AttemptStatus::Failed,
             error_class: Some(class),
             failover_reason: Some(crate::dashboard_flow::AttemptFailoverReason::ProviderFailed),
@@ -3342,7 +3665,9 @@ mod tests {
             model: Some("m".to_string()),
             start_ms: 1_000,
             end_ms: 1_000 + latency_ms,
+            duration_ms: Some(latency_ms),
             first_upstream_byte_ms: Some(1_000 + latency_ms),
+            first_upstream_byte_offset_ms: Some(latency_ms),
             status: AttemptStatus::Served,
             error_class: None,
             failover_reason: None,
@@ -3391,6 +3716,7 @@ mod tests {
             failure_reason: TerminalReasonClass::Stop,
             cost_usd,
             cost_confidence: confidence,
+            cache_price_impact_usd: None,
             effective_route_limit: None,
         }
     }
@@ -3675,10 +4001,7 @@ mod tests {
         assert_eq!(a.error_rate, 100.0, "A's only attempt failed");
         assert_eq!(a.errors.http_status, 1, "A's failure classed http_status");
         assert_eq!(a.errors.connect, 0);
-        assert!(
-            a.p50 > 0.0,
-            "A's failed-attempt latency feeds its percentiles"
-        );
+        assert_eq!(a.p50, None, "p50 needs two provider-attempt samples");
 
         let b = view
             .window_1m
@@ -4053,6 +4376,10 @@ mod tests {
             model_served: Some("served-model".to_string()),
             upstream_target: Some("provider-a".to_string()),
             usage: None,
+            terminal_cost_usd: None,
+            terminal_cost_confidence: TerminalCostConfidence::Unavailable,
+            cache_price_impact_usd: None,
+            effective_route_limit: None,
             status: FlowStatus::Completed,
             started_ms: 1,
             finished_ms: Some(2),
@@ -4086,7 +4413,9 @@ mod tests {
             model: Some(reserved_string(1024, "served-model")),
             start_ms: 1,
             end_ms: 2,
+            duration_ms: Some(1),
             first_upstream_byte_ms: None,
+            first_upstream_byte_offset_ms: None,
             status: AttemptStatus::Failed,
             error_class: Some(AttemptErrorClass::Timeout),
             failover_reason: Some(crate::dashboard_flow::AttemptFailoverReason::ProviderFailed),

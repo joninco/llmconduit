@@ -140,7 +140,7 @@ export function TopologyView() {
                     </th>
                     <td className="px-2 py-1">{node.status}</td>
                     <td className="px-2 py-1 text-right tabular-nums">{health?.samples ?? '—'}</td>
-                    <td className="px-2 py-1 text-right tabular-nums">{health ? `${Math.round(health.p95)} ms` : '—'}</td>
+                    <td className="px-2 py-1 text-right tabular-nums">{health?.p95 != null ? `${Math.round(health.p95)} ms` : '—'}</td>
                     <td className="px-2 py-1 text-right tabular-nums">{health ? `${health.error_rate.toFixed(1)}%` : '—'}</td>
                   </tr>
                 );

@@ -128,17 +128,26 @@
         },
         "p50": {
           "description": "`derived` p50 attempt latency (ms).",
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "p95": {
           "description": "`derived` p95 attempt latency (ms).",
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "p99": {
           "description": "`derived` p99 attempt latency (ms).",
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "provider": {
@@ -175,7 +184,8 @@
       "description": "Gap 12 — the data-quality tag for a per-provider metric. Every per-provider latency\nfigure is `derived` (computed from the provider's own attempt-latency histogram). The\n`unavailable` case (a provider with no in-window samples) is represented by the\nABSENCE of a [`ProviderLatency`] entirely, not by a variant here — so a present DTO is\nalways a real `derived` measurement (don't-lie-with-zeros). Serializes snake_case to\nmatch the cross-cutting DQ-tag contract.",
       "type": "string",
       "enum": [
-        "derived"
+        "derived",
+        "partial"
       ]
     },
     "ProviderStatus": {
@@ -191,31 +201,42 @@
       "description": "A topology edge (gateway → provider). The aggregate throughput/token/cost\nrates are D5/D13 roll-ups; until a price/throughput aggregation feeds them\nthey serialize as `0.0` (the contract requires the keys present + finite, not\na specific value), so the byte-shape is exact while the rich values land in\nD13.",
       "type": "object",
       "properties": {
-        "cost_per_sec": {
+        "attempts_per_sec": {
           "type": "number",
           "format": "double"
         },
         "from": {
           "type": "string"
         },
-        "throughput": {
+        "reported_tokens_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "terminal_cost_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "terminal_flows_per_sec": {
           "type": "number",
           "format": "double"
         },
         "to": {
           "type": "string"
-        },
-        "tokens_per_sec": {
-          "type": "number",
-          "format": "double"
         }
       },
       "required": [
         "from",
         "to",
-        "throughput",
-        "tokens_per_sec",
-        "cost_per_sec"
+        "attempts_per_sec",
+        "terminal_flows_per_sec",
+        "reported_tokens_per_sec",
+        "terminal_cost_per_sec"
       ]
     },
     "TopologyNode": {

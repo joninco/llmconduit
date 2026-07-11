@@ -13,7 +13,7 @@ const PRICE_TABLE: Record<string, ModelPrice> = {
 };
 
 function flow(over: Partial<FlowSummary> = {}): FlowSummary {
-  return {
+  const value: FlowSummary = {
     revision: 1,
     api_call_id: 'api_x',
     method: 'POST',
@@ -24,6 +24,12 @@ function flow(over: Partial<FlowSummary> = {}): FlowSummary {
     model_served: 'gpt-4o',
     ...over,
   };
+  const price = value.model_served ? PRICE_TABLE[value.model_served] : undefined;
+  const cached = value.usage?.cached;
+  if (value.cache_price_impact_usd === undefined && price?.cached_price_configured && cached !== undefined && cached !== null) {
+    value.cache_price_impact_usd = cached / 1000 * (price.cached_per_1k - price.input_per_1k);
+  }
+  return value;
 }
 function usage(over: Partial<Usage> = {}): Usage {
   return { prompt: 1000, completion: 200, total: 1200, ...over };
@@ -31,7 +37,7 @@ function usage(over: Partial<Usage> = {}): Usage {
 
 describe('tokenEconomics — per-flow split / cache-hit / $ saved (gap 08)', () => {
   it('a MEASURED split: cached/reasoning reported ⇒ measured counts, derived hit + $ saved', () => {
-    const econ = tokenEconomics(flow({ usage: usage({ cached: 250, reasoning: 64 }) }), PRICE_TABLE);
+    const econ = tokenEconomics(flow({ usage: usage({ cached: 250, reasoning: 64 }) }));
     expect(econ.cached).toEqual({ value: '250', quality: 'measured' });
     expect(econ.reasoning).toEqual({ value: '64', quality: 'measured' });
     // 250 / 1000 = 25.0%
@@ -44,7 +50,7 @@ describe('tokenEconomics — per-flow split / cache-hit / $ saved (gap 08)', () 
 
   it('UNREPORTED cached/reasoning ⇒ "—" (unavailable), NEVER "0"; hit + $ saved unavailable', () => {
     // gap-07 contract: absent cached/reasoning is unreported, distinct from a reported 0.
-    const econ = tokenEconomics(flow({ usage: usage() }), PRICE_TABLE);
+    const econ = tokenEconomics(flow({ usage: usage() }));
     expect(econ.cached).toEqual({ value: '—', quality: 'unavailable' });
     expect(econ.reasoning).toEqual({ value: '—', quality: 'unavailable' });
     expect(econ.cached.value).not.toBe('0');
@@ -55,7 +61,7 @@ describe('tokenEconomics — per-flow split / cache-hit / $ saved (gap 08)', () 
   });
 
   it('a REPORTED cached 0 ⇒ a measured "0" (a real miss): 0% hit + $0.00 saved, distinct from "—"', () => {
-    const econ = tokenEconomics(flow({ usage: usage({ cached: 0, reasoning: 0 }) }), PRICE_TABLE);
+    const econ = tokenEconomics(flow({ usage: usage({ cached: 0, reasoning: 0 }) }));
     // Measured zero reads "0", NOT "—".
     expect(econ.cached).toEqual({ value: '0', quality: 'measured' });
     expect(econ.cached.value).not.toBe('—');
@@ -69,7 +75,7 @@ describe('tokenEconomics — per-flow split / cache-hit / $ saved (gap 08)', () 
 
   it('cached reported but NO configured cached price ⇒ split shows, "$ saved" is "—" (no fabrication)', () => {
     // llama has cached tokens but cached_price_configured=false → the numeric 0.0 must NOT be used.
-    const econ = tokenEconomics(flow({ model_served: 'llama-3.1-70b', cost_confidence: 'estimated', usage: usage({ cached: 300 }) }), PRICE_TABLE);
+    const econ = tokenEconomics(flow({ model_served: 'llama-3.1-70b', cost_confidence: 'estimated', usage: usage({ cached: 300 }) }));
     expect(econ.cached).toEqual({ value: '300', quality: 'measured' }); // split still shows
     expect(econ.cacheHit.quality).toBe('derived'); // hit rate still derivable from counts
     // The presence gate: no configured cached price ⇒ NO dollar figure.
@@ -78,21 +84,20 @@ describe('tokenEconomics — per-flow split / cache-hit / $ saved (gap 08)', () 
   });
 
   it('no usage at all ⇒ every figure "—" (unavailable), never "0"', () => {
-    const econ = tokenEconomics(flow({ usage: null }), PRICE_TABLE);
+    const econ = tokenEconomics(flow({ usage: null }));
     for (const v of [econ.prompt, econ.completion, econ.cached, econ.reasoning, econ.cacheHit, econ.saved]) {
       expect(v).toEqual({ value: '—', quality: 'unavailable' });
     }
   });
 
   it('cached reported but prompt is 0 ⇒ hit rate "—" (undefined ratio), never a fabricated %', () => {
-    const econ = tokenEconomics(flow({ usage: { prompt: 0, completion: 10, total: 10, cached: 0 } }), PRICE_TABLE);
+    const econ = tokenEconomics(flow({ usage: { prompt: 0, completion: 10, total: 10, cached: 0 } }));
     expect(econ.cacheHit).toEqual({ value: '—', quality: 'unavailable' });
   });
 
-  it('a configured cached rate ABOVE the input rate clamps the saving at $0.00 (never negative)', () => {
-    const inverted: ModelPrice = { input_per_1k: 0.001, output_per_1k: 0.002, cached_per_1k: 0.009, cached_price_configured: true };
-    const econ = tokenEconomics(flow({ model_served: 'weird', usage: usage({ cached: 500 }) }), { weird: inverted });
-    expect(econ.saved.value).toBe('$0.00');
+  it('a configured cached rate above input preserves a signed negative saving', () => {
+    const econ = tokenEconomics(flow({ model_served: 'weird', usage: usage({ cached: 500 }), cache_price_impact_usd: 0.004 }));
+    expect(econ.saved.value).toBe('$-0.0040');
     expect(econ.saved.quality).toBe('derived');
   });
 });
@@ -105,7 +110,7 @@ describe('aggregateCacheByKey — by-model roll-up (gap 08)', () => {
       // unreported cached — must NOT drag the rate toward 0%; excluded entirely.
       flow({ api_call_id: 'c', model_served: 'gpt-4o', usage: usage({ prompt: 9999 }) }),
     ];
-    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served, PRICE_TABLE);
+    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served);
     expect(agg!.key).toBe('gpt-4o');
     // (200+400) / (1000+1000) = 30.0% — the unreported flow's 9999 prompt is excluded.
     expect(agg!.hitRate).toEqual({ value: '30.0%', quality: 'derived' });
@@ -123,7 +128,7 @@ describe('aggregateCacheByKey — by-model roll-up (gap 08)', () => {
       flow({ api_call_id: 'a', model_served: 'gpt-4o', usage: usage() }),
       flow({ api_call_id: 'b', model_served: 'gpt-4o', usage: usage() }),
     ];
-    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served, PRICE_TABLE);
+    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served);
     expect(agg!.hitRate).toEqual({ value: '—', quality: 'unavailable' });
     expect(agg!.hitRate.value).not.toBe('0.0%');
     expect(agg!.reportedSamples).toBe(0);
@@ -135,7 +140,7 @@ describe('aggregateCacheByKey — by-model roll-up (gap 08)', () => {
       flow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: usage({ cached: 100 }) }),
       flow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'estimated', usage: usage({ cached: 100 }) }),
     ];
-    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served, PRICE_TABLE);
+    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served);
     expect(agg!.estimated).toBe(true);
   });
 
@@ -150,7 +155,7 @@ describe('aggregateCacheByKey — by-model roll-up (gap 08)', () => {
       // non-confident, UNREPORTED cached — excluded from the rate, but MUST still taint confidence.
       flow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'estimated', usage: usage({ prompt: 1000 }) }),
     ];
-    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served, PRICE_TABLE);
+    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served);
     // The rate still derives ONLY from the reported member (250/1000) — no zero-lie reintroduced.
     expect(agg!.hitRate).toEqual({ value: '25.0%', quality: 'derived' });
     expect(agg!.reportedSamples).toBe(1);
@@ -167,7 +172,7 @@ describe('aggregateCacheByKey — by-model roll-up (gap 08)', () => {
       flow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'estimated', usage: usage() }), // unreported cached
       flow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'unavailable', usage: usage() }),
     ];
-    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served, PRICE_TABLE);
+    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served);
     expect(agg!.hitRate).toEqual({ value: '—', quality: 'unavailable' });
     expect(agg!.reportedSamples).toBe(0);
     expect(agg!.estimated).toBe(true);
@@ -180,13 +185,13 @@ describe('aggregateCacheByKey — by-model roll-up (gap 08)', () => {
       flow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: usage() }),
       flow({ api_call_id: 'b', model_served: 'gpt-4o', cost_confidence: 'confident', usage: usage() }),
     ];
-    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served, PRICE_TABLE);
+    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served);
     expect(agg!.estimated).toBe(false);
   });
 
   it('a model with cached but NO configured cache price ⇒ hit rate shown, "$ saved" "—"', () => {
     const rows = [flow({ api_call_id: 'a', model_served: 'llama-3.1-70b', cost_confidence: 'estimated', usage: usage({ cached: 250 }) })];
-    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served, PRICE_TABLE);
+    const [agg] = aggregateCacheByKey(rows, (f) => f.model_served);
     expect(agg!.hitRate.quality).toBe('derived');
     expect(agg!.saved).toEqual({ value: '—', quality: 'unavailable' });
   });
@@ -197,7 +202,7 @@ describe('aggregateCacheByKey — by-model roll-up (gap 08)', () => {
       flow({ api_call_id: 'b', model_served: 'llama-3.1-70b', cost_confidence: 'estimated', usage: usage({ cached: 900 }) }),
       flow({ api_call_id: 'c', model_served: null, model_requested: null, usage: usage({ cached: 5 }) }),
     ];
-    const aggs = aggregateCacheByKey(rows, (f) => f.model_served ?? f.model_requested, PRICE_TABLE);
+    const aggs = aggregateCacheByKey(rows, (f) => f.model_served ?? f.model_requested);
     expect(aggs).toHaveLength(2); // the null-model row is dropped
     expect(aggs[0]!.key).toBe('llama-3.1-70b'); // 900 cached tokens — busiest first
     expect(aggs[1]!.key).toBe('gpt-4o');

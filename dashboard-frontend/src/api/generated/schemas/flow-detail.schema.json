@@ -14,6 +14,13 @@
         "$ref": "#/$defs/Attempt"
       }
     },
+    "cache_price_impact_usd": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
     "cost": {
       "type": [
         "number",
@@ -37,6 +44,13 @@
       "format": "uint64",
       "minimum": 0
     },
+    "effective_route_limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
     "elapsed_ms": {
       "type": [
         "integer",
@@ -54,6 +68,14 @@
       "format": "uint128",
       "minimum": 0
     },
+    "finalize_offset_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint128",
+      "minimum": 0
+    },
     "finished_ms": {
       "type": [
         "integer",
@@ -64,6 +86,14 @@
     },
     "first_content_delta_ms": {
       "description": "True TTFT — the wall-clock instant the FIRST canonical **content** SSE delta was\nemitted to the client. NOT reasoning, tool-argument, refusal, or signature\ndeltas: a stream that emits reasoning/tool deltas before content does NOT stamp\nthis early (first-write-wins on the content arm only). `None` if the flow errored\nbefore any content delta.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint128",
+      "minimum": 0
+    },
+    "first_content_delta_offset_ms": {
       "type": [
         "integer",
         "null"
@@ -106,6 +136,15 @@
       "format": "uint128",
       "minimum": 0
     },
+    "ingress_offset_ms": {
+      "description": "Monotonic offset from flow ingress. Present on newly captured records; legacy\nsnapshots without offsets continue to use ordered epoch timestamps as fallback.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint128",
+      "minimum": 0
+    },
     "model_requested": {
       "type": [
         "string",
@@ -127,8 +166,26 @@
       "format": "uint128",
       "minimum": 0
     },
+    "normalization_done_offset_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint128",
+      "minimum": 0
+    },
     "normalized": {
       "description": "The captured CANONICAL/normalized body (D2), parsed. Absent when evicted."
+    },
+    "normalized_usage": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FlowUsage"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "response_id": {
       "type": [
@@ -150,6 +207,14 @@
       "format": "uint128",
       "minimum": 0
     },
+    "routing_decision_offset_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint128",
+      "minimum": 0
+    },
     "started_ms": {
       "type": "integer",
       "format": "uint128",
@@ -160,6 +225,14 @@
     },
     "stream_end_ms": {
       "description": "Stream completion — stamped when `run_turn` finishes emitting the terminal\n`response.completed`/`response.incomplete`. `None` if the flow errored or was\ncancelled mid-stream.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint128",
+      "minimum": 0
+    },
+    "stream_end_offset_ms": {
       "type": [
         "integer",
         "null"
@@ -202,6 +275,11 @@
           "type": "null"
         }
       ]
+    },
+    "usage_anomaly_count": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
     }
   },
   "required": [
@@ -209,6 +287,8 @@
     "revision",
     "api_call_id",
     "usage",
+    "normalized_usage",
+    "usage_anomaly_count",
     "status",
     "deltas_through_monitor_seq",
     "deltas",
@@ -221,6 +301,15 @@
       "description": "Gap 03 — one upstream dispatch attempt's full provenance: WHICH provider, WHAT model,\nHOW LONG it took, WHEN the first wire byte arrived, and the OUTCOME. The failover loop\nrecords one per provider it tries (failed ones + the served one); a non-failover\n(bare-leaf / single-upstream / routing-with-no-fallback) flow records exactly one.\n\nAll timestamps are MEASURED epoch-ms (`now_ms`). `first_upstream_byte_ms` is the wire\ninstant the attempt's FIRST chunk arrived — `None` when the attempt never received\nresponse headers / a first chunk (a connect/timeout/non-2xx failure), so an unmeasured\nfirst-byte time is `None`, NEVER `0` (don't-lie-with-zeros). `error_class` /\n`failover_reason` are `None` on the served attempt and are BOUNDED taxonomic codes\n(never raw upstream text) on a failed attempt — they ride the body-free summary, so\nraw error bodies stay behind spec 05's gated seam. Snake_case + `skip_serializing_if`\nso a `None` field is absent on the wire.",
       "type": "object",
       "properties": {
+        "duration_ms": {
+          "description": "Monotonic attempt duration. New records always populate this; `None` identifies\nlegacy data that must fall back to an ordered epoch pair or stay unavailable.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
         "end_ms": {
           "description": "Epoch-ms the attempt resolved (served first chunk, or failed). Always measured.",
           "type": "integer",
@@ -251,6 +340,15 @@
         },
         "first_upstream_byte_ms": {
           "description": "Epoch-ms the FIRST chunk arrived on the wire for this attempt. `None` when the\nattempt never received a first chunk (failed before response headers) — NEVER `0`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "first_upstream_byte_offset_ms": {
+          "description": "Monotonic response-header offset from attempt start. Unlike the display epoch,\nthis remains valid across wall-clock adjustments.",
           "type": [
             "integer",
             "null"
