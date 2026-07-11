@@ -8,9 +8,11 @@
 //! decisions to it; the BLOCK EMISSION (thinking/text blocks, block indices,
 //! `open_block`) stays on the converter, which owns that machinery.
 //!
-//! Rules (unchanged from G8 — pure structural extraction, no behavior change):
-//! - Reasoning is buffered, not emitted live, so its final shape is decided
-//!   once the stream's shape is known.
+//! Rules:
+//! - Unrequested reasoning is buffered so its final shape can be decided once
+//!   the stream shape is known (the original G8 compatibility behavior).
+//! - When an Anthropic request explicitly enables thinking, the converter emits
+//!   reasoning live while this state retains the same text for signing.
 //! - Reasoning arriving after text/tool output has begun is "late" and dropped
 //!   (`is_late_reasoning`).
 //! - At a terminal event, reasoning-only output is PROMOTED to a `text` block
@@ -23,8 +25,9 @@
 /// block emission stays on the converter.
 #[derive(Debug, Default)]
 pub(super) struct ReasoningEgressState {
-    /// Buffered reasoning text deltas, flushed (promoted or as thinking) once
-    /// the stream shape is known.
+    /// Retained reasoning text deltas. Deferred mode flushes these once the
+    /// stream shape is known; live mode emits each immediately and retains them
+    /// only until the block closes with a deterministic signature.
     pub(super) reasoning_buffer: Vec<String>,
     /// Accumulated reasoning signature (genuine chain-of-thought marker).
     /// Pins the buffer to a `thinking` block (never promoted) when present.
@@ -40,7 +43,8 @@ pub(super) struct ReasoningEgressState {
 }
 
 impl ReasoningEgressState {
-    /// Whether there is any buffered reasoning (text or signature) to flush.
+    /// Whether there is any retained reasoning (text or signature) to flush or
+    /// finish signing.
     pub(super) fn has_buffered(&self) -> bool {
         !self.reasoning_buffer.is_empty() || self.reasoning_signature.is_some()
     }
@@ -62,7 +66,7 @@ impl ReasoningEgressState {
         self.has_tool_calls = true;
     }
 
-    /// Push a buffered reasoning text delta.
+    /// Retain a reasoning text delta.
     pub(super) fn push_reasoning(&mut self, delta: &str) {
         self.reasoning_buffer.push(delta.to_string());
     }

@@ -4,8 +4,8 @@
 //!
 //! claude-relay buffered upstream reasoning in its Chat->Anthropic converter and
 //! decided its final shape only once the stream's shape was known. llmconduit's
-//! egress converter (`responses_to_anthropic.rs`) carries the same heuristics on
-//! the canonical-Responses -> Anthropic path:
+//! egress converter (`responses_to_anthropic.rs`) retains those heuristics for
+//! unrequested backend reasoning on the canonical-Responses -> Anthropic path:
 //!   - reasoning-only ending cleanly (`finish_reason:stop`) is PROMOTED to a
 //!     `text` block (the backend put its answer in the reasoning channel),
 //!   - reasoning-only truncated (`finish_reason:length` -> `max_tokens`) stays a
@@ -15,6 +15,10 @@
 //!   - reasoning arriving AFTER text has started is "late" and dropped,
 //!   - normal reasoning-then-text flushes the reasoning as a `thinking` block
 //!     before the text.
+//!
+//! Explicitly enabled/adaptive Anthropic thinking uses a separate live path and
+//! is covered by the converter unit test plus the parked-upstream HTTP regression
+//! in `gateway.rs`.
 //!
 //! These drive the full gateway through the Anthropic `/v1/messages` surface
 //! (mirroring `gateway.rs`) so the heuristics are proven end-to-end across the
@@ -41,8 +45,10 @@ use serde_json::Value;
 use serde_json::json;
 use tower::ServiceExt;
 
-/// Run an Anthropic streaming `/v1/messages` turn with `thinking` enabled over a
-/// single canned upstream turn, returning the parsed Anthropic SSE events.
+/// Run an Anthropic streaming `/v1/messages` turn without explicit thinking over
+/// a single canned upstream turn, returning the parsed Anthropic SSE events.
+/// The mock may still return reasoning, which exercises the legacy compatibility
+/// path for unrequested backend reasoning (defer / promote / suppress).
 async fn run_anthropic_stream(
     upstream_chunks: Vec<Result<ChatCompletionChunk, AppError>>,
 ) -> Vec<Value> {
@@ -55,9 +61,6 @@ async fn run_anthropic_stream(
         "model": "claude-3-7-sonnet-20250219",
         "max_tokens": 1024,
         "stream": true,
-        // Enabled thinking so the request asks the backend for reasoning; the
-        // egress converter still decides promotion vs. suppression per turn.
-        "thinking": { "type": "enabled", "budget_tokens": 1024 },
         "messages": [{ "role": "user", "content": "Think then answer." }]
     });
 

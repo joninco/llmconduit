@@ -55,8 +55,22 @@ pub struct AnthropicStreamCollector {
 
 impl AnthropicStreamCollector {
     pub fn new(model: String) -> Self {
+        Self::with_converter(model.clone(), AnthropicStreamConverter::new(model))
+    }
+
+    /// Non-streaming collection still runs through the streaming converter.
+    /// Select its live-thinking semantics when the original Anthropic request
+    /// explicitly enabled thinking so streaming and JSON responses agree.
+    pub fn with_live_thinking(model: String) -> Self {
+        Self::with_converter(
+            model.clone(),
+            AnthropicStreamConverter::with_live_thinking(model),
+        )
+    }
+
+    fn with_converter(model: String, inner: AnthropicStreamConverter) -> Self {
         Self {
-            inner: AnthropicStreamConverter::new(model.clone()),
+            inner,
             message_id: None,
             model: Some(model),
             stop_reason: None,

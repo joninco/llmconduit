@@ -60,6 +60,7 @@ fn is_hidden_server_tool(name: &str) -> bool {
 }
 
 enum ContentBlockState {
+    Thinking { index: usize },
     Text { index: usize },
     ToolUse { index: usize, call_id: String },
 }
@@ -82,12 +83,17 @@ pub struct AnthropicStreamConverter {
     web_search_count: u64,
     emitted_tool_call_ids: HashSet<String>,
     closed_tool_call_ids: HashSet<String>,
-    // Deferred reasoning (G8) state machine (T8): owns the buffer, signature,
+    // Reasoning egress state machine (G8/T8): owns retained text, signature,
     // late-reasoning gate, tool-call flag, and the promote/hold decisions. See
     // `reasoning::ReasoningEgressState`. Block EMISSION stays on the converter
-    // (it owns block indices + `open_block`); the converter delegates the
-    // buffer/hold/promote DECISIONS to `self.reasoning`.
+    // (it owns block indices + `open_block`).
     reasoning: ReasoningEgressState,
+    // An Anthropic caller that explicitly requested enabled/adaptive thinking
+    // has already disambiguated the upstream reasoning channel: it is genuine
+    // thinking, not a backend that accidentally placed its final answer there.
+    // Stream those deltas immediately so clients can show live progress. The
+    // default remains G8's deferred/promoted mode for unrequested reasoning.
+    live_thinking: bool,
 }
 
 impl AnthropicStreamConverter {
@@ -106,6 +112,17 @@ impl AnthropicStreamConverter {
             emitted_tool_call_ids: HashSet::new(),
             closed_tool_call_ids: HashSet::new(),
             reasoning: ReasoningEgressState::default(),
+            live_thinking: false,
+        }
+    }
+
+    /// Construct an Anthropic converter for a request that explicitly enabled
+    /// thinking. Unlike the default G8 compatibility mode, reasoning deltas are
+    /// emitted as they arrive instead of being held until text or termination.
+    pub fn with_live_thinking(model: String) -> Self {
+        Self {
+            live_thinking: true,
+            ..Self::new(model)
         }
     }
 
@@ -213,8 +230,10 @@ impl AnthropicStreamConverter {
                 self.start_text_block(output);
             }
             "reasoning" => {
-                // Deferred: do not open a thinking block here. Reasoning is
-                // buffered until the stream shape is known (see struct docs).
+                // The live path opens on the first non-empty delta, not merely
+                // on item creation, so an empty reasoning item cannot create an
+                // empty thinking block. Deferred mode waits until stream shape
+                // is known, as before.
             }
             _ => {}
         }
@@ -267,11 +286,22 @@ impl AnthropicStreamConverter {
         if self.reasoning.is_late_reasoning() {
             return;
         }
-        // Defer: buffer the reasoning. Output-token bookkeeping still
-        // accumulates (record_output_delta), but it no longer pushes a
-        // progressive `message_delta` -- see that function's doc comment.
+        let live_index = self
+            .live_thinking
+            .then(|| self.ensure_live_thinking_block(output));
+        // Retain every chunk for deterministic synthetic-signature generation.
+        // In deferred mode this is also the pending wire buffer; in live mode
+        // the same chunk is emitted immediately below.
         self.record_output_delta(delta);
         self.reasoning.push_reasoning(delta);
+        if let Some(index) = live_index {
+            output.push(AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicDelta::ThinkingDelta {
+                    thinking: delta.to_string(),
+                },
+            });
+        }
     }
 
     fn handle_reasoning_signature_delta(
@@ -286,12 +316,13 @@ impl AnthropicStreamConverter {
         if signature.is_empty() || self.reasoning.is_late_reasoning() {
             return;
         }
-        // Buffered alongside the reasoning text; flushed with it. A signature is
-        // a marker of genuine chain-of-thought, so its presence later pins the
-        // buffer to a `thinking` block (never promoted to text). A signature can
-        // arrive in multiple `signature_delta` chunks, so accumulate them in
-        // order (concatenate) rather than overwriting -- otherwise only the last
-        // fragment would survive.
+        // Retained alongside the reasoning text and emitted when the thinking
+        // block closes. A signature is a marker of genuine chain-of-thought, so
+        // its presence pins deferred reasoning to a thinking block. A signature
+        // can arrive in multiple chunks, so concatenate rather than overwrite.
+        if self.live_thinking {
+            self.ensure_live_thinking_block(output);
+        }
         self.reasoning.push_signature(signature);
     }
 
@@ -407,9 +438,13 @@ impl AnthropicStreamConverter {
                 }
             }
             "reasoning" => {
-                // Deferred: the reasoning item completing does not flush the
-                // buffer. The buffer is held until content arrives (-> thinking)
-                // or the turn ends (-> promote to text / keep as thinking).
+                // A live block has already committed this channel to thinking,
+                // so close it now with its real/synthetic signature. Deferred
+                // mode still waits until content or the terminal event so it
+                // can preserve reasoning-only answer promotion.
+                if self.live_thinking {
+                    self.flush_reasoning_as_thinking(output);
+                }
             }
             "function_call" | "custom_tool_call" => {
                 // G4: a server-side `analyzeImage` function_call is hidden like
@@ -661,6 +696,13 @@ impl AnthropicStreamConverter {
     /// signed reasoning. No-op when the buffer is empty. The buffer (text and
     /// signature) is consumed.
     fn flush_reasoning_as_thinking(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
+        // Live mode has already emitted every retained chunk. Closing the open
+        // thinking block emits only its signature and stop, never the text a
+        // second time.
+        if matches!(self.open_block, Some(ContentBlockState::Thinking { .. })) {
+            self.close_open_block(output);
+            return;
+        }
         if !self.reasoning.has_buffered() {
             return;
         }
@@ -725,6 +767,13 @@ impl AnthropicStreamConverter {
         clean_stop: bool,
         output: &mut Vec<AnthropicStreamEvent>,
     ) {
+        // Explicitly requested thinking is never reclassified as an accidental
+        // answer-channel response. It was streamed live and must remain a
+        // thinking block for every terminal reason.
+        if self.live_thinking {
+            self.flush_reasoning_as_thinking(output);
+            return;
+        }
         if !self.reasoning.has_buffered() {
             return;
         }
@@ -754,14 +803,27 @@ impl AnthropicStreamConverter {
 
     fn close_open_block(&mut self, output: &mut Vec<AnthropicStreamEvent>) {
         if let Some(block) = self.open_block.take() {
-            let index = match block {
-                ContentBlockState::Text { index } => index,
+            match block {
+                ContentBlockState::Thinking { index } => {
+                    let thinking_text = self.reasoning.take_buffer();
+                    let signature = self
+                        .reasoning
+                        .take_signature()
+                        .unwrap_or_else(|| synthetic_signature(&thinking_text));
+                    output.push(AnthropicStreamEvent::ContentBlockDelta {
+                        index,
+                        delta: AnthropicDelta::SignatureDelta { signature },
+                    });
+                    output.push(AnthropicStreamEvent::ContentBlockStop { index });
+                }
+                ContentBlockState::Text { index } => {
+                    output.push(AnthropicStreamEvent::ContentBlockStop { index });
+                }
                 ContentBlockState::ToolUse { index, call_id } => {
                     self.closed_tool_call_ids.insert(call_id);
-                    index
+                    output.push(AnthropicStreamEvent::ContentBlockStop { index });
                 }
-            };
-            output.push(AnthropicStreamEvent::ContentBlockStop { index });
+            }
         }
     }
 
@@ -799,6 +861,26 @@ impl AnthropicStreamConverter {
                 text: String::new(),
             },
         });
+    }
+
+    /// Open (or return) the single live thinking block for the current reasoning
+    /// segment. Callers invoke this only after the late-reasoning gate, so an
+    /// existing non-thinking block is merely a defensive case.
+    fn ensure_live_thinking_block(&mut self, output: &mut Vec<AnthropicStreamEvent>) -> usize {
+        if let Some(ContentBlockState::Thinking { index }) = &self.open_block {
+            return *index;
+        }
+        self.close_open_block(output);
+        let index = self.next_block_index;
+        self.next_block_index += 1;
+        self.open_block = Some(ContentBlockState::Thinking { index });
+        output.push(AnthropicStreamEvent::ContentBlockStart {
+            index,
+            content_block: AnthropicContentBlockStart::Thinking {
+                thinking: String::new(),
+            },
+        });
+        index
     }
 
     fn ensure_tool_block(

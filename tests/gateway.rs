@@ -9135,6 +9135,70 @@ async fn anthropic_messages_streams_nested_thinking_response() {
     );
 }
 
+/// Regression: when an Anthropic caller explicitly requests thinking, a
+/// reasoning delta must cross the REAL HTTP `/v1/messages` egress while the
+/// upstream is still parked in the thinking phase. Previously the converter
+/// emitted only `message_start` here and held every reasoning chunk until text
+/// or the terminal event, leaving Claude Code's live token counter at zero.
+#[tokio::test]
+async fn anthropic_requested_thinking_streams_before_upstream_completes() {
+    let upstream =
+        ChunkThenPendingUpstream::new(vec![reasoning_chunk("chat-1", "live reasoning progress")]);
+    let stream_polled = upstream.stream_polled.notified();
+    let gateway = test_gateway_with_flow_store_upstream(Arc::new(upstream.clone()));
+    let app = llmconduit::build_app_from_gateway(gateway);
+
+    let body = json!({
+        "model": "glm-5.1",
+        "max_tokens": 1024,
+        "stream": true,
+        "thinking": { "type": "adaptive" },
+        "messages": [{ "role": "user", "content": "Think for a while." }]
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&body).expect("serialize")))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status().as_u16(), 200);
+
+    let mut served = response.into_body().into_data_stream();
+    tokio::time::timeout(std::time::Duration::from_secs(2), stream_polled)
+        .await
+        .expect("upstream yielded its reasoning prefix and parked");
+
+    let wire = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let mut wire = String::new();
+        while !wire.contains("\"type\":\"thinking_delta\"") {
+            let bytes = served
+                .next()
+                .await
+                .expect("HTTP stream must stay open while upstream is parked")
+                .expect("served SSE bytes");
+            wire.push_str(&String::from_utf8_lossy(&bytes));
+        }
+        wire
+    })
+    .await
+    .expect("thinking_delta must be served before the parked upstream completes");
+
+    assert!(
+        wire.contains("\"type\":\"thinking\""),
+        "live delta must be inside a thinking block: {wire}"
+    );
+    assert!(
+        wire.contains("\"thinking\":\"live reasoning progress\""),
+        "the reasoning chunk itself must be forwarded immediately: {wire}"
+    );
+    drop(served);
+}
+
 #[tokio::test]
 async fn anthropic_messages_preserves_image_content_parts() {
     let upstream = MockUpstream::default();

@@ -241,6 +241,103 @@ fn converts_reasoning_then_text_response() {
 }
 
 #[test]
+fn explicitly_requested_thinking_streams_reasoning_progressively() {
+    let mut converter = AnthropicStreamConverter::with_live_thinking("claude-3".to_string());
+    let mut events = converter.convert(&created_event());
+
+    // Merely creating a reasoning item does not open an empty block. The first
+    // actual delta must open the block and reach the wire in the SAME convert
+    // call; deferring this batch until text starts is the spinner regression.
+    assert!(
+        converter
+            .convert(&item_added_event("reasoning", ""))
+            .is_empty()
+    );
+    let first = converter.convert(&reasoning_delta_event("Think"));
+    assert_eq!(
+        event_types(&first),
+        vec!["content_block_start", "content_block_delta"]
+    );
+    assert!(matches!(
+        &first[0],
+        AnthropicStreamEvent::ContentBlockStart {
+            content_block: AnthropicContentBlockStart::Thinking { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &first[1],
+        AnthropicStreamEvent::ContentBlockDelta {
+            delta: AnthropicDelta::ThinkingDelta { thinking },
+            ..
+        } if thinking == "Think"
+    ));
+    events.extend(first);
+
+    // Subsequent chunks stay in the same open thinking block and remain
+    // progressive rather than accumulating behind the egress converter.
+    let second = converter.convert(&reasoning_delta_event("ing..."));
+    assert_eq!(event_types(&second), vec!["content_block_delta"]);
+    assert!(matches!(
+        &second[0],
+        AnthropicStreamEvent::ContentBlockDelta {
+            delta: AnthropicDelta::ThinkingDelta { thinking },
+            ..
+        } if thinking == "ing..."
+    ));
+    events.extend(second);
+
+    // The first real content boundary signs and closes thinking before opening
+    // text. The retained chunks are used for the signature, not emitted twice.
+    let transition = converter.convert(&item_added_event("message", "assistant"));
+    assert_eq!(
+        event_types(&transition),
+        vec![
+            "content_block_delta", // synthetic signature
+            "content_block_stop",
+            "content_block_start", // text
+        ]
+    );
+    let signatures: Vec<&str> = transition
+        .iter()
+        .filter_map(|event| match event {
+            AnthropicStreamEvent::ContentBlockDelta {
+                delta: AnthropicDelta::SignatureDelta { signature },
+                ..
+            } => Some(signature.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(signatures.len(), 1);
+    assert!(signatures[0].starts_with(SYNTHETIC_SIGNATURE_PREFIX));
+    assert_eq!(
+        transition
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AnthropicStreamEvent::ContentBlockDelta {
+                    delta: AnthropicDelta::ThinkingDelta { .. },
+                    ..
+                }
+            ))
+            .count(),
+        0,
+        "closing a live block must not replay buffered thinking"
+    );
+    events.extend(transition);
+
+    for event in [
+        text_delta_event("Answer"),
+        item_done_event("reasoning", json!({})),
+        item_done_event("message", json!({})),
+        completed_event(),
+    ] {
+        events.extend(converter.convert(&event));
+    }
+    conformance::assert_stream_conformant(&events, conformance::Surface::ReasoningText);
+}
+
+#[test]
 fn unsigned_reasoning_gets_a_synthetic_signature() {
     // C2: when the upstream reasoning channel carries no signature (the
     // DeepSeek `reasoning_content` case -- no `signature_delta` events at

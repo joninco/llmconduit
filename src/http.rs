@@ -1491,14 +1491,20 @@ async fn handle_post_messages(
     let model = gateway.resolve_request_model(&request.model).await.0;
     let wants_stream = request.stream;
     let responses_request = anthropic_to_responses::convert_request(request)?;
+    // The ingress adapter records whether the Anthropic caller explicitly
+    // enabled/adapted thinking. Preserve that signal at egress: only explicitly
+    // requested reasoning is safe to commit to a live thinking block before the
+    // final stream shape is known. Unrequested backend reasoning retains the G8
+    // deferred/promotion compatibility path.
+    let live_thinking = responses_request.thinking == Some(true);
     let stream = gateway
         .stream_responses_with_api_call_id(responses_request, api_call_id)
         .await?;
 
     let response = if wants_stream {
-        stream_anthropic_response(model.clone(), stream)?
+        stream_anthropic_response(model.clone(), live_thinking, stream)?
     } else {
-        collect_anthropic_response(model.clone(), stream).await?
+        collect_anthropic_response(model.clone(), live_thinking, stream).await?
     };
     Ok(with_model_headers(response, &requested, &model))
 }
@@ -1728,11 +1734,16 @@ fn stream_chat_completions_response(
 
 fn stream_anthropic_response(
     model: String,
+    live_thinking: bool,
     stream: ReceiverStream<crate::engine::SseEvent>,
 ) -> AppResult<Response> {
     let (tx, rx) = mpsc::channel(128);
     tokio::spawn(async move {
-        let mut converter = AnthropicStreamConverter::new(model);
+        let mut converter = if live_thinking {
+            AnthropicStreamConverter::with_live_thinking(model)
+        } else {
+            AnthropicStreamConverter::new(model)
+        };
         let mut stream = std::pin::pin!(stream);
         while let Some(event) = stream.next().await {
             let anthropic_events = converter.convert(&event);
@@ -1910,9 +1921,14 @@ async fn collect_chat_completions_response(
 
 async fn collect_anthropic_response(
     model: String,
+    live_thinking: bool,
     stream: ReceiverStream<crate::engine::SseEvent>,
 ) -> AppResult<Response> {
-    let mut collector = AnthropicStreamCollector::new(model);
+    let mut collector = if live_thinking {
+        AnthropicStreamCollector::with_live_thinking(model)
+    } else {
+        AnthropicStreamCollector::new(model)
+    };
     let mut stream = std::pin::pin!(stream);
     while let Some(event) = stream.next().await {
         collector.process(&event);
