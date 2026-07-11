@@ -1,21 +1,21 @@
 import { describe, it, expect } from 'vitest';
-import type { MetricWindow } from '../../api/types';
+import type { InstantMetricSample } from '../../api/types';
 import { CHIP_METRICS, deriveChips, deltaGlyph, ERROR_PCT_THRESHOLD } from './chips';
 
-function win(over: Partial<MetricWindow> = {}): MetricWindow {
+function win(over: Partial<InstantMetricSample> = {}): InstantMetricSample {
   // Default to a fully-measured window: the three denominators mirror `latency_samples` so a test
   // that sets `latency_samples: 0` (no finalized flow) also zeroes the tok/s + $/min denominators
   // unless it overrides them — keeping the gap-01 "unavailable" semantics intact. A test
   // that needs to diverge them (latency_samples > 0 but usage/priced = 0) passes them explicitly.
   const latency_samples = over.latency_samples ?? 252;
   return {
-    window_seconds: 60, observed_seconds: 60, warm: true, accepted_requests: 252,
+    interval_duration_ms: 1000, ready: true, accepted_requests: 252,
     accepted_per_sec: 4.2, active_streams_now: 3, failure_pct: 1.1,
     terminal_requests: latency_samples, terminal_per_sec: 4.2, successes: latency_samples,
     failures: 0, cancellations: 0, cancellation_pct: 0,
     p50_ms: 180, p95_ms: 920, p99_ms: 1840, reported_tokens_per_sec: 142, cost_per_min: 0.21,
     quantile_method: 'log_histogram_nearest_rank', max_relative_error: 0.062,
-    latency_overflow_count: 0, latency_quality: 'measured', usage_anomaly_count: 0,
+    latency_overflow_count: 0, p50_quality: 'measured', p95_quality: 'measured', p99_quality: 'measured', usage_anomaly_count: 0,
     latency_samples,
     usage_samples: latency_samples,
     priced_samples: latency_samples,
@@ -103,6 +103,24 @@ describe('chips', () => {
     expect(byKey.p50_ms).toBe('0');
     expect(byKey.cost_per_min).toBe('0.00');
     expect(byKey.accepted_per_sec).toBe('0.0'); // genuine idle zero, also numeric
+  });
+
+  it('keeps sparse percentile values visible and tags each one partial', () => {
+    const chips = deriveChips(win({
+      latency_samples: 1,
+      p50_ms: 125,
+      p95_ms: 125,
+      p99_ms: 125,
+      p50_quality: 'partial',
+      p95_quality: 'partial',
+      p99_quality: 'partial',
+    }), null);
+    for (const key of ['p50_ms', 'p95_ms', 'p99_ms'] as const) {
+      const chip = chips.find((candidate) => candidate.key === key)!;
+      expect(chip.value).toBe('125');
+      expect(chip.quality).toBe('partial');
+      expect(chip.details).toContain('1 latency samples');
+    }
   });
 
   it('an unavailable (zero-sample) window has a FLAT delta and no err% threshold accent', () => {

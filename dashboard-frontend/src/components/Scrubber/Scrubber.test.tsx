@@ -3,27 +3,27 @@ import { act, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { Scrubber } from './Scrubber';
 import { dashboardStore, type LiveBaseline } from '../../store/dashboardStore';
 import { getConnection } from '../../api/connection';
-import type { MetricsResponse, MetricWindow } from '../../api/types';
+import type { MetricsResponse, InstantMetricSample } from '../../api/types';
 import { renderWithQuery, resetWorld } from '../testHarness';
 
-function win(over: Partial<MetricWindow> = {}): MetricWindow {
+function win(over: Partial<InstantMetricSample> = {}): InstantMetricSample {
   const latency_samples = over.latency_samples ?? 252;
   return {
-    window_seconds: 60, observed_seconds: 60, warm: true, accepted_requests: 252,
+    interval_duration_ms: 1000, ready: true, accepted_requests: 252,
     accepted_per_sec: 4.2, active_streams_now: 3, failure_pct: 1.1,
     terminal_requests: latency_samples, terminal_per_sec: 4.2, successes: latency_samples,
     failures: 0, cancellations: 0, cancellation_pct: 0,
     p50_ms: 180, p95_ms: 920, p99_ms: 1840, reported_tokens_per_sec: 142, cost_per_min: 0.21,
     quantile_method: 'log_histogram_nearest_rank', max_relative_error: 0.062,
-    latency_overflow_count: 0, latency_quality: 'measured', usage_anomaly_count: 0,
+    latency_overflow_count: 0, p50_quality: 'measured', p95_quality: 'measured', p99_quality: 'measured', usage_anomaly_count: 0,
     latency_samples, usage_samples: latency_samples, priced_samples: latency_samples, cost_confidence: 'estimated',
     ...over,
   };
 }
 function metrics(seq: number, reqs: number): MetricsResponse {
   return {
-    metrics_seq: seq, generated_at_ms: seq * 1000, headline_window: 'm1',
-    windows: { m1: win({ accepted_per_sec: reqs }), m5: win(), h1: win() },
+    metrics_seq: seq, generated_at_ms: Date.now() + seq * 1000,
+    instant: win({ accepted_per_sec: reqs }),
   };
 }
 

@@ -29,6 +29,8 @@ export interface SparklineProps {
    * $/min tick) leaves a break, NEVER a fabricated `0` and never a poisoned scale.
    */
   data: (number | null)[];
+  /** Epoch seconds matching `data`; preserves spacing across retained 5s and live 1s points. */
+  timestamps?: number[];
   width?: number;
   height?: number;
   /** Stroke color (hex). Defaults to the accent token. */
@@ -64,12 +66,12 @@ function sparkOpts(width: number, height: number, stroke: string, reducedMotion:
  * a gap (a `NaN` would poison the y-scale/path), so this boundary keeps the gap semantics honest
  * regardless of what the caller pushed.
  */
-function toAlignedData(data: (number | null)[]): uPlot.AlignedData {
+function toAlignedData(data: (number | null)[], timestamps?: number[]): uPlot.AlignedData {
   const n = data.length;
   const xs = new Array<number>(n);
   const ys = new Array<number | null>(n);
   for (let i = 0; i < n; i++) {
-    xs[i] = i;
+    xs[i] = timestamps?.[i] ?? i;
     const v = data[i];
     ys[i] = typeof v === 'number' && Number.isFinite(v) ? v : null;
   }
@@ -78,6 +80,7 @@ function toAlignedData(data: (number | null)[]): uPlot.AlignedData {
 
 export function Sparkline({
   data,
+  timestamps,
   width = DEFAULT_W,
   height = DEFAULT_H,
   stroke = colors.accent,
@@ -86,8 +89,8 @@ export function Sparkline({
   const ref = useRef<HTMLDivElement>(null);
   const plotRef = useRef<uPlot | null>(null);
   // Keep the latest data accessible to the (size/stroke-keyed) setup without re-running it.
-  const dataRef = useRef(data);
-  dataRef.current = data;
+  const dataRef = useRef({ data, timestamps });
+  dataRef.current = { data, timestamps };
   const reduced = prefersReducedMotion();
 
   // Recreate the uPlot ONLY when the chart shape changes (size/stroke/motion). Data updates
@@ -95,7 +98,7 @@ export function Sparkline({
   useImperativeViz(
     ref,
     (el): VizCleanup => {
-      const u = new uPlot(sparkOpts(width, height, stroke, reduced), toAlignedData(dataRef.current), el);
+      const u = new uPlot(sparkOpts(width, height, stroke, reduced), toAlignedData(dataRef.current.data, dataRef.current.timestamps), el);
       plotRef.current = u;
       sparklineCounters.creates += 1;
       return () => {
@@ -114,8 +117,8 @@ export function Sparkline({
   useEffect(() => {
     const u = plotRef.current;
     if (!u) return;
-    u.setData(toAlignedData(data));
-  }, [data]);
+    u.setData(toAlignedData(data, timestamps));
+  }, [data, timestamps]);
 
   return (
     <div

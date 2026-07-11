@@ -46,7 +46,7 @@ export function resetWorld(opts: { mock?: boolean } = {}): void {
       authenticated: true,
       csrf_token: 'test-csrf',
       mutations_enabled: true,
-      schema_version: 4,
+      schema_version: 5,
     };
   }
 }

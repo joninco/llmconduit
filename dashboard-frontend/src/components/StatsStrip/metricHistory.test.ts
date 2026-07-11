@@ -1,109 +1,56 @@
-import { describe, it, expect } from 'vitest';
-import type { MetricWindow, MetricsResponse } from '../../api/types';
-import {
-  appendTick,
-  emptyHistory,
-  HISTORY_DEPTH,
-  latest,
-  previous,
-  seriesFor,
-} from './metricHistory';
+import { describe, expect, it } from 'vitest';
+import type { HistoryPoint, InstantMetricSample, MetricsResponse } from '../../api/types';
+import { appendTick, emptyHistory, horizon, latest, mergeRetained, previous, seriesFor } from './metricHistory';
 
-function win(over: Partial<MetricWindow> = {}): MetricWindow {
-  // Fully-measured default: the three denominators mirror `latency_samples` unless overridden.
-  const latency_samples = over.latency_samples ?? 252;
+function instant(rate: number | null): InstantMetricSample {
   return {
-    window_seconds: 60, observed_seconds: 60, warm: true, accepted_requests: 252,
-    accepted_per_sec: 4.2, active_streams_now: 3, failure_pct: 1.1,
-    terminal_requests: latency_samples, terminal_per_sec: 4.2, successes: latency_samples,
-    failures: 0, cancellations: 0, cancellation_pct: 0,
-    p50_ms: 180, p95_ms: 920, p99_ms: 1840, reported_tokens_per_sec: 142, cost_per_min: 0.21,
+    interval_duration_ms: 1000, ready: true,
+    accepted_requests: rate ?? 0, accepted_per_sec: rate,
+    terminal_requests: 0, terminal_per_sec: 0,
+    successes: 0, failures: 0, failure_pct: null,
+    cancellations: 0, cancellation_pct: null, active_streams_now: 0,
+    latency_samples: 0, p50_ms: null, p95_ms: null, p99_ms: null,
+    p50_quality: 'unavailable', p95_quality: 'unavailable', p99_quality: 'unavailable',
     quantile_method: 'log_histogram_nearest_rank', max_relative_error: 0.062,
-    latency_overflow_count: 0, latency_quality: 'measured', usage_anomaly_count: 0,
-    latency_samples,
-    usage_samples: latency_samples,
-    priced_samples: latency_samples,
-    cost_confidence: 'estimated',
-    ...over,
+    latency_overflow_count: 0, usage_samples: 0, reported_tokens_per_sec: null,
+    usage_anomaly_count: 0, priced_samples: 0, cost_per_min: null,
+    cost_confidence: 'unavailable',
   };
 }
 
-function tick(over: { m1?: Partial<MetricWindow>; m5?: Partial<MetricWindow>; h1?: Partial<MetricWindow> } = {}) {
-  return { windows: { m1: win(over.m1), m5: win(over.m5), h1: win(over.h1) } } as Pick<MetricsResponse, 'windows'>;
+function tick(seq: number, t: number, rate: number): MetricsResponse {
+  return { metrics_seq: seq, generated_at_ms: t, instant: instant(rate) };
 }
 
-describe('metricHistory', () => {
-  it('emptyHistory starts with empty rings', () => {
-    const h = emptyHistory();
-    expect(h.m1).toEqual([]);
-    expect(seriesFor(h, 'm1', 'accepted_per_sec')).toEqual([]);
-    expect(latest(h, 'm1')).toBeNull();
-    expect(previous(h, 'm1')).toBeNull();
+describe('instant metric history', () => {
+  it('slices one point series by real timestamp horizons without changing current', () => {
+    let history = emptyHistory();
+    history = appendTick(history, tick(1, 0, 1));
+    history = appendTick(history, tick(2, 4 * 60_000, 2));
+    history = appendTick(history, tick(3, 5 * 60_000, 3));
+    expect(horizon(history, 'm1').map((point) => point.instant.accepted_per_sec)).toEqual([2, 3]);
+    expect(horizon(history, 'm5')).toHaveLength(3);
+    expect(latest(history)?.accepted_per_sec).toBe(3);
   });
 
-  it('appendTick folds one sample per window, newest last', () => {
-    let h = emptyHistory();
-    h = appendTick(h, tick({ m1: { accepted_per_sec: 1 } }));
-    h = appendTick(h, tick({ m1: { accepted_per_sec: 2 } }));
-    expect(seriesFor(h, 'm1', 'accepted_per_sec')).toEqual([1, 2]);
-    expect(latest(h, 'm1')?.accepted_per_sec).toBe(2);
-    expect(previous(h, 'm1')?.accepted_per_sec).toBe(1);
+  it('merges retained/live points, deduplicates identity, sorts, and prunes past one hour', () => {
+    const retained: HistoryPoint[] = [{
+      cut_id: 1, at_ms: 3_600_000, cursors: { flow_seq: 0, metrics_seq: 2, topology_seq: 0, monitor_seq: 0, backend_metrics_seq: 0 }, instant: instant(2),
+    }];
+    let live = appendTick(emptyHistory(), tick(2, 3_600_000, 99));
+    live = appendTick(live, tick(3, 7_200_001, 3));
+    const merged = mergeRetained(live, retained);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]?.instant.accepted_per_sec).toBe(3);
   });
 
-  it('extracts the per-metric series independently per window', () => {
-    let h = emptyHistory();
-    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 10 }, h1: { reported_tokens_per_sec: 99 } }));
-    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 20 }, h1: { reported_tokens_per_sec: 88 } }));
-    expect(seriesFor(h, 'm1', 'reported_tokens_per_sec')).toEqual([10, 20]);
-    expect(seriesFor(h, 'h1', 'reported_tokens_per_sec')).toEqual([99, 88]);
-  });
-
-  it('caps each ring at HISTORY_DEPTH (oldest evicted)', () => {
-    let h = emptyHistory();
-    for (let i = 0; i < HISTORY_DEPTH + 25; i++) h = appendTick(h, tick({ m1: { p95_ms: i } }));
-    const series = seriesFor(h, 'm1', 'p95_ms');
-    expect(series).toHaveLength(HISTORY_DEPTH);
-    // Last value is the most recent; first is exactly DEPTH back (oldest dropped).
-    expect(series[series.length - 1]).toBe(HISTORY_DEPTH + 24);
-    expect(series[0]).toBe(25);
-  });
-
-  it('append is immutable (returns a new history, does not mutate input)', () => {
-    const h0 = emptyHistory();
-    const h1 = appendTick(h0, tick());
-    expect(h0.m1).toHaveLength(0);
-    expect(h1.m1).toHaveLength(1);
-    expect(h1).not.toBe(h0);
-  });
-
-  // Gap 01 finding 2 — sparklines must NOT plot a raw 0 for an unmeasurable sample.
-  it('emits a NaN gap (not 0) for a sample-derived point that was unavailable in its sample', () => {
-    let h = emptyHistory();
-    // Sample A: usage reported → real tok/s (142). Sample B: NO usage (usage_samples 0)
-    // with a raw 0 tok/s on the wire. Sample C: usage again → real tok/s (50).
-    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 142, usage_samples: 5, priced_samples: 5 } }));
-    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 0, usage_samples: 0, priced_samples: 0 } }));
-    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 50, usage_samples: 5, priced_samples: 5 } }));
-    const series = seriesFor(h, 'm1', 'reported_tokens_per_sec');
-    expect(series).toHaveLength(3);
-    expect(series[0]).toBe(142);
-    expect(Number.isNaN(series[1])).toBe(true); // GAP, not a fabricated 0
-    expect(series[2]).toBe(50);
-  });
-
-  it('never gaps req/s — a genuine idle 0 is plotted (it is not sample-derived)', () => {
-    let h = emptyHistory();
-    // Even with zero latency_samples (nothing finalized), req/s is a real measured rate.
-    h = appendTick(h, tick({ m1: { accepted_per_sec: 0, latency_samples: 0, usage_samples: 0, priced_samples: 0 } }));
-    h = appendTick(h, tick({ m1: { accepted_per_sec: 2.5, latency_samples: 0, usage_samples: 0, priced_samples: 0 } }));
-    const series = seriesFor(h, 'm1', 'accepted_per_sec');
-    expect(series).toEqual([0, 2.5]); // both plotted, no NaN gap
-  });
-
-  it('gaps cost_per_min when pricing is missing but plots tok/s when usage is present', () => {
-    let h = emptyHistory();
-    h = appendTick(h, tick({ m1: { reported_tokens_per_sec: 142, cost_per_min: 0, latency_samples: 4, usage_samples: 4, priced_samples: 0 } }));
-    expect(Number.isNaN(seriesFor(h, 'm1', 'cost_per_min')[0])).toBe(true); // unpriced → gap
-    expect(seriesFor(h, 'm1', 'reported_tokens_per_sec')[0]).toBe(142); // usage present → plotted
+  it('uses the preceding historical point for seek deltas and emits gaps', () => {
+    let history = appendTick(emptyHistory(), tick(1, 1_000, 1));
+    history = appendTick(history, tick(2, 2_000, 2));
+    history = appendTick(history, { metrics_seq: 3, generated_at_ms: 3_000, instant: instant(null) });
+    expect(previous(history, 3_000)?.accepted_per_sec).toBe(2);
+    const series = seriesFor(history, 'accepted_per_sec');
+    expect(series.times).toEqual([1, 2, 3]);
+    expect(Number.isNaN(series.values[2])).toBe(true);
   });
 });

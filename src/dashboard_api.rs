@@ -33,8 +33,8 @@ use crate::dashboard_flow::FlowRecord;
 use crate::dashboard_flow::FlowStatus;
 use crate::dashboard_flow::FlowUsage;
 use crate::dashboard_flow::PhaseTimings;
+#[cfg(test)]
 use crate::dashboard_ws::MetricWindow;
-use crate::dashboard_ws::MetricWindows;
 use crate::dashboard_ws::MetricsSnapshot;
 use crate::dashboard_ws::ModelPrice;
 use crate::dashboard_ws::SeqCursors;
@@ -47,6 +47,7 @@ use crate::metrics::OverviewAggregate;
 use crate::metrics::OverviewDataQuality;
 use crate::metrics::OverviewFilter;
 use crate::metrics::SnapshotHistoryMetadata;
+#[cfg(test)]
 use crate::metrics::StatusClass;
 use crate::metrics::WindowReport;
 use crate::monitor::DebugSnapshot;
@@ -63,12 +64,6 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// Window lengths in SECONDS (the divisor for the per-window rate fields). Must
-/// match the MetricsLayer ring spans (1m/5m/1h at 1 s resolution).
-const WINDOW_1M_SECS: f64 = 60.0;
-const WINDOW_5M_SECS: f64 = 300.0;
-const WINDOW_1H_SECS: f64 = 3600.0;
 
 // ---------------------------------------------------------------------------
 // Flow row + detail DTOs (the cost-bearing projections of a FlowRecord)
@@ -546,7 +541,7 @@ pub struct HistoryPoint {
     pub cut_id: u64,
     pub at_ms: u128,
     pub cursors: SeqCursors,
-    pub metrics: MetricWindow,
+    pub instant: crate::metrics::InstantMetricSample,
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -686,6 +681,7 @@ fn finite(value: f64) -> f64 {
 
 /// Canonical token throughput is prompt + completion. Cached and reasoning are
 /// diagnostic subsets and must never be added a second time.
+#[cfg(test)]
 fn window_total_tokens(report: &WindowReport) -> i64 {
     report
         .buckets
@@ -717,6 +713,7 @@ fn price_lookup(prices: &HashMap<String, ModelPrice>, model: &str) -> Option<Mod
 /// `window_tile` ships raw counts + `0.0` cost). `active_streams` is the live open-
 /// flow count (passed in; the rings don't track liveness). An empty window reports
 /// all-zero rates (finite — the contract requires finite numbers).
+#[cfg(test)]
 fn rest_window_tile(
     report: &WindowReport,
     window_secs: f64,
@@ -800,19 +797,14 @@ fn rest_window_tile(
 /// nests all three windows under `windows`. Shared by the live `/metrics` read AND
 /// the `/snapshot` metrics reshape so both emit byte-identical shapes.
 pub fn metrics_body(
-    view: &MetricsView,
+    instant: &crate::metrics::InstantMetricSample,
+    generated_at_ms: u128,
     metrics_seq: u64,
-    active_streams: u64,
-    prices: &HashMap<String, ModelPrice>,
 ) -> MetricsSnapshot {
-    let m1 = rest_window_tile(&view.window_1m, WINDOW_1M_SECS, active_streams, prices);
-    let m5 = rest_window_tile(&view.window_5m, WINDOW_5M_SECS, active_streams, prices);
-    let h1 = rest_window_tile(&view.window_1h, WINDOW_1H_SECS, active_streams, prices);
     MetricsSnapshot {
         metrics_seq,
-        generated_at_ms: view.generated_at_ms,
-        headline_window: crate::dashboard_ws::MetricWindowName::M1,
-        windows: MetricWindows { m1, m5, h1 },
+        generated_at_ms,
+        instant: instant.clone(),
     }
 }
 
@@ -900,18 +892,6 @@ fn upstream_edge_rates(
         (usage_samples > 0).then_some(finite(tokens as f64 / denominator)),
         (priced_samples > 0).then_some(finite(cost / denominator)),
     )
-}
-
-/// Count the OPEN flows in a FROZEN snapshot cut's body-free summaries — the
-/// `active_streams` value for a historical `/snapshot?at=` (D13 R1 HIGH). Reading the
-/// live FlowStore for a time-travel cut would report NOW's open count, not the cut's;
-/// the summaries are the cut's own consistent flow projection, so counting their open
-/// status keeps the whole snapshot frozen to one instant.
-fn cut_active_stream_count(summaries: &[crate::dashboard_flow::SnapshotFlowSummary]) -> u64 {
-    summaries
-        .iter()
-        .filter(|summary| summary.status == FlowStatus::Open)
-        .count() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,29 +1321,29 @@ pub async fn dashboard_metrics(
                 &serde_json::json!({"error": {"code": "historical_cut_not_found", "cut_id": cut_id}}),
             );
         };
-        let active = cut_active_stream_count(&cut.snapshot.summaries);
         return json_no_store(
             StatusCode::OK,
             &metrics_body(
-                &cut.snapshot.metrics,
+                &cut.snapshot.instant,
+                cut.snapshot.taken_at_ms,
                 cut.snapshot.cursors.metrics_seq,
-                active,
-                gateway.price_table(),
             ),
         );
     }
     let body = if let Some(cut) = gateway.metrics().latest_published_metrics() {
-        metrics_body(
-            &cut.view,
-            cut.cursors.metrics_seq,
-            cut.active_streams,
-            gateway.price_table(),
-        )
+        metrics_body(&cut.instant, cut.taken_at_ms, cut.cursors.metrics_seq)
     } else {
         // A manually-constructed Gateway may omit the DI bootstrap publication. Return
         // the explicit zero-sample/unavailable shape; never independently recompute a
         // second presentation or allocate a cursor outside the process publisher.
-        metrics_body(&MetricsView::default(), 0, 0, gateway.price_table())
+        metrics_body(
+            &crate::metrics::InstantMetricSample::bootstrap(0),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            0,
+        )
     };
     json_no_store(StatusCode::OK, &body)
 }
@@ -1649,12 +1629,10 @@ pub async fn dashboard_snapshot(
     // `summaries` are the same body-free flow projections captured in the snapshot's
     // single critical section, so counting `status == Open` among them is consistent
     // with the rest of the frozen cut.
-    let active = cut_active_stream_count(summary_source);
     let metrics = Some(metrics_body(
-        &cut.metrics,
+        &cut.instant,
+        cut.taken_at_ms,
         cut.cursors.metrics_seq,
-        active,
-        prices,
     ));
     let topology = Some(topology_body(
         &cut.topology,
@@ -1700,11 +1678,32 @@ pub async fn dashboard_history(
     Query(query): Query<HistoryQuery>,
 ) -> Response {
     let metadata = gateway.dashboard_history().metadata().await;
-    let cuts = gateway
+    let durable_cuts = gateway
         .dashboard_history()
         .cuts_between(query.from, query.to)
         .await;
+    // Durable writes are asynchronous and may lag or drop under pressure. Merge them
+    // with the bounded in-memory five-second ring and deduplicate by the coordinated cut
+    // timestamp (also the durable cut id), preferring the durable row when both exist.
+    let mut merged =
+        std::collections::BTreeMap::<u128, crate::dashboard_history::HistoricalCut>::new();
+    for snapshot in gateway.metrics().snapshots_between(query.from, query.to) {
+        let Ok(cut_id) = u64::try_from(snapshot.taken_at_ms) else {
+            continue;
+        };
+        merged.insert(
+            snapshot.taken_at_ms,
+            crate::dashboard_history::HistoricalCut { cut_id, snapshot },
+        );
+    }
+    for cut in durable_cuts {
+        merged.insert(cut.snapshot.taken_at_ms, cut);
+    }
+    let cuts = merged.into_values().collect::<Vec<_>>();
     let limit = query.limit.unwrap_or(2_000).clamp(2, 10_000);
+    let retained_cuts = cuts.len();
+    let oldest_at_ms = cuts.first().map(|cut| cut.snapshot.taken_at_ms);
+    let newest_at_ms = cuts.last().map(|cut| cut.snapshot.taken_at_ms);
     let selected: Vec<_> = if cuts.len() <= limit {
         cuts
     } else {
@@ -1716,36 +1715,27 @@ pub async fn dashboard_history(
             })
             .collect()
     };
-    let points = selected
+    let points: Vec<HistoryPoint> = selected
         .into_iter()
-        .map(|cut| {
-            let active = cut_active_stream_count(&cut.snapshot.summaries);
-            let metrics = metrics_body(
-                &cut.snapshot.metrics,
-                cut.snapshot.cursors.metrics_seq,
-                active,
-                gateway.price_table(),
-            );
-            HistoryPoint {
-                cut_id: cut.cut_id,
-                at_ms: cut.snapshot.taken_at_ms,
-                cursors: SeqCursors {
-                    flow_seq: cut.snapshot.cursors.flow_seq,
-                    metrics_seq: cut.snapshot.cursors.metrics_seq,
-                    topology_seq: cut.snapshot.cursors.topology_seq,
-                    monitor_seq: cut.snapshot.cursors.monitor_seq,
-                    backend_metrics_seq: cut.snapshot.cursors.backend_metrics_seq,
-                },
-                metrics: metrics.windows.m1,
-            }
+        .map(|cut| HistoryPoint {
+            cut_id: cut.cut_id,
+            at_ms: cut.snapshot.taken_at_ms,
+            cursors: SeqCursors {
+                flow_seq: cut.snapshot.cursors.flow_seq,
+                metrics_seq: cut.snapshot.cursors.metrics_seq,
+                topology_seq: cut.snapshot.cursors.topology_seq,
+                monitor_seq: cut.snapshot.cursors.monitor_seq,
+                backend_metrics_seq: cut.snapshot.cursors.backend_metrics_seq,
+            },
+            instant: cut.snapshot.instant.clone(),
         })
         .collect();
     json_no_store(
         StatusCode::OK,
         &HistoryResponse {
-            oldest_at_ms: metadata.oldest_at_ms,
-            newest_at_ms: metadata.newest_at_ms,
-            retained_cuts: metadata.retained_cuts,
+            oldest_at_ms,
+            newest_at_ms,
+            retained_cuts,
             database_bytes: metadata.database_bytes,
             dropped_writes: metadata.dropped_writes,
             points,
@@ -2018,209 +2008,20 @@ mod tests {
         assert!(price_lookup(&prices, "other").is_none());
     }
 
-    /// Gap 01 (the honest strip): a window fed by a real TERMINAL flow reports a
-    /// non-zero `samples` count AND real `tokens_per_sec`/`cost_per_min` (priced) +
-    /// the passed-in live `active_streams` — NOT the hard-coded zeros the live WS
-    /// tile used to ship. This is the "a live-flow is counted in the strip" proof,
-    /// exercised through the SAME `metrics_body` builder the live tick now uses.
+    /// Schema-v5 round trip: the reset-on-publish sample is the only public metrics tile.
     #[test]
-    fn metrics_body_counts_a_terminal_flow_with_real_rates() {
-        use crate::dashboard_flow::FlowStatus as FS;
-        use crate::metrics::MetricsLayer;
-        let metrics = MetricsLayer::new();
-        // One completed flow on a priced model: 1000 prompt + 500 completion tokens.
-        metrics.record_terminal_inputs(
-            FS::Completed,
-            1200,
-            &crate::dashboard_flow::TerminalMetricsInputs {
-                model_served: Some("glm-5.1".into()),
-                endpoint: "/v1/responses".into(),
-                upstream: Some("vllm-a".into()),
-                usage: Some(usage(1000, 500, 0)),
-                cost_usd: Some(5.0),
-                cost_confidence: crate::dashboard_flow::TerminalCostConfidence::Confident,
-                ..Default::default()
-            },
-        );
-        let (view, seq) = metrics.view_with_seq();
-        let mut prices = HashMap::new();
-        prices.insert("glm-5.1".to_string(), price(2.0, 6.0, 0.5));
-        // Live open-flow count threaded in (3 streams currently in flight).
-        let body = metrics_body(&view, seq, 3, &prices);
-
-        // The terminal flow IS counted — the measured/unavailable signal is non-zero.
-        assert_eq!(
-            body.windows.m1.terminal_requests, 1,
-            "the finalized flow counts as one terminal sample"
-        );
-        // The flow reported usage on a PRICED model → both per-metric denominators are
-        // non-zero (gap 01 finding 3): tok/s and $/min are both measurable here.
-        assert_eq!(
-            body.windows.m1.usage_samples, 1,
-            "the usage-bearing flow is a usage sample"
-        );
-        assert_eq!(body.windows.m1.usage_samples, 1);
-        assert_eq!(body.windows.m1.priced_samples, 1);
-        // active_streams carries the live count (was hard-coded 0 on the WS tile).
-        assert_eq!(
-            body.windows.m1.active_streams_now, 3,
-            "live open-flow count is carried"
-        );
-        // During warm-up the observed denominator is one second, not a dishonest full minute.
-        assert!(
-            (body.windows.m1.reported_tokens_per_sec.unwrap() - 1500.0).abs() < 1e-9,
-            "warm tok/s uses observed coverage"
-        );
-        assert!(
-            (body.windows.m1.cost_per_min.unwrap() - 300.0).abs() < 1e-9,
-            "warm cost/min uses observed coverage"
-        );
-        assert_eq!(body.windows.m1.terminal_per_sec, 1.0);
-    }
-
-    /// Gap 01 (don't lie with zeros): an EMPTY window (no finalized flow) reports
-    /// `samples == 0` — the signal the frontend reads to render latency/tok-s/cost as
-    /// `unavailable` (`—`) — while `reqs_per_sec` stays a genuine measured `0` (legit
-    /// zero traffic). The two cases are thus distinguishable on the wire.
-    #[test]
-    fn metrics_body_empty_window_reports_zero_samples_not_a_fake_zero() {
-        use crate::metrics::MetricsView;
-        let body = metrics_body(&MetricsView::default(), 0, 0, &HashMap::new());
-        assert_eq!(
-            body.windows.m1.terminal_requests, 0,
-            "no finalized flow → zero samples (unavailable)"
-        );
-        assert_eq!(body.windows.m5.terminal_requests, 0);
-        assert_eq!(body.windows.h1.terminal_requests, 0);
-        // The per-metric denominators are zero too → tok/s + $/min are unavailable.
-        assert_eq!(body.windows.m1.usage_samples, 0);
-        assert_eq!(body.windows.m1.priced_samples, 0);
-        // req/s is a genuine measured zero (idle), distinguishable from the unavailable
-        // latency/tok-s/cost above precisely BECAUSE samples == 0.
-        assert_eq!(body.windows.m1.accepted_per_sec, 0.0);
-        assert_eq!(body.windows.m1.reported_tokens_per_sec, None);
-        assert_eq!(body.windows.m1.cost_per_min, None);
-    }
-
-    /// Gap 01 finding 3 (per-metric availability): a window can have measured LATENCY
-    /// (`samples > 0`) yet UNMEASURABLE tokens/cost. Two terminal flows finalize — one
-    /// with usage on a PRICED model, one with NO usage at all and one with usage on an
-    /// UNPRICED model — so `samples` (latency) and the two token/cost denominators
-    /// diverge. The frontend reads each denominator independently to decide `—` vs a
-    /// number, so this asserts they are emitted independently and correctly.
-    #[test]
-    fn metrics_body_per_metric_denominators_diverge() {
-        use crate::dashboard_flow::FlowStatus as FS;
-        use crate::metrics::MetricsLayer;
-        let metrics = MetricsLayer::new();
-        // (a) usage on a PRICED model → counts toward samples + usage + priced.
-        metrics.record_terminal_inputs(
-            FS::Completed,
-            900,
-            &crate::dashboard_flow::TerminalMetricsInputs {
-                model_served: Some("glm-5.1".into()),
-                endpoint: "/v1/responses".into(),
-                upstream: Some("vllm-a".into()),
-                usage: Some(usage(1000, 500, 0)),
-                cost_usd: Some(5.0),
-                cost_confidence: crate::dashboard_flow::TerminalCostConfidence::Confident,
-                ..Default::default()
-            },
-        );
-        // (b) NO usage (e.g. an upstream that omitted it) → samples only.
-        metrics.record_terminal(
-            FS::Completed,
-            Some("glm-5.1"),
-            "/v1/responses",
-            Some("vllm-a"),
-            900,
-            None,
-            &[],
-        );
-        // (c) usage on an UNPRICED model → samples + usage, but NOT priced.
-        metrics.record_terminal(
-            FS::Completed,
-            Some("free-model"),
-            "/v1/responses",
-            Some("vllm-a"),
-            900,
-            Some(usage(10, 5, 0)),
-            &[],
-        );
-        let (view, seq) = metrics.view_with_seq();
-        let mut prices = HashMap::new();
-        prices.insert("glm-5.1".to_string(), price(2.0, 6.0, 0.5));
-        let body = metrics_body(&view, seq, 0, &prices);
-
-        // Latency is measurable for all three finalized flows.
-        assert_eq!(
-            body.windows.m1.terminal_requests, 3,
-            "three finalized flows → latency measurable"
-        );
-        // Two of the three reported usage → tok/s measurable, but distinct from samples.
-        assert_eq!(
-            body.windows.m1.usage_samples, 2,
-            "two usage-bearing flows → tok/s measurable (≠ samples)"
-        );
-        // Only one of those two is on a priced model → cost measurable for exactly one.
-        assert_eq!(
-            body.windows.m1.priced_samples, 1,
-            "only the priced-model usage flow → $/min measurable (≠ usage_samples)"
-        );
-        // The headline mirrors the m1 window's per-metric denominators.
-        assert_eq!(body.windows.m1.terminal_requests, 3);
-    }
-
-    /// Round-trip (AGENTS.md: no new wire fields without a round-trip test): the new
-    /// `usage_samples`/`priced_samples` wire fields survive a serialize → JSON → re-parse
-    /// cycle at BOTH the headline and the per-window level, with the exact values the
-    /// `metrics_body` builder produced. This pins the byte contract the frozen frontend
-    /// validators (`isMetricWindow`/`isMetricsResponse`) decode.
-    #[test]
-    fn metrics_body_new_sample_fields_round_trip_through_json() {
-        use crate::dashboard_flow::FlowStatus as FS;
-        use crate::metrics::MetricsLayer;
-        let metrics = MetricsLayer::new();
-        metrics.record_terminal_inputs(
-            FS::Completed,
-            900,
-            &crate::dashboard_flow::TerminalMetricsInputs {
-                model_served: Some("glm-5.1".into()),
-                endpoint: "/v1/responses".into(),
-                upstream: Some("vllm-a".into()),
-                usage: Some(usage(1000, 500, 0)),
-                cost_usd: Some(5.0),
-                cost_confidence: crate::dashboard_flow::TerminalCostConfidence::Confident,
-                ..Default::default()
-            },
-        );
-        let (view, seq) = metrics.view_with_seq();
-        let mut prices = HashMap::new();
-        prices.insert("glm-5.1".to_string(), price(2.0, 6.0, 0.5));
-        let body = metrics_body(&view, seq, 2, &prices);
-
-        // Serialize → JSON bytes → re-parse: the fields must survive intact.
-        let json = serde_json::to_string(&body).expect("serialize metrics body");
-        let value: serde_json::Value = serde_json::from_str(&json).expect("re-parse");
-        assert!(
-            value.get("usage_samples").is_none(),
-            "v3 has no duplicated headline fields"
-        );
-        // Per-window (m1 fed the terminal; m5/h1 share the same epoch ⇒ same counts).
-        for window in ["m1", "m5", "h1"] {
-            assert_eq!(
-                value["windows"][window]["latency_samples"],
-                serde_json::json!(1)
-            );
-            assert_eq!(
-                value["windows"][window]["usage_samples"],
-                serde_json::json!(1)
-            );
-            assert_eq!(
-                value["windows"][window]["priced_samples"],
-                serde_json::json!(1)
-            );
-        }
+    fn metrics_body_instant_sample_round_trips() {
+        let instant = crate::metrics::InstantMetricSample {
+            ready: true,
+            interval_duration_ms: Some(1_250),
+            accepted_per_sec: Some(0.8),
+            active_streams_now: 2,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(metrics_body(&instant, 42_000, 7)).unwrap();
+        assert_eq!(value["generated_at_ms"], 42_000);
+        assert_eq!(value["instant"]["interval_duration_ms"], 1_250);
+        assert!(value.get("windows").is_none());
     }
 
     /// 1-based paging: page 2 with limit 2 over 5 rows yields rows 3..=4; a limit
@@ -2855,13 +2656,13 @@ mod tests {
             Some(5.0),
             crate::dashboard_flow::TerminalCostConfidence::Estimated,
         );
-        let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
+        let body = rest_window_tile(&metrics.view().window_1m, 60.0, 0, &prices);
         assert_eq!(
-            body.windows.m1.cost_confidence,
+            body.cost_confidence,
             CostConfidence::Estimated,
             "unreported cached on a no-cache-rate model ⇒ estimated aggregate (summed cached==0)"
         );
-        assert_eq!(body.windows.m1.cost_confidence, CostConfidence::Estimated);
+        assert_eq!(body.cost_confidence, CostConfidence::Estimated);
 
         // (b) one priced flow with a REPORTED cached=0 → confident aggregate.
         let metrics = MetricsLayer::new();
@@ -2878,9 +2679,9 @@ mod tests {
             Some(5.0),
             crate::dashboard_flow::TerminalCostConfidence::Confident,
         );
-        let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
+        let body = rest_window_tile(&metrics.view().window_1m, 60.0, 0, &prices);
         assert_eq!(
-            body.windows.m1.cost_confidence,
+            body.cost_confidence,
             CostConfidence::Confident,
             "a reported cached=0 keeps the aggregate confident"
         );
@@ -2896,8 +2697,8 @@ mod tests {
             Some(usage(10, 5, 0)),
             &[],
         );
-        let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
-        assert_eq!(body.windows.m1.cost_confidence, CostConfidence::Unavailable);
+        let body = rest_window_tile(&metrics.view().window_1m, 60.0, 0, &prices);
+        assert_eq!(body.cost_confidence, CostConfidence::Unavailable);
     }
 
     /// Gap 07 review round 1, finding 2 — a MIXED window (one CONFIDENT priced bucket
@@ -2943,22 +2744,22 @@ mod tests {
             Some(usage(800, 400, 0)),
             &[],
         );
-        let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
+        let body = rest_window_tile(&metrics.view().window_1m, 60.0, 0, &prices);
         assert_eq!(
-            body.windows.m1.cost_confidence,
+            body.cost_confidence,
             CostConfidence::Estimated,
             "a priced-confident bucket + an unpriced USAGE-BEARING bucket ⇒ estimated \
              (the unpriced spend is omitted from cost_per_min — a partial total)"
         );
-        assert_eq!(body.windows.m1.cost_confidence, CostConfidence::Estimated);
+        assert_eq!(body.cost_confidence, CostConfidence::Estimated);
         // The priced bucket makes the total a real number (NOT unavailable): a priced
         // sample exists, so $/min renders.
         assert_eq!(
-            body.windows.m1.priced_samples, 1,
+            body.priced_samples, 1,
             "exactly the priced bucket is countable"
         );
         assert!(
-            body.windows.m1.cost_per_min.is_some_and(|cost| cost > 0.0),
+            body.cost_per_min.is_some_and(|cost| cost > 0.0),
             "cost_per_min is a real (if partial) number, so estimated — not unavailable"
         );
 
@@ -2990,9 +2791,9 @@ mod tests {
             None,
             &[],
         );
-        let body = metrics_body(&metrics.view_with_seq().0, 0, 0, &prices);
+        let body = rest_window_tile(&metrics.view().window_1m, 60.0, 0, &prices);
         assert_eq!(
-            body.windows.m1.cost_confidence,
+            body.cost_confidence,
             CostConfidence::Confident,
             "a usage-LESS unpriced bucket adds no missing cost ⇒ the window stays confident"
         );

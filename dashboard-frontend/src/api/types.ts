@@ -493,29 +493,30 @@ export interface UsagePayload {
   reasoning?: number | null;
 }
 
-/** Sliding-window metric tiles (mirrors `/dashboard/api/metrics`, sans cursor). */
-export interface MetricWindow {
-  window_seconds: number;
-  observed_seconds: number;
-  warm: boolean;
+/** One reset-on-publish metrics interval (normally about one second). */
+export interface InstantMetricSample {
+  interval_duration_ms: number | null;
+  ready: boolean;
   accepted_requests: number;
-  accepted_per_sec: number;
+  accepted_per_sec: number | null;
   terminal_requests: number;
-  terminal_per_sec: number;
+  terminal_per_sec: number | null;
   successes: number;
   failures: number;
-  failure_pct: number;
+  failure_pct: number | null;
   cancellations: number;
-  cancellation_pct: number;
+  cancellation_pct: number | null;
   active_streams_now: number;
   latency_samples: number;
   p50_ms: number | null;
   p95_ms: number | null;
   p99_ms: number | null;
+  p50_quality: 'measured' | 'partial' | 'unavailable';
+  p95_quality: 'measured' | 'partial' | 'unavailable';
+  p99_quality: 'measured' | 'partial' | 'unavailable';
   quantile_method: 'log_histogram_nearest_rank';
   max_relative_error: number;
   latency_overflow_count: number;
-  latency_quality: 'measured' | 'partial' | 'unavailable';
   usage_samples: number;
   reported_tokens_per_sec: number | null;
   usage_anomaly_count?: number;
@@ -527,12 +528,7 @@ export interface MetricWindow {
 export interface MetricTickPayload {
   type: 'metric_tick';
   generated_at_ms: number;
-  headline_window: 'm1';
-  windows: {
-    m1: MetricWindow;
-    m5: MetricWindow;
-    h1: MetricWindow;
-  };
+  instant: InstantMetricSample;
 }
 
 /**
@@ -877,12 +873,7 @@ export interface FlowUpstreamResponse {
 export interface MetricsResponse {
   metrics_seq: number;
   generated_at_ms: number;
-  headline_window: 'm1';
-  windows: {
-    m1: MetricWindow;
-    m5: MetricWindow;
-    h1: MetricWindow;
-  };
+  instant: InstantMetricSample;
 }
 
 export interface TopologyEdge {
@@ -955,7 +946,7 @@ export interface HistoryPoint {
   cut_id: number;
   at_ms: number;
   cursors: SeqCursors;
-  metrics: MetricWindow;
+  instant: InstantMetricSample;
 }
 
 export interface HistoryResponse {
@@ -1119,22 +1110,22 @@ function isOptUsage(v: unknown): boolean {
   return v === undefined || isUsageOrNull(v);
 }
 
-function isMetricWindow(v: unknown): v is MetricWindow {
+function isInstantMetricSample(v: unknown): v is InstantMetricSample {
   return (
-    isObj(v) && isUint(v.window_seconds) && isUint(v.observed_seconds) && typeof v.warm === 'boolean' &&
-    isUint(v.accepted_requests) && isNum(v.accepted_per_sec) &&
-    isUint(v.terminal_requests) && isNum(v.terminal_per_sec) &&
-    isUint(v.successes) && isUint(v.failures) && isNum(v.failure_pct) &&
-    isUint(v.cancellations) && isNum(v.cancellation_pct) && isUint(v.active_streams_now) &&
+    isObj(v) && isOptUint(v.interval_duration_ms) && typeof v.ready === 'boolean' &&
+    isUint(v.accepted_requests) && isNullableNum(v.accepted_per_sec) &&
+    isUint(v.terminal_requests) && isNullableNum(v.terminal_per_sec) &&
+    isUint(v.successes) && isUint(v.failures) && isNullableNum(v.failure_pct) &&
+    isUint(v.cancellations) && isNullableNum(v.cancellation_pct) && isUint(v.active_streams_now) &&
     isUint(v.latency_samples) && isNullableNum(v.p50_ms) && isNullableNum(v.p95_ms) && isNullableNum(v.p99_ms) &&
+    isOneOf(v.p50_quality, ['measured', 'partial', 'unavailable'] as const) &&
+    isOneOf(v.p95_quality, ['measured', 'partial', 'unavailable'] as const) &&
+    isOneOf(v.p99_quality, ['measured', 'partial', 'unavailable'] as const) &&
     v.quantile_method === 'log_histogram_nearest_rank' && isNum(v.max_relative_error) &&
-    isUint(v.latency_overflow_count) && isOneOf(v.latency_quality, ['measured', 'partial', 'unavailable'] as const) &&
+    isUint(v.latency_overflow_count) &&
     isUint(v.usage_samples) && isNullableNum(v.reported_tokens_per_sec) && isUint(v.usage_anomaly_count) &&
     isUint(v.priced_samples) && isNullableNum(v.cost_per_min) && isCostConfidence(v.cost_confidence)
   );
-}
-function isMetricWindows(v: unknown): boolean {
-  return isObj(v) && isMetricWindow(v.m1) && isMetricWindow(v.m5) && isMetricWindow(v.h1);
 }
 
 /**
@@ -1320,7 +1311,7 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
       );
     case 'metric_tick':
       return (
-        isUint(v.generated_at_ms) && v.headline_window === 'm1' && isMetricWindows(v.windows)
+        isUint(v.generated_at_ms) && isInstantMetricSample(v.instant)
       );
     case 'flow_status':
       return (
@@ -1388,7 +1379,7 @@ function isOptClientSource(v: unknown): boolean {
 export function isMetricsResponse(v: unknown): v is MetricsResponse {
   return (
     isObj(v) && isUint(v.metrics_seq) &&
-    isUint(v.generated_at_ms) && v.headline_window === 'm1' && isMetricWindows(v.windows)
+    isUint(v.generated_at_ms) && isInstantMetricSample(v.instant)
   );
 }
 

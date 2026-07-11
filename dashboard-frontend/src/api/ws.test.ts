@@ -35,7 +35,7 @@ function flowPayload(over: Partial<FlowStatusPayload> = {}): FlowStatusPayload {
 function snapshot(): SnapshotFrame {
   return {
     type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
     cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
     flows: [],
     metrics: null,
@@ -45,19 +45,18 @@ function snapshot(): SnapshotFrame {
 
 /** A fully-valid MetricsResponse (passes `isMetricsResponse`) for staged-snapshot tests. */
 const METRIC_WINDOW = {
-  window_seconds: 60, observed_seconds: 60, warm: true,
+  interval_duration_ms: 1000, ready: true,
   accepted_requests: 7,
   accepted_per_sec: 4.2, active_streams_now: 1, failure_pct: 0,
   terminal_requests: 7, terminal_per_sec: 4.0, successes: 7, failures: 0,
   cancellations: 0, cancellation_pct: 0,
   p50_ms: 1, p95_ms: 2, p99_ms: 3, reported_tokens_per_sec: 10, cost_per_min: 0.5,
   quantile_method: 'log_histogram_nearest_rank' as const, max_relative_error: 0.062,
-  latency_overflow_count: 0, latency_quality: 'measured' as const, usage_anomaly_count: 0,
+  latency_overflow_count: 0, p50_quality: 'measured' as const, p95_quality: 'partial' as const, p99_quality: 'partial' as const, usage_anomaly_count: 0,
   latency_samples: 7, usage_samples: 7, priced_samples: 7, cost_confidence: 'estimated' as const,
 };
 const METRICS_SNAP = {
-  metrics_seq: 5, generated_at_ms: 5000, headline_window: 'm1' as const,
-  windows: { m1: METRIC_WINDOW, m5: METRIC_WINDOW, h1: METRIC_WINDOW },
+  metrics_seq: 5, generated_at_ms: 5000, instant: METRIC_WINDOW,
 };
 
 /** A controllable fake socket so tests can drive open/message/close/error. */
@@ -171,7 +170,7 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     expect(flow?.status).toBe('completed');
     expect(flow?.api_call_id).toBe('api_001');
     expect(flow?.response_id).toBe('resp_001');
-    expect(st.metrics?.windows.m1.accepted_per_sec).toBe(4.2);
+    expect(st.metrics?.instant.accepted_per_sec).toBe(4.2);
     expect(st.topologyNodes).toHaveLength(1);
     expect(st.topologyNodes[0]?.status).toBe('healthy');
     expect(st.topologyEdges).toHaveLength(1);
@@ -323,7 +322,7 @@ describe('DashboardSocket — malformed frames do NOT mutate cursor or store (fi
   it('surfaces a malformed root snapshot as a fatal contract error', () => {
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 1 },
       flows: [],
       metrics: null,
@@ -411,7 +410,7 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
   it('accepts a fully-valid snapshot', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [{ revision: 1, api_call_id: 'a', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1, usage: null, normalized_usage: null, usage_anomaly_count: 0, cost: null, cost_confidence: 'unavailable' }],
       metrics: null, topology: null,
@@ -421,7 +420,7 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
   it('rejects a snapshot whose cursors are not all unsigned ints', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: -1, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     })).toBe(false);
@@ -430,7 +429,7 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
   it('rejects a snapshot with an invalid summary (bad status)', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [{ revision: 1, api_call_id: 'a', method: 'POST', uri: '/x', status: 'bogus', started_ms: 1 }],
       metrics: null, topology: null,
@@ -445,7 +444,7 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
     const badMetrics = { metrics_seq: 1, accepted_per_sec: 1, active_streams_now: 1, failure_pct: 0, p50_ms: 1, p95_ms: 1, p99_ms: 1, reported_tokens_per_sec: 1, cost_per_min: 0, latency_samples: 1, usage_samples: 1, priced_samples: 1, windows: { m1: badWindow, m5: badWindow, h1: badWindow } };
     expect(isSnapshotFrame({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 0, metrics_seq: 1, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: badMetrics, topology: null,
     })).toBe(false);
@@ -463,7 +462,7 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
   it('accepts a metric_tick frame carrying the new denominators (regression guard)', () => {
     expect(isDashboardFrame({
       domain: 'metrics', seq: 1,
-      batch: [{ type: 'metric_tick', generated_at_ms: 1000, headline_window: 'm1', windows: { m1: METRIC_WINDOW, m5: METRIC_WINDOW, h1: METRIC_WINDOW } }],
+      batch: [{ type: 'metric_tick', generated_at_ms: 1000, instant: METRIC_WINDOW }],
     })).toBe(true);
   });
 
@@ -498,14 +497,14 @@ describe('gap 07 — usage confidence wire validation', () => {
     const base = { revision: 1, api_call_id: 'a', method: 'POST', uri: '/v1/responses', status: 'completed', started_ms: 1, usage: null, normalized_usage: null, usage_anomaly_count: 0, cost: null };
     expect(isSnapshotFrame({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [base], // cost_confidence absent → rejected
       metrics: null, topology: null,
     })).toBe(false);
     expect(isSnapshotFrame({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [{ ...base, cost_confidence: 'bogus' }], // invalid enum → rejected
       metrics: null, topology: null,
@@ -513,7 +512,7 @@ describe('gap 07 — usage confidence wire validation', () => {
     // A valid tag is accepted.
     expect(isSnapshotFrame({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [{ ...base, cost_confidence: 'estimated' }],
       metrics: null, topology: null,
@@ -552,7 +551,7 @@ describe('ProviderHealth + price_table validation (findings 2 + 4)', () => {
   it('accepts a topology snapshot whose price_table entries are complete ModelPrice', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [],
       metrics: null,
@@ -564,7 +563,7 @@ describe('ProviderHealth + price_table validation (findings 2 + 4)', () => {
   it('rejects a price_table entry MISSING cached_price_configured (gap 07 presence flag)', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [],
       metrics: null,
@@ -576,7 +575,7 @@ describe('ProviderHealth + price_table validation (findings 2 + 4)', () => {
   it('rejects a price_table entry with a non-finite number (finding 4)', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [],
       metrics: null,
@@ -587,7 +586,7 @@ describe('ProviderHealth + price_table validation (findings 2 + 4)', () => {
   it('rejects a price_table entry missing a field (finding 4)', () => {
     expect(isSnapshotFrame({
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [],
       metrics: null,
@@ -1010,7 +1009,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // the frozen cut. It carries the authoritative live rows (`api_snap`) + cursors + metrics.
     const reconnectSnap: SnapshotFrame = {
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 5, metrics_seq: 5, topology_seq: 5, monitor_seq: 5 , backend_metrics_seq: 0},
       flows: [{ revision: 1, api_call_id: 'api_snap', method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 3000, usage: null, normalized_usage: null, usage_anomaly_count: 0, cost: null, cost_confidence: 'unavailable' }],
       metrics: METRICS_SNAP,
@@ -1057,7 +1056,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     expect(st.flows.has('api_snap')).toBe(true);    // staged snapshot row
     expect(st.flows.has('api_buffered')).toBe(true); // replayed buffered frame on top
     expect(st.flows.has('api_frozen')).toBe(false);  // frozen cut discarded
-    expect(st.metrics?.windows.m1.accepted_per_sec).toBe(4.2); // staged snapshot metrics installed
+    expect(st.metrics?.instant.accepted_per_sec).toBe(4.2); // staged snapshot metrics installed
     expect(st.cursors.flow_seq).toBe(6);             // snapshot cursor 5 → replayed frame 6
     expect(socket.getCursors().flow).toBe(6);
     expect(st.seekAtMs).toBeNull();
@@ -1079,7 +1078,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // A reconnect delivers a FRESH snapshot (different cut: empty flows, new cursors).
     const reconnectSnap: SnapshotFrame = {
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 99, metrics_seq: 99, topology_seq: 99, monitor_seq: 99 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     };
@@ -1149,7 +1148,7 @@ describe('DashboardSocket — time travel (seek/live shadow buffer)', () => {
     // The reconnected socket's snapshot is STAGED (not applied over the frozen cut).
     const reconnectSnap: SnapshotFrame = {
       type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
       cursors: { flow_seq: 7, metrics_seq: 7, topology_seq: 7, monitor_seq: 7 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     };

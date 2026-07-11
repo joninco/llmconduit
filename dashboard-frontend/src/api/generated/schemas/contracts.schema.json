@@ -2384,15 +2384,15 @@
           "format": "uint64",
           "minimum": 0
         },
-        "metrics": {
-          "$ref": "#/$defs/MetricWindow"
+        "instant": {
+          "$ref": "#/$defs/InstantMetricSample"
         }
       },
       "required": [
         "cut_id",
         "at_ms",
         "cursors",
-        "metrics"
+        "instant"
       ]
     },
     "HistoryResponse": {
@@ -2445,6 +2445,199 @@
         "points"
       ]
     },
+    "InstantMetricQuality": {
+      "description": "Data quality for one instantaneous metric value. Percentiles are still emitted for\nsparse intervals; `Partial` tells consumers that the nearest-rank estimate has fewer\nthan the recommended number of observations.",
+      "type": "string",
+      "enum": [
+        "measured",
+        "partial",
+        "unavailable"
+      ]
+    },
+    "InstantMetricSample": {
+      "description": "One reset-on-publish dashboard telemetry interval. Unlike [`WindowReport`], this\nvalue contains only events observed since the previous publisher cut. Rates are\nnormalized by `interval_duration_ms`, so a delayed tick remains truthful.",
+      "type": "object",
+      "properties": {
+        "accepted_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "accepted_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "active_streams_now": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cancellation_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "cancellations": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cost_confidence": {
+          "$ref": "#/$defs/TerminalCostConfidence"
+        },
+        "cost_per_min": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "failure_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "failures": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "interval_duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "latency_overflow_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "latency_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_relative_error": {
+          "type": "number",
+          "format": "double"
+        },
+        "p50_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p50_quality": {
+          "$ref": "#/$defs/InstantMetricQuality"
+        },
+        "p95_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p95_quality": {
+          "$ref": "#/$defs/InstantMetricQuality"
+        },
+        "p99_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p99_quality": {
+          "$ref": "#/$defs/InstantMetricQuality"
+        },
+        "priced_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "quantile_method": {
+          "$ref": "#/$defs/QuantileMethod"
+        },
+        "ready": {
+          "type": "boolean"
+        },
+        "reported_tokens_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "successes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "terminal_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "terminal_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "usage_anomaly_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "usage_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "interval_duration_ms",
+        "ready",
+        "accepted_requests",
+        "accepted_per_sec",
+        "terminal_requests",
+        "terminal_per_sec",
+        "successes",
+        "failures",
+        "failure_pct",
+        "cancellations",
+        "cancellation_pct",
+        "active_streams_now",
+        "latency_samples",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "p50_quality",
+        "p95_quality",
+        "p99_quality",
+        "quantile_method",
+        "max_relative_error",
+        "latency_overflow_count",
+        "usage_samples",
+        "reported_tokens_per_sec",
+        "usage_anomaly_count",
+        "priced_samples",
+        "cost_per_min",
+        "cost_confidence"
+      ]
+    },
     "KillResponse": {
       "description": "Successful `POST /dashboard/api/flows/:id/kill` response.",
       "type": "object",
@@ -2472,14 +2665,6 @@
         "token"
       ]
     },
-    "MetricQuality": {
-      "type": "string",
-      "enum": [
-        "measured",
-        "partial",
-        "unavailable"
-      ]
-    },
     "MetricTick": {
       "description": "The flat metric-tile shape carried by a `metric_tick` payload — mirrors the\n`/dashboard/api/metrics` REST body (sans cursor). The top level repeats the\n`m1` window's fields (the dashboard's headline tile) and nests all three\nwindows under `windows`.",
       "type": "object",
@@ -2489,210 +2674,13 @@
           "format": "uint128",
           "minimum": 0
         },
-        "headline_window": {
-          "$ref": "#/$defs/MetricWindowName"
-        },
-        "windows": {
-          "$ref": "#/$defs/MetricWindows"
+        "instant": {
+          "$ref": "#/$defs/InstantMetricSample"
         }
       },
       "required": [
         "generated_at_ms",
-        "headline_window",
-        "windows"
-      ]
-    },
-    "MetricWindow": {
-      "description": "One sliding-window metric tile. Same fields as the headline tile.\n\n`samples` is the count of TERMINAL (finalized) flows that fell in the window —\nthe data-quality signal the frontend uses to tell a genuine measured `0` from an\n`unavailable` gap (gap 01 / \"don't lie with zeros\"). When `samples == 0` the\nlatency/tok-s/cost/error-% fields are NOT measurable (no finalized flow fed them),\nso the strip renders them `—`; `reqs_per_sec` (a genuine `0` for an idle window)\nand `active_streams` (live open-flow count) stay numeric. The field is a finite\n`u64`, so it never violates the frozen finite-number wire contract.",
-      "type": "object",
-      "properties": {
-        "accepted_per_sec": {
-          "type": "number",
-          "format": "double"
-        },
-        "accepted_requests": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "active_streams_now": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "cancellation_pct": {
-          "type": "number",
-          "format": "double"
-        },
-        "cancellations": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "cost_confidence": {
-          "$ref": "#/$defs/CostConfidence"
-        },
-        "cost_per_min": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "failure_pct": {
-          "type": "number",
-          "format": "double"
-        },
-        "failures": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "latency_overflow_count": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "latency_quality": {
-          "$ref": "#/$defs/MetricQuality"
-        },
-        "latency_samples": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "max_relative_error": {
-          "type": "number",
-          "format": "double"
-        },
-        "observed_seconds": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "p50_ms": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "p95_ms": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "p99_ms": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "priced_samples": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "quantile_method": {
-          "$ref": "#/$defs/QuantileMethod"
-        },
-        "reported_tokens_per_sec": {
-          "type": [
-            "number",
-            "null"
-          ],
-          "format": "double"
-        },
-        "successes": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "terminal_per_sec": {
-          "type": "number",
-          "format": "double"
-        },
-        "terminal_requests": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "usage_anomaly_count": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "usage_samples": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "warm": {
-          "type": "boolean"
-        },
-        "window_seconds": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        }
-      },
-      "required": [
-        "window_seconds",
-        "observed_seconds",
-        "warm",
-        "accepted_requests",
-        "accepted_per_sec",
-        "terminal_requests",
-        "terminal_per_sec",
-        "successes",
-        "failures",
-        "failure_pct",
-        "cancellations",
-        "cancellation_pct",
-        "active_streams_now",
-        "latency_samples",
-        "p50_ms",
-        "p95_ms",
-        "p99_ms",
-        "quantile_method",
-        "max_relative_error",
-        "latency_overflow_count",
-        "latency_quality",
-        "usage_samples",
-        "reported_tokens_per_sec",
-        "usage_anomaly_count",
-        "priced_samples",
-        "cost_per_min",
-        "cost_confidence"
-      ]
-    },
-    "MetricWindowName": {
-      "type": "string",
-      "enum": [
-        "m1"
-      ]
-    },
-    "MetricWindows": {
-      "description": "The three sliding windows (`m1`/`m5`/`h1`) of a [`MetricTick`].",
-      "type": "object",
-      "properties": {
-        "h1": {
-          "$ref": "#/$defs/MetricWindow"
-        },
-        "m1": {
-          "$ref": "#/$defs/MetricWindow"
-        },
-        "m5": {
-          "$ref": "#/$defs/MetricWindow"
-        }
-      },
-      "required": [
-        "m1",
-        "m5",
-        "h1"
+        "instant"
       ]
     },
     "MetricsSnapshot": {
@@ -2704,23 +2692,19 @@
           "format": "uint128",
           "minimum": 0
         },
-        "headline_window": {
-          "$ref": "#/$defs/MetricWindowName"
+        "instant": {
+          "$ref": "#/$defs/InstantMetricSample"
         },
         "metrics_seq": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0
-        },
-        "windows": {
-          "$ref": "#/$defs/MetricWindows"
         }
       },
       "required": [
         "metrics_seq",
         "generated_at_ms",
-        "headline_window",
-        "windows"
+        "instant"
       ]
     },
     "ModelPrice": {

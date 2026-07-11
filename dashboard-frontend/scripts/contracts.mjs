@@ -71,7 +71,7 @@ async function generate(output) {
     { file: 'ws-frame', exported: 'validateWsFrame', type: 'DashboardFrame', definition: 'DashboardFrame', group: 'initial' },
     { file: 'ws-snapshot', exported: 'validateWsSnapshot', type: 'SnapshotMessage', definition: 'SnapshotMessage', group: 'initial' },
   ];
-  const commonId = 'urn:llmconduit:dashboard:contracts:v4';
+  const commonId = 'urn:llmconduit:dashboard:contracts:v5';
   declarationsSchema.$id = commonId;
   for (const group of ['initial', 'rest']) {
     const selected = roots.filter((root) => root.group === group);
@@ -85,7 +85,7 @@ async function generate(output) {
     ajv.addSchema(declarationsSchema, commonId);
     const exports = {};
     for (const root of selected) {
-      const id = `urn:llmconduit:dashboard:${root.file}:v4`;
+      const id = `urn:llmconduit:dashboard:${root.file}:v5`;
       const target = root.definition
         ? { $ref: `${commonId}#/$defs/${root.definition}` }
         : { type: 'array', items: { $ref: `${commonId}#/$defs/CatalogEntry` } };

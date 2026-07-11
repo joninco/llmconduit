@@ -9,46 +9,23 @@
       "format": "uint128",
       "minimum": 0
     },
-    "headline_window": {
-      "$ref": "#/$defs/MetricWindowName"
+    "instant": {
+      "$ref": "#/$defs/InstantMetricSample"
     },
     "metrics_seq": {
       "type": "integer",
       "format": "uint64",
       "minimum": 0
-    },
-    "windows": {
-      "$ref": "#/$defs/MetricWindows"
     }
   },
   "required": [
     "metrics_seq",
     "generated_at_ms",
-    "headline_window",
-    "windows"
+    "instant"
   ],
   "$defs": {
-    "CostConfidence": {
-      "description": "Gap 07 — the CONFIDENCE tier of a flow's `cost`, so an operator can tell a trusted\nfigure from a best-effort estimate from an honest gap. Emitted alongside `cost` on\nevery flow row + detail (and aggregated onto the metrics windows). Serializes\nsnake_case to mirror the data-quality vocabulary the frontend already uses\n(`measured`/`derived`/`estimated`/`unavailable`).",
-      "oneOf": [
-        {
-          "description": "The model is priced AND every billed token class has a known rate: the prompt\n(input) + completion (output) rates always exist when priced, and cached tokens\neither were reported as `0` (nothing billed at the cache rate) OR the model has\na CONFIGURED cached rate. The dollar figure is trustworthy.",
-          "type": "string",
-          "const": "confident"
-        },
-        {
-          "description": "The model is priced but a billed class would fall back to an APPROXIMATE rate:\ncached tokens were reported `> 0` (or are UNAVAILABLE) while the model has NO\nconfigured cached rate, so those tokens silently bill at the default `0.0`\n(an undercount). The figure is a best-effort ESTIMATE — surfaced as such.",
-          "type": "string",
-          "const": "estimated"
-        },
-        {
-          "description": "No price is configured for the served model: there is NO cost (the row reports\n`cost: null`), so the figure is UNAVAILABLE — never a fabricated `0`. The\nDEFAULT: a window/flow with nothing priced makes no confident claim.",
-          "type": "string",
-          "const": "unavailable"
-        }
-      ]
-    },
-    "MetricQuality": {
+    "InstantMetricQuality": {
+      "description": "Data quality for one instantaneous metric value. Percentiles are still emitted for\nsparse intervals; `Partial` tells consumers that the nearest-rank estimate has fewer\nthan the recommended number of observations.",
       "type": "string",
       "enum": [
         "measured",
@@ -56,12 +33,15 @@
         "unavailable"
       ]
     },
-    "MetricWindow": {
-      "description": "One sliding-window metric tile. Same fields as the headline tile.\n\n`samples` is the count of TERMINAL (finalized) flows that fell in the window —\nthe data-quality signal the frontend uses to tell a genuine measured `0` from an\n`unavailable` gap (gap 01 / \"don't lie with zeros\"). When `samples == 0` the\nlatency/tok-s/cost/error-% fields are NOT measurable (no finalized flow fed them),\nso the strip renders them `—`; `reqs_per_sec` (a genuine `0` for an idle window)\nand `active_streams` (live open-flow count) stay numeric. The field is a finite\n`u64`, so it never violates the frozen finite-number wire contract.",
+    "InstantMetricSample": {
+      "description": "One reset-on-publish dashboard telemetry interval. Unlike [`WindowReport`], this\nvalue contains only events observed since the previous publisher cut. Rates are\nnormalized by `interval_duration_ms`, so a delayed tick remains truthful.",
       "type": "object",
       "properties": {
         "accepted_per_sec": {
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "accepted_requests": {
@@ -75,7 +55,10 @@
           "minimum": 0
         },
         "cancellation_pct": {
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "cancellations": {
@@ -84,7 +67,7 @@
           "minimum": 0
         },
         "cost_confidence": {
-          "$ref": "#/$defs/CostConfidence"
+          "$ref": "#/$defs/TerminalCostConfidence"
         },
         "cost_per_min": {
           "type": [
@@ -94,7 +77,10 @@
           "format": "double"
         },
         "failure_pct": {
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "failures": {
@@ -102,13 +88,18 @@
           "format": "uint64",
           "minimum": 0
         },
+        "interval_duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "latency_overflow_count": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0
-        },
-        "latency_quality": {
-          "$ref": "#/$defs/MetricQuality"
         },
         "latency_samples": {
           "type": "integer",
@@ -119,17 +110,15 @@
           "type": "number",
           "format": "double"
         },
-        "observed_seconds": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
         "p50_ms": {
           "type": [
             "number",
             "null"
           ],
           "format": "double"
+        },
+        "p50_quality": {
+          "$ref": "#/$defs/InstantMetricQuality"
         },
         "p95_ms": {
           "type": [
@@ -138,12 +127,18 @@
           ],
           "format": "double"
         },
+        "p95_quality": {
+          "$ref": "#/$defs/InstantMetricQuality"
+        },
         "p99_ms": {
           "type": [
             "number",
             "null"
           ],
           "format": "double"
+        },
+        "p99_quality": {
+          "$ref": "#/$defs/InstantMetricQuality"
         },
         "priced_samples": {
           "type": "integer",
@@ -152,6 +147,9 @@
         },
         "quantile_method": {
           "$ref": "#/$defs/QuantileMethod"
+        },
+        "ready": {
+          "type": "boolean"
         },
         "reported_tokens_per_sec": {
           "type": [
@@ -166,7 +164,10 @@
           "minimum": 0
         },
         "terminal_per_sec": {
-          "type": "number",
+          "type": [
+            "number",
+            "null"
+          ],
           "format": "double"
         },
         "terminal_requests": {
@@ -183,20 +184,11 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
-        },
-        "warm": {
-          "type": "boolean"
-        },
-        "window_seconds": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
         }
       },
       "required": [
-        "window_seconds",
-        "observed_seconds",
-        "warm",
+        "interval_duration_ms",
+        "ready",
         "accepted_requests",
         "accepted_per_sec",
         "terminal_requests",
@@ -211,10 +203,12 @@
         "p50_ms",
         "p95_ms",
         "p99_ms",
+        "p50_quality",
+        "p95_quality",
+        "p99_quality",
         "quantile_method",
         "max_relative_error",
         "latency_overflow_count",
-        "latency_quality",
         "usage_samples",
         "reported_tokens_per_sec",
         "usage_anomaly_count",
@@ -223,36 +217,19 @@
         "cost_confidence"
       ]
     },
-    "MetricWindowName": {
-      "type": "string",
-      "enum": [
-        "m1"
-      ]
-    },
-    "MetricWindows": {
-      "description": "The three sliding windows (`m1`/`m5`/`h1`) of a [`MetricTick`].",
-      "type": "object",
-      "properties": {
-        "h1": {
-          "$ref": "#/$defs/MetricWindow"
-        },
-        "m1": {
-          "$ref": "#/$defs/MetricWindow"
-        },
-        "m5": {
-          "$ref": "#/$defs/MetricWindow"
-        }
-      },
-      "required": [
-        "m1",
-        "m5",
-        "h1"
-      ]
-    },
     "QuantileMethod": {
       "type": "string",
       "enum": [
         "log_histogram_nearest_rank"
+      ]
+    },
+    "TerminalCostConfidence": {
+      "description": "Confidence attached to a terminal-time price. This lives with the evict-safe\nterminal payload (rather than the REST projection) so historical overview cuts keep\nthe rate table decision that was true when the request finished.",
+      "type": "string",
+      "enum": [
+        "confident",
+        "estimated",
+        "unavailable"
       ]
     }
   }

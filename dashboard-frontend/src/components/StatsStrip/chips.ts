@@ -5,7 +5,7 @@
  * DOM-free so it is unit-testable and the component stays a thin renderer. Formatting reuses the
  * flow-table formatters where they fit (tokens), and adds small local ones for rates/latency/%.
  */
-import type { CostConfidence, MetricWindow } from '../../api/types';
+import type { CostConfidence, InstantMetricSample } from '../../api/types';
 import { colors } from '../../design/tokens';
 import { metricUnavailable, type MetricKey } from './metricHistory';
 
@@ -25,7 +25,7 @@ export type DeltaDir = 'up' | 'down' | 'flat';
  *                     ($/min). MUST be surfaced as such (the plan calls this out).
  *  - `unavailable`  — not measurable in this window; the value renders `—`, never `0`.
  */
-export type MetricQuality = 'measured' | 'derived' | 'estimated' | 'unavailable';
+export type MetricQuality = 'measured' | 'derived' | 'partial' | 'estimated' | 'unavailable';
 
 export interface ChipDescriptor {
   key: MetricKey;
@@ -49,9 +49,9 @@ export interface ChipDescriptor {
   details: string;
 }
 
-function metricDetails(window: MetricWindow | null, key: MetricKey): string {
-  if (!window) return 'No metric window has been published.';
-  const coverage = `${window.observed_seconds}/${window.window_seconds}s observed${window.warm ? ', warm' : ', warming'}`;
+function metricDetails(window: InstantMetricSample | null, key: MetricKey): string {
+  if (!window) return 'No metrics interval has been published.';
+  const coverage = window.interval_duration_ms === null ? 'publisher interval unavailable' : `${window.interval_duration_ms}ms publisher interval`;
   switch (key) {
     case 'accepted_per_sec': return `accepted starts / observed seconds; ${window.accepted_requests} starts; ${coverage}`;
     case 'terminal_per_sec': return `terminal flows / observed seconds; ${window.terminal_requests} terminals; ${coverage}`;
@@ -60,7 +60,7 @@ function metricDetails(window: MetricWindow | null, key: MetricKey): string {
     case 'cancellation_pct': return `cancellations / terminal flows × 100; ${window.cancellations}/${window.terminal_requests} terminals`;
     case 'p50_ms':
     case 'p95_ms':
-    case 'p99_ms': return `${key.slice(0, 3)} nearest-rank logarithmic histogram; ${window.latency_samples} latency samples; max relative error ${(window.max_relative_error * 100).toFixed(1)}%; ${window.latency_quality}`;
+    case 'p99_ms': return `${key.slice(0, 3)} nearest-rank logarithmic histogram; ${window.latency_samples} latency samples; max relative error ${(window.max_relative_error * 100).toFixed(1)}%; ${window[`${key.slice(0, 3)}_quality` as 'p50_quality' | 'p95_quality' | 'p99_quality']}`;
     case 'reported_tokens_per_sec': return `normalized prompt + completion / observed seconds; ${window.usage_samples} usage samples, ${window.usage_anomaly_count} anomalies; subsets counted once; ${coverage}`;
     case 'cost_per_min': return `persisted terminal cost / observed minutes; ${window.priced_samples}/${window.terminal_requests} priced terminals; ${window.cost_confidence}; ${coverage}`;
   }
@@ -139,7 +139,7 @@ interface MetricSpec {
    * price-modelled cost. Collapses to `unavailable` when the metric's denominator is `0`
    * (the denominator itself lives in `METRIC_AVAILABILITY` in metricHistory).
    */
-  quality: Exclude<MetricQuality, 'unavailable'>;
+  quality: Exclude<MetricQuality, 'partial' | 'unavailable'>;
 }
 
 const METRIC_SPECS: readonly MetricSpec[] = [
@@ -177,7 +177,7 @@ export const CHIP_METRICS: readonly MetricKey[] = METRIC_SPECS.map((s) => s.key)
  * `req/s` (a genuine idle `0`) and `active_streams` (the live open count) are never gated.
  * Every chip also carries a `quality` provenance tag (measured/derived/estimated/unavailable).
  */
-export function deriveChips(cur: MetricWindow | null, prev: MetricWindow | null): ChipDescriptor[] {
+export function deriveChips(cur: InstantMetricSample | null, prev: InstantMetricSample | null): ChipDescriptor[] {
   return METRIC_SPECS.map((spec): ChipDescriptor => {
     // Unmeasurable when there is no window, or this metric's own denominator is 0.
     const unavailable = metricUnavailable(cur, spec.key);
@@ -187,7 +187,7 @@ export function deriveChips(cur: MetricWindow | null, prev: MetricWindow | null)
     // The err% chip turns red ABOVE the threshold — but only when it is actually MEASURED
     // (an unavailable err% carries no threshold accent); others keep their static accent.
     const accent: ChipDescriptor['accent'] =
-      !unavailable && cur && spec.key === 'failure_pct' && cur.failure_pct > ERROR_PCT_THRESHOLD ? 'down' : spec.accent;
+      !unavailable && cur && spec.key === 'failure_pct' && cur.failure_pct !== null && cur.failure_pct > ERROR_PCT_THRESHOLD ? 'down' : spec.accent;
     // No trend direction for an unavailable value, nor across the genuine→unavailable boundary
     // (the previous sample being unavailable for THIS metric makes the delta meaningless).
     const prevUnavailable = metricUnavailable(prev, spec.key);
@@ -202,8 +202,13 @@ export function deriveChips(cur: MetricWindow | null, prev: MetricWindow | null)
     // is a labelled estimate. `unavailable` is already handled by the denominator branch above
     // (it coincides with `priced_samples === 0`), so operators can finally tell a confident
     // aggregate cost from an estimated one instead of every `$/min` always reading `estimated`.
+    const percentileQuality = cur && (spec.key === 'p50_ms' || spec.key === 'p95_ms' || spec.key === 'p99_ms')
+      ? cur[`${spec.key.slice(0, 3)}_quality` as 'p50_quality' | 'p95_quality' | 'p99_quality']
+      : null;
     const quality: MetricQuality = unavailable
       ? 'unavailable'
+      : percentileQuality === 'partial'
+        ? 'partial'
       : spec.key === 'cost_per_min' && cur
         ? costQuality(cur.cost_confidence)
         : spec.quality;

@@ -105,13 +105,13 @@ export const GOLDEN_FLOW_STATUS_FRAME_JSON = JSON.stringify({
 });
 
 /** A `metric_tick` frame (metrics domain). */
-const metricWindow = (window_seconds: number, accepted_per_sec: number) => ({
-  window_seconds, observed_seconds: window_seconds, warm: true,
+const metricWindow = (accepted_per_sec: number) => ({
+  interval_duration_ms: 1000, ready: true,
   accepted_requests: 252, accepted_per_sec, terminal_requests: 250, terminal_per_sec: 4.1,
   successes: 246, failures: 3, failure_pct: 1.2, cancellations: 1, cancellation_pct: 0.4,
   active_streams_now: 3, latency_samples: 250, p50_ms: 180, p95_ms: 920, p99_ms: 1840,
   quantile_method: 'log_histogram_nearest_rank', max_relative_error: 0.062,
-  latency_overflow_count: 0, latency_quality: 'measured', usage_samples: 250,
+  latency_overflow_count: 0, p50_quality: 'measured', p95_quality: 'measured', p99_quality: 'measured', usage_samples: 250,
   reported_tokens_per_sec: 142, usage_anomaly_count: 0, priced_samples: 240,
   cost_per_min: 0.21, cost_confidence: 'estimated',
 });
@@ -122,12 +122,7 @@ export const GOLDEN_METRIC_TICK_FRAME_JSON = JSON.stringify({
     {
       type: 'metric_tick',
       generated_at_ms: 1718900000000,
-      headline_window: 'm1',
-      windows: {
-        m1: metricWindow(60, 4.2),
-        m5: metricWindow(300, 3.8),
-        h1: metricWindow(3600, 2.9),
-      },
+      instant: metricWindow(4.2),
     },
   ],
 });
@@ -173,5 +168,5 @@ export const GOLDEN_BOOTSTRAP = {
   authenticated: true,
   csrf_token: 'csrf-abc123',
   mutations_enabled: true,
-  schema_version: 4,
+  schema_version: 5,
 } as const;

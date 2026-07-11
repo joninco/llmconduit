@@ -285,33 +285,22 @@ const UPSTREAM_RESPONSE_BY_ID: Record<string, FlowDetail['upstream_response']> =
 };
 
 function buildMetrics(): MetricsResponse {
-  const win = (m: number) => {
-    const samples = Math.round(252 * m);
-    return {
-      window_seconds: 60, observed_seconds: 60, warm: true,
-      accepted_requests: samples + 3, accepted_per_sec: 4.2 * m,
-      terminal_requests: samples, terminal_per_sec: 4.0 * m,
-      successes: Math.max(0, samples - 4), failures: 3, failure_pct: 1.1,
-      cancellations: 1, cancellation_pct: 0.4, active_streams_now: Math.round(3 * m),
-      latency_samples: samples, p50_ms: 180, p95_ms: 920, p99_ms: 1840,
-      quantile_method: 'log_histogram_nearest_rank' as const, max_relative_error: 0.062,
-      latency_overflow_count: 0, latency_quality: 'measured' as const,
-      usage_samples: samples,
-      reported_tokens_per_sec: 142 * m,
-      usage_anomaly_count: 0,
-      priced_samples: samples,
-      cost_per_min: 0.21 * m,
-      // Gap 07: the priced llama model has no configured cache rate (and the seed flow on it
-      // bills/omits cached) ⇒ the aggregate $/min is an ESTIMATE, labelled as such.
-      cost_confidence: 'estimated' as const,
-    };
-  };
-  const m1 = win(1);
   return {
     metrics_seq: 1,
     generated_at_ms: Date.now(),
-    headline_window: 'm1',
-    windows: { m1, m5: { ...win(0.9), window_seconds: 300 }, h1: { ...win(0.7), window_seconds: 3600 } },
+    instant: {
+      interval_duration_ms: 1_000, ready: true,
+      accepted_requests: 4, accepted_per_sec: 4.2,
+      terminal_requests: 4, terminal_per_sec: 4.0,
+      successes: 3, failures: 1, failure_pct: 25,
+      cancellations: 0, cancellation_pct: 0, active_streams_now: 3,
+      latency_samples: 4, p50_ms: 180, p95_ms: 920, p99_ms: 1840,
+      p50_quality: 'measured', p95_quality: 'partial', p99_quality: 'partial',
+      quantile_method: 'log_histogram_nearest_rank', max_relative_error: 0.062,
+      latency_overflow_count: 0, usage_samples: 4, reported_tokens_per_sec: 142,
+      usage_anomaly_count: 0, priced_samples: 4, cost_per_min: 0.21,
+      cost_confidence: 'estimated',
+    },
   };
 }
 
@@ -509,7 +498,7 @@ function buildTopology(): TopologyResponse {
 function buildSnapshot(): SnapshotFrame {
   return {
     type: 'snapshot',
-      schema_version: 4,
+      schema_version: 5,
     cursors: { flow_seq: 3, metrics_seq: 1, topology_seq: 1, monitor_seq: 5 , backend_metrics_seq: 0},
     flows: seedFlows(),
     metrics: buildMetrics(),
@@ -570,7 +559,7 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: {
       'Content-Type': 'application/json',
-      'X-LLMConduit-Dashboard-Schema': '4',
+      'X-LLMConduit-Dashboard-Schema': '5',
     },
   });
 }
@@ -638,14 +627,14 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   if (path === '/dashboard/api/catalog') return json(CATALOG);
   if (path === '/dashboard/api/history') {
     const now = Date.now();
-    const metrics = buildMetrics().windows.m1;
+    const instant = buildMetrics().instant;
     const points = Array.from({ length: 60 }, (_, index) => {
       const at_ms = now - (59 - index) * 5_000;
       return {
         cut_id: at_ms,
         at_ms,
         cursors: { flow_seq: 3, metrics_seq: index + 1, topology_seq: 1, monitor_seq: 5 , backend_metrics_seq: 0},
-        metrics,
+        instant,
       };
     });
     const history: HistoryResponse = {
@@ -862,8 +851,7 @@ export class MockWebSocket implements WsLike {
       batch: [{
         type: 'metric_tick',
         generated_at_ms: Date.now(),
-        headline_window: 'm1',
-        windows: m.windows,
+        instant: m.instant,
       }],
     };
   }

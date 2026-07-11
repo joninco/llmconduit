@@ -6025,35 +6025,39 @@ async fn d13_metrics_shape_carries_seq_and_windows() {
         body["metrics_seq"].is_u64(),
         "metrics carries its domain cursor"
     );
-    assert_eq!(body["headline_window"], serde_json::json!("m1"));
+    assert!(body["instant"].is_object());
     assert!(
         body.get("reqs_per_sec").is_none(),
         "v3 has no duplicated headline fields"
     );
-    for window in ["m1", "m5", "h1"] {
-        let tile = &body["windows"][window];
-        assert!(tile.is_object(), "windows.{window} present");
-        for field in [
-            "accepted_per_sec",
-            "terminal_per_sec",
-            "active_streams_now",
-            "failure_pct",
-            "cancellation_pct",
-        ] {
-            assert!(tile[field].is_number(), "windows.{window} has {field}");
-        }
-        for field in [
-            "p50_ms",
-            "p95_ms",
-            "p99_ms",
-            "reported_tokens_per_sec",
-            "cost_per_min",
-        ] {
-            assert!(
-                tile[field].is_number() || tile[field].is_null(),
-                "windows.{window} has nullable {field}"
-            );
-        }
+    assert!(body.get("windows").is_none());
+    let tile = &body["instant"];
+    for field in [
+        "accepted_per_sec",
+        "terminal_per_sec",
+        "failure_pct",
+        "cancellation_pct",
+    ] {
+        assert!(
+            tile[field].is_number() || tile[field].is_null(),
+            "instant has nullable {field}"
+        );
+    }
+    assert!(
+        tile["active_streams_now"].is_number(),
+        "instant has active_streams_now"
+    );
+    for field in [
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "reported_tokens_per_sec",
+        "cost_per_min",
+    ] {
+        assert!(
+            tile[field].is_number() || tile[field].is_null(),
+            "instant has nullable {field}"
+        );
     }
 }
 
@@ -6745,7 +6749,7 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
     );
     // The v3 headline is the named m1 window; no values are duplicated at top level.
     assert_eq!(
-        metrics["windows"]["m1"]["cost_confidence"],
+        metrics["instant"]["cost_confidence"],
         serde_json::json!("confident"),
         "aggregate cost confidence rides the headline window"
     );
@@ -6855,7 +6859,7 @@ async fn d13_historical_snapshot_active_streams_is_frozen_to_the_cut() {
     // The historical `?at=` reflects the FROZEN cut: 1 active stream.
     let snapshot = d13_json(d13_get(&app, &format!("/dashboard/api/snapshot?at={at}")).await).await;
     assert_eq!(
-        snapshot["metrics"]["windows"]["m1"]["active_streams_now"],
+        snapshot["metrics"]["instant"]["active_streams_now"],
         serde_json::json!(1),
         "historical snapshot active_streams is the FROZEN cut's open count (1), not now"
     );
@@ -6863,7 +6867,7 @@ async fn d13_historical_snapshot_active_streams_is_frozen_to_the_cut() {
     // The LIVE `/metrics` reflects NOW: the flow finalized, so 0 active streams.
     let metrics = d13_json(d13_get(&app, "/dashboard/api/metrics").await).await;
     assert_eq!(
-        metrics["windows"]["m1"]["active_streams_now"],
+        metrics["instant"]["active_streams_now"],
         serde_json::json!(0),
         "live metrics active_streams reflects the finalized flow (0), proving the \
          snapshot's 1 came from the cut, not the live store"

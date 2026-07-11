@@ -2,21 +2,21 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act, cleanup, fireEvent, within } from '@testing-library/react';
 import { StatsStrip } from './StatsStrip';
 import { dashboardStore, type LiveBaseline } from '../../store/dashboardStore';
-import type { MetricsResponse, MetricWindow } from '../../api/types';
+import type { MetricsResponse, InstantMetricSample } from '../../api/types';
 import { renderWithQuery, resetWorld } from '../testHarness';
 import { CHIP_METRICS } from './chips';
 
-function win(over: Partial<MetricWindow> = {}): MetricWindow {
+function win(over: Partial<InstantMetricSample> = {}): InstantMetricSample {
   // Fully-measured default: the three denominators mirror `latency_samples` unless overridden.
   const latency_samples = over.latency_samples ?? 252;
   return {
-    window_seconds: 60, observed_seconds: 60, warm: true, accepted_requests: 252,
+    interval_duration_ms: 1000, ready: true, accepted_requests: 252,
     accepted_per_sec: 4.2, active_streams_now: 3, failure_pct: 1.1,
     terminal_requests: latency_samples, terminal_per_sec: 4.2, successes: latency_samples,
     failures: 0, cancellations: 0, cancellation_pct: 0,
     p50_ms: 180, p95_ms: 920, p99_ms: 1840, reported_tokens_per_sec: 142, cost_per_min: 0.21,
     quantile_method: 'log_histogram_nearest_rank', max_relative_error: 0.062,
-    latency_overflow_count: 0, latency_quality: 'measured', usage_anomaly_count: 0,
+    latency_overflow_count: 0, p50_quality: 'measured', p95_quality: 'measured', p99_quality: 'measured', usage_anomaly_count: 0,
     latency_samples,
     usage_samples: latency_samples,
     priced_samples: latency_samples,
@@ -25,13 +25,12 @@ function win(over: Partial<MetricWindow> = {}): MetricWindow {
   };
 }
 
-function metrics(seq: number, over: Partial<MetricsResponse> = {}, windows?: { m1?: Partial<MetricWindow>; m5?: Partial<MetricWindow>; h1?: Partial<MetricWindow> }): MetricsResponse {
+function metrics(seq: number, over: Partial<MetricsResponse> = {}, windows?: { m1?: Partial<InstantMetricSample>; m5?: Partial<InstantMetricSample>; h1?: Partial<InstantMetricSample> }): MetricsResponse {
   const m1 = win(windows?.m1);
   return {
     metrics_seq: seq,
     generated_at_ms: seq * 1000,
-    headline_window: 'm1',
-    windows: { m1, m5: win(windows?.m5), h1: win(windows?.h1) },
+    instant: m1,
     ...over,
   };
 }
@@ -177,10 +176,9 @@ describe('StatsStrip — seek isolation (D11 R5)', () => {
         topology: null,
       });
     });
-    // Chip CURRENT value now reads the FROZEN snapshot (42) — as-of the seeked moment — with a FLAT
-    // delta (a point-in-time snapshot is not a live trend; the frozen cut never folded into history).
+    // Chip CURRENT value reads the frozen sample and compares it with the preceding historical point.
     expect(value()).toBe('42.0');
-    expect(delta()).toBe('·');
+    expect(delta()).toBe('▲');
 
     // RESUME: restore baseline (live seq 2) atomically with connection='live' → chip back on live.
     act(() => dashboardStore.getState().restoreLiveBaseline(baseline));
@@ -193,21 +191,21 @@ describe('StatsStrip — seek isolation (D11 R5)', () => {
   });
 });
 
-describe('StatsStrip — window selector', () => {
-  it('switches the source window so chips read metrics.windows.{m1,m5,h1}', () => {
+describe('StatsStrip — history horizon selector', () => {
+  it('changes sparkline horizon without changing the instantaneous chip value', () => {
     const { getByTestId, getByText } = renderWithQuery(<StatsStrip />);
-    // Distinct values per window so we can prove the switch.
+    // Legacy-shaped override arguments are deliberately distinct; only the instant m1 value exists.
     pushMetrics(metrics(1, {}, { m1: { accepted_per_sec: 1 }, m5: { accepted_per_sec: 5 }, h1: { accepted_per_sec: 9 } }));
     // Default window is 1m.
     expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('1.0');
 
     // Switch to 5m.
     fireEvent.click(getByText('5m'));
-    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('5.0');
+    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('1.0');
 
     // Switch to 1h.
     fireEvent.click(getByText('1h'));
-    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('9.0');
+    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('1.0');
 
     // aria-pressed tracks the active window.
     expect(getByText('1h').getAttribute('aria-pressed')).toBe('true');

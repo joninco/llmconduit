@@ -37,22 +37,18 @@ export type FlowStatus = "open" | "completed" | "failed" | "cancelled";
  */
 export type ClientSource = "key_hash" | "configured_header" | "user_agent";
 /**
- * Gap 07 — the CONFIDENCE tier of a flow's `cost`, so an operator can tell a trusted
- * figure from a best-effort estimate from an honest gap. Emitted alongside `cost` on
- * every flow row + detail (and aggregated onto the metrics windows). Serializes
- * snake_case to mirror the data-quality vocabulary the frontend already uses
- * (`measured`/`derived`/`estimated`/`unavailable`).
- */
-export type CostConfidence = "confident" | "estimated" | "unavailable";
-export type MetricQuality = "measured" | "partial" | "unavailable";
-export type QuantileMethod = "log_histogram_nearest_rank";
-export type MetricWindowName = "m1";
-/**
  * Confidence attached to a terminal-time price. This lives with the evict-safe
  * terminal payload (rather than the REST projection) so historical overview cuts keep
  * the rate table decision that was true when the request finished.
  */
 export type TerminalCostConfidence = "confident" | "estimated" | "unavailable";
+/**
+ * Data quality for one instantaneous metric value. Percentiles are still emitted for
+ * sparse intervals; `Partial` tells consumers that the nearest-rank estimate has fewer
+ * than the recommended number of observations.
+ */
+export type InstantMetricQuality = "measured" | "partial" | "unavailable";
+export type QuantileMethod = "log_histogram_nearest_rank";
 /**
  * Cross-cutting quality tag for Overview values. `partial` is explicit whenever a
  * bounded slot/union folded dimensions into `__other__`; missing source facts are
@@ -185,11 +181,11 @@ export type DashboardPayload =
        */
       cost: number | null;
       /**
-       * Gap 07 — the CONFIDENCE tier of a flow's `cost`, so an operator can tell a trusted
-       * figure from a best-effort estimate from an honest gap. Emitted alongside `cost` on
-       * every flow row + detail (and aggregated onto the metrics windows). Serializes
-       * snake_case to mirror the data-quality vocabulary the frontend already uses
-       * (`measured`/`derived`/`estimated`/`unavailable`).
+       * Gap 07 — the [`CostConfidence`] of `cost`: `confident` (priced + every billed
+       * class has a known rate), `estimated` (a class falls back to the default `0.0`
+       * cached rate / cached unreported), or `unavailable` (unpriced ⇒ `cost: null`).
+       * Always present so the frontend can label an `estimated` figure as such and
+       * distinguish an `unavailable` cost from a measured `$0.00`.
        */
       cost_confidence: "confident" | "estimated" | "unavailable";
       effective_route_limit?: number | null;
@@ -786,7 +782,7 @@ export interface HistoryPoint {
   at_ms: number;
   cursors: SeqCursors;
   cut_id: number;
-  metrics: MetricWindow;
+  instant: InstantMetricSample;
 }
 /**
  * The four per-domain cursors carried on the initial [`SnapshotMessage`] — the
@@ -802,44 +798,39 @@ export interface SeqCursors {
   topology_seq: number;
 }
 /**
- * One sliding-window metric tile. Same fields as the headline tile.
- *
- * `samples` is the count of TERMINAL (finalized) flows that fell in the window —
- * the data-quality signal the frontend uses to tell a genuine measured `0` from an
- * `unavailable` gap (gap 01 / "don't lie with zeros"). When `samples == 0` the
- * latency/tok-s/cost/error-% fields are NOT measurable (no finalized flow fed them),
- * so the strip renders them `—`; `reqs_per_sec` (a genuine `0` for an idle window)
- * and `active_streams` (live open-flow count) stay numeric. The field is a finite
- * `u64`, so it never violates the frozen finite-number wire contract.
+ * One reset-on-publish dashboard telemetry interval. Unlike [`WindowReport`], this
+ * value contains only events observed since the previous publisher cut. Rates are
+ * normalized by `interval_duration_ms`, so a delayed tick remains truthful.
  */
-export interface MetricWindow {
-  accepted_per_sec: number;
+export interface InstantMetricSample {
+  accepted_per_sec: number | null;
   accepted_requests: number;
   active_streams_now: number;
-  cancellation_pct: number;
+  cancellation_pct: number | null;
   cancellations: number;
-  cost_confidence: CostConfidence;
+  cost_confidence: TerminalCostConfidence;
   cost_per_min: number | null;
-  failure_pct: number;
+  failure_pct: number | null;
   failures: number;
+  interval_duration_ms: number | null;
   latency_overflow_count: number;
-  latency_quality: MetricQuality;
   latency_samples: number;
   max_relative_error: number;
-  observed_seconds: number;
   p50_ms: number | null;
+  p50_quality: InstantMetricQuality;
   p95_ms: number | null;
+  p95_quality: InstantMetricQuality;
   p99_ms: number | null;
+  p99_quality: InstantMetricQuality;
   priced_samples: number;
   quantile_method: QuantileMethod;
+  ready: boolean;
   reported_tokens_per_sec: number | null;
   successes: number;
-  terminal_per_sec: number;
+  terminal_per_sec: number | null;
   terminal_requests: number;
   usage_anomaly_count: number;
   usage_samples: number;
-  warm: boolean;
-  window_seconds: number;
 }
 /**
  * Successful `POST /dashboard/api/flows/:id/kill` response.
@@ -858,17 +849,8 @@ export interface LoginRequest {
  */
 export interface MetricsSnapshot {
   generated_at_ms: number;
-  headline_window: MetricWindowName;
+  instant: InstantMetricSample;
   metrics_seq: number;
-  windows: MetricWindows;
-}
-/**
- * The three sliding windows (`m1`/`m5`/`h1`) of a [`MetricTick`].
- */
-export interface MetricWindows {
-  h1: MetricWindow;
-  m1: MetricWindow;
-  m5: MetricWindow;
 }
 /**
  * `GET /dashboard/api/overview`: an immutable exact-window rollup. The aggregate is

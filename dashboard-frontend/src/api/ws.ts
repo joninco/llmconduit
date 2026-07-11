@@ -709,8 +709,7 @@ export class DashboardSocket {
         store.setMetrics({
           metrics_seq: this.lastSeq.metrics,
           generated_at_ms: payload.generated_at_ms,
-          headline_window: payload.headline_window,
-          windows: payload.windows,
+          instant: payload.instant,
         });
         return;
       case 'flow_status':

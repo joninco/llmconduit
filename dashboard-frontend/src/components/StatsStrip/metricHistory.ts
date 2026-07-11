@@ -1,22 +1,12 @@
-/**
- * Per-window metric history — the ring buffers the StatsStrip sparklines read.
- *
- * Each `MetricTick` (and the seed `/metrics`) carries `windows.{m1,m5,h1}`, every one a full
- * `MetricWindow` (the 8 chip metrics). A sparkline for a chosen window+metric is the recent
- * history of that `windows[w][metric]` scalar. So we keep, PER window, a capped ring of the last
- * N `MetricWindow` samples; a chip extracts one field into a `number[]` for its Sparkline.
- *
- * Pure + DOM-free (a plain reducer over an immutable state object) so it is trivially testable
- * and can live in `useMemo`/`useRef` without React entanglement.
- */
-import type { MetricWindow, MetricsResponse, MetricTickPayload } from '../../api/types';
+/** Timestamped instantaneous metrics history shared by every StatsStrip horizon. */
+import type { HistoryPoint, InstantMetricSample, MetricsResponse } from '../../api/types';
 
-/** The three sliding windows the selector switches between. */
 export type WindowKey = 'm1' | 'm5' | 'h1';
 export const WINDOW_KEYS: readonly WindowKey[] = ['m1', 'm5', 'h1'];
 export const WINDOW_LABELS: Record<WindowKey, string> = { m1: '1m', m5: '5m', h1: '1h' };
+const HORIZON_MS: Record<WindowKey, number> = { m1: 60_000, m5: 300_000, h1: 3_600_000 };
+const MAX_HISTORY_MS = 3_600_000;
 
-/** The chip metrics, in strip display order. Each maps to a `MetricWindow` field. */
 export type MetricKey =
   | 'accepted_per_sec'
   | 'terminal_per_sec'
@@ -29,123 +19,71 @@ export type MetricKey =
   | 'reported_tokens_per_sec'
   | 'cost_per_min';
 
-/**
- * Which per-window count is a metric's MEASURABILITY denominator (gap 01 findings 2/3 —
- * token and cost availability are SEPARATE from latency). `0` for the relevant count means
- * the metric is unmeasurable in that window → the chip renders `—` and the sparkline draws
- * a gap, never a fabricated `0`:
- *  - `always`  — not sample-gated (`req/s` idle-`0`, `active_streams` live count).
- *  - `samples` — needs a finalized flow (err%, p50/p95/p99).
- *  - `usage`   — needs a finalized flow that REPORTED usage (`tokens_per_sec`).
- *  - `priced`  — needs a usage-bearing flow on a PRICED model (`cost_per_min`).
- * Lives here (the pure history module) so both the sparkline (`seriesFor`) and the chip
- * value (`deriveChips`) read one source — and so there is no chips↔history import cycle.
- */
-export type Availability = 'always' | 'terminal' | 'latency50' | 'latency95' | 'latency99' | 'usage' | 'priced';
+export interface MetricPoint {
+  seq: number;
+  t: number;
+  instant: InstantMetricSample;
+}
 
-/** Each metric's measurability denominator (gap 01 finding 3). */
-export const METRIC_AVAILABILITY: Record<MetricKey, Availability> = {
-  accepted_per_sec: 'always',
-  terminal_per_sec: 'always',
-  active_streams_now: 'always',
-  failure_pct: 'terminal',
-  cancellation_pct: 'terminal',
-  p50_ms: 'latency50',
-  p95_ms: 'latency95',
-  p99_ms: 'latency99',
-  reported_tokens_per_sec: 'usage',
-  cost_per_min: 'priced',
-};
+export type MetricHistory = MetricPoint[];
+export function emptyHistory(): MetricHistory { return []; }
 
-/** Read a window's measurability denominator for an `Availability` tier. */
-function denominatorFor(window: MetricWindow, availability: Availability): number {
-  switch (availability) {
-    case 'always':
-      return Number.POSITIVE_INFINITY; // never gated
-    case 'terminal':
-      return window.terminal_requests;
-    case 'latency50': return window.latency_samples >= 2 ? 1 : 0;
-    case 'latency95': return window.latency_samples >= 20 ? 1 : 0;
-    case 'latency99': return window.latency_samples >= 100 ? 1 : 0;
-    case 'usage': return window.usage_samples;
-    case 'priced': return window.priced_samples;
+function normalized(points: MetricPoint[]): MetricHistory {
+  const byIdentity = new Map<string, MetricPoint>();
+  for (const point of points) {
+    if (!Number.isFinite(point.t)) continue;
+    byIdentity.set(`${point.seq}:${point.t}`, point);
   }
+  const sorted = [...byIdentity.values()].sort((a, b) => a.t - b.t || a.seq - b.seq);
+  const newest = sorted.at(-1)?.t;
+  return newest === undefined ? [] : sorted.filter((point) => point.t >= newest - MAX_HISTORY_MS);
 }
 
-/**
- * Whether `metric` is UNMEASURABLE for `window` — its measurability denominator is `0`.
- * A `null` window (no tick yet) is unavailable for every metric. Shared by `seriesFor`
- * (sparkline → gap) AND `deriveChips` (value → `—`) so the trend and the value agree.
- */
-export function metricUnavailable(window: MetricWindow | null, metric: MetricKey): boolean {
-  if (!window) return true;
-  if (denominatorFor(window, METRIC_AVAILABILITY[metric]) === 0) return true;
-  return window[metric] === null;
+export function appendTick(history: MetricHistory, tick: MetricsResponse): MetricHistory {
+  return normalized([...history, { seq: tick.metrics_seq, t: tick.generated_at_ms, instant: tick.instant }]);
 }
 
-/** Sparkline depth (samples retained per window). Spec: 60-sample sparklines. */
-export const HISTORY_DEPTH = 60;
-
-/** Immutable history state: a capped ring of `MetricWindow` samples per window. */
-export interface MetricHistory {
-  m1: MetricWindow[];
-  m5: MetricWindow[];
-  h1: MetricWindow[];
+export function mergeRetained(history: MetricHistory, points: HistoryPoint[]): MetricHistory {
+  return normalized([
+    ...points.map((point) => ({ seq: point.cursors.metrics_seq, t: point.at_ms, instant: point.instant })),
+    ...history,
+  ]);
 }
 
-export function emptyHistory(): MetricHistory {
-  return { m1: [], m5: [], h1: [] };
+export function horizon(history: MetricHistory, window: WindowKey, endAt?: number | null): MetricHistory {
+  const end = endAt ?? history.at(-1)?.t;
+  if (end === undefined) return [];
+  const start = end - HORIZON_MS[window];
+  return history.filter((point) => point.t >= start && point.t <= end);
 }
 
-/** Append `sample` to `ring`, dropping the oldest beyond `cap` (returns a NEW array). */
-function pushCapped(ring: MetricWindow[], sample: MetricWindow, cap = HISTORY_DEPTH): MetricWindow[] {
-  const next = ring.length >= cap ? ring.slice(ring.length - cap + 1) : ring.slice();
-  next.push(sample);
-  return next;
+export function metricUnavailable(sample: InstantMetricSample | null, metric: MetricKey): boolean {
+  if (!sample) return true;
+  if (metric === 'active_streams_now') return false;
+  if (!sample.ready) return true;
+  if ((metric === 'failure_pct' || metric === 'cancellation_pct') && sample.terminal_requests === 0) return true;
+  if ((metric === 'p50_ms' || metric === 'p95_ms' || metric === 'p99_ms') && sample.latency_samples === 0) return true;
+  if (metric === 'reported_tokens_per_sec' && sample.usage_samples === 0) return true;
+  if (metric === 'cost_per_min' && sample.priced_samples === 0) return true;
+  const value = sample[metric];
+  return value === null || !Number.isFinite(value);
 }
 
-/**
- * Fold one tick's `windows` into the history (one sample per window). Accepts the `MetricTick`
- * WS payload OR the `/metrics` REST response — both expose the same `windows` shape — so the
- * seed read and the live stream share one accumulator. Returns a NEW `MetricHistory`.
- */
-export function appendTick(
-  history: MetricHistory,
-  tick: Pick<MetricTickPayload | MetricsResponse, 'windows'>,
-): MetricHistory {
+export function seriesFor(history: MetricHistory, metric: MetricKey): { times: number[]; values: number[] } {
   return {
-    m1: pushCapped(history.m1, tick.windows.m1),
-    m5: pushCapped(history.m5, tick.windows.m5),
-    h1: pushCapped(history.h1, tick.windows.h1),
+    times: history.map((point) => point.t / 1_000),
+    values: history.map(({ instant }) => {
+      const value = instant[metric];
+      return metricUnavailable(instant, metric) || value === null ? NaN : value;
+    }),
   };
 }
 
-/**
- * Extract the `metric` field across a window's ring into the Sparkline's `number[]`.
- *
- * Availability-aware (gap 01 finding 2): a sample-derived point that was UNMEASURABLE in
- * its sample (e.g. `tokens_per_sec` when that sample's `usage_samples === 0`, or
- * `cost_per_min` when `priced_samples === 0`) is emitted as `NaN` — uPlot renders a GAP
- * there rather than plotting a raw `0`, so an unavailable p50/tok-s/$/min never draws a
- * misleading zero trend. `metricUnavailable` (above) is the same predicate the chip value
- * uses, so the sparkline and the chip agree on what is real vs. a gap. `req/s`/
- * `active_streams` are never gated, so their series is the raw values.
- */
-export function seriesFor(history: MetricHistory, window: WindowKey, metric: MetricKey): number[] {
-  return history[window].map((w) => {
-    const value = w[metric];
-    return metricUnavailable(w, metric) || value === null ? NaN : value;
-  });
+export function latest(history: MetricHistory): InstantMetricSample | null {
+  return history.at(-1)?.instant ?? null;
 }
 
-/** The newest sample for a window (the live chip VALUE), or null before any tick. */
-export function latest(history: MetricHistory, window: WindowKey): MetricWindow | null {
-  const ring = history[window];
-  return ring.length ? ring[ring.length - 1]! : null;
-}
-
-/** The previous sample for a window (drives the chip's delta arrow), or null. */
-export function previous(history: MetricHistory, window: WindowKey): MetricWindow | null {
-  const ring = history[window];
-  return ring.length >= 2 ? ring[ring.length - 2]! : null;
+export function previous(history: MetricHistory, beforeAt?: number | null): InstantMetricSample | null {
+  const candidates = beforeAt == null ? history.slice(0, -1) : history.filter((point) => point.t < beforeAt);
+  return candidates.at(-1)?.instant ?? null;
 }

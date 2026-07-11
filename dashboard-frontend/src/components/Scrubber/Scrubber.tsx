@@ -66,11 +66,9 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   // millisecond still produce distinct hill points (the wire carries no per-tick timestamp).
   const ringRef = useRef<ReqsSample[]>([]);
   const historyPointsRef = useRef<HistoryPoint[]>([]);
-  const lastStampRef = useRef<number>(0);
   const fold = useCallback((sample: MetricsResponse) => {
-    const t = Math.max(Date.now(), lastStampRef.current + 1);
-    lastStampRef.current = t;
-    ringRef.current = appendReqs(ringRef.current, t, sample.windows.m1.accepted_per_sec);
+    if (sample.instant.accepted_per_sec === null) return;
+    ringRef.current = appendReqs(ringRef.current, sample.generated_at_ms, sample.instant.accepted_per_sec);
   }, []);
   const { version } = useMetricStream(fold);
   // `version` is read so this body re-runs after each ring fold; `ringRef.current` is reassigned a
@@ -87,10 +85,10 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   const ring = useMemo(() => {
     void version;
     if (historyPoints.length === 0) return ringRef.current;
-    const persisted = historyPoints.map((point) => ({
+    const persisted = historyPoints.flatMap((point) => point.instant.accepted_per_sec === null ? [] : [{
       t: point.at_ms,
-      reqs: point.metrics.accepted_per_sec,
-    }));
+      reqs: point.instant.accepted_per_sec,
+    }]);
     const newestPersisted = persisted[persisted.length - 1]?.t ?? 0;
     return [...persisted, ...ringRef.current.filter((sample) => sample.t > newestPersisted)];
   }, [historyPoints, version]);

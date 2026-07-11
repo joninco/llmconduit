@@ -33,7 +33,9 @@ import { Sparkline } from '../../viz/Sparkline';
 import {
   appendTick,
   emptyHistory,
+  horizon,
   latest,
+  mergeRetained,
   previous,
   seriesFor,
   WINDOW_KEYS,
@@ -56,6 +58,7 @@ export function StatsStrip() {
   // chip CURRENT VALUE (per window) so the strip reads as-of the seeked moment, while the sparkline
   // history stays the LIVE ring (the seek cut is never folded into it — D11 R5).
   const seekMetrics = useDashboard((s) => (s.connection === 'seeking' ? s.metrics : null));
+  const seekAtMs = useDashboard((s) => s.seekAtMs);
   const { client } = getConnection();
 
   // The `/metrics` REST read: seeds the strip pre-WS and is the production data source. `metric`
@@ -64,6 +67,12 @@ export function StatsStrip() {
   const query = useQuery({
     queryKey: queryKeys.metrics,
     queryFn: () => client.metrics(),
+  });
+  const historyQuery = useQuery({
+    queryKey: ['history'],
+    queryFn: () => client.history({ limit: 10_000 }),
+    staleTime: 5_000,
+    refetchInterval: seeking ? false : 5_000,
   });
 
   // History ring (per window), held in a ref so streaming ticks don't recreate it. `useMetricStream`
@@ -77,20 +86,21 @@ export function StatsStrip() {
   // `version` is read so this body re-runs after each ring fold (the ref mutation is otherwise
   // invisible to React); `window` switches the source window — so the memo below recomputes.
   void version;
-  const history = historyRef.current;
+  const history = mergeRetained(historyRef.current, historyQuery.data?.points ?? []);
+  const visibleHistory = horizon(history, window, seeking ? seekAtMs : null);
   // While seeking, the chip CURRENT value is the FROZEN snapshot window (as-of the seeked moment),
   // NOT the live ring's latest — but the sparkline (`seriesFor` below) stays the live history. The
   // delta is FLAT while seeking (`prev = null`): a point-in-time snapshot is not a live trend, so a
   // direction arrow would be misleading. Live → the ring's latest/previous drive value + delta.
-  const liveCur = latest(history, window);
-  const cur = seeking ? (seekMetrics?.windows[window] ?? null) : liveCur;
-  const prev = seeking ? null : previous(history, window);
+  const liveCur = latest(history);
+  const cur = seeking ? (seekMetrics?.instant ?? null) : liveCur;
+  const prev = previous(history, seeking ? seekAtMs : null);
   const chips = useMemo(() => deriveChips(cur, prev), [cur, prev]);
 
   return (
     <Panel className="m-2 mb-0 flex snap-x snap-mandatory items-center gap-1 overflow-x-auto px-2 py-1 sm:m-4 sm:mb-0" data-testid="stats-strip">
       {chips.map((chip) => (
-        <ChipCell key={chip.key} chip={chip} series={seriesFor(history, window, chip.key)} />
+        <ChipCell key={chip.key} chip={chip} series={seriesFor(visibleHistory, chip.key)} />
       ))}
       <div className="ml-auto flex items-center gap-2 pr-1">
         <span
@@ -127,11 +137,12 @@ const QUALITY_LABEL: Record<ChipDescriptor['quality'], string> = {
   measured: 'measured',
   derived: 'derived from finalized-flow samples',
   estimated: 'estimated (priced via the configured price table)',
+  partial: 'partial — sparse interval sample',
   unavailable: 'unavailable — not measurable in this window',
 };
 
 /** One chip: label, tabular-nums value + delta arrow, a provenance tag, and the sparkline. */
-function ChipCell({ chip, series }: { chip: ChipDescriptor; series: number[] }) {
+function ChipCell({ chip, series }: { chip: ChipDescriptor; series: { times: number[]; values: number[] } }) {
   const qualityText = QUALITY_LABEL[chip.quality];
   return (
     <div
@@ -159,7 +170,7 @@ function ChipCell({ chip, series }: { chip: ChipDescriptor; series: number[] }) 
           {deltaGlyph(chip.delta)}
         </span>
       </div>
-      <Sparkline data={series} stroke={chip.sparkStroke} label={`${chip.label} trend`} />
+      <Sparkline data={series.values} timestamps={series.times} stroke={chip.sparkStroke} label={`${chip.label} trend`} />
     </div>
   );
 }
@@ -167,7 +178,7 @@ function ChipCell({ chip, series }: { chip: ChipDescriptor; series: number[] }) 
 /** 1m/5m/1h window selector — switches the source `metrics.windows.*` + sparkline depth. */
 function WindowSelector({ value, onChange }: { value: WindowKey; onChange: (w: WindowKey) => void }) {
   return (
-    <div className="flex overflow-hidden rounded-md border border-line" role="group" aria-label="metrics window" data-testid="window-selector">
+    <div className="flex overflow-hidden rounded-md border border-line" role="group" aria-label="history and analytics horizon" data-testid="window-selector">
       {WINDOW_KEYS.map((w) => (
         <button
           key={w}

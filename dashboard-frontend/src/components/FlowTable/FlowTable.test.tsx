@@ -336,7 +336,7 @@ describe('FlowTable — loading, failure, empty, and filtered-empty states', () 
         status: 200,
         headers: {
           'Content-Type': 'application/json',
-          'X-LLMConduit-Dashboard-Schema': '4',
+          'X-LLMConduit-Dashboard-Schema': '5',
         },
       });
     }));

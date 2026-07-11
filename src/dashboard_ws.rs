@@ -39,7 +39,7 @@ use crate::dashboard_flow::DashboardFlowStore;
 use crate::dashboard_flow::FlowMutation;
 use crate::dashboard_flow::FlowMutationPhase;
 use crate::engine::Gateway;
-use crate::metrics::MetricsView;
+use crate::metrics::InstantMetricSample;
 use crate::monitor::DebugUpdate;
 use crate::monitor::DebugWsMessage;
 use crate::upstream::ProviderHealthSnapshot;
@@ -125,8 +125,7 @@ pub struct SeqCursors {
 pub struct MetricsSnapshot {
     pub metrics_seq: u64,
     pub generated_at_ms: u128,
-    pub headline_window: MetricWindowName,
-    pub windows: MetricWindows,
+    pub instant: InstantMetricSample,
 }
 
 /// The full `/api/topology`-shaped snapshot body (nodes + edges + the price table)
@@ -256,8 +255,7 @@ pub enum DashboardPayload {
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct MetricTick {
     pub generated_at_ms: u128,
-    pub headline_window: MetricWindowName,
-    pub windows: MetricWindows,
+    pub instant: InstantMetricSample,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, schemars::JsonSchema)]
@@ -507,19 +505,16 @@ fn next_metrics_cursor(view_seq: u64, last_emitted: u64) -> u64 {
 /// while real traffic streamed). The single-CAS terminal feed stays idempotent; this
 /// only changes how the already-recorded view is collapsed for the wire.
 pub fn metric_tick_frame(
-    view: &MetricsView,
+    instant: &InstantMetricSample,
+    generated_at_ms: u128,
     seq: u64,
-    active_streams: u64,
-    prices: &std::collections::HashMap<String, ModelPrice>,
 ) -> DashboardFrame {
-    let body = crate::dashboard_api::metrics_body(view, seq, active_streams, prices);
     DashboardFrame {
         domain: Domain::Metrics,
         seq,
         batch: vec![DashboardPayload::MetricTick(Box::new(MetricTick {
-            generated_at_ms: body.generated_at_ms,
-            headline_window: body.headline_window,
-            windows: body.windows,
+            generated_at_ms,
+            instant: instant.clone(),
         }))],
     }
 }
@@ -562,12 +557,11 @@ pub fn topology_frame(snapshot: &ProviderHealthSnapshot) -> DashboardFrame {
 /// `active_streams`/`tokens_per_sec`/`cost_per_min`/true rates), not a raw-count/`0.0`
 /// placeholder the SPA would render before the first live tick.
 fn metrics_snapshot(
-    view: &MetricsView,
+    instant: &InstantMetricSample,
+    generated_at_ms: u128,
     metrics_seq: u64,
-    active_streams: u64,
-    prices: &std::collections::HashMap<String, ModelPrice>,
 ) -> MetricsSnapshot {
-    crate::dashboard_api::metrics_body(view, metrics_seq, active_streams, prices)
+    crate::dashboard_api::metrics_body(instant, generated_at_ms, metrics_seq)
 }
 
 /// Build the topology half of the initial [`SnapshotMessage`] from a D4
@@ -719,10 +713,9 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
     let (metrics, topology, mut last_topology_version) = if let Some(cut) = published {
         (
             Some(metrics_snapshot(
-                &cut.view,
+                &cut.instant,
+                cut.taken_at_ms,
                 cut.cursors.metrics_seq,
-                cut.active_streams,
-                gateway.price_table(),
             )),
             Some(topology_snapshot(&cut.topology)),
             cut.topology.version,
@@ -848,10 +841,9 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                     continue;
                 };
                 let frame = metric_tick_frame(
-                    &cut.view,
+                    &cut.instant,
+                    cut.taken_at_ms,
                     cut.cursors.metrics_seq,
-                    cut.active_streams,
-                    gateway.price_table(),
                 );
                 match send_frames(std::slice::from_ref(&frame), expiry.as_mut(), &mut sink).await {
                     SendOutcome::Completed => {}
@@ -1589,21 +1581,16 @@ mod tests {
     /// types are byte-shape-exact.)
     #[test]
     fn metric_tick_frame_matches_golden_fixture_shape() {
-        let frame = metric_tick_frame(
-            &crate::metrics::MetricsView::default(),
-            2,
-            3,
-            &std::collections::HashMap::new(),
-        );
+        let frame = metric_tick_frame(&crate::metrics::InstantMetricSample::bootstrap(3), 1_000, 2);
         let got: serde_json::Value = serde_json::to_value(&frame).expect("serialize");
         assert_eq!(got["domain"], "metrics");
         assert_eq!(got["seq"], 2);
         let payload = &got["batch"][0];
         assert_eq!(payload["type"], "metric_tick");
-        assert_eq!(payload["headline_window"], "m1");
+        assert_eq!(payload["instant"]["active_streams_now"], 3);
         assert!(payload.get("reqs_per_sec").is_none());
-        assert_eq!(payload["windows"]["m1"]["window_seconds"], 60);
-        assert!(payload["windows"]["m1"]["p95_ms"].is_null());
+        assert!(payload.get("windows").is_none());
+        assert!(payload["instant"]["p95_ms"].is_null());
     }
 
     /// Gap 01 finding 1: the metrics-domain cursor stays STRICTLY MONOTONIC across both
@@ -1794,10 +1781,9 @@ mod tests {
         let flow_seq = store.flow_seq();
 
         let metrics = Some(metrics_snapshot(
-            &MetricsView::default(),
+            &crate::metrics::InstantMetricSample::default(),
+            1_000,
             7,
-            0,
-            &std::collections::HashMap::new(),
         ));
         let snapshot = ProviderHealthSnapshot {
             version: 3,
@@ -1847,12 +1833,11 @@ mod tests {
             serde_json::json!("unavailable"),
             "snapshot rows must carry the gap-07 cost_confidence tag"
         );
-        // metrics: the flat tile + metrics_seq + windows{m1,m5,h1}.
+        // metrics: the instantaneous interval sample + metrics cursor.
         let m = &value["metrics"];
         assert_eq!(m["metrics_seq"], serde_json::json!(7));
-        assert!(m["windows"]["m1"].is_object());
-        assert!(m["windows"]["m5"].is_object());
-        assert!(m["windows"]["h1"].is_object());
+        assert!(m["instant"].is_object());
+        assert!(m.get("windows").is_none());
         // topology: topology_seq + nodes + edges + a (possibly empty) price_table map.
         let t = &value["topology"];
         assert_eq!(t["topology_seq"], serde_json::json!(3));

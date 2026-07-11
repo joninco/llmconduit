@@ -37,6 +37,7 @@ use crate::dashboard_flow::AttemptStatus;
 use crate::dashboard_flow::DashboardFlowStore;
 use crate::dashboard_flow::FlowStatus;
 use crate::dashboard_flow::FlowUsage;
+use crate::dashboard_flow::NormalizedUsage;
 use crate::dashboard_flow::SnapshotFlowSummary;
 use crate::dashboard_flow::TerminalCostConfidence;
 use crate::dashboard_flow::TerminalMetricsInputs;
@@ -926,6 +927,191 @@ impl WindowRing {
     }
 }
 
+/// Mutable facts since the previous publisher cut. It is guarded by the same mutex as
+/// the rolling rings, so draining cannot split or double-count an accepted/terminal
+/// mutation across two samples.
+#[derive(Debug, Default)]
+struct InstantAccumulator {
+    accepted_requests: u64,
+    buckets: BTreeMap<BucketKey, BucketCounts>,
+    histogram: Histogram,
+}
+
+impl InstantAccumulator {
+    fn record_response(&mut self, key: &BucketKey, elapsed_ms: f64) {
+        let counts = self.buckets.entry(key.clone()).or_default();
+        counts.count = counts.count.saturating_add(1);
+        self.histogram.record(elapsed_ms);
+    }
+
+    fn add_normalized_usage(
+        counts: &mut BucketCounts,
+        normalized: NormalizedUsage,
+        inputs: Option<&TerminalMetricsInputs>,
+    ) {
+        let usage = normalized.usage;
+        counts.prompt_tokens = counts.prompt_tokens.saturating_add(usage.prompt);
+        counts.completion_tokens = counts.completion_tokens.saturating_add(usage.completion);
+        counts.cached_tokens = counts
+            .cached_tokens
+            .saturating_add(usage.cached.unwrap_or(0));
+        counts.reasoning_tokens = counts
+            .reasoning_tokens
+            .saturating_add(usage.reasoning.unwrap_or(0));
+        counts.usage_samples = counts.usage_samples.saturating_add(1);
+        counts.usage_anomalies = counts
+            .usage_anomalies
+            .saturating_add(normalized.anomaly_count);
+        if usage.cached.is_none() {
+            counts.unreported_cached_samples = counts.unreported_cached_samples.saturating_add(1);
+        }
+        match inputs.and_then(|inputs| inputs.cost_usd) {
+            Some(cost) if cost.is_finite() && cost >= 0.0 => {
+                counts.terminal_cost_usd += cost;
+                counts.priced_samples = counts.priced_samples.saturating_add(1);
+                if inputs.is_some_and(|inputs| {
+                    inputs.cost_confidence == TerminalCostConfidence::Estimated
+                }) || normalized.anomaly_count > 0
+                {
+                    counts.estimated_cost_samples = counts.estimated_cost_samples.saturating_add(1);
+                }
+            }
+            _ => {
+                counts.unpriced_usage_samples = counts.unpriced_usage_samples.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_terminal(
+        &mut self,
+        key: &BucketKey,
+        elapsed_ms: f64,
+        usage: Option<NormalizedUsage>,
+        inputs: Option<&TerminalMetricsInputs>,
+    ) {
+        let counts = self.buckets.entry(key.clone()).or_default();
+        counts.count = counts.count.saturating_add(1);
+        if let Some(usage) = usage {
+            Self::add_normalized_usage(counts, usage, inputs);
+        }
+        self.histogram.record(elapsed_ms);
+    }
+
+    fn add_tokens(&mut self, key: &BucketKey, usage: NormalizedUsage) {
+        Self::add_normalized_usage(self.buckets.entry(key.clone()).or_default(), usage, None);
+    }
+
+    fn into_sample(self, duration_ms: u128, active_streams_now: u64) -> InstantMetricSample {
+        // The DI root installs one synchronous bootstrap cut immediately after
+        // construction. Treat that sub-interval as state-only rather than publishing a
+        // misleading near-infinite startup rate; the async task waits a full second.
+        if duration_ms < 500 && self.accepted_requests == 0 && self.buckets.is_empty() {
+            return InstantMetricSample::bootstrap(active_streams_now);
+        }
+        let duration_ms = duration_ms.max(1);
+        let seconds = duration_ms as f64 / 1_000.0;
+        let count_status = |status| {
+            self.buckets
+                .iter()
+                .filter(|(key, _)| key.status == status)
+                .map(|(_, counts)| counts.count)
+                .fold(0u64, u64::saturating_add)
+        };
+        let successes = count_status(StatusClass::Success);
+        let failures = count_status(StatusClass::Error);
+        let cancellations = count_status(StatusClass::Cancelled);
+        let terminal_requests = successes
+            .saturating_add(failures)
+            .saturating_add(cancellations);
+        let usage_samples = self
+            .buckets
+            .values()
+            .map(|counts| counts.usage_samples)
+            .fold(0u64, u64::saturating_add);
+        let usage_anomaly_count = self
+            .buckets
+            .values()
+            .map(|counts| counts.usage_anomalies)
+            .fold(0u64, u64::saturating_add);
+        let priced_samples = self
+            .buckets
+            .values()
+            .map(|counts| counts.priced_samples)
+            .fold(0u64, u64::saturating_add);
+        let total_tokens = self
+            .buckets
+            .values()
+            .map(|counts| {
+                counts
+                    .prompt_tokens
+                    .saturating_add(counts.completion_tokens)
+            })
+            .fold(0i64, i64::saturating_add);
+        let total_cost: f64 = self
+            .buckets
+            .values()
+            .map(|counts| counts.terminal_cost_usd)
+            .sum();
+        let estimated_cost = self
+            .buckets
+            .values()
+            .any(|counts| counts.estimated_cost_samples > 0 || counts.unpriced_usage_samples > 0);
+        let percentiles = Percentiles {
+            p50: self.histogram.quantile(0.50),
+            p95: self.histogram.quantile(0.95),
+            p99: self.histogram.quantile(0.99),
+        };
+        let latency_quality = |minimum: u64| {
+            if terminal_requests == 0 {
+                InstantMetricQuality::Unavailable
+            } else if terminal_requests < minimum || self.histogram.is_partial() {
+                InstantMetricQuality::Partial
+            } else {
+                InstantMetricQuality::Measured
+            }
+        };
+        let percentage = |count: u64| {
+            (terminal_requests > 0).then_some(count as f64 / terminal_requests as f64 * 100.0)
+        };
+        InstantMetricSample {
+            interval_duration_ms: Some(duration_ms.min(u128::from(u64::MAX)) as u64),
+            ready: true,
+            accepted_requests: self.accepted_requests,
+            accepted_per_sec: Some(self.accepted_requests as f64 / seconds),
+            terminal_requests,
+            terminal_per_sec: Some(terminal_requests as f64 / seconds),
+            successes,
+            failures,
+            failure_pct: percentage(failures),
+            cancellations,
+            cancellation_pct: percentage(cancellations),
+            active_streams_now,
+            latency_samples: terminal_requests,
+            p50_ms: (terminal_requests > 0).then_some(percentiles.p50),
+            p95_ms: (terminal_requests > 0).then_some(percentiles.p95),
+            p99_ms: (terminal_requests > 0).then_some(percentiles.p99),
+            p50_quality: latency_quality(2),
+            p95_quality: latency_quality(20),
+            p99_quality: latency_quality(100),
+            quantile_method: QuantileMethod::LogHistogramNearestRank,
+            max_relative_error: HISTOGRAM_MAX_RELATIVE_ERROR,
+            latency_overflow_count: self.histogram.overflow_count(),
+            usage_samples,
+            reported_tokens_per_sec: (usage_samples > 0).then_some(total_tokens as f64 / seconds),
+            usage_anomaly_count,
+            priced_samples,
+            cost_per_min: (priced_samples > 0).then_some(total_cost / seconds * 60.0),
+            cost_confidence: if priced_samples == 0 {
+                TerminalCostConfidence::Unavailable
+            } else if estimated_cost {
+                TerminalCostConfidence::Estimated
+            } else {
+                TerminalCostConfidence::Confident
+            },
+        }
+    }
+}
+
 /// The collapsed per-window view: the merged per-key counts + the merged latency
 /// histogram, from which p50/p95/p99 are reported.
 #[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
@@ -1617,6 +1803,76 @@ pub struct Percentiles {
     pub p99: f64,
 }
 
+/// Data quality for one instantaneous metric value. Percentiles are still emitted for
+/// sparse intervals; `Partial` tells consumers that the nearest-rank estimate has fewer
+/// than the recommended number of observations.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum InstantMetricQuality {
+    Measured,
+    Partial,
+    #[default]
+    Unavailable,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum QuantileMethod {
+    #[default]
+    LogHistogramNearestRank,
+}
+
+/// One reset-on-publish dashboard telemetry interval. Unlike [`WindowReport`], this
+/// value contains only events observed since the previous publisher cut. Rates are
+/// normalized by `interval_duration_ms`, so a delayed tick remains truthful.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct InstantMetricSample {
+    pub interval_duration_ms: Option<u64>,
+    pub ready: bool,
+    pub accepted_requests: u64,
+    pub accepted_per_sec: Option<f64>,
+    pub terminal_requests: u64,
+    pub terminal_per_sec: Option<f64>,
+    pub successes: u64,
+    pub failures: u64,
+    pub failure_pct: Option<f64>,
+    pub cancellations: u64,
+    pub cancellation_pct: Option<f64>,
+    pub active_streams_now: u64,
+    pub latency_samples: u64,
+    pub p50_ms: Option<f64>,
+    pub p95_ms: Option<f64>,
+    pub p99_ms: Option<f64>,
+    pub p50_quality: InstantMetricQuality,
+    pub p95_quality: InstantMetricQuality,
+    pub p99_quality: InstantMetricQuality,
+    pub quantile_method: QuantileMethod,
+    pub max_relative_error: f64,
+    pub latency_overflow_count: u64,
+    pub usage_samples: u64,
+    pub reported_tokens_per_sec: Option<f64>,
+    pub usage_anomaly_count: u64,
+    pub priced_samples: u64,
+    pub cost_per_min: Option<f64>,
+    pub cost_confidence: TerminalCostConfidence,
+}
+
+impl InstantMetricSample {
+    /// Explicit pre-publisher value. Only the point-in-time active count is ready;
+    /// interval-derived fields remain unavailable until a complete interval is cut.
+    pub fn bootstrap(active_streams_now: u64) -> Self {
+        Self {
+            active_streams_now,
+            max_relative_error: HISTOGRAM_MAX_RELATIVE_ERROR,
+            ..Self::default()
+        }
+    }
+}
+
 /// The body-free metrics view captured into a [`DashboardSnapshot`]: the three
 /// windows' collapsed reports + their percentiles, as of the snapshot instant. This
 /// is a pure value (no `Arc`, no live-store reference), so a retained snapshot
@@ -1737,6 +1993,8 @@ pub struct PublishedMetricsCut {
     /// OPEN flows at this exact cut, counted from the same body-free FlowStore summaries
     /// captured while the FlowStore lock was held.
     pub active_streams: u64,
+    /// Reset-on-publish interval telemetry used by the StatsStrip and scrubber.
+    pub instant: InstantMetricSample,
     /// The three age-filtered metric windows as of `taken_at_ms`.
     pub view: MetricsView,
     /// The topology generation sampled for this same cut. Consumers that need provider
@@ -1821,6 +2079,10 @@ pub struct DashboardSnapshot {
     /// the oldest suffix and preserves a contiguous newest prefix.
     pub flow_summaries_truncated: bool,
     pub metrics: MetricsView,
+    /// Exact instantaneous sample from the publisher cut retained by this snapshot.
+    /// Schema-v4 CBOR rows predate it and deserialize to an unavailable bootstrap.
+    #[serde(default)]
+    pub instant: InstantMetricSample,
     /// The ONE topology cut captured in this snapshot. Serialized by DEREF (serde's
     /// blanket `Arc: Serialize` needs the `rc` feature, which we don't enable
     /// crate-wide; the inner `ProviderHealthSnapshot` already derives `Serialize`).
@@ -2148,6 +2410,16 @@ impl SnapshotRing {
         self.cuts.back().map(Arc::clone)
     }
 
+    fn between(&self, from_ms: Option<u64>, to_ms: Option<u64>) -> Vec<Arc<DashboardSnapshot>> {
+        let from = u128::from(from_ms.unwrap_or(0));
+        let to = u128::from(to_ms.unwrap_or(u64::MAX));
+        self.cuts
+            .iter()
+            .filter(|cut| cut.taken_at_ms >= from && cut.taken_at_ms <= to)
+            .cloned()
+            .collect()
+    }
+
     fn metadata(&self) -> SnapshotHistoryMetadata {
         SnapshotHistoryMetadata {
             oldest_at_ms: self.cuts.front().map(|cut| cut.taken_at_ms),
@@ -2170,6 +2442,8 @@ struct MetricsState {
     ring_1m: WindowRing,
     ring_5m: WindowRing,
     ring_1h: WindowRing,
+    instant: InstantAccumulator,
+    instant_started_ms: u128,
     /// Terminal/data mutation watermark. This proves which recorded samples a view
     /// includes but is not the published presentation cursor.
     metrics_seq: u64,
@@ -2188,6 +2462,8 @@ impl MetricsState {
             ring_1m: WindowRing::new(WINDOW_1M_SLOTS),
             ring_5m: WindowRing::new(WINDOW_5M_SLOTS),
             ring_1h: WindowRing::new(WINDOW_1H_SLOTS),
+            instant: InstantAccumulator::default(),
+            instant_started_ms: now_ms(),
             metrics_seq: 0,
             presentation_seq: 0,
             snapshots: SnapshotRing::new(snapshot_quota_bytes),
@@ -2214,6 +2490,7 @@ impl MetricsState {
             let slot = ring.slot_mut(epoch_s);
             slot.accepted_requests = slot.accepted_requests.saturating_add(1);
         }
+        self.instant.accepted_requests = self.instant.accepted_requests.saturating_add(1);
         self.metrics_seq = self.metrics_seq.saturating_add(1);
     }
 
@@ -2226,6 +2503,7 @@ impl MetricsState {
             entry.count = entry.count.saturating_add(1);
             slot.histogram.record(elapsed_ms);
         }
+        self.instant.record_response(key, elapsed_ms);
         self.metrics_seq = self.metrics_seq.saturating_add(1);
     }
 
@@ -2315,6 +2593,8 @@ impl MetricsState {
             }
             slot.histogram.record(elapsed_ms);
         }
+        self.instant
+            .record_terminal(key, elapsed_ms, normalized_usage, overview_inputs);
         self.metrics_seq = self.metrics_seq.saturating_add(1);
     }
 
@@ -2352,7 +2632,15 @@ impl MetricsState {
                 entry.unreported_cached_samples = entry.unreported_cached_samples.saturating_add(1);
             }
         }
+        self.instant.add_tokens(key, normalized);
         self.metrics_seq = self.metrics_seq.saturating_add(1);
+    }
+
+    fn drain_instant(&mut self, taken_at_ms: u128, active_streams: u64) -> InstantMetricSample {
+        let duration_ms = taken_at_ms.saturating_sub(self.instant_started_ms);
+        self.instant_started_ms = taken_at_ms;
+        let drained = std::mem::take(&mut self.instant);
+        drained.into_sample(duration_ms, active_streams)
     }
 
     /// Collapse the three rings into a body-free [`MetricsView`] as of `now_epoch_s`.
@@ -2745,6 +3033,7 @@ impl MetricsLayer {
             // Stamp LAST, after every independently mutable domain read.
             let taken_at_ms = read_time_ms();
             let now_epoch_s = (taken_at_ms / 1000) as u64;
+            let instant = state.drain_instant(taken_at_ms, active_streams);
 
             // The atomic cut is fixed. Release FlowStore before the heavier window
             // aggregation and optional summary trimming; Metrics remains locked.
@@ -2765,6 +3054,7 @@ impl MetricsLayer {
                     summaries,
                     flow_summaries_truncated: false,
                     metrics: view.clone(),
+                    instant: instant.clone(),
                     topology: Arc::clone(&topology),
                     backend_metrics: Arc::clone(&backend_metrics),
                 };
@@ -2777,6 +3067,7 @@ impl MetricsLayer {
                 cursors,
                 source_metrics_seq,
                 active_streams,
+                instant,
                 view,
                 topology,
                 backend_metrics,
@@ -2912,6 +3203,11 @@ impl MetricsLayer {
             // work (aggregation + push) under the metrics guard alone.
             flow_guard.release();
             let metrics = state.view(now_epoch);
+            let active_streams = summaries
+                .iter()
+                .filter(|summary| summary.status == FlowStatus::Open)
+                .count() as u64;
+            let instant = state.drain_instant(taken_at_ms, active_streams);
             let cursors = DomainCursors {
                 flow_seq,
                 metrics_seq,
@@ -2925,6 +3221,7 @@ impl MetricsLayer {
                 summaries,
                 flow_summaries_truncated: false,
                 metrics,
+                instant,
                 topology,
                 backend_metrics,
             };
@@ -2969,6 +3266,18 @@ impl MetricsLayer {
             return None;
         }
         self.lock().snapshots.latest()
+    }
+
+    /// Retained in-memory cuts in ascending timestamp order for history hydration.
+    pub fn snapshots_between(
+        &self,
+        from_ms: Option<u64>,
+        to_ms: Option<u64>,
+    ) -> Vec<Arc<DashboardSnapshot>> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        self.lock().snapshots.between(from_ms, to_ms)
     }
 
     /// Metadata for the bounded historical snapshot ring. This is an API-neutral,
@@ -3048,7 +3357,10 @@ pub fn spawn_metrics_publisher_task_with_history(
     }
     Some(tokio::spawn(async move {
         let clock = MetricsPublisherClock::new();
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut tick_count = 0u64;
         loop {
@@ -3184,6 +3496,8 @@ mod tests {
         let decoded: DashboardSnapshot = serde_cbor::from_slice(&bytes).unwrap();
         assert_eq!(decoded.cursors.backend_metrics_seq, 0);
         assert!(decoded.backend_metrics.providers.is_empty());
+        assert!(!decoded.instant.ready);
+        assert_eq!(decoded.instant.accepted_per_sec, None);
     }
 
     /// Build a histogram from an explicit list of latency samples (ms).
@@ -3295,6 +3609,61 @@ mod tests {
     }
 
     #[test]
+    fn instantaneous_rates_use_actual_interval_and_sparse_quantiles_remain_visible() {
+        let key = BucketKey {
+            status: StatusClass::Success,
+            model: "priced".to_string(),
+            endpoint: "/v1/responses".to_string(),
+            upstream: "provider-a".to_string(),
+        };
+        let mut accumulator = InstantAccumulator {
+            accepted_requests: 2,
+            ..Default::default()
+        };
+        accumulator.record_terminal(
+            &key,
+            125.0,
+            Some(normalize_usage(FlowUsage {
+                prompt: 100,
+                completion: 50,
+                total: 150,
+                cached: Some(0),
+                reasoning: Some(0),
+            })),
+            Some(&TerminalMetricsInputs {
+                cost_usd: Some(0.25),
+                cost_confidence: TerminalCostConfidence::Confident,
+                ..Default::default()
+            }),
+        );
+        let sample = accumulator.into_sample(2_500, 3);
+        assert_eq!(sample.accepted_per_sec, Some(0.8));
+        assert_eq!(sample.terminal_per_sec, Some(0.4));
+        assert_eq!(sample.reported_tokens_per_sec, Some(60.0));
+        assert_eq!(sample.cost_per_min, Some(6.0));
+        assert_eq!(sample.p50_ms, Some(125.0));
+        assert_eq!(sample.p95_ms, Some(125.0));
+        assert_eq!(sample.p99_ms, Some(125.0));
+        assert_eq!(sample.p50_quality, InstantMetricQuality::Partial);
+        assert_eq!(sample.p95_quality, InstantMetricQuality::Partial);
+        assert_eq!(sample.p99_quality, InstantMetricQuality::Partial);
+        assert_eq!(sample.active_streams_now, 3);
+    }
+
+    #[test]
+    fn instantaneous_idle_interval_has_zero_rates_and_sample_gaps() {
+        let sample = InstantAccumulator::default().into_sample(1_750, 0);
+        assert!(sample.ready);
+        assert_eq!(sample.accepted_per_sec, Some(0.0));
+        assert_eq!(sample.terminal_per_sec, Some(0.0));
+        assert_eq!(sample.failure_pct, None);
+        assert_eq!(sample.cancellation_pct, None);
+        assert_eq!(sample.p50_ms, None);
+        assert_eq!(sample.reported_tokens_per_sec, None);
+        assert_eq!(sample.cost_per_min, None);
+    }
+
+    #[test]
     fn malformed_usage_is_normalized_without_double_counting_subclasses() {
         let metrics = MetricsLayer::new();
         metrics.record_terminal(
@@ -3377,10 +3746,24 @@ mod tests {
         .expect("enabled publisher task");
 
         tokio::task::yield_now().await;
+        assert!(
+            receiver.borrow().is_none(),
+            "the first tick waits one full interval"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
         let first = next_published_cut(&mut receiver).await;
         assert_eq!(first.view.window_1m.total_count(), 1);
         assert_eq!(first.view.window_5m.total_count(), 1);
         assert_eq!(first.source_metrics_seq, 1);
+        assert!(first.instant.ready);
+        assert_eq!(first.instant.terminal_requests, 1);
+        assert_eq!(first.instant.p50_quality, InstantMetricQuality::Partial);
+
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let idle = next_published_cut(&mut receiver).await;
+        assert_eq!(idle.instant.terminal_requests, 0);
+        assert_eq!(idle.instant.terminal_per_sec, Some(0.0));
+        assert_eq!(idle.instant.p50_ms, None, "the request does not decay");
 
         // No terminal mutation occurs. Advancing only Tokio's paused monotonic clock
         // still drives the publisher's epoch-compatible timestamp far enough to expire
@@ -3432,6 +3815,7 @@ mod tests {
         .expect("enabled publisher task");
 
         tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
         let mut published = next_published_cut(&mut receiver).await;
         assert_eq!(published.active_streams, 1);
         assert!(
@@ -3455,6 +3839,7 @@ mod tests {
             .expect("tick 5 persisted a snapshot");
         assert_eq!(snapshot.taken_at_ms, published.taken_at_ms);
         assert_eq!(snapshot.cursors, published.cursors);
+        assert_eq!(snapshot.instant, published.instant);
         assert!(Arc::ptr_eq(&snapshot.topology, &published.topology));
         assert_eq!(
             snapshot.metrics.window_1m.total_count(),

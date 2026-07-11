@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 /// Current dashboard bootstrap, REST, and WebSocket schema version.
-pub const DASHBOARD_SCHEMA_VERSION: u32 = 4;
+pub const DASHBOARD_SCHEMA_VERSION: u32 = 5;
 
 /// Header carried by every `/dashboard/api/*` response.
 pub const DASHBOARD_SCHEMA_HEADER: &str = "x-llmconduit-dashboard-schema";

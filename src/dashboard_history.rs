@@ -859,6 +859,7 @@ mod tests {
             summaries: vec![summary],
             flow_summaries_truncated: false,
             metrics: MetricsView::default(),
+            instant: crate::metrics::InstantMetricSample::default(),
             topology: Arc::new(ProviderHealthSnapshot::default()),
             backend_metrics: Arc::new(crate::backend_metrics::BackendMetricsSnapshot::default()),
         });
@@ -893,6 +894,7 @@ mod tests {
                 summaries: vec![flow.clone()],
                 flow_summaries_truncated: false,
                 metrics: MetricsView::default(),
+                instant: crate::metrics::InstantMetricSample::default(),
                 topology: Arc::new(ProviderHealthSnapshot::default()),
                 backend_metrics: Arc::new(crate::backend_metrics::BackendMetricsSnapshot::default()),
             }));
