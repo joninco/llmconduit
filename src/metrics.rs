@@ -129,7 +129,7 @@ const BTREE_ENTRY_OVERHEAD_BYTES: usize = 4 * std::mem::size_of::<usize>();
 /// HTTP status class for a terminal flow, the metrics bucket key dimension. Derived
 /// from the [`FlowStatus`] terminal (the engine does not thread a raw numeric code
 /// to the metrics seam — the terminal status IS the authoritative outcome).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StatusClass {
     /// A clean `Completed` terminal (2xx-equivalent).
@@ -159,7 +159,7 @@ impl StatusClass {
 /// is the serving provider/route label. Unknown dimensions collapse to `"unknown"`
 /// so the key space stays bounded and a missing attribution never spawns a distinct
 /// `None` bucket.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 pub struct BucketKey {
     pub status: StatusClass,
     pub model: String,
@@ -171,7 +171,7 @@ pub struct BucketKey {
 /// token counters. Latency is aggregated separately in the window-level
 /// [`Histogram`] (a per-key histogram would be 30 buckets × |keys| — wasteful;
 /// p-quantiles are reported window-wide, which is the stats-strip contract).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
 pub struct BucketCounts {
     pub count: u64,
     pub prompt_tokens: i64,
@@ -253,6 +253,38 @@ impl Serialize for Histogram {
         state.serialize_field("observed_max_ms", &self.observed_max_ms)?;
         state.serialize_field("saturated", &self.saturated)?;
         state.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Histogram {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct StoredHistogram {
+            buckets: Vec<u32>,
+            underflow: u32,
+            overflow: u32,
+            total: u64,
+            observed_min_ms: f64,
+            observed_max_ms: f64,
+            saturated: bool,
+        }
+        let stored = StoredHistogram::deserialize(deserializer)?;
+        let buckets: [u32; HISTOGRAM_BUCKETS] =
+            stored.buckets.try_into().map_err(|values: Vec<u32>| {
+                serde::de::Error::invalid_length(values.len(), &"128 histogram buckets")
+            })?;
+        Ok(Self {
+            buckets,
+            underflow: stored.underflow,
+            overflow: stored.overflow,
+            total: stored.total,
+            observed_min_ms: stored.observed_min_ms,
+            observed_max_ms: stored.observed_max_ms,
+            saturated: stored.saturated,
+        })
     }
 }
 
@@ -448,7 +480,7 @@ impl ProviderErrorDistribution {
 /// distribution 6 `u64`s) so a provider's per-slot footprint is O(1) regardless of
 /// traffic — samples-per-provider are bounded by the histogram, provider COUNT by
 /// [`MAX_TRACKED_PROVIDERS`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 struct ProviderSample {
     histogram: Histogram,
     served: u64,
@@ -497,7 +529,7 @@ impl ProviderSample {
 /// already scalar-capped by the evict-safe terminal payload. Missing attribution is
 /// normalized to `unknown`, while cardinality overflow uses the distinct enum-level
 /// [`OverviewKey::Other`] key so a legitimate label can never collide with it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 struct OverviewDimensions {
     status: StatusClass,
     requested_model: String,
@@ -522,7 +554,7 @@ impl OverviewDimensions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, serde::Deserialize)]
 enum OverviewKey {
     Exact(OverviewDimensions),
     Other,
@@ -542,7 +574,7 @@ fn overview_key_heap_bytes(key: &OverviewKey) -> usize {
 
 /// Additive terminal facts for one overview combination. Cost is the value captured at
 /// terminal time; no price table is consulted while a live or historical view is read.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 struct OverviewCounts {
     requests: u64,
     successes: u64,
@@ -652,7 +684,7 @@ impl OverviewCounts {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 struct OverviewSlotReport {
     epoch_s: u64,
     entries: BTreeMap<OverviewKey, OverviewCounts>,
@@ -896,15 +928,15 @@ impl WindowRing {
 
 /// The collapsed per-window view: the merged per-key counts + the merged latency
 /// histogram, from which p50/p95/p99 are reported.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 pub struct WindowReport {
     /// Accepted starts in the window. Unlike `total_count`, this includes still-open flows.
     pub accepted_requests: u64,
     /// Process coverage at this cut. Renderers cap it to the selected window length.
     pub observed_seconds: u64,
-    #[serde(skip)]
+    #[serde(default)]
     window_seconds: u64,
-    #[serde(skip)]
+    #[serde(default)]
     as_of_epoch_s: u64,
     pub buckets: BTreeMap<BucketKey, BucketCounts>,
     pub histogram: Histogram,
@@ -915,15 +947,15 @@ pub struct WindowReport {
     /// window `percentiles` are computed at render rather than stored. This keeps the
     /// raw internal [`ProviderSample`] (with its private histogram) off the wire and
     /// the snapshot payload unchanged.
-    #[serde(skip)]
+    #[serde(default)]
     providers: BTreeMap<String, ProviderSample>,
-    #[serde(skip)]
+    #[serde(default)]
     overview: BTreeMap<OverviewKey, OverviewCounts>,
-    #[serde(skip)]
+    #[serde(default)]
     overview_slots: Vec<OverviewSlotReport>,
-    #[serde(skip)]
+    #[serde(default)]
     slot_folded_samples: u64,
-    #[serde(skip)]
+    #[serde(default)]
     aggregate_folded_samples: u64,
 }
 
@@ -1578,7 +1610,7 @@ fn terminal_reason_label(reason: TerminalReasonClass) -> &'static str {
 }
 
 /// The reported p50/p95/p99 latency (ms) for a window.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, serde::Deserialize)]
 pub struct Percentiles {
     pub p50: f64,
     pub p95: f64,
@@ -1589,7 +1621,7 @@ pub struct Percentiles {
 /// windows' collapsed reports + their percentiles, as of the snapshot instant. This
 /// is a pure value (no `Arc`, no live-store reference), so a retained snapshot
 /// cannot pin live state.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 pub struct MetricsView {
     pub generated_at_ms: u128,
     pub window_1m: WindowReport,
@@ -1667,7 +1699,7 @@ impl MetricsView {
 /// The per-domain cursor quad carried on every [`DashboardSnapshot`] (AGENTS.md:
 /// per-domain `{domain, seq}` cursors, NOT a single global watermark). Each field
 /// is the authoritative sequence of its own store at the cut instant.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct DomainCursors {
     /// FlowStore mutation sequence (D1).
     pub flow_seq: u64,
@@ -1773,7 +1805,7 @@ impl std::fmt::Debug for MetricsPublisher {
 ///
 /// Immutable once built; `Arc`-wrapped in the ring so a reader's clone is cheap and
 /// never mutated underneath it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct DashboardSnapshot {
     pub taken_at_ms: u128,
     pub cursors: DomainCursors,
@@ -1786,7 +1818,10 @@ pub struct DashboardSnapshot {
     /// The ONE topology cut captured in this snapshot. Serialized by DEREF (serde's
     /// blanket `Arc: Serialize` needs the `rc` feature, which we don't enable
     /// crate-wide; the inner `ProviderHealthSnapshot` already derives `Serialize`).
-    #[serde(serialize_with = "serialize_topology")]
+    #[serde(
+        serialize_with = "serialize_topology",
+        deserialize_with = "deserialize_topology"
+    )]
     pub topology: Arc<ProviderHealthSnapshot>,
 }
 
@@ -1800,6 +1835,13 @@ where
     S: serde::Serializer,
 {
     (**topology).serialize(serializer)
+}
+
+fn deserialize_topology<'de, D>(deserializer: D) -> Result<Arc<ProviderHealthSnapshot>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <ProviderHealthSnapshot as serde::Deserialize>::deserialize(deserializer).map(Arc::new)
 }
 
 impl DashboardSnapshot {
@@ -2920,6 +2962,25 @@ pub fn spawn_metrics_publisher_task(
     topology: ProviderHealthPublisher,
     monitor: crate::monitor::MonitorHub,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_metrics_publisher_task_with_history(
+        metrics,
+        flow_store,
+        topology,
+        monitor,
+        crate::dashboard_history::DashboardHistory::disabled(),
+    )
+}
+
+/// Durable-history variant used by the DI root. The SQLite enqueue happens only on the
+/// publisher task after the exact in-memory cut is committed; inference seams never
+/// serialize or wait on the database writer.
+pub fn spawn_metrics_publisher_task_with_history(
+    metrics: MetricsLayer,
+    flow_store: DashboardFlowStore,
+    topology: ProviderHealthPublisher,
+    monitor: crate::monitor::MonitorHub,
+    history: crate::dashboard_history::DashboardHistory,
+) -> Option<tokio::task::JoinHandle<()>> {
     if !metrics.is_enabled() {
         return None;
     }
@@ -2932,13 +2993,19 @@ pub fn spawn_metrics_publisher_task(
             interval.tick().await;
             tick_count = tick_count.saturating_add(1);
             let persist_snapshot = tick_count.is_multiple_of(5);
-            let _ = metrics.publish_metrics_cut_with(
+            let published = metrics.publish_metrics_cut_with(
                 &flow_store,
                 &topology,
                 || monitor.last_sequence(),
                 || clock.now_ms(),
                 persist_snapshot,
             );
+            if persist_snapshot
+                && let (Some(published), Some(snapshot)) = (published, metrics.latest_snapshot())
+                && snapshot.taken_at_ms == published.taken_at_ms
+            {
+                history.persist_cut(snapshot);
+            }
         }
     }))
 }

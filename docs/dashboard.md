@@ -73,6 +73,11 @@ All handlers take `State(Arc<Gateway>)`. Every response flows through `json_no_s
 | GET | `/dashboard/api/topology` | `dashboard_topology` (1092) | Provider node/edge graph with per-upstream rates |
 | GET | `/dashboard/api/catalog` | `dashboard_catalog` (1113) | Model catalog bare array `[{id, context_limit?}]` |
 | GET | `/dashboard/api/snapshot?at=` | `dashboard_snapshot` (1136) | Body-free frozen cut (time-travel) |
+| GET | `/dashboard/api/history` | `dashboard_history` | Downsampled SQLite cut index for the scrubber |
+
+All historical endpoints also accept the stable `cut_id` returned by `/history` or `/snapshot`.
+Passing it to `/snapshot`, `/flows`, `/flows/:id`, `/metrics`, `/overview`, or `/topology`
+keeps every view on one coordinated cut rather than independently rounding a timestamp.
 
 ### Key DTOs
 
@@ -162,6 +167,22 @@ The authoritative per-flow record store with capped/redacted body capture.
 ### Env for response capture
 
 `LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE` (line 73) — off by default, arms gap-05 upstream error body capture.
+
+### Durable dashboard history
+
+`LLMCONDUIT_DASHBOARD_HISTORY_DB=/path/to/dashboard.sqlite3` enables SQLite history when
+`--with-debug-ui` is active. `LLMCONDUIT_DASHBOARD_HISTORY_RETENTION_HOURS` controls retention
+(default 24 hours). The store uses WAL mode and a dedicated bounded writer queue; request handling
+never performs SQLite I/O. Every five-second coordinated cut persists metrics, topology, flow
+versions, and domain cursors. Monitor updates are persisted separately through the cut's monitor
+cursor, so historical Theater and flow timelines replay only data known at that cut.
+
+Large bodies remain in the existing atomic `turn_capture_dir/<api_call_id>.json` artifacts rather
+than in SQLite/WAL. The artifact now contains inbound, normalized, final upstream request, raw final
+upstream response, and served response sections when available. SQLite indexes those files at
+startup, and flow detail also resolves the deterministic path for newly completed turns. Retention
+of the artifact files remains governed by `debug_log_max_age_hours`; align it with the SQLite
+retention if historical cuts must retain full captured I/O for the same duration.
 
 ## WebSocket (`dashboard_ws.rs`)
 

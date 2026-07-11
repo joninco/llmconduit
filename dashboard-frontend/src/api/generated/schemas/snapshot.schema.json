@@ -12,6 +12,15 @@
     "cursors": {
       "$ref": "#/$defs/SeqCursors"
     },
+    "cut_id": {
+      "description": "Stable durable-cut identifier. Equal to the coordinated cut's epoch-ms stamp;\nabsent only when no historical cut exists yet.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint64",
+      "minimum": 0
+    },
     "flow_summaries_truncated": {
       "description": "Whether this selected cut dropped its oldest flow summaries to fit the quota.",
       "type": "boolean"
@@ -29,6 +38,13 @@
           "type": "null"
         }
       ]
+    },
+    "monitor_messages": {
+      "description": "Persisted monitor messages through this cut. Empty for legacy in-memory-only\ncuts; durable cuts use them for historical flow timelines and Theater replay.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DebugWsMessage"
+      }
     },
     "summaries": {
       "type": "array",
@@ -254,6 +270,491 @@
           "description": "No price is configured for the served model: there is NO cost (the row reports\n`cost: null`), so the figure is UNAVAILABLE — never a fabricated `0`. The\nDEFAULT: a window/flow with nothing priced makes no confident claim.",
           "type": "string",
           "const": "unavailable"
+        }
+      ]
+    },
+    "DebugEventImage": {
+      "description": "Metadata about an image found in a request/response preview, surfaced to the\ndebug UI over `/debug/ws`. Carries ONLY non-sensitive descriptors — never the\nraw image bytes or URL (G4 round-4 #4): `data:`/signed URLs must not leave the\nprocess via the monitor broadcast. The UI renders a redacted placeholder card\nfrom this metadata, not the image itself.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "path",
+        "mime_type",
+        "size_bytes"
+      ]
+    },
+    "DebugRequest": {
+      "type": "object",
+      "properties": {
+        "completed_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "response_id": {
+          "type": "string"
+        },
+        "started_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "stats": {
+          "$ref": "#/$defs/DebugRequestStats"
+        },
+        "status": {
+          "$ref": "#/$defs/DebugRequestStatus"
+        },
+        "updated_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "usage": {
+          "description": "D3: latest cumulative token usage for the flow (`None` until the first\nusage-bearing chunk). Retained so `snapshot()` replays it to a late\nsubscriber after the `RequestUpsert`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DebugUsage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "response_id",
+        "model",
+        "started_at_ms",
+        "updated_at_ms",
+        "completed_at_ms",
+        "status",
+        "stats",
+        "error"
+      ]
+    },
+    "DebugRequestStats": {
+      "type": "object",
+      "properties": {
+        "assistant_messages": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "developer_messages": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "function_calls": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "function_outputs": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "input_chars": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "input_items": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "instructions_chars": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "reasoning_items": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "system_messages": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "tool_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "tool_items": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "turn_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "user_messages": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "input_items",
+        "tool_count",
+        "turn_count",
+        "user_messages",
+        "assistant_messages",
+        "system_messages",
+        "developer_messages",
+        "reasoning_items",
+        "function_calls",
+        "function_outputs",
+        "tool_items",
+        "input_chars",
+        "instructions_chars"
+      ]
+    },
+    "DebugRequestStatus": {
+      "type": "string",
+      "enum": [
+        "running",
+        "completed",
+        "failed"
+      ]
+    },
+    "DebugSegment": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/DebugSegmentKind"
+        },
+        "text": {
+          "type": "string"
+        },
+        "timestamp_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "timestamp_ms",
+        "kind",
+        "text"
+      ]
+    },
+    "DebugSegmentKind": {
+      "type": "string",
+      "enum": [
+        "output",
+        "reasoning",
+        "tool"
+      ]
+    },
+    "DebugTimelineEvent": {
+      "type": "object",
+      "properties": {
+        "images": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DebugEventImage"
+          }
+        },
+        "kind": {
+          "type": "string"
+        },
+        "payload_preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "timestamp_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "timestamp_ms",
+        "kind",
+        "summary",
+        "payload_preview",
+        "images"
+      ]
+    },
+    "DebugUsage": {
+      "description": "D3: the latest cumulative token usage retained on a [`DebugRequest`] so the\n`/debug/ws` snapshot can replay it to a late subscriber.",
+      "type": "object",
+      "properties": {
+        "cached": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "completion": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "prompt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "reasoning": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "total": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "prompt",
+        "completion",
+        "total",
+        "cached",
+        "reasoning"
+      ]
+    },
+    "DebugWsMessage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "history_limit": {
+              "type": "integer",
+              "format": "uint",
+              "minimum": 0
+            },
+            "history_retention_ms": {
+              "type": "integer",
+              "format": "uint128",
+              "minimum": 0
+            },
+            "protocol_version": {
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "hello"
+            }
+          },
+          "required": [
+            "type",
+            "protocol_version",
+            "history_limit",
+            "history_retention_ms"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/DebugRequest"
+            },
+            "type": {
+              "type": "string",
+              "const": "request_upsert"
+            }
+          },
+          "required": [
+            "type",
+            "request"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "response_id": {
+              "type": "string"
+            },
+            "segment": {
+              "$ref": "#/$defs/DebugSegment"
+            },
+            "type": {
+              "type": "string",
+              "const": "segment_append"
+            }
+          },
+          "required": [
+            "type",
+            "response_id",
+            "segment"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "$ref": "#/$defs/DebugTimelineEvent"
+            },
+            "response_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "event_append"
+            }
+          },
+          "required": [
+            "type",
+            "response_id",
+            "event"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "completed_at_ms": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint128",
+              "minimum": 0
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "response_id": {
+              "type": "string"
+            },
+            "status": {
+              "$ref": "#/$defs/DebugRequestStatus"
+            },
+            "type": {
+              "type": "string",
+              "const": "request_status"
+            }
+          },
+          "required": [
+            "type",
+            "response_id",
+            "status",
+            "completed_at_ms",
+            "error"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "response_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "request_remove"
+            }
+          },
+          "required": [
+            "type",
+            "response_id",
+            "reason"
+          ]
+        },
+        {
+          "description": "D3: cumulative token usage for a flow (running total, not an increment).\nReplayed in `snapshot()` after the record's `RequestUpsert` so a late\nsubscriber sees the latest usage. Carries no image URIs (no-op redact arm).",
+          "type": "object",
+          "properties": {
+            "cached": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "completion": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "prompt": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "reasoning": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "response_id": {
+              "type": "string"
+            },
+            "total": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "type": {
+              "type": "string",
+              "const": "usage"
+            }
+          },
+          "required": [
+            "type",
+            "response_id",
+            "prompt",
+            "completion",
+            "total",
+            "cached",
+            "reasoning"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "snapshot_done"
+            }
+          },
+          "required": [
+            "type"
+          ]
         }
       ]
     },

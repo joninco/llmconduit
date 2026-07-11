@@ -6,11 +6,9 @@
  * auto-sizes: 1 river → big, 2 → split, 3-6 → a 3-wide multi-grid. A fullscreen toggle expands the
  * theater over the whole viewport.
  *
- * SEEK (D11) — the approved body-free-snapshot tradeoff, surfaced honestly: a historical snapshot
- * carries NO delta stream (the bodies are evicted — see D5/D10), so the theater CANNOT replay a
- * live river for a past moment. While seeking we therefore show an explicit "historical — deltas
- * not replayed" banner and render only the frozen snapshot's TERMINAL SUMMARY per flow (model,
- * status, token totals), NOT a fake live river. Leaving seek returns to the live rivers.
+ * SEEK (D11) — durable SQLite cuts carry a monitor cursor and persisted transcript. Theater folds
+ * those messages into frozen rivers when available and falls back to terminal summaries for legacy
+ * or incomplete history. Leaving seek returns to the live rivers.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { River } from '../components/viz/River';
@@ -132,12 +130,13 @@ function LiveTheater() {
 }
 
 /**
- * The frozen-seek theater: NO live river (body-free snapshots have no deltas). Renders the
- * snapshot's terminal summary per flow + the explicit "deltas not replayed" affordance.
+ * The frozen-seek theater replays persisted monitor messages when present and otherwise renders
+ * the snapshot's terminal summaries with an explicit unavailable affordance.
  */
 function HistoricalTheater() {
   const flows = useDashboard((s) => s.flows);
   const summaries = useMemo(() => [...flows.values()], [flows]);
+  const rivers = useLiveRivers();
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-bg p-4" data-testid="theater-view-historical">
@@ -147,10 +146,18 @@ function HistoricalTheater() {
           className="rounded-sm border border-status-cooling/40 bg-status-cooling/10 px-2 py-0.5 text-[11px] text-status-cooling"
           data-testid="theater-historical-banner"
         >
-          historical — deltas not replayed
+          historical — persisted transcript; deltas not replayed when unavailable
         </span>
       </header>
-      {summaries.length === 0 ? (
+      {rivers.length > 0 ? (
+        <div
+          className="grid min-h-0 flex-1 gap-3"
+          style={{ gridTemplateColumns: `repeat(${gridColumns(rivers.length)}, minmax(0, 1fr))` }}
+          data-testid="theater-historical-rivers"
+        >
+          {rivers.map((river) => <River key={river.id} river={river} exiting={false} />)}
+        </div>
+      ) : summaries.length === 0 ? (
         <div className="flex flex-1 items-center justify-center text-sm text-text-muted" data-testid="theater-historical-empty">
           No flows in this snapshot.
         </div>

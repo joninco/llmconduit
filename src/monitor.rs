@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -15,7 +15,7 @@ const REQUEST_TEXT_CHAR_LIMIT: usize = 128 * 1024;
 /// 512-record cap. Also reused as the dashboard FlowStore record cap (D1).
 pub(crate) const REQUEST_EVENT_LIMIT: usize = 512;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MonitorEventKind {
     RequestStarted {
         model: String,
@@ -89,7 +89,7 @@ pub enum MonitorEventKind {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitorEvent {
     pub sequence: u64,
     pub response_id: String,
@@ -97,19 +97,19 @@ pub struct MonitorEvent {
     pub kind: MonitorEventKind,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugUpdate {
     pub sequence: u64,
     pub messages: Vec<DebugWsMessage>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugSnapshot {
     pub last_sequence: u64,
     pub messages: Vec<DebugWsMessage>,
 }
 
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DebugWsMessage {
     Hello {
@@ -154,7 +154,7 @@ pub enum DebugWsMessage {
 
 /// D3: the latest cumulative token usage retained on a [`DebugRequest`] so the
 /// `/debug/ws` snapshot can replay it to a late subscriber.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DebugUsage {
     pub prompt: i64,
     pub completion: i64,
@@ -163,7 +163,7 @@ pub struct DebugUsage {
     pub reasoning: i64,
 }
 
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DebugRequest {
     pub response_id: String,
     pub model: String,
@@ -180,7 +180,7 @@ pub struct DebugRequest {
     pub usage: Option<DebugUsage>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DebugRequestStatus {
     Running,
@@ -188,7 +188,7 @@ pub enum DebugRequestStatus {
     Failed,
 }
 
-#[derive(Debug, Default, Clone, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DebugRequestStats {
     pub input_items: usize,
     pub tool_count: usize,
@@ -205,14 +205,14 @@ pub struct DebugRequestStats {
     pub instructions_chars: usize,
 }
 
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DebugSegment {
     pub timestamp_ms: u128,
     pub kind: DebugSegmentKind,
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DebugSegmentKind {
     Output,
@@ -220,7 +220,7 @@ pub enum DebugSegmentKind {
     Tool,
 }
 
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DebugTimelineEvent {
     pub timestamp_ms: u128,
     pub kind: String,
@@ -234,7 +234,7 @@ pub struct DebugTimelineEvent {
 /// raw image bytes or URL (G4 round-4 #4): `data:`/signed URLs must not leave the
 /// process via the monitor broadcast. The UI renders a redacted placeholder card
 /// from this metadata, not the image itself.
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DebugEventImage {
     pub id: String,
     pub label: String,

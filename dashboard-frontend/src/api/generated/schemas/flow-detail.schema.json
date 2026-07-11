@@ -21,6 +21,13 @@
       ],
       "format": "double"
     },
+    "captured_sections": {
+      "description": "Every body section available from the durable per-turn artifact. This includes\nsuccessful upstream/served responses that were intentionally never retained in\nthe live FlowStore. Sections load lazily at the HTTP request, not into snapshots.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/CapturedSection"
+      }
+    },
     "cost": {
       "type": [
         "number",
@@ -43,6 +50,9 @@
       "type": "integer",
       "format": "uint64",
       "minimum": 0
+    },
+    "detail_source": {
+      "$ref": "#/$defs/FlowDetailSource"
     },
     "effective_route_limit": {
       "type": [
@@ -283,6 +293,7 @@
     }
   },
   "required": [
+    "detail_source",
     "flow_seq",
     "revision",
     "api_call_id",
@@ -457,6 +468,33 @@
         }
       ]
     },
+    "CapturedSection": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "content": true,
+        "encoding": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "partial": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "bytes",
+        "partial",
+        "encoding",
+        "content"
+      ]
+    },
     "CostConfidence": {
       "description": "Gap 07 — the CONFIDENCE tier of a flow's `cost`, so an operator can tell a trusted\nfigure from a best-effort estimate from an honest gap. Emitted alongside `cost` on\nevery flow row + detail (and aggregated onto the metrics windows). Serializes\nsnake_case to mirror the data-quality vocabulary the frontend already uses\n(`measured`/`derived`/`estimated`/`unavailable`).",
       "oneOf": [
@@ -502,6 +540,13 @@
       "required": [
         "sequence",
         "kind"
+      ]
+    },
+    "FlowDetailSource": {
+      "type": "string",
+      "enum": [
+        "live",
+        "durable"
       ]
     },
     "FlowStatus": {

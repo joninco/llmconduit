@@ -48,17 +48,18 @@ export function OverviewView() {
   const hashScope = useHashScope();
   const seeking = useDashboard((state) => state.connection === 'seeking');
   const seekAtMs = useDashboard((state) => state.seekAtMs);
+  const seekCutId = useDashboard((state) => state.seekCutId);
   const { client } = getConnection();
   const openOnly = hashScope.status === 'open';
 
   const request = useMemo<OverviewQuery>(() => ({
     window: hashScope.window,
-    ...(seeking && seekAtMs !== null ? { at: seekAtMs } : {}),
+    ...(seeking && seekCutId !== null ? { cut_id: seekCutId } : seeking && seekAtMs !== null ? { at: seekAtMs } : {}),
     ...(hashScope.status ? { status: hashScope.status } : {}),
     ...(hashScope.model ? { model: hashScope.model } : {}),
     ...(hashScope.upstream ? { upstream: hashScope.upstream } : {}),
     ...(hashScope.client ? { client: hashScope.client } : {}),
-  }), [hashScope.client, hashScope.model, hashScope.status, hashScope.upstream, hashScope.window, seekAtMs, seeking]);
+  }), [hashScope.client, hashScope.model, hashScope.status, hashScope.upstream, hashScope.window, seekAtMs, seekCutId, seeking]);
 
   const overview = useQuery({
     queryKey: queryKeys.overview(request),

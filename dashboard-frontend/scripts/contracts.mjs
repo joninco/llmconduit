@@ -62,6 +62,7 @@ async function generate(output) {
     { file: 'catalog', exported: 'validateCatalog', type: 'CatalogEntry[]', definition: null, group: 'rest' },
     { file: 'flow-detail', exported: 'validateFlowDetail', type: 'FlowDetailBody', definition: 'FlowDetailBody', group: 'rest' },
     { file: 'flows', exported: 'validateFlows', type: 'FlowsResponse', definition: 'FlowsResponse', group: 'rest' },
+    { file: 'history', exported: 'validateHistory', type: 'HistoryResponse', definition: 'HistoryResponse', group: 'rest' },
     { file: 'kill', exported: 'validateKill', type: 'KillResponse', definition: 'KillResponse', group: 'rest' },
     { file: 'metrics', exported: 'validateMetrics', type: 'MetricsSnapshot', definition: 'MetricsSnapshot', group: 'rest' },
     { file: 'overview', exported: 'validateOverview', type: 'OverviewResponse', definition: 'OverviewResponse', group: 'rest' },

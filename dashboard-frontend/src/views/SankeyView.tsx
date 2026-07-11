@@ -18,16 +18,17 @@ export function SankeyView() {
   const scope = useHashScope();
   const seeking = useDashboard((state) => state.connection === 'seeking');
   const seekAtMs = useDashboard((state) => state.seekAtMs);
+  const seekCutId = useDashboard((state) => state.seekCutId);
   const { client } = getConnection();
   const openOnly = scope.status === 'open';
   const request = useMemo<OverviewQuery>(() => ({
     window: scope.window,
-    ...(seeking && seekAtMs !== null ? { at: seekAtMs } : {}),
+    ...(seeking && seekCutId !== null ? { cut_id: seekCutId } : seeking && seekAtMs !== null ? { at: seekAtMs } : {}),
     ...(scope.status ? { status: scope.status } : {}),
     ...(scope.model ? { model: scope.model } : {}),
     ...(scope.upstream ? { upstream: scope.upstream } : {}),
     ...(scope.client ? { client: scope.client } : {}),
-  }), [scope.client, scope.model, scope.status, scope.upstream, scope.window, seekAtMs, seeking]);
+  }), [scope.client, scope.model, scope.status, scope.upstream, scope.window, seekAtMs, seekCutId, seeking]);
 
   const overview = useQuery({
     queryKey: queryKeys.overview(request),

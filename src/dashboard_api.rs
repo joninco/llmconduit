@@ -262,6 +262,7 @@ pub struct FlowsResponse {
 /// `upstream` filter, `page`/`limit` page (1-based page; absent ⇒ all rows).
 #[derive(Debug, Default, Deserialize)]
 pub struct FlowsQuery {
+    pub cut_id: Option<u64>,
     pub status: Option<String>,
     pub model: Option<String>,
     pub upstream: Option<String>,
@@ -318,6 +319,7 @@ pub struct FlowUpstreamResponse {
 /// the additive detail fields over a [`FlowRow`].
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct FlowDetailBody {
+    pub detail_source: FlowDetailSource,
     pub flow_seq: u64,
     pub revision: u64,
     pub api_call_id: String,
@@ -401,6 +403,32 @@ pub struct FlowDetailBody {
     /// CLIENT). `None` ⇒ absent ⇒ renders `—`, NEVER `0`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_upstream_byte_ms: Option<u128>,
+    /// Every body section available from the durable per-turn artifact. This includes
+    /// successful upstream/served responses that were intentionally never retained in
+    /// the live FlowStore. Sections load lazily at the HTTP request, not into snapshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captured_sections: Vec<CapturedSection>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowDetailSource {
+    Live,
+    Durable,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct CapturedSection {
+    pub name: String,
+    pub bytes: u64,
+    pub partial: bool,
+    pub encoding: String,
+    pub content: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FlowDetailQuery {
+    pub cut_id: Option<u64>,
 }
 
 /// One catalog entry (`GET /dashboard/api/catalog` — a BARE array, no cursor).
@@ -434,6 +462,10 @@ pub struct CatalogEntry {
 /// their REST bodies (`null` when the cut is empty for that domain).
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct SnapshotResponse {
+    /// Stable durable-cut identifier. Equal to the coordinated cut's epoch-ms stamp;
+    /// absent only when no historical cut exists yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cut_id: Option<u64>,
     pub cursors: SeqCursors,
     pub at_ms: u128,
     pub summaries: Vec<FlowRow>,
@@ -443,6 +475,10 @@ pub struct SnapshotResponse {
     pub history: SnapshotHistoryMetadata,
     /// Whether this selected cut dropped its oldest flow summaries to fit the quota.
     pub flow_summaries_truncated: bool,
+    /// Persisted monitor messages through this cut. Empty for legacy in-memory-only
+    /// cuts; durable cuts use them for historical flow timelines and Theater replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub monitor_messages: Vec<DebugWsMessage>,
 }
 
 /// Query param for `GET /dashboard/api/snapshot` — the wall-clock instant (unix
@@ -452,6 +488,7 @@ pub struct SnapshotResponse {
 #[derive(Debug, Default, Deserialize)]
 pub struct SnapshotQuery {
     pub at: Option<u64>,
+    pub cut_id: Option<u64>,
 }
 
 /// Exact server-side Overview window. Kept to the three MetricsLayer ring spans so a
@@ -472,6 +509,7 @@ pub struct OverviewQuery {
     #[serde(default)]
     pub window: OverviewWindow,
     pub at: Option<u64>,
+    pub cut_id: Option<u64>,
     pub status: Option<String>,
     pub model: Option<String>,
     pub upstream: Option<String>,
@@ -481,12 +519,44 @@ pub struct OverviewQuery {
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct OverviewScope {
     pub window: OverviewWindow,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cut_id: Option<u64>,
     pub requested_at_ms: Option<u128>,
     pub selected_at_ms: Option<u128>,
     pub status: Option<String>,
     pub model: Option<String>,
     pub upstream: Option<String>,
     pub client: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HistoricalCutQuery {
+    pub cut_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct HistoryQuery {
+    pub from: Option<u64>,
+    pub to: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct HistoryPoint {
+    pub cut_id: u64,
+    pub at_ms: u128,
+    pub cursors: SeqCursors,
+    pub metrics: MetricWindow,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct HistoryResponse {
+    pub oldest_at_ms: Option<u128>,
+    pub newest_at_ms: Option<u128>,
+    pub retained_cuts: usize,
+    pub database_bytes: usize,
+    pub dropped_writes: u64,
+    pub points: Vec<HistoryPoint>,
 }
 
 /// `GET /dashboard/api/overview`: an immutable exact-window rollup. The aggregate is
@@ -939,6 +1009,58 @@ fn parse_captured_body(body: &Arc<[u8]>) -> serde_json::Value {
     }
 }
 
+async fn durable_sections(
+    history: &crate::dashboard_history::DashboardHistory,
+    api_call_id: &str,
+) -> Vec<CapturedSection> {
+    let Some(path) = history.artifact_path(api_call_id).await else {
+        return Vec::new();
+    };
+    tokio::task::spawn_blocking(move || {
+        let bytes = std::fs::read(path).ok()?;
+        let artifact: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let sections = artifact.get("sections")?.as_object()?;
+        let order = [
+            "inbound_request",
+            "normalized_request",
+            "upstream_request",
+            "upstream_response",
+            "served_response",
+        ];
+        let mut captured = Vec::new();
+        for name in order {
+            let Some(section) = sections.get(name).and_then(serde_json::Value::as_object) else {
+                continue;
+            };
+            captured.push(CapturedSection {
+                name: name.to_string(),
+                bytes: section
+                    .get("bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                partial: section
+                    .get("partial")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true),
+                encoding: section
+                    .get("encoding")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                content: section
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            });
+        }
+        Some(captured)
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default()
+}
+
 // ---------------------------------------------------------------------------
 // Handlers (each `State(Arc<Gateway>)`; no-store + auth applied by the route layer)
 // ---------------------------------------------------------------------------
@@ -951,6 +1073,49 @@ pub async fn dashboard_flows(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<FlowsQuery>,
 ) -> Response {
+    if let Some(cut_id) = query.cut_id {
+        let Some(cut) = gateway.dashboard_history().cut_by_id(cut_id).await else {
+            return json_no_store(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": {"code": "historical_cut_not_found", "cut_id": cut_id}}),
+            );
+        };
+        let status_filter = query.status.as_deref().and_then(parse_status_filter);
+        let model_filter = query.model.as_deref().map(str::to_ascii_lowercase);
+        let upstream_filter = query.upstream.as_deref().map(str::to_ascii_lowercase);
+        let mut rows: Vec<FlowRow> = gateway
+            .dashboard_history()
+            .flow_summaries_as_of(cut_id)
+            .await
+            .iter()
+            .map(|summary| FlowRow::from_summary(summary, gateway.as_ref()))
+            .filter(|row| {
+                status_filter.is_none_or(|status| row.status == status)
+                    && model_filter.as_ref().is_none_or(|wanted| {
+                        row.model_requested
+                            .as_deref()
+                            .into_iter()
+                            .chain(row.model_served.as_deref())
+                            .any(|model| model.to_ascii_lowercase().contains(wanted))
+                    })
+                    && upstream_filter.as_ref().is_none_or(|wanted| {
+                        row.upstream_target
+                            .as_deref()
+                            .is_some_and(|target| target.to_ascii_lowercase().contains(wanted))
+                    })
+            })
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.started_ms));
+        let total = rows.len();
+        return json_no_store(
+            StatusCode::OK,
+            &FlowsResponse {
+                flows: apply_paging(rows, query.page, query.limit),
+                total,
+                flow_seq: cut.snapshot.cursors.flow_seq,
+            },
+        );
+    }
     let (records, flow_seq) = gateway.flow_store().list_with_seq();
     let status_filter = query.status.as_deref().and_then(parse_status_filter);
     let model_filter = query.model.as_deref().map(str::to_ascii_lowercase);
@@ -993,81 +1158,166 @@ pub async fn dashboard_flows(
 pub async fn dashboard_flow_detail(
     State(gateway): State<Arc<Gateway>>,
     Path(id): Path<String>,
+    Query(query): Query<FlowDetailQuery>,
 ) -> Response {
     // Capture the record AND its own mutation watermark in one lock hold so the
     // detail's `flow_seq` is the record's own cursor (D7b R1 finding 3), not a
     // later global value bumped by unrelated flows.
-    let Some((record, flow_seq)) = gateway.flow_store().detail_with_seq(&id) else {
-        return json_no_store(
-            StatusCode::NOT_FOUND,
-            &serde_json::json!({ "error": "no flow for that id" }),
-        );
-    };
-    let normalized = record.usage.map(crate::dashboard_flow::normalize_usage);
-    let cost = record.terminal_cost_usd;
-    let cost_confidence = record.terminal_cost_confidence.into();
-    // One MonitorHub snapshot supplies BOTH the replay and its coverage watermark.
-    // `FlowDelta.sequence` is only a per-flow ordinal; the separate monitor cursor is
-    // what lets the SPA place live `segment_append`s after this replay exactly.
-    let (deltas, deltas_through_monitor_seq) =
-        replay_deltas(record.response_id.as_deref(), gateway.debug_snapshot());
-    let inbound_headers = if record.headers.is_empty() {
-        None
+    if query.cut_id.is_none()
+        && let Some((record, flow_seq)) = gateway.flow_store().detail_with_seq(&id)
+    {
+        let normalized = record.usage.map(crate::dashboard_flow::normalize_usage);
+        let cost = record.terminal_cost_usd;
+        let cost_confidence = record.terminal_cost_confidence.into();
+        let (deltas, deltas_through_monitor_seq) =
+            replay_deltas(record.response_id.as_deref(), gateway.debug_snapshot());
+        let inbound_headers = if record.headers.is_empty() {
+            None
+        } else {
+            Some(
+                record
+                    .headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect::<BTreeMap<String, String>>(),
+            )
+        };
+        let captured_sections = durable_sections(gateway.dashboard_history(), &id).await;
+        let body = FlowDetailBody {
+            detail_source: FlowDetailSource::Live,
+            flow_seq,
+            revision: record.revision,
+            api_call_id: record.api_call_id.clone(),
+            response_id: record.response_id.clone(),
+            inbound_body: record.inbound_body.as_ref().map(parse_captured_body),
+            inbound_headers,
+            normalized: record.normalized.as_ref().map(parse_captured_body),
+            upstream_body: record.upstream_body.as_ref().map(parse_captured_body),
+            upstream_response: record.upstream_response.as_ref().map(|response| {
+                FlowUpstreamResponse {
+                    body: parse_captured_body(&response.bytes),
+                    truncated: response.truncated,
+                }
+            }),
+            model_requested: record.model_requested.clone(),
+            model_served: record.model_served.clone(),
+            upstream_target: record.upstream_target.clone(),
+            usage: record.usage,
+            normalized_usage: normalized.map(|value| value.usage),
+            usage_anomaly_count: normalized.map_or(0, |value| value.anomaly_count),
+            effective_route_limit: record.effective_route_limit,
+            cache_price_impact_usd: record.cache_price_impact_usd,
+            status: record.status,
+            deltas_through_monitor_seq,
+            deltas,
+            terminal_reason: record.terminal_reason.clone(),
+            started_ms: record.started_ms,
+            finished_ms: record.finished_ms,
+            elapsed_ms: record.elapsed_ms,
+            cost,
+            cost_confidence,
+            phases: record.phases,
+            attempts: record.attempts.clone(),
+            first_upstream_byte_ms: record.first_upstream_byte_ms,
+            captured_sections,
+        };
+        return json_no_store(StatusCode::OK, &body);
+    }
+
+    let (summary, flow_seq, monitor_seq) = if let Some(cut_id) = query.cut_id {
+        let Some(cut) = gateway.dashboard_history().cut_by_id(cut_id).await else {
+            return json_no_store(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": {"code": "historical_cut_not_found", "cut_id": cut_id}}),
+            );
+        };
+        let Some(summary) = gateway
+            .dashboard_history()
+            .flow_summary_at(&id, cut_id)
+            .await
+        else {
+            return json_no_store(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": {"code": "historical_flow_not_found", "cut_id": cut_id, "api_call_id": id}}),
+            );
+        };
+        (
+            summary,
+            cut.snapshot.cursors.flow_seq,
+            cut.snapshot.cursors.monitor_seq,
+        )
     } else {
-        Some(
-            record
-                .headers
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect::<BTreeMap<String, String>>(),
+        let Some(summary) = gateway.dashboard_history().latest_flow_summary(&id).await else {
+            return json_no_store(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": {"code": "flow_expired", "message": "live flow expired and no durable history exists", "api_call_id": id}}),
+            );
+        };
+        let latest = gateway.dashboard_history().latest_cut().await;
+        (
+            summary,
+            latest
+                .as_ref()
+                .map_or(0, |cut| cut.snapshot.cursors.flow_seq),
+            latest
+                .as_ref()
+                .map_or(0, |cut| cut.snapshot.cursors.monitor_seq),
         )
     };
+    let captured_sections =
+        durable_sections(gateway.dashboard_history(), &summary.api_call_id).await;
+    let section = |name: &str| {
+        captured_sections
+            .iter()
+            .find(|section| section.name == name)
+            .map(|section| section.content.clone())
+    };
+    let messages = gateway
+        .dashboard_history()
+        .monitor_messages_through(monitor_seq)
+        .await;
+    let (deltas, deltas_through_monitor_seq) = replay_deltas(
+        summary.response_id.as_deref(),
+        DebugSnapshot {
+            last_sequence: monitor_seq,
+            messages,
+        },
+    );
+    let normalized = summary.usage.map(crate::dashboard_flow::normalize_usage);
     let body = FlowDetailBody {
+        detail_source: FlowDetailSource::Durable,
         flow_seq,
-        revision: record.revision,
-        api_call_id: record.api_call_id.clone(),
-        response_id: record.response_id.clone(),
-        inbound_body: record.inbound_body.as_ref().map(parse_captured_body),
-        inbound_headers,
-        normalized: record.normalized.as_ref().map(parse_captured_body),
-        upstream_body: record.upstream_body.as_ref().map(parse_captured_body),
-        // Gap 05: project the captured upstream RESPONSE/ERROR body (bytes + truncated)
-        // onto the LIVE detail body. Parse the redacted/capped bytes like the other
-        // captured bodies; `truncated` rides alongside so the dashboard flags a partial
-        // body. Absent when the record's `upstream_response` is `None` (capture off / no
-        // body / evicted). Stays OFF the list rows + snapshot summaries.
-        upstream_response: record
-            .upstream_response
-            .as_ref()
-            .map(|response| FlowUpstreamResponse {
-                body: parse_captured_body(&response.bytes),
-                truncated: response.truncated,
-            }),
-        model_requested: record.model_requested.clone(),
-        model_served: record.model_served.clone(),
-        upstream_target: record.upstream_target.clone(),
-        usage: record.usage,
+        revision: summary.revision,
+        api_call_id: summary.api_call_id.clone(),
+        response_id: summary.response_id.clone(),
+        inbound_body: section("inbound_request"),
+        inbound_headers: None,
+        // Legacy artifacts predate durable canonical-body capture. Absence is honest;
+        // newly captured files can add `normalized_request` without changing this API.
+        normalized: section("normalized_request"),
+        upstream_body: section("upstream_request"),
+        upstream_response: None,
+        model_requested: summary.model_requested.clone(),
+        model_served: summary.model_served.clone(),
+        upstream_target: summary.upstream_target.clone(),
+        usage: summary.usage,
         normalized_usage: normalized.map(|value| value.usage),
         usage_anomaly_count: normalized.map_or(0, |value| value.anomaly_count),
-        effective_route_limit: record.effective_route_limit,
-        cache_price_impact_usd: record.cache_price_impact_usd,
-        status: record.status,
+        effective_route_limit: summary.effective_route_limit,
+        cache_price_impact_usd: summary.cache_price_impact_usd,
+        status: summary.status,
         deltas_through_monitor_seq,
         deltas,
-        terminal_reason: record.terminal_reason.clone(),
-        started_ms: record.started_ms,
-        finished_ms: record.finished_ms,
-        elapsed_ms: record.elapsed_ms,
-        cost,
-        cost_confidence,
-        // Gap 10b: project the FULL gap-02 phase spine + gap-03 attempts/wire-TTFB from the
-        // live record onto the inspector detail — this is where the gap-10 waterfall + the
-        // gap-11 attempt stepper live. `PhaseTimings` is `Copy`; the attempts vec is cloned
-        // (body-free scalar provenance). No recompute — the spine was measured by the engine
-        // (gaps 02/03); the detail just threads it through.
-        phases: record.phases,
-        attempts: record.attempts.clone(),
-        first_upstream_byte_ms: record.first_upstream_byte_ms,
+        terminal_reason: summary.terminal_reason.clone(),
+        started_ms: summary.started_ms,
+        finished_ms: summary.finished_ms,
+        elapsed_ms: summary.elapsed_ms,
+        cost: summary.terminal_cost_usd,
+        cost_confidence: summary.terminal_cost_confidence.into(),
+        phases: summary.phases,
+        attempts: summary.attempts.clone(),
+        first_upstream_byte_ms: summary.first_upstream_byte_ms,
+        captured_sections,
     };
     json_no_store(StatusCode::OK, &body)
 }
@@ -1077,7 +1327,28 @@ pub async fn dashboard_flow_detail(
 /// `cost_per_min`. Per-window TRUE per-second rates (D13 divides by the window
 /// seconds). The view + its cursor are captured in ONE metrics-lock hold so the
 /// body and `metrics_seq` are consistent.
-pub async fn dashboard_metrics(State(gateway): State<Arc<Gateway>>) -> Response {
+pub async fn dashboard_metrics(
+    State(gateway): State<Arc<Gateway>>,
+    Query(query): Query<HistoricalCutQuery>,
+) -> Response {
+    if let Some(cut_id) = query.cut_id {
+        let Some(cut) = gateway.dashboard_history().cut_by_id(cut_id).await else {
+            return json_no_store(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": {"code": "historical_cut_not_found", "cut_id": cut_id}}),
+            );
+        };
+        let active = cut_active_stream_count(&cut.snapshot.summaries);
+        return json_no_store(
+            StatusCode::OK,
+            &metrics_body(
+                &cut.snapshot.metrics,
+                cut.snapshot.cursors.metrics_seq,
+                active,
+                gateway.price_table(),
+            ),
+        );
+    }
     let body = if let Some(cut) = gateway.metrics().latest_published_metrics() {
         metrics_body(
             &cut.view,
@@ -1125,33 +1396,68 @@ pub async fn dashboard_overview(
     };
     let requested_at_ms = query.at.map(u128::from);
 
-    let (generated_at_ms, metrics_seq, selected_at_ms, mut aggregate) =
-        if let Some(at) = requested_at_ms {
-            if let Some(cut) = gateway.metrics().nearest_snapshot(at) {
+    let (generated_at_ms, metrics_seq, selected_at_ms, selected_cut_id, mut aggregate) =
+        if let Some(cut_id) = query.cut_id {
+            if let Some(cut) = gateway.dashboard_history().cut_by_id(cut_id).await {
                 (
-                    cut.taken_at_ms,
-                    cut.cursors.metrics_seq,
-                    Some(cut.taken_at_ms),
-                    overview_window_report(&cut.metrics, query.window).overview(&filter),
+                    cut.snapshot.taken_at_ms,
+                    cut.snapshot.cursors.metrics_seq,
+                    Some(cut.snapshot.taken_at_ms),
+                    Some(cut.cut_id),
+                    overview_window_report(&cut.snapshot.metrics, query.window).overview(&filter),
                 )
             } else {
                 let mut empty =
                     overview_window_report(&MetricsView::default(), query.window).overview(&filter);
                 empty.data_quality = OverviewDataQuality::Unavailable;
-                (at, 0, None, empty)
+                (
+                    requested_at_ms.unwrap_or(cut_id as u128),
+                    0,
+                    None,
+                    Some(cut_id),
+                    empty,
+                )
+            }
+        } else if let Some(at) = requested_at_ms {
+            if let Some(cut) = gateway.metrics().nearest_snapshot(at) {
+                (
+                    cut.taken_at_ms,
+                    cut.cursors.metrics_seq,
+                    Some(cut.taken_at_ms),
+                    u64::try_from(cut.taken_at_ms).ok(),
+                    overview_window_report(&cut.metrics, query.window).overview(&filter),
+                )
+            } else if let Some(cut) = gateway
+                .dashboard_history()
+                .nearest_cut(at.min(u64::MAX as u128) as u64)
+                .await
+            {
+                (
+                    cut.snapshot.taken_at_ms,
+                    cut.snapshot.cursors.metrics_seq,
+                    Some(cut.snapshot.taken_at_ms),
+                    Some(cut.cut_id),
+                    overview_window_report(&cut.snapshot.metrics, query.window).overview(&filter),
+                )
+            } else {
+                let mut empty =
+                    overview_window_report(&MetricsView::default(), query.window).overview(&filter);
+                empty.data_quality = OverviewDataQuality::Unavailable;
+                (at, 0, None, None, empty)
             }
         } else if let Some(cut) = gateway.metrics().latest_published_metrics() {
             (
                 cut.taken_at_ms,
                 cut.cursors.metrics_seq,
                 Some(cut.taken_at_ms),
+                None,
                 overview_window_report(&cut.view, query.window).overview(&filter),
             )
         } else {
             let mut empty =
                 overview_window_report(&MetricsView::default(), query.window).overview(&filter);
             empty.data_quality = OverviewDataQuality::Unavailable;
-            (dashboard_now_ms(), 0, None, empty)
+            (dashboard_now_ms(), 0, None, None, empty)
         };
 
     // A filtered query over a window with bounded overflow is necessarily partial: the
@@ -1169,6 +1475,7 @@ pub async fn dashboard_overview(
             metrics_seq,
             scope: OverviewScope {
                 window: query.window,
+                cut_id: selected_cut_id,
                 requested_at_ms,
                 selected_at_ms,
                 status: status_scope,
@@ -1184,7 +1491,26 @@ pub async fn dashboard_overview(
 /// `GET /dashboard/api/topology` — the provider topology (D4 nodes + edges) + the
 /// price table + the topology domain `topology_seq`. Edges carry per-upstream
 /// per-second request/token/cost rates rolled up from the live `m1` metrics window.
-pub async fn dashboard_topology(State(gateway): State<Arc<Gateway>>) -> Response {
+pub async fn dashboard_topology(
+    State(gateway): State<Arc<Gateway>>,
+    Query(query): Query<HistoricalCutQuery>,
+) -> Response {
+    if let Some(cut_id) = query.cut_id {
+        let Some(cut) = gateway.dashboard_history().cut_by_id(cut_id).await else {
+            return json_no_store(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": {"code": "historical_cut_not_found", "cut_id": cut_id}}),
+            );
+        };
+        return json_no_store(
+            StatusCode::OK,
+            &topology_body(
+                &cut.snapshot.topology,
+                gateway.price_table(),
+                &cut.snapshot.metrics.window_1m,
+            ),
+        );
+    }
     let body = if let Some(cut) = gateway.metrics().latest_published_metrics() {
         topology_body(&cut.topology, gateway.price_table(), &cut.view.window_1m)
     } else {
@@ -1241,17 +1567,41 @@ pub async fn dashboard_snapshot(
     // Widen the `u64` query instant to the `u128` `snapshot_at` key (the query
     // deserializer cannot parse `u128`; unix-ms fits `u64`).
     let at_query = query.at.map(u128::from);
-    let cut = match at_query {
-        Some(at) => gateway.metrics().snapshot_at(at),
-        None => gateway.metrics().latest_snapshot(),
+    let selected = if let Some(cut_id) = query.cut_id {
+        gateway
+            .dashboard_history()
+            .cut_by_id(cut_id)
+            .await
+            .map(|cut| (cut.snapshot, Some(cut.cut_id), true))
+    } else if let Some(at) = query.at {
+        if let Some(cut) = gateway.metrics().snapshot_at(u128::from(at)) {
+            let cut_id = u64::try_from(cut.taken_at_ms).ok();
+            Some((cut, cut_id, false))
+        } else {
+            gateway
+                .dashboard_history()
+                .cut_at_or_before(at)
+                .await
+                .map(|cut| (cut.snapshot, Some(cut.cut_id), true))
+        }
+    } else if let Some(cut) = gateway.metrics().latest_snapshot() {
+        let cut_id = u64::try_from(cut.taken_at_ms).ok();
+        Some((cut, cut_id, false))
+    } else {
+        gateway
+            .dashboard_history()
+            .latest_cut()
+            .await
+            .map(|cut| (cut.snapshot, Some(cut.cut_id), true))
     };
     let history = gateway.metrics().snapshot_history_metadata();
-    let Some(cut) = cut else {
+    let Some((cut, cut_id, durable)) = selected else {
         // No cut yet (the 5 s task has not run, or every cut is newer than `at`):
         // a contract-valid empty snapshot, not a 404.
         return json_no_store(
             StatusCode::OK,
             &SnapshotResponse {
+                cut_id: query.cut_id,
                 cursors: SeqCursors::default(),
                 at_ms: at_query.unwrap_or(0),
                 summaries: Vec::new(),
@@ -1259,13 +1609,26 @@ pub async fn dashboard_snapshot(
                 topology: None,
                 history,
                 flow_summaries_truncated: false,
+                monitor_messages: Vec::new(),
             },
         );
     };
 
     let prices = gateway.price_table();
-    let summaries: Vec<FlowRow> = cut
-        .summaries
+    let durable_summaries = if durable {
+        gateway
+            .dashboard_history()
+            .flow_summaries_as_of(cut_id.unwrap_or_default())
+            .await
+    } else {
+        Vec::new()
+    };
+    let summary_source = if durable && !durable_summaries.is_empty() {
+        durable_summaries.as_slice()
+    } else {
+        cut.summaries.as_slice()
+    };
+    let summaries: Vec<FlowRow> = summary_source
         .iter()
         .map(|summary| FlowRow::from_summary(summary, gateway.as_ref()))
         .collect();
@@ -1276,7 +1639,7 @@ pub async fn dashboard_snapshot(
     // `summaries` are the same body-free flow projections captured in the snapshot's
     // single critical section, so counting `status == Open` among them is consistent
     // with the rest of the frozen cut.
-    let active = cut_active_stream_count(&cut.summaries);
+    let active = cut_active_stream_count(summary_source);
     let metrics = Some(metrics_body(
         &cut.metrics,
         cut.cursors.metrics_seq,
@@ -1284,9 +1647,18 @@ pub async fn dashboard_snapshot(
         prices,
     ));
     let topology = Some(topology_body(&cut.topology, prices, &cut.metrics.window_1m));
+    let monitor_messages = if durable {
+        gateway
+            .dashboard_history()
+            .monitor_messages_through(cut.cursors.monitor_seq)
+            .await
+    } else {
+        Vec::new()
+    };
     json_no_store(
         StatusCode::OK,
         &SnapshotResponse {
+            cut_id,
             cursors: SeqCursors {
                 flow_seq: cut.cursors.flow_seq,
                 metrics_seq: cut.cursors.metrics_seq,
@@ -1299,6 +1671,67 @@ pub async fn dashboard_snapshot(
             topology,
             history,
             flow_summaries_truncated: cut.flow_summaries_truncated,
+            monitor_messages,
+        },
+    )
+}
+
+/// Durable scrubber history. Points are materialized from the exact persisted cuts;
+/// downsampling always retains the oldest/newest requested point so the UI's bounds and
+/// playhead remain honest.
+pub async fn dashboard_history(
+    State(gateway): State<Arc<Gateway>>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let metadata = gateway.dashboard_history().metadata().await;
+    let cuts = gateway
+        .dashboard_history()
+        .cuts_between(query.from, query.to)
+        .await;
+    let limit = query.limit.unwrap_or(2_000).clamp(2, 10_000);
+    let selected: Vec<_> = if cuts.len() <= limit {
+        cuts
+    } else {
+        let last = cuts.len() - 1;
+        (0..limit)
+            .map(|index| {
+                let source = index.saturating_mul(last) / (limit - 1);
+                cuts[source].clone()
+            })
+            .collect()
+    };
+    let points = selected
+        .into_iter()
+        .map(|cut| {
+            let active = cut_active_stream_count(&cut.snapshot.summaries);
+            let metrics = metrics_body(
+                &cut.snapshot.metrics,
+                cut.snapshot.cursors.metrics_seq,
+                active,
+                gateway.price_table(),
+            );
+            HistoryPoint {
+                cut_id: cut.cut_id,
+                at_ms: cut.snapshot.taken_at_ms,
+                cursors: SeqCursors {
+                    flow_seq: cut.snapshot.cursors.flow_seq,
+                    metrics_seq: cut.snapshot.cursors.metrics_seq,
+                    topology_seq: cut.snapshot.cursors.topology_seq,
+                    monitor_seq: cut.snapshot.cursors.monitor_seq,
+                },
+                metrics: metrics.windows.m1,
+            }
+        })
+        .collect();
+    json_no_store(
+        StatusCode::OK,
+        &HistoryResponse {
+            oldest_at_ms: metadata.oldest_at_ms,
+            newest_at_ms: metadata.newest_at_ms,
+            retained_cuts: metadata.retained_cuts,
+            database_bytes: metadata.database_bytes,
+            dropped_writes: metadata.dropped_writes,
+            points,
         },
     )
 }
@@ -1440,6 +1873,7 @@ mod tests {
             metrics_seq: 7,
             scope: OverviewScope {
                 window: OverviewWindow::M5,
+                cut_id: None,
                 requested_at_ms: None,
                 selected_at_ms: Some(123),
                 status: None,
@@ -1889,6 +2323,7 @@ mod tests {
     #[test]
     fn flow_detail_body_upstream_response_round_trips_present_and_absent() {
         let base = || FlowDetailBody {
+            detail_source: FlowDetailSource::Live,
             flow_seq: 7,
             revision: 1,
             api_call_id: "api_d".to_string(),
@@ -1918,6 +2353,7 @@ mod tests {
             phases: PhaseTimings::default(),
             attempts: Vec::new(),
             first_upstream_byte_ms: None,
+            captured_sections: Vec::new(),
         };
 
         // PRESENT (not truncated): a JSON error body survives the round-trip intact,
@@ -2111,6 +2547,7 @@ mod tests {
     #[test]
     fn flow_detail_body_projects_spine_fields_present_and_absent() {
         let base = || FlowDetailBody {
+            detail_source: FlowDetailSource::Live,
             flow_seq: 3,
             revision: 1,
             api_call_id: "api_sd".to_string(),
@@ -2140,6 +2577,7 @@ mod tests {
             phases: PhaseTimings::default(),
             attempts: Vec::new(),
             first_upstream_byte_ms: None,
+            captured_sections: Vec::new(),
         };
 
         // PRESENT: the inspector carries the measured waterfall + attempt trace.

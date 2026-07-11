@@ -11,7 +11,7 @@
  *   3. `SnapshotController.requestAt(ts)` fetches `/snapshot?at=<ts>` — rAF-throttled + LRU-cached
  *      by second-bucket, strictly ONE in flight (coalescing intermediate drags), so rapid drags
  *      make ≤1 fetch/frame (NO request storm);
- *   4. on resolve, ONE atomic `applySeekCut(...)` installs the frozen body-free cut (rows + cursors
+ *   4. on resolve, ONE atomic `applySeekCut(...)` installs the frozen durable cut (rows + cursors
  *      + `seekAtMs` + `seekMonitorSeq`) AND flips `connection==='seeking'` together — so D10/D12
  *      render the frozen moment with a frozen `seekAtMs` and the store is never `seeking` with live
  *      rows.
@@ -20,12 +20,12 @@
  *
  * `prefers-reduced-motion` cuts the pulsing LIVE indicator + the playhead transition (static).
  *
- * Snapshot bodies are evicted (D5 body-free): stats/summary render as-of; this is surfaced as a
- * small "as of <time> · bodies live" note while seeking (the documented tradeoff).
+ * Snapshot rows remain body-free, while flow detail lazily resolves the durable per-turn artifact.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import type { DashboardSocket } from '../../api/ws';
-import type { MetricsResponse, SnapshotResponse } from '../../api/types';
+import type { HistoryPoint, MetricsResponse, SnapshotResponse } from '../../api/types';
 import { useDashboard } from '../../store/hooks';
 import { useMetricStream } from '../../store/useMetricStream';
 import { dashboardStore } from '../../store/dashboardStore';
@@ -46,6 +46,7 @@ import { SnapshotController } from './snapshotController';
 const HILL_H = 40;
 const KEYBOARD_STEP = 0.01;
 const KEYBOARD_PAGE = 0.1;
+const EMPTY_HISTORY_POINTS: HistoryPoint[] = [];
 
 export function Scrubber({ socket }: { socket: DashboardSocket }) {
   const { client } = getConnection();
@@ -64,6 +65,7 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   // is stamped with arrival wall-clock, nudged strictly monotonic so several arriving in the same
   // millisecond still produce distinct hill points (the wire carries no per-tick timestamp).
   const ringRef = useRef<ReqsSample[]>([]);
+  const historyPointsRef = useRef<HistoryPoint[]>([]);
   const lastStampRef = useRef<number>(0);
   const fold = useCallback((sample: MetricsResponse) => {
     const t = Math.max(Date.now(), lastStampRef.current + 1);
@@ -74,8 +76,26 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   // `version` is read so this body re-runs after each ring fold; `ringRef.current` is reassigned a
   // FRESH array on every fold (appendReqs is immutable), so `ring` changes reference and the
   // ring-derived memos below recompute without needing `version` in their dep arrays.
-  void version;
-  const ring = ringRef.current;
+  const historyQuery = useQuery({
+    queryKey: ['history'],
+    queryFn: () => client.history({ limit: 10_000 }),
+    staleTime: 5_000,
+    refetchInterval: seeking ? false : 5_000,
+  });
+  const historyPoints = historyQuery.data?.points ?? EMPTY_HISTORY_POINTS;
+  historyPointsRef.current = historyPoints;
+  const ring = useMemo(() => {
+    void version;
+    if (historyPoints.length === 0) return ringRef.current;
+    const persisted = historyPoints.map((point) => ({
+      t: point.at_ms,
+      reqs: point.metrics.accepted_per_sec,
+    }));
+    const newestPersisted = persisted[persisted.length - 1]?.t ?? 0;
+    return [...persisted, ...ringRef.current.filter((sample) => sample.t > newestPersisted)];
+  }, [historyPoints, version]);
+  const displayRingRef = useRef<ReqsSample[]>(ring);
+  displayRingRef.current = ring;
 
   // The snapshot controller: broadcast a fetched cut as a FROZEN seek view via ONE atomic store
   // action. `applySeekCut` installs the frozen rows + cursors + `seekAtMs` + `seekMonitorSeq` AND
@@ -85,15 +105,24 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   const controllerRef = useRef<SnapshotController | null>(null);
   if (controllerRef.current === null) {
     controllerRef.current = new SnapshotController({
-      fetchSnapshot: (atMs) => client.snapshot(atMs),
+      fetchSnapshot: (atMs) => {
+        const points = historyPointsRef.current;
+        const nearest = points.reduce<HistoryPoint | null>((best, point) => {
+          if (!best) return point;
+          return Math.abs(point.at_ms - atMs) < Math.abs(best.at_ms - atMs) ? point : best;
+        }, null);
+        return nearest ? client.snapshot(undefined, nearest.cut_id) : client.snapshot(atMs);
+      },
       onSnapshot: (resp: SnapshotResponse) => {
         dashboardStore.getState().applySeekCut({
           rows: resp.summaries,
           cursors: resp.cursors,
           atMs: resp.at_ms,
+          cutId: resp.cut_id ?? null,
           monitorSeq: resp.cursors.monitor_seq,
           metrics: resp.metrics,
           topology: resp.topology,
+          monitorMessages: resp.monitor_messages,
         });
         // The cut is now exposed; drop the local pre-fetch drag marker (the frozen `seekAtMs`
         // drives the playhead from here).
@@ -137,7 +166,7 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   /** Resolve a pointer clientX to a wall-clock instant in the ring (falls back to now). */
   const timeFromClientX = useCallback((clientX: number): number => {
     const frac = fracFromClientX(clientX);
-    const t = xToTime(ringRef.current, frac);
+    const t = xToTime(displayRingRef.current, frac);
     return t !== null && Number.isFinite(t) ? t : Date.now();
   }, [fracFromClientX]);
 
@@ -183,7 +212,7 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   const onPointerMove = useCallback(
     (e: React.PointerEvent) => {
       const t = timeFromClientX(e.clientX);
-      const s = sampleAt(ringRef.current, t);
+      const s = sampleAt(displayRingRef.current, t);
       const rect = trackRef.current?.getBoundingClientRect();
       const cx = Number.isFinite(e.clientX) ? e.clientX : 0;
       const x = rect ? Math.min(rect.width, Math.max(0, cx - rect.left)) : 0;
@@ -261,11 +290,11 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
           return;
       }
       event.preventDefault();
-      const retained = reqsBounds(ringRef.current);
+      const retained = reqsBounds(displayRingRef.current);
       if (!retained || retained.tEnd === retained.t0) return;
       nextFrac = Math.min(1, Math.max(0, nextFrac));
       if (Math.abs(nextFrac - playheadFrac) < Number.EPSILON) return;
-      const t = xToTime(ringRef.current, nextFrac);
+      const t = xToTime(displayRingRef.current, nextFrac);
       if (t !== null && Number.isFinite(t)) seekToTime(t);
     },
     [playheadFrac, seekToTime],
@@ -351,7 +380,7 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
         )}
       </div>
 
-      {/* Seek state readout: shadow-buffer depth + the body-free tradeoff note. */}
+      {/* Seek state readout: durable cut identity + shadow-buffer depth. */}
       <span className="tabular-nums text-xs text-text-muted" data-testid="scrubber-status">
         {resyncRequired ? (
           <span className="text-status-cooling">resync required · select LIVE</span>
@@ -363,8 +392,8 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
             </button>
           </span>
         ) : seeking && seekAtMs !== null ? (
-          <span title="Snapshot is body-free (D5): stats render as-of; request/response bodies render live.">
-            as of {fmtClock(seekAtMs)} · buffered {socket.shadowBufferLength()}
+          <span title="SQLite-backed frozen cut: summaries, metrics, topology, transcripts, and captured artifacts are read as-of this cut.">
+            as of {fmtClock(seekAtMs)} · durable history · buffered {socket.shadowBufferLength()}
           </span>
         ) : (
           'live'

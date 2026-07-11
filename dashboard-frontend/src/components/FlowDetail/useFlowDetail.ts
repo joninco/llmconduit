@@ -2,9 +2,8 @@
  * Data + actions for the inspector of ONE flow (`api_call_id`).
  *
  *  - `detailQuery`: `GET /flows/:id` (TanStack), keyed by `queryKeys.flowDetail(id)` — the three
- *    captured bodies + headers + replayed deltas. Invalidated by accepted `flow` frames
- *    (connection.ts). The body fields are absent when EVICTED (D5 body-free tradeoff), which the
- *    panes render as "body evicted".
+ *    captured bodies + headers + replayed deltas. Historical reads carry `cut_id` and lazily load
+ *    the durable per-turn artifact without putting bodies into snapshot rows.
  *  - kill: `POST /flows/:id/kill` (CSRF via the client). OPTIMISTIC — the row flips to
  *    `cancelled` immediately in the live store; a 403 (mutations off / bad CSRF) ROLLS BACK and
  *    surfaces the error. Gated by `mutations_enabled` from the auth bootstrap.
@@ -63,6 +62,7 @@ export function useFlowDetail(apiCallId: string | null): FlowDetailView {
   const mutationsEnabled = useAuth((s) => s.mutationsEnabled);
   const seekMonitorSeq = useDashboard((s) => s.seekMonitorSeq);
   const seekAtMs = useDashboard((s) => s.seekAtMs);
+  const seekCutId = useDashboard((s) => s.seekCutId);
   const seeking = connection === 'seeking';
 
   // The live store row (authoritative status/usage). While seeking this IS the frozen snapshot row.
@@ -76,14 +76,20 @@ export function useFlowDetail(apiCallId: string | null): FlowDetailView {
   // only the BODIES are consumed during seek (see `frozenDetail`).
   const detailEnabled = !!apiCallId && (!seeking || inCut);
   const detailQuery = useQuery({
-    queryKey: apiCallId ? queryKeys.flowDetail(apiCallId) : ['flows', '__none__'],
-    queryFn: () => client.flowDetail(apiCallId as string),
+    queryKey: apiCallId
+      ? seeking && seekCutId !== null
+        ? queryKeys.historicalFlowDetail(apiCallId, seekCutId)
+        : queryKeys.flowDetail(apiCallId)
+      : ['flows', '__none__'],
+    queryFn: () => client.flowDetail(apiCallId as string, seeking ? seekCutId ?? undefined : undefined),
     enabled: detailEnabled,
   });
   const detail = detailEnabled ? detailQuery.data ?? null : null;
   // Non-body surfaces (headers/deltas/timeline/status/usage/cost/elapsed) must come from the FROZEN
   // cut while seeking, so the live REST detail is withheld from them (finding 1).
-  const frozenDetail = seeking ? null : detail;
+  // A cut-addressed durable detail is itself frozen at the selected SQLite cut. Legacy in-memory
+  // cuts have no stable id and retain the summary-only behavior.
+  const frozenDetail = seeking && seekCutId === null ? null : detail;
 
   const [killState, setKillState] = useState<KillState>({ phase: 'idle' });
 

@@ -193,7 +193,9 @@ fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptError
 /// Per-provider serving status for the topology map (D4). `Cooling` while inside
 /// the failure cooldown window; `Down` once a cooling provider has also crossed
 /// [`DOWN_THRESHOLD`] consecutive failures; `Healthy` otherwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderStatus {
     Healthy,
@@ -207,7 +209,7 @@ pub enum ProviderStatus {
 /// UNCONDITIONALLY (no `skip_serializing_if`) so the `Option` keys are always
 /// present as JSON `null` — the frontend D9/D10/D12 model validates this exact
 /// shape. `base_url` is REQUIRED (non-null).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ProviderHealth {
     /// Stable identifier for the provider (the configured provider/route name).
     pub id: String,
@@ -299,7 +301,7 @@ struct CatalogMeta {
 /// change. Published on a coalesced 1 s tick AND a cooldown-deadline wake (so an
 /// IDLE cooling→Healthy transition flips with no traffic); the atomics underneath
 /// update continuously, and the snapshot reads them at publication time.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 pub struct ProviderHealthSnapshot {
     pub version: u64,
     pub providers: Vec<ProviderHealth>,

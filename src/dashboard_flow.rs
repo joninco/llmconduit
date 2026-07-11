@@ -206,7 +206,9 @@ impl Default for AbortHub {
 
 /// Lifecycle status of a flow. `Open` at creation; D3 moves it to a terminal
 /// state. Serializes snake_case for the dashboard REST/WS surface.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FlowStatus {
     Open,
@@ -251,7 +253,9 @@ pub struct FlowMutation {
 /// distinction is load-bearing for cost confidence: a `cached` charge against a
 /// model with no configured cache rate (or an unreported `cached`) is `estimated`,
 /// not `confident`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
 pub struct FlowUsage {
     pub prompt: i64,
     pub completion: i64,
@@ -1168,7 +1172,7 @@ impl FlowRecord {
 /// the D5 snapshot ring. Carries every field EXCEPT the three body `Arc<[u8]>`s and
 /// the non-serializable `claim`/`started_at` — body retention on snapshots is
 /// forbidden (135 GiB worst case; AGENTS.md don't-rule).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct SnapshotFlowSummary {
     pub revision: u64,
     pub api_call_id: String,

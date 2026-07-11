@@ -8,6 +8,7 @@ use crate::adapters::responses_to_chat;
 use crate::dashboard_api::dashboard_catalog;
 use crate::dashboard_api::dashboard_flow_detail;
 use crate::dashboard_api::dashboard_flows;
+use crate::dashboard_api::dashboard_history;
 use crate::dashboard_api::dashboard_metrics;
 use crate::dashboard_api::dashboard_overview;
 use crate::dashboard_api::dashboard_snapshot;
@@ -189,6 +190,7 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .route("/dashboard/api/topology", get(dashboard_topology))
         .route("/dashboard/api/catalog", get(dashboard_catalog))
         .route("/dashboard/api/snapshot", get(dashboard_snapshot))
+        .route("/dashboard/api/history", get(dashboard_history))
         .route_layer(middleware::map_response(dashboard_api_no_store));
 
     // The `/debug` HTML/JS endpoints share the same session gate but stamp their own

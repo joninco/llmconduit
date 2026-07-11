@@ -349,6 +349,14 @@
             "null"
           ]
         },
+        "cut_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "model": {
           "type": [
             "string",

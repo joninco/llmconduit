@@ -241,6 +241,9 @@ pub struct TurnCaptureState {
     model_served: Mutex<Option<String>>,
     /// The redacted inbound Anthropic/OpenAI request body (F1b).
     inbound_request: Section,
+    /// Redacted canonical Responses request after gateway normalization and tool/image policy.
+    normalized_request: Section,
+    normalized_request_written: AtomicBool,
     /// F1d: the redacted, FINAL on-wire OpenAI `ChatCompletionRequest` (post
     /// profile/lowering/sanitize). Written WHOLE per dispatch attempt via
     /// [`Section::replace`] (last-writer-wins), NOT streamed -- so a shrink-retry
@@ -364,6 +367,7 @@ impl TurnCaptureState {
         self_weak: Weak<TurnCaptureState>,
     ) -> Self {
         let inbound_request = Section::new(work_dir.join("inbound_request"));
+        let normalized_request = Section::new(work_dir.join("normalized_request"));
         let upstream_request = Section::new(work_dir.join("upstream_request"));
         let upstream_response =
             Mutex::new(Arc::new(Section::new(work_dir.join("upstream_response"))));
@@ -378,6 +382,8 @@ impl TurnCaptureState {
             self_weak,
             model_served: Mutex::new(None),
             inbound_request,
+            normalized_request,
+            normalized_request_written: AtomicBool::new(false),
             upstream_request,
             upstream_request_written: AtomicBool::new(false),
             upstream_response,
@@ -495,6 +501,19 @@ impl TurnCaptureState {
         self.inbound_request.append(bytes);
         // The whole (redacted) body is in hand, so the section is complete.
         self.inbound_request.close(false);
+    }
+
+    /// Persist the canonical request that the engine has settled on. The shared capped redacting
+    /// serializer keeps secret/image handling identical to live dashboard capture and bounds peak
+    /// memory independently of prompt size.
+    pub fn write_normalized_request<T: serde::Serialize>(&self, value: &T) {
+        const CAPTURE_CAP: usize = 128 * 1024;
+        const SCALAR_CAP: usize = 4 * 1024;
+        let bytes = crate::redaction::capture_capped_redacted_value(value, CAPTURE_CAP, SCALAR_CAP);
+        if self.normalized_request.replace(&bytes) {
+            self.normalized_request_written
+                .store(true, Ordering::Release);
+        }
     }
 
     /// F3 (Fable-fix): mark the `inbound_request` section `partial` -- used when the
@@ -924,6 +943,8 @@ impl TurnCaptureState {
     /// without hanging.
     async fn finalize_and_assemble(self: Arc<Self>) {
         self.inbound_request.await_closed().await;
+        self.normalized_request.close(false);
+        self.normalized_request.await_closed().await;
         // F1d: `upstream_request` stays OPEN across the turn's dispatch attempts
         // (each is a `replace`, last-writer-wins) -- close it now, at the
         // both-`done` barrier, so the writer task drains + flushes the FINAL
@@ -1150,6 +1171,10 @@ impl TurnCaptureState {
         // value). Requests may embed as a JSON value; responses embed as strings.
         w.write_all(b",\"sections\":{")?;
         write_section(&mut w, "inbound_request", &self.inbound_request, true)?;
+        if self.normalized_request_written.load(Ordering::Acquire) {
+            w.write_all(b",")?;
+            write_section(&mut w, "normalized_request", &self.normalized_request, true)?;
+        }
         // F1d: `upstream_request` is gated on `upstream_request_written` -- a turn
         // that never dispatched upstream (e.g. a pre-spawn validation failure)
         // never wrote it, so the key is OMITTED entirely rather than emitted with
@@ -3721,7 +3746,7 @@ mod tests {
     }
 
     /// AC-15 (atomicity + encoding + no residue): a completed turn writes exactly ONE
-    /// valid `<id>.json` carrying ALL FOUR sections plus the outcome metadata; a
+    /// valid `<id>.json` carrying all five request/response sections plus the outcome metadata; a
     /// NON-UTF-8 `upstream_response` round-trips via base64 with an
     /// `encoding:"base64"` marker; and NO `.json.tmp` or `.work/<id>/` residue is left
     /// once assembly's atomic tmp->rename + work-dir delete complete. Drives the REAL
@@ -3738,11 +3763,15 @@ mod tests {
             .expect("state");
         let work_dir = state.work_dir().to_path_buf();
 
-        // All four sections. `upstream_response` is deliberately NON-UTF-8 raw bytes
+        // All five sections. `upstream_response` is deliberately NON-UTF-8 raw bytes
         // (0xFF/0xFE can never begin a valid UTF-8 sequence) to exercise the base64
         // fallback + encoding marker; the others are valid UTF-8/JSON.
         let raw_upstream: &[u8] = &[0xff, 0xfe, 0x00, 0x9c, 0x80, 0x01, 0xfd];
         state.write_inbound_request(br#"{"model":"claude-opus","stream":true}"#);
+        state.write_normalized_request(&serde_json::json!({
+            "model": "served-model",
+            "input": [{"role": "user", "content": "hello"}]
+        }));
         state.write_upstream_request(br#"{"model":"served-model","max_tokens":123}"#);
         state.write_upstream_response(raw_upstream);
         state.write_served_response(b"event: message_start\n\nevent: message_stop\n\n");
@@ -3762,10 +3791,11 @@ mod tests {
         assert_eq!(started, 1_000);
         assert!(finished >= started, "finished_ms >= started_ms");
 
-        // ALL FOUR sections present.
+        // Every diagnostic section is present.
         let sections = &artifact["sections"];
         for name in [
             "inbound_request",
+            "normalized_request",
             "upstream_request",
             "upstream_response",
             "served_response",

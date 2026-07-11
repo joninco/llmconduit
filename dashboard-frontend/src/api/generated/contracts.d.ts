@@ -16,6 +16,7 @@ export type AttemptErrorClass = "connect" | "http_status" | "timeout" | "stream"
  * (it did not fail over). Serializes snake_case.
  */
 export type AttemptFailoverReason = "provider_failed" | "request_rejected" | "terminal_no_failover";
+export type FlowDetailSource = "live" | "durable";
 /**
  * Lifecycle status of a flow. `Open` at creation; D3 moves it to a terminal
  * state. Serializes snake_case for the dashboard REST/WS surface.
@@ -35,7 +36,6 @@ export type FlowStatus = "open" | "completed" | "failed" | "cancelled";
  * one is deliberately absent until such a seam exists (spec 04 / Codex review).
  */
 export type ClientSource = "key_hash" | "configured_header" | "user_agent";
-export type MetricWindowName = "m1";
 /**
  * Gap 07 — the CONFIDENCE tier of a flow's `cost`, so an operator can tell a trusted
  * figure from a best-effort estimate from an honest gap. Emitted alongside `cost` on
@@ -46,6 +46,7 @@ export type MetricWindowName = "m1";
 export type CostConfidence = "confident" | "estimated" | "unavailable";
 export type MetricQuality = "measured" | "partial" | "unavailable";
 export type QuantileMethod = "log_histogram_nearest_rank";
+export type MetricWindowName = "m1";
 /**
  * Confidence attached to a terminal-time price. This lives with the evict-safe
  * terminal payload (rather than the REST projection) so historical overview cuts keep
@@ -64,6 +65,53 @@ export type OverviewMetricScope = "global";
  * live and historical request always selects the same retained population.
  */
 export type OverviewWindow = "m1" | "m5" | "h1";
+export type DebugWsMessage =
+  | {
+      history_limit: number;
+      history_retention_ms: number;
+      protocol_version: number;
+      type: "hello";
+    }
+  | {
+      request: DebugRequest;
+      type: "request_upsert";
+    }
+  | {
+      response_id: string;
+      segment: DebugSegment;
+      type: "segment_append";
+    }
+  | {
+      event: DebugTimelineEvent;
+      response_id: string;
+      type: "event_append";
+    }
+  | {
+      completed_at_ms: number | null;
+      error: string | null;
+      response_id: string;
+      status: DebugRequestStatus;
+      type: "request_status";
+    }
+  | {
+      reason: string;
+      response_id: string;
+      type: "request_remove";
+    }
+  | {
+      cached: number;
+      completion: number;
+      prompt: number;
+      reasoning: number;
+      response_id: string;
+      total: number;
+      type: "usage";
+    }
+  | {
+      type: "snapshot_done";
+    };
+export type DebugRequestStatus = "running" | "completed" | "failed";
+export type DebugSegmentKind = "output" | "reasoning" | "tool";
 /**
  * Per-provider serving status for the topology map (D4). `Cooling` while inside
  * the failure cooldown window; `Down` once a cooling provider has also crossed
@@ -225,53 +273,6 @@ export type DashboardPayload =
       nodes: TopologyNode[];
       type: "topology_update";
     };
-export type DebugWsMessage =
-  | {
-      history_limit: number;
-      history_retention_ms: number;
-      protocol_version: number;
-      type: "hello";
-    }
-  | {
-      request: DebugRequest;
-      type: "request_upsert";
-    }
-  | {
-      response_id: string;
-      segment: DebugSegment;
-      type: "segment_append";
-    }
-  | {
-      event: DebugTimelineEvent;
-      response_id: string;
-      type: "event_append";
-    }
-  | {
-      completed_at_ms: number | null;
-      error: string | null;
-      response_id: string;
-      status: DebugRequestStatus;
-      type: "request_status";
-    }
-  | {
-      reason: string;
-      response_id: string;
-      type: "request_remove";
-    }
-  | {
-      cached: number;
-      completion: number;
-      prompt: number;
-      reasoning: number;
-      response_id: string;
-      total: number;
-      type: "usage";
-    }
-  | {
-      type: "snapshot_done";
-    };
-export type DebugRequestStatus = "running" | "completed" | "failed";
-export type DebugSegmentKind = "output" | "reasoning" | "tool";
 /**
  * Coarse lifecycle phase attached to every authoritative live-flow mutation.
  * The vocabulary is deliberately bounded: usage and all non-terminal enrichment
@@ -295,6 +296,7 @@ export interface DashboardContracts {
   catalog_response: CatalogEntry[];
   flow_detail: FlowDetailBody;
   flows_response: FlowsResponse;
+  history_response: HistoryResponse;
   kill_response: KillResponse;
   login_request: LoginRequest;
   metrics_response: MetricsSnapshot;
@@ -359,6 +361,12 @@ export interface FlowDetailBody {
    */
   attempts?: Attempt[];
   cache_price_impact_usd?: number | null;
+  /**
+   * Every body section available from the durable per-turn artifact. This includes
+   * successful upstream/served responses that were intentionally never retained in
+   * the live FlowStore. Sections load lazily at the HTTP request, not into snapshots.
+   */
+  captured_sections?: CapturedSection[];
   cost: number | null;
   /**
    * Gap 07 — the [`CostConfidence`] of `cost` (confident/estimated/unavailable),
@@ -375,6 +383,7 @@ export interface FlowDetailBody {
    * repeated or same-millisecond content.
    */
   deltas_through_monitor_seq: number;
+  detail_source: FlowDetailSource;
   effective_route_limit?: number | null;
   elapsed_ms?: number | null;
   /**
@@ -541,6 +550,13 @@ export interface Attempt {
    * Served vs failed.
    */
   status: "served" | "failed";
+}
+export interface CapturedSection {
+  bytes: number;
+  content: unknown;
+  encoding: string;
+  name: string;
+  partial: boolean;
 }
 /**
  * One streamed delta replayed into the inspector (from the MonitorHub snapshot,
@@ -755,34 +771,31 @@ export interface FlowRow {
   usage: FlowUsage | null;
   usage_anomaly_count: number;
 }
-/**
- * Successful `POST /dashboard/api/flows/:id/kill` response.
- */
-export interface KillResponse {
-  api_call_id: string;
-  killed: boolean;
+export interface HistoryResponse {
+  database_bytes: number;
+  dropped_writes: number;
+  newest_at_ms: number | null;
+  oldest_at_ms: number | null;
+  points: HistoryPoint[];
+  retained_cuts: number;
 }
-export interface LoginRequest {
-  token: string;
+export interface HistoryPoint {
+  at_ms: number;
+  cursors: SeqCursors;
+  cut_id: number;
+  metrics: MetricWindow;
 }
 /**
- * The full `/api/metrics`-shaped snapshot body (the flat tile + the three
- * windows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live
- * [`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.
+ * The four per-domain cursors carried on the initial [`SnapshotMessage`] — the
+ * `{flow,metrics,topology,monitor}` sequences the SPA installs as its dedup
+ * baseline (`commitSnapshot` in `dashboard-frontend/src/api/ws.ts`). Serializes
+ * snake_case to the frozen `SeqCursors` contract.
  */
-export interface MetricsSnapshot {
-  generated_at_ms: number;
-  headline_window: MetricWindowName;
+export interface SeqCursors {
+  flow_seq: number;
   metrics_seq: number;
-  windows: MetricWindows;
-}
-/**
- * The three sliding windows (`m1`/`m5`/`h1`) of a [`MetricTick`].
- */
-export interface MetricWindows {
-  h1: MetricWindow;
-  m1: MetricWindow;
-  m5: MetricWindow;
+  monitor_seq: number;
+  topology_seq: number;
 }
 /**
  * One sliding-window metric tile. Same fields as the headline tile.
@@ -823,6 +836,35 @@ export interface MetricWindow {
   usage_samples: number;
   warm: boolean;
   window_seconds: number;
+}
+/**
+ * Successful `POST /dashboard/api/flows/:id/kill` response.
+ */
+export interface KillResponse {
+  api_call_id: string;
+  killed: boolean;
+}
+export interface LoginRequest {
+  token: string;
+}
+/**
+ * The full `/api/metrics`-shaped snapshot body (the flat tile + the three
+ * windows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live
+ * [`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.
+ */
+export interface MetricsSnapshot {
+  generated_at_ms: number;
+  headline_window: MetricWindowName;
+  metrics_seq: number;
+  windows: MetricWindows;
+}
+/**
+ * The three sliding windows (`m1`/`m5`/`h1`) of a [`MetricTick`].
+ */
+export interface MetricWindows {
+  h1: MetricWindow;
+  m1: MetricWindow;
+  m5: MetricWindow;
 }
 /**
  * `GET /dashboard/api/overview`: an immutable exact-window rollup. The aggregate is
@@ -966,6 +1008,7 @@ export interface ProviderErrorDistribution {
 }
 export interface OverviewScope {
   client: string | null;
+  cut_id?: number | null;
   model: string | null;
   requested_at_ms: number | null;
   selected_at_ms: number | null;
@@ -991,25 +1034,23 @@ export interface SnapshotResponse {
   at_ms: number;
   cursors: SeqCursors;
   /**
+   * Stable durable-cut identifier. Equal to the coordinated cut's epoch-ms stamp;
+   * absent only when no historical cut exists yet.
+   */
+  cut_id?: number | null;
+  /**
    * Whether this selected cut dropped its oldest flow summaries to fit the quota.
    */
   flow_summaries_truncated: boolean;
   history: SnapshotHistoryMetadata;
   metrics: MetricsSnapshot | null;
+  /**
+   * Persisted monitor messages through this cut. Empty for legacy in-memory-only
+   * cuts; durable cuts use them for historical flow timelines and Theater replay.
+   */
+  monitor_messages?: DebugWsMessage[];
   summaries: FlowRow[];
   topology: TopologySnapshot | null;
-}
-/**
- * The four per-domain cursors carried on the initial [`SnapshotMessage`] — the
- * `{flow,metrics,topology,monitor}` sequences the SPA installs as its dedup
- * baseline (`commitSnapshot` in `dashboard-frontend/src/api/ws.ts`). Serializes
- * snake_case to the frozen `SeqCursors` contract.
- */
-export interface SeqCursors {
-  flow_seq: number;
-  metrics_seq: number;
-  monitor_seq: number;
-  topology_seq: number;
 }
 /**
  * Bounds and memory use of the retained historical-cut ring.
@@ -1020,6 +1061,74 @@ export interface SnapshotHistoryMetadata {
   quota_bytes: number;
   retained_bytes: number;
   retained_cuts: number;
+}
+export interface DebugRequest {
+  completed_at_ms: number | null;
+  error: string | null;
+  model: string;
+  response_id: string;
+  started_at_ms: number;
+  stats: DebugRequestStats;
+  status: DebugRequestStatus;
+  updated_at_ms: number;
+  /**
+   * D3: latest cumulative token usage for the flow (`None` until the first
+   * usage-bearing chunk). Retained so `snapshot()` replays it to a late
+   * subscriber after the `RequestUpsert`.
+   */
+  usage?: DebugUsage | null;
+}
+export interface DebugRequestStats {
+  assistant_messages: number;
+  developer_messages: number;
+  function_calls: number;
+  function_outputs: number;
+  input_chars: number;
+  input_items: number;
+  instructions_chars: number;
+  reasoning_items: number;
+  system_messages: number;
+  tool_count: number;
+  tool_items: number;
+  turn_count: number;
+  user_messages: number;
+}
+/**
+ * D3: the latest cumulative token usage retained on a [`DebugRequest`] so the
+ * `/debug/ws` snapshot can replay it to a late subscriber.
+ */
+export interface DebugUsage {
+  cached: number;
+  completion: number;
+  prompt: number;
+  reasoning: number;
+  total: number;
+}
+export interface DebugSegment {
+  kind: DebugSegmentKind;
+  text: string;
+  timestamp_ms: number;
+}
+export interface DebugTimelineEvent {
+  images: DebugEventImage[];
+  kind: string;
+  payload_preview: string | null;
+  summary: string;
+  timestamp_ms: number;
+}
+/**
+ * Metadata about an image found in a request/response preview, surfaced to the
+ * debug UI over `/debug/ws`. Carries ONLY non-sensitive descriptors — never the
+ * raw image bytes or URL (G4 round-4 #4): `data:`/signed URLs must not leave the
+ * process via the monitor broadcast. The UI renders a redacted placeholder card
+ * from this metadata, not the image itself.
+ */
+export interface DebugEventImage {
+  id: string;
+  label: string;
+  mime_type: string;
+  path: string;
+  size_bytes: number | null;
 }
 /**
  * The full `/api/topology`-shaped snapshot body (nodes + edges + the price table)
@@ -1146,74 +1255,6 @@ export interface DashboardFrame {
   batch: DashboardPayload[];
   domain: Domain;
   seq: number;
-}
-export interface DebugRequest {
-  completed_at_ms: number | null;
-  error: string | null;
-  model: string;
-  response_id: string;
-  started_at_ms: number;
-  stats: DebugRequestStats;
-  status: DebugRequestStatus;
-  updated_at_ms: number;
-  /**
-   * D3: latest cumulative token usage for the flow (`None` until the first
-   * usage-bearing chunk). Retained so `snapshot()` replays it to a late
-   * subscriber after the `RequestUpsert`.
-   */
-  usage?: DebugUsage | null;
-}
-export interface DebugRequestStats {
-  assistant_messages: number;
-  developer_messages: number;
-  function_calls: number;
-  function_outputs: number;
-  input_chars: number;
-  input_items: number;
-  instructions_chars: number;
-  reasoning_items: number;
-  system_messages: number;
-  tool_count: number;
-  tool_items: number;
-  turn_count: number;
-  user_messages: number;
-}
-/**
- * D3: the latest cumulative token usage retained on a [`DebugRequest`] so the
- * `/debug/ws` snapshot can replay it to a late subscriber.
- */
-export interface DebugUsage {
-  cached: number;
-  completion: number;
-  prompt: number;
-  reasoning: number;
-  total: number;
-}
-export interface DebugSegment {
-  kind: DebugSegmentKind;
-  text: string;
-  timestamp_ms: number;
-}
-export interface DebugTimelineEvent {
-  images: DebugEventImage[];
-  kind: string;
-  payload_preview: string | null;
-  summary: string;
-  timestamp_ms: number;
-}
-/**
- * Metadata about an image found in a request/response preview, surfaced to the
- * debug UI over `/debug/ws`. Carries ONLY non-sensitive descriptors — never the
- * raw image bytes or URL (G4 round-4 #4): `data:`/signed URLs must not leave the
- * process via the monitor broadcast. The UI renders a redacted placeholder card
- * from this metadata, not the image itself.
- */
-export interface DebugEventImage {
-  id: string;
-  label: string;
-  mime_type: string;
-  path: string;
-  size_bytes: number | null;
 }
 /**
  * The flat `/api/metrics`-shaped metric tile (metrics domain).

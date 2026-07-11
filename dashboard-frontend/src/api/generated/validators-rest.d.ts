@@ -1,10 +1,11 @@
 /* eslint-disable */
 /** Generated CSP-safe standalone rest validator declarations. */
-import type { CatalogEntry, FlowDetailBody, FlowsResponse, KillResponse, MetricsSnapshot, OverviewResponse, SnapshotResponse, TopologySnapshot } from './contracts';
+import type { CatalogEntry, FlowDetailBody, FlowsResponse, HistoryResponse, KillResponse, MetricsSnapshot, OverviewResponse, SnapshotResponse, TopologySnapshot } from './contracts';
 import type { ContractValidator } from '../contractValidator';
 export const validateCatalog: ContractValidator<CatalogEntry[]>;
 export const validateFlowDetail: ContractValidator<FlowDetailBody>;
 export const validateFlows: ContractValidator<FlowsResponse>;
+export const validateHistory: ContractValidator<HistoryResponse>;
 export const validateKill: ContractValidator<KillResponse>;
 export const validateMetrics: ContractValidator<MetricsSnapshot>;
 export const validateOverview: ContractValidator<OverviewResponse>;

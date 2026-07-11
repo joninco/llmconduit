@@ -675,6 +675,7 @@ export interface FlowsQuery {
   upstream?: string;
   page?: number;
   limit?: number;
+  cut_id?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +698,7 @@ export type OverviewResponse = import('./generated/contracts').OverviewResponse;
 export interface OverviewQuery {
   window: OverviewWindow;
   at?: number;
+  cut_id?: number;
   status?: FlowStatus;
   model?: string;
   upstream?: string;
@@ -723,6 +725,7 @@ export interface FlowDelta {
  * `api_call_id`.
  */
 export interface FlowDetail extends PhaseTimings {
+  detail_source?: 'live' | 'durable';
   flow_seq: number;
   /** Monotonic optimistic-concurrency version for this flow. */
   revision: number;
@@ -773,6 +776,15 @@ export interface FlowDetail extends PhaseTimings {
   attempts?: Attempt[];
   /** Gap 03 — flow-level wire TTFB (the served attempt's first on-wire byte); `null`/absent, never `0`. */
   first_upstream_byte_ms?: number | null;
+  captured_sections?: CapturedSection[];
+}
+
+export interface CapturedSection {
+  name: string;
+  bytes: number;
+  partial: boolean;
+  encoding: string;
+  content: unknown;
 }
 
 /**
@@ -865,6 +877,7 @@ export interface SnapshotHistoryMetadata {
 }
 
 export interface SnapshotResponse {
+  cut_id?: number;
   cursors: SeqCursors;
   at_ms: number;
   summaries: SnapshotFlowSummary[];
@@ -872,6 +885,29 @@ export interface SnapshotResponse {
   topology: TopologyResponse | null;
   history: SnapshotHistoryMetadata;
   flow_summaries_truncated: boolean;
+  monitor_messages?: DebugWsMessage[];
+}
+
+export interface HistoryPoint {
+  cut_id: number;
+  at_ms: number;
+  cursors: SeqCursors;
+  metrics: MetricWindow;
+}
+
+export interface HistoryResponse {
+  oldest_at_ms: number | null;
+  newest_at_ms: number | null;
+  retained_cuts: number;
+  database_bytes: number;
+  dropped_writes: number;
+  points: HistoryPoint[];
+}
+
+export interface HistoryQuery {
+  from?: number;
+  to?: number;
+  limit?: number;
 }
 
 /** `POST /dashboard/api/flows/:id/kill` */

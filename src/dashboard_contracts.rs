@@ -46,6 +46,7 @@ pub struct DashboardContracts {
     pub topology_response: crate::dashboard_ws::TopologySnapshot,
     pub catalog_response: Vec<crate::dashboard_api::CatalogEntry>,
     pub snapshot_response: crate::dashboard_api::SnapshotResponse,
+    pub history_response: crate::dashboard_api::HistoryResponse,
     pub kill_response: KillResponse,
     pub login_request: crate::dashboard_auth::LoginRequest,
 }
@@ -68,6 +69,10 @@ pub fn root_schemas() -> BTreeMap<&'static str, schemars::Schema> {
             wire_schema_for::<crate::dashboard_api::FlowsResponse>(),
         ),
         ("kill", wire_schema_for::<KillResponse>()),
+        (
+            "history",
+            wire_schema_for::<crate::dashboard_api::HistoryResponse>(),
+        ),
         (
             "metrics",
             wire_schema_for::<crate::dashboard_ws::MetricsSnapshot>(),
@@ -139,6 +144,7 @@ mod tests {
                 "catalog",
                 "flow-detail",
                 "flows",
+                "history",
                 "kill",
                 "metrics",
                 "overview",

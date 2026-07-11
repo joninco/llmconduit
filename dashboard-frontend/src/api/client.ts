@@ -12,6 +12,8 @@ import type {
   FlowDetail,
   FlowsQuery,
   FlowsResponse,
+  HistoryQuery,
+  HistoryResponse,
   KillResponse,
   LoginRequest,
   MetricsResponse,
@@ -33,6 +35,7 @@ type RestValidatorName =
   | 'validateCatalog'
   | 'validateFlowDetail'
   | 'validateFlows'
+  | 'validateHistory'
   | 'validateKill'
   | 'validateMetrics'
   | 'validateOverview'
@@ -52,6 +55,7 @@ async function loadRestValidator(name: RestValidatorName): Promise<ContractValid
     case 'validateCatalog': validator = validators.validateCatalog; break;
     case 'validateFlowDetail': validator = validators.validateFlowDetail; break;
     case 'validateFlows': validator = validators.validateFlows; break;
+    case 'validateHistory': validator = validators.validateHistory; break;
     case 'validateKill': validator = validators.validateKill; break;
     case 'validateMetrics': validator = validators.validateMetrics; break;
     case 'validateOverview': validator = validators.validateOverview; break;
@@ -195,20 +199,23 @@ export class DashboardClient {
     return this.request<FlowsResponse>(`/flows${qs}`, 'validateFlows');
   }
 
-  flowDetail(id: string): Promise<FlowDetail> {
-    return this.request<FlowDetail>(`/flows/${encodeURIComponent(id)}`, 'validateFlowDetail');
+  flowDetail(id: string, cutId?: number): Promise<FlowDetail> {
+    const suffix = cutId === undefined ? '' : `?cut_id=${encodeURIComponent(String(cutId))}`;
+    return this.request<FlowDetail>(`/flows/${encodeURIComponent(id)}${suffix}`, 'validateFlowDetail');
   }
 
-  metrics(): Promise<MetricsResponse> {
-    return this.request<MetricsResponse>('/metrics', 'validateMetrics');
+  metrics(cutId?: number): Promise<MetricsResponse> {
+    const suffix = cutId === undefined ? '' : `?cut_id=${encodeURIComponent(String(cutId))}`;
+    return this.request<MetricsResponse>(`/metrics${suffix}`, 'validateMetrics');
   }
 
   overview(query: OverviewQuery): Promise<OverviewResponse> {
     return this.request<OverviewResponse>(`/overview${buildQuery(query)}`, 'validateOverview');
   }
 
-  topology(): Promise<TopologyResponse> {
-    return this.request<TopologyResponse>('/topology', 'validateTopology');
+  topology(cutId?: number): Promise<TopologyResponse> {
+    const suffix = cutId === undefined ? '' : `?cut_id=${encodeURIComponent(String(cutId))}`;
+    return this.request<TopologyResponse>(`/topology${suffix}`, 'validateTopology');
   }
 
   /** Bare array — no cursor (D13: static-ish catalog read). */
@@ -216,11 +223,18 @@ export class DashboardClient {
     return this.request<CatalogEntry[]>('/catalog', 'validateCatalog');
   }
 
-  snapshot(atMs: number): Promise<SnapshotResponse> {
+  snapshot(atMs?: number, cutId?: number): Promise<SnapshotResponse> {
+    const query = cutId !== undefined
+      ? `cut_id=${encodeURIComponent(String(cutId))}`
+      : `at=${encodeURIComponent(String(atMs ?? Date.now()))}`;
     return this.request<SnapshotResponse>(
-      `/snapshot?at=${encodeURIComponent(String(atMs))}`,
+      `/snapshot?${query}`,
       'validateSnapshot',
     );
+  }
+
+  history(query: HistoryQuery = {}): Promise<HistoryResponse> {
+    return this.request<HistoryResponse>(`/history${buildQuery(query)}`, 'validateHistory');
   }
 
   // -- Mutation (CSRF-gated) ------------------------------------------------
@@ -242,7 +256,7 @@ export class DashboardClient {
 }
 
 /** Serializes a flows query into a `?a=b&c=d` string, dropping undefined values. */
-function buildQuery(query: FlowsQuery | OverviewQuery): string {
+function buildQuery(query: FlowsQuery | OverviewQuery | HistoryQuery): string {
   const params = new URLSearchParams();
   for (const [k, v] of Object.entries(query)) {
     if (v !== undefined && v !== null) params.set(k, String(v));

@@ -1138,7 +1138,7 @@ describe('FlowDetail — narrow single-pane accessibility', () => {
 
     const tablist = getByRole('tablist', { name: 'Flow detail sections' });
     const tabs = within(tablist).getAllByRole('tab');
-    expect(tabs).toHaveLength(7);
+    expect(tabs).toHaveLength(8);
     const inbound = getByRole('tab', { name: 'A · inbound' });
     const panel = getByRole('tabpanel');
     expect(inbound.getAttribute('aria-selected')).toBe('true');

@@ -5,6 +5,7 @@ pub mod dashboard_api;
 pub mod dashboard_auth;
 pub mod dashboard_contracts;
 pub mod dashboard_flow;
+pub mod dashboard_history;
 pub mod dashboard_ui;
 pub mod dashboard_ws;
 pub mod debug_ui;
@@ -130,6 +131,13 @@ pub fn build_app_with_gateway_and_options(
         Some(dir) => crate::turn_capture::TurnCapture::enabled(dir),
         None => crate::turn_capture::TurnCapture::disabled(),
     };
+    // Durable dashboard cuts are independently opt-in through an env-only path, but
+    // remain gated by `--with-debug-ui` so a production-disabled dashboard retains its
+    // zero-task/zero-IO behavior. Large bodies continue to live in `turn_capture_dir`.
+    let dashboard_history = crate::dashboard_history::DashboardHistory::from_env(
+        options.with_debug_ui,
+        config.turn_capture_dir.clone(),
+    );
     // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
     // (G7); routes alone are enough to switch the gateway into the routing
     // client so route-name/glob matching applies.
@@ -292,6 +300,7 @@ pub fn build_app_with_gateway_and_options(
     let publisher_flow_store = flow_store.clone();
     let publisher_metrics = metrics.clone();
     let publisher_monitor = monitor.clone();
+    let publisher_history = dashboard_history.clone();
     let gateway = Arc::new(
         Gateway::new(
             config,
@@ -306,7 +315,8 @@ pub fn build_app_with_gateway_and_options(
         )
         .with_dashboard_auth(dashboard_auth)
         .with_metrics(metrics)
-        .with_turn_capture(turn_capture),
+        .with_turn_capture(turn_capture)
+        .with_dashboard_history(dashboard_history),
     );
     // Install the initial immutable presentation synchronously, before any REST/WS
     // consumer can observe the Gateway. The async publisher owns every later cut, but
@@ -328,11 +338,16 @@ pub fn build_app_with_gateway_and_options(
         gateway.spawn_provider_health_publisher();
         // Spawn ONE process-level publisher rather than a timer per dashboard socket.
         // Every fifth one-second cut is also retained as the historical snapshot.
-        let _ = crate::metrics::spawn_metrics_publisher_task(
+        let _ = crate::metrics::spawn_metrics_publisher_task_with_history(
             publisher_metrics,
             publisher_flow_store,
             gateway.provider_health_publisher(),
             publisher_monitor,
+            publisher_history,
+        );
+        crate::dashboard_history::spawn_monitor_history_task(
+            gateway.dashboard_history().clone(),
+            gateway.subscribe_monitor(),
         );
     }
     let router_options = RouterOptions {

@@ -4,6 +4,13 @@ This document defines the shipped schema-v3 statistical contract and its audit c
 The REST, WebSocket, generated TypeScript, standalone validators, and dashboard consumers
 share this version; a schema mismatch continues to use the existing reload/upgrade error path.
 
+When SQLite history is enabled, each five-second coordinated cut has a stable `cut_id`. The
+scrubber is sourced from `/dashboard/api/history`, and every historical view reuses that ID for
+metrics, topology, Overview/Sankey, flow rows, flow detail, and persisted monitor transcripts.
+Selecting a scrubber bar therefore drills into the same as-of population across the dashboard;
+exact zeroes and nullable gaps are stored unchanged. Large captured I/O is loaded lazily from the
+per-turn artifact and never copied into snapshot rows or SQLite blobs.
+
 Unless a row says
 otherwise, a flow enters a time window at its terminal timestamp and windows are
 sliding `m1` (60 s), `m5` (300 s), and `h1` (3600 s) rings with one-second slots.

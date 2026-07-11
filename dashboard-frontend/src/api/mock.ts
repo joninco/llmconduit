@@ -16,6 +16,7 @@ import type {
   FlowDetail,
   FlowSummary,
   FlowsResponse,
+  HistoryResponse,
   MetricsResponse,
   MonitorPayload,
   OverviewCost,
@@ -607,10 +608,33 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   if (path === '/dashboard/api/overview') return json(buildOverview(qs));
   if (path === '/dashboard/api/topology') return json(buildTopology());
   if (path === '/dashboard/api/catalog') return json(CATALOG);
+  if (path === '/dashboard/api/history') {
+    const now = Date.now();
+    const metrics = buildMetrics().windows.m1;
+    const points = Array.from({ length: 60 }, (_, index) => {
+      const at_ms = now - (59 - index) * 5_000;
+      return {
+        cut_id: at_ms,
+        at_ms,
+        cursors: { flow_seq: 3, metrics_seq: index + 1, topology_seq: 1, monitor_seq: 5 },
+        metrics,
+      };
+    });
+    const history: HistoryResponse = {
+      oldest_at_ms: points[0]!.at_ms,
+      newest_at_ms: points[points.length - 1]!.at_ms,
+      retained_cuts: points.length,
+      database_bytes: 256 * 1024,
+      dropped_writes: 0,
+      points,
+    };
+    return json(history);
+  }
   if (path === '/dashboard/api/snapshot') {
-    const atMs = Number(qs.get('at') ?? Date.now());
+    const atMs = Number(qs.get('cut_id') ?? qs.get('at') ?? Date.now());
     // Snapshot summaries are body-free FlowSummary objects (identical shape, D1).
     const snap: SnapshotResponse = {
+      cut_id: atMs,
       cursors: { flow_seq: 3, metrics_seq: 1, topology_seq: 1, monitor_seq: 5 },
       at_ms: atMs,
       summaries: seedFlows(),
@@ -645,6 +669,7 @@ function buildFlowDetail(id: string): FlowDetail | null {
   const base = seedFlows().find((f) => f.api_call_id === id);
   if (!base) return null;
   return {
+    detail_source: 'live',
     flow_seq: 3,
     revision: base.revision,
     api_call_id: base.api_call_id,

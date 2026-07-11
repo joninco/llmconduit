@@ -25,18 +25,21 @@ import { DashboardContractError } from './validation';
 export const queryKeys = {
   flows: ['flows'] as const,
   flowDetail: (id: string) => ['flows', id] as const,
+  historicalFlowDetail: (id: string, cutId: number) => ['flows', id, 'cut', cutId] as const,
   metrics: ['metrics'] as const,
   overviewRoot: ['overview'] as const,
   overview: (query: OverviewQuery) => [
     'overview',
     query.window,
     query.at ?? null,
+    query.cut_id ?? null,
     query.status ?? null,
     query.model ?? null,
     query.upstream ?? null,
     query.client ?? null,
   ] as const,
   topology: ['topology'] as const,
+  history: ['history'] as const,
   catalog: ['catalog'] as const,
 } as const;
 

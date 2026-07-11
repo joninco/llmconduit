@@ -52,7 +52,7 @@ import { EdgeStrip } from '../ui/EdgeStrip';
 import { cn } from '../../lib/cn';
 import { useMediaQuery } from '../../lib/useMediaQuery';
 
-type Tab = 'headers' | 'timeline' | 'error';
+type Tab = 'headers' | 'captures' | 'timeline' | 'error';
 
 /** Focus-mode target: one of the three JSON layers, or the deltas rail. */
 type ZoomTarget = 'A' | 'B' | 'C' | 'deltas';
@@ -61,6 +61,7 @@ type NarrowTab = ZoomTarget | Tab;
 const NARROW_QUERY = '(max-width: 1023px)';
 const DRAWER_TABS: ReadonlyArray<{ id: Tab; label: string }> = [
   { id: 'headers', label: 'Headers' },
+  { id: 'captures', label: 'Captured I/O' },
   { id: 'timeline', label: 'Timeline' },
   { id: 'error', label: 'Error' },
 ];
@@ -70,6 +71,7 @@ const NARROW_TABS: ReadonlyArray<{ id: NarrowTab; label: string }> = [
   { id: 'C', label: 'C · upstream' },
   { id: 'deltas', label: 'Deltas' },
   { id: 'headers', label: 'Headers' },
+  { id: 'captures', label: 'Captured I/O' },
   { id: 'timeline', label: 'Timeline' },
   { id: 'error', label: 'Error' },
 ];
@@ -521,6 +523,8 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
               <DeltasRail segments={segments} />
             ) : narrowTab === 'headers' ? (
               <HeadersTab headers={frozenDetail?.inbound_headers} />
+            ) : narrowTab === 'captures' ? (
+              <CapturedSectionsTab detail={frozenDetail} />
             ) : narrowTab === 'timeline' ? (
               <Timeline events={join.events} />
             ) : (
@@ -722,6 +726,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
               {/* Headers + Error read the FROZEN detail (null while seeking) so no live/post-cut
                   metadata leaks; Timeline reads the cut-bounded monitor join (finding 1). */}
               {tab === 'headers' && <HeadersTab headers={frozenDetail?.inbound_headers} />}
+              {tab === 'captures' && <CapturedSectionsTab detail={frozenDetail} />}
               {tab === 'timeline' && <Timeline events={join.events} />}
               {tab === 'error' && <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} seeking={seeking} />}
             </div>
@@ -1355,6 +1360,27 @@ function HeadersTab({ headers }: { headers?: Record<string, string> }) {
         </div>
       ))}
     </dl>
+  );
+}
+
+function CapturedSectionsTab({ detail }: { detail: FlowDetailDto | null }) {
+  const sections = detail?.captured_sections ?? [];
+  if (sections.length === 0) {
+    return <div className="px-3 py-3 text-xs italic text-text-muted">No durable captured sections are available.</div>;
+  }
+  return (
+    <div className="space-y-2 p-3" data-testid="captured-sections-tab">
+      {sections.map((section) => (
+        <details key={section.name} className="rounded border border-line bg-panel-raised" open>
+          <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-text">
+            {section.name} · {section.bytes.toLocaleString()} bytes{section.partial ? ' · partial' : ''}
+          </summary>
+          <pre className="max-h-80 overflow-auto border-t border-line p-3 font-mono text-[11px] text-text-muted">
+            {typeof section.content === 'string' ? section.content : JSON.stringify(section.content, null, 2)}
+          </pre>
+        </details>
+      ))}
+    </div>
   );
 }
 

@@ -19,6 +19,9 @@
     "flows_response": {
       "$ref": "#/$defs/FlowsResponse"
     },
+    "history_response": {
+      "$ref": "#/$defs/HistoryResponse"
+    },
     "kill_response": {
       "$ref": "#/$defs/KillResponse"
     },
@@ -55,6 +58,7 @@
     "topology_response",
     "catalog_response",
     "snapshot_response",
+    "history_response",
     "kill_response",
     "login_request"
   ],
@@ -217,6 +221,33 @@
           "type": "string",
           "const": "failed"
         }
+      ]
+    },
+    "CapturedSection": {
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "content": true,
+        "encoding": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "partial": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "bytes",
+        "partial",
+        "encoding",
+        "content"
       ]
     },
     "CatalogEntry": {
@@ -1276,6 +1307,13 @@
           ],
           "format": "double"
         },
+        "captured_sections": {
+          "description": "Every body section available from the durable per-turn artifact. This includes\nsuccessful upstream/served responses that were intentionally never retained in\nthe live FlowStore. Sections load lazily at the HTTP request, not into snapshots.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CapturedSection"
+          }
+        },
         "cost": {
           "type": [
             "number",
@@ -1298,6 +1336,9 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "detail_source": {
+          "$ref": "#/$defs/FlowDetailSource"
         },
         "effective_route_limit": {
           "type": [
@@ -1538,6 +1579,7 @@
         }
       },
       "required": [
+        "detail_source",
         "flow_seq",
         "revision",
         "api_call_id",
@@ -1550,6 +1592,13 @@
         "started_ms",
         "cost",
         "cost_confidence"
+      ]
+    },
+    "FlowDetailSource": {
+      "type": "string",
+      "enum": [
+        "live",
+        "durable"
       ]
     },
     "FlowMutationPhase": {
@@ -1930,6 +1979,83 @@
         "flows",
         "total",
         "flow_seq"
+      ]
+    },
+    "HistoryPoint": {
+      "type": "object",
+      "properties": {
+        "at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "cursors": {
+          "$ref": "#/$defs/SeqCursors"
+        },
+        "cut_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "metrics": {
+          "$ref": "#/$defs/MetricWindow"
+        }
+      },
+      "required": [
+        "cut_id",
+        "at_ms",
+        "cursors",
+        "metrics"
+      ]
+    },
+    "HistoryResponse": {
+      "type": "object",
+      "properties": {
+        "database_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "dropped_writes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "newest_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "oldest_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "points": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HistoryPoint"
+          }
+        },
+        "retained_cuts": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "oldest_at_ms",
+        "newest_at_ms",
+        "retained_cuts",
+        "database_bytes",
+        "dropped_writes",
+        "points"
       ]
     },
     "KillResponse": {
@@ -2591,6 +2717,14 @@
             "null"
           ]
         },
+        "cut_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "model": {
           "type": [
             "string",
@@ -3012,6 +3146,15 @@
         "cursors": {
           "$ref": "#/$defs/SeqCursors"
         },
+        "cut_id": {
+          "description": "Stable durable-cut identifier. Equal to the coordinated cut's epoch-ms stamp;\nabsent only when no historical cut exists yet.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
         "flow_summaries_truncated": {
           "description": "Whether this selected cut dropped its oldest flow summaries to fit the quota.",
           "type": "boolean"
@@ -3029,6 +3172,13 @@
               "type": "null"
             }
           ]
+        },
+        "monitor_messages": {
+          "description": "Persisted monitor messages through this cut. Empty for legacy in-memory-only\ncuts; durable cuts use them for historical flow timelines and Theater replay.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DebugWsMessage"
+          }
         },
         "summaries": {
           "type": "array",

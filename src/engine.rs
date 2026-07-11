@@ -174,6 +174,10 @@ pub struct Gateway {
     /// keyed only on `config.turn_capture_dir` (spec Design overview #1 --
     /// its own instrumentation gate, independent of the debug UI).
     turn_capture: crate::turn_capture::TurnCapture,
+    /// Optional SQLite-backed durable dashboard history. Disabled unless the debug UI
+    /// is enabled and `LLMCONDUIT_DASHBOARD_HISTORY_DB` is configured; the disabled
+    /// handle owns no writer, channel, or database connection.
+    dashboard_history: crate::dashboard_history::DashboardHistory,
     /// D6 AbortHub: the live-cancellation registry keyed by `api_call_id`, so the
     /// dashboard kill route can cancel a stuck server-side stream. Gated identically to
     /// the FlowStore (enabled iff `flow_store.is_enabled()`), because the D3 L1 guard —
@@ -741,6 +745,7 @@ impl Gateway {
             // enabled sink via `with_turn_capture` when `turn_capture_dir` is
             // configured -- independent of `--with-debug-ui`.
             turn_capture: crate::turn_capture::TurnCapture::disabled(),
+            dashboard_history: crate::dashboard_history::DashboardHistory::disabled(),
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             tokenize_capability: Arc::new(std::sync::Mutex::new(TokenizeCapability::Unknown)),
@@ -814,6 +819,18 @@ impl Gateway {
     /// no-op (no thread, no alloc, no fs). Independent of the debug UI.
     pub fn turn_capture(&self) -> &crate::turn_capture::TurnCapture {
         &self.turn_capture
+    }
+
+    pub fn with_dashboard_history(
+        mut self,
+        history: crate::dashboard_history::DashboardHistory,
+    ) -> Self {
+        self.dashboard_history = history;
+        self
+    }
+
+    pub fn dashboard_history(&self) -> &crate::dashboard_history::DashboardHistory {
+        &self.dashboard_history
     }
 
     /// D5: record a TERMINAL response into the metrics rings at the engine's D3
@@ -1456,6 +1473,11 @@ impl Gateway {
             let normalized = crate::dashboard_flow::capture_body_from_value(&request);
             self.flow_store()
                 .set_normalized(api_call_id, Some(model_requested), Some(normalized));
+        }
+        if let Some(api_call_id) = api_call_id.as_deref()
+            && let Some(capture) = self.turn_capture().state(api_call_id)
+        {
+            capture.write_normalized_request(&request);
         }
         // Lower the canonical request to the upstream chat payload BEFORE
         // budgeting. The `?` surfaces any lowering/validation error (invalid

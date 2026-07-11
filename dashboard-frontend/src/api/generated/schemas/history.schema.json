@@ -1,0 +1,314 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HistoryResponse",
+  "type": "object",
+  "properties": {
+    "database_bytes": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "dropped_writes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "newest_at_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint128",
+      "minimum": 0
+    },
+    "oldest_at_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint128",
+      "minimum": 0
+    },
+    "points": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/HistoryPoint"
+      }
+    },
+    "retained_cuts": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "oldest_at_ms",
+    "newest_at_ms",
+    "retained_cuts",
+    "database_bytes",
+    "dropped_writes",
+    "points"
+  ],
+  "$defs": {
+    "CostConfidence": {
+      "description": "Gap 07 — the CONFIDENCE tier of a flow's `cost`, so an operator can tell a trusted\nfigure from a best-effort estimate from an honest gap. Emitted alongside `cost` on\nevery flow row + detail (and aggregated onto the metrics windows). Serializes\nsnake_case to mirror the data-quality vocabulary the frontend already uses\n(`measured`/`derived`/`estimated`/`unavailable`).",
+      "oneOf": [
+        {
+          "description": "The model is priced AND every billed token class has a known rate: the prompt\n(input) + completion (output) rates always exist when priced, and cached tokens\neither were reported as `0` (nothing billed at the cache rate) OR the model has\na CONFIGURED cached rate. The dollar figure is trustworthy.",
+          "type": "string",
+          "const": "confident"
+        },
+        {
+          "description": "The model is priced but a billed class would fall back to an APPROXIMATE rate:\ncached tokens were reported `> 0` (or are UNAVAILABLE) while the model has NO\nconfigured cached rate, so those tokens silently bill at the default `0.0`\n(an undercount). The figure is a best-effort ESTIMATE — surfaced as such.",
+          "type": "string",
+          "const": "estimated"
+        },
+        {
+          "description": "No price is configured for the served model: there is NO cost (the row reports\n`cost: null`), so the figure is UNAVAILABLE — never a fabricated `0`. The\nDEFAULT: a window/flow with nothing priced makes no confident claim.",
+          "type": "string",
+          "const": "unavailable"
+        }
+      ]
+    },
+    "HistoryPoint": {
+      "type": "object",
+      "properties": {
+        "at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "cursors": {
+          "$ref": "#/$defs/SeqCursors"
+        },
+        "cut_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "metrics": {
+          "$ref": "#/$defs/MetricWindow"
+        }
+      },
+      "required": [
+        "cut_id",
+        "at_ms",
+        "cursors",
+        "metrics"
+      ]
+    },
+    "MetricQuality": {
+      "type": "string",
+      "enum": [
+        "measured",
+        "partial",
+        "unavailable"
+      ]
+    },
+    "MetricWindow": {
+      "description": "One sliding-window metric tile. Same fields as the headline tile.\n\n`samples` is the count of TERMINAL (finalized) flows that fell in the window —\nthe data-quality signal the frontend uses to tell a genuine measured `0` from an\n`unavailable` gap (gap 01 / \"don't lie with zeros\"). When `samples == 0` the\nlatency/tok-s/cost/error-% fields are NOT measurable (no finalized flow fed them),\nso the strip renders them `—`; `reqs_per_sec` (a genuine `0` for an idle window)\nand `active_streams` (live open-flow count) stay numeric. The field is a finite\n`u64`, so it never violates the frozen finite-number wire contract.",
+      "type": "object",
+      "properties": {
+        "accepted_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "accepted_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "active_streams_now": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cancellation_pct": {
+          "type": "number",
+          "format": "double"
+        },
+        "cancellations": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "cost_confidence": {
+          "$ref": "#/$defs/CostConfidence"
+        },
+        "cost_per_min": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "failure_pct": {
+          "type": "number",
+          "format": "double"
+        },
+        "failures": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "latency_overflow_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "latency_quality": {
+          "$ref": "#/$defs/MetricQuality"
+        },
+        "latency_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "max_relative_error": {
+          "type": "number",
+          "format": "double"
+        },
+        "observed_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "p50_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p95_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p99_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "priced_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "quantile_method": {
+          "$ref": "#/$defs/QuantileMethod"
+        },
+        "reported_tokens_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "successes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "terminal_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "terminal_requests": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "usage_anomaly_count": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "usage_samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "warm": {
+          "type": "boolean"
+        },
+        "window_seconds": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "window_seconds",
+        "observed_seconds",
+        "warm",
+        "accepted_requests",
+        "accepted_per_sec",
+        "terminal_requests",
+        "terminal_per_sec",
+        "successes",
+        "failures",
+        "failure_pct",
+        "cancellations",
+        "cancellation_pct",
+        "active_streams_now",
+        "latency_samples",
+        "p50_ms",
+        "p95_ms",
+        "p99_ms",
+        "quantile_method",
+        "max_relative_error",
+        "latency_overflow_count",
+        "latency_quality",
+        "usage_samples",
+        "reported_tokens_per_sec",
+        "usage_anomaly_count",
+        "priced_samples",
+        "cost_per_min",
+        "cost_confidence"
+      ]
+    },
+    "QuantileMethod": {
+      "type": "string",
+      "enum": [
+        "log_histogram_nearest_rank"
+      ]
+    },
+    "SeqCursors": {
+      "description": "The four per-domain cursors carried on the initial [`SnapshotMessage`] — the\n`{flow,metrics,topology,monitor}` sequences the SPA installs as its dedup\nbaseline (`commitSnapshot` in `dashboard-frontend/src/api/ws.ts`). Serializes\nsnake_case to the frozen `SeqCursors` contract.",
+      "type": "object",
+      "properties": {
+        "flow_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "metrics_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "monitor_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "topology_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "flow_seq",
+        "metrics_seq",
+        "topology_seq",
+        "monitor_seq"
+      ]
+    }
+  }
+}

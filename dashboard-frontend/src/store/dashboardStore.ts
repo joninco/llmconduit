@@ -74,6 +74,8 @@ export interface DashboardState {
    *    deltas/timeline (finding 1).
    */
   seekAtMs: number | null;
+  /** Stable SQLite cut selected by the scrubber; null for live/legacy in-memory cuts. */
+  seekCutId: number | null;
   seekMonitorSeq: number | null;
 
   /** Flow rows keyed by `api_call_id` (insertion order preserved via `flowOrder`). */
@@ -122,9 +124,11 @@ export interface DashboardState {
     rows: FlowSummary[];
     cursors: SeqCursors;
     atMs: number;
+    cutId?: number | null;
     monitorSeq: number;
     metrics: MetricsResponse | null;
     topology: TopologyResponse | null;
+    monitorMessages?: DebugWsMessage[];
   }) => void;
   setCursor: (domain: keyof SeqCursors, seq: number) => void;
   /**
@@ -224,6 +228,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
   connEpoch: 0,
   cursors: emptyCursors(),
   seekAtMs: null,
+  seekCutId: null,
   seekMonitorSeq: null,
   flows: new Map(),
   flowOrder: [],
@@ -245,9 +250,9 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       // Any real transition advances the monotonic epoch (finding 1).
       const connEpoch = s.connEpoch + 1;
       if (connection === 'seeking') {
-        return { connection, connEpoch, seekAtMs: Date.now(), seekMonitorSeq: s.cursors.monitor_seq };
+        return { connection, connEpoch, seekAtMs: Date.now(), seekCutId: null, seekMonitorSeq: s.cursors.monitor_seq };
       }
-      return { connection, connEpoch, seekAtMs: null, seekMonitorSeq: null };
+      return { connection, connEpoch, seekAtMs: null, seekCutId: null, seekMonitorSeq: null };
     }),
   setFatalError: (fatalError) => set({ fatalError }),
   setResyncRequired: (resyncRequired) => set({ resyncRequired }),
@@ -258,6 +263,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       // Entering seek always crosses a boundary (live store → frozen cut), so bump the epoch.
       connEpoch: s.connEpoch + 1,
       seekAtMs: atMs,
+      seekCutId: null,
       seekMonitorSeq: s.cursors.monitor_seq,
     })),
 
@@ -269,6 +275,10 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
         flows.set(f.api_call_id, f);
         flowOrder.push(f.api_call_id);
       }
+      const monitor = (cut.monitorMessages ?? []).slice(-MONITOR_RING_CAP);
+      const monitorSeqs = monitor.map(() => cut.monitorSeq);
+      let riverFold = createRiverFold();
+      for (const message of monitor) riverFold = foldRiverMessage(riverFold, message);
       // ONE atomic update: frozen rows + cursors AND `connection='seeking'` AND the cut's
       // `seekAtMs`/`seekMonitorSeq` install together. `seekMonitorSeq` is the SNAPSHOT's
       // `monitor_seq` (the authoritative cut), not the live cursor — so the monitor join is bounded
@@ -279,6 +289,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
         connEpoch: s.connEpoch + 1,
         cursors: cut.cursors,
         seekAtMs: cut.atMs,
+        seekCutId: cut.cutId ?? null,
         seekMonitorSeq: cut.monitorSeq,
         flows,
         flowOrder,
@@ -286,6 +297,9 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
         topologyNodes: cut.topology?.nodes ?? [],
         topologyEdges: cut.topology?.edges ?? [],
         priceTable: cut.topology?.price_table ?? {},
+        monitor,
+        monitorSeqs,
+        riverFold,
       };
     }),
 
@@ -323,6 +337,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       connEpoch: s.connEpoch + 1,
       // The frozen cut is fully gone — clear the seek freeze so elapsed ticks + the monitor unbounds.
       seekAtMs: null,
+      seekCutId: null,
       seekMonitorSeq: null,
       cursors: { ...baseline.cursors },
       flows: new Map(baseline.flows),
@@ -351,6 +366,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
         connEpoch: s.connEpoch + 1,
         // A fresh snapshot re-establishes the authoritative LIVE cut — clear any seek freeze.
         seekAtMs: null,
+        seekCutId: null,
         seekMonitorSeq: null,
         flows,
         flowOrder,
@@ -380,6 +396,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
         connEpoch: s.connEpoch + 1,
         // The frozen cut is fully gone — clear the seek freeze so elapsed ticks + the monitor unbounds.
         seekAtMs: null,
+        seekCutId: null,
         seekMonitorSeq: null,
         cursors: snap.cursors,
         flows,
@@ -509,6 +526,7 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       connEpoch: s.connEpoch + 1,
       cursors: emptyCursors(),
       seekAtMs: null,
+      seekCutId: null,
       seekMonitorSeq: null,
       flows: new Map(),
       flowOrder: [],
