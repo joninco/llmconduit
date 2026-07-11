@@ -12,6 +12,7 @@
 import type {
   CatalogEntry,
   DashboardFrame,
+  BackendProviderMetrics,
   DebugWsMessage,
   FlowDetail,
   FlowSummary,
@@ -64,6 +65,29 @@ const PER_PROVIDER: Record<string, ProviderLatency> = {
     p50: 240, p95: 1100, p99: 2400, error_rate: 16, errors: { connect: 7, timeout: 5 },
   },
   // openai: intentionally ABSENT (zero in-window samples → unavailable tile + neutral node).
+};
+
+const ENGINE_METRICS: Record<string, BackendProviderMetrics> = {
+  'vllm-a': {
+    engine_kind: 'vllm', status: 'fresh', coverage: 'full', scraped_at_ms: Date.now() - 1000,
+    last_success_ms: Date.now() - 1000,
+    instant: { running_requests: 3, waiting_requests: 1, kv_cache_utilization: 0.62 },
+    windows: {
+      m1: { samples: 12, generated_tokens_per_sec: 142.4, prefix_cache_hit_ratio: 0.71, speculative_acceptance_ratio: 0.83, prompt_tokens_per_sec: 88, cached_prompt_tokens_per_sec: 62, completed_requests_per_sec: 4.2, preemptions_per_sec: 0, histograms: { ttft_ms: { samples: 248, p50: 88, p95: 210, p99: 320, quantile_method: 'prometheus_histogram_derived' }, inter_token_ms: { samples: 900, p50: 17, p95: 31, p99: 48, quantile_method: 'prometheus_histogram_derived' } } },
+      m5: { samples: 60, generated_tokens_per_sec: 139.1, histograms: {} },
+      h1: { samples: 42, generated_tokens_per_sec: 131.8, histograms: {} },
+    },
+  },
+  'vllm-b': {
+    engine_kind: 'vllm', status: 'stale', coverage: 'full', scraped_at_ms: Date.now() - 18000,
+    last_success_ms: Date.now() - 18000, last_error_class: 'timeout',
+    instant: { running_requests: 1, waiting_requests: 8, kv_cache_utilization: 0.91 },
+    windows: {
+      m1: { samples: 12, generated_tokens_per_sec: 61.2, prefix_cache_hit_ratio: 0.22, histograms: { ttft_ms: { samples: 75, p50: 240, p95: 1100, p99: 2400, quantile_method: 'prometheus_histogram_derived' } } },
+      m5: { samples: 60, generated_tokens_per_sec: 65, histograms: {} },
+      h1: { samples: 38, generated_tokens_per_sec: 69, histograms: {} },
+    },
+  },
 };
 
 const PRICE_TABLE: TopologyResponse['price_table'] = {
@@ -469,7 +493,11 @@ function buildTopology(): TopologyResponse {
     // Gap 12/13: the REST `/topology` (+ snapshot) node carries the additive `per_provider` when the
     // provider had in-window samples; an absent entry (openai) leaves the field off (don't-lie-with
     // -zeros). The WS `topology_update` frame strips it (see `topologyFrame`).
-    nodes: NODES.map((n) => (PER_PROVIDER[n.id] ? { ...n, per_provider: PER_PROVIDER[n.id] } : n)),
+    nodes: NODES.map((n) => ({
+      ...n,
+      ...(PER_PROVIDER[n.id] ? { per_provider: PER_PROVIDER[n.id] } : {}),
+      ...(ENGINE_METRICS[n.id] ? { engine_metrics: ENGINE_METRICS[n.id] } : {}),
+    })),
     edges: [
       { from: 'gateway', to: 'vllm-a', attempts_per_sec: 4.3, terminal_flows_per_sec: 4.2, reported_tokens_per_sec: 142, terminal_cost_per_sec: 0.003 },
       { from: 'gateway', to: 'vllm-b', attempts_per_sec: 1.1, terminal_flows_per_sec: 1.0, reported_tokens_per_sec: 61, terminal_cost_per_sec: 0.001 },
@@ -481,8 +509,8 @@ function buildTopology(): TopologyResponse {
 function buildSnapshot(): SnapshotFrame {
   return {
     type: 'snapshot',
-      schema_version: 3,
-    cursors: { flow_seq: 3, metrics_seq: 1, topology_seq: 1, monitor_seq: 5 },
+      schema_version: 4,
+    cursors: { flow_seq: 3, metrics_seq: 1, topology_seq: 1, monitor_seq: 5 , backend_metrics_seq: 0},
     flows: seedFlows(),
     metrics: buildMetrics(),
     topology: buildTopology(),
@@ -542,7 +570,7 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: {
       'Content-Type': 'application/json',
-      'X-LLMConduit-Dashboard-Schema': '3',
+      'X-LLMConduit-Dashboard-Schema': '4',
     },
   });
 }
@@ -616,7 +644,7 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
       return {
         cut_id: at_ms,
         at_ms,
-        cursors: { flow_seq: 3, metrics_seq: index + 1, topology_seq: 1, monitor_seq: 5 },
+        cursors: { flow_seq: 3, metrics_seq: index + 1, topology_seq: 1, monitor_seq: 5 , backend_metrics_seq: 0},
         metrics,
       };
     });
@@ -635,7 +663,7 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
     // Snapshot summaries are body-free FlowSummary objects (identical shape, D1).
     const snap: SnapshotResponse = {
       cut_id: atMs,
-      cursors: { flow_seq: 3, metrics_seq: 1, topology_seq: 1, monitor_seq: 5 },
+      cursors: { flow_seq: 3, metrics_seq: 1, topology_seq: 1, monitor_seq: 5 , backend_metrics_seq: 0},
       at_ms: atMs,
       summaries: seedFlows(),
       metrics: buildMetrics(),
@@ -846,7 +874,7 @@ export class MockWebSocket implements WsLike {
     // carries `per_provider` ABSENT — strip it here to mirror the Rust `from_health` (the REST
     // `/topology` + `/snapshot` are the per-provider source). Stripping (not just omitting) proves
     // the frontend reads the REST path, not the WS frame, for the per-provider tile.
-    const nodes = t.nodes.map(({ per_provider: _omit, ...rest }) => rest);
+    const nodes = t.nodes.map(({ per_provider: _perProvider, engine_metrics: _engineMetrics, ...rest }) => rest);
     return {
       domain: 'topology',
       seq: ++this.seq.topology,

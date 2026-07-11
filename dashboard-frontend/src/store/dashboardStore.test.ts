@@ -9,7 +9,7 @@ import type { Attempt, FlowStatusPayload, FlowSummary, ProviderHealth, SeqCursor
  * `live → seek → live` round-trip. These lock that invariant at the store level.
  */
 
-const CURSORS: SeqCursors = { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 };
+const CURSORS: SeqCursors = { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0};
 function flow(id: string): FlowSummary {
   return { revision: 1, api_call_id: id, method: 'POST', uri: '/v1/responses', status: 'open', started_ms: 1, cost_confidence: 'unavailable' };
 }
@@ -113,7 +113,7 @@ describe('dashboardStore — atomic seek cut (finding 1)', () => {
     // The atomic install: frozen rows + cursors + cut, AND connection='seeking', in ONE update.
     dashboardStore.getState().applySeekCut({
       rows: [flow('frozen-row')],
-      cursors: { ...CURSORS, monitor_seq: 5 },
+      cursors: { ...CURSORS, monitor_seq: 5 , backend_metrics_seq: 0},
       atMs: 1_700_000_000_000,
       monitorSeq: 5,
       metrics: null,

@@ -422,6 +422,20 @@ pub trait UpstreamClient: Send + Sync {
         Ok(timeout_upstream_stream(stream, request_timeout))
     }
     async fn list_models(&self) -> AppResult<reqwest::Response>;
+    /// Concrete leaf targets eligible for debug-only backend telemetry. The
+    /// returned handles scrape directly and therefore cannot mutate serving
+    /// failover/cooldown state.
+    fn backend_metrics_targets(&self) -> Vec<crate::backend_metrics::BackendMetricsTarget> {
+        Vec::new()
+    }
+    /// Raw Prometheus exposition from the primary backend. Metrics are provider-
+    /// specific, so routing/failover implementations deliberately select their
+    /// first configured primary and never substitute a fallback provider.
+    async fn proxy_metrics(&self) -> AppResult<reqwest::Response> {
+        Err(AppError::internal(
+            "upstream metrics proxy is not implemented",
+        ))
+    }
     async fn proxy_completions(
         &self,
         _headers: HeaderMap,
@@ -1057,9 +1071,9 @@ impl ReqwestUpstreamClient {
             .map_err(|err| AppError::internal(format!("invalid upstream URL: {err}")))
     }
 
-    /// vLLM/SGLang expose `/tokenize` at the server root rather than below
-    /// their OpenAI-compatible `/v1` prefix.
-    fn tokenize_url(&self) -> Url {
+    /// vLLM/SGLang expose operational endpoints at the server root rather than
+    /// below their OpenAI-compatible `/v1` prefix.
+    fn server_root_endpoint_url(&self, endpoint: &str) -> Url {
         let mut segments: Vec<String> = self
             .base_url
             .path_segments()
@@ -1073,10 +1087,35 @@ impl ReqwestUpstreamClient {
         if segments.last().map(String::as_str) == Some("v1") {
             segments.pop();
         }
-        segments.push("tokenize".to_string());
+        segments.push(endpoint.to_string());
         let mut url = self.base_url.clone();
         url.set_path(&format!("/{}", segments.join("/")));
         url
+    }
+
+    fn tokenize_url(&self) -> Url {
+        self.server_root_endpoint_url("tokenize")
+    }
+
+    fn metrics_url(&self) -> Url {
+        let mut url = self.server_root_endpoint_url("metrics");
+        url.set_query(None);
+        url.set_fragment(None);
+        url
+    }
+
+    fn backend_metrics_target(
+        &self,
+        route: Option<String>,
+        provider_id: String,
+    ) -> crate::backend_metrics::BackendMetricsTarget {
+        crate::backend_metrics::BackendMetricsTarget::new(
+            route,
+            provider_id,
+            self.metrics_url(),
+            self.client.clone(),
+            self.api_key.clone(),
+        )
     }
 
     async fn send_chat_request(
@@ -1785,6 +1824,37 @@ impl UpstreamClient for ReqwestUpstreamClient {
             )));
         }
         Ok(response)
+    }
+
+    async fn proxy_metrics(&self) -> AppResult<reqwest::Response> {
+        self.with_auth(self.client.get(self.metrics_url()))
+            .send()
+            .await
+            .map_err(|err| AppError::upstream(format!("upstream metrics request failed: {err}")))
+    }
+
+    fn backend_metrics_targets(&self) -> Vec<crate::backend_metrics::BackendMetricsTarget> {
+        vec![self.backend_metrics_target(None, "primary".to_string())]
+    }
+
+    fn provider_health(&self) -> Vec<ProviderHealth> {
+        if !self.tag_primary_provider {
+            return Vec::new();
+        }
+        vec![ProviderHealth {
+            id: "primary".to_string(),
+            name: "primary".to_string(),
+            route: None,
+            base_url: self.base_url_string(),
+            status: ProviderStatus::Healthy,
+            cooling_until_ms: None,
+            last_error: None,
+            served_count: 0,
+            failover_count: 0,
+            consecutive_failures: 0,
+            catalog_fetched_ms: None,
+            catalog_size: None,
+        }]
     }
 
     async fn proxy_completions(
@@ -2946,6 +3016,25 @@ impl UpstreamClient for FailoverUpstreamClient {
             .unwrap_or_else(|| AppError::upstream("all upstream providers failed to list models")))
     }
 
+    async fn proxy_metrics(&self) -> AppResult<reqwest::Response> {
+        let provider = self
+            .providers
+            .first()
+            .ok_or_else(|| AppError::upstream("no primary upstream is configured for /metrics"))?;
+        provider.client.proxy_metrics().await
+    }
+
+    fn backend_metrics_targets(&self) -> Vec<crate::backend_metrics::BackendMetricsTarget> {
+        self.providers
+            .iter()
+            .map(|provider| {
+                provider
+                    .client
+                    .backend_metrics_target(None, provider.name.clone())
+            })
+            .collect()
+    }
+
     async fn proxy_completions(
         &self,
         headers: HeaderMap,
@@ -3248,6 +3337,35 @@ impl UpstreamClient for RoutingUpstreamClient {
     async fn list_models(&self) -> AppResult<reqwest::Response> {
         let catalog = self.load_catalog().await?;
         json_response(catalog.union_body())
+    }
+
+    async fn proxy_metrics(&self) -> AppResult<reqwest::Response> {
+        if let Some(provider) = self.providers.first() {
+            return provider.primary_client.proxy_metrics().await;
+        }
+        if let Some(provider) = self.route_providers.first() {
+            return provider.client.proxy_metrics().await;
+        }
+        Err(AppError::upstream(
+            "no primary upstream is configured for /metrics",
+        ))
+    }
+
+    fn backend_metrics_targets(&self) -> Vec<crate::backend_metrics::BackendMetricsTarget> {
+        let mut targets = Vec::new();
+        for provider in &self.providers {
+            targets.extend(provider.client.providers.iter().map(|leaf| {
+                leaf.client
+                    .backend_metrics_target(Some(provider.name.clone()), leaf.name.clone())
+            }));
+        }
+        for provider in &self.route_providers {
+            targets.extend(provider.client.providers.iter().map(|leaf| {
+                leaf.client
+                    .backend_metrics_target(Some(provider.name.clone()), leaf.name.clone())
+            }));
+        }
+        targets
     }
 
     async fn proxy_completions(

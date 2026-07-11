@@ -115,6 +115,7 @@ pub struct SeqCursors {
     pub metrics_seq: u64,
     pub topology_seq: u64,
     pub monitor_seq: u64,
+    pub backend_metrics_seq: u64,
 }
 
 /// The full `/api/metrics`-shaped snapshot body (the flat tile + the three
@@ -364,6 +365,10 @@ pub struct TopologyNode {
     /// reshape, which already join the m1 window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub per_provider: Option<crate::metrics::ProviderLatency>,
+    /// REST/snapshot-only normalized engine telemetry. Live WS topology frames
+    /// leave this absent, matching `per_provider`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_metrics: Option<crate::backend_metrics::BackendProviderMetrics>,
 }
 
 impl TopologyNode {
@@ -391,6 +396,7 @@ impl TopologyNode {
             // Gap 12: no metrics join on this path — populated only via
             // `from_health_with_metrics` (REST `/topology` + `/snapshot`).
             per_provider: None,
+            engine_metrics: None,
         }
     }
 
@@ -403,9 +409,13 @@ impl TopologyNode {
     pub(crate) fn from_health_with_metrics(
         health: &crate::upstream::ProviderHealth,
         window_1m: &crate::metrics::WindowReport,
+        backend_metrics: &crate::backend_metrics::BackendMetricsSnapshot,
     ) -> Self {
         let mut node = Self::from_health(health);
         node.per_provider = window_1m.provider_latency(&health.id);
+        node.engine_metrics = backend_metrics
+            .provider(health.route.as_deref(), &health.id)
+            .cloned();
         node
     }
 }
@@ -612,6 +622,9 @@ fn snapshot_message(
             metrics_seq: metrics.as_ref().map_or(0, |m| m.metrics_seq),
             topology_seq: topology.as_ref().map_or(0, |t| t.topology_seq),
             monitor_seq,
+            // Engine telemetry is deliberately REST/snapshot-only. The cursor is
+            // still explicit so future domain frames cannot share a watermark.
+            backend_metrics_seq: 0,
         },
         flows,
         metrics,

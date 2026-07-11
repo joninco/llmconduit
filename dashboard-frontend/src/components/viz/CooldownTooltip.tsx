@@ -17,10 +17,11 @@
  * — NOT the live WS topology frame, which carries `per_provider` ABSENT (it does not join the
  * metrics window). An absent entry (a provider with no in-window samples) renders `—` honestly.
  */
-import type { ProviderHealth, ProviderLatency } from '../../api/types';
+import type { BackendProviderMetrics, ProviderHealth, ProviderLatency } from '../../api/types';
 import { statusColor } from '../../design/tokens';
 import { ProviderLatencyTile } from './ProviderLatencyTile';
 import { buildProviderLatency } from './providerLatency';
+import { EngineMetricsCard } from './EngineMetricsCard';
 
 /** Format a future `cooling_until_ms` as a countdown ("cools in 8s") against `nowMs`, else "—". */
 function cooldownLabel(coolingUntilMs: number | null, nowMs: number): string {
@@ -44,9 +45,10 @@ export interface CooldownTooltipProps {
    * the tile renders `—` (unavailable), never a fabricated `0`.
    */
   perProvider: ProviderLatency | null | undefined;
+  engineMetrics?: BackendProviderMetrics | null;
 }
 
-export function CooldownTooltip({ health: h, x, y, nowMs, perProvider }: CooldownTooltipProps) {
+export function CooldownTooltip({ health: h, x, y, nowMs, perProvider, engineMetrics }: CooldownTooltipProps) {
   const providerModel = buildProviderLatency(perProvider, h.id);
   return (
     <div
@@ -75,6 +77,9 @@ export function CooldownTooltip({ health: h, x, y, nowMs, perProvider }: Cooldow
       {/* Gap 13: the per-provider latency tile — replaces the old global p99 with THIS provider's
           p50/p95/p99 + error rate + failure distribution (from the REST/snapshot node). */}
       <ProviderLatencyTile model={providerModel} />
+      <div className="mt-2 border-t border-line pt-2">
+        <EngineMetricsCard provider={h.name} metrics={engineMetrics} nowMs={nowMs} />
+      </div>
       {h.last_error && (
         <p className="mt-1.5 truncate border-t border-line pt-1.5 text-status-down" title={h.last_error} data-testid="tooltip-error">
           {h.last_error}

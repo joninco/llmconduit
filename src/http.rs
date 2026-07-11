@@ -116,6 +116,7 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         .route("/v1/chat/completions", post(post_chat_completions))
         .route("/v1/completions", post(post_completions))
         .route("/v1/models", get(get_models))
+        .route("/metrics", get(get_metrics))
         .route("/health", get(get_health))
         .route("/", get(get_root));
 
@@ -1470,6 +1471,14 @@ async fn post_completions(
         .upstream_client()
         .proxy_completions(headers, body)
         .await?;
+    Ok(proxy_upstream_response(response))
+}
+
+/// Raw Prometheus passthrough from the first configured primary backend. This
+/// intentionally stays separate from `/dashboard/api/metrics`, whose JSON is
+/// gateway-owned rolling telemetry rather than backend engine exposition.
+async fn get_metrics(State(gateway): State<Arc<Gateway>>) -> AppResult<Response> {
+    let response = gateway.upstream_client().proxy_metrics().await?;
     Ok(proxy_upstream_response(response))
 }
 

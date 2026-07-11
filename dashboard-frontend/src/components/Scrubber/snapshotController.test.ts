@@ -10,7 +10,7 @@ import {
 /** A snapshot whose `at_ms` echoes the requested bucket (so we can assert which one delivered). */
 function snap(atMs: number): SnapshotResponse {
   return {
-    cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+    cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
     at_ms: atMs,
     summaries: [],
     metrics: null,

@@ -37,6 +37,7 @@ http-body = "1"
 # `dashboard_ui.rs` is what makes `include_dir!` type-check.
 include_dir = "0.7"
 regex = "1"
+prometheus-parse = "0.2.5"
 # Persistent dashboard history. SQLite is used only from a dedicated blocking
 # worker/read tasks; inference never performs database IO on a Tokio worker.
 rusqlite = { version = "0.37", features = ["bundled"] }

@@ -43,6 +43,66 @@ export const FLOW_MUTATION_PHASES: readonly FlowMutationPhase[] = ['open', 'prog
 export type ProviderStatus = 'healthy' | 'cooling' | 'down';
 export const PROVIDER_STATUSES: readonly ProviderStatus[] = ['healthy', 'cooling', 'down'];
 
+export type BackendEngineKind = 'vllm' | 'sglang' | 'unknown';
+export type BackendMetricsStatus = 'warming' | 'fresh' | 'stale' | 'unsupported' | 'error';
+export type BackendMetricsCoverage = 'full' | 'partial';
+
+export interface BackendHistogramSummary {
+  samples: number;
+  p50?: number | null;
+  p95?: number | null;
+  p99?: number | null;
+  quantile_method: string;
+}
+
+export interface BackendLatencyMetrics {
+  ttft_ms?: BackendHistogramSummary | null;
+  inter_token_ms?: BackendHistogramSummary | null;
+  time_per_output_token_ms?: BackendHistogramSummary | null;
+  end_to_end_ms?: BackendHistogramSummary | null;
+  queue_ms?: BackendHistogramSummary | null;
+  inference_ms?: BackendHistogramSummary | null;
+  prefill_ms?: BackendHistogramSummary | null;
+  decode_ms?: BackendHistogramSummary | null;
+  prompt_tokens?: BackendHistogramSummary | null;
+  generation_tokens?: BackendHistogramSummary | null;
+  iteration_tokens?: BackendHistogramSummary | null;
+}
+
+export interface BackendMetricsWindow {
+  samples: number;
+  prompt_tokens_per_sec?: number | null;
+  cached_prompt_tokens_per_sec?: number | null;
+  generated_tokens_per_sec?: number | null;
+  completed_requests_per_sec?: number | null;
+  preemptions_per_sec?: number | null;
+  finish_reasons?: Record<string, number>;
+  prefix_cache_hit_ratio?: number | null;
+  prompt_token_cache_hit_ratio?: number | null;
+  speculative_draft_tokens_per_sec?: number | null;
+  speculative_accepted_tokens_per_sec?: number | null;
+  speculative_acceptance_ratio?: number | null;
+  histograms: BackendLatencyMetrics;
+}
+
+export interface BackendProviderMetrics {
+  engine_kind: BackendEngineKind;
+  status: BackendMetricsStatus;
+  coverage: BackendMetricsCoverage;
+  scraped_at_ms?: number | null;
+  last_success_ms?: number | null;
+  last_error_class?: string | null;
+  instant: {
+    running_requests?: number | null;
+    waiting_requests?: number | null;
+    waiting_by_reason?: Record<string, number>;
+    kv_cache_utilization?: number | null;
+    kv_cache_token_capacity?: number | null;
+    engine_sleeping?: boolean | null;
+  };
+  windows: { m1: BackendMetricsWindow; m5: BackendMetricsWindow; h1: BackendMetricsWindow };
+}
+
 /**
  * Gap 07 — the CONFIDENCE tier of a `cost` figure (Rust `CostConfidence`, snake_case).
  * Lets an operator tell a trusted figure from a best-effort estimate from an honest gap:
@@ -529,6 +589,8 @@ export interface ProviderHealth {
    * `skip_serializing_if` on a no-sample REST node) and a literal `null` both type.
    */
   per_provider?: ProviderLatency | null;
+  /** REST/snapshot-only engine telemetry; absent from live WS topology frames. */
+  engine_metrics?: BackendProviderMetrics | null;
 }
 
 export interface TopologyUpdatePayload {
@@ -595,6 +657,7 @@ export interface SeqCursors {
   metrics_seq: number;
   topology_seq: number;
   monitor_seq: number;
+  backend_metrics_seq: number;
 }
 
 /**

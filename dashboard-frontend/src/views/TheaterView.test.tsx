@@ -310,7 +310,7 @@ describe('TheaterView — SEEK shows historical summaries, NOT a live river', ()
     act(() => {
       dashboardStore.getState().applySeekCut({
         rows: [frozenFlow({ model_served: 'gpt-4o', terminal_reason: 'response.completed', usage: { prompt: 10, completion: 20, total: 30, cached: 0, reasoning: 0 } })],
-        cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+        cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
         atMs: 1_700_000_000_000,
         monitorSeq: 0,
         metrics: null,

@@ -826,6 +826,7 @@ pub fn topology_body(
     snapshot: &ProviderHealthSnapshot,
     prices: &HashMap<String, ModelPrice>,
     window_1m: &WindowReport,
+    backend_metrics: &crate::backend_metrics::BackendMetricsSnapshot,
 ) -> TopologySnapshot {
     // Gap 12: each node carries its per-provider latency/error metrics from the m1
     // window (aggregated off the evict-safe per-attempt trace), looked up by provider id
@@ -834,7 +835,9 @@ pub fn topology_body(
     let nodes: Vec<TopologyNode> = snapshot
         .providers
         .iter()
-        .map(|provider| TopologyNode::from_health_with_metrics(provider, window_1m))
+        .map(|provider| {
+            TopologyNode::from_health_with_metrics(provider, window_1m, backend_metrics)
+        })
         .collect();
     let edges: Vec<TopologyEdge> = snapshot
         .providers
@@ -1508,16 +1511,23 @@ pub async fn dashboard_topology(
                 &cut.snapshot.topology,
                 gateway.price_table(),
                 &cut.snapshot.metrics.window_1m,
+                &cut.snapshot.backend_metrics,
             ),
         );
     }
     let body = if let Some(cut) = gateway.metrics().latest_published_metrics() {
-        topology_body(&cut.topology, gateway.price_table(), &cut.view.window_1m)
+        topology_body(
+            &cut.topology,
+            gateway.price_table(),
+            &cut.view.window_1m,
+            &cut.backend_metrics,
+        )
     } else {
         topology_body(
             &ProviderHealthSnapshot::default(),
             gateway.price_table(),
             &MetricsView::default().window_1m,
+            &crate::backend_metrics::BackendMetricsSnapshot::default(),
         )
     };
     json_no_store(StatusCode::OK, &body)
@@ -1646,7 +1656,12 @@ pub async fn dashboard_snapshot(
         active,
         prices,
     ));
-    let topology = Some(topology_body(&cut.topology, prices, &cut.metrics.window_1m));
+    let topology = Some(topology_body(
+        &cut.topology,
+        prices,
+        &cut.metrics.window_1m,
+        &cut.backend_metrics,
+    ));
     let monitor_messages = if durable {
         gateway
             .dashboard_history()
@@ -1664,6 +1679,7 @@ pub async fn dashboard_snapshot(
                 metrics_seq: cut.cursors.metrics_seq,
                 topology_seq: cut.cursors.topology_seq,
                 monitor_seq: cut.cursors.monitor_seq,
+                backend_metrics_seq: cut.cursors.backend_metrics_seq,
             },
             at_ms: cut.taken_at_ms,
             summaries,
@@ -1718,6 +1734,7 @@ pub async fn dashboard_history(
                     metrics_seq: cut.snapshot.cursors.metrics_seq,
                     topology_seq: cut.snapshot.cursors.topology_seq,
                     monitor_seq: cut.snapshot.cursors.monitor_seq,
+                    backend_metrics_seq: cut.snapshot.cursors.backend_metrics_seq,
                 },
                 metrics: metrics.windows.m1,
             }
@@ -3055,7 +3072,28 @@ mod tests {
             providers: vec![provider_health("provider-a"), provider_health("provider-b")],
         };
         let prices: HashMap<String, ModelPrice> = HashMap::new();
-        let body = topology_body(&snapshot, &prices, &metrics.view().window_1m);
+        let backend = crate::backend_metrics::BackendMetricsSnapshot {
+            seq: 9,
+            generated_at_ms: 1_000,
+            providers: BTreeMap::from([(
+                crate::backend_metrics::LogicalProviderKey {
+                    route: None,
+                    provider_id: "provider-a".to_string(),
+                },
+                crate::backend_metrics::BackendProviderMetrics {
+                    engine_kind: crate::backend_metrics::BackendEngineKind::Vllm,
+                    status: crate::backend_metrics::BackendMetricsStatus::Fresh,
+                    coverage: crate::backend_metrics::BackendMetricsCoverage::Full,
+                    scraped_at_ms: Some(1_000),
+                    last_success_ms: Some(1_000),
+                    last_error_class: None,
+                    instant: crate::backend_metrics::BackendInstantMetrics::default(),
+                    windows: crate::backend_metrics::BackendMetricWindows::default(),
+                },
+            )]),
+            overflow_count: 0,
+        };
+        let body = topology_body(&snapshot, &prices, &metrics.view().window_1m, &backend);
 
         let value = serde_json::to_value(&body).expect("serialize topology body");
         let nodes = value["nodes"].as_array().expect("nodes array");
@@ -3079,12 +3117,14 @@ mod tests {
         assert_eq!(per_a["p50"], serde_json::Value::Null);
         assert_eq!(per_a["p95"], serde_json::Value::Null);
         assert_eq!(per_a["p99"], serde_json::Value::Null);
+        assert_eq!(node_a["engine_metrics"]["engine_kind"], "vllm");
 
         // provider-b has NO samples → the field is ABSENT (don't-lie-with-zeros).
         assert!(
             node_b.get("per_provider").is_none(),
             "a zero-sample provider omits per_provider entirely (unavailable, not 0)"
         );
+        assert!(node_b.get("engine_metrics").is_none());
 
         // The per_provider tile round-trips back into the typed DTO.
         let typed: crate::metrics::ProviderLatency =

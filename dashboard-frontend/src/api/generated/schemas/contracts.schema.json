@@ -223,6 +223,393 @@
         }
       ]
     },
+    "BackendEngineKind": {
+      "type": "string",
+      "enum": [
+        "vllm",
+        "sglang",
+        "unknown"
+      ]
+    },
+    "BackendHistogramSummary": {
+      "type": "object",
+      "properties": {
+        "p50": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p95": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "p99": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "quantile_method": {
+          "type": "string"
+        },
+        "samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "samples",
+        "quantile_method"
+      ]
+    },
+    "BackendInstantMetrics": {
+      "type": "object",
+      "properties": {
+        "engine_sleeping": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "kv_cache_token_capacity": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "kv_cache_utilization": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "running_requests": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "waiting_by_reason": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double"
+          }
+        },
+        "waiting_requests": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      }
+    },
+    "BackendLatencyMetrics": {
+      "type": "object",
+      "properties": {
+        "decode_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendHistogramSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "end_to_end_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendHistogramSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "generation_tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendHistogramSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inference_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendHistogramSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inter_token_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendHistogramSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "iteration_tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendHistogramSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prefill_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendHistogramSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prompt_tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendHistogramSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "queue_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendHistogramSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_per_output_token_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendHistogramSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ttft_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendHistogramSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "BackendMetricWindows": {
+      "type": "object",
+      "properties": {
+        "h1": {
+          "$ref": "#/$defs/BackendMetricsWindow"
+        },
+        "m1": {
+          "$ref": "#/$defs/BackendMetricsWindow"
+        },
+        "m5": {
+          "$ref": "#/$defs/BackendMetricsWindow"
+        }
+      },
+      "required": [
+        "m1",
+        "m5",
+        "h1"
+      ]
+    },
+    "BackendMetricsCoverage": {
+      "type": "string",
+      "enum": [
+        "full",
+        "partial"
+      ]
+    },
+    "BackendMetricsStatus": {
+      "type": "string",
+      "enum": [
+        "warming",
+        "fresh",
+        "stale",
+        "unsupported",
+        "error"
+      ]
+    },
+    "BackendMetricsWindow": {
+      "type": "object",
+      "properties": {
+        "cached_prompt_tokens_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "completed_requests_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "finish_reasons": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0
+          }
+        },
+        "generated_tokens_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "histograms": {
+          "$ref": "#/$defs/BackendLatencyMetrics"
+        },
+        "preemptions_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "prefix_cache_hit_ratio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "prompt_token_cache_hit_ratio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "prompt_tokens_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "samples": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "speculative_acceptance_ratio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "speculative_accepted_tokens_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "speculative_draft_tokens_per_sec": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "samples",
+        "histograms"
+      ]
+    },
+    "BackendProviderMetrics": {
+      "type": "object",
+      "properties": {
+        "coverage": {
+          "$ref": "#/$defs/BackendMetricsCoverage"
+        },
+        "engine_kind": {
+          "$ref": "#/$defs/BackendEngineKind"
+        },
+        "instant": {
+          "$ref": "#/$defs/BackendInstantMetrics"
+        },
+        "last_error_class": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_success_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "scraped_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/BackendMetricsStatus"
+        },
+        "windows": {
+          "$ref": "#/$defs/BackendMetricWindows"
+        }
+      },
+      "required": [
+        "engine_kind",
+        "status",
+        "coverage",
+        "instant",
+        "windows"
+      ]
+    },
     "CapturedSection": {
       "type": "object",
       "properties": {
@@ -3006,6 +3393,11 @@
       "description": "The four per-domain cursors carried on the initial [`SnapshotMessage`] — the\n`{flow,metrics,topology,monitor}` sequences the SPA installs as its dedup\nbaseline (`commitSnapshot` in `dashboard-frontend/src/api/ws.ts`). Serializes\nsnake_case to the frozen `SeqCursors` contract.",
       "type": "object",
       "properties": {
+        "backend_metrics_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "flow_seq": {
           "type": "integer",
           "format": "uint64",
@@ -3031,7 +3423,8 @@
         "flow_seq",
         "metrics_seq",
         "topology_seq",
-        "monitor_seq"
+        "monitor_seq",
+        "backend_metrics_seq"
       ]
     },
     "SnapshotHistoryMetadata": {
@@ -3298,6 +3691,17 @@
           ],
           "format": "uint64",
           "minimum": 0
+        },
+        "engine_metrics": {
+          "description": "REST/snapshot-only normalized engine telemetry. Live WS topology frames\nleave this absent, matching `per_provider`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackendProviderMetrics"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "failover_count": {
           "type": "integer",

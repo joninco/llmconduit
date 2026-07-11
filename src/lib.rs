@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod backend_metrics;
 pub mod cli;
 pub mod config;
 pub mod dashboard_api;
@@ -118,8 +119,13 @@ pub fn build_app_with_gateway_and_options(
     // `disabled()` split). Attached to the Gateway via `with_metrics`; the shared 1 s
     // publisher (with a snapshot every fifth cut) is spawned below under the same gate,
     // so production runs no ring/histogram/publisher/snapshot work.
+    let backend_metrics = if crate::backend_metrics::collection_enabled(options.with_debug_ui) {
+        crate::backend_metrics::BackendMetricsStore::new()
+    } else {
+        crate::backend_metrics::BackendMetricsStore::disabled()
+    };
     let metrics = if options.with_debug_ui {
-        crate::metrics::MetricsLayer::new()
+        crate::metrics::MetricsLayer::new().with_backend_metrics(backend_metrics.clone())
     } else {
         crate::metrics::MetricsLayer::disabled()
     };
@@ -273,6 +279,7 @@ pub fn build_app_with_gateway_and_options(
             ))
         }
     };
+    let backend_metrics_targets = upstream.backend_metrics_targets();
     let search = Arc::new(BraveSearchClient::new(http_client.clone(), config.clone()));
     // G4 image agent: a vision client + a shared per-session image cache. The
     // cache is constructed once and shared so the strip seam (in
@@ -335,6 +342,10 @@ pub fn build_app_with_gateway_and_options(
     // tokio runtime so a non-async embedder that enables the debug UI does not
     // panic in `tokio::spawn` (the `main.rs` server path always has one).
     if options.with_debug_ui && tokio::runtime::Handle::try_current().is_ok() {
+        let _ = crate::backend_metrics::spawn_backend_metrics_collector(
+            backend_metrics,
+            backend_metrics_targets,
+        );
         gateway.spawn_provider_health_publisher();
         // Spawn ONE process-level publisher rather than a timer per dashboard socket.
         // Every fifth one-second cut is also retained as the historical snapshot.

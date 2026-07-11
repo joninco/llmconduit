@@ -20,7 +20,7 @@ import { useQuery } from '@tanstack/react-query';
 import { getConnection, queryKeys } from '../api/connection';
 import { dashboardStore } from './dashboardStore';
 import { useDashboard } from './hooks';
-import type { ProviderLatency } from '../api/types';
+import type { BackendProviderMetrics, ProviderHealth, ProviderLatency } from '../api/types';
 
 /**
  * Gap 13 — a by-id map of the per-provider latency/error metrics from the LIVE REST `/topology`
@@ -33,10 +33,17 @@ import type { ProviderLatency } from '../api/types';
  * own `per_provider` instead, which the `/snapshot` reshape populates).
  */
 export type PerProviderById = Record<string, ProviderLatency>;
+export type EngineMetricsById = Record<string, BackendProviderMetrics>;
+
+export function topologyProviderKey(provider: Pick<ProviderHealth, 'id' | 'route'>): string {
+  return `${provider.route ?? ''}|${provider.id}`;
+}
 
 export interface TopologyQueryResult {
   /** Per-provider metrics keyed by provider id, from the LIVE REST read (absent ⇒ no in-window data). */
   perProviderById: PerProviderById;
+  /** REST-only engine telemetry keyed by composite route/provider identity. */
+  engineMetricsById: EngineMetricsById;
   loadState: 'loading' | 'ready' | 'error';
   retry: () => void;
 }
@@ -74,8 +81,19 @@ export function useTopologyQuery(): TopologyQueryResult {
     return map;
   }, [seeking, data]);
 
+  const engineMetricsById = useMemo<EngineMetricsById>(() => {
+    const map: EngineMetricsById = {};
+    if (!seeking && data) {
+      for (const node of data.nodes) {
+        if (node.engine_metrics) map[topologyProviderKey(node)] = node.engine_metrics;
+      }
+    }
+    return map;
+  }, [seeking, data]);
+
   return {
     perProviderById,
+    engineMetricsById,
     loadState: seeking ? 'ready' : query.isError ? 'error' : query.isPending ? 'loading' : 'ready',
     retry: () => { void query.refetch(); },
   };

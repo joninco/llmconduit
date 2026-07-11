@@ -3365,6 +3365,112 @@ async fn proxies_completions_endpoint_passthrough() {
 }
 
 #[tokio::test]
+async fn proxies_metrics_endpoint_from_backend_root() {
+    let server = MockServer::start().await;
+    let metrics = concat!(
+        "# HELP vllm:num_requests_running Number of running requests.\n",
+        "# TYPE vllm:num_requests_running gauge\n",
+        "vllm:num_requests_running{model_name=\"glm-5.1\"} 3\n",
+    );
+    Mock::given(method("GET"))
+        .and(path("/metrics"))
+        .and(header("authorization", "Bearer upstream-secret"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+                .insert_header("x-upstream", "metrics")
+                .set_body_string(metrics),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
+    config.upstream_api_key = Some("upstream-secret".to_string());
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream")
+            .and_then(|value| value.to_str().ok()),
+        Some("metrics")
+    );
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    assert_eq!(body.as_ref(), metrics.as_bytes());
+}
+
+#[tokio::test]
+async fn metrics_passthrough_does_not_substitute_a_fallback_provider() {
+    let primary = MockServer::start().await;
+    let fallback = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/metrics"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .insert_header("content-type", "text/plain")
+                .set_body_string("primary metrics unavailable\n"),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/metrics"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("fallback_metric 1\n"))
+        .expect(0)
+        .mount(&fallback)
+        .await;
+
+    let mut config = test_config();
+    config.upstream_base_url = format!("{}/v1/", primary.uri()).parse().expect("url");
+    config.fallback_upstreams = vec![FallbackUpstreamConfig {
+        name: "fallback".to_string(),
+        upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
+        upstream_api_key: None,
+        upstream_model: None,
+        exposed_model: None,
+        upstream_chat_kwargs: JsonMap::new(),
+        upstream_request_log_path: None,
+    }];
+    let app = llmconduit::build_app(config);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status().as_u16(), 503);
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("read body");
+    assert_eq!(body.as_ref(), b"primary metrics unavailable\n");
+}
+
+#[tokio::test]
 async fn merges_instructions_and_developer_into_single_system_message() {
     let upstream = MockUpstream::default();
     upstream
@@ -4727,8 +4833,8 @@ async fn flow_store_skips_non_whitelisted_paths() {
     // The FlowStore is enabled; the middleware's whitelist must skip these requests
     // BEFORE any upstream call, so whether the upstream proxy succeeds is
     // irrelevant — the assertion is purely "no record opened". (`/v1/completions`
-    // is a raw passthrough that bypasses the engine and is intentionally never
-    // instrumented; `/v1/models`, `/health`, `/dashboard/*` carry no flow.) D1 R1
+    // and `/metrics` are raw passthroughs that bypass the engine and are intentionally
+    // never instrumented; `/v1/models`, `/health`, `/dashboard/*` carry no flow.) D1 R1
     // #1: HEAD/OPTIONS probes on the whitelisted `/v1/messages` path must ALSO open
     // no record — the gate requires METHOD==POST, not just an allowed path.
     let gateway = test_gateway_with_flow_store(MockUpstream::default(), MockSearch::default());
@@ -4740,6 +4846,7 @@ async fn flow_store_skips_non_whitelisted_paths() {
             "/v1/completions",
             Some("{\"model\":\"glm-5.1\",\"prompt\":\"hi\"}"),
         ),
+        ("GET", "/metrics", None),
         ("GET", "/v1/models", None),
         ("GET", "/health", None),
         ("GET", "/dashboard/anything", None),

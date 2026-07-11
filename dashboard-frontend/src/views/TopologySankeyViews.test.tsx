@@ -47,7 +47,7 @@ function overview(over: Partial<OverviewResponse> = {}): OverviewResponse {
 function seedTopology(): void {
   act(() => {
     dashboardStore.getState().applySnapshot({
-      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 1, monitor_seq: 0 },
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 1, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: TOPOLOGY,
     });
     dashboardStore.getState().setConnection('live');
@@ -118,7 +118,7 @@ describe('SankeyView — authoritative Overview lanes', () => {
     act(() => {
       seedTopology();
       dashboardStore.getState().applySeekCut({
-        rows: [], cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 1, monitor_seq: 0 },
+        rows: [], cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 1, monitor_seq: 0 , backend_metrics_seq: 0},
         atMs: at, monitorSeq: 0, metrics: null, topology: TOPOLOGY,
       });
     });

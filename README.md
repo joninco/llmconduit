@@ -463,8 +463,14 @@ startup logs a prominent warning because `/debug` and `/dashboard` will be open.
 | `POST /v1/chat/completions` | OpenAI Chat Completions API |
 | `POST /v1/messages` | Anthropic Messages API |
 | `GET /v1/models` | Proxied model list |
+| `GET /metrics` | Raw Prometheus passthrough from the first configured primary upstream |
 | `GET /healthz` | Health check |
 | `GET /debug` | Debug UI when started with `--with-debug-ui` |
+
+`/metrics` preserves the primary backend's status, body, and eligible end-to-end
+headers. It does not fail over, because metrics from a different provider would
+describe different capacity and process state. `/dashboard/api/metrics` remains
+llmconduit's separate gateway-owned dashboard telemetry surface.
 
 ## Environment
 
@@ -485,11 +491,18 @@ LLMCONDUIT_MAX_WEB_SEARCH_ROUNDS
 LLMCONDUIT_MAX_REPLAY_ENTRIES
 LLMCONDUIT_FLATTEN_CONTENT
 LLMCONDUIT_TURN_CAPTURE_DIR
+LLMCONDUIT_BACKEND_METRICS
 BRAVE_SEARCH_API_KEY
 OPENAI_API_KEY
 ```
 
 `OPENAI_API_KEY` is used as a fallback upstream API key.
+
+With `--with-debug-ui`, llmconduit also polls every configured primary,
+fallback, and model-route backend's server-root `/metrics` endpoint for
+normalized vLLM/SGLang engine health. Set `LLMCONDUIT_BACKEND_METRICS=off` to
+disable those scrapes. This telemetry is observational only and never affects
+routing, failover, cooldowns, or request budgeting.
 
 ## Request Logs
 

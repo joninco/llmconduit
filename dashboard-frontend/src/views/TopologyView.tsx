@@ -14,7 +14,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { RadialTopology, type TopoHover } from '../components/viz/RadialTopology';
 import type { ProviderLatency } from '../api/types';
 import { useDashboard } from '../store/hooks';
-import { useTopologyQuery } from '../store/useTopologyQuery';
+import { topologyProviderKey, useTopologyQuery } from '../store/useTopologyQuery';
 import { flowFilterStore } from '../store/flowFilterStore';
 import { navigate } from '../router/useHashRoute';
 import { Panel } from '../components/ui/Panel';
@@ -24,7 +24,7 @@ export function TopologyView() {
   // Seed nodes/edges/prices from `/topology` (LIVE-only; never overwrites a seek cut) — finding 5.
   // Gap 13: it ALSO returns the per-provider latency/error map off the LIVE REST data (the
   // authoritative per-provider source live; the WS topology frame carries `per_provider` ABSENT).
-  const { perProviderById, loadState, retry } = useTopologyQuery();
+  const { perProviderById, engineMetricsById, loadState, retry } = useTopologyQuery();
   const nodes = useDashboard((s) => s.topologyNodes);
   const edges = useDashboard((s) => s.topologyEdges);
   const seeking = useDashboard((s) => s.connection === 'seeking');
@@ -55,6 +55,8 @@ export function TopologyView() {
   // RadialTopology emphasis doesn't churn on unrelated renders.
   const perProviderFor = (id: string): ProviderLatency | null | undefined =>
     perProviderById[id] ?? nodes.find((n) => n.id === id)?.per_provider ?? undefined;
+  const engineMetricsFor = (node: (typeof nodes)[number]) =>
+    engineMetricsById[topologyProviderKey(node)] ?? node.engine_metrics;
   const perProviderByNode = useMemo<Record<string, ProviderLatency>>(() => {
     const map: Record<string, ProviderLatency> = {};
     for (const n of nodes) {
@@ -126,6 +128,7 @@ export function TopologyView() {
                 <th className="px-2 py-1.5 text-right" scope="col">Attempts</th>
                 <th className="px-2 py-1.5 text-right" scope="col">p95</th>
                 <th className="px-2 py-1.5 text-right" scope="col">Errors</th>
+                <th className="px-2 py-1.5 text-right" scope="col">Engine</th>
               </tr>
             </thead>
             <tbody>
@@ -142,6 +145,7 @@ export function TopologyView() {
                     <td className="px-2 py-1 text-right tabular-nums">{health?.samples ?? '—'}</td>
                     <td className="px-2 py-1 text-right tabular-nums">{health?.p95 != null ? `${Math.round(health.p95)} ms` : '—'}</td>
                     <td className="px-2 py-1 text-right tabular-nums">{health ? `${health.error_rate.toFixed(1)}%` : '—'}</td>
+                    <td className="px-2 py-1 text-right tabular-nums">{engineMetricsFor(node)?.status ?? '—'}</td>
                   </tr>
                 );
               })}
@@ -150,7 +154,7 @@ export function TopologyView() {
         </div>
       )}
       {hover && hoverHealth && (
-        <CooldownTooltip health={hoverHealth} x={hover.x} y={hover.y} nowMs={clock} perProvider={perProviderFor(hover.id)} />
+        <CooldownTooltip health={hoverHealth} x={hover.x} y={hover.y} nowMs={clock} perProvider={perProviderFor(hover.id)} engineMetrics={engineMetricsFor(hoverHealth)} />
       )}
     </div>
   );

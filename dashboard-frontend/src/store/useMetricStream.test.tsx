@@ -85,7 +85,7 @@ describe('useMetricStream', () => {
       baseline = dashboardStore.getState().captureLiveBaseline();
       dashboardStore.getState().applySeekCut({
         rows: [],
-        cursors: { flow_seq: 0, metrics_seq: 77, topology_seq: 0, monitor_seq: 5 },
+        cursors: { flow_seq: 0, metrics_seq: 77, topology_seq: 0, monitor_seq: 5 , backend_metrics_seq: 0},
         atMs: Date.now(),
         monitorSeq: 5,
         metrics: metrics(77, 99), // FROZEN historical metrics (distinct seq + value)

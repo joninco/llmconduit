@@ -112,6 +112,9 @@ export type DebugWsMessage =
     };
 export type DebugRequestStatus = "running" | "completed" | "failed";
 export type DebugSegmentKind = "output" | "reasoning" | "tool";
+export type BackendMetricsCoverage = "full" | "partial";
+export type BackendEngineKind = "vllm" | "sglang" | "unknown";
+export type BackendMetricsStatus = "warming" | "fresh" | "stale" | "unsupported" | "error";
 /**
  * Per-provider serving status for the topology map (D4). `Cooling` while inside
  * the failure cooldown window; `Down` once a cooling provider has also crossed
@@ -792,6 +795,7 @@ export interface HistoryPoint {
  * snake_case to the frozen `SeqCursors` contract.
  */
 export interface SeqCursors {
+  backend_metrics_seq: number;
   flow_seq: number;
   metrics_seq: number;
   monitor_seq: number;
@@ -1177,6 +1181,11 @@ export interface TopologyNode {
   catalog_size: number;
   consecutive_failures: number;
   cooling_until_ms: number | null;
+  /**
+   * REST/snapshot-only normalized engine telemetry. Live WS topology frames
+   * leave this absent, matching `per_provider`.
+   */
+  engine_metrics?: BackendProviderMetrics | null;
   failover_count: number;
   id: string;
   last_error: string | null;
@@ -1197,6 +1206,68 @@ export interface TopologyNode {
   route: string | null;
   served_count: number;
   status: ProviderStatus;
+}
+export interface BackendProviderMetrics {
+  coverage: BackendMetricsCoverage;
+  engine_kind: BackendEngineKind;
+  instant: BackendInstantMetrics;
+  last_error_class?: string | null;
+  last_success_ms?: number | null;
+  scraped_at_ms?: number | null;
+  status: BackendMetricsStatus;
+  windows: BackendMetricWindows;
+}
+export interface BackendInstantMetrics {
+  engine_sleeping?: boolean | null;
+  kv_cache_token_capacity?: number | null;
+  kv_cache_utilization?: number | null;
+  running_requests?: number | null;
+  waiting_by_reason?: {
+    [k: string]: number;
+  };
+  waiting_requests?: number | null;
+}
+export interface BackendMetricWindows {
+  h1: BackendMetricsWindow;
+  m1: BackendMetricsWindow;
+  m5: BackendMetricsWindow;
+}
+export interface BackendMetricsWindow {
+  cached_prompt_tokens_per_sec?: number | null;
+  completed_requests_per_sec?: number | null;
+  finish_reasons?: {
+    [k: string]: number;
+  };
+  generated_tokens_per_sec?: number | null;
+  histograms: BackendLatencyMetrics;
+  preemptions_per_sec?: number | null;
+  prefix_cache_hit_ratio?: number | null;
+  prompt_token_cache_hit_ratio?: number | null;
+  prompt_tokens_per_sec?: number | null;
+  samples: number;
+  speculative_acceptance_ratio?: number | null;
+  speculative_accepted_tokens_per_sec?: number | null;
+  speculative_draft_tokens_per_sec?: number | null;
+}
+export interface BackendLatencyMetrics {
+  decode_ms?: BackendHistogramSummary | null;
+  end_to_end_ms?: BackendHistogramSummary | null;
+  generation_tokens?: BackendHistogramSummary | null;
+  inference_ms?: BackendHistogramSummary | null;
+  inter_token_ms?: BackendHistogramSummary | null;
+  iteration_tokens?: BackendHistogramSummary | null;
+  prefill_ms?: BackendHistogramSummary | null;
+  prompt_tokens?: BackendHistogramSummary | null;
+  queue_ms?: BackendHistogramSummary | null;
+  time_per_output_token_ms?: BackendHistogramSummary | null;
+  ttft_ms?: BackendHistogramSummary | null;
+}
+export interface BackendHistogramSummary {
+  p50?: number | null;
+  p95?: number | null;
+  p99?: number | null;
+  quantile_method: string;
+  samples: number;
 }
 /**
  * One model's billing rates (T13/D13), per 1k tokens. Field names mirror the

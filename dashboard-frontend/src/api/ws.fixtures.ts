@@ -173,5 +173,5 @@ export const GOLDEN_BOOTSTRAP = {
   authenticated: true,
   csrf_token: 'csrf-abc123',
   mutations_enabled: true,
-  schema_version: 3,
+  schema_version: 4,
 } as const;

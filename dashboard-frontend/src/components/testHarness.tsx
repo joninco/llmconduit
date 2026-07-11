@@ -46,7 +46,7 @@ export function resetWorld(opts: { mock?: boolean } = {}): void {
       authenticated: true,
       csrf_token: 'test-csrf',
       mutations_enabled: true,
-      schema_version: 3,
+      schema_version: 4,
     };
   }
 }
@@ -61,7 +61,7 @@ export function renderWithQuery(ui: ReactElement): RenderResult & { queryClient:
 /** Push a batch of flows into the live store via the snapshot path (newest-on-top order). */
 export function seedFlows(flows: FlowSummary[]): void {
   dashboardStore.getState().applySnapshot({
-    cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+    cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
     flows,
     metrics: null,
     topology: null,

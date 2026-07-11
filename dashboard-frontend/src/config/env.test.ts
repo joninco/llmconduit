@@ -9,26 +9,26 @@ describe('bootstrap parsing — frozen field names (finding 6)', () => {
       authenticated: true,
       csrf_token: 'csrf-abc123',
       mutations_enabled: true,
-      schema_version: 3,
+      schema_version: 4,
     });
   });
 
-  it('accepts only the server-authored schema-v3 bootstrap', () => {
+  it('accepts only the server-authored schema-v4 bootstrap', () => {
     expect(
       parseBootstrap({
         authenticated: true,
         csrf_token: 'csrf',
         mutations_enabled: false,
-        schema_version: 3,
+        schema_version: 4,
       }),
-    ).toEqual({ authenticated: true, csrf_token: 'csrf', mutations_enabled: false, schema_version: 3 });
+    ).toEqual({ authenticated: true, csrf_token: 'csrf', mutations_enabled: false, schema_version: 4 });
   });
 
   it('surfaces malformed contracts instead of silently coercing them', () => {
     expect(() => parseBootstrap({})).toThrow(/contract validation failed/);
     expect(() => parseBootstrap(null)).toThrow(/contract validation failed/);
     expect(() =>
-      parseBootstrap({ authenticated: 'yes', csrf_token: 123, mutations_enabled: 1, schema_version: 3 }),
+      parseBootstrap({ authenticated: 'yes', csrf_token: 123, mutations_enabled: 1, schema_version: 4 }),
     ).toThrow(/contract validation failed/);
   });
 });

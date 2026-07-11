@@ -1709,6 +1709,10 @@ pub struct DomainCursors {
     pub topology_seq: u64,
     /// Monitor hub sequence (D3 transcript domain).
     pub monitor_seq: u64,
+    /// Debug-only backend Prometheus domain. Independent from gateway metrics
+    /// and topology so a faster scrape cannot discard a sibling frame/cut.
+    #[serde(default)]
+    pub backend_metrics_seq: u64,
 }
 
 /// The single process-wide immutable metrics presentation cut. A one-second publisher
@@ -1738,6 +1742,8 @@ pub struct PublishedMetricsCut {
     /// The topology generation sampled for this same cut. Consumers that need provider
     /// joins should use this Arc rather than independently reading the topology publisher.
     pub topology: Arc<ProviderHealthSnapshot>,
+    /// Immutable normalized backend-engine telemetry sampled for this cut.
+    pub backend_metrics: Arc<crate::backend_metrics::BackendMetricsSnapshot>,
 }
 
 /// One latest-value broadcaster shared by the process. The `watch` channel retains a
@@ -1823,6 +1829,40 @@ pub struct DashboardSnapshot {
         deserialize_with = "deserialize_topology"
     )]
     pub topology: Arc<ProviderHealthSnapshot>,
+    /// Normalized, body-free backend telemetry. Old v1 CBOR rows deserialize
+    /// to an empty domain.
+    #[serde(
+        default = "default_backend_metrics_snapshot",
+        serialize_with = "serialize_backend_metrics",
+        deserialize_with = "deserialize_backend_metrics"
+    )]
+    pub backend_metrics: Arc<crate::backend_metrics::BackendMetricsSnapshot>,
+}
+
+fn default_backend_metrics_snapshot() -> Arc<crate::backend_metrics::BackendMetricsSnapshot> {
+    Arc::new(crate::backend_metrics::BackendMetricsSnapshot::default())
+}
+
+fn serialize_backend_metrics<S>(
+    metrics: &Arc<crate::backend_metrics::BackendMetricsSnapshot>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    (**metrics).serialize(serializer)
+}
+
+fn deserialize_backend_metrics<'de, D>(
+    deserializer: D,
+) -> Result<Arc<crate::backend_metrics::BackendMetricsSnapshot>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <crate::backend_metrics::BackendMetricsSnapshot as serde::Deserialize>::deserialize(
+        deserializer,
+    )
+    .map(Arc::new)
 }
 
 /// Serialize an `Arc<ProviderHealthSnapshot>` by dereferencing to the inner value
@@ -1857,6 +1897,7 @@ impl DashboardSnapshot {
             .saturating_add(snapshot_summaries_retained_bytes(&self.summaries))
             .saturating_add(self.metrics.heap_bytes())
             .saturating_add(topology_retained_bytes(&self.topology))
+            .saturating_add(self.backend_metrics.approx_bytes())
     }
 
     /// Reduce an oversized cut to the largest contiguous NEWEST summary prefix that
@@ -2353,6 +2394,7 @@ pub struct MetricsLayer {
     /// `None` on the disabled path: no watch channel and therefore no publisher
     /// allocation or subscription surface when `--with-debug-ui` is off.
     publisher: Option<Arc<MetricsPublisher>>,
+    backend_metrics: crate::backend_metrics::BackendMetricsStore,
 }
 
 impl std::fmt::Debug for MetricsLayer {
@@ -2387,6 +2429,7 @@ impl MetricsLayer {
                 configured_snapshot_quota_bytes(),
             )))),
             publisher: Some(Arc::new(MetricsPublisher::new())),
+            backend_metrics: crate::backend_metrics::BackendMetricsStore::disabled(),
         }
     }
 
@@ -2397,6 +2440,7 @@ impl MetricsLayer {
             enabled: false,
             state: None,
             publisher: None,
+            backend_metrics: crate::backend_metrics::BackendMetricsStore::disabled(),
         }
     }
 
@@ -2408,7 +2452,16 @@ impl MetricsLayer {
             enabled: true,
             state: Some(Arc::new(Mutex::new(MetricsState::new(quota_bytes)))),
             publisher: Some(Arc::new(MetricsPublisher::new())),
+            backend_metrics: crate::backend_metrics::BackendMetricsStore::disabled(),
         }
+    }
+
+    pub fn with_backend_metrics(
+        mut self,
+        backend_metrics: crate::backend_metrics::BackendMetricsStore,
+    ) -> Self {
+        self.backend_metrics = backend_metrics;
+        self
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -2684,6 +2737,8 @@ impl MetricsLayer {
                 .count() as u64;
             let topology = topology_publisher.latest();
             let topology_seq = topology.version;
+            let backend_metrics = self.backend_metrics.latest();
+            let backend_metrics_seq = backend_metrics.seq;
             let source_metrics_seq = state.metrics_seq;
             let monitor_seq = read_monitor_seq();
             let metrics_seq = state.next_presentation_seq();
@@ -2700,6 +2755,7 @@ impl MetricsLayer {
                 metrics_seq,
                 topology_seq,
                 monitor_seq,
+                backend_metrics_seq,
             };
 
             if persist_snapshot {
@@ -2710,6 +2766,7 @@ impl MetricsLayer {
                     flow_summaries_truncated: false,
                     metrics: view.clone(),
                     topology: Arc::clone(&topology),
+                    backend_metrics: Arc::clone(&backend_metrics),
                 };
                 snapshot.truncate_summaries_to_fit(state.snapshots.quota_bytes);
                 let _ = state.snapshots.push(Arc::new(snapshot));
@@ -2722,6 +2779,7 @@ impl MetricsLayer {
                 active_streams,
                 view,
                 topology,
+                backend_metrics,
             });
             // Never hold FlowStore/Metrics while waking subscribers. A consumer may
             // immediately call back into either store.
@@ -2837,6 +2895,8 @@ impl MetricsLayer {
             // ONE topology Arc capture (D4) at the cut instant.
             let topology = topology.latest();
             let topology_seq = topology.version;
+            let backend_metrics = self.backend_metrics.latest();
+            let backend_metrics_seq = backend_metrics.seq;
             // Manual cuts share the SAME presentation allocator as the one-second
             // publisher, so a diagnostic/test snapshot can never make the metrics cursor
             // regress relative to a published cut.
@@ -2857,6 +2917,7 @@ impl MetricsLayer {
                 metrics_seq,
                 topology_seq,
                 monitor_seq,
+                backend_metrics_seq,
             };
             let mut cut = DashboardSnapshot {
                 taken_at_ms,
@@ -2865,6 +2926,7 @@ impl MetricsLayer {
                 flow_summaries_truncated: false,
                 metrics,
                 topology,
+                backend_metrics,
             };
             // A single cut may exceed the configured history quota even though every
             // summary is body-free (512 summaries with max-cap client/attempt labels can
@@ -3084,6 +3146,45 @@ fn now_epoch_s() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(serde::Serialize)]
+    struct LegacyDomainCursors {
+        flow_seq: u64,
+        metrics_seq: u64,
+        topology_seq: u64,
+        monitor_seq: u64,
+    }
+
+    #[derive(serde::Serialize)]
+    struct LegacyDashboardSnapshot {
+        taken_at_ms: u128,
+        cursors: LegacyDomainCursors,
+        summaries: Vec<SnapshotFlowSummary>,
+        flow_summaries_truncated: bool,
+        metrics: MetricsView,
+        topology: ProviderHealthSnapshot,
+    }
+
+    #[test]
+    fn old_cbor_snapshot_defaults_backend_metrics_domain() {
+        let bytes = serde_cbor::to_vec(&LegacyDashboardSnapshot {
+            taken_at_ms: 1,
+            cursors: LegacyDomainCursors {
+                flow_seq: 2,
+                metrics_seq: 3,
+                topology_seq: 4,
+                monitor_seq: 5,
+            },
+            summaries: Vec::new(),
+            flow_summaries_truncated: false,
+            metrics: MetricsView::default(),
+            topology: ProviderHealthSnapshot::default(),
+        })
+        .unwrap();
+        let decoded: DashboardSnapshot = serde_cbor::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.cursors.backend_metrics_seq, 0);
+        assert!(decoded.backend_metrics.providers.is_empty());
+    }
 
     /// Build a histogram from an explicit list of latency samples (ms).
     fn histogram_of(samples: &[f64]) -> Histogram {

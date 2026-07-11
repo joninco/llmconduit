@@ -36,7 +36,7 @@ function stubFlowsFetch(flows: FlowSummary[], flowSeq = 0): void {
         status: 200,
         headers: {
           'Content-Type': 'application/json',
-          'X-LLMConduit-Dashboard-Schema': '3',
+          'X-LLMConduit-Dashboard-Schema': '4',
         },
       });
     }

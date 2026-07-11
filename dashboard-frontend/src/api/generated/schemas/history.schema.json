@@ -282,6 +282,11 @@
       "description": "The four per-domain cursors carried on the initial [`SnapshotMessage`] — the\n`{flow,metrics,topology,monitor}` sequences the SPA installs as its dedup\nbaseline (`commitSnapshot` in `dashboard-frontend/src/api/ws.ts`). Serializes\nsnake_case to the frozen `SeqCursors` contract.",
       "type": "object",
       "properties": {
+        "backend_metrics_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "flow_seq": {
           "type": "integer",
           "format": "uint64",
@@ -307,7 +312,8 @@
         "flow_seq",
         "metrics_seq",
         "topology_seq",
-        "monitor_seq"
+        "monitor_seq",
+        "backend_metrics_seq"
       ]
     }
   }

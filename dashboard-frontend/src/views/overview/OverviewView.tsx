@@ -26,6 +26,8 @@ import { ProviderLatencyTile } from '../../components/viz/ProviderLatencyTile';
 import { buildProviderLatency } from '../../components/viz/providerLatency';
 import { fmtCost, fmtTokens } from '../../components/FlowTable/format';
 import { cn } from '../../lib/cn';
+import { useTopologyQuery, topologyProviderKey } from '../../store/useTopologyQuery';
+import { EngineMetricsCard } from '../../components/viz/EngineMetricsCard';
 
 const DASH = '—';
 const TOP_ROWS = 5;
@@ -51,6 +53,8 @@ export function OverviewView() {
   const seekCutId = useDashboard((state) => state.seekCutId);
   const { client } = getConnection();
   const openOnly = hashScope.status === 'open';
+  const topologyNodes = useDashboard((state) => state.topologyNodes);
+  const { engineMetricsById } = useTopologyQuery();
 
   const request = useMemo<OverviewQuery>(() => ({
     window: hashScope.window,
@@ -80,6 +84,29 @@ export function OverviewView() {
           </span>
         )}
       </div>
+
+      <section className="mb-3" aria-labelledby="engine-health-title" data-testid="engine-health-section">
+        <div className="mb-2 flex items-baseline gap-2">
+          <h2 id="engine-health-title" className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">Engine health</h2>
+          <span className="text-[9px] text-text-muted">backend m1 · scheduler / cache / throughput</span>
+        </div>
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+          {topologyNodes
+            .filter((node) => !hashScope.upstream || node.id === hashScope.upstream)
+            .map((node) => (
+              <EngineMetricsCard
+                key={topologyProviderKey(node)}
+                provider={node.route ? `${node.route} / ${node.name}` : node.name}
+                metrics={engineMetricsById[topologyProviderKey(node)] ?? node.engine_metrics}
+                nowMs={seeking && seekAtMs != null ? seekAtMs : Date.now()}
+                compact
+              />
+            ))}
+          {topologyNodes.filter((node) => !hashScope.upstream || node.id === hashScope.upstream).length === 0 && (
+            <Panel className="p-3 text-xs italic text-text-muted" data-quality="unavailable">No providers in this scope · {DASH}</Panel>
+          )}
+        </div>
+      </section>
 
       {openOnly ? (
         <Panel className="p-6 text-center" data-testid="overview-open-unavailable" role="status">

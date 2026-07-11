@@ -928,7 +928,7 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     fireEvent.click(getByTestId('kill-button'));
     expect(dashboardStore.getState().flows.get('api_001')?.status).toBe('cancelled');
     const frozenRow = makeFlow({ api_call_id: 'api_snap', status: 'completed', started_ms: started });
-    act(() => dashboardStore.getState().applySnapshot({ cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 }, flows: [frozenRow], metrics: null, topology: null }));
+    act(() => dashboardStore.getState().applySnapshot({ cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0}, flows: [frozenRow], metrics: null, topology: null }));
     act(() => dashboardStore.getState().enterSeek(started + 1_000));
 
     // Let the 403 resolve. The epoch guard skips the rollback: the frozen cut keeps ONLY api_snap;
@@ -965,7 +965,7 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     // Return to LIVE via a fresh snapshot that does NOT contain api_001 (it was killed server-side),
     // then flip back to 'live' — exactly the socket's resume path (commitSnapshot → setConnection).
     act(() => {
-      dashboardStore.getState().applySnapshot({ cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 }, flows: [], metrics: null, topology: null });
+      dashboardStore.getState().applySnapshot({ cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0}, flows: [], metrics: null, topology: null });
       dashboardStore.getState().setConnection('live');
     });
     expect(dashboardStore.getState().connection).toBe('live');

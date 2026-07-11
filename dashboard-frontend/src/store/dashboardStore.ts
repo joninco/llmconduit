@@ -219,6 +219,7 @@ const emptyCursors = (): SeqCursors => ({
   metrics_seq: 0,
   topology_seq: 0,
   monitor_seq: 0,
+  backend_metrics_seq: 0,
 });
 
 export const dashboardStore = createStore<DashboardState>((set, get) => ({

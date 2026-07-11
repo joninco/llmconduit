@@ -170,7 +170,7 @@ describe('StatsStrip — seek isolation (D11 R5)', () => {
       baseline = dashboardStore.getState().captureLiveBaseline();
       dashboardStore.getState().applySeekCut({
         rows: [],
-        cursors: { flow_seq: 0, metrics_seq: 50, topology_seq: 0, monitor_seq: 3 },
+        cursors: { flow_seq: 0, metrics_seq: 50, topology_seq: 0, monitor_seq: 3 , backend_metrics_seq: 0},
         atMs: Date.now(),
         monitorSeq: 3,
         metrics: metrics(50, {}, { m1: { accepted_per_sec: 42 } }),

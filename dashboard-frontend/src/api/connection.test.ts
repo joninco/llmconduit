@@ -79,8 +79,8 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     // Prime snapshot so live frames apply.
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 3,
-      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      schema_version: 4,
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
     socket.applyFrame({
@@ -99,8 +99,8 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const spy = vi.spyOn(queryClient, 'invalidateQueries');
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 3,
-      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      schema_version: 4,
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
     socket.applyFrame({
@@ -116,8 +116,8 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 3,
-      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      schema_version: 4,
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
     const spy = vi.spyOn(queryClient, 'invalidateQueries');
@@ -148,8 +148,8 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 3,
-      cursors: { flow_seq: 5, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      schema_version: 4,
+      cursors: { flow_seq: 5, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
     const spy = vi.spyOn(queryClient, 'invalidateQueries');
@@ -165,8 +165,8 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 3,
-      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 },
+      schema_version: 4,
+      cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
     const spy = vi.spyOn(queryClient, 'invalidateQueries');
@@ -185,8 +185,8 @@ describe('teardownSession — clears cache + resets stores + disconnects WS (fin
     queryClient.setQueryData(queryKeys.flows, { flows: [], total: 0, flow_seq: 1 });
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 3,
-      cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 5 },
+      schema_version: 4,
+      cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 5 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
     socket.applyFrame(buildMonitorFrame(6));
@@ -247,7 +247,7 @@ describe('connection — fatal REST roots surface through dashboardStore', () =>
       authenticated: true,
       csrf_token: 'csrf',
       mutations_enabled: false,
-      schema_version: 3,
+      schema_version: 4,
     };
   });
   afterEach(() => {
@@ -260,7 +260,7 @@ describe('connection — fatal REST roots surface through dashboardStore', () =>
   it('turns a REST contract failure into the explicit fatal shell state', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', {
       status: 200,
-      headers: { 'X-LLMConduit-Dashboard-Schema': '3' },
+      headers: { 'X-LLMConduit-Dashboard-Schema': '4' },
     })));
     const { client } = getConnection();
 

@@ -854,11 +854,13 @@ mod tests {
                 metrics_seq: 5,
                 topology_seq: 6,
                 monitor_seq: 7,
+                backend_metrics_seq: 8,
             },
             summaries: vec![summary],
             flow_summaries_truncated: false,
             metrics: MetricsView::default(),
             topology: Arc::new(ProviderHealthSnapshot::default()),
+            backend_metrics: Arc::new(crate::backend_metrics::BackendMetricsSnapshot::default()),
         });
         serde_cbor::to_vec(cut.as_ref()).expect("snapshot serializes");
         history.persist_cut(cut);
@@ -892,6 +894,7 @@ mod tests {
                 flow_summaries_truncated: false,
                 metrics: MetricsView::default(),
                 topology: Arc::new(ProviderHealthSnapshot::default()),
+                backend_metrics: Arc::new(crate::backend_metrics::BackendMetricsSnapshot::default()),
             }));
         }
         for _ in 0..100 {

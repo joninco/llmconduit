@@ -43,6 +43,45 @@ when no token is configured it also permits fully unauthenticated non-loopback d
 uses same-origin `Origin`/`Host` validation for dashboard WebSockets. Kill requires `LLMCONDUIT_DASHBOARD_ALLOW_MUTATIONS=1`
 + a CSRF token.
 
+## Deploy
+
+Production deployment is a local systemd binary swap. The authoritative runbook is
+`~/ops/runbooks/llmconduit.md`; read its **Live state** and **Deploy** sections first because the
+served model/backend rotates. When the user asks to deploy, do not stop after building: commit the
+intended tree, install the binary, restart the service, and verify the running version and HTTP
+surface unless a concrete deployment step fails.
+
+The production unit is `/etc/systemd/system/llmconduit.service`, the installed binary is
+`/usr/local/bin/llmconduit`, and the service listens on `:5022`. It uses
+`~/.config/llmconduit/config.yaml` plus `/etc/llmconduit/dashboard.env`; a code-only deploy must not
+rewrite either file. Build with the dashboard embedded because production launches with
+`--with-debug-ui`:
+
+```bash
+cd ~/git/local-inference-lab/llmconduit
+
+# Commit first: build.rs embeds the commit and dirty flag in the binary.
+git status --short
+LLMCONDUIT_BUILD_DASHBOARD=1 cargo build --release
+./target/release/llmconduit --version
+
+# Atomic replacement avoids ETXTBSY while the old inode is running.
+sudo cp target/release/llmconduit /usr/local/bin/llmconduit.new
+sudo mv -f /usr/local/bin/llmconduit.new /usr/local/bin/llmconduit
+sudo systemctl restart llmconduit
+
+systemctl is-active llmconduit
+/usr/local/bin/llmconduit --version
+journalctl -u llmconduit -n 20 --no-pager | grep -E 'commit=|listening'
+curl -fsS http://localhost:5022/health
+curl -fsS -o /dev/null -w '%{http_code}\n' http://localhost:5022/v1/models
+```
+
+The install/restart commands require `sudo`. Use the atomic `.new` + `mv` sequence exactly; do not
+overwrite the executing binary in place. A successful deployment has an `active` unit, the expected
+committed version with `dirty=false`, a journal `listening on 0.0.0.0:5022` line, healthy `/health`,
+and HTTP 200 from `/v1/models`.
+
 ## Code layout
 
 | Path | Role |
@@ -60,6 +99,7 @@ uses same-origin `Origin`/`Host` validation for dashboard WebSockets. Kill requi
 | `src/debug_ui.rs` | `/debug` HTML + WS handler |
 | `src/dashboard_flow.rs` | (T13) DashboardFlowStore — authoritative per-flow records + capture seams |
 | `src/metrics.rs` | (T13) MetricsLayer — ring buffers, histograms, 5 s body-free snapshots |
+| `src/backend_metrics.rs` | Debug-only vLLM/SGLang Prometheus collection + normalized engine telemetry |
 | `src/dashboard_api.rs` | (T13) `/dashboard/api/*` REST handlers |
 | `src/dashboard_auth.rs` / `src/dashboard_ws.rs` | (T13) dashboard session-cookie auth + batched WS envelope |
 | `src/dashboard_ui.rs` | (T13) `include_dir!`-embedded SPA shell + static assets |
