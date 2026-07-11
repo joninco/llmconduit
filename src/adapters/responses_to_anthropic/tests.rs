@@ -338,6 +338,101 @@ fn explicitly_requested_thinking_streams_reasoning_progressively() {
 }
 
 #[test]
+fn explicitly_requested_thinking_streams_multiple_interleaved_blocks() {
+    let mut converter = AnthropicStreamConverter::with_live_thinking("claude-3".to_string());
+    let results = json!([
+        {"type": "web_search_result", "url": "https://example.com/a", "title": "Site A"}
+    ]);
+    let mut events = converter.convert(&created_event());
+
+    // The first reasoning segment is live immediately. The search boundary
+    // signs and closes it before emitting the two server-tool blocks.
+    assert!(
+        converter
+            .convert(&item_added_event("reasoning", ""))
+            .is_empty()
+    );
+    let pre_search = converter.convert(&reasoning_delta_event("Pre-search thought."));
+    assert_eq!(
+        event_types(&pre_search),
+        vec!["content_block_start", "content_block_delta"]
+    );
+    events.extend(pre_search);
+    events.extend(converter.convert(&web_search_results_event("srvtoolu_1", "weather", results)));
+
+    // Additive server-side search output must not trip the late-reasoning gate.
+    // The next delta opens a NEW thinking block and reaches the wire in the
+    // same conversion call instead of joining or waiting behind the first.
+    assert!(
+        converter
+            .convert(&item_added_event("reasoning", ""))
+            .is_empty()
+    );
+    let post_search = converter.convert(&reasoning_delta_event("Post-search thought."));
+    assert_eq!(
+        event_types(&post_search),
+        vec!["content_block_start", "content_block_delta"]
+    );
+    events.extend(post_search);
+
+    for event in [
+        item_added_event("message", "assistant"),
+        text_delta_event("It is sunny."),
+        item_done_event("message", json!({})),
+        completed_event(),
+    ] {
+        events.extend(converter.convert(&event));
+    }
+
+    let thinking_starts: Vec<usize> = events
+        .iter()
+        .filter_map(|event| match event {
+            AnthropicStreamEvent::ContentBlockStart {
+                index,
+                content_block: AnthropicContentBlockStart::Thinking { .. },
+            } => Some(*index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(thinking_starts.len(), 2, "expected two thinking blocks");
+    assert!(
+        thinking_starts[0] < thinking_starts[1],
+        "thinking block indices must increase: {thinking_starts:?}"
+    );
+
+    let thinking_deltas: Vec<&str> = events
+        .iter()
+        .filter_map(|event| match event {
+            AnthropicStreamEvent::ContentBlockDelta {
+                delta: AnthropicDelta::ThinkingDelta { thinking },
+                ..
+            } => Some(thinking.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        thinking_deltas,
+        vec!["Pre-search thought.", "Post-search thought."]
+    );
+
+    let signed_blocks: Vec<usize> = events
+        .iter()
+        .filter_map(|event| match event {
+            AnthropicStreamEvent::ContentBlockDelta {
+                index,
+                delta: AnthropicDelta::SignatureDelta { signature },
+            } if signature.starts_with(SYNTHETIC_SIGNATURE_PREFIX) => Some(*index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        signed_blocks, thinking_starts,
+        "each live thinking block must close with its own signature"
+    );
+    conformance::assert_stream_conformant(&events, conformance::Surface::WebSearch);
+}
+
+#[test]
 fn unsigned_reasoning_gets_a_synthetic_signature() {
     // C2: when the upstream reasoning channel carries no signature (the
     // DeepSeek `reasoning_content` case -- no `signature_delta` events at
