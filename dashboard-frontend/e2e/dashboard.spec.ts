@@ -379,11 +379,11 @@ test.describe('Argus dashboard', () => {
     // Cross-link: clicking the key-hash client row SETS the per-client filter → the table narrows to
     // that client's 2 flows (api_001 + api_002). The filter chip is then active + toggle-off-able.
     await khRow.getByTestId('client-rollup-pick').click();
-    await expect(page.getByTestId('flow-count')).toHaveText('2 loaded / 2 matching');
+    await expect(page.getByTestId('flow-population-coverage')).toHaveText('Rows loaded 2 / matching total 2');
     await expect(page.getByTestId('flow-row')).toHaveCount(2);
     // The active client chip clears via the filter-bar clear control, restoring all rows.
     await page.getByTestId('flow-filter-clear').click();
-    await expect(page.getByTestId('flow-count')).toHaveText('6 loaded / 6 matching');
+    await expect(page.getByTestId('flow-population-coverage')).toHaveText('Rows loaded 6 / matching total 6');
 
     expect(consoleErrors, 'console errors on the client attribution surface').toEqual([]);
   });
@@ -601,7 +601,9 @@ test.describe('Argus dashboard', () => {
 
     // Terms AND across fields: pasted id + served provider + visible status alias.
     await search.fill('api_003 openai 5xx');
-    await expect(page.getByTestId('flow-count')).toHaveText('1 loaded / 1 matching');
+    // U11: the ScopeBar count is the server population (search is view-local); the search
+    // live-region carries the narrowed count.
+    await expect(page.getByTestId('flow-search-announcement')).toContainText('1 of 1 flows match');
     await expect(page.getByTestId('flow-row')).toHaveCount(1);
     await expect(page.getByTestId('flow-row')).toContainText('api_003');
     await expect(page.getByTestId('failure-taxonomy')).toHaveAttribute('data-available', 'true');
@@ -618,7 +620,7 @@ test.describe('Argus dashboard', () => {
     // Escape clears lookup only; it never writes an unsupported free-text server scope into the URL.
     await search.press('Escape');
     await expect(search).toHaveValue('');
-    await expect(page.getByTestId('flow-count')).toHaveText('6 loaded / 6 matching');
+    await expect(page.getByTestId('flow-population-coverage')).toHaveText('Rows loaded 6 / matching total 6');
     expect(new URL(page.url()).hash).not.toContain('query=');
     expect(new URL(page.url()).hash).not.toContain('q=');
 
@@ -755,6 +757,10 @@ test.describe('Argus dashboard', () => {
   test('shell chrome collapses to a strip; drawer reaches the nav bar (full-height reclaim)', async ({ page, consoleErrors }) => {
     await login(page);
     await openView(page, VIEWS[0]!); // Flows
+    // U4: non-Overview tabs default to the compact one-line strip (no resizable chrome band).
+    // Pin the full strip first — this test exercises the band's drag-collapse machinery.
+    await page.getByTestId('stats-strip-expand').click();
+    await expect(page.getByTestId('stats-strip')).toBeVisible();
     await page.waitForTimeout(400);
 
     // Collapse the chrome band by dragging the shell splitter up to the nav.
@@ -791,6 +797,10 @@ test.describe('Argus dashboard', () => {
     await page.mouse.down();
     await page.mouse.move(d2.x + 400, 800, { steps: 10 });
     await page.mouse.up();
+    // U3 gives the summary's technical region real height; collapse it so the assertion
+    // measures the pane row itself rather than competing with the (intentionally) taller
+    // timing/routing details.
+    await page.getByTestId('summary-toggle').click();
     expect((await page.getByTestId('pane-row').boundingBox())!.height, 'main region returns').toBeGreaterThan(100);
 
     expect(consoleErrors, 'console errors on shell chrome collapse').toEqual([]);

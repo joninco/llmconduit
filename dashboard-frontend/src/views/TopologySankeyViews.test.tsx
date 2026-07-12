@@ -4,7 +4,7 @@ import { TopologyView } from './TopologyView';
 import { SankeyView } from './SankeyView';
 import { dashboardStore } from '../store/dashboardStore';
 import { flowFilterStore } from '../store/flowFilterStore';
-import { renderWithQuery, resetWorld } from '../components/testHarness';
+import { makeFlow, renderWithQuery, resetWorld } from '../components/testHarness';
 import type { OverviewResponse, ProviderHealth, TopologyResponse } from '../api/types';
 import { getConnection, queryKeys } from '../api/connection';
 
@@ -81,6 +81,34 @@ describe('TopologyView', () => {
     getConnection().queryClient.setDefaultOptions({ queries: { retry: false } });
     const { getByTestId } = renderWithQuery(<TopologyView />);
     await waitFor(() => expect(getByTestId('topology-error')).toBeTruthy());
+  });
+
+  // U9 — the caption promises client → gateway → providers; the compact layout renders the
+  // client side from the LOADED flow rows and cross-links to the client-filtered Flows view.
+  it('renders client nodes with per-client share and cross-links the client filter', () => {
+    window.location.hash = '#/topology';
+    act(() => {
+      dashboardStore.getState().applySnapshot({
+        cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 1, monitor_seq: 0, backend_metrics_seq: 0 },
+        flows: [
+          makeFlow({ api_call_id: 'api_c1', client_label: 'key-8fd8', client_source: 'key_hash', started_ms: 3 }),
+          makeFlow({ api_call_id: 'api_c2', client_label: 'key-8fd8', client_source: 'key_hash', started_ms: 2 }),
+          makeFlow({ api_call_id: 'api_c3', client_label: 'curl/8.5.0', client_source: 'user_agent', started_ms: 1 }),
+        ],
+        metrics: null,
+        topology: TOPOLOGY,
+      });
+      dashboardStore.getState().setConnection('live');
+    });
+    const { getByTestId, getAllByTestId } = renderWithQuery(<TopologyView />);
+    expect(getByTestId('topology-clients')).toBeTruthy();
+    const clients = getAllByTestId('topology-client');
+    // Heaviest client first, with its share of the loaded population.
+    expect(clients[0]!.getAttribute('data-client')).toBe('key-8fd8');
+    expect(clients[0]!.textContent).toContain('2 · 67%');
+    fireEvent.click(clients[0]!);
+    expect(flowFilterStore.getState().filters.client).toBe('key-8fd8');
+    expect(window.location.hash).toBe('#/flows?client=key-8fd8');
   });
 });
 

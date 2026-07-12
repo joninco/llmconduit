@@ -3,6 +3,7 @@ import { flowFilterStore } from '../store/flowFilterStore';
 import { useFlowRows } from './FlowTable/useFlowRows';
 import { useHashScope } from '../router/useHashRoute';
 import { useEffect, useRef, useState } from 'react';
+import { Term } from '../lib/glossary';
 
 /** Shared scope disclosure shown before every dashboard summary/view. */
 export function ScopeBar() {
@@ -32,9 +33,11 @@ export function ScopeBar() {
       tabIndex={0}
       data-testid="scope-bar"
     >
-      <span className="shrink-0 font-semibold uppercase tracking-[0.14em] text-text">{scope.window}</span>
+      <span className="shrink-0 font-semibold uppercase tracking-[0.14em] text-text">
+        <Term term={scope.window as 'm1' | 'm5' | 'h1'}>{scope.window}</Term>
+      </span>
       <span className="shrink-0 rounded border border-accent/40 px-1.5 py-0.5 text-accent">
-        Flow rollups · {scoped ? 'Scoped' : 'Global'}
+        <Term term="rollup">Flow rollups</Term> · {scoped ? 'Scoped' : 'Global'}
       </span>
       <span className="shrink-0 rounded border border-line px-1.5 py-0.5 text-text-muted">
         Provider health · Global

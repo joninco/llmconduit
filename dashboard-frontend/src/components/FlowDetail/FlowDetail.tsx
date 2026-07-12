@@ -634,11 +634,14 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
             panel in the way snaps out of view (collapsedSize 0); drag back and it returns. The
             summary band lives INSIDE the main panel, so a drawer dragged to the top swallows it
             too — the drawer reaches the drill-down's top bar. */}
+        {/* U3: a %-only minimum let a persisted drawer layout crush the summary band (and the
+            waterfall inside it) to a sliver. A pixel floor keeps the summary + technical region
+            readable at any drag position; dragging past it still snaps to the full collapse. */}
         <Panel
           id="detail-main"
           collapsible
           collapsedSize={0}
-          minSize="15%"
+          minSize={240}
           className="flex min-h-0 min-w-0 flex-col"
           style={{ overflow: 'hidden' }}
         >
@@ -1234,7 +1237,11 @@ function SummaryBand({
       </div>
 
       {!collapsed && (
-        <div id="request-technical-details" className="grid max-h-32 gap-4 overflow-auto border-t border-line/60 px-3 py-3 xl:grid-cols-[minmax(24rem,2fr)_minmax(18rem,1fr)]" data-testid="request-technical-details" tabIndex={0} role="region" aria-label="Request timing, routing, and usage details">
+        // U3: the latency waterfall + attempt trace are the most diagnostic content in the
+        // detail view — a hard 8rem cap rendered them clipped mid-label on every open. Give
+        // the region real room (bounded by viewport share so the panes keep space) and keep
+        // overflow-auto as the safety valve on short viewports.
+        <div id="request-technical-details" className="grid max-h-[38vh] min-h-40 gap-4 overflow-auto border-t border-line/60 px-3 py-3 xl:grid-cols-[minmax(24rem,2fr)_minmax(18rem,1fr)]" data-testid="request-technical-details" tabIndex={0} role="region" aria-label="Request timing, routing, and usage details">
           <section className="min-w-0" aria-labelledby="request-timing-title">
             <h3 id="request-timing-title" className="mb-2 text-xs font-medium text-text-muted">Timing and context</h3>
             <div className="mb-3"><LatencyBreakdown model={latency} /></div>

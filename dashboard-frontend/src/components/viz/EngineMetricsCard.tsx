@@ -18,7 +18,12 @@ export function EngineMetricsCard({
   compact?: boolean;
 }) {
   const [selected, setSelected] = useState<WindowName>('m1');
-  const window = metrics ? engineWindow(metrics, compact ? 'm1' : selected) : null;
+  const windowName: WindowName = compact ? 'm1' : selected;
+  const window = metrics ? engineWindow(metrics, windowName) : null;
+  // U2: the strip's "engine gen tok/s" may show the RETAINED last-active interval while this
+  // card shows the current window — same metric name with two values needs a distinguishing
+  // label, so the card states its window inline (not just via the selector buttons).
+  const windowLabel = windowName === 'h1' ? '1h' : `${windowName.slice(1)}m`;
   const status = metrics ? engineStatusText(metrics, nowMs) : 'unavailable';
   const statusClass = metrics?.status === 'fresh' ? 'text-status-healthy'
     : metrics?.status === 'stale' || metrics?.status === 'warming' ? 'text-status-cooling'
@@ -27,7 +32,7 @@ export function EngineMetricsCard({
     ['running', engineValue(metrics?.instant.running_requests, 0), metrics?.instant.running_requests == null ? 'unavailable' : 'measured'],
     ['queued', engineValue(metrics?.instant.waiting_requests, 0), metrics?.instant.waiting_requests == null ? 'unavailable' : 'measured'],
     ['KV used', enginePercent(metrics?.instant.kv_cache_utilization), metrics?.instant.kv_cache_utilization == null ? 'unavailable' : 'measured'],
-    ['gen tok/s', engineValue(window?.generated_tokens_per_sec), window?.generated_tokens_per_sec == null ? 'unavailable' : 'derived'],
+    [`gen tok/s (${windowLabel})`, engineValue(window?.generated_tokens_per_sec), window?.generated_tokens_per_sec == null ? 'unavailable' : 'derived'],
     ['prefix hit', enginePercent(window?.prefix_cache_hit_ratio), window?.prefix_cache_hit_ratio == null ? 'unavailable' : 'derived'],
     ['spec accept', enginePercent(window?.speculative_acceptance_ratio), window?.speculative_acceptance_ratio == null ? 'unavailable' : 'derived'],
     ['TTFT p95', window?.histograms.ttft_ms?.p95 == null ? ENGINE_DASH : `${engineValue(window.histograms.ttft_ms.p95, 0)} ms`, window?.histograms.ttft_ms?.p95 == null ? 'unavailable' : 'derived'],

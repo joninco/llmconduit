@@ -30,6 +30,7 @@ import { useTopologyQuery, topologyProviderKey } from '../../store/useTopologyQu
 import { EngineMetricsCard } from '../../components/viz/EngineMetricsCard';
 import { StaleFallbackBanner } from '../../components/StaleFallbackBanner';
 import { deriveDashboardStatus } from '../../lib/dashboardStatus';
+import { GLOSSARY, Term, type GlossaryTerm } from '../../lib/glossary';
 
 const DASH = '—';
 const TOP_ROWS = 5;
@@ -78,7 +79,7 @@ export function OverviewView() {
       <div className="mb-3 flex flex-wrap items-baseline gap-x-2 gap-y-1">
         <h1 className="text-base font-semibold text-text">Control room</h1>
         <span className="text-[11px] text-text-muted">
-          terminal {hashScope.window} rollups · server cut
+          <Term term="terminal">terminal</Term> <Term term={hashScope.window as 'm1' | 'm5' | 'h1'}>{hashScope.window}</Term> <Term term="rollup">rollups</Term> · <Term term="server cut">server cut</Term>
         </span>
         {seeking && (
           <span className="text-[10px] text-status-cooling" data-testid="overview-frozen">
@@ -242,12 +243,12 @@ function OverviewContent({ response }: { response: OverviewResponse }) {
         <span className="rounded border border-line px-1.5 py-0.5 uppercase tracking-wide text-text-muted">
           Provider attempts · Global
         </span>
-        <span className="font-mono tabular-nums text-text-muted">{response.totals.requests} terminal flows</span>
+        <span className="font-mono tabular-nums text-text-muted">{response.totals.requests} <Term term="terminal">terminal</Term> <Term term="flow">flows</Term></span>
         <span className="font-mono tabular-nums text-text-muted">
           {response.totals.successes} success · {response.totals.failures} fail · {response.totals.cancellations} cancel
         </span>
         <span className="ml-auto font-mono tabular-nums text-text-muted">
-          cut {formatCut(response.scope.selected_at_ms ?? response.generated_at_ms)} · seq {response.metrics_seq}
+          <Term term="server cut">cut</Term> {formatCut(response.scope.selected_at_ms ?? response.generated_at_ms)} · <Term term="seq">seq</Term> {response.metrics_seq}
         </span>
       </section>
 
@@ -661,7 +662,10 @@ function costQuality(cost: OverviewCost, aggregate: OverviewDataQuality): Displa
 }
 
 function QualityBadge({ quality }: { quality: DisplayQuality }) {
-  return <span className={cn('text-[9px] font-semibold uppercase tracking-wide', QUALITY_CLASS[quality])} data-quality={quality}>{quality}</span>;
+  // U10: the provenance tier is jargon — give it its glossary definition on hover/focus.
+  const term = quality in GLOSSARY ? (quality as GlossaryTerm) : null;
+  const badge = <span className={cn('text-[9px] font-semibold uppercase tracking-wide', QUALITY_CLASS[quality])} data-quality={quality}>{quality}</span>;
+  return term ? <Term term={term}>{badge}</Term> : badge;
 }
 
 function SmallBadge({ text }: { text: string }) {

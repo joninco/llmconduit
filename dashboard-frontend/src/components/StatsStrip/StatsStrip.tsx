@@ -50,6 +50,7 @@ import {
   type WindowKey,
 } from './metricHistory';
 import { deriveChips, deltaGlyph, type ChipDescriptor } from './chips';
+import { fmtLatency, fmtTokensPerSec } from '../FlowTable/format';
 import { updateHashScope, useHashScope } from '../../router/useHashRoute';
 import { deriveDashboardStatus } from '../../lib/dashboardStatus';
 import { OperationalStatus } from '../ui/OperationalStatus';
@@ -62,7 +63,88 @@ const PRIMARY_METRICS = new Set([
   'reported_tokens_per_sec',
 ]);
 
-export function StatsStrip() {
+/**
+ * CompactStatsStrip (U4) — the one-line variant for non-Overview tabs: the full strip costs
+ * ~30% of every viewport, but Flows/Topology/Sankey/Theater only need the operational pulse.
+ * Shows Connection/Metrics/Traffic (the same `OperationalStatus` model) + E2E p50 + engine
+ * tok/s, and an expand control that pins the full strip.
+ */
+export function CompactStatsStrip({ onExpand }: { onExpand: () => void }) {
+  const connection = useDashboard((s) => s.connection);
+  const seeking = connection === 'seeking';
+  const seekAtMs = useDashboard((s) => s.seekAtMs);
+  const hasDashboardData = useDashboard((s) =>
+    s.metrics !== null || s.flows.size > 0 || s.topologyNodes.length > 0,
+  );
+  const storeMetrics = useDashboard((s) => s.metrics);
+  const { client } = getConnection();
+  const query = useQuery({ queryKey: queryKeys.metrics, queryFn: () => client.metrics() });
+  // SEEK gating (review HIGH): while seeking, the store metrics ARE the frozen snapshot cut —
+  // never fall back to the live `/metrics` REST read, or a historical view shows CURRENT
+  // numbers labeled as the seeked moment. Null frozen metrics render honest dashes.
+  const currentMetrics = seeking ? storeMetrics : (storeMetrics ?? query.data ?? null);
+  const instant = currentMetrics?.instant ?? null;
+  const retainedActivity = currentMetrics?.last_activity ?? null;
+  const idle = instant !== null && instant.active_streams_now === 0;
+  const showingRetained = idle && retainedActivity !== null;
+  const cur = showingRetained && instant && retainedActivity
+    ? { ...retainedActivity.instant, active_streams_now: instant.active_streams_now }
+    : instant;
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = globalThis.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => globalThis.clearInterval(id);
+  }, []);
+  const operationalStatus = deriveDashboardStatus({
+    connection,
+    hasDashboardData,
+    generatedAtMs: currentMetrics?.generated_at_ms ?? null,
+    activeStreams: instant?.active_streams_now ?? 0,
+    lastActivityAtMs: retainedActivity?.at_ms ?? null,
+    // While seeking the strip reads as-of the frozen instant, never the wall clock.
+    nowMs: seeking ? (seekAtMs ?? nowMs) : nowMs,
+  });
+  const p50 = cur !== null && cur.latency_samples > 0 && cur.p50_ms !== null ? fmtLatency(cur.p50_ms) : '—';
+  const engine = currentMetrics?.engine_throughput ?? null;
+  const tokPerSec = engine !== null
+    ? fmtTokensPerSec(engine.generated_tokens_per_sec)
+    : cur !== null && cur.usage_samples > 0 && cur.reported_tokens_per_sec !== null
+      ? fmtTokensPerSec(cur.reported_tokens_per_sec)
+      : '—';
+  const interval = showingRetained ? 'last active interval' : 'latest interval';
+  return (
+    <Panel
+      className="m-2 mb-0 flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1 px-3 py-1.5 sm:m-4 sm:mb-0"
+      data-testid="stats-strip-compact"
+      data-metrics-state={showingRetained ? 'retained' : cur ? 'instant' : 'empty'}
+    >
+      <OperationalStatus model={operationalStatus} />
+      <span className="text-[11px] text-text-muted" title={`Gateway E2E p50 · ${interval}`}>
+        E2E p50{' '}
+        <span className="font-mono font-semibold tabular-nums text-text" data-testid="compact-p50">{p50}</span>
+        {/* The retained qualifier belongs to the GATEWAY value (it comes from the retained
+            request-bearing interval); the engine figure below is its own generation-associated
+            interval and must not inherit this label (review MED). */}
+        {showingRetained && <span className="ml-1 text-[10px]">· last active</span>}
+      </span>
+      <span className="text-[11px] text-text-muted" title={`${engine !== null ? 'Engine generation throughput · latest generation-associated interval' : `Reported throughput · ${interval}`}`}>
+        {engine !== null ? 'gen' : 'reported'}{' '}
+        <span className="font-mono font-semibold tabular-nums text-status-healthy" data-testid="compact-toks">{tokPerSec}</span>
+      </span>
+      <button
+        type="button"
+        className="ml-auto inline-flex min-h-7 items-center rounded px-1.5 text-[11px] font-medium text-text-muted hover:text-text focus-visible:ring-2 focus-visible:ring-accent"
+        aria-expanded={false}
+        onClick={onExpand}
+        data-testid="stats-strip-expand"
+      >
+        Expand metrics
+      </button>
+    </Panel>
+  );
+}
+
+export function StatsStrip({ onCompact }: { onCompact?: () => void } = {}) {
   const scope = useHashScope();
   const window = scope.window as WindowKey;
   const connection = useDashboard((s) => s.connection);
@@ -136,7 +218,7 @@ export function StatsStrip() {
   const previousEngineThroughput = engineThroughput
     ? latestEngineThroughput(history, engineThroughput.sampled_at_ms)
     : null;
-  const chips = deriveChips(cur, prev, engineThroughput, previousEngineThroughput);
+  const chips = deriveChips(cur, prev, engineThroughput, previousEngineThroughput, { retained: showingRetained });
   const primaryChips = chips.filter((chip) => PRIMARY_METRICS.has(chip.key));
   const secondaryChips = chips.filter((chip) => !PRIMARY_METRICS.has(chip.key));
   const [moreMetricsOpen, setMoreMetricsOpen] = useState(false);
@@ -178,6 +260,17 @@ export function StatsStrip() {
         <div className="flex shrink-0 items-center gap-2">
           <span className="hidden text-[11px] text-text-muted sm:inline">Trend window</span>
           <WindowSelector value={window} onChange={(next) => updateHashScope({ window: next })} />
+          {onCompact && (
+            <button
+              type="button"
+              className="inline-flex min-h-7 items-center rounded px-1.5 text-[11px] font-medium text-text-muted hover:text-text focus-visible:ring-2 focus-visible:ring-accent"
+              aria-expanded
+              onClick={onCompact}
+              data-testid="stats-strip-compact-toggle"
+            >
+              Compact
+            </button>
+          )}
         </div>
       </div>
 
@@ -289,6 +382,11 @@ function ChipCell({
         <span className={cn('text-[10px]', DELTA_CLASS[chip.delta])} aria-hidden data-testid="chip-delta">
           {deltaGlyph(chip.delta)}
         </span>
+        {chip.valueSuffix && (
+          <span className="truncate text-[10px] text-text-muted" data-testid="chip-value-suffix">
+            {chip.valueSuffix}
+          </span>
+        )}
       </div>
       <div className="flex min-w-0 items-end gap-2">
         <span className="min-w-0 flex-1 text-[10px] leading-tight text-text-muted" data-testid="metric-scope">{scope}</span>

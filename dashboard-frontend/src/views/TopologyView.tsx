@@ -21,6 +21,10 @@ import { Panel } from '../components/ui/Panel';
 import { CooldownTooltip } from '../components/viz/CooldownTooltip';
 import { StaleFallbackBanner } from '../components/StaleFallbackBanner';
 import { fmtLatency, fmtPercent, fmtSamples } from '../components/FlowTable/format';
+import { clientRollup } from '../components/FlowTable/clientAttribution';
+
+/** U9 — client nodes rendered in the compact topology; the rest fold into a counted note. */
+const MAX_CLIENT_NODES = 5;
 
 export function TopologyView() {
   // Seed nodes/edges/prices from `/topology` (LIVE-only; never overwrites a seek cut) — finding 5.
@@ -78,6 +82,21 @@ export function TopologyView() {
     navigate('flows');
   }
 
+  // U9 — the caption promises "client → gateway → upstream providers"; render the client side.
+  // Population: the LOADED flow rows (the same non-secret labels the by-client roll-up uses —
+  // BucketKey has no client dimension, so there is no server-windowed client rate to lie with).
+  // Ordered heaviest-first; capped for layout, with the remainder counted honestly.
+  const flows = useDashboard((s) => s.flows);
+  const clientNodes = useMemo(() => {
+    const rollup = clientRollup([...flows.values()]);
+    return { rows: rollup.rows.slice(0, MAX_CLIENT_NODES), hidden: Math.max(0, rollup.rows.length - MAX_CLIENT_NODES), totalFlows: rollup.totalFlows };
+  }, [flows]);
+
+  function onSelectClient(label: string): void {
+    flowFilterStore.getState().setClient(label);
+    navigate('flows');
+  }
+
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col p-4" data-testid="topology-view">
       <header className="mb-3 flex items-center gap-3">
@@ -115,6 +134,49 @@ export function TopologyView() {
           )
         ) : nodes.length <= 3 ? (
           <div className="flex w-full flex-wrap items-stretch justify-center gap-3" data-testid="compact-topology">
+            {clientNodes.rows.length > 0 && (
+              <>
+                <div className="flex flex-col justify-center gap-2" data-testid="topology-clients">
+                  {clientNodes.rows.map((client) => (
+                    <button
+                      key={client.key}
+                      type="button"
+                      className="min-w-44 rounded-md border border-line bg-panel-raised px-3 py-2 text-left hover:border-accent focus-visible:ring-2 focus-visible:ring-accent"
+                      onClick={() => onSelectClient(client.key)}
+                      data-testid="topology-client"
+                      data-client={client.key}
+                      title={`Show flows for client ${client.label} (${client.total} loaded flows)`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className={`truncate font-mono text-xs text-text${client.weak ? ' italic' : ''}`}>{client.label}</span>
+                        {/* Weak UA attribution carries the same explicit marker as the flow table
+                            and the by-client roll-up — italics alone read as styling, not as
+                            "spoofable, not a confirmed identity" (review MED). */}
+                        {client.weak && (
+                          <span
+                            className="shrink-0 rounded-sm bg-status-cooling/15 px-1 text-[9px] uppercase tracking-wide text-status-cooling"
+                            data-testid="topology-client-weak"
+                            title="weak User-Agent fallback — spoofable, NOT a confirmed identity"
+                          >
+                            ua
+                          </span>
+                        )}
+                        <span className="shrink-0 text-[10px] tabular-nums text-text-muted">
+                          {client.total}{clientNodes.totalFlows > 0 ? ` · ${Math.round((client.total / clientNodes.totalFlows) * 100)}%` : ''}
+                        </span>
+                      </div>
+                    </button>
+                  ))}
+                  {clientNodes.hidden > 0 && (
+                    <span className="text-center text-[10px] text-text-muted" data-testid="topology-clients-hidden">
+                      +{clientNodes.hidden} more client{clientNodes.hidden === 1 ? '' : 's'} · see BY CLIENT on Flows
+                    </span>
+                  )}
+                  <span className="text-center text-[9px] uppercase tracking-[0.14em] text-text-muted">clients · loaded flows</span>
+                </div>
+                <div className="flex items-center text-xl text-text-muted" aria-hidden>→</div>
+              </>
+            )}
             <div className="flex min-w-40 items-center justify-center rounded-md border border-accent/40 bg-accent/10 px-4 py-3 text-center">
               <div><div className="text-[10px] uppercase tracking-[0.14em] text-text-muted">gateway</div><div className="mt-1 font-mono text-sm text-text">llmconduit</div></div>
             </div>

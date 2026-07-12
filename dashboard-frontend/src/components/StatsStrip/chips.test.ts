@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { EngineThroughputSample, InstantMetricSample } from '../../api/types';
-import { CHIP_METRICS, deriveChips, deltaGlyph, ERROR_PCT_THRESHOLD } from './chips';
+import { CHIP_METRICS, COST_RATE_MIN_PRICED_SAMPLES, deriveChips, deltaGlyph, ERROR_PCT_THRESHOLD, LATENCY_PERCENTILE_MIN_SAMPLES } from './chips';
 
 function win(over: Partial<InstantMetricSample> = {}): InstantMetricSample {
   // Default to a fully-measured window: the three denominators mirror `latency_samples` so a test
@@ -156,7 +156,8 @@ describe('chips', () => {
     expect(byKey.accepted_per_sec).toBe('0'); // genuine idle zero, also numeric
   });
 
-  it('keeps a one-sample median visible but withholds misleading tail percentiles', () => {
+  // U7 — with 1–4 latency samples the trio collapses into ONE honest latency chip.
+  it('collapses the percentile trio into a single latency chip below the sample threshold', () => {
     const chips = deriveChips(win({
       latency_samples: 1,
       p50_ms: 125,
@@ -167,13 +168,35 @@ describe('chips', () => {
       p99_quality: 'partial',
     }), null);
     const p50 = chips.find((candidate) => candidate.key === 'p50_ms')!;
+    expect(p50.label).toBe('gateway E2E latency');
     expect(p50.value).toBe('125 ms');
+    expect(p50.valueSuffix).toBe('· 1 request');
     expect(p50.quality).toBe('partial');
-    for (const key of ['p95_ms', 'p99_ms'] as const) {
+    expect(chips.some((candidate) => candidate.key === 'p95_ms')).toBe(false);
+    expect(chips.some((candidate) => candidate.key === 'p99_ms')).toBe(false);
+  });
+
+  it('keeps the percentile trio at the threshold boundary (n=5) and pluralizes below it (n=4)', () => {
+    const four = deriveChips(win({ latency_samples: LATENCY_PERCENTILE_MIN_SAMPLES - 1 }), null);
+    const p50Four = four.find((candidate) => candidate.key === 'p50_ms')!;
+    expect(p50Four.label).toBe('gateway E2E latency');
+    expect(p50Four.valueSuffix).toBe('· 4 requests');
+    expect(four.some((candidate) => candidate.key === 'p95_ms')).toBe(false);
+
+    const five = deriveChips(win({ latency_samples: LATENCY_PERCENTILE_MIN_SAMPLES }), null);
+    const p50Five = five.find((candidate) => candidate.key === 'p50_ms')!;
+    expect(p50Five.label).toBe('gateway E2E p50');
+    expect(p50Five.valueSuffix).toBeUndefined();
+    expect(five.some((candidate) => candidate.key === 'p95_ms')).toBe(true);
+    expect(five.some((candidate) => candidate.key === 'p99_ms')).toBe(true);
+  });
+
+  it('keeps the (all-unavailable) trio when latency_samples is exactly zero', () => {
+    const chips = deriveChips(win({ latency_samples: 0 }), null);
+    for (const key of ['p50_ms', 'p95_ms', 'p99_ms'] as const) {
       const chip = chips.find((candidate) => candidate.key === key)!;
       expect(chip.value).toBe('—');
       expect(chip.quality).toBe('unavailable');
-      expect(chip.details).toContain('1 latency samples');
     }
   });
 
@@ -280,5 +303,63 @@ describe('chips', () => {
     // tok/s keeps its intrinsic `derived` tier even when the window cost is confident.
     const toks = deriveChips(win({ cost_confidence: 'confident' }), null).find((c) => c.key === 'reported_tokens_per_sec')!;
     expect(toks.quality).toBe('derived');
+  });
+
+  // U2 — never extrapolate a $/min rate from a near-empty window; show the actual total.
+  it('shows the interval cost TOTAL (not $/min) when priced samples are below the threshold', () => {
+    // 60s interval at $0.0716/min ⇒ the actual persisted total is $0.0716.
+    const chip = deriveChips(win({
+      latency_samples: 8, usage_samples: 8,
+      priced_samples: COST_RATE_MIN_PRICED_SAMPLES - 1,
+      cost_per_min: 0.0716, interval_duration_ms: 60_000,
+    }), null).find((c) => c.key === 'cost_per_min')!;
+    expect(chip.label).toBe('cost');
+    expect(chip.value).toBe('$0.0716');
+    expect(chip.valueSuffix).toBe('· window total');
+  });
+
+  it('keeps the $/min rate at or above the priced-sample threshold', () => {
+    const chip = deriveChips(win({
+      latency_samples: 8, usage_samples: 8,
+      priced_samples: COST_RATE_MIN_PRICED_SAMPLES,
+      cost_per_min: 0.21, interval_duration_ms: 60_000,
+    }), null).find((c) => c.key === 'cost_per_min')!;
+    expect(chip.label).toBe('cost rate');
+    expect(chip.value).toBe('$0.21/min');
+    expect(chip.valueSuffix).toBeUndefined();
+  });
+
+  it('keeps a FLAT delta in total mode (rate-based trends do not apply to a displayed total)', () => {
+    const chip = deriveChips(
+      win({ latency_samples: 8, usage_samples: 8, priced_samples: 1, cost_per_min: 0.3, interval_duration_ms: 60_000 }),
+      win({ latency_samples: 8, usage_samples: 8, priced_samples: 1, cost_per_min: 0.1, interval_duration_ms: 60_000 }),
+    ).find((c) => c.key === 'cost_per_min')!;
+    expect(chip.valueSuffix).toBe('· window total');
+    expect(chip.delta).toBe('flat');
+  });
+
+  it('shows the cost TOTAL on a retained (idle) window even with many priced samples', () => {
+    const chip = deriveChips(win({ cost_per_min: 0.21, interval_duration_ms: 60_000 }), null, null, null, { retained: true })
+      .find((c) => c.key === 'cost_per_min')!;
+    expect(chip.value).toBe('$0.2100');
+    expect(chip.valueSuffix).toBe('· window total');
+  });
+
+  it('keeps the unavailable marker for cost when unmeasurable, regardless of retained', () => {
+    const chip = deriveChips(win({ priced_samples: 0, usage_samples: 8, latency_samples: 8 }), null, null, null, { retained: true })
+      .find((c) => c.key === 'cost_per_min')!;
+    expect(chip.value).toBe('—');
+    expect(chip.valueSuffix).toBeUndefined();
+  });
+
+  // U2 — a retained strip showing the last-active engine interval says so INLINE, not hover-only.
+  it('suffixes the engine tok/s chip with "last active" on a retained window', () => {
+    const retained = deriveChips(win(), null, engine(), null, { retained: true })
+      .find((c) => c.key === 'reported_tokens_per_sec')!;
+    expect(retained.label).toBe('engine gen tok/s');
+    expect(retained.valueSuffix).toBe('· last active');
+    const live = deriveChips(win(), null, engine(), null)
+      .find((c) => c.key === 'reported_tokens_per_sec')!;
+    expect(live.valueSuffix).toBeUndefined();
   });
 });

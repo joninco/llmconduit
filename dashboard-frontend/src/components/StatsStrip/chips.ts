@@ -6,12 +6,26 @@
  * flow-table formatters where they fit (tokens), and adds small local ones for rates/latency/%.
  */
 import type { CostConfidence, EngineThroughputSample, InstantMetricSample } from '../../api/types';
-import { fmtCostRate, fmtLatency, fmtPercent, fmtRate, fmtTokensPerSec } from '../FlowTable/format';
+import { fmtCost, fmtCostRate, fmtLatency, fmtPercent, fmtRate, fmtTokensPerSec } from '../FlowTable/format';
 import { colors } from '../../design/tokens';
 import { metricUnavailable, type MetricKey, type MetricSource } from './metricHistory';
 
 /** Error-% threshold above which the err chip turns red (spec: "red above threshold"). */
 export const ERROR_PCT_THRESHOLD = 5;
+
+/**
+ * Below this many latency samples the p50/p95/p99 trio collapses into ONE "gateway E2E latency"
+ * chip (U7): percentiles over a near-empty window are machinery pretending to be statistics.
+ * Zero samples keeps the trio (each honestly `—`) so the unavailable semantics stay intact.
+ */
+export const LATENCY_PERCENTILE_MIN_SAMPLES = 5;
+
+/**
+ * Below this many priced samples the $/min chip stops extrapolating a rate and shows the
+ * interval's actual cost total instead (U2): one priced request annualized into "$9.35/min"
+ * reads as an alarm, not a measurement. Idle (retained) windows always show the total.
+ */
+export const COST_RATE_MIN_PRICED_SAMPLES = 3;
 
 export type DeltaDir = 'up' | 'down' | 'flat';
 
@@ -44,6 +58,12 @@ export interface ChipDescriptor {
    * the value is `—`; otherwise the metric's intrinsic tier (measured/derived/estimated).
    */
   quality: MetricQuality;
+  /**
+   * Optional muted inline suffix rendered right of the value (U2/U7): a qualifier that must be
+   * VISIBLE, not hover-only — "· window total" on a non-extrapolated cost, "· 1 request" on a
+   * collapsed low-n latency chip, "· last active" on a retained engine tok/s.
+   */
+  valueSuffix?: string;
   /** The telemetry seam supplying this value; exposed in the DOM and tooltip. */
   source: MetricSource;
   /** uPlot stroke as hex for the sparkline (mirrors `stroke`, kept explicit for clarity). */
@@ -165,8 +185,17 @@ export function deriveChips(
   prev: InstantMetricSample | null,
   engineThroughput: EngineThroughputSample | null = null,
   previousEngineThroughput: EngineThroughputSample | null = null,
+  opts: { retained?: boolean } = {},
 ): ChipDescriptor[] {
-  return METRIC_SPECS.map((spec): ChipDescriptor => {
+  // U7: with 1–4 latency samples the tail percentiles are noise — collapse the trio into one
+  // "gateway E2E latency" chip. Zero samples keeps the trio so `—`/unavailable semantics hold.
+  const collapseLatency = cur !== null
+    && cur.latency_samples > 0
+    && cur.latency_samples < LATENCY_PERCENTILE_MIN_SAMPLES;
+  const specs = collapseLatency
+    ? METRIC_SPECS.filter((spec) => spec.key !== 'p95_ms' && spec.key !== 'p99_ms')
+    : METRIC_SPECS;
+  return specs.map((spec): ChipDescriptor => {
     const useEngine = spec.key === 'reported_tokens_per_sec' && engineThroughput !== null;
     // Unmeasurable when there is no window, or this metric's own denominator is 0.
     const unavailable = useEngine ? false : metricUnavailable(cur, spec.key);
@@ -176,7 +205,27 @@ export function deriveChips(
     const previousValue = useEngine
       ? previousEngineThroughput?.generated_tokens_per_sec
       : prev?.[spec.key] ?? undefined;
-    const value = unavailable || currentValue === null ? UNAVAILABLE : spec.fmt(currentValue);
+    // U2: too few priced samples (or an idle/retained window) → the $/min extrapolation is
+    // suppressed in favor of the interval's ACTUAL persisted cost (rate × observed minutes,
+    // which round-trips the backend's `persisted terminal cost / observed minutes` exactly).
+    const costAsTotal = spec.key === 'cost_per_min'
+      && !unavailable
+      && cur !== null
+      && cur.cost_per_min !== null
+      && cur.interval_duration_ms !== null
+      && (cur.priced_samples < COST_RATE_MIN_PRICED_SAMPLES || opts.retained === true);
+    const value = unavailable || currentValue === null
+      ? UNAVAILABLE
+      : costAsTotal
+        ? fmtCost((currentValue * cur.interval_duration_ms!) / 60_000)
+        : spec.fmt(currentValue);
+    const valueSuffix = costAsTotal
+      ? '· window total'
+      : collapseLatency && spec.key === 'p50_ms'
+        ? `· ${cur!.latency_samples} request${cur!.latency_samples === 1 ? '' : 's'}`
+        : useEngine && opts.retained === true
+          ? '· last active'
+          : undefined;
     // The err% chip turns red ABOVE the threshold — but only when it is actually MEASURED
     // (an unavailable err% carries no threshold accent); others keep their static accent.
     const accent: ChipDescriptor['accent'] =
@@ -186,7 +235,9 @@ export function deriveChips(
     const prevUnavailable = useEngine
       ? previousEngineThroughput === null
       : metricUnavailable(prev, spec.key);
-    const delta = !unavailable && currentValue !== null && !prevUnavailable
+    // Total mode shows an interval TOTAL while the underlying series is a RATE — a trend arrow
+    // comparing rates against a displayed total misleads (review MED), so it stays flat.
+    const delta = !unavailable && currentValue !== null && !prevUnavailable && !costAsTotal
       ? deltaDir(currentValue, previousValue ?? undefined)
       : 'flat';
     // Provenance (finding 4): `unavailable` when `—`, else the metric's intrinsic tier — EXCEPT
@@ -211,12 +262,19 @@ export function deriveChips(
         : spec.quality;
     return {
       key: spec.key,
-      label: useEngine ? 'engine gen tok/s' : spec.label,
+      label: useEngine
+        ? 'engine gen tok/s'
+        : collapseLatency && spec.key === 'p50_ms'
+          ? 'gateway E2E latency'
+          : costAsTotal
+            ? 'cost'
+            : spec.label,
       value,
       stroke: spec.stroke,
       accent,
       delta,
       quality,
+      valueSuffix,
       source: useEngine ? 'engine' : spec.key === 'reported_tokens_per_sec' ? 'reported' : 'gateway',
       sparkStroke: spec.stroke,
       details: useEngine ? engineThroughputDetails(engineThroughput) : metricDetails(cur, spec.key),

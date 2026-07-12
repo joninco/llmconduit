@@ -16,10 +16,47 @@
  * without a JS animation library). The component is presentational; the TheaterView owns the data
  * (the store's incremental river fold) and the grid.
  */
-import { useEffect, useRef, useState } from 'react';
-import type { River as RiverData } from './riverModel';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { splitJsonTail, type River as RiverData } from './riverModel';
 import { cn } from '../../lib/cn';
 import { fmtElapsed, fmtTokens, fmtTokensPerSec } from '../FlowTable/format';
+
+/** Lines shown before a pretty-printed tool payload folds behind an expand control (U8). */
+const TOOL_FOLD_LINES = 10;
+
+/**
+ * One tool call: JSON payloads pretty-print (2-space) and fold past TOOL_FOLD_LINES with an
+ * explicit line count — no more single-line JSON walls. Non-JSON content renders unchanged.
+ * Display-only: transcript copy elsewhere still yields the raw payload.
+ */
+function ToolCard({ text }: { text: string }) {
+  const parsed = useMemo(() => splitJsonTail(text), [text]);
+  const [expanded, setExpanded] = useState(false);
+  if (!parsed) {
+    return <div className="rounded-sm border border-line bg-panel-raised px-2 py-1 text-[11px] text-meta">{text}</div>;
+  }
+  const pretty = JSON.stringify(parsed.value, null, 2);
+  const lines = pretty.split('\n');
+  const foldable = lines.length > TOOL_FOLD_LINES;
+  const shown = foldable && !expanded ? lines.slice(0, TOOL_FOLD_LINES).join('\n') : pretty;
+  return (
+    <div className="rounded-sm border border-line bg-panel-raised px-2 py-1 text-[11px] text-meta" data-testid="river-tool-card">
+      {parsed.prefix && <p className="break-words text-text-muted">{parsed.prefix}</p>}
+      <pre className="mt-0.5 overflow-x-auto whitespace-pre-wrap break-words" data-testid="river-tool-json">{shown}</pre>
+      {foldable && (
+        <button
+          type="button"
+          className="mt-0.5 text-[10px] uppercase tracking-wide text-text-muted hover:text-text"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((v) => !v)}
+          data-testid="river-tool-fold"
+        >
+          {expanded ? '▾ collapse' : `▸ ${lines.length - TOOL_FOLD_LINES} more lines`}
+        </button>
+      )}
+    </div>
+  );
+}
 
 const STATUS_DOT: Record<RiverData['status'], string> = {
   running: 'bg-status-healthy',
@@ -244,13 +281,11 @@ export function River({
           )}
         </p>
 
-        {/* Tool calls — compact cards. */}
+        {/* Tool calls — compact cards; JSON payloads pretty-print and fold (U8). */}
         {visibleTools.length > 0 && (
           <div className="mt-2 flex flex-col gap-1" data-testid="river-tools">
             {visibleTools.map((tool, i) => (
-              <div key={i} className="rounded-sm border border-line bg-panel-raised px-2 py-1 text-[11px] text-meta">
-                {tool}
-              </div>
+              <ToolCard key={i} text={tool} />
             ))}
           </div>
         )}

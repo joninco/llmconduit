@@ -20,8 +20,12 @@ describe('CacheEconomics — aggregate cache-hit by model (gap 08)', () => {
     const { getByTestId, queryByTestId } = render(<CacheEconomics rows={rows} />);
     // Collapsed: no table yet.
     expect(queryByTestId('cache-economics-table')).toBeNull();
-    // 1 of 2 model groups has a measured hit rate (llama never reported cached).
-    expect(getByTestId('cache-economics-summary').textContent).toContain('1/2 models with measured hit rate');
+    // U12: the headline leads with the best measured group's actual hit rate, not just coverage.
+    const summary = getByTestId('cache-economics-summary').textContent!;
+    expect(summary).toContain('1/2 models');
+    expect(summary).toContain('gpt-4o');
+    expect(summary).toContain('20.0%'); // 200 cached / 1000 prompt
+    expect(summary).toContain('hit');
   });
 
   it('shows a derived hit rate + $ saved for a confident gpt-4o group (no est badge)', () => {

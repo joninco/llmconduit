@@ -362,3 +362,22 @@ export function gridColumns(n: number): number {
   if (n === 2) return 2;
   return 3; // 3-6 rivers tile into a 3-wide grid (2 rows at 6).
 }
+
+/**
+ * Split a tool-card string into a human prefix + a parseable JSON tail (U8). Tool lines arrive
+ * as `tool arguments <id>: {"command": …}` — the tail is what deserves pretty-printing. Returns
+ * null when no parseable JSON object/array is found (the card renders as plain text).
+ */
+export function splitJsonTail(text: string): { prefix: string; value: unknown } | null {
+  for (const opener of ['{', '[']) {
+    const at = text.indexOf(opener);
+    if (at === -1) continue;
+    const tail = text.slice(at).trim();
+    try {
+      return { prefix: text.slice(0, at).trimEnd(), value: JSON.parse(tail) };
+    } catch {
+      // fall through — try the other opener or give up
+    }
+  }
+  return null;
+}

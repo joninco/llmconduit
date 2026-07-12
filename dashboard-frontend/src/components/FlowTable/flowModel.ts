@@ -116,17 +116,26 @@ export function elapsedMs(flow: FlowSummary, now: number): number | null {
   return null;
 }
 
-/** A flow that failed OVER to another upstream is tagged (failover_count surfaced via target). */
+/**
+ * A flow that actually failed OVER: more than one dispatch attempt was recorded (the gap-03
+ * `attempts[]` trace), or the terminal reason says so. U6: requested→served model divergence
+ * alone is alias/route MAPPING, not failover — a single-attempt mapped flow must NOT wear the
+ * failover tag (the detail view for those rows says "No failover", and it is right).
+ */
 export function isFailover(flow: FlowSummary): boolean {
-  // A served model different from the requested one, OR a terminal reason mentioning failover,
-  // marks a row that was re-routed. (The authoritative failover_count lives on ProviderHealth;
-  // at the flow row we infer the tag from the requested→served divergence + reason text.)
+  if ((flow.attempts?.length ?? 0) >= 2) return true;
   const reason = flow.terminal_reason?.toLowerCase() ?? '';
-  if (reason.includes('failover') || reason.includes('failed over')) return true;
+  return reason.includes('failover') || reason.includes('failed over');
+}
+
+/**
+ * A flow whose served model differs from the requested one — alias/route mapping (U6). Neutral
+ * provenance, not a warning: the gateway did exactly what its routing config says.
+ */
+export function isMapped(flow: FlowSummary): boolean {
   return (
     !!flow.model_requested &&
     !!flow.model_served &&
-    flow.model_requested !== flow.model_served &&
-    !!flow.upstream_target
+    flow.model_requested !== flow.model_served
   );
 }

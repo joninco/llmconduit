@@ -263,17 +263,17 @@ describe('TheaterView — retains the latest response and ages out older termina
       expect(getByTestId('river').getAttribute('data-retained')).toBe('true');
       expect(getByTestId('river-retained-badge').textContent).toContain('last response');
       expect(getByTestId('theater-state').getAttribute('data-state')).toBe('idle');
-      expect(getByTestId('theater-idle-age').textContent).toContain('last response 00:00 ago');
+      expect(getByTestId('theater-idle-age').textContent).toContain('last response 0s ago');
 
       // It remains after the old 4.4s removal boundary and the fixed-width clock keeps advancing.
       act(() => { vi.advanceTimersByTime(65_000); });
       expect(getByTestId('river').getAttribute('data-retained')).toBe('true');
-      expect(getByTestId('theater-idle-age').textContent).toContain('last response 01:05 ago');
+      expect(getByTestId('theater-idle-age').textContent).toContain('last response 1m 5s ago');
 
       // The shared stale formatter remains concise across day boundaries.
       vi.setSystemTime(finishedAt + 90_061_000);
       act(() => { vi.advanceTimersByTime(1_000); });
-      expect(getByTestId('theater-idle-age').textContent).toContain('last response 1d 01:01:02 ago');
+      expect(getByTestId('theater-idle-age').textContent).toContain('last response 1d 1h ago');
 
       // Backend monitor retention may later remove the request; Theater's bounded one-response
       // cache intentionally survives that automatic cleanup.
@@ -334,11 +334,11 @@ describe('TheaterView — retains the latest response and ages out older termina
         { type: 'request_remove', response_id: 'r1', reason: 'evicted' },
       ]);
       const { getByTestId, unmount } = render(<TheaterView />);
-      expect(getByTestId('theater-idle-age').textContent).toContain('last response 00:10 ago');
+      expect(getByTestId('theater-idle-age').textContent).toContain('last response 10s ago');
       expect(getByTestId('river-output').textContent).toContain('done');
       unmount();
       const remount = render(<TheaterView />);
-      expect(remount.getByTestId('theater-idle-age').textContent).toContain('last response 00:10 ago');
+      expect(remount.getByTestId('theater-idle-age').textContent).toContain('last response 10s ago');
       expect(remount.getByTestId('river').getAttribute('data-retained')).toBe('true');
     } finally {
       vi.useRealTimers();

@@ -9,7 +9,7 @@
  * only the status dot animates — so scrolling never thrashes. The header is a sibling of the
  * scroll container (not virtualized) so it stays put.
  */
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import type { FlowSummary } from '../../api/types';
 import { useDashboard, useFlowFilter } from '../../store/hooks';
@@ -20,8 +20,8 @@ import { TokensCell } from './TokensCell';
 import { CacheEconomics } from './CacheEconomics';
 import { ContextPressure } from './ContextPressure';
 import { fmtClock, fmtElapsed, fmtModelPair } from './format';
-import { costDisplay, elapsedMs, flowCost, isFailover, shortId, statusClass } from './flowModel';
-import { clientCell } from './clientAttribution';
+import { costDisplay, elapsedMs, flowCost, isFailover, isMapped, shortId, statusClass } from './flowModel';
+import { clientCell, clientKey } from './clientAttribution';
 import { ClientRollup } from './ClientRollup';
 import { FilterBar } from './FilterBar';
 import { useFlowRows } from './useFlowRows';
@@ -143,6 +143,17 @@ export function FlowTable({
     overscan: OVERSCAN,
   });
   useEffect(() => virtualizer.measure(), [narrow, virtualizer]);
+
+  // U5 — the latency-bar scale: max elapsed among LOADED rows. Terminal rows only (an open
+  // row's elapsed grows every second and would re-scale every bar each tick).
+  const maxElapsedMs = useMemo(
+    () => rows.reduce((max, flow) => {
+      if (flow.status === 'open') return max;
+      const value = elapsedMs(flow, 0);
+      return value !== null && value > max ? value : max;
+    }, 0),
+    [rows],
+  );
 
   const registerRow = useCallback((apiCallId: string, node: HTMLButtonElement | null) => {
     if (node) rowRefs.current.set(apiCallId, node);
@@ -266,6 +277,8 @@ export function FlowTable({
                     <FlowRow
                       buttonRef={(node) => registerRow(flow.api_call_id, node)}
                       flow={flow}
+                      prev={rows[vi.index - 1] ?? null}
+                      maxElapsedMs={maxElapsedMs}
                       index={vi.index}
                       nowMs={seekAtMs ?? Date.now()}
                       selected={flow.api_call_id === selectedId}
@@ -421,9 +434,66 @@ function HeaderRow({ sort, direction, onSortChange }: { sort: FlowSort; directio
   );
 }
 
+/**
+ * U6 — route provenance badges. `FO` (warning voice) marks an ACTUAL failover: ≥2 dispatch
+ * attempts (or a terminal reason that says so). `MAP` (neutral voice) marks alias/route model
+ * mapping on a single attempt — expected behavior, not an alarm. A failover row is not
+ * additionally tagged MAP; the re-route is the signal.
+ */
+function RouteBadges({ flow }: { flow: FlowSummary }) {
+  const failover = isFailover(flow);
+  const mapped = isMapped(flow);
+  return (
+    <>
+      {mapped && !failover && (
+        <span
+          className="shrink-0 rounded-sm border border-line px-1 text-[9px] uppercase text-text-muted"
+          data-testid="mapping-tag"
+          title="model mapping — the requested model is served by a configured alias/route (single attempt, no failover)"
+        >
+          MAP
+        </span>
+      )}
+      {failover && (
+        <span
+          className="shrink-0 rounded-sm bg-status-cooling/15 px-1 text-[9px] uppercase text-status-cooling"
+          data-testid="failover-tag"
+          title="failover — more than one dispatch attempt was made (re-routed)"
+        >
+          FO
+        </span>
+      )}
+    </>
+  );
+}
+
+/**
+ * U5 — repeat-run dimming: which low-entropy cells equal the PREVIOUS loaded row. CSS-only
+ * (opacity); the full text stays in the DOM and in accessible names. Recomputed per render, so
+ * a sort/filter change (new neighbors) resets naturally.
+ */
+function repeatedCells(flow: FlowSummary, prev: FlowSummary | null) {
+  if (!prev) return { client: false, uri: false, model: false, upstream: false, status: false };
+  return {
+    client: clientKey(prev) === clientKey(flow) && clientCell(prev).label === clientCell(flow).label,
+    uri: (prev.uri ?? '') === (flow.uri ?? ''),
+    model: fmtModelPair(prev.model_requested, prev.model_served) === fmtModelPair(flow.model_requested, flow.model_served)
+      && isFailover(prev) === isFailover(flow)
+      && isMapped(prev) === isMapped(flow),
+    upstream: (prev.upstream_target ?? '') === (flow.upstream_target ?? ''),
+    status: prev.status === flow.status && (prev.terminal_reason ?? null) === (flow.terminal_reason ?? null),
+  };
+}
+
+/** Dimmed-repeat presentation: value unchanged for a11y/copy, visually receded. 60% keeps
+ * already-muted cells above accessible contrast on long runs of similar flows (review MED). */
+const DIM_REPEAT = 'opacity-60';
+
 function FlowRow({
   buttonRef,
   flow,
+  prev,
+  maxElapsedMs,
   index,
   nowMs,
   selected,
@@ -434,6 +504,10 @@ function FlowRow({
 }: {
   buttonRef: (node: HTMLButtonElement | null) => void;
   flow: FlowSummary;
+  /** Previous LOADED row (sort order) — drives U5 repeat-dimming; null on the first row. */
+  prev: FlowSummary | null;
+  /** Max elapsed among loaded rows — scales the U5 inline latency bar (0 disables). */
+  maxElapsedMs: number;
   index: number;
   /** Reference instant for an OPEN row's elapsed: the frozen cut `at_ms` while seeking, else now. */
   nowMs: number;
@@ -445,7 +519,8 @@ function FlowRow({
 }) {
   const klass = statusClass(flow.status, flow.terminal_reason);
   const isError = klass === 'client-error' || klass === 'server-error';
-  const failover = isFailover(flow);
+  const repeats = repeatedCells(flow, prev);
+  const elapsed = elapsedMs(flow, nowMs);
   // Gap 07: derive the dollar STRING and the `estimated` flag TOGETHER from the cost + the per-flow
   // `cost_confidence`, so an `estimated` row is visibly labelled and an `unavailable` one renders
   // `—` (never a fabricated `$0.00`) — the same contract the StatsStrip $/min chip + FlowDetail use.
@@ -476,22 +551,14 @@ function FlowRow({
     >
       <span role="gridcell" className="tabular-nums text-text-muted">{fmtClock(flow.started_ms)}</span>
       <span role="gridcell" className="truncate font-mono text-text-muted">{shortId(flow.api_call_id)}</span>
-      <span role="gridcell" className="min-w-0"><ClientCellView flow={flow} /></span>
-      <span role="gridcell" className="truncate font-mono">{flow.uri || '—'}</span>
-      <span role="gridcell" className="flex min-w-0 items-center gap-1.5">
+      <span role="gridcell" className={cn('min-w-0', repeats.client && DIM_REPEAT)} data-repeat={repeats.client || undefined}><ClientCellView flow={flow} /></span>
+      <span role="gridcell" className={cn('truncate font-mono', repeats.uri && DIM_REPEAT)} data-repeat={repeats.uri || undefined}>{flow.uri || '—'}</span>
+      <span role="gridcell" className={cn('flex min-w-0 items-center gap-1.5', repeats.model && DIM_REPEAT)} data-repeat={repeats.model || undefined}>
         <span className="truncate">{fmtModelPair(flow.model_requested, flow.model_served)}</span>
-        {failover && (
-          <span
-            className="shrink-0 rounded-sm bg-status-cooling/15 px-1 text-[9px] uppercase text-status-cooling"
-            data-testid="failover-tag"
-            title="failover / re-routed"
-          >
-            FO
-          </span>
-        )}
+        <RouteBadges flow={flow} />
       </span>
-      <span role="gridcell" className="truncate text-text-muted">{flow.upstream_target ?? '—'}</span>
-      <span role="gridcell">
+      <span role="gridcell" className={cn('truncate text-text-muted', repeats.upstream && DIM_REPEAT)} data-repeat={repeats.upstream || undefined}>{flow.upstream_target ?? '—'}</span>
+      <span role="gridcell" className={cn(repeats.status && DIM_REPEAT)} data-repeat={repeats.status || undefined}>
         <StatusChip status={flow.status} terminalReason={flow.terminal_reason} />
       </span>
       <span role="gridcell"><TokensCell flow={flow} /></span>
@@ -510,7 +577,19 @@ function FlowRow({
           </span>
         )}
       </span>
-      <span role="gridcell" className="text-right tabular-nums text-text-muted">{fmtElapsed(elapsedMs(flow, nowMs))}</span>
+      <span role="gridcell" className="relative text-right tabular-nums text-text-muted">
+        {fmtElapsed(elapsed)}
+        {/* U5 — proportional latency bar so outliers pop without reading every number. Linear
+            vs the max elapsed among LOADED rows; aria-hidden (the number is the datum). */}
+        {elapsed !== null && maxElapsedMs > 0 && (
+          <span
+            aria-hidden
+            data-testid="elapsed-bar"
+            className="absolute bottom-0 right-0 block h-0.5 rounded-full bg-accent/50"
+            style={{ width: `${Math.max(3, Math.min(100, (elapsed / maxElapsedMs) * 100))}%` }}
+          />
+        )}
+      </span>
     </button>
   );
 }
@@ -533,7 +612,6 @@ function FlowCard({
 }) {
   const klass = statusClass(flow.status, flow.terminal_reason);
   const isError = klass === 'client-error' || klass === 'server-error';
-  const failover = isFailover(flow);
   const cost = costDisplay(flowCost(flow), flow.cost_confidence);
 
   return (
@@ -560,15 +638,7 @@ function FlowCard({
 
       <span className="flex min-w-0 items-center gap-1.5">
         <span className="truncate font-medium">{fmtModelPair(flow.model_requested, flow.model_served)}</span>
-        {failover && (
-          <span
-            className="shrink-0 rounded-sm bg-status-cooling/15 px-1 text-[9px] uppercase text-status-cooling"
-            data-testid="failover-tag"
-            title="failover / re-routed"
-          >
-            FO
-          </span>
-        )}
+        <RouteBadges flow={flow} />
         <span className="ml-auto max-w-[35%] truncate text-text-muted">{flow.upstream_target ?? '—'}</span>
       </span>
 

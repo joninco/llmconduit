@@ -7,6 +7,7 @@ import {
   costPerMinDisplay,
   elapsedMs,
   isFailover,
+  isMapped,
   shortId,
 } from './flowModel';
 
@@ -105,15 +106,30 @@ describe('elapsedMs', () => {
   });
 });
 
-describe('isFailover', () => {
-  it('tags a requested→served divergence with a target', () => {
-    expect(isFailover(flow({ model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a' }))).toBe(true);
+describe('isFailover / isMapped (U6)', () => {
+  it('a single-attempt requested→served divergence is MAPPING, not failover', () => {
+    const mapped = flow({ model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a' });
+    expect(isFailover(mapped)).toBe(false);
+    expect(isMapped(mapped)).toBe(true);
+  });
+  it('tags ≥2 recorded dispatch attempts as failover', () => {
+    const attempts = [
+      { attempt: 1, provider: 'vllm-a', outcome: 'failed' },
+      { attempt: 2, provider: 'vllm-b', outcome: 'served' },
+    ] as never;
+    expect(isFailover(flow({ attempts, model_requested: 'm', model_served: 'm' }))).toBe(true);
+  });
+  it('a single recorded attempt is not failover', () => {
+    const attempts = [{ attempt: 1, provider: 'vllm-a', outcome: 'served' }] as never;
+    expect(isFailover(flow({ attempts }))).toBe(false);
   });
   it('tags an explicit failover terminal reason', () => {
     expect(isFailover(flow({ terminal_reason: 'failover to vllm-b' }))).toBe(true);
   });
-  it('does not tag a same-model served row', () => {
-    expect(isFailover(flow({ model_requested: 'm', model_served: 'm', upstream_target: 'vllm-a' }))).toBe(false);
+  it('does not tag or map a same-model served row', () => {
+    const same = flow({ model_requested: 'm', model_served: 'm', upstream_target: 'vllm-a' });
+    expect(isFailover(same)).toBe(false);
+    expect(isMapped(same)).toBe(false);
   });
 });
 

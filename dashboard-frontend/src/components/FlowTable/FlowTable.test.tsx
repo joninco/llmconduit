@@ -72,9 +72,8 @@ describe('FlowTable — virtualization', () => {
     seedFlows(flows);
     const { getByTestId, getAllByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
 
-    // The list reports 10k total via the filter-bar count…
-    expect(getByTestId('flow-count').textContent).toContain('10000');
-    // …but only the visible window + overscan is in the DOM (far fewer than 10k rows).
+    // Only the visible window + overscan is in the DOM (far fewer than 10k rows). (U11: the
+    // visible loaded/matching count now lives once, in the ScopeBar outside this component.)
     const rows = getAllByTestId('flow-row');
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.length).toBeLessThan(200);
@@ -179,14 +178,13 @@ describe('FlowTable — filtering', () => {
   });
 
   it('a status chip narrows the rows', () => {
-    const { getByText, getByTestId, getAllByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    const { getByText, getAllByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
     expect(getAllByTestId('flow-row')).toHaveLength(3);
     // Click the `open` status chip.
     fireEvent.click(getByText('open'));
     const rows = getAllByTestId('flow-row');
     expect(rows).toHaveLength(1);
     expect(within(rows[0]!).getByText('running')).toBeTruthy();
-    expect(getByTestId('flow-count').textContent).toContain('1 loaded / 1 matching');
   });
 
   it('a model chip narrows the rows', () => {
@@ -202,7 +200,8 @@ describe('FlowTable — filtering', () => {
       <FlowTable selectedId={null} onSelect={noop} searchQuery="api_fail openai" />,
     );
     expect(found.getAllByTestId('flow-row')).toHaveLength(1);
-    expect(found.getByTestId('flow-count').textContent).toContain('1 loaded / 1 matching');
+    // U11: the visible count moved to the ScopeBar; the search live-region still reports it.
+    expect(found.getByTestId('flow-search-announcement').textContent).toContain('1 of 1 flows match');
     found.unmount();
 
     const empty = renderWithQuery(
@@ -240,10 +239,62 @@ describe('FlowTable — live WS update + interactions', () => {
     expect(within(getAllByTestId('flow-row')[0]!).getByText('2xx')).toBeTruthy();
   });
 
-  it('tags a failover row and reports error styling', () => {
-    seedFlows([makeFlow({ api_call_id: 'api_fo', status: 'completed', model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a' })]);
-    const { getByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+  // U6 — model mapping (single attempt) is NEUTRAL provenance; FO is reserved for a real
+  // multi-attempt failover. A mapped row must not read as "failed over".
+  it('tags a single-attempt mapped row MAP, not FO', () => {
+    seedFlows([makeFlow({ api_call_id: 'api_map', status: 'completed', model_requested: 'gpt-4o', model_served: 'llama-3.1-70b', upstream_target: 'vllm-a' })]);
+    const { getByTestId, queryByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    expect(getByTestId('mapping-tag')).toBeTruthy();
+    expect(getByTestId('mapping-tag').getAttribute('title')).toContain('no failover');
+    expect(queryByTestId('failover-tag')).toBeNull();
+  });
+
+  it('tags a multi-attempt row FO (and not MAP)', () => {
+    seedFlows([makeFlow({
+      api_call_id: 'api_fo',
+      status: 'completed',
+      model_requested: 'gpt-4o',
+      model_served: 'llama-3.1-70b',
+      upstream_target: 'vllm-b',
+      attempts: [
+        { attempt: 1, provider: 'vllm-a', outcome: 'failed', error_class: 'upstream_5xx', failover_reason: 'provider_failed' },
+        { attempt: 2, provider: 'vllm-b', outcome: 'served' },
+      ] as never,
+    })]);
+    const { getByTestId, queryByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
     expect(getByTestId('failover-tag')).toBeTruthy();
+    expect(getByTestId('failover-tag').getAttribute('title')).toContain('more than one dispatch attempt');
+    expect(queryByTestId('mapping-tag')).toBeNull();
+  });
+
+  // U5 — repeat-run dimming + latency bar: low-entropy repeats recede, variance pops.
+  it('dims cells equal to the previous loaded row while keeping their accessible text', () => {
+    seedFlows([
+      makeFlow({ api_call_id: 'api_a', status: 'completed', started_ms: 1_700_000_000_100, elapsed_ms: 4_300 }),
+      makeFlow({ api_call_id: 'api_b', status: 'completed', started_ms: 1_700_000_000_000, elapsed_ms: 800 }),
+    ]);
+    const { getAllByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    const [first, second] = getAllByTestId('flow-row');
+    // First row: nothing above it → no repeat dimming.
+    expect(first!.querySelectorAll('[data-repeat]')).toHaveLength(0);
+    // Second row repeats client/endpoint/model/upstream/status → those cells carry the marker,
+    // and the DIMMED text is still fully present (a11y/copy unchanged).
+    const repeated = second!.querySelectorAll('[data-repeat]');
+    expect(repeated.length).toBeGreaterThanOrEqual(4);
+    for (const cell of repeated) expect(cell.className).toContain('opacity-60');
+    expect(within(second!).getByText('/v1/responses')).toBeTruthy();
+  });
+
+  it('renders a proportional elapsed bar scaled to the loaded max', () => {
+    seedFlows([
+      makeFlow({ api_call_id: 'api_slow', status: 'completed', started_ms: 1_700_000_000_100, elapsed_ms: 4_000 }),
+      makeFlow({ api_call_id: 'api_fast', status: 'completed', started_ms: 1_700_000_000_000, elapsed_ms: 1_000 }),
+    ]);
+    const { getAllByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    const bars = getAllByTestId('elapsed-bar');
+    expect(bars).toHaveLength(2);
+    expect(bars[0]!.style.width).toBe('100%');
+    expect(bars[1]!.style.width).toBe('25%');
   });
 
   it('clicking a row calls onSelect with its api_call_id', () => {
@@ -323,7 +374,7 @@ describe('FlowTable — live WS update + interactions', () => {
       makeFlow({ api_call_id: 'api_x2', status: 'completed', client_label: 'key-A', client_source: 'key_hash' }),
       makeFlow({ api_call_id: 'api_y1', status: 'completed', client_label: 'svc-checkout', client_source: 'configured_header' }),
     ]);
-    const { getAllByTestId, getByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    const { getAllByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
     expect(getAllByTestId('flow-row')).toHaveLength(3);
     // `key-A` appears as a client filter chip (its label is in a bounded truncate span); resolve the
     // enclosing chip button via the filter-bar chip-label testid (the CLIENT cell also renders `key-A`).
@@ -332,7 +383,6 @@ describe('FlowTable — live WS update + interactions', () => {
       .closest('button')!;
     fireEvent.click(chip);
     expect(getAllByTestId('flow-row')).toHaveLength(2);
-    expect(getByTestId('flow-count').textContent).toContain('2 loaded / 2 matching');
   });
 });
 

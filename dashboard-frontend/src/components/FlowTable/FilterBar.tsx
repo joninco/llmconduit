@@ -264,9 +264,8 @@ export function FilterBar({
           clear
         </button>
       )}
-      <span className="ml-auto tabular-nums text-xs text-text-muted" data-testid="flow-count">
-        {shown} loaded / {total} matching
-      </span>
+      {/* U11: the visible loaded/matching count lives ONCE, in the ScopeBar (authoritative,
+          every tab). The live-region announcement stays — search feedback for screen readers. */}
       <span className="sr-only" aria-live="polite" aria-atomic="true" data-testid="flow-search-announcement">
         {searchQuery.trim() ? `${shown} of ${total} flows match ${searchQuery.trim()}.` : ''}
       </span>

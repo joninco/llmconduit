@@ -37,13 +37,32 @@ import { useMediaQuery } from './lib/useMediaQuery';
 import { DurabilityBanner } from './components/DurabilityBanner';
 
 const StatsStrip = lazy(() => import('./components/StatsStrip/StatsStrip').then((module) => ({ default: module.StatsStrip })));
+const CompactStatsStrip = lazy(() => import('./components/StatsStrip/StatsStrip').then((module) => ({ default: module.CompactStatsStrip })));
 
-function LazyStatsStrip() {
+function LazyStatsStrip({ onCompact }: { onCompact?: () => void }) {
   return (
     <Suspense fallback={<div className="m-2 h-24 animate-pulse rounded-md border border-line bg-panel sm:m-4" role="status" aria-label="Loading gateway metrics" />}>
-      <StatsStrip />
+      <StatsStrip onCompact={onCompact} />
     </Suspense>
   );
+}
+
+/**
+ * U4 — the full metrics strip costs ~30% of every viewport but only Overview needs it at full
+ * size. Non-Overview tabs default to the one-line compact strip; expanding pins the full strip
+ * (persisted), compacting unpins. Overview always renders full.
+ */
+const STRIP_PIN_KEY = 'argus:metrics-strip:pinned-full';
+
+function readStripPin(): boolean {
+  try { return window.localStorage.getItem(STRIP_PIN_KEY) === '1'; } catch { return false; }
+}
+
+function writeStripPin(pinned: boolean) {
+  try {
+    if (pinned) window.localStorage.setItem(STRIP_PIN_KEY, '1');
+    else window.localStorage.removeItem(STRIP_PIN_KEY);
+  } catch { /* storage unavailable */ }
 }
 
 export function App() {
@@ -83,6 +102,12 @@ function Dashboard() {
   const scope = useHashScope();
   const ActiveView = VIEW_BY_ROUTE[route];
   const narrow = useMediaQuery('(max-width: 1023px)');
+  const [stripPinnedFull, setStripPinnedFull] = useState(readStripPin);
+  const compactStrip = route !== 'overview' && !stripPinnedFull;
+  const pinStrip = useCallback((pinned: boolean) => {
+    writeStripPin(pinned);
+    setStripPinnedFull(pinned);
+  }, []);
 
   useEffect(() => {
     flowFilterStore.getState().hydrate({
@@ -147,6 +172,15 @@ function Dashboard() {
             <RouteContent ActiveView={ActiveView} routeKey={route} />
           </main>
         </div>
+      ) : compactStrip ? (
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col" data-testid="compact-shell">
+          <Suspense fallback={<div className="m-2 h-9 animate-pulse rounded-md border border-line bg-panel sm:m-4 sm:mb-0" role="status" aria-label="Loading gateway status" />}>
+            <CompactStatsStrip onExpand={() => pinStrip(true)} />
+          </Suspense>
+          <main className="mt-2 flex min-h-0 min-w-0 flex-1 overflow-hidden sm:mt-3">
+            <RouteContent ActiveView={ActiveView} routeKey={route} />
+          </main>
+        </div>
       ) : (
         <Group
         orientation="vertical"
@@ -182,7 +216,7 @@ function Dashboard() {
           ) : (
             <>
               {/* stats-strip slot */}
-              <LazyStatsStrip />
+              <LazyStatsStrip onCompact={route !== 'overview' ? () => pinStrip(false) : undefined} />
               {/* scrubber slot */}
               <Scrubber socket={socket} />
             </>

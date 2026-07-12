@@ -39,6 +39,17 @@ export function CacheEconomics({
 
   // Overall coverage: how many model groups have ANY measured cache-hit rate (reported cached).
   const measuredGroups = aggregates.filter((a) => a.hitRate.quality !== 'unavailable').length;
+  // U12 — the collapsed header must carry a NUMBER worth expanding for, not just group counts:
+  // the best measured hit rate when one exists, else how many flows reported cached at all
+  // (quantifying WHY nothing is measured).
+  const topMeasured = aggregates.find((a) => a.hitRate.quality !== 'unavailable') ?? null;
+  const reportedFlows = aggregates.reduce((n, a) => n + a.reportedSamples, 0);
+  const totalFlows = aggregates.reduce((n, a) => n + a.totalSamples, 0);
+  const headline = aggregates.length === 0
+    ? 'no models'
+    : topMeasured
+      ? `${measuredGroups}/${aggregates.length} models · ${topMeasured.key} ${topMeasured.hitRate.value} hit${topMeasured.saved.quality !== 'unavailable' ? ` · ${topMeasured.saved.value} saved` : ''}`
+      : `0/${aggregates.length} models measured · ${reportedFlows}/${totalFlows} flows reported cached`;
 
   return (
     <section
@@ -57,10 +68,8 @@ export function CacheEconomics({
           ▸
         </span>
         <span>cache economics</span>
-        <span className="ml-auto font-mono tabular-nums text-text-muted" data-testid="cache-economics-summary">
-          {aggregates.length === 0
-            ? 'no models'
-            : `${measuredGroups}/${aggregates.length} models with measured hit rate`}
+        <span className="ml-auto truncate font-mono normal-case tabular-nums text-text-muted" data-testid="cache-economics-summary">
+          {headline}
         </span>
       </button>
       {open && (

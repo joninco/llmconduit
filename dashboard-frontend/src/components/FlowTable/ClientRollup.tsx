@@ -89,10 +89,15 @@ export function ClientRollup({ rows, archive }: { rows: FlowSummary[]; archive?:
           ▸
         </span>
         <span>by client</span>
-        <span className="ml-auto font-mono tabular-nums text-text-muted" data-testid="client-rollup-summary">
+        {/* U12: the collapsed header leads with the heaviest client + its share — the number an
+            operator expands this panel to find. */}
+        <span className="ml-auto truncate font-mono normal-case tabular-nums text-text-muted" data-testid="client-rollup-summary">
           {!model.available
             ? 'no attributed clients'
             : `${model.rows.length} client${model.rows.length === 1 ? '' : 's'}` +
+              (model.rows[0] && model.totalFlows > 0
+                ? ` · top ${model.rows[0].label} ${Math.round((model.rows[0].total / model.totalFlows) * 100)}%`
+                : '') +
               (model.unattributedFlows > 0 ? ` · ${model.unattributedFlows} unattributed` : '')}
         </span>
       </button>

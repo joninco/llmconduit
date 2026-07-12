@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { act, cleanup, fireEvent, within } from '@testing-library/react';
-import { StatsStrip } from './StatsStrip';
+import { CompactStatsStrip, StatsStrip } from './StatsStrip';
 import { dashboardStore, type LiveBaseline } from '../../store/dashboardStore';
 import type { MetricsResponse, InstantMetricSample } from '../../api/types';
 import { renderWithQuery, resetWorld } from '../testHarness';
@@ -333,5 +333,69 @@ describe('StatsStrip — history horizon selector', () => {
     // aria-pressed tracks the active window.
     expect(getByText('1h').getAttribute('aria-pressed')).toBe('true');
     expect(getByText('1m').getAttribute('aria-pressed')).toBe('false');
+  });
+});
+
+describe('CompactStatsStrip (U4)', () => {
+  it('renders the one-line pulse: operational status + p50 + tok/s + expand control', () => {
+    const { getByTestId } = renderWithQuery(<CompactStatsStrip onExpand={() => {}} />);
+    pushMetrics(metrics(1, {
+      engine_throughput: {
+        generated_tokens_per_sec: 287.5,
+        sampled_at_ms: 900,
+        measured_sources: 2,
+        total_sources: 2,
+        coverage: 'full',
+      },
+    }, { m1: { p50_ms: 721 } }));
+    const strip = getByTestId('stats-strip-compact');
+    expect(within(strip).getByTestId('compact-p50').textContent).toBe('721 ms');
+    expect(within(strip).getByTestId('compact-toks').textContent).toBe('288 tok/s');
+    const expand = within(strip).getByTestId('stats-strip-expand');
+    expect(expand.getAttribute('aria-expanded')).toBe('false');
+    // The full strip's chip grid does NOT render in compact mode.
+    expect(within(strip).queryByTestId('primary-metrics')).toBeNull();
+  });
+
+  it('invokes onExpand and marks a retained idle window inline', () => {
+    const onExpand = vi.fn();
+    const { getByTestId } = renderWithQuery(<CompactStatsStrip onExpand={onExpand} />);
+    pushMetrics(metrics(1, {
+      engine_throughput: {
+        generated_tokens_per_sec: 152,
+        sampled_at_ms: 900,
+        measured_sources: 1,
+        total_sources: 1,
+        coverage: 'full',
+      },
+      last_activity: { at_ms: 500, instant: win({ p50_ms: 721, active_streams_now: 1 }) },
+    }, { m1: { active_streams_now: 0, latency_samples: 0, p50_ms: null } }));
+    const strip = getByTestId('stats-strip-compact');
+    expect(strip.getAttribute('data-metrics-state')).toBe('retained');
+    // Retained interval supplies the p50; the retained qualifier is VISIBLE, not hover-only.
+    expect(within(strip).getByTestId('compact-p50').textContent).toBe('721 ms');
+    expect(strip.textContent).toContain('· last active');
+    fireEvent.click(within(strip).getByTestId('stats-strip-expand'));
+    expect(onExpand).toHaveBeenCalledTimes(1);
+  });
+
+  it('never falls back to live REST metrics while seeking (review HIGH)', () => {
+    const { getByTestId, queryClient } = renderWithQuery(<CompactStatsStrip onExpand={() => {}} />);
+    // A live REST answer is cached — the trap the seek gate must not fall into.
+    queryClient.setQueryData(['metrics'], metrics(9, {}, { m1: { p50_ms: 111 } }));
+    act(() => {
+      dashboardStore.setState({ connection: 'seeking', metrics: null, seekAtMs: 500 });
+    });
+    const strip = getByTestId('stats-strip-compact');
+    // Frozen cut has no metrics → honest dashes, NOT the live 111ms p50.
+    expect(within(strip).getByTestId('compact-p50').textContent).toBe('—');
+    expect(strip.getAttribute('data-metrics-state')).toBe('empty');
+  });
+
+  it('renders honest dashes with no metrics at all', () => {
+    const { getByTestId } = renderWithQuery(<CompactStatsStrip onExpand={() => {}} />);
+    const strip = getByTestId('stats-strip-compact');
+    expect(within(strip).getByTestId('compact-p50').textContent).toBe('—');
+    expect(within(strip).getByTestId('compact-toks').textContent).toBe('—');
   });
 });

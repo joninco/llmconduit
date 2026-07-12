@@ -111,7 +111,7 @@ describe('FlowsView — direct lookup re-scopes every flow instrument', () => {
     expect(document.activeElement).toBe(search);
     fireEvent.change(search, { target: { value: 'provider-a timeout' } });
     await waitFor(() => expect(view.getAllByTestId('flow-row')).toHaveLength(1));
-    expect(view.getByTestId('flow-count').textContent).toContain('1 loaded / 1 matching');
+    expect(view.getByTestId('flow-search-announcement').textContent).toContain('1 of 1 flows match');
     expect(view.getByTestId('failure-taxonomy').getAttribute('data-available')).toBe('true');
 
     fireEvent.change(search, { target: { value: 'missing-request' } });
