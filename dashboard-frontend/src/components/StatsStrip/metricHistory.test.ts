@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { HistoryPoint, InstantMetricSample, MetricsResponse } from '../../api/types';
-import { appendTick, emptyHistory, horizon, latest, mergeRetained, previous, seriesFor } from './metricHistory';
+import { appendTick, emptyHistory, horizon, latest, latestActivity, mergeRetained, previous, seriesFor } from './metricHistory';
 
 function instant(rate: number | null): InstantMetricSample {
   return {
@@ -52,5 +52,30 @@ describe('instant metric history', () => {
     const series = seriesFor(history, 'accepted_per_sec');
     expect(series.times).toEqual([1, 2, 3]);
     expect(Number.isNaN(series.values[2])).toBe(true);
+  });
+
+  it('finds the newest request-bearing interval while skipping later idle cuts', () => {
+    let history = appendTick(emptyHistory(), tick(1, 1_000, 4));
+    history = appendTick(history, tick(2, 2_000, 0));
+    history = appendTick(history, tick(3, 3_000, 0));
+    expect(latestActivity(history)?.t).toBe(1_000);
+    expect(latestActivity(history, 1_000)).toBeNull();
+  });
+
+  it('builds the token sparkline from engine counters when that source is selected', () => {
+    let history = appendTick(emptyHistory(), {
+      ...tick(1, 1_000, 1),
+      engine_throughput: {
+        generated_tokens_per_sec: 12.5,
+        sampled_at_ms: 900,
+        measured_sources: 1,
+        total_sources: 1,
+        coverage: 'full',
+      },
+    });
+    history = appendTick(history, tick(2, 2_000, 2));
+    const series = seriesFor(history, 'reported_tokens_per_sec', 'engine');
+    expect(series.values[0]).toBe(12.5);
+    expect(Number.isNaN(series.values[1])).toBe(true);
   });
 });

@@ -1646,6 +1646,41 @@
         "monitor"
       ]
     },
+    "EngineThroughputSample": {
+      "description": "Physically de-duplicated per-request output-token throughput from the newest\nsuccessful Prometheus TPOT interval across configured engines. The value is the\ninverse mean `request_time_per_output_token_seconds`; speculative accepted tokens\nare already reflected in that shorter output-token time and are never double-counted.\nOne physical `/metrics` endpoint contributes once even when several logical routes\npoint at it.",
+      "type": "object",
+      "properties": {
+        "coverage": {
+          "$ref": "#/$defs/BackendMetricsCoverage"
+        },
+        "generated_tokens_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "measured_sources": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sampled_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "total_sources": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "generated_tokens_per_sec",
+        "sampled_at_ms",
+        "measured_sources",
+        "total_sources",
+        "coverage"
+      ]
+    },
     "FlowDelta": {
       "description": "One streamed delta replayed into the inspector (from the MonitorHub snapshot,\nfiltered by the flow's `response_id`). Mirrors the frozen `FlowDelta`:\n`{sequence, kind, payload?, ts_ms?}`. `payload` is the heterogeneous delta body\n(a segment text, an event summary, a status, …); the SPA narrows at the use\nsite. `sequence` is a per-flow ordinal (the replay order), NOT a domain cursor.",
       "type": "object",
@@ -2384,6 +2419,16 @@
           "format": "uint64",
           "minimum": 0
         },
+        "engine_throughput": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EngineThroughputSample"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "instant": {
           "$ref": "#/$defs/InstantMetricSample"
         }
@@ -2654,6 +2699,24 @@
         "killed"
       ]
     },
+    "LastActivitySample": {
+      "description": "The most recent reset-on-publish interval that observed a request. Idle cuts\ncarry this alongside their truthful empty [`InstantMetricSample`] so the dashboard\ncan keep the last useful instantaneous figures visible while explicitly aging them.",
+      "type": "object",
+      "properties": {
+        "at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "instant": {
+          "$ref": "#/$defs/InstantMetricSample"
+        }
+      },
+      "required": [
+        "at_ms",
+        "instant"
+      ]
+    },
     "LoginRequest": {
       "type": "object",
       "properties": {
@@ -2666,9 +2729,19 @@
       ]
     },
     "MetricTick": {
-      "description": "The flat metric-tile shape carried by a `metric_tick` payload — mirrors the\n`/dashboard/api/metrics` REST body (sans cursor). The top level repeats the\n`m1` window's fields (the dashboard's headline tile) and nests all three\nwindows under `windows`.",
+      "description": "The instantaneous metric shape carried by a `metric_tick` payload — mirrors\n`/dashboard/api/metrics` sans cursor. `last_activity` lets an idle client retain\nthe last request-bearing interval without mistaking it for a live sample.",
       "type": "object",
       "properties": {
+        "engine_throughput": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EngineThroughputSample"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "generated_at_ms": {
           "type": "integer",
           "format": "uint128",
@@ -2676,6 +2749,16 @@
         },
         "instant": {
           "$ref": "#/$defs/InstantMetricSample"
+        },
+        "last_activity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastActivitySample"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -2684,9 +2767,20 @@
       ]
     },
     "MetricsSnapshot": {
-      "description": "The full `/api/metrics`-shaped snapshot body (the flat tile + the three\nwindows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live\n[`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.",
+      "description": "The `/api/metrics` snapshot body: the current reset-on-publish interval, optional\nretained request-bearing interval, and `metrics_seq` cursor. Mirrors the frontend\n`MetricsResponse` and the snapshot-time shape of a live metric tick.",
       "type": "object",
       "properties": {
+        "engine_throughput": {
+          "description": "Preferred stats-bar token source when a fresh physical-engine TPOT interval\nwas observed for the current request generation.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EngineThroughputSample"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "generated_at_ms": {
           "type": "integer",
           "format": "uint128",
@@ -2694,6 +2788,17 @@
         },
         "instant": {
           "$ref": "#/$defs/InstantMetricSample"
+        },
+        "last_activity": {
+          "description": "Most recent request-bearing interval. Optional for compatibility with\npre-retention snapshots; absent means no request has been observed yet.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastActivitySample"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "metrics_seq": {
           "type": "integer",

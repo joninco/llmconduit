@@ -47,6 +47,18 @@ export type BackendEngineKind = 'vllm' | 'sglang' | 'unknown';
 export type BackendMetricsStatus = 'warming' | 'fresh' | 'stale' | 'unsupported' | 'error';
 export type BackendMetricsCoverage = 'full' | 'partial';
 
+/**
+ * Per-request output-generation rate derived from inverse mean Prometheus TPOT across
+ * physically distinct backend engines. Logical routes sharing `/metrics` count once.
+ */
+export interface EngineThroughputSample {
+  generated_tokens_per_sec: number;
+  sampled_at_ms: number;
+  measured_sources: number;
+  total_sources: number;
+  coverage: BackendMetricsCoverage;
+}
+
 export interface BackendHistogramSummary {
   samples: number;
   p50?: number | null;
@@ -525,10 +537,20 @@ export interface InstantMetricSample {
   cost_confidence: CostConfidence;
 }
 
+/** Most recent one-second interval that observed an accepted, active, or terminal request. */
+export interface LastActivitySample {
+  at_ms: number;
+  instant: InstantMetricSample;
+}
+
 export interface MetricTickPayload {
   type: 'metric_tick';
   generated_at_ms: number;
   instant: InstantMetricSample;
+  /** Absent until the gateway has observed its first request. */
+  last_activity?: LastActivitySample;
+  /** Preferred output-token source when backend Prometheus TPOT is available. */
+  engine_throughput?: EngineThroughputSample | null;
 }
 
 /**
@@ -874,6 +896,10 @@ export interface MetricsResponse {
   metrics_seq: number;
   generated_at_ms: number;
   instant: InstantMetricSample;
+  /** Retained across empty instantaneous intervals so idle stats survive reloads. */
+  last_activity?: LastActivitySample;
+  /** Physically de-duplicated inverse-TPOT rate retained with the request sample. */
+  engine_throughput?: EngineThroughputSample | null;
 }
 
 export interface TopologyEdge {
@@ -947,6 +973,7 @@ export interface HistoryPoint {
   at_ms: number;
   cursors: SeqCursors;
   instant: InstantMetricSample;
+  engine_throughput?: EngineThroughputSample | null;
 }
 
 export interface HistoryResponse {
@@ -1125,6 +1152,21 @@ function isInstantMetricSample(v: unknown): v is InstantMetricSample {
     isUint(v.latency_overflow_count) &&
     isUint(v.usage_samples) && isNullableNum(v.reported_tokens_per_sec) && isUint(v.usage_anomaly_count) &&
     isUint(v.priced_samples) && isNullableNum(v.cost_per_min) && isCostConfidence(v.cost_confidence)
+  );
+}
+
+function isOptLastActivitySample(v: unknown): boolean {
+  return v === undefined || (
+    isObj(v) && isUint(v.at_ms) && isInstantMetricSample(v.instant)
+  );
+}
+
+function isOptEngineThroughputSample(v: unknown): boolean {
+  return v === undefined || v === null || (
+    isObj(v) && isNum(v.generated_tokens_per_sec) && v.generated_tokens_per_sec >= 0 &&
+    isUint(v.sampled_at_ms) && isUint(v.measured_sources) && isUint(v.total_sources) &&
+    v.measured_sources <= v.total_sources &&
+    isOneOf(v.coverage, ['full', 'partial'] as const)
   );
 }
 
@@ -1311,7 +1353,9 @@ export function isDashboardPayload(v: unknown): v is DashboardPayload {
       );
     case 'metric_tick':
       return (
-        isUint(v.generated_at_ms) && isInstantMetricSample(v.instant)
+        isUint(v.generated_at_ms) && isInstantMetricSample(v.instant) &&
+        isOptLastActivitySample(v.last_activity) &&
+        isOptEngineThroughputSample(v.engine_throughput)
       );
     case 'flow_status':
       return (
@@ -1379,7 +1423,9 @@ function isOptClientSource(v: unknown): boolean {
 export function isMetricsResponse(v: unknown): v is MetricsResponse {
   return (
     isObj(v) && isUint(v.metrics_seq) &&
-    isUint(v.generated_at_ms) && isInstantMetricSample(v.instant)
+    isUint(v.generated_at_ms) && isInstantMetricSample(v.instant) &&
+    isOptLastActivitySample(v.last_activity) &&
+    isOptEngineThroughputSample(v.engine_throughput)
   );
 }
 

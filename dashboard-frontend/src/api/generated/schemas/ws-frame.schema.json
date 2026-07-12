@@ -1510,6 +1510,41 @@
         "monitor"
       ]
     },
+    "EngineThroughputSample": {
+      "description": "Physically de-duplicated per-request output-token throughput from the newest\nsuccessful Prometheus TPOT interval across configured engines. The value is the\ninverse mean `request_time_per_output_token_seconds`; speculative accepted tokens\nare already reflected in that shorter output-token time and are never double-counted.\nOne physical `/metrics` endpoint contributes once even when several logical routes\npoint at it.",
+      "type": "object",
+      "properties": {
+        "coverage": {
+          "$ref": "#/$defs/BackendMetricsCoverage"
+        },
+        "generated_tokens_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "measured_sources": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sampled_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "total_sources": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "generated_tokens_per_sec",
+        "sampled_at_ms",
+        "measured_sources",
+        "total_sources",
+        "coverage"
+      ]
+    },
     "FlowMutationPhase": {
       "description": "Coarse lifecycle phase attached to every authoritative live-flow mutation.\nThe vocabulary is deliberately bounded: usage and all non-terminal enrichment\nare `progress`, while the exactly-once final store mutation is `terminal`.",
       "type": "string",
@@ -1761,10 +1796,38 @@
         "cost_confidence"
       ]
     },
-    "MetricTick": {
-      "description": "The flat metric-tile shape carried by a `metric_tick` payload — mirrors the\n`/dashboard/api/metrics` REST body (sans cursor). The top level repeats the\n`m1` window's fields (the dashboard's headline tile) and nests all three\nwindows under `windows`.",
+    "LastActivitySample": {
+      "description": "The most recent reset-on-publish interval that observed a request. Idle cuts\ncarry this alongside their truthful empty [`InstantMetricSample`] so the dashboard\ncan keep the last useful instantaneous figures visible while explicitly aging them.",
       "type": "object",
       "properties": {
+        "at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "instant": {
+          "$ref": "#/$defs/InstantMetricSample"
+        }
+      },
+      "required": [
+        "at_ms",
+        "instant"
+      ]
+    },
+    "MetricTick": {
+      "description": "The instantaneous metric shape carried by a `metric_tick` payload — mirrors\n`/dashboard/api/metrics` sans cursor. `last_activity` lets an idle client retain\nthe last request-bearing interval without mistaking it for a live sample.",
+      "type": "object",
+      "properties": {
+        "engine_throughput": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EngineThroughputSample"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "generated_at_ms": {
           "type": "integer",
           "format": "uint128",
@@ -1772,6 +1835,16 @@
         },
         "instant": {
           "$ref": "#/$defs/InstantMetricSample"
+        },
+        "last_activity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastActivitySample"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

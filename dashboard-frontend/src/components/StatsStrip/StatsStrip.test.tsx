@@ -45,6 +45,7 @@ function pushMetrics(m: MetricsResponse): void {
 beforeEach(() => resetWorld());
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -61,6 +62,25 @@ describe('StatsStrip — chips', () => {
     expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('7.5');
     // tokens compaction.
     expect(within(getByTestId('chip-reported_tokens_per_sec')).getByTestId('chip-value').textContent).toBe('1.5k');
+  });
+
+  it('uses backend generation counters when present and exposes source plus coverage', () => {
+    const { getByTestId } = renderWithQuery(<StatsStrip />);
+    pushMetrics(metrics(1, {
+      engine_throughput: {
+        generated_tokens_per_sec: 287.5,
+        sampled_at_ms: 900,
+        measured_sources: 1,
+        total_sources: 2,
+        coverage: 'partial',
+      },
+    }));
+    const chip = getByTestId('chip-reported_tokens_per_sec');
+    expect(chip.textContent).toContain('engine gen tok/s');
+    expect(within(chip).getByTestId('chip-value').textContent).toBe('288');
+    expect(chip.getAttribute('data-source')).toBe('engine');
+    expect(chip.getAttribute('data-quality')).toBe('partial');
+    expect(chip.getAttribute('title')).toContain('1/2 physically distinct metrics sources');
   });
 
   it('renders a sparkline per metric and updates from successive MetricTick frames', () => {
@@ -149,6 +169,90 @@ describe('StatsStrip — connection semantics', () => {
 
     act(() => dashboardStore.getState().setConnection('error'));
     expect(getByTestId('connection-state').textContent).toBe('error');
+  });
+});
+
+describe('StatsStrip — instantaneous idle retention', () => {
+  it('shows current instantaneous cuts while active, then freezes the last cut with a counting stale timer', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const { getByTestId } = renderWithQuery(<StatsStrip />);
+    const value = (key: string) => within(getByTestId(`chip-${key}`)).getByTestId('chip-value').textContent;
+
+    const active = win({ accepted_requests: 6, accepted_per_sec: 6.5, active_streams_now: 1 });
+    pushMetrics(metrics(1, {
+      generated_at_ms: 10_000,
+      instant: active,
+      last_activity: { at_ms: 10_000, instant: active },
+    }));
+    expect(value('accepted_per_sec')).toBe('6.5');
+    expect(getByTestId('stats-strip').getAttribute('data-metrics-state')).toBe('instant');
+
+    vi.setSystemTime(11_000);
+    const idle = win({
+      accepted_requests: 0,
+      accepted_per_sec: 0,
+      terminal_requests: 0,
+      terminal_per_sec: 0,
+      successes: 0,
+      failures: 0,
+      failure_pct: null,
+      cancellations: 0,
+      cancellation_pct: null,
+      active_streams_now: 0,
+      latency_samples: 0,
+      p50_ms: null,
+      p95_ms: null,
+      p99_ms: null,
+      p50_quality: 'unavailable',
+      p95_quality: 'unavailable',
+      p99_quality: 'unavailable',
+      usage_samples: 0,
+      reported_tokens_per_sec: null,
+      priced_samples: 0,
+      cost_per_min: null,
+      cost_confidence: 'unavailable',
+    });
+    pushMetrics(metrics(2, {
+      generated_at_ms: 11_000,
+      instant: idle,
+      last_activity: { at_ms: 10_000, instant: active },
+      engine_throughput: {
+        generated_tokens_per_sec: 75,
+        sampled_at_ms: 10_500,
+        measured_sources: 1,
+        total_sources: 1,
+        coverage: 'full',
+      },
+    }));
+
+    // Request-derived values stay on the last instantaneous cut, but the live active count is 0.
+    expect(value('accepted_per_sec')).toBe('6.5');
+    expect(value('active_streams_now')).toBe('0.0');
+    expect(value('reported_tokens_per_sec')).toBe('75.0');
+    expect(getByTestId('chip-reported_tokens_per_sec').textContent).toContain('engine gen tok/s');
+    expect(getByTestId('stats-strip').getAttribute('data-metrics-state')).toBe('stale');
+    expect(getByTestId('chip-accepted_per_sec').getAttribute('data-stale')).toBe('true');
+    expect(getByTestId('stats-strip').firstElementChild).toBe(getByTestId('stats-activity-state'));
+    expect(getByTestId('stats-stale-age').textContent).toBe('00:01');
+
+    act(() => vi.advanceTimersByTime(4_000));
+    expect(getByTestId('stats-stale-age').textContent).toBe('00:05');
+  });
+
+  it('uses an explicit idle/no-request state before any request has been observed', () => {
+    const { getByTestId } = renderWithQuery(<StatsStrip />);
+    pushMetrics(metrics(1, {
+      instant: win({
+        accepted_requests: 0,
+        accepted_per_sec: 0,
+        terminal_requests: 0,
+        terminal_per_sec: 0,
+        active_streams_now: 0,
+      }),
+    }));
+    expect(getByTestId('stats-activity-state').getAttribute('data-state')).toBe('empty');
+    expect(getByTestId('stats-activity-state').textContent).toContain('idle · no request yet');
   });
 });
 

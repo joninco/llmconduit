@@ -35,11 +35,13 @@
 //! The bare `DebugWsMessage` contract on `/debug/ws` (debug_ui.rs) is untouched —
 //! the batched envelope is dashboard-only.
 
+use crate::backend_metrics::EngineThroughputSample;
 use crate::dashboard_flow::DashboardFlowStore;
 use crate::dashboard_flow::FlowMutation;
 use crate::dashboard_flow::FlowMutationPhase;
 use crate::engine::Gateway;
 use crate::metrics::InstantMetricSample;
+use crate::metrics::LastActivitySample;
 use crate::monitor::DebugUpdate;
 use crate::monitor::DebugWsMessage;
 use crate::upstream::ProviderHealthSnapshot;
@@ -55,6 +57,7 @@ use axum::response::Response;
 use futures::SinkExt;
 use futures::StreamExt;
 use futures::stream::SplitSink;
+use serde::Deserialize;
 use serde::Serialize;
 use std::future::Future;
 use std::sync::Arc;
@@ -118,14 +121,22 @@ pub struct SeqCursors {
     pub backend_metrics_seq: u64,
 }
 
-/// The full `/api/metrics`-shaped snapshot body (the flat tile + the three
-/// windows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live
-/// [`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+/// The `/api/metrics` snapshot body: the current reset-on-publish interval, optional
+/// retained request-bearing interval, and `metrics_seq` cursor. Mirrors the frontend
+/// `MetricsResponse` and the snapshot-time shape of a live metric tick.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MetricsSnapshot {
     pub metrics_seq: u64,
     pub generated_at_ms: u128,
     pub instant: InstantMetricSample,
+    /// Most recent request-bearing interval. Optional for compatibility with
+    /// pre-retention snapshots; absent means no request has been observed yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<LastActivitySample>,
+    /// Preferred stats-bar token source when a fresh physical-engine TPOT interval
+    /// was observed for the current request generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_throughput: Option<EngineThroughputSample>,
 }
 
 /// The full `/api/topology`-shaped snapshot body (nodes + edges + the price table)
@@ -248,14 +259,17 @@ pub enum DashboardPayload {
     },
 }
 
-/// The flat metric-tile shape carried by a `metric_tick` payload — mirrors the
-/// `/dashboard/api/metrics` REST body (sans cursor). The top level repeats the
-/// `m1` window's fields (the dashboard's headline tile) and nests all three
-/// windows under `windows`.
-#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+/// The instantaneous metric shape carried by a `metric_tick` payload — mirrors
+/// `/dashboard/api/metrics` sans cursor. `last_activity` lets an idle client retain
+/// the last request-bearing interval without mistaking it for a live sample.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MetricTick {
     pub generated_at_ms: u128,
     pub instant: InstantMetricSample,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<LastActivitySample>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_throughput: Option<EngineThroughputSample>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, schemars::JsonSchema)]
@@ -493,19 +507,14 @@ fn next_metrics_cursor(view_seq: u64, last_emitted: u64) -> u64 {
     view_seq.max(last_emitted.saturating_add(1))
 }
 
-/// Build a metrics-domain `MetricTick` frame from a collapsed [`MetricsView`]
-/// (D5), the live open-flow `active_streams` count, and the price table.
-///
-/// Gap 01: the live tick is built from the SAME [`crate::dashboard_api::metrics_body`]
-/// the REST `/dashboard/api/metrics` read uses — ONE honest computation for both
-/// surfaces — so `active_streams`, `tokens_per_sec`, `cost_per_min`, and the TRUE
-/// per-second `reqs_per_sec` carry real values on the live wire (previously this path
-/// hard-coded `active_streams`/`tokens_per_sec`/`cost_per_min` to `0.0` and shipped raw
-/// counts as `reqs_per_sec`, so the strip read all-`0` once it folded a WS tick even
-/// while real traffic streamed). The single-CAS terminal feed stays idempotent; this
-/// only changes how the already-recorded view is collapsed for the wire.
+/// Build a metrics-domain `MetricTick` from the exact process-published interval used
+/// by REST, including the retained idle sample and optional physical-engine token rate.
+/// No metric is recomputed on the socket path, so reconnects cannot change its source
+/// or presentation independently of `/dashboard/api/metrics`.
 pub fn metric_tick_frame(
     instant: &InstantMetricSample,
+    last_activity: Option<&LastActivitySample>,
+    engine_throughput: Option<&EngineThroughputSample>,
     generated_at_ms: u128,
     seq: u64,
 ) -> DashboardFrame {
@@ -515,6 +524,8 @@ pub fn metric_tick_frame(
         batch: vec![DashboardPayload::MetricTick(Box::new(MetricTick {
             generated_at_ms,
             instant: instant.clone(),
+            last_activity: last_activity.cloned(),
+            engine_throughput: engine_throughput.cloned(),
         }))],
     }
 }
@@ -548,20 +559,23 @@ pub fn topology_frame(snapshot: &ProviderHealthSnapshot) -> DashboardFrame {
     }
 }
 
-/// Build the metrics half of the initial [`SnapshotMessage`] from a collapsed
-/// [`MetricsView`] (D5) + its `metrics_seq` + the live open-flow `active_streams`
-/// count + the price table. Same flat tile + three windows as a live
-/// [`DashboardPayload::MetricTick`], with the cursor attached — and built by the SAME
-/// [`crate::dashboard_api::metrics_body`] the REST read and the live tick use (gap 01),
-/// so the initial snapshot's strip is honest from the first frame (real
-/// `active_streams`/`tokens_per_sec`/`cost_per_min`/true rates), not a raw-count/`0.0`
-/// placeholder the SPA would render before the first live tick.
+/// Build the metrics half of the initial [`SnapshotMessage`] from the same instantaneous
+/// cut and retained activity sample used by REST and live ticks. Sharing
+/// [`crate::dashboard_api::metrics_body`] keeps the strip honest from its first frame.
 fn metrics_snapshot(
     instant: &InstantMetricSample,
+    last_activity: Option<&LastActivitySample>,
+    engine_throughput: Option<&EngineThroughputSample>,
     generated_at_ms: u128,
     metrics_seq: u64,
 ) -> MetricsSnapshot {
-    crate::dashboard_api::metrics_body(instant, generated_at_ms, metrics_seq)
+    crate::dashboard_api::metrics_body(
+        instant,
+        last_activity,
+        engine_throughput,
+        generated_at_ms,
+        metrics_seq,
+    )
 }
 
 /// Build the topology half of the initial [`SnapshotMessage`] from a D4
@@ -714,6 +728,8 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
         (
             Some(metrics_snapshot(
                 &cut.instant,
+                cut.last_activity.as_ref(),
+                cut.engine_throughput.as_ref(),
                 cut.taken_at_ms,
                 cut.cursors.metrics_seq,
             )),
@@ -842,6 +858,8 @@ async fn dashboard_socket(socket: WebSocket, gateway: Arc<Gateway>, session_exp:
                 };
                 let frame = metric_tick_frame(
                     &cut.instant,
+                    cut.last_activity.as_ref(),
+                    cut.engine_throughput.as_ref(),
                     cut.taken_at_ms,
                     cut.cursors.metrics_seq,
                 );
@@ -1581,16 +1599,59 @@ mod tests {
     /// types are byte-shape-exact.)
     #[test]
     fn metric_tick_frame_matches_golden_fixture_shape() {
-        let frame = metric_tick_frame(&crate::metrics::InstantMetricSample::bootstrap(3), 1_000, 2);
+        let instant = crate::metrics::InstantMetricSample::bootstrap(3);
+        let last_activity = crate::metrics::LastActivitySample {
+            at_ms: 900,
+            instant: instant.clone(),
+        };
+        let engine_throughput = EngineThroughputSample {
+            generated_tokens_per_sec: 12.5,
+            sampled_at_ms: 950,
+            measured_sources: 1,
+            total_sources: 1,
+            coverage: crate::backend_metrics::BackendMetricsCoverage::Full,
+        };
+        let frame = metric_tick_frame(
+            &instant,
+            Some(&last_activity),
+            Some(&engine_throughput),
+            1_000,
+            2,
+        );
         let got: serde_json::Value = serde_json::to_value(&frame).expect("serialize");
         assert_eq!(got["domain"], "metrics");
         assert_eq!(got["seq"], 2);
         let payload = &got["batch"][0];
         assert_eq!(payload["type"], "metric_tick");
         assert_eq!(payload["instant"]["active_streams_now"], 3);
+        assert_eq!(payload["last_activity"]["at_ms"], 900);
+        assert_eq!(
+            payload["engine_throughput"]["generated_tokens_per_sec"],
+            12.5
+        );
         assert!(payload.get("reqs_per_sec").is_none());
         assert!(payload.get("windows").is_none());
         assert!(payload["instant"]["p95_ms"].is_null());
+
+        // The additive field round-trips on the live payload DTO; omission remains
+        // compatible with a pre-retention sender via `serde(default)`.
+        let decoded: MetricTick = serde_json::from_value(payload.clone()).unwrap();
+        assert_eq!(
+            decoded.last_activity.as_ref().map(|sample| sample.at_ms),
+            Some(900)
+        );
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap()["last_activity"]["at_ms"],
+            900
+        );
+        assert_eq!(decoded.engine_throughput, Some(engine_throughput));
+        let legacy: MetricTick = serde_json::from_value(serde_json::json!({
+            "generated_at_ms": 1_000,
+            "instant": instant,
+        }))
+        .unwrap();
+        assert!(legacy.last_activity.is_none());
+        assert!(legacy.engine_throughput.is_none());
     }
 
     /// Gap 01 finding 1: the metrics-domain cursor stays STRICTLY MONOTONIC across both
@@ -1782,6 +1843,8 @@ mod tests {
 
         let metrics = Some(metrics_snapshot(
             &crate::metrics::InstantMetricSample::default(),
+            None,
+            None,
             1_000,
             7,
         ));

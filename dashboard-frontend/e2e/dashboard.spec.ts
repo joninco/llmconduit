@@ -39,15 +39,18 @@ test.describe('Argus dashboard', () => {
       expect(text, `${key} reads a real number`).toMatch(/[1-9]/);
     }
 
-    // Gap 01 finding 4: every chip exposes its data-quality provenance. The mock window
-    // is fully measured, so directly-counted metrics read `measured`, sample-derived ones
-    // `derived`, and the priced cost `estimated` (labelled as such, per the plan).
+    // Every chip exposes provenance. The counter-backed token source is deliberately
+    // 1/2 physical engines in the mock, so it must be visibly PARTIAL rather than
+    // inheriting the response-usage window's `derived` tag.
     const quality = (key: string) => page.getByTestId(`chip-${key}`).getAttribute('data-quality');
     expect(await quality('accepted_per_sec')).toBe('measured');
     expect(await quality('active_streams_now')).toBe('measured');
     expect(await quality('p50_ms')).toBe('derived');
-    expect(await quality('reported_tokens_per_sec')).toBe('derived');
+    expect(await quality('reported_tokens_per_sec')).toBe('partial');
     expect(await quality('cost_per_min')).toBe('estimated');
+    const tokenChip = page.getByTestId('chip-reported_tokens_per_sec');
+    await expect(tokenChip).toContainText('engine gen tok/s');
+    expect(await tokenChip.getAttribute('data-source')).toBe('engine');
 
     expect(consoleErrors, 'console errors on the stats strip').toEqual([]);
   });

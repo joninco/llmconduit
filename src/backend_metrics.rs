@@ -122,6 +122,21 @@ pub enum BackendMetricsCoverage {
     Partial,
 }
 
+/// Physically de-duplicated per-request output-token throughput from the newest
+/// successful Prometheus TPOT interval across configured engines. The value is the
+/// inverse mean `request_time_per_output_token_seconds`; speculative accepted tokens
+/// are already reflected in that shorter output-token time and are never double-counted.
+/// One physical `/metrics` endpoint contributes once even when several logical routes
+/// point at it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct EngineThroughputSample {
+    pub generated_tokens_per_sec: f64,
+    pub sampled_at_ms: u128,
+    pub measured_sources: u64,
+    pub total_sources: u64,
+    pub coverage: BackendMetricsCoverage,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct BackendInstantMetrics {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -232,6 +247,10 @@ pub struct BackendMetricsSnapshot {
     pub generated_at_ms: u128,
     pub providers: BTreeMap<LogicalProviderKey, BackendProviderMetrics>,
     pub overflow_count: u64,
+    /// Latest inverse-mean per-request TPOT, aggregated before logical-provider
+    /// fan-out so aliases cannot double count one engine.
+    #[serde(default)]
+    pub engine_throughput: Option<EngineThroughputSample>,
 }
 
 impl BackendMetricsSnapshot {
@@ -409,6 +428,89 @@ struct EndpointState {
     intervals_1m: VecDeque<(tokio::time::Instant, IntervalMetrics)>,
     pending_minute: Option<(tokio::time::Instant, IntervalMetrics)>,
     reported_status: Option<BackendMetricsStatus>,
+}
+
+#[derive(Debug)]
+struct EngineThroughputAccumulator {
+    tpot_seconds_sum: f64,
+    tpot_observations: f64,
+    sampled_at_ms: Option<u128>,
+    measured_sources: u64,
+    total_sources: u64,
+}
+
+impl Default for EngineThroughputAccumulator {
+    fn default() -> Self {
+        Self {
+            tpot_seconds_sum: 0.0,
+            tpot_observations: 0.0,
+            sampled_at_ms: None,
+            measured_sources: 0,
+            total_sources: 0,
+        }
+    }
+}
+
+impl EngineThroughputAccumulator {
+    fn observe(&mut self, state: &EndpointState, metrics: &BackendProviderMetrics) {
+        self.total_sources = self.total_sources.saturating_add(1);
+        if metrics.status != BackendMetricsStatus::Fresh {
+            return;
+        }
+        let Some((_, interval)) = state.intervals_5s.back() else {
+            return;
+        };
+        let Some(tpot_seconds_sum) = interval.counters.get("request_tpot_seconds_sum").copied()
+        else {
+            return;
+        };
+        let Some(tpot_observations) = interval.counters.get("request_tpot_observations").copied()
+        else {
+            return;
+        };
+        let Some(sampled_at_ms) = state.last_success_ms else {
+            return;
+        };
+        if !tpot_seconds_sum.is_finite()
+            || !tpot_observations.is_finite()
+            || tpot_seconds_sum <= 0.0
+            || tpot_observations <= 0.0
+        {
+            return;
+        }
+        self.tpot_seconds_sum += tpot_seconds_sum;
+        self.tpot_observations += tpot_observations;
+        self.measured_sources = self.measured_sources.saturating_add(1);
+        // The aggregate is only as fresh as its oldest contributing source.
+        self.sampled_at_ms = Some(
+            self.sampled_at_ms
+                .map_or(sampled_at_ms, |oldest| oldest.min(sampled_at_ms)),
+        );
+    }
+
+    fn finish(self) -> Option<EngineThroughputSample> {
+        let sampled_at_ms = self.sampled_at_ms?;
+        let generated_tokens_per_sec = self.tpot_observations / self.tpot_seconds_sum;
+        if !generated_tokens_per_sec.is_finite() || generated_tokens_per_sec < 0.0 {
+            return None;
+        }
+        Some(EngineThroughputSample {
+            generated_tokens_per_sec,
+            sampled_at_ms,
+            measured_sources: self.measured_sources,
+            total_sources: self.total_sources,
+            // Coverage is specific to this rate: a source counts as measured only
+            // when its fresh interval contains at least one completed TPOT observation.
+            // The provider-wide coverage flag also reflects unrelated metric families
+            // (and is always partial for SGLang), so folding it in would understate an
+            // otherwise complete TPOT aggregate.
+            coverage: if self.measured_sources == self.total_sources {
+                BackendMetricsCoverage::Full
+            } else {
+                BackendMetricsCoverage::Partial
+            },
+        })
+    }
 }
 
 impl EndpointState {
@@ -593,8 +695,10 @@ pub fn spawn_backend_metrics_collector(
             }
             let now = tokio::time::Instant::now();
             let mut providers = BTreeMap::new();
+            let mut throughput = EngineThroughputAccumulator::default();
             for state in states.values_mut() {
                 let metrics = state.logical_metrics(now);
+                throughput.observe(state, &metrics);
                 if state.reported_status != Some(metrics.status) {
                     match metrics.status {
                         BackendMetricsStatus::Fresh => {
@@ -624,6 +728,7 @@ pub fn spawn_backend_metrics_collector(
                 generated_at_ms: now_ms(),
                 providers,
                 overflow_count,
+                engine_throughput: throughput.finish(),
             });
         }
     }))
@@ -676,18 +781,46 @@ async fn scrape_target_inner(
     parse_metrics(&bytes)
 }
 
+/// Preserve the TPOT histogram's exact sum/count through `prometheus-parse`, which
+/// otherwise keeps only its buckets. Aliases use `\w` exclusively because that parser
+/// rejects the `:` accepted by Prometheus and used by vLLM/SGLang.
+fn normalize_exposition_line(line: &str) -> String {
+    let mut normalized = line.replace("vllm:", "vllm_").replace("sglang:", "sglang_");
+    let metric_end = normalized
+        .find(|ch: char| ch == '{' || ch.is_ascii_whitespace())
+        .unwrap_or(normalized.len());
+    let alias = match &normalized[..metric_end] {
+        "vllm_request_time_per_output_token_seconds_sum"
+        | "vllm_time_per_output_token_seconds_sum"
+        | "sglang_time_per_output_token_seconds_sum" => Some("llmconduit_request_tpot_seconds_sum"),
+        "vllm_request_time_per_output_token_seconds_count"
+        | "vllm_time_per_output_token_seconds_count"
+        | "sglang_time_per_output_token_seconds_count" => {
+            Some("llmconduit_request_tpot_observations")
+        }
+        _ => None,
+    };
+    if let Some(alias) = alias {
+        normalized.replace_range(..metric_end, alias);
+    }
+    normalized
+}
+
 fn parse_metrics(body: &[u8]) -> Result<ParsedMetrics, ScrapeErrorClass> {
     let text = std::str::from_utf8(body).map_err(|_| ScrapeErrorClass::Parse)?;
     if text.lines().count() > SAMPLE_LIMIT.saturating_mul(4) {
         return Err(ScrapeErrorClass::Parse);
     }
     // prometheus-parse 0.2.5 accepts only `\w` metric names even though the
-    // Prometheus grammar (and both engines) permits `:`. Normalize the two
-    // explicitly-supported namespaces before parsing, then restore them. This
-    // keeps exposition parsing in the crate while avoiding an ad-hoc parser.
-    let mut scrape = Scrape::parse(text.lines().map(|line| {
-        Ok::<_, io::Error>(line.replace("vllm:", "vllm_").replace("sglang:", "sglang_"))
-    }))
+    // Prometheus grammar (and both engines) permits `:`. It also intentionally drops
+    // histogram `_sum`/`_count` samples. Normalize the namespaces and rename only the
+    // TPOT components to untyped synthetic metrics before parsing, then restore the
+    // engine namespaces. The crate still owns numeric/label parsing; this shim merely
+    // prevents the two exact samples needed for inverse-mean TPOT from being discarded.
+    let mut scrape = Scrape::parse(
+        text.lines()
+            .map(|line| Ok::<_, io::Error>(normalize_exposition_line(line))),
+    )
     .map_err(|_| ScrapeErrorClass::Parse)?;
     for sample in &mut scrape.samples {
         if let Some(rest) = sample.metric.strip_prefix("vllm_") {
@@ -767,6 +900,12 @@ fn parse_metrics(body: &[u8]) -> Result<ParsedMetrics, ScrapeErrorClass> {
             }
             "vllm:generation_tokens_total" | "sglang:generation_tokens_total" => {
                 add_counter(&mut parsed.counters, "generated", scalar)
+            }
+            "llmconduit_request_tpot_seconds_sum" => {
+                add_counter(&mut parsed.counters, "request_tpot_seconds_sum", scalar)
+            }
+            "llmconduit_request_tpot_observations" => {
+                add_counter(&mut parsed.counters, "request_tpot_observations", scalar)
             }
             "vllm:prefix_cache_queries"
             | "vllm:gpu_prefix_cache_queries"
@@ -1073,6 +1212,11 @@ vllm:kv_cache_usage_perc{engine="0"} 0.5
 vllm:kv_cache_usage_perc{engine="1"} 0.75
 # TYPE vllm:generation_tokens_total counter
 vllm:generation_tokens_total 100
+# TYPE vllm:request_time_per_output_token_seconds histogram
+vllm:request_time_per_output_token_seconds_bucket{le="0.01"} 1
+vllm:request_time_per_output_token_seconds_bucket{le="+Inf"} 1
+vllm:request_time_per_output_token_seconds_sum{engine="0",model_name="a"} 0.006666666666666667
+vllm:request_time_per_output_token_seconds_count{engine="0",model_name="a"} 1
 # TYPE vllm:time_to_first_token_seconds histogram
 vllm:time_to_first_token_seconds_bucket{le="0.1"} 5
 vllm:time_to_first_token_seconds_bucket{le="0.5"} 10
@@ -1087,6 +1231,12 @@ vllm:time_to_first_token_seconds_count 10
         assert_eq!(parsed.instant.running_requests, Some(3.0));
         assert_eq!(parsed.instant.kv_cache_utilization, Some(0.75));
         assert_eq!(parsed.counters.get("generated"), Some(&100.0));
+        assert_eq!(
+            parsed.counters.get("request_tpot_seconds_sum"),
+            Some(&0.006666666666666667)
+        );
+        assert_eq!(parsed.counters.get("request_tpot_observations"), Some(&1.0));
+        assert_eq!(parsed.histograms["tpot"].buckets[&OrderedF64(0.01)], 1.0);
         assert_eq!(parsed.histograms["ttft"].buckets[&OrderedF64(0.5)], 10.0);
     }
 
@@ -1103,6 +1253,22 @@ vllm:time_to_first_token_seconds_count 10
         let first = parse_metrics(VLLM.as_bytes()).unwrap();
         let second_text = VLLM
             .replace("generation_tokens_total 100", "generation_tokens_total 140")
+            .replace(
+                "request_time_per_output_token_seconds_bucket{le=\"0.01\"} 1",
+                "request_time_per_output_token_seconds_bucket{le=\"0.01\"} 2",
+            )
+            .replace(
+                "request_time_per_output_token_seconds_bucket{le=\"+Inf\"} 1",
+                "request_time_per_output_token_seconds_bucket{le=\"+Inf\"} 2",
+            )
+            .replace(
+                "request_time_per_output_token_seconds_sum{engine=\"0\",model_name=\"a\"} 0.006666666666666667",
+                "request_time_per_output_token_seconds_sum{engine=\"0\",model_name=\"a\"} 0.013333333333333334",
+            )
+            .replace(
+                "request_time_per_output_token_seconds_count{engine=\"0\",model_name=\"a\"} 1",
+                "request_time_per_output_token_seconds_count{engine=\"0\",model_name=\"a\"} 2",
+            )
             .replace("bucket{le=\"0.1\"} 5", "bucket{le=\"0.1\"} 7")
             .replace("bucket{le=\"0.5\"} 10", "bucket{le=\"0.5\"} 14")
             .replace("bucket{le=\"+Inf\"} 10", "bucket{le=\"+Inf\"} 14");
@@ -1110,6 +1276,9 @@ vllm:time_to_first_token_seconds_count 10
         let interval = interval_delta(&first, &second, Duration::from_secs(5));
         let window = window_from_intervals(std::iter::once(&interval));
         assert_eq!(window.generated_tokens_per_sec, Some(8.0));
+        let tpot_rate = interval.counters["request_tpot_observations"]
+            / interval.counters["request_tpot_seconds_sum"];
+        assert!((tpot_rate - 150.0).abs() < 1e-9);
         assert!(window.histograms.ttft_ms.unwrap().p95.unwrap() <= 500.0);
     }
 
@@ -1125,6 +1294,130 @@ vllm:time_to_first_token_seconds_count 10
                 .generated_tokens_per_sec
                 .is_none()
         );
+    }
+
+    #[test]
+    fn parses_sglang_tpot_sum_and_count_aliases() {
+        let parsed = parse_metrics(
+            br#"
+# TYPE sglang:time_per_output_token_seconds histogram
+sglang:time_per_output_token_seconds_bucket{le="0.01"} 3
+sglang:time_per_output_token_seconds_bucket{le="+Inf"} 3
+sglang:time_per_output_token_seconds_sum 0.02
+sglang:time_per_output_token_seconds_count 3
+"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.engine, BackendEngineKind::Sglang);
+        assert_eq!(parsed.counters["request_tpot_seconds_sum"], 0.02);
+        assert_eq!(parsed.counters["request_tpot_observations"], 3.0);
+    }
+
+    fn endpoint_with_tpot_interval(
+        rate: f64,
+        observations: u64,
+        coverage: BackendMetricsCoverage,
+        sampled_at_ms: u128,
+        aliases: usize,
+    ) -> EndpointState {
+        let client = Client::new();
+        let url: Url = "http://localhost:8000/metrics".parse().unwrap();
+        let targets = (0..aliases)
+            .map(|index| {
+                BackendMetricsTarget::new(
+                    Some(format!("route-{index}")),
+                    "shared-engine".to_string(),
+                    url.clone(),
+                    client.clone(),
+                    None,
+                )
+            })
+            .collect();
+        let now = tokio::time::Instant::now();
+        let mut state = EndpointState::new(targets);
+        state.parsed = Some(ParsedMetrics {
+            engine: BackendEngineKind::Vllm,
+            coverage,
+            instant: BackendInstantMetrics::default(),
+            process_start: Some(1.0),
+            counters: BTreeMap::new(),
+            finish_reasons: BTreeMap::new(),
+            histograms: BTreeMap::new(),
+        });
+        state.last_success_at = Some(now);
+        state.last_success_ms = Some(sampled_at_ms);
+        state.intervals_5s.push_back((
+            now,
+            IntervalMetrics {
+                duration_secs: 5.0,
+                counters: BTreeMap::from([
+                    (
+                        "request_tpot_seconds_sum".to_string(),
+                        observations as f64 / rate,
+                    ),
+                    ("request_tpot_observations".to_string(), observations as f64),
+                ]),
+                ..Default::default()
+            },
+        ));
+        state
+    }
+
+    #[test]
+    fn engine_throughput_counts_each_physical_endpoint_once_before_alias_fanout() {
+        let shared = endpoint_with_tpot_interval(150.0, 2, BackendMetricsCoverage::Full, 12_000, 2);
+        let now = tokio::time::Instant::now();
+        let metrics = shared.logical_metrics(now);
+        let mut aggregate = EngineThroughputAccumulator::default();
+        // One observation represents the collector's physical-state loop; the two
+        // logical targets are fanned out only after this aggregation seam.
+        aggregate.observe(&shared, &metrics);
+        let sample = aggregate.finish().expect("TPOT interval is measurable");
+        assert!((sample.generated_tokens_per_sec - 150.0).abs() < 1e-9);
+        assert_eq!(sample.measured_sources, 1);
+        assert_eq!(sample.total_sources, 1);
+        assert_eq!(sample.coverage, BackendMetricsCoverage::Full);
+    }
+
+    #[test]
+    fn engine_throughput_uses_tpot_not_idle_time_in_the_scrape_interval() {
+        let mut state =
+            endpoint_with_tpot_interval(149.011, 1, BackendMetricsCoverage::Full, 12_000, 1);
+        let interval = &mut state.intervals_5s.back_mut().unwrap().1;
+        interval.duration_secs = 6.0;
+        interval.counters.insert("generated".to_string(), 256.0);
+        let now = tokio::time::Instant::now();
+        let mut aggregate = EngineThroughputAccumulator::default();
+        aggregate.observe(&state, &state.logical_metrics(now));
+        let sample = aggregate.finish().expect("TPOT interval is measurable");
+        assert!((sample.generated_tokens_per_sec - 149.011).abs() < 1e-9);
+        assert!(
+            (sample.generated_tokens_per_sec - (256.0 / 6.0)).abs() > 100.0,
+            "scrape-window idle time must not dilute active decode throughput"
+        );
+    }
+
+    #[test]
+    fn engine_throughput_combines_tpot_observations_and_marks_incomplete_coverage() {
+        let full = endpoint_with_tpot_interval(150.0, 2, BackendMetricsCoverage::Full, 12_000, 1);
+        let partial =
+            endpoint_with_tpot_interval(100.0, 1, BackendMetricsCoverage::Partial, 11_500, 1);
+        let mut unavailable =
+            endpoint_with_tpot_interval(99.0, 1, BackendMetricsCoverage::Full, 11_000, 1);
+        let now = tokio::time::Instant::now();
+        unavailable.last_success_at = Some(now - STALE_AFTER - Duration::from_secs(1));
+
+        let mut aggregate = EngineThroughputAccumulator::default();
+        for state in [&full, &partial, &unavailable] {
+            aggregate.observe(state, &state.logical_metrics(now));
+        }
+        let sample = aggregate.finish().expect("two sources are measurable");
+        let expected = 3.0 / (2.0 / 150.0 + 1.0 / 100.0);
+        assert!((sample.generated_tokens_per_sec - expected).abs() < 1e-9);
+        assert_eq!(sample.sampled_at_ms, 11_500);
+        assert_eq!(sample.measured_sources, 2);
+        assert_eq!(sample.total_sources, 3);
+        assert_eq!(sample.coverage, BackendMetricsCoverage::Partial);
     }
 
     #[tokio::test]

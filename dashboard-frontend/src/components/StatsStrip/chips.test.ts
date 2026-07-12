@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import type { InstantMetricSample } from '../../api/types';
+import type { EngineThroughputSample, InstantMetricSample } from '../../api/types';
 import { CHIP_METRICS, deriveChips, deltaGlyph, ERROR_PCT_THRESHOLD } from './chips';
 
 function win(over: Partial<InstantMetricSample> = {}): InstantMetricSample {
@@ -20,6 +20,17 @@ function win(over: Partial<InstantMetricSample> = {}): InstantMetricSample {
     usage_samples: latency_samples,
     priced_samples: latency_samples,
     cost_confidence: 'estimated',
+    ...over,
+  };
+}
+
+function engine(over: Partial<EngineThroughputSample> = {}): EngineThroughputSample {
+  return {
+    generated_tokens_per_sec: 321.4,
+    sampled_at_ms: 10_000,
+    measured_sources: 2,
+    total_sources: 2,
+    coverage: 'full',
     ...over,
   };
 }
@@ -45,6 +56,46 @@ describe('chips', () => {
     const byKey = Object.fromEntries(tiny.map((chip) => [chip.key, chip.value]));
     expect(byKey.accepted_per_sec).toBe('0.0011');
     expect(byKey.reported_tokens_per_sec).toBe('31.1');
+  });
+
+  it('prefers physically de-duplicated engine generation throughput and labels the source', () => {
+    const chip = deriveChips(
+      win({ usage_samples: 0, reported_tokens_per_sec: null }),
+      null,
+      engine(),
+    ).find((candidate) => candidate.key === 'reported_tokens_per_sec')!;
+    expect(chip.label).toBe('engine gen tok/s');
+    expect(chip.value).toBe('321');
+    expect(chip.source).toBe('engine');
+    expect(chip.quality).toBe('derived');
+    expect(chip.details).toContain('2/2 physically distinct metrics sources');
+    expect(chip.details).toContain('inverse mean per-request time-per-output-token');
+    expect(chip.details).toContain('output tokens only');
+    expect(chip.details).toContain('speculative accepted tokens are already reflected');
+  });
+
+  it('marks incomplete engine coverage partial and preserves a measured zero', () => {
+    const chip = deriveChips(
+      win(),
+      null,
+      engine({ generated_tokens_per_sec: 0, measured_sources: 1, total_sources: 3, coverage: 'partial' }),
+    ).find((candidate) => candidate.key === 'reported_tokens_per_sec')!;
+    expect(chip.value).toBe('0.0');
+    expect(chip.quality).toBe('partial');
+  });
+
+  it('falls back to reported response usage when no engine interval is available', () => {
+    const chip = deriveChips(win({ reported_tokens_per_sec: 142 }), null)
+      .find((candidate) => candidate.key === 'reported_tokens_per_sec')!;
+    expect(chip.label).toBe('reported tok/s');
+    expect(chip.value).toBe('142');
+    expect(chip.source).toBe('reported');
+  });
+
+  it('compares engine deltas only with the preceding engine interval', () => {
+    const chip = deriveChips(win(), win(), engine({ generated_tokens_per_sec: 20 }), engine({ generated_tokens_per_sec: 10 }))
+      .find((candidate) => candidate.key === 'reported_tokens_per_sec')!;
+    expect(chip.delta).toBe('up');
   });
 
   it('renders "—" for every chip when there is no sample', () => {

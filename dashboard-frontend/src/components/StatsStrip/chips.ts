@@ -5,9 +5,9 @@
  * DOM-free so it is unit-testable and the component stays a thin renderer. Formatting reuses the
  * flow-table formatters where they fit (tokens), and adds small local ones for rates/latency/%.
  */
-import type { CostConfidence, InstantMetricSample } from '../../api/types';
+import type { CostConfidence, EngineThroughputSample, InstantMetricSample } from '../../api/types';
 import { colors } from '../../design/tokens';
-import { metricUnavailable, type MetricKey } from './metricHistory';
+import { metricUnavailable, type MetricKey, type MetricSource } from './metricHistory';
 
 /** Error-% threshold above which the err chip turns red (spec: "red above threshold"). */
 export const ERROR_PCT_THRESHOLD = 5;
@@ -20,7 +20,7 @@ export type DeltaDir = 'up' | 'down' | 'flat';
  * via `data-quality` + an ARIA/title hint on the chip so operators can tell a directly
  * counted value from a derived/estimated one from an honest gap:
  *  - `measured`     — directly counted off the live gateway (`req/s`, `active_streams`).
- *  - `derived`      — computed from finalized-flow samples (err%, p50/p95/p99, tok/s).
+ *  - `derived`      — computed from samples/counter deltas (err%, p50/p95/p99, tok/s).
  *  - `estimated`    — priced via the configured price table, i.e. a modelled estimate
  *                     ($/min). MUST be surfaced as such (the plan calls this out).
  *  - `unavailable`  — not measurable in this window; the value renders `—`, never `0`.
@@ -43,10 +43,17 @@ export interface ChipDescriptor {
    * the value is `—`; otherwise the metric's intrinsic tier (measured/derived/estimated).
    */
   quality: MetricQuality;
+  /** The telemetry seam supplying this value; exposed in the DOM and tooltip. */
+  source: MetricSource;
   /** uPlot stroke as hex for the sparkline (mirrors `stroke`, kept explicit for clarity). */
   sparkStroke: string;
   /** Accessible formula, coverage, sample count, and approximation summary. */
   details: string;
+}
+
+function engineThroughputDetails(sample: EngineThroughputSample): string {
+  const sources = `${sample.measured_sources}/${sample.total_sources} physically distinct metrics sources`;
+  return `inverse mean per-request time-per-output-token (TPOT) from the latest backend Prometheus interval; ${sources}; ${sample.coverage} coverage; output tokens only; speculative accepted tokens are already reflected in TPOT; may include traffic sent directly to the engine; sampled at ${sample.sampled_at_ms}`;
 }
 
 function metricDetails(window: InstantMetricSample | null, key: MetricKey): string {
@@ -177,12 +184,22 @@ export const CHIP_METRICS: readonly MetricKey[] = METRIC_SPECS.map((s) => s.key)
  * `req/s` (a genuine idle `0`) and `active_streams` (the live open count) are never gated.
  * Every chip also carries a `quality` provenance tag (measured/derived/estimated/unavailable).
  */
-export function deriveChips(cur: InstantMetricSample | null, prev: InstantMetricSample | null): ChipDescriptor[] {
+export function deriveChips(
+  cur: InstantMetricSample | null,
+  prev: InstantMetricSample | null,
+  engineThroughput: EngineThroughputSample | null = null,
+  previousEngineThroughput: EngineThroughputSample | null = null,
+): ChipDescriptor[] {
   return METRIC_SPECS.map((spec): ChipDescriptor => {
+    const useEngine = spec.key === 'reported_tokens_per_sec' && engineThroughput !== null;
     // Unmeasurable when there is no window, or this metric's own denominator is 0.
-    const unavailable = metricUnavailable(cur, spec.key);
-    const currentValue = cur?.[spec.key] ?? null;
-    const previousValue = prev?.[spec.key] ?? undefined;
+    const unavailable = useEngine ? false : metricUnavailable(cur, spec.key);
+    const currentValue = useEngine
+      ? engineThroughput.generated_tokens_per_sec
+      : cur?.[spec.key] ?? null;
+    const previousValue = useEngine
+      ? previousEngineThroughput?.generated_tokens_per_sec
+      : prev?.[spec.key] ?? undefined;
     const value = unavailable || currentValue === null ? UNAVAILABLE : spec.fmt(currentValue);
     // The err% chip turns red ABOVE the threshold — but only when it is actually MEASURED
     // (an unavailable err% carries no threshold accent); others keep their static accent.
@@ -190,7 +207,9 @@ export function deriveChips(cur: InstantMetricSample | null, prev: InstantMetric
       !unavailable && cur && spec.key === 'failure_pct' && cur.failure_pct !== null && cur.failure_pct > ERROR_PCT_THRESHOLD ? 'down' : spec.accent;
     // No trend direction for an unavailable value, nor across the genuine→unavailable boundary
     // (the previous sample being unavailable for THIS metric makes the delta meaningless).
-    const prevUnavailable = metricUnavailable(prev, spec.key);
+    const prevUnavailable = useEngine
+      ? previousEngineThroughput === null
+      : metricUnavailable(prev, spec.key);
     const delta = !unavailable && currentValue !== null && !prevUnavailable
       ? deltaDir(currentValue, previousValue ?? undefined)
       : 'flat';
@@ -207,6 +226,8 @@ export function deriveChips(cur: InstantMetricSample | null, prev: InstantMetric
       : null;
     const quality: MetricQuality = unavailable
       ? 'unavailable'
+      : useEngine && engineThroughput.coverage === 'partial'
+        ? 'partial'
       : percentileQuality === 'partial'
         ? 'partial'
       : spec.key === 'cost_per_min' && cur
@@ -214,14 +235,15 @@ export function deriveChips(cur: InstantMetricSample | null, prev: InstantMetric
         : spec.quality;
     return {
       key: spec.key,
-      label: spec.label,
+      label: useEngine ? 'engine gen tok/s' : spec.label,
       value,
       stroke: spec.stroke,
       accent,
       delta,
       quality,
+      source: useEngine ? 'engine' : spec.key === 'reported_tokens_per_sec' ? 'reported' : 'gateway',
       sparkStroke: spec.stroke,
-      details: metricDetails(cur, spec.key),
+      details: useEngine ? engineThroughputDetails(engineThroughput) : metricDetails(cur, spec.key),
     };
   });
 }

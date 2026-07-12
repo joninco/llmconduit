@@ -542,6 +542,8 @@ pub struct HistoryPoint {
     pub at_ms: u128,
     pub cursors: SeqCursors,
     pub instant: crate::metrics::InstantMetricSample,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_throughput: Option<crate::backend_metrics::EngineThroughputSample>,
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -791,13 +793,14 @@ fn rest_window_tile(
     }
 }
 
-/// Build the full `/metrics`-shaped [`MetricsSnapshot`] body from a collapsed
-/// [`MetricsView`] (+ its `metrics_seq`), the live open-flow count, and the price
-/// table. The headline tile repeats the `m1` window (the dashboard's headline) and
-/// nests all three windows under `windows`. Shared by the live `/metrics` read AND
-/// the `/snapshot` metrics reshape so both emit byte-identical shapes.
+/// Build the `/metrics`-shaped [`MetricsSnapshot`] from one process-published
+/// reset-on-publish interval, its retained idle sample, and the preferred engine
+/// token-rate sample. Shared by REST, snapshots, and the WebSocket projection so
+/// all three surfaces expose one byte-shape and one source-selection seam.
 pub fn metrics_body(
     instant: &crate::metrics::InstantMetricSample,
+    last_activity: Option<&crate::metrics::LastActivitySample>,
+    engine_throughput: Option<&crate::backend_metrics::EngineThroughputSample>,
     generated_at_ms: u128,
     metrics_seq: u64,
 ) -> MetricsSnapshot {
@@ -805,6 +808,8 @@ pub fn metrics_body(
         metrics_seq,
         generated_at_ms,
         instant: instant.clone(),
+        last_activity: last_activity.cloned(),
+        engine_throughput: engine_throughput.cloned(),
     }
 }
 
@@ -1325,19 +1330,29 @@ pub async fn dashboard_metrics(
             StatusCode::OK,
             &metrics_body(
                 &cut.snapshot.instant,
+                cut.snapshot.last_activity.as_ref(),
+                cut.snapshot.engine_throughput.as_ref(),
                 cut.snapshot.taken_at_ms,
                 cut.snapshot.cursors.metrics_seq,
             ),
         );
     }
     let body = if let Some(cut) = gateway.metrics().latest_published_metrics() {
-        metrics_body(&cut.instant, cut.taken_at_ms, cut.cursors.metrics_seq)
+        metrics_body(
+            &cut.instant,
+            cut.last_activity.as_ref(),
+            cut.engine_throughput.as_ref(),
+            cut.taken_at_ms,
+            cut.cursors.metrics_seq,
+        )
     } else {
         // A manually-constructed Gateway may omit the DI bootstrap publication. Return
         // the explicit zero-sample/unavailable shape; never independently recompute a
         // second presentation or allocate a cursor outside the process publisher.
         metrics_body(
             &crate::metrics::InstantMetricSample::bootstrap(0),
+            None,
+            None,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1631,6 +1646,8 @@ pub async fn dashboard_snapshot(
     // with the rest of the frozen cut.
     let metrics = Some(metrics_body(
         &cut.instant,
+        cut.last_activity.as_ref(),
+        cut.engine_throughput.as_ref(),
         cut.taken_at_ms,
         cut.cursors.metrics_seq,
     ));
@@ -1728,6 +1745,7 @@ pub async fn dashboard_history(
                 backend_metrics_seq: cut.snapshot.cursors.backend_metrics_seq,
             },
             instant: cut.snapshot.instant.clone(),
+            engine_throughput: cut.snapshot.engine_throughput.clone(),
         })
         .collect();
     json_no_store(
@@ -2008,7 +2026,8 @@ mod tests {
         assert!(price_lookup(&prices, "other").is_none());
     }
 
-    /// Schema-v5 round trip: the reset-on-publish sample is the only public metrics tile.
+    /// Additive wire round trip: an idle response carries the retained request-bearing
+    /// sample, while an older response may omit it and still deserialize.
     #[test]
     fn metrics_body_instant_sample_round_trips() {
         let instant = crate::metrics::InstantMetricSample {
@@ -2018,10 +2037,46 @@ mod tests {
             active_streams_now: 2,
             ..Default::default()
         };
-        let value = serde_json::to_value(metrics_body(&instant, 42_000, 7)).unwrap();
+        let last_activity = crate::metrics::LastActivitySample {
+            at_ms: 41_000,
+            instant: instant.clone(),
+        };
+        let engine_throughput = crate::backend_metrics::EngineThroughputSample {
+            generated_tokens_per_sec: 37.5,
+            sampled_at_ms: 41_500,
+            measured_sources: 1,
+            total_sources: 2,
+            coverage: crate::backend_metrics::BackendMetricsCoverage::Partial,
+        };
+        let value = serde_json::to_value(metrics_body(
+            &crate::metrics::InstantMetricSample::bootstrap(0),
+            Some(&last_activity),
+            Some(&engine_throughput),
+            42_000,
+            7,
+        ))
+        .unwrap();
         assert_eq!(value["generated_at_ms"], 42_000);
-        assert_eq!(value["instant"]["interval_duration_ms"], 1_250);
+        assert_eq!(value["last_activity"]["at_ms"], 41_000);
+        assert_eq!(
+            value["last_activity"]["instant"]["interval_duration_ms"],
+            1_250
+        );
+        assert_eq!(value["engine_throughput"]["generated_tokens_per_sec"], 37.5);
+        assert_eq!(value["engine_throughput"]["coverage"], "partial");
         assert!(value.get("windows").is_none());
+
+        let decoded: MetricsSnapshot = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), value);
+
+        let legacy = serde_json::json!({
+            "metrics_seq": 7,
+            "generated_at_ms": 42_000,
+            "instant": crate::metrics::InstantMetricSample::bootstrap(0),
+        });
+        let decoded: MetricsSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.last_activity.is_none());
+        assert!(decoded.engine_throughput.is_none());
     }
 
     /// 1-based paging: page 2 with limit 2 over 5 rows yields rows 3..=4; a limit
@@ -2893,6 +2948,7 @@ mod tests {
                 },
             )]),
             overflow_count: 0,
+            engine_throughput: None,
         };
         let body = topology_body(&snapshot, &prices, &metrics.view().window_1m, &backend);
 

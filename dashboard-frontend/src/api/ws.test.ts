@@ -171,6 +171,8 @@ describe('DashboardSocket — batched envelope decode + per-domain dedup', () =>
     expect(flow?.api_call_id).toBe('api_001');
     expect(flow?.response_id).toBe('resp_001');
     expect(st.metrics?.instant.accepted_per_sec).toBe(4.2);
+    expect(st.metrics?.engine_throughput?.generated_tokens_per_sec).toBe(128.6);
+    expect(st.metrics?.engine_throughput?.coverage).toBe('partial');
     expect(st.topologyNodes).toHaveLength(1);
     expect(st.topologyNodes[0]?.status).toBe('healthy');
     expect(st.topologyEdges).toHaveLength(1);
@@ -464,6 +466,34 @@ describe('snapshot validation — full shape before applying (finding 4)', () =>
       domain: 'metrics', seq: 1,
       batch: [{ type: 'metric_tick', generated_at_ms: 1000, instant: METRIC_WINDOW }],
     })).toBe(true);
+  });
+
+  it('validates engine throughput source counts and coverage before applying a tick', () => {
+    const base = {
+      type: 'metric_tick' as const,
+      generated_at_ms: 1000,
+      instant: METRIC_WINDOW,
+    };
+    expect(isDashboardFrame({
+      domain: 'metrics', seq: 1,
+      batch: [{ ...base, engine_throughput: {
+        generated_tokens_per_sec: 12.5,
+        sampled_at_ms: 950,
+        measured_sources: 1,
+        total_sources: 2,
+        coverage: 'partial',
+      } }],
+    })).toBe(true);
+    expect(isDashboardFrame({
+      domain: 'metrics', seq: 1,
+      batch: [{ ...base, engine_throughput: {
+        generated_tokens_per_sec: 12.5,
+        sampled_at_ms: 950,
+        measured_sources: 3,
+        total_sources: 2,
+        coverage: 'full',
+      } }],
+    })).toBe(false);
   });
 
   // Gap 07 — the metric_tick aggregate cost-confidence tag is REQUIRED + must be a valid enum.

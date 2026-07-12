@@ -285,21 +285,31 @@ const UPSTREAM_RESPONSE_BY_ID: Record<string, FlowDetail['upstream_response']> =
 };
 
 function buildMetrics(): MetricsResponse {
+  const generatedAt = Date.now();
+  const instant: MetricsResponse['instant'] = {
+    interval_duration_ms: 1_000, ready: true,
+    accepted_requests: 4, accepted_per_sec: 4.2,
+    terminal_requests: 4, terminal_per_sec: 4.0,
+    successes: 3, failures: 1, failure_pct: 25,
+    cancellations: 0, cancellation_pct: 0, active_streams_now: 3,
+    latency_samples: 4, p50_ms: 180, p95_ms: 920, p99_ms: 1840,
+    p50_quality: 'measured', p95_quality: 'partial', p99_quality: 'partial',
+    quantile_method: 'log_histogram_nearest_rank', max_relative_error: 0.062,
+    latency_overflow_count: 0, usage_samples: 4, reported_tokens_per_sec: 142,
+    usage_anomaly_count: 0, priced_samples: 4, cost_per_min: 0.21,
+    cost_confidence: 'estimated',
+  };
   return {
     metrics_seq: 1,
-    generated_at_ms: Date.now(),
-    instant: {
-      interval_duration_ms: 1_000, ready: true,
-      accepted_requests: 4, accepted_per_sec: 4.2,
-      terminal_requests: 4, terminal_per_sec: 4.0,
-      successes: 3, failures: 1, failure_pct: 25,
-      cancellations: 0, cancellation_pct: 0, active_streams_now: 3,
-      latency_samples: 4, p50_ms: 180, p95_ms: 920, p99_ms: 1840,
-      p50_quality: 'measured', p95_quality: 'partial', p99_quality: 'partial',
-      quantile_method: 'log_histogram_nearest_rank', max_relative_error: 0.062,
-      latency_overflow_count: 0, usage_samples: 4, reported_tokens_per_sec: 142,
-      usage_anomaly_count: 0, priced_samples: 4, cost_per_min: 0.21,
-      cost_confidence: 'estimated',
+    generated_at_ms: generatedAt,
+    instant,
+    last_activity: { at_ms: generatedAt, instant },
+    engine_throughput: {
+      generated_tokens_per_sec: 128.6,
+      sampled_at_ms: generatedAt,
+      measured_sources: 1,
+      total_sources: 2,
+      coverage: 'partial',
     },
   };
 }
@@ -852,6 +862,8 @@ export class MockWebSocket implements WsLike {
         type: 'metric_tick',
         generated_at_ms: Date.now(),
         instant: m.instant,
+        last_activity: m.last_activity,
+        engine_throughput: m.engine_throughput,
       }],
     };
   }

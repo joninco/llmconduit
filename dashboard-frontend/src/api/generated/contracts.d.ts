@@ -36,6 +36,7 @@ export type FlowStatus = "open" | "completed" | "failed" | "cancelled";
  * one is deliberately absent until such a seam exists (spec 04 / Codex review).
  */
 export type ClientSource = "key_hash" | "configured_header" | "user_agent";
+export type BackendMetricsCoverage = "full" | "partial";
 /**
  * Confidence attached to a terminal-time price. This lives with the evict-safe
  * terminal payload (rather than the REST projection) so historical overview cuts keep
@@ -108,7 +109,6 @@ export type DebugWsMessage =
     };
 export type DebugRequestStatus = "running" | "completed" | "failed";
 export type DebugSegmentKind = "output" | "reasoning" | "tool";
-export type BackendMetricsCoverage = "full" | "partial";
 export type BackendEngineKind = "vllm" | "sglang" | "unknown";
 export type BackendMetricsStatus = "warming" | "fresh" | "stale" | "unsupported" | "error";
 /**
@@ -782,6 +782,7 @@ export interface HistoryPoint {
   at_ms: number;
   cursors: SeqCursors;
   cut_id: number;
+  engine_throughput?: EngineThroughputSample | null;
   instant: InstantMetricSample;
 }
 /**
@@ -796,6 +797,21 @@ export interface SeqCursors {
   metrics_seq: number;
   monitor_seq: number;
   topology_seq: number;
+}
+/**
+ * Physically de-duplicated per-request output-token throughput from the newest
+ * successful Prometheus TPOT interval across configured engines. The value is the
+ * inverse mean `request_time_per_output_token_seconds`; speculative accepted tokens
+ * are already reflected in that shorter output-token time and are never double-counted.
+ * One physical `/metrics` endpoint contributes once even when several logical routes
+ * point at it.
+ */
+export interface EngineThroughputSample {
+  coverage: BackendMetricsCoverage;
+  generated_tokens_per_sec: number;
+  measured_sources: number;
+  sampled_at_ms: number;
+  total_sources: number;
 }
 /**
  * One reset-on-publish dashboard telemetry interval. Unlike [`WindowReport`], this
@@ -843,14 +859,33 @@ export interface LoginRequest {
   token: string;
 }
 /**
- * The full `/api/metrics`-shaped snapshot body (the flat tile + the three
- * windows) PLUS its `metrics_seq` cursor — the snapshot-time analogue of a live
- * [`DashboardPayload::MetricTick`]. Mirrors the frontend `MetricsResponse`.
+ * The `/api/metrics` snapshot body: the current reset-on-publish interval, optional
+ * retained request-bearing interval, and `metrics_seq` cursor. Mirrors the frontend
+ * `MetricsResponse` and the snapshot-time shape of a live metric tick.
  */
 export interface MetricsSnapshot {
+  /**
+   * Preferred stats-bar token source when a fresh physical-engine TPOT interval
+   * was observed for the current request generation.
+   */
+  engine_throughput?: EngineThroughputSample | null;
   generated_at_ms: number;
   instant: InstantMetricSample;
+  /**
+   * Most recent request-bearing interval. Optional for compatibility with
+   * pre-retention snapshots; absent means no request has been observed yet.
+   */
+  last_activity?: LastActivitySample | null;
   metrics_seq: number;
+}
+/**
+ * The most recent reset-on-publish interval that observed a request. Idle cuts
+ * carry this alongside their truthful empty [`InstantMetricSample`] so the dashboard
+ * can keep the last useful instantaneous figures visible while explicitly aging them.
+ */
+export interface LastActivitySample {
+  at_ms: number;
+  instant: InstantMetricSample;
 }
 /**
  * `GET /dashboard/api/overview`: an immutable exact-window rollup. The aggregate is

@@ -31,6 +31,7 @@
 //!   quota bounds retained cuts; an oversized cut is reduced to its newest summary
 //!   prefix before insertion, and the ring never retains a cut it cannot fit.
 
+use crate::backend_metrics::EngineThroughputSample;
 use crate::dashboard_flow::Attempt;
 use crate::dashboard_flow::AttemptErrorClass;
 use crate::dashboard_flow::AttemptStatus;
@@ -1871,6 +1872,22 @@ impl InstantMetricSample {
             ..Self::default()
         }
     }
+
+    /// Whether this interval observed a request at any lifecycle point. The active
+    /// count catches long-running streams whose start landed in an earlier interval;
+    /// accepted/terminal counts catch short requests that begin and end between cuts.
+    fn has_request_activity(&self) -> bool {
+        self.active_streams_now > 0 || self.accepted_requests > 0 || self.terminal_requests > 0
+    }
+}
+
+/// The most recent reset-on-publish interval that observed a request. Idle cuts
+/// carry this alongside their truthful empty [`InstantMetricSample`] so the dashboard
+/// can keep the last useful instantaneous figures visible while explicitly aging them.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct LastActivitySample {
+    pub at_ms: u128,
+    pub instant: InstantMetricSample,
 }
 
 /// The body-free metrics view captured into a [`DashboardSnapshot`]: the three
@@ -1995,6 +2012,12 @@ pub struct PublishedMetricsCut {
     pub active_streams: u64,
     /// Reset-on-publish interval telemetry used by the StatsStrip and scrubber.
     pub instant: InstantMetricSample,
+    /// Most recent request-bearing interval, retained across truthful idle cuts.
+    pub last_activity: Option<LastActivitySample>,
+    /// Effective inverse-TPOT rate for this cut: the current physical-engine interval
+    /// while active, or the last nonzero interval associated with the latest request
+    /// while idle.
+    pub engine_throughput: Option<EngineThroughputSample>,
     /// The three age-filtered metric windows as of `taken_at_ms`.
     pub view: MetricsView,
     /// The topology generation sampled for this same cut. Consumers that need provider
@@ -2083,6 +2106,13 @@ pub struct DashboardSnapshot {
     /// Schema-v4 CBOR rows predate it and deserialize to an unavailable bootstrap.
     #[serde(default)]
     pub instant: InstantMetricSample,
+    /// Most recent request-bearing interval as of this historical cut. Old durable
+    /// rows predate the field and deserialize to `None`.
+    #[serde(default)]
+    pub last_activity: Option<LastActivitySample>,
+    /// Effective inverse-TPOT generation rate retained with this historical cut.
+    #[serde(default)]
+    pub engine_throughput: Option<EngineThroughputSample>,
     /// The ONE topology cut captured in this snapshot. Serialized by DEREF (serde's
     /// blanket `Arc: Serialize` needs the `rc` feature, which we don't enable
     /// crate-wide; the inner `ProviderHealthSnapshot` already derives `Serialize`).
@@ -2444,6 +2474,18 @@ struct MetricsState {
     ring_1h: WindowRing,
     instant: InstantAccumulator,
     instant_started_ms: u128,
+    /// Retained independently of the one-hour trend rings so a long idle period does
+    /// not erase the last useful instantaneous sample.
+    last_activity: Option<LastActivitySample>,
+    /// Start of the newest gateway request activity generation. Engine samples older
+    /// than this cannot be attributed to the current stats-bar generation.
+    engine_activity_floor_ms: Option<u128>,
+    /// Whether the preceding cut still had an open request. New arrivals during one
+    /// continuous busy period must not reset the scrape floor every second, otherwise
+    /// a five-second collector can never catch up under sustained traffic.
+    engine_generation_active: bool,
+    /// Last nonzero, physically de-duplicated engine interval observed since that floor.
+    last_engine_throughput: Option<EngineThroughputSample>,
     /// Terminal/data mutation watermark. This proves which recorded samples a view
     /// includes but is not the published presentation cursor.
     metrics_seq: u64,
@@ -2464,6 +2506,10 @@ impl MetricsState {
             ring_1h: WindowRing::new(WINDOW_1H_SLOTS),
             instant: InstantAccumulator::default(),
             instant_started_ms: now_ms(),
+            last_activity: None,
+            engine_activity_floor_ms: None,
+            engine_generation_active: false,
+            last_engine_throughput: None,
             metrics_seq: 0,
             presentation_seq: 0,
             snapshots: SnapshotRing::new(snapshot_quota_bytes),
@@ -2640,7 +2686,46 @@ impl MetricsState {
         let duration_ms = taken_at_ms.saturating_sub(self.instant_started_ms);
         self.instant_started_ms = taken_at_ms;
         let drained = std::mem::take(&mut self.instant);
-        drained.into_sample(duration_ms, active_streams)
+        let sample = drained.into_sample(duration_ms, active_streams);
+        if sample.has_request_activity() {
+            self.last_activity = Some(LastActivitySample {
+                at_ms: taken_at_ms,
+                instant: sample.clone(),
+            });
+        }
+        sample
+    }
+
+    fn effective_engine_throughput(
+        &mut self,
+        taken_at_ms: u128,
+        instant: &InstantMetricSample,
+        current: Option<&EngineThroughputSample>,
+    ) -> Option<EngineThroughputSample> {
+        if instant.accepted_requests > 0 && !self.engine_generation_active {
+            // The collector's current interval may predate this request even when its
+            // scrape timestamp falls inside the just-drained gateway interval. Wait for
+            // a scrape published at or after this cut before associating engine output
+            // with the new request generation; dropping one early sample is preferable
+            // to briefly relabeling the previous request's throughput as current.
+            self.engine_activity_floor_ms = Some(taken_at_ms);
+            self.last_engine_throughput = None;
+        }
+        let eligible = current.filter(|sample| {
+            self.engine_activity_floor_ms
+                .is_some_and(|floor| sample.sampled_at_ms >= floor)
+        });
+        if let Some(sample) = eligible
+            && sample.generated_tokens_per_sec > 0.0
+        {
+            self.last_engine_throughput = Some(sample.clone());
+        }
+        self.engine_generation_active = instant.active_streams_now > 0;
+        if self.engine_generation_active {
+            eligible.cloned()
+        } else {
+            self.last_engine_throughput.clone()
+        }
     }
 
     /// Collapse the three rings into a body-free [`MetricsView`] as of `now_epoch_s`.
@@ -3034,6 +3119,12 @@ impl MetricsLayer {
             let taken_at_ms = read_time_ms();
             let now_epoch_s = (taken_at_ms / 1000) as u64;
             let instant = state.drain_instant(taken_at_ms, active_streams);
+            let last_activity = state.last_activity.clone();
+            let engine_throughput = state.effective_engine_throughput(
+                taken_at_ms,
+                &instant,
+                backend_metrics.engine_throughput.as_ref(),
+            );
 
             // The atomic cut is fixed. Release FlowStore before the heavier window
             // aggregation and optional summary trimming; Metrics remains locked.
@@ -3055,6 +3146,8 @@ impl MetricsLayer {
                     flow_summaries_truncated: false,
                     metrics: view.clone(),
                     instant: instant.clone(),
+                    last_activity: last_activity.clone(),
+                    engine_throughput: engine_throughput.clone(),
                     topology: Arc::clone(&topology),
                     backend_metrics: Arc::clone(&backend_metrics),
                 };
@@ -3068,6 +3161,8 @@ impl MetricsLayer {
                 source_metrics_seq,
                 active_streams,
                 instant,
+                last_activity,
+                engine_throughput,
                 view,
                 topology,
                 backend_metrics,
@@ -3208,6 +3303,12 @@ impl MetricsLayer {
                 .filter(|summary| summary.status == FlowStatus::Open)
                 .count() as u64;
             let instant = state.drain_instant(taken_at_ms, active_streams);
+            let last_activity = state.last_activity.clone();
+            let engine_throughput = state.effective_engine_throughput(
+                taken_at_ms,
+                &instant,
+                backend_metrics.engine_throughput.as_ref(),
+            );
             let cursors = DomainCursors {
                 flow_seq,
                 metrics_seq,
@@ -3222,6 +3323,8 @@ impl MetricsLayer {
                 flow_summaries_truncated: false,
                 metrics,
                 instant,
+                last_activity,
+                engine_throughput,
                 topology,
                 backend_metrics,
             };
@@ -3498,6 +3601,8 @@ mod tests {
         assert!(decoded.backend_metrics.providers.is_empty());
         assert!(!decoded.instant.ready);
         assert_eq!(decoded.instant.accepted_per_sec, None);
+        assert!(decoded.last_activity.is_none());
+        assert!(decoded.engine_throughput.is_none());
     }
 
     /// Build a histogram from an explicit list of latency samples (ms).
@@ -3663,6 +3768,114 @@ mod tests {
         assert_eq!(sample.cost_per_min, None);
     }
 
+    fn engine_sample(rate: f64, sampled_at_ms: u128) -> EngineThroughputSample {
+        EngineThroughputSample {
+            generated_tokens_per_sec: rate,
+            sampled_at_ms,
+            measured_sources: 1,
+            total_sources: 1,
+            coverage: crate::backend_metrics::BackendMetricsCoverage::Full,
+        }
+    }
+
+    #[test]
+    fn engine_throughput_waits_for_the_current_request_and_retains_its_last_nonzero_rate() {
+        let mut state = MetricsState::new(1024 * 1024);
+        let active = InstantMetricSample {
+            ready: true,
+            accepted_requests: 1,
+            active_streams_now: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            state.effective_engine_throughput(10_000, &active, Some(&engine_sample(90.0, 9_999))),
+            None,
+            "a scrape from before the accepted-request cut is never relabelled current"
+        );
+
+        let measured = engine_sample(42.5, 10_005);
+        let active_without_new_accept = InstantMetricSample {
+            ready: true,
+            active_streams_now: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            state.effective_engine_throughput(11_000, &active_without_new_accept, Some(&measured),),
+            Some(measured.clone())
+        );
+
+        let idle = InstantMetricSample {
+            ready: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            state.effective_engine_throughput(12_000, &idle, None),
+            Some(measured),
+            "idle cuts retain the newest positive engine interval for the stale strip"
+        );
+    }
+
+    #[test]
+    fn a_new_request_clears_retained_engine_throughput_and_preserves_zero_while_active() {
+        let mut state = MetricsState::new(1024 * 1024);
+        state.engine_activity_floor_ms = Some(1_000);
+        state.last_engine_throughput = Some(engine_sample(40.0, 1_500));
+        let active = InstantMetricSample {
+            ready: true,
+            accepted_requests: 1,
+            active_streams_now: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            state.effective_engine_throughput(2_000, &active, Some(&engine_sample(40.0, 1_999))),
+            None
+        );
+        let zero = engine_sample(0.0, 2_005);
+        assert_eq!(
+            state.effective_engine_throughput(
+                3_000,
+                &InstantMetricSample {
+                    ready: true,
+                    active_streams_now: 1,
+                    ..Default::default()
+                },
+                Some(&zero)
+            ),
+            Some(zero),
+            "a measured zero is honest while the request remains active"
+        );
+        assert_eq!(
+            state.effective_engine_throughput(
+                4_000,
+                &InstantMetricSample {
+                    ready: true,
+                    ..Default::default()
+                },
+                None
+            ),
+            None,
+            "zero-only activity does not become a misleading retained idle rate"
+        );
+    }
+
+    #[test]
+    fn sustained_arrivals_do_not_keep_backend_scrapes_permanently_ineligible() {
+        let mut state = MetricsState::new(1024 * 1024);
+        let busy = InstantMetricSample {
+            ready: true,
+            accepted_requests: 1,
+            active_streams_now: 2,
+            ..Default::default()
+        };
+        assert_eq!(state.effective_engine_throughput(10_000, &busy, None), None);
+        let later_scrape = engine_sample(88.0, 10_500);
+        assert_eq!(
+            state.effective_engine_throughput(11_000, &busy, Some(&later_scrape)),
+            Some(later_scrape),
+            "new arrivals in the same busy period do not move the floor past every 5s scrape"
+        );
+    }
+
     #[test]
     fn malformed_usage_is_normalized_without_double_counting_subclasses() {
         let metrics = MetricsLayer::new();
@@ -3758,12 +3971,24 @@ mod tests {
         assert!(first.instant.ready);
         assert_eq!(first.instant.terminal_requests, 1);
         assert_eq!(first.instant.p50_quality, InstantMetricQuality::Partial);
+        assert_eq!(
+            first
+                .last_activity
+                .as_ref()
+                .expect("request-bearing cut is retained")
+                .instant,
+            first.instant
+        );
 
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         let idle = next_published_cut(&mut receiver).await;
         assert_eq!(idle.instant.terminal_requests, 0);
         assert_eq!(idle.instant.terminal_per_sec, Some(0.0));
         assert_eq!(idle.instant.p50_ms, None, "the request does not decay");
+        assert_eq!(
+            idle.last_activity, first.last_activity,
+            "an empty interval keeps the last request-bearing instantaneous sample"
+        );
 
         // No terminal mutation occurs. Advancing only Tokio's paused monotonic clock
         // still drives the publisher's epoch-compatible timestamp far enough to expire
@@ -3840,6 +4065,8 @@ mod tests {
         assert_eq!(snapshot.taken_at_ms, published.taken_at_ms);
         assert_eq!(snapshot.cursors, published.cursors);
         assert_eq!(snapshot.instant, published.instant);
+        assert_eq!(snapshot.last_activity, published.last_activity);
+        assert_eq!(snapshot.engine_throughput, published.engine_throughput);
         assert!(Arc::ptr_eq(&snapshot.topology, &published.topology));
         assert_eq!(
             snapshot.metrics.window_1m.total_count(),

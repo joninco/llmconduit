@@ -50,6 +50,48 @@
     "points"
   ],
   "$defs": {
+    "BackendMetricsCoverage": {
+      "type": "string",
+      "enum": [
+        "full",
+        "partial"
+      ]
+    },
+    "EngineThroughputSample": {
+      "description": "Physically de-duplicated per-request output-token throughput from the newest\nsuccessful Prometheus TPOT interval across configured engines. The value is the\ninverse mean `request_time_per_output_token_seconds`; speculative accepted tokens\nare already reflected in that shorter output-token time and are never double-counted.\nOne physical `/metrics` endpoint contributes once even when several logical routes\npoint at it.",
+      "type": "object",
+      "properties": {
+        "coverage": {
+          "$ref": "#/$defs/BackendMetricsCoverage"
+        },
+        "generated_tokens_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "measured_sources": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sampled_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "total_sources": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "generated_tokens_per_sec",
+        "sampled_at_ms",
+        "measured_sources",
+        "total_sources",
+        "coverage"
+      ]
+    },
     "HistoryPoint": {
       "type": "object",
       "properties": {
@@ -65,6 +107,16 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "engine_throughput": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EngineThroughputSample"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "instant": {
           "$ref": "#/$defs/InstantMetricSample"

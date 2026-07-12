@@ -1,5 +1,5 @@
 /** Timestamped instantaneous metrics history shared by every StatsStrip horizon. */
-import type { HistoryPoint, InstantMetricSample, MetricsResponse } from '../../api/types';
+import type { EngineThroughputSample, HistoryPoint, InstantMetricSample, MetricsResponse } from '../../api/types';
 
 export type WindowKey = 'm1' | 'm5' | 'h1';
 export const WINDOW_KEYS: readonly WindowKey[] = ['m1', 'm5', 'h1'];
@@ -19,10 +19,14 @@ export type MetricKey =
   | 'reported_tokens_per_sec'
   | 'cost_per_min';
 
+/** Which telemetry seam supplies a chip and its sparkline. */
+export type MetricSource = 'gateway' | 'reported' | 'engine';
+
 export interface MetricPoint {
   seq: number;
   t: number;
   instant: InstantMetricSample;
+  engineThroughput: EngineThroughputSample | null;
 }
 
 export type MetricHistory = MetricPoint[];
@@ -40,12 +44,22 @@ function normalized(points: MetricPoint[]): MetricHistory {
 }
 
 export function appendTick(history: MetricHistory, tick: MetricsResponse): MetricHistory {
-  return normalized([...history, { seq: tick.metrics_seq, t: tick.generated_at_ms, instant: tick.instant }]);
+  return normalized([...history, {
+    seq: tick.metrics_seq,
+    t: tick.generated_at_ms,
+    instant: tick.instant,
+    engineThroughput: tick.engine_throughput ?? null,
+  }]);
 }
 
 export function mergeRetained(history: MetricHistory, points: HistoryPoint[]): MetricHistory {
   return normalized([
-    ...points.map((point) => ({ seq: point.cursors.metrics_seq, t: point.at_ms, instant: point.instant })),
+    ...points.map((point) => ({
+      seq: point.cursors.metrics_seq,
+      t: point.at_ms,
+      instant: point.instant,
+      engineThroughput: point.engine_throughput ?? null,
+    })),
     ...history,
   ]);
 }
@@ -69,10 +83,17 @@ export function metricUnavailable(sample: InstantMetricSample | null, metric: Me
   return value === null || !Number.isFinite(value);
 }
 
-export function seriesFor(history: MetricHistory, metric: MetricKey): { times: number[]; values: number[] } {
+export function seriesFor(
+  history: MetricHistory,
+  metric: MetricKey,
+  source: MetricSource = 'gateway',
+): { times: number[]; values: number[] } {
   return {
     times: history.map((point) => point.t / 1_000),
-    values: history.map(({ instant }) => {
+    values: history.map(({ instant, engineThroughput }) => {
+      if (metric === 'reported_tokens_per_sec' && source === 'engine') {
+        return engineThroughput?.generated_tokens_per_sec ?? NaN;
+      }
       const value = instant[metric];
       return metricUnavailable(instant, metric) || value === null ? NaN : value;
     }),
@@ -81,6 +102,32 @@ export function seriesFor(history: MetricHistory, metric: MetricKey): { times: n
 
 export function latest(history: MetricHistory): InstantMetricSample | null {
   return history.at(-1)?.instant ?? null;
+}
+
+/** Newest backend-counter sample, optionally strictly older than a scrape timestamp. */
+export function latestEngineThroughput(
+  history: MetricHistory,
+  beforeSampledAt?: number | null,
+): EngineThroughputSample | null {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const sample = history[index]?.engineThroughput;
+    if (sample && (beforeSampledAt == null || sample.sampled_at_ms < beforeSampledAt)) return sample;
+  }
+  return null;
+}
+
+/** Same request-activity predicate as the publisher's retained-sample seam. */
+export function hasRequestActivity(sample: InstantMetricSample): boolean {
+  return sample.active_streams_now > 0 || sample.accepted_requests > 0 || sample.terminal_requests > 0;
+}
+
+/** Newest request-bearing point, optionally strictly before a retained sample timestamp. */
+export function latestActivity(history: MetricHistory, beforeAt?: number | null): MetricPoint | null {
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const point = history[index]!;
+    if ((beforeAt == null || point.t < beforeAt) && hasRequestActivity(point.instant)) return point;
+  }
+  return null;
 }
 
 export function previous(history: MetricHistory, beforeAt?: number | null): InstantMetricSample | null {

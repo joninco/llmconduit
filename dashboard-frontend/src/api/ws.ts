@@ -710,6 +710,8 @@ export class DashboardSocket {
           metrics_seq: this.lastSeq.metrics,
           generated_at_ms: payload.generated_at_ms,
           instant: payload.instant,
+          last_activity: payload.last_activity,
+          engine_throughput: payload.engine_throughput,
         });
         return;
       case 'flow_status':

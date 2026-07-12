@@ -123,6 +123,17 @@ export const GOLDEN_METRIC_TICK_FRAME_JSON = JSON.stringify({
       type: 'metric_tick',
       generated_at_ms: 1718900000000,
       instant: metricWindow(4.2),
+      last_activity: {
+        at_ms: 1718900000000,
+        instant: metricWindow(4.2),
+      },
+      engine_throughput: {
+        generated_tokens_per_sec: 128.6,
+        sampled_at_ms: 1718900000000,
+        measured_sources: 1,
+        total_sources: 2,
+        coverage: 'partial',
+      },
     },
   ],
 });

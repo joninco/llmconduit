@@ -860,6 +860,8 @@ mod tests {
             flow_summaries_truncated: false,
             metrics: MetricsView::default(),
             instant: crate::metrics::InstantMetricSample::default(),
+            last_activity: None,
+            engine_throughput: None,
             topology: Arc::new(ProviderHealthSnapshot::default()),
             backend_metrics: Arc::new(crate::backend_metrics::BackendMetricsSnapshot::default()),
         });
@@ -895,6 +897,8 @@ mod tests {
                 flow_summaries_truncated: false,
                 metrics: MetricsView::default(),
                 instant: crate::metrics::InstantMetricSample::default(),
+                last_activity: None,
+                engine_throughput: None,
                 topology: Arc::new(ProviderHealthSnapshot::default()),
                 backend_metrics: Arc::new(crate::backend_metrics::BackendMetricsSnapshot::default()),
             }));
