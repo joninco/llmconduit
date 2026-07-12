@@ -90,3 +90,35 @@ describe('FlowsView — seek suppresses a selection absent from the frozen snaps
     await waitFor(() => expect(queryByTestId('flow-detail')).toBeTruthy());
   });
 });
+
+describe('FlowsView — direct lookup re-scopes every flow instrument', () => {
+  it('focuses with `/`, searches IDs/attempt provenance, and clears with Escape', async () => {
+    seedFlows([
+      makeFlow({ api_call_id: 'api_ok', status: 'completed', upstream_target: 'provider-b' }),
+      makeFlow({
+        api_call_id: 'api_failover', status: 'failed', upstream_target: 'provider-b',
+        attempts: [
+          { provider: 'provider-a', model: 'm', start_ms: 1, end_ms: 2, status: 'failed', error_class: 'timeout' },
+          { provider: 'provider-b', model: 'm', start_ms: 3, end_ms: 4, status: 'served' },
+        ],
+      }),
+    ]);
+    const view = renderWithQuery(<FlowsView />);
+    await waitFor(() => expect(view.getAllByTestId('flow-row')).toHaveLength(2));
+
+    fireEvent.keyDown(window, { key: '/' });
+    const search = view.getByRole('searchbox', { name: 'Search flows' });
+    expect(document.activeElement).toBe(search);
+    fireEvent.change(search, { target: { value: 'provider-a timeout' } });
+    await waitFor(() => expect(view.getAllByTestId('flow-row')).toHaveLength(1));
+    expect(view.getByTestId('flow-count').textContent).toContain('1 / 2');
+    expect(view.getByTestId('failure-taxonomy').getAttribute('data-available')).toBe('true');
+
+    fireEvent.change(search, { target: { value: 'missing-request' } });
+    await waitFor(() => expect(view.getByTestId('flow-table-search-empty')).toBeTruthy());
+    expect(view.getByTestId('failure-taxonomy').getAttribute('data-available')).toBe('false');
+
+    fireEvent.keyDown(search, { key: 'Escape' });
+    await waitFor(() => expect(view.getAllByTestId('flow-row')).toHaveLength(2));
+  });
+});

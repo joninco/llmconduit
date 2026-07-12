@@ -1,8 +1,9 @@
 /**
  * River (D12) — a single live stream tile in the theater. Reasoning renders FIRST (dim, expanded by
  * default — it is what the model streams first), then the bright mono output, then tool cards. A
- * per-river tokens/sec meter sits in the header; a blinking cursor trails the output while the
- * stream is running (gone once it completes).
+ * text-first status + request telemetry sit in the header; a blinking cursor trails the output
+ * while the stream is running (gone once it completes). Failed streams surface their terminal
+ * error explicitly instead of relying on a red dot or a buried tool segment.
  *
  * FOLLOW-THE-STREAM: the body is a scroll container pinned to the bottom while new text arrives
  * ("stick to bottom"), so a stream longer than the tile scrolls naturally instead of overflowing —
@@ -18,6 +19,7 @@
 import { useEffect, useRef, useState } from 'react';
 import type { River as RiverData } from './riverModel';
 import { cn } from '../../lib/cn';
+import { fmtElapsed, fmtTokens, fmtTokensPerSec } from '../FlowTable/format';
 
 const STATUS_DOT: Record<RiverData['status'], string> = {
   running: 'bg-status-healthy',
@@ -25,14 +27,53 @@ const STATUS_DOT: Record<RiverData['status'], string> = {
   failed: 'bg-status-down',
 };
 
+const STATUS_LABEL: Record<RiverData['status'], string> = {
+  running: 'streaming',
+  completed: 'complete',
+  failed: 'failed',
+};
+
+const STATUS_BADGE: Record<RiverData['status'], string> = {
+  running: 'border-status-healthy/40 bg-status-healthy/10 text-status-healthy',
+  completed: 'border-line bg-panel-raised text-text-muted',
+  failed: 'border-status-down/50 bg-status-down/10 text-status-down',
+};
+
 /** How close (px) to the bottom counts as "at the bottom" for re-engaging the follow pin. */
 const STICK_THRESHOLD_PX = 48;
 
-export function River({ river, exiting = false }: { river: RiverData; exiting?: boolean }) {
+export function River({
+  river,
+  exiting = false,
+  retained = false,
+}: {
+  river: RiverData;
+  exiting?: boolean;
+  /** Latest completed response kept visible while Theater is idle. */
+  retained?: boolean;
+}) {
   // Reasoning is EXPANDED by default — it streams before the output, so hiding it made the tile
   // look empty during the thinking phase. The toggle collapses it for output-only reading.
   const [showReasoning, setShowReasoning] = useState(true);
   const running = river.status === 'running';
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  // A live duration is more actionable than a color pulse. Terminal rivers freeze on their
+  // measured completion timestamp; only running tiles own a once-per-second clock.
+  useEffect(() => {
+    if (!running || (river.startedAtMs == null && river.firstMs == null)) return;
+    setNowMs(Date.now());
+    const id = globalThis.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => globalThis.clearInterval(id);
+  }, [river.firstMs, river.startedAtMs, running]);
+
+  const startMs = river.startedAtMs ?? river.firstMs;
+  const endMs = running ? nowMs : (river.terminalAtMs ?? river.lastMs);
+  const elapsedMs = startMs != null && endMs != null ? Math.max(0, endMs - startMs) : null;
+  const hasRateWindow = river.firstMs != null && river.lastMs != null && river.lastMs > river.firstMs;
+  const visibleTools = river.status === 'failed' && river.error
+    ? river.tools.filter((tool) => tool.trim() !== `failed: ${river.error}`)
+    : river.tools;
 
   const bodyRef = useRef<HTMLDivElement | null>(null);
   // Follow pin: true while the view should track the stream's tail. A ref (not state) — toggling
@@ -44,7 +85,7 @@ export function River({ river, exiting = false }: { river: RiverData; exiting?: 
   const contentLen =
     river.reasoning.length +
     river.output.length +
-    river.tools.reduce((sum, t) => sum + t.length, 0);
+    visibleTools.reduce((sum, t) => sum + t.length, 0);
   useEffect(() => {
     const el = bodyRef.current;
     if (el && stickRef.current) el.scrollTop = el.scrollHeight;
@@ -63,21 +104,65 @@ export function River({ river, exiting = false }: { river: RiverData; exiting?: 
       data-river-id={river.id}
       data-status={river.status}
       data-exiting={exiting || undefined}
+      data-retained={retained || undefined}
+      data-stale={retained || undefined}
       // `river-tile` carries the CSS entrance; `river-tile-exiting` swaps it for the linger-then-fade
       // exit while a terminated tile is being removed (finding 4; reduced-motion → ~instant).
       className={cn(
         'river-tile flex min-h-0 min-w-0 flex-col overflow-hidden rounded-md border border-line bg-panel',
         exiting && 'river-tile-exiting',
+        retained && 'border-status-cooling/60',
       )}
     >
-      <div className="flex items-center gap-2 border-b border-line px-3 py-1.5">
-        <span className={cn('h-2 w-2 shrink-0 rounded-full', STATUS_DOT[river.status])} aria-hidden />
-        <span className="truncate font-mono text-xs text-text" title={river.id}>
-          {river.model ?? river.id}
-        </span>
-        <span className="ml-auto shrink-0 tabular-nums text-[11px] text-accent" data-testid="river-tps">
-          {river.tokensPerSec.toFixed(1)} tok/s
-        </span>
+      <div className="shrink-0 border-b border-line bg-panel-raised/30">
+        <div className="flex min-w-0 flex-wrap items-center gap-2 px-3 py-1.5">
+          <span
+            className={cn(
+              'inline-flex shrink-0 items-center gap-1.5 rounded-sm border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide',
+              STATUS_BADGE[river.status],
+            )}
+            data-testid="river-status"
+            data-status={river.status}
+          >
+            <span className={cn('h-1.5 w-1.5 rounded-full', STATUS_DOT[river.status])} aria-hidden />
+            {STATUS_LABEL[river.status]}
+          </span>
+          <span className="min-w-0 flex-1 truncate font-mono text-xs text-text" title={`${river.model ?? river.id} · ${river.id}`}>
+            {river.model ?? river.id}
+          </span>
+          {retained && (
+            <span
+              className="shrink-0 rounded-sm border border-status-cooling/50 bg-status-cooling/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-status-cooling"
+              data-testid="river-retained-badge"
+            >
+              last response
+            </span>
+          )}
+        </div>
+        <div
+          className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-line/50 px-3 py-1 font-mono text-[10px] text-text-muted"
+          data-testid="river-telemetry"
+        >
+          <span data-testid="river-elapsed" data-quality={elapsedMs == null ? 'unavailable' : 'measured'}>
+            elapsed <strong className="font-medium tabular-nums text-text">{fmtElapsed(elapsedMs)}</strong>
+          </span>
+          <span
+            data-testid="river-tokens"
+            data-quality="estimated"
+            title="Approximate output + reasoning tokens, estimated at four characters per token"
+          >
+            <strong className="font-medium tabular-nums text-text">≈{fmtTokens(Math.round(river.approxTokens))}</strong> tok
+          </span>
+          <span
+            data-testid="river-tps"
+            data-quality={hasRateWindow ? 'estimated' : 'unavailable'}
+            title={hasRateWindow ? 'Approximate stream rate from emitted text' : 'Stream rate unavailable until two timestamped segments arrive'}
+          >
+            rate <strong className="font-medium tabular-nums text-accent">
+              {fmtTokensPerSec(hasRateWindow ? river.tokensPerSec : null)}
+            </strong>
+          </span>
+        </div>
       </div>
 
       <div
@@ -86,6 +171,20 @@ export function River({ river, exiting = false }: { river: RiverData; exiting?: 
         className="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed"
         data-testid="river-body"
       >
+        {river.status === 'failed' && (
+          <div
+            className="mb-2 rounded-sm border border-status-down/50 bg-status-down/10 px-2.5 py-2 text-status-down"
+            role="alert"
+            data-testid="river-error"
+            data-quality={river.error ? 'measured' : 'unavailable'}
+          >
+            <p className="text-[10px] font-semibold uppercase tracking-wide">request failed</p>
+            <p className="mt-0.5 whitespace-pre-wrap break-words text-[11px] text-text">
+              {river.error ?? 'No failure detail was reported.'}
+            </p>
+          </div>
+        )}
+
         {/* Honest memory-cap marker: text only ever disappears from the top past the riverModel
             caps, and then it says so — never a silent ring truncation. */}
         {river.truncated && (
@@ -125,9 +224,9 @@ export function River({ river, exiting = false }: { river: RiverData; exiting?: 
         </p>
 
         {/* Tool calls — compact cards. */}
-        {river.tools.length > 0 && (
+        {visibleTools.length > 0 && (
           <div className="mt-2 flex flex-col gap-1" data-testid="river-tools">
-            {river.tools.map((tool, i) => (
+            {visibleTools.map((tool, i) => (
               <div key={i} className="rounded-sm border border-line bg-panel-raised px-2 py-1 text-[11px] text-meta">
                 {tool}
               </div>

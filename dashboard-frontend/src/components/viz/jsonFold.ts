@@ -5,8 +5,8 @@
  * This module turns that flat list into a foldable, searchable view WITHOUT re-parsing: it
  * pairs each container's opening line with its closing line (a bracket-matching stack pass),
  * records each line's ancestor containers, and computes the visible row order given a set of
- * collapsed paths OR an active search query. Pure + synchronous so it unit-tests directly and
- * memoizes cleanly in `JsonPane`.
+ * collapsed paths, an active search query, OR a set of transformation-operation paths. Pure +
+ * synchronous so it unit-tests directly and memoizes cleanly in `JsonPane`.
  */
 import type { JsonLine } from './jsonLines';
 
@@ -110,6 +110,8 @@ export interface RowsResult {
  * The visible rows in render order.
  *  - Search mode (non-empty query): every line whose text contains the query (case-insensitive)
  *    PLUS its ancestor container lines (for context), fold state ignored, matches flagged.
+ *  - Focus mode (`focusPaths` supplied): each operation root plus its ancestor containers. A
+ *    container operation renders as a compact folded summary instead of dumping its whole subtree.
  *  - Fold mode: the full document, except collapsed containers render as a single summary row
  *    and their descendants (and close line) are skipped.
  */
@@ -118,6 +120,7 @@ export function computeRows(
   model: FoldModel,
   collapsed: ReadonlySet<string>,
   query: string,
+  focusPaths?: ReadonlySet<string>,
 ): RowsResult {
   const q = query.trim().toLowerCase();
 
@@ -142,6 +145,34 @@ export function computeRows(
         block: model.blocksByOpen.get(i),
       }));
     return { rows, matchCount: matched.size };
+  }
+
+  if (focusPaths !== undefined) {
+    // Closing braces inherit their container's path, but focus mode wants the OPEN row only; that
+    // row can render the useful `{ … } N` summary. Including the close would duplicate an operation.
+    const focused = new Set<number>();
+    lines.forEach((line, i) => {
+      if (focusPaths.has(line.path) && !isCloseLine(line.text)) focused.add(i);
+    });
+    const keep = new Set<number>();
+    for (const index of focused) {
+      keep.add(index);
+      for (const ancestor of model.ancestorsByLine[index] ?? []) keep.add(ancestor);
+    }
+    const rows = [...keep]
+      .sort((a, b) => a - b)
+      .map((i) => {
+        const block = model.blocksByOpen.get(i);
+        return {
+          index: i,
+          line: lines[i]!,
+          foldable: !!block,
+          folded: focused.has(i) && !!block,
+          isMatch: false,
+          block,
+        };
+      });
+    return { rows, matchCount: 0 };
   }
 
   const rows: FoldRow[] = [];

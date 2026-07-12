@@ -89,15 +89,20 @@ const COLS: ColumnWidths = {
 export function FlowTable({
   selectedId,
   onSelect,
+  searchQuery = '',
+  onSearchQueryChange = () => {},
 }: {
   selectedId: string | null;
   onSelect: (apiCallId: string) => void;
+  /** Flows-only lookup; kept out of global hash scope because server rollups cannot apply it. */
+  searchQuery?: string;
+  onSearchQueryChange?: (query: string) => void;
 }) {
   // The filter lives in the SHARED store (D12) so Topology/Sankey clicks can drive it; the
   // FilterBar below remains the in-table editor (its onChange writes the same store).
   const filters = useFlowFilter((s) => s.filters);
   const setFilters = flowFilterStore.getState().setFilters;
-  const { rows, total, models, upstreams, clients, loadState, retry } = useFlowRows(filters);
+  const { rows, total, models, upstreams, clients, loadState, retry } = useFlowRows(filters, searchQuery);
   // Gap 09: the per-model context-window capacities (gap-06 nullable `context_limit`), for the
   // aggregate context-pressure stat. A `null`/absent window is UNKNOWN ⇒ that flow is excluded from
   // the pressure figures (never a fabricated 0%/100%).
@@ -110,7 +115,8 @@ export function FlowTable({
   const filtered = filters.status !== null
     || filters.model !== null
     || filters.upstream !== null
-    || filters.client !== null;
+    || filters.client !== null
+    || searchQuery.trim().length > 0;
   const seeking = useDashboard((s) => s.connection === 'seeking');
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -191,8 +197,10 @@ export function FlowTable({
         total={total}
         shown={rows.length}
         onChange={setFilters}
+        searchQuery={searchQuery}
+        onSearchQueryChange={onSearchQueryChange}
       />
-      {loadState === 'error' && rows.length > 0 && !seeking && (
+      {loadState === 'error' && total > 0 && !seeking && (
         <div
           className="flex items-center gap-3 border-b border-status-cooling/40 bg-status-cooling/10 px-3 py-2 text-xs text-text"
           role="alert"
@@ -265,6 +273,8 @@ export function FlowTable({
             <FlowTableEmptyState
               loadState={loadState}
               filtered={filtered}
+              searchQuery={searchQuery}
+              total={total}
               seeking={seeking}
               onRetry={retry}
             />
@@ -290,14 +300,35 @@ export function FlowTable({
 function FlowTableEmptyState({
   loadState,
   filtered,
+  searchQuery,
+  total,
   seeking,
   onRetry,
 }: {
   loadState: 'loading' | 'ready' | 'error';
   filtered: boolean;
+  searchQuery: string;
+  total: number;
   seeking: boolean;
   onRetry: () => void;
 }) {
+  // A known in-memory population plus zero matches is already an honest search/filter result even
+  // if the background REST reconciliation is loading or stale. Do not replace that useful answer
+  // with a generic transport state; the parent renders the stale-data warning when appropriate.
+  if (total > 0 && searchQuery.trim()) {
+    return (
+      <div className="px-3 py-6 text-center text-xs text-text-muted" data-testid="flow-table-search-empty">
+        No flows match “{searchQuery.trim()}”. Try an API call ID, response ID, endpoint, model, provider, or client.
+      </div>
+    );
+  }
+  if (total > 0 && filtered) {
+    return (
+      <div className="px-3 py-6 text-center text-xs text-text-muted" data-testid="flow-table-filtered-empty">
+        No flows match the current filters.
+      </div>
+    );
+  }
   if (loadState === 'loading') {
     return (
       <div className="px-3 py-6 text-center text-xs text-text-muted" role="status" data-testid="flow-table-loading">
@@ -313,13 +344,12 @@ function FlowTableEmptyState({
       </div>
     );
   }
-  const message = seeking
-    ? 'No flows in this historical snapshot.'
-    : filtered
-      ? 'No flows match the current filters.'
-      : 'No flows yet. Waiting for requests.';
+  const message = seeking ? 'No flows in this historical snapshot.' : 'No flows yet. Waiting for requests.';
   return (
-    <div className="px-3 py-6 text-center text-xs text-text-muted" data-testid={filtered ? 'flow-table-filtered-empty' : 'flow-table-empty'}>
+    <div
+      className="px-3 py-6 text-center text-xs text-text-muted"
+      data-testid="flow-table-empty"
+    >
       {message}
     </div>
   );

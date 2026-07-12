@@ -3,15 +3,14 @@ import { createRef, StrictMode } from 'react';
 import { render, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import hljs from 'highlight.js/lib/core';
 import { JsonPane, JSON_RENDER_LINE_CAP } from './JsonPane';
-import { diffLayers } from '../FlowDetail/diff';
-import { colors } from '../../design/tokens';
+import { describeChanges, diffLayers } from '../FlowDetail/diff';
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
 
-describe('JsonPane — highlight.js JSON + per-path diff tints', () => {
+describe('JsonPane — highlight.js JSON + explicit transformation annotations', () => {
   it('renders one highlighted line per JSON line and highlight.js tokens', () => {
     const { getByTestId } = render(<JsonPane label="A" value={{ model: 'gpt-4o', stream: true }} />);
     const code = getByTestId('jsonpane-code-A');
@@ -22,53 +21,125 @@ describe('JsonPane — highlight.js JSON + per-path diff tints', () => {
     expect(code.querySelectorAll('span[class^="hljs-"]').length).toBeGreaterThan(0);
   });
 
-  it('tints added/changed paths on the RIGHT pane from a known 3-layer fixture', () => {
+  it('explains a rewritten value on the RIGHT pane with its prior value', () => {
     const inbound = { model: 'gpt-4o', temperature: 0.7, messages: [{ role: 'user', content: 'Hi' }] };
     const normalized = { model: 'llama-3.1-70b', messages: [{ role: 'user', content: 'Hi' }] };
     const diff = diffLayers(inbound, normalized);
-    const { getByTestId } = render(<JsonPane label="B" value={normalized} diff={diff} side="right" />);
+    const { getByTestId, getByLabelText } = render(
+      <JsonPane label="B" value={normalized} diff={diff} incomingChanges={describeChanges(inbound, normalized)} side="right" />,
+    );
     const code = getByTestId('jsonpane-code-B');
     const modelLine = code.querySelector('.json-line[data-path="$.model"]') as HTMLElement;
-    // model changed gpt-4o → llama: tinted with the "context" (changed) background on the right.
     expect(modelLine?.dataset.diff).toBe('changed');
-    expect(modelLine?.style.backgroundColor).not.toBe('');
+    expect(modelLine?.dataset.operation).toBe('rewritten');
+    expect(getByLabelText('was "gpt-4o"')).toBeTruthy();
+    // The redesign does not rely on a red/green background to carry the meaning.
+    expect(modelLine?.style.backgroundColor).toBe('');
   });
 
-  it('tints REMOVED paths on the LEFT pane (a field the next layer drops)', () => {
+  it('labels a removed path on the LEFT pane with its destination', () => {
     const inbound = { model: 'gpt-4o', temperature: 0.7 };
     const normalized = { model: 'gpt-4o' };
     const diff = diffLayers(inbound, normalized);
-    const { getByTestId } = render(<JsonPane label="A" value={inbound} diff={diff} side="left" />);
+    const { getByTestId, getByLabelText } = render(
+      <JsonPane
+        label="A"
+        stage={{ step: 'A', title: 'Client payload', subtitle: 'captured at ingress', nextLabel: 'canonical' }}
+        value={inbound}
+        diff={diff}
+        outgoingChanges={describeChanges(inbound, normalized)}
+        side="left"
+      />,
+    );
     const code = getByTestId('jsonpane-code-A');
     const tempLine = code.querySelector('.json-line[data-path="$.temperature"]') as HTMLElement;
     expect(tempLine?.dataset.diff).toBe('removed');
-    // The removed tint resolves from the design token (non-empty background).
-    expect(tempLine?.style.backgroundColor).not.toBe('');
-    void colors; // token module imported to confirm tint derivation is wired
+    expect(tempLine?.dataset.operation).toBe('omitted');
+    expect(getByLabelText('not in canonical')).toBeTruthy();
   });
 
-  it('tints EVERY line of an added nested subtree, not just its opening bracket (finding 3)', () => {
+  it('retains descendant classifications for diagnostics while annotating the operation root once', () => {
     const left = { model: 'x' };
     const right = { model: 'x', tools: [{ name: 'search' }] };
     const diff = diffLayers(left, right);
-    const { getByTestId } = render(<JsonPane label="C" value={right} diff={diff} side="right" />);
+    const { getByTestId, getAllByLabelText } = render(
+      <JsonPane label="C" value={right} diff={diff} incomingChanges={describeChanges(left, right)} side="right" />,
+    );
     const code = getByTestId('jsonpane-code-C');
-    // The container line AND each nested line under the new subtree carry an added tint.
+    // The structural map remains descendant-aware, but the visible explanation is one operation
+    // at the subtree root — “tools added”, not a badge on every tool-schema line.
     expect((code.querySelector('.json-line[data-path="$.tools"]') as HTMLElement)?.dataset.diff).toBe('added');
     expect((code.querySelector('.json-line[data-path="$.tools[0]"]') as HTMLElement)?.dataset.diff).toBe('added');
     expect((code.querySelector('.json-line[data-path="$.tools[0].name"]') as HTMLElement)?.dataset.diff).toBe('added');
+    expect(getAllByLabelText('introduced here')).toHaveLength(1);
   });
 
-  it('renders BOTH a composite added-removed tint on the middle pane (finding 5)', () => {
-    // A field introduced by A→B and dropped by B→C: pane B (side `both`) gets the composite kind
-    // and renders a gradient carrying BOTH signals, not just the add.
+  it('renders BOTH explicit operations when B introduces a field and drops it before C', () => {
+    const a = {};
+    const b = { b_only: 1 };
+    const c = {};
     const diff = new Map([['$.b_only', 'added-removed' as const]]);
-    const { getByTestId } = render(<JsonPane label="B" value={{ b_only: 1 }} diff={diff} side="both" />);
+    const { getByTestId, getByLabelText } = render(
+      <JsonPane
+        label="B"
+        stage={{ step: 'B', title: 'Gateway canonical', subtitle: 'Responses protocol', nextLabel: 'upstream' }}
+        value={b}
+        diff={diff}
+        incomingChanges={describeChanges(a, b)}
+        outgoingChanges={describeChanges(b, c)}
+        side="both"
+      />,
+    );
     const code = getByTestId('jsonpane-code-B');
     const line = code.querySelector('.json-line[data-path="$.b_only"]') as HTMLElement;
     expect(line?.dataset.diff).toBe('added-removed');
-    // A gradient (both halves) — not a single solid colour — encodes the dual classification.
-    expect(line?.style.backgroundImage).toContain('gradient');
+    expect(line?.dataset.operation).toBe('introduced omitted');
+    expect(getByLabelText('introduced here')).toBeTruthy();
+    expect(getByLabelText('not sent upstream')).toBeTruthy();
+  });
+
+  it('changes-only mode shows operation roots + ancestors and folds a large new subtree', () => {
+    const left = { model: 'x', keep: 'unchanged' };
+    const right = { model: 'y', keep: 'unchanged', tools: [{ name: 'search' }, { name: 'fetch' }] };
+    const { getByTestId, queryByText, rerender } = render(
+      <JsonPane
+        label="focused"
+        value={right}
+        diff={diffLayers(left, right)}
+        incomingChanges={describeChanges(left, right)}
+        changesOnly
+      />,
+    );
+    const code = getByTestId('jsonpane-code-focused');
+    expect(code.querySelector('.json-line[data-path="$.model"]')).toBeTruthy();
+    expect(code.querySelector('.json-line[data-path="$.keep"]')).toBeNull();
+    const tools = code.querySelector('.json-line[data-path="$.tools"]');
+    expect(tools?.textContent).toContain('… ]');
+    expect(tools?.textContent).toContain('2');
+    expect(code.querySelector('.json-line[data-path="$.tools[0].name"]')).toBeNull();
+    expect(getByTestId('jsonpane-change-count-focused').textContent).toContain('2 ops');
+
+    // Search intentionally overrides the compact filter and scans the complete representation.
+    rerender(
+      <JsonPane
+        label="focused"
+        value={right}
+        diff={diffLayers(left, right)}
+        incomingChanges={describeChanges(left, right)}
+        changesOnly
+        query="unchanged"
+      />,
+    );
+    expect(queryByText(/unchanged/)).toBeTruthy();
+  });
+
+  it('states explicitly when a stage has no operations in changes-only mode', () => {
+    const value = { model: 'same' };
+    const { getByTestId, queryByTestId } = render(
+      <JsonPane label="same" value={value} incomingChanges={describeChanges(value, value)} changesOnly />,
+    );
+    expect(getByTestId('jsonpane-no-changes-same').textContent).toContain('no operations');
+    expect(queryByTestId('jsonpane-code-same')).toBeNull();
   });
 
   it('shows the evicted placeholder (not undefined) when the body is absent', () => {
@@ -141,6 +212,8 @@ describe('JsonPane — highlight.js JSON + per-path diff tints', () => {
     );
     const scroll = getByTestId('jsonpane-scroll-sync');
     expect(scrollRef.current).toBe(scroll);
+    expect(scroll.tabIndex).toBe(0);
+    expect(scroll.getAttribute('aria-label')).toBe('sync JSON');
     scroll.scrollTop = 20;
     fireEvent.scroll(scroll);
     expect(onScroll).toHaveBeenCalledTimes(1);

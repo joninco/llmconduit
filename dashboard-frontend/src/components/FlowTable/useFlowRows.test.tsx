@@ -18,12 +18,12 @@ import type { FlowSummary, FlowsResponse } from '../../api/types';
  */
 
 /** Render `useFlowRows` inside the connection's QueryClient (built fresh per `getConnection`). */
-function renderRows(filters: FlowFilters = EMPTY_FILTERS) {
+function renderRows(filters: FlowFilters = EMPTY_FILTERS, searchQuery = '') {
   const { queryClient } = getConnection();
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
   );
-  return renderHook(() => useFlowRows(filters), { wrapper });
+  return renderHook(() => useFlowRows(filters, searchQuery), { wrapper });
 }
 
 /** A `fetch` stub answering ONLY `/flows` with the given list; everything else 404s. */
@@ -146,6 +146,34 @@ describe('useFlowRows — provider-attempt drilldown', () => {
     const { result } = renderRows({ ...EMPTY_FILTERS, upstream: 'provider-a' });
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
     expect(result.current.rows.map((row) => row.api_call_id)).toEqual(['api_failover']);
+  });
+});
+
+describe('useFlowRows — view-local multi-field search', () => {
+  beforeEach(() => resetWorld());
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('searches the merged population and keeps total as the pre-search denominator', async () => {
+    stubFlowsFetch([]);
+    seedFlows([
+      makeFlow({ api_call_id: 'api_success', status: 'completed', response_id: 'resp_123', upstream_target: 'provider-b' }),
+      makeFlow({
+        api_call_id: 'api_failover', status: 'completed', upstream_target: 'provider-b',
+        attempts: [
+          { provider: 'provider-a', model: 'm', start_ms: 1, end_ms: 2, status: 'failed', error_class: 'timeout' },
+          { provider: 'provider-b', model: 'm', start_ms: 3, end_ms: 4, status: 'served' },
+        ],
+      }),
+    ]);
+
+    const { result } = renderRows(EMPTY_FILTERS, 'provider-a timeout');
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
+    expect(result.current.rows.map((row) => row.api_call_id)).toEqual(['api_failover']);
+    expect(result.current.total).toBe(2);
   });
 });
 

@@ -3,11 +3,10 @@
  *
  * The inspector shows three layers of the SAME logical request as it is transformed:
  *   A = raw inbound body      → B = normalized Responses    → C = upstream chat body
- * To tint what the gateway changed, we compare the layer to the PREVIOUS one and classify
+ * To locate what the gateway changed, we compare the layer to the PREVIOUS one and classify
  * every JSON path as added / removed / changed / unchanged. The classification is keyed by a
- * canonical path string (`$.a.b[0].c`) so a `JsonPane` rendering the *right-hand* layer can
- * look up the tint for the value it is about to print, and a pane rendering the *left-hand*
- * layer can show what was removed.
+ * canonical path string (`$.a.b[0].c`) so `JsonPane` can attach operation diagnostics to the
+ * exact value and a pane rendering the *left-hand* layer can show what was removed.
  *
  * "Structural" = we walk the parsed JSON tree by path, NOT a textual line diff. Reordered
  * object keys therefore do NOT register as a change (objects are compared key-wise); only a
@@ -34,9 +33,34 @@ export type DiffKind =
 /**
  * A flat path→kind map for one layer comparison. Keys are canonical JSON paths
  * (`$`, `$.model`, `$.messages[0].role`). `removed` entries describe paths that exist in the
- * LEFT layer but not the RIGHT — they are surfaced so the left pane can tint a dropped field.
+ * LEFT layer but not the RIGHT — they are surfaced so the left pane can explain a dropped field.
  */
 export type DiffMap = ReadonlyMap<string, DiffKind>;
+
+/**
+ * One OPERATOR-SIZED transformation at a JSON path. Unlike `DiffMap`, which marks every
+ * descendant so the old background tint could cover a whole subtree, this map records one entry
+ * for the root of an added/removed subtree and one entry for each rewritten leaf/type boundary.
+ * That makes it suitable for counts, a changes-only view, and explicit inline explanations.
+ */
+export type ChangeKind = 'added' | 'removed' | 'changed';
+
+export interface ChangeDetail {
+  kind: ChangeKind;
+  /** Value before this transformation. Undefined only when `kind === 'added'`. */
+  before: unknown;
+  /** Value after this transformation. Undefined only when `kind === 'removed'`. */
+  after: unknown;
+}
+
+export type ChangeMap = ReadonlyMap<string, ChangeDetail>;
+
+export interface ChangeSummary {
+  added: number;
+  changed: number;
+  removed: number;
+  total: number;
+}
 
 /** Root path token; every other path is built by appending a key or `[i]` segment. */
 export const ROOT_PATH = '$';
@@ -205,10 +229,9 @@ export function deepEqual(a: unknown, b: unknown): boolean {
 }
 
 /**
- * Builds the path→kind map for `right` relative to `left`. The result tints the RIGHT pane
- * (added/changed paths) and lets the LEFT pane surface `removed` paths. A missing layer
- * (`undefined` — e.g. body evicted) yields an empty map so panes render untinted rather than
- * flagging the whole document.
+ * Builds the path→kind map for `right` relative to `left`. The result lets the RIGHT pane surface
+ * added/changed paths and the LEFT pane surface removed paths. A missing layer (`undefined` —
+ * e.g. body evicted) yields an empty map rather than claiming the whole document changed.
  */
 export function diffLayers(left: unknown, right: unknown): DiffMap {
   const out = new Map<string, DiffKind>();
@@ -218,10 +241,76 @@ export function diffLayers(left: unknown, right: unknown): DiffMap {
 }
 
 /**
- * Tints for the MIDDLE pane (B), which sits between two comparisons: it is the RIGHT side of
+ * Records concise transformation operations between two layers. A whole introduced/dropped
+ * subtree is ONE operation (at its root), while same-shaped objects/arrays recurse to the precise
+ * rewritten leaf. This intentionally differs from `diffLayers`' descendant-heavy paint map: an
+ * operator should read “tools added” once, not “437 green lines”.
+ */
+function walkChanges(
+  path: string,
+  left: unknown,
+  right: unknown,
+  leftHas: boolean,
+  rightHas: boolean,
+  out: Map<string, ChangeDetail>,
+): void {
+  if (leftHas && !rightHas) {
+    out.set(path, { kind: 'removed', before: left, after: undefined });
+    return;
+  }
+  if (!leftHas && rightHas) {
+    out.set(path, { kind: 'added', before: undefined, after: right });
+    return;
+  }
+  if (isPlainObject(left) && isPlainObject(right)) {
+    const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
+    for (const key of keys) {
+      walkChanges(
+        pathKey(path, key),
+        left[key],
+        right[key],
+        Object.prototype.hasOwnProperty.call(left, key),
+        Object.prototype.hasOwnProperty.call(right, key),
+        out,
+      );
+    }
+    return;
+  }
+  if (Array.isArray(left) && Array.isArray(right)) {
+    const len = Math.max(left.length, right.length);
+    for (let i = 0; i < len; i++) {
+      walkChanges(pathIndex(path, i), left[i], right[i], i < left.length, i < right.length, out);
+    }
+    return;
+  }
+  if (!leafEqual(left, right)) {
+    out.set(path, { kind: 'changed', before: left, after: right });
+  }
+}
+
+/** Missing/evicted layers yield no claimed operations, matching `diffLayers`. */
+export function describeChanges(left: unknown, right: unknown): ChangeMap {
+  const out = new Map<string, ChangeDetail>();
+  if (left === undefined || right === undefined) return out;
+  walkChanges(ROOT_PATH, left, right, true, true, out);
+  return out;
+}
+
+/** Stable roll-up used by the transformation rail; counts operation roots, not painted lines. */
+export function summarizeChanges(changes: ChangeMap): ChangeSummary {
+  const summary: ChangeSummary = { added: 0, changed: 0, removed: 0, total: 0 };
+  for (const change of changes.values()) {
+    summary[change.kind]++;
+    summary.total++;
+  }
+  return summary;
+}
+
+/**
+ * Classifications for the MIDDLE pane (B), which sits between two comparisons: it is the RIGHT side of
  * A→B (so its `added`/`changed` paths show how the gateway built B from A) AND the LEFT side of
  * B→C (so a field B carries that C drops must show as `removed`). This overlays the two maps so
- * pane B (side `both`, JsonPane) tints BOTH directions. Without this, pane B never shows B→C
+ * pane B (side `both`, JsonPane) exposes BOTH directions. Without this, pane B never shows B→C
  * removals (finding 4).
  *
  * A path classified by BOTH comparisons keeps BOTH (finding 5): an A→B `added`+B→C `removed`

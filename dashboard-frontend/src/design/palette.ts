@@ -39,13 +39,7 @@ function channelToHex(triple: string): string {
 }
 
 /** Hex palette derived from the channels (single source stays `CHANNELS`). */
-export const PALETTE: Record<ChannelKey, string> & {
-  diffAddBg: string;
-  diffAddText: string;
-  diffRemoveBg: string;
-  diffRemoveText: string;
-  diffContextBg: string;
-} = {
+export const PALETTE: Record<ChannelKey, string> = {
   bg: channelToHex(CHANNELS.bg),
   panel: channelToHex(CHANNELS.panel),
   panelRaised: channelToHex(CHANNELS.panelRaised),
@@ -57,12 +51,6 @@ export const PALETTE: Record<ChannelKey, string> & {
   meta: channelToHex(CHANNELS.meta),
   text: channelToHex(CHANNELS.text),
   textMuted: channelToHex(CHANNELS.textMuted),
-  // Diff tints derived from the status/accent channels at fixed alphas.
-  diffAddBg: `rgba(${CHANNELS.statusHealthy.split(' ').join(', ')}, 0.14)`,
-  diffAddText: '#9be8b8',
-  diffRemoveBg: `rgba(${CHANNELS.statusDown.split(' ').join(', ')}, 0.14)`,
-  diffRemoveText: '#ff9d9d',
-  diffContextBg: `rgba(${CHANNELS.accent.split(' ').join(', ')}, 0.07)`,
 };
 
 export const FONTS = {

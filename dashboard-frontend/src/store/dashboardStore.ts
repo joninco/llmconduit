@@ -102,7 +102,9 @@ export interface DashboardState {
    * rivers rebuilt from it lose their head on long streams (the theater visibly deleted tokens from
    * the top, and reasoning — which streams first — vanished entirely). The fold keeps FULL stream
    * text; its own caps in riverModel bound memory (per-channel head-trim + `truncated` flag,
-   * `MAX_RIVERS`). Captured/restored with the live baseline like the ring, cleared on reset.
+   * `MAX_RIVERS`) and it retains exactly one latest terminal response after monitor eviction so
+   * an idle Theater does not blank itself. Captured/restored with the live baseline like the ring,
+   * cleared on reset.
    */
   riverFold: RiverFold;
 
@@ -323,7 +325,11 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       monitorSeqs: [...s.monitorSeqs],
       // Shallow copy is a real freeze: fold updates are immutable (fresh Map + fresh river object
       // per applied message), so the captured Map's river objects can never mutate underneath.
-      riverFold: { rivers: new Map(s.riverFold.rivers), order: [...s.riverFold.order] },
+      riverFold: {
+        rivers: new Map(s.riverFold.rivers),
+        order: [...s.riverFold.order],
+        lastTerminal: s.riverFold.lastTerminal,
+      },
     };
   },
 
@@ -349,7 +355,11 @@ export const dashboardStore = createStore<DashboardState>((set, get) => ({
       priceTable: { ...baseline.priceTable },
       monitor: [...baseline.monitor],
       monitorSeqs: [...baseline.monitorSeqs],
-      riverFold: { rivers: new Map(baseline.riverFold.rivers), order: [...baseline.riverFold.order] },
+      riverFold: {
+        rivers: new Map(baseline.riverFold.rivers),
+        order: [...baseline.riverFold.order],
+        lastTerminal: baseline.riverFold.lastTerminal,
+      },
     })),
 
   applySnapshot: (snap) =>

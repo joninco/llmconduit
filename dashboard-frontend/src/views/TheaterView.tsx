@@ -1,6 +1,7 @@
 /**
  * TheaterView (D12) — the "wow": a fullscreen-capable dark grid of live "rivers", one per active
- * stream. Each river streams its output/reasoning/tool deltas (from the store's incremental
+ * stream plus the last completed response while idle. Each river streams its
+ * output/reasoning/tool deltas (from the store's incremental
  * `riverFold`, fed per `segment_append` at arrival — ring-eviction-proof), with a per-river
  * tokens/sec meter + a blinking cursor. The grid
  * auto-sizes: 1 river → big, 2 → split, 3-6 → a 3-wide multi-grid. A fullscreen toggle expands the
@@ -14,9 +15,10 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { River } from '../components/viz/River';
 import { gridColumns } from '../components/viz/riverModel';
 import { useLingeringRivers } from '../components/viz/useLingeringRivers';
-import { useLiveRivers } from '../components/viz/useLiveRivers';
+import { useLastTerminalRiver, useLiveRivers } from '../components/viz/useLiveRivers';
 import { useDashboard } from '../store/hooks';
 import type { FlowSummary } from '../api/types';
+import { formatStaleAge } from '../lib/staleAge';
 
 export function TheaterView() {
   const seeking = useDashboard((s) => s.connection === 'seeking');
@@ -34,9 +36,15 @@ function LiveTheater() {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const fullscreenToggleRef = useRef<HTMLButtonElement>(null);
   const wasFullscreenRef = useRef(false);
-  // Terminated tiles linger-then-fade-then-remove (finding 4) rather than persisting until the
-  // monitor evicts them; the hook owns the StrictMode-safe timers.
-  const rivers = useLingeringRivers(useLiveRivers());
+  const liveRivers = useLiveRivers();
+  const lastTerminal = useLastTerminalRiver();
+  const activeCount = liveRivers.filter((river) => river.status === 'running').length;
+  // Older terminated tiles still linger/fade, but the newest terminal response is retained while
+  // no stream is active — including after monitor eviction. The hook owns boundary timers.
+  const rivers = useLingeringRivers(liveRivers, { retainLast: lastTerminal });
+  const lastResponseAtMs = activeCount === 0
+    ? lastTerminal?.terminalAtMs ?? lastTerminal?.lastMs ?? null
+    : null;
   const cols = gridColumns(rivers.length);
 
   useEffect(() => {
@@ -68,9 +76,10 @@ function LiveTheater() {
 
   const content = (
     <>
-      <header className="mb-3 flex items-center gap-3">
+      <header className="mb-3 flex flex-wrap items-center gap-3">
         <h2 id="theater-title" className="text-base font-semibold text-text">Theater</h2>
-        <p className="text-sm text-text-muted">live streams · {rivers.length} active</p>
+        <p className="text-sm text-text-muted">live streams · {activeCount} active</p>
+        {lastResponseAtMs !== null && <TheaterStaleState lastResponseAtMs={lastResponseAtMs} />}
         <button
           ref={fullscreenToggleRef}
           type="button"
@@ -94,7 +103,7 @@ function LiveTheater() {
           data-cols={cols}
         >
           {rivers.map((river) => (
-            <River key={river.id} river={river} exiting={river.exiting} />
+            <River key={river.id} river={river} exiting={river.exiting} retained={river.retained} />
           ))}
         </div>
       )}
@@ -109,6 +118,7 @@ function LiveTheater() {
         className="fixed inset-0 z-40 m-0 hidden h-[100dvh] max-h-none w-screen max-w-none flex-col border-0 bg-bg p-4 text-text backdrop:bg-black/70 open:flex"
         data-testid="theater-view"
         data-fullscreen="true"
+        data-stale={lastResponseAtMs !== null ? 'true' : undefined}
         onCancel={(event) => {
           event.preventDefault();
           setFullscreen(false);
@@ -123,9 +133,35 @@ function LiveTheater() {
     <div
       className="flex min-h-0 min-w-0 flex-1 flex-col bg-bg p-4"
       data-testid="theater-view"
+      data-stale={lastResponseAtMs !== null ? 'true' : undefined}
     >
       {content}
     </div>
+  );
+}
+
+/** Same fixed-width, once-per-second stale clock used by the Stats strip. */
+function TheaterStaleState({ lastResponseAtMs }: { lastResponseAtMs: number }) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    setNowMs(Date.now());
+    const id = globalThis.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => globalThis.clearInterval(id);
+  }, [lastResponseAtMs]);
+
+  const age = formatStaleAge(nowMs - lastResponseAtMs);
+  return (
+    <span
+      className="flex shrink-0 items-baseline gap-2 rounded border-2 border-status-cooling/70 bg-panel px-2.5 py-1 text-status-cooling shadow-lg"
+      role="status"
+      aria-label={`Theater response stale for ${age} since the last response`}
+      data-testid="theater-stale-state"
+      data-stale="true"
+    >
+      <span className="text-[10px] font-bold uppercase tracking-[0.14em]">response stale</span>
+      <span className="font-mono text-lg font-bold tabular-nums leading-none" data-testid="theater-stale-age">{age}</span>
+      <span className="hidden text-[10px] font-semibold uppercase tracking-wide sm:inline">since last response</span>
+    </span>
   );
 }
 

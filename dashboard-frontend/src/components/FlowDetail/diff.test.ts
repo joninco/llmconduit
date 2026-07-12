@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { diffLayers, deepEqual, combineMiddleDiff } from './diff';
+import { combineMiddleDiff, deepEqual, describeChanges, diffLayers, summarizeChanges } from './diff';
 
 /**
  * The structural diff is the heart of the inspector. These lock the per-JSON-path contract:
@@ -163,6 +163,37 @@ describe('combineMiddleDiff — pane B shows A→B added/changed AND B→C remov
     const mid = combineMiddleDiff(diffLayers(a, b), diffLayers(b, c));
     // `drops` was not added/changed by A→B, so the B→C removal surfaces as a plain removed.
     expect(mid.get('$.drops')).toBe('removed');
+  });
+});
+
+describe('describeChanges — operator-sized transformation model', () => {
+  it('records counterpart values for rewrites and counts a whole subtree once', () => {
+    const left = { model: 'gpt-4o', temperature: 0.7 };
+    const right = { model: 'llama', tools: [{ name: 'search', schema: { q: 'string' } }] };
+    const changes = describeChanges(left, right);
+
+    expect(changes.get('$.model')).toEqual({ kind: 'changed', before: 'gpt-4o', after: 'llama' });
+    expect(changes.get('$.temperature')).toEqual({ kind: 'removed', before: 0.7, after: undefined });
+    expect(changes.get('$.tools')).toEqual({ kind: 'added', before: undefined, after: right.tools });
+    // Descendants are intentionally absent: the UI reports “tools introduced” once.
+    expect(changes.has('$.tools[0].name')).toBe(false);
+    expect(summarizeChanges(changes)).toEqual({ added: 1, changed: 1, removed: 1, total: 3 });
+  });
+
+  it('recurses same-shaped arrays positionally but treats a type boundary as one rewrite', () => {
+    const positional = describeChanges({ xs: [1, 2] }, { xs: [1, 9, 3] });
+    expect([...positional.keys()]).toEqual(['$.xs[1]', '$.xs[2]']);
+    expect(positional.get('$.xs[1]')?.kind).toBe('changed');
+    expect(positional.get('$.xs[2]')?.kind).toBe('added');
+
+    const shape = describeChanges({ tool: 'search' }, { tool: { name: 'search' } });
+    expect([...shape.keys()]).toEqual(['$.tool']);
+    expect(shape.get('$.tool')?.kind).toBe('changed');
+  });
+
+  it('does not claim operations when either captured layer is missing', () => {
+    expect(describeChanges(undefined, { model: 'x' }).size).toBe(0);
+    expect(describeChanges({ model: 'x' }, undefined).size).toBe(0);
   });
 });
 

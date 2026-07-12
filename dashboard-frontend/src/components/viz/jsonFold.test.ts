@@ -65,3 +65,28 @@ describe('computeRows — search mode', () => {
     expect(matchCount).toBe(1);
   });
 });
+
+describe('computeRows — transformation focus mode', () => {
+  const lines = toJsonLines(VALUE);
+  const model = buildFoldModel(lines);
+
+  it('keeps operation roots + ancestors and summarizes a container operation once', () => {
+    const { rows, matchCount } = computeRows(lines, model, new Set(), '', new Set(['$.b', '$.a']));
+    expect(matchCount).toBe(0);
+    expect(rows.map((row) => row.line.path)).toEqual(['$', '$.a', '$.b']);
+    const b = rows.find((row) => row.line.path === '$.b');
+    expect(b?.foldable).toBe(true);
+    expect(b?.folded).toBe(true);
+    expect(b?.block?.childCount).toBe(1);
+  });
+
+  it('returns no rows for an explicitly empty operation set', () => {
+    expect(computeRows(lines, model, new Set(), '', new Set()).rows).toEqual([]);
+  });
+
+  it('lets search inspect unchanged fields even while focus paths are supplied', () => {
+    const { rows, matchCount } = computeRows(lines, model, new Set(), 'c', new Set(['$.a']));
+    expect(matchCount).toBe(1);
+    expect(rows.map((row) => row.line.path)).toEqual(['$', '$.b', '$.b.c']);
+  });
+});

@@ -547,6 +547,116 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on the control-room overview').toEqual([]);
   });
 
+  test('request transformation inspector explains each hop and offers compact/full views', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[0]!); // Flows
+    await page.waitForTimeout(400);
+    await page.getByTestId('flow-row').filter({ hasText: 'api_001' }).first().click();
+    await expect(page.getByTestId('flow-detail')).toBeVisible();
+
+    // The rail orients the operator before the JSON: named wire/canonical stages + concise,
+    // color-independent operation counts at each hop.
+    const rail = page.getByTestId('request-stage-rail');
+    await expect(rail).toContainText('Client payload');
+    await expect(rail).toContainText('Gateway canonical');
+    await expect(rail).toContainText('Provider payload');
+    await expect(page.getByTestId('request-hop-normalize')).toHaveAttribute(
+      'aria-label',
+      'normalize: 1 introduced, 1 rewritten, 1 omitted',
+    );
+    await expect(page.getByTestId('request-hop-lower')).toHaveAttribute(
+      'aria-label',
+      'lower: 2 introduced, 0 rewritten, 1 omitted',
+    );
+
+    // Changes-only is the useful default. Rows explain the operation in words; large new
+    // containers stay folded instead of painting every descendant green.
+    await expect(page.getByTestId('request-view-changes')).toHaveAttribute('aria-pressed', 'true');
+    const inbound = page.getByTestId('jsonpane-code-A · inbound');
+    const canonical = page.getByTestId('jsonpane-code-B · normalized');
+    const provider = page.getByTestId('jsonpane-code-C · upstream');
+    await expect(inbound.locator('.json-line[data-path="$.messages"]')).toContainText('not in canonical');
+    await expect(canonical.locator('.json-line[data-path="$.model"]')).toContainText('was');
+    await expect(canonical.locator('.json-line[data-path="$.model"]')).toContainText('gpt-4o');
+    await expect(provider.locator('.json-line[data-path="$.stream"]')).toContainText('introduced here');
+    await expect(provider.locator('.json-line[data-path="$.messages[0].content"]')).toHaveCount(0);
+
+    // Full JSON is one click away. Returning to compact mode still lets shared search inspect an
+    // unchanged/descendant value because search always scans the complete representation.
+    await page.getByTestId('request-view-all').click();
+    await expect(provider.locator('.json-line[data-path="$.messages[0].content"]')).toBeVisible();
+    await page.getByTestId('request-view-changes').click();
+    await expect(provider.locator('.json-line[data-path="$.messages[0].content"]')).toHaveCount(0);
+    await page.getByTestId('json-search-input').fill('Hi');
+    await expect(provider.locator('.json-line[data-path="$.messages[0].content"]')).toBeVisible();
+
+    expect(consoleErrors, 'console errors on request transformation inspector').toEqual([]);
+  });
+
+  test('flows direct lookup finds pasted IDs and failed-primary provenance without changing global scope', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS.find((view) => view.name === 'flows')!);
+
+    // Slash focuses the view-local lookup from anywhere in the table.
+    await page.keyboard.press('/');
+    const search = page.getByRole('searchbox', { name: 'Search flows' });
+    await expect(search).toBeFocused();
+
+    // Terms AND across fields: pasted id + served provider + visible status alias.
+    await search.fill('api_003 openai 5xx');
+    await expect(page.getByTestId('flow-count')).toHaveText('1 / 6');
+    await expect(page.getByTestId('flow-row')).toHaveCount(1);
+    await expect(page.getByTestId('flow-row')).toContainText('api_003');
+    await expect(page.getByTestId('failure-taxonomy')).toHaveAttribute('data-available', 'true');
+
+    // A failed primary is searchable even though another provider served the final response.
+    await search.fill('vllm-b http_status provider_failed');
+    await expect(page.getByTestId('flow-row')).toHaveCount(1);
+    await expect(page.getByTestId('flow-row')).toContainText('api_005');
+
+    await search.fill('missing-request');
+    await expect(page.getByTestId('flow-table-search-empty')).toContainText('No flows match “missing-request”');
+    await expect(page.getByTestId('failure-taxonomy')).toHaveAttribute('data-available', 'false');
+
+    // Escape clears lookup only; it never writes an unsupported free-text server scope into the URL.
+    await search.press('Escape');
+    await expect(search).toHaveValue('');
+    await expect(page.getByTestId('flow-count')).toHaveText('6 flows');
+    expect(new URL(page.url()).hash).not.toContain('query=');
+    expect(new URL(page.url()).hash).not.toContain('q=');
+
+    expect(consoleErrors, 'console errors on flow lookup').toEqual([]);
+  });
+
+  test('theater retains the last response after its old fade window and marks it stale', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS.find((view) => view.name === 'theater')!);
+
+    // The scripted mock response terminates shortly after connect. It remains as the single
+    // retained tile and is clearly distinguished from active streaming output.
+    const river = page.getByTestId('river');
+    await expect(river).toHaveAttribute('data-retained', 'true');
+    await expect(river).toHaveAttribute('data-stale', 'true');
+    await expect(river.getByTestId('river-output')).toContainText('Hello, world');
+    await expect(page.getByTestId('theater-view')).toContainText('0 active');
+    await expect(page.getByTestId('theater-stale-state')).toBeVisible();
+    await expect(page.getByTestId('theater-stale-age')).toHaveText('00:00');
+    // Status is text-first (not just a colored dot), and the compact telemetry is honest about
+    // estimated tokens plus an unavailable rate when the mock has no measurable timestamp span.
+    await expect(river.getByTestId('river-status')).toHaveText(/complete/i);
+    await expect(river.getByTestId('river-elapsed')).toContainText('elapsed');
+    await expect(river.getByTestId('river-tokens')).toHaveAttribute('data-quality', 'estimated');
+    await expect(river.getByTestId('river-tps')).toHaveAttribute('data-quality', 'unavailable');
+    await expect(river.getByTestId('river-tps')).toContainText('rate —');
+
+    // This crosses the former 4s linger + 0.4s fade boundary. The last response must not vanish.
+    await page.waitForTimeout(4_600);
+    await expect(river).toBeVisible();
+    await expect(river.getByTestId('river-retained-badge')).toHaveText('last response');
+
+    expect(consoleErrors, 'console errors on retained Theater response').toEqual([]);
+  });
+
   // Adjustable FlowDetail sections: draggable splitters (persisted via localStorage), the three
   // collapse-to-strip surfaces, and per-pane zoom with the Esc PRECEDENCE contract (first Esc
   // restores zoom, second dismisses — with NO zoom the first Esc still dismisses, which every
@@ -613,9 +723,10 @@ test.describe('Argus dashboard', () => {
     // 6 — FULL-RANGE pane: drag the A|B splitter hard right — B (and possibly C) collapse to
     // their labeled slivers; clicking a sliver restores that pane.
     const ab = (await page.getByTestId('split-ab').boundingBox())!;
-    await page.mouse.move(ab.x + ab.width / 2, ab.y + 200);
+    const abMidY = ab.y + ab.height / 2;
+    await page.mouse.move(ab.x + ab.width / 2, abMidY);
     await page.mouse.down();
-    await page.mouse.move(ab.x + 900, ab.y + 200, { steps: 10 });
+    await page.mouse.move(ab.x + 900, abMidY, { steps: 10 });
     await page.mouse.up();
     await expect(page.getByTestId('pane-strip-b')).toBeVisible();
     await page.getByTestId('pane-strip-b').click();

@@ -41,7 +41,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
   });
   afterEach(cleanup);
 
-  it('renders all 3 bodies and tints the diff between layers (A→B→C)', async () => {
+  it('renders all 3 stages with explicit operations and toggles from changes to full JSON', async () => {
     const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
     // The /flows/:id query resolves the three bodies.
     await waitFor(() => expect(getByTestId('jsonpane-code-A · inbound').querySelectorAll('.json-line').length).toBeGreaterThan(0));
@@ -49,10 +49,17 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     const paneC = getByTestId('jsonpane-code-C · upstream');
     expect(paneB.querySelectorAll('.json-line').length).toBeGreaterThan(0);
     expect(paneC.querySelectorAll('.json-line').length).toBeGreaterThan(0);
-    // The mock bodies differ at $.model (gpt-4o → llama) and add $.stream on C — tinted lines exist.
-    const tintedB = paneB.querySelectorAll('.json-line[data-diff]');
-    const tintedC = paneC.querySelectorAll('.json-line[data-diff]');
-    expect(tintedB.length + tintedC.length).toBeGreaterThan(0);
+    expect(getByTestId('request-hop-normalize').getAttribute('aria-label')).toContain('rewritten');
+    expect(getByTestId('request-hop-lower').getAttribute('aria-label')).toContain('introduced');
+    expect(getByTestId('request-view-changes').getAttribute('aria-pressed')).toBe('true');
+
+    // C's provider-only stream flag is stated explicitly; the added messages subtree is compact.
+    expect((paneC.querySelector('.json-line[data-path="$.stream"]') as HTMLElement)?.dataset.operation).toBe('introduced');
+    expect(paneC.querySelector('.json-line[data-path="$.messages[0].content"]')).toBeNull();
+
+    // Full JSON remains available without leaving the inspector.
+    fireEvent.click(getByTestId('request-view-all'));
+    await waitFor(() => expect(paneC.querySelector('.json-line[data-path="$.messages[0].content"]')).toBeTruthy());
   });
 
   it('distinguishes initial detail loading from a retryable load failure and body eviction', async () => {
@@ -151,9 +158,9 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     expect(dashboardStore.getState().flows.get(MOCK_KILL_UNAUTHORIZED_ID)).toBeUndefined();
   });
 
-  it('pane B marks a field present in B but dropped by C as removed (finding 4)', async () => {
+  it('pane B labels a field present in B but dropped by C as not sent upstream (finding 4)', async () => {
     // A crafted 3-layer fixture where `b_only` exists in B (normalized) but is dropped in C
-    // (upstream). Pane B must visibly tint `b_only` as REMOVED (it leaves on the way to C), which
+    // (upstream). Pane B must explicitly label `b_only` as REMOVED (it leaves on the way to C), which
     // the A→B-only diff never showed. `api_replay` is unknown to the mock so /flows/:id 404s and
     // does NOT overwrite the injected detail.
     seedFlows([makeFlow({ api_call_id: 'api_replay', response_id: 'resp_replay', status: 'completed', started_ms: 1_700_000_000_000 })]);
@@ -172,8 +179,9 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     await waitFor(() => expect(getByTestId('jsonpane-code-B · normalized').querySelectorAll('.json-line').length).toBeGreaterThan(0));
     const paneB = getByTestId('jsonpane-code-B · normalized');
     const bOnlyLine = paneB.querySelector('.json-line[data-path="$.b_only"]') as HTMLElement | null;
-    // The B-only field that C drops is tinted removed in pane B (combined middle diff).
+    // The B-only field that C drops is classified and verbally explained in pane B.
     expect(bOnlyLine?.dataset.diff).toBe('removed');
+    expect(bOnlyLine?.textContent).toContain('not sent upstream');
   });
 
   it('replays REST detail.deltas into the deltas panel for a completed flow (finding 5)', async () => {

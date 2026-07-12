@@ -5,10 +5,16 @@
  * changes when a river-bearing message was folded.
  */
 import { useMemo } from 'react';
-import { finalizeRivers, type River } from './riverModel';
+import { finalizeLastTerminalRiver, finalizeRivers, type River } from './riverModel';
 import { useDashboard } from '../../store/hooks';
 
 export function useLiveRivers(): River[] {
   const fold = useDashboard((s) => s.riverFold);
   return useMemo(() => finalizeRivers(fold), [fold]);
+}
+
+/** Newest terminal response, retained outside the active river map for Theater idle mode. */
+export function useLastTerminalRiver(): River | null {
+  const fold = useDashboard((s) => s.riverFold);
+  return useMemo(() => finalizeLastTerminalRiver(fold), [fold]);
 }

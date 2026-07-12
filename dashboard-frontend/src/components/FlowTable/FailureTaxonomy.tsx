@@ -10,9 +10,9 @@
  * 0%`). Design language matches the inspector's other instruments (`AttemptTrace`, `LatencyBreakdown`,
  * the stats strip): `tabular-nums`, the Night Watch status tokens, an instrument feel.
  *
- * SOURCE: the same observed flow population the FlowTable shows — `useFlowRows(filters)` (live WS
- * store ∪ the `/flows` query, scoped by the active filter bar). So filtering to a provider re-scopes
- * the taxonomy to that provider's failures too.
+ * SOURCE: the same observed flow population the FlowTable shows — `useFlowRows(filters,
+ * searchQuery)` (live WS store ∪ the `/flows` query, scoped by facets + view-local search). So a
+ * provider facet or pasted request lookup re-scopes the taxonomy too.
  */
 import { useMemo } from 'react';
 import { useDashboard, useFlowFilter } from '../../store/hooks';
@@ -31,9 +31,9 @@ export const FAILURE_RATE_THRESHOLD = 5;
  * all-success window which shows a MEASURED-base derived `0%`. A blank/hidden panel would conflate the
  * two — a zero-sample window must read "unmeasured (—)", not "0% / no failures".
  */
-export function FailureTaxonomy() {
+export function FailureTaxonomy({ searchQuery = '' }: { searchQuery?: string }) {
   const filters = useFlowFilter((s) => s.filters);
-  const { rows } = useFlowRows(filters);
+  const { rows } = useFlowRows(filters, searchQuery);
   const seeking = useDashboard((s) => s.connection === 'seeking');
   const model = useMemo(() => failureTaxonomy(rows), [rows]);
   const observed = model.available;

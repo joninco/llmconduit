@@ -29,6 +29,10 @@ export interface River {
   id: string;
   model: string | null;
   status: DebugRequestStatus;
+  /** Request start from the monitor clock; distinct from the first emitted segment (TTFT). */
+  startedAtMs: number | null;
+  /** Terminal failure detail, bounded by `RIVER_ERROR_CHAR_CAP`; null for non-failures. */
+  error: string | null;
   /** Concatenated `output` deltas (the bright mono body). */
   output: string;
   /** Concatenated `reasoning` deltas (dim, rendered ABOVE the output — it streams first). */
@@ -75,6 +79,8 @@ export interface RiverAccum {
   id: string;
   model: string | null;
   status: DebugRequestStatus;
+  startedAtMs: number | null;
+  error: string | null;
   output: string;
   reasoning: string;
   /** Coalesced tool RUNS (split into per-call cards only at finalize). */
@@ -93,6 +99,12 @@ export interface RiverFold {
   rivers: Map<string, RiverAccum>;
   /** First-seen river order (render order). */
   order: string[];
+  /**
+   * Newest terminal response, retained independently of the active map. Monitor retention later
+   * sends `request_remove`; keeping this single bounded snapshot prevents an idle Theater from
+   * going blank while avoiding an unbounded archive of completed bodies.
+   */
+  lastTerminal: RiverAccum | null;
 }
 
 const CHARS_PER_TOKEN = 4;
@@ -107,6 +119,8 @@ export const RIVER_CHANNEL_CHAR_CAP = 1_500_000;
 const RIVER_CHANNEL_KEEP = 1_350_000;
 /** Total chars across a river's tool runs (oldest runs drop first). */
 export const RIVER_TOOL_CHAR_CAP = 300_000;
+/** Max retained terminal-error text per river. Failure detail stays useful without unbounded memory. */
+export const RIVER_ERROR_CHAR_CAP = 4_000;
 /** Max concurrently-tracked rivers; creating past the cap evicts the oldest TERMINAL river first. */
 export const MAX_RIVERS = 24;
 
@@ -117,15 +131,23 @@ function approxTokensFor(text: string): number {
 
 /** A fresh, empty fold (store initial state / `buildRivers` seed). */
 export function createRiverFold(): RiverFold {
-  return { rivers: new Map(), order: [] };
+  return { rivers: new Map(), order: [], lastTerminal: null };
 }
 
 function emptyRiver(id: string): RiverAccum {
   return {
-    id, model: null, status: 'running', output: '', reasoning: '', toolRuns: [],
+    id, model: null, status: 'running', startedAtMs: null, error: null,
+    output: '', reasoning: '', toolRuns: [],
     lastWasTool: false, truncated: false, firstMs: null, lastMs: null, terminalAtMs: null,
     approxTokens: 0,
   };
+}
+
+/** Preserve the useful head of a terminal error while keeping the incremental fold bounded. */
+function capError(error: string | null | undefined): string | null {
+  if (!error) return null;
+  if (error.length <= RIVER_ERROR_CHAR_CAP) return error;
+  return `${error.slice(0, RIVER_ERROR_CHAR_CAP - 1)}…`;
 }
 
 /** Head-trim a channel past its cap (keep the newest `RIVER_CHANNEL_KEEP` chars). */
@@ -167,12 +189,14 @@ export function foldRiverMessage(fold: RiverFold, msg: DebugWsMessage): RiverFol
         ...base,
         model: msg.request.model,
         status: msg.request.status,
+        startedAtMs: msg.request.started_at_ms,
+        error: msg.request.status === 'failed' ? capError(msg.request.error ?? base.error) : null,
         // Record the terminal instant from the monitor's own clock (a replayed/already-finished
         // flow upserts as terminal) so the linger fade counts from when it ACTUALLY finished.
         terminalAtMs:
           msg.request.status === 'running'
             ? null
-            : (msg.request.completed_at_ms ?? base.terminalAtMs ?? base.lastMs),
+            : (msg.request.completed_at_ms ?? base.terminalAtMs ?? base.lastMs ?? msg.request.updated_at_ms),
       };
       return insertRiver(fold, next, prev !== undefined);
     }
@@ -216,6 +240,7 @@ export function foldRiverMessage(fold: RiverFold, msg: DebugWsMessage): RiverFol
       const next: RiverAccum = {
         ...base,
         status: msg.status,
+        error: msg.status === 'failed' ? capError(msg.error ?? base.error) : null,
         // A terminal status stamps the river's finish instant (the monitor's `completed_at_ms`,
         // falling back to its last segment ts); returning to running clears it.
         terminalAtMs:
@@ -227,7 +252,9 @@ export function foldRiverMessage(fold: RiverFold, msg: DebugWsMessage): RiverFol
       if (!fold.rivers.has(msg.response_id)) return fold;
       const rivers = new Map(fold.rivers);
       rivers.delete(msg.response_id);
-      return { rivers, order: fold.order.filter((id) => id !== msg.response_id) };
+      // `lastTerminal` intentionally survives monitor eviction: it is the Theater's one-response
+      // idle retention, replaced by the next terminal response and cleared only with the store.
+      return { rivers, order: fold.order.filter((id) => id !== msg.response_id), lastTerminal: fold.lastTerminal };
     }
     // These arms carry no river body — intentionally ignored, but enumerated so a NEW protocol
     // arm (added to the `DebugWsMessage` union) is a COMPILE error here, not a silent drop
@@ -266,7 +293,39 @@ function insertRiver(fold: RiverFold, river: RiverAccum, existed: boolean): Rive
     }
   }
   rivers.set(river.id, river);
-  return { rivers, order };
+  return {
+    rivers,
+    order,
+    // A terminal river becomes the retained response. Later terminal segments update this same
+    // snapshot; running activity leaves the previous completed response available for idle mode.
+    lastTerminal: river.status === 'running' ? fold.lastTerminal : river,
+  };
+}
+
+/** Project one accumulator into the public/render-ready river shape. */
+function finalizeRiver(r: RiverAccum): River {
+  // A still-running river with a single timestamp has no measurable rate yet (0); a completed
+  // river keeps its final rate.
+  const tokensPerSec =
+    r.firstMs != null && r.lastMs != null && r.lastMs > r.firstMs
+      ? r.approxTokens / ((r.lastMs - r.firstMs) / 1000)
+      : 0;
+  return {
+    id: r.id,
+    model: r.model,
+    status: r.status,
+    startedAtMs: r.startedAtMs,
+    error: r.error,
+    output: r.output,
+    reasoning: r.reasoning,
+    tools: r.toolRuns.flatMap(splitToolCallText),
+    truncated: r.truncated,
+    firstMs: r.firstMs,
+    lastMs: r.lastMs,
+    terminalAtMs: r.status !== 'running' && r.terminalAtMs == null ? r.lastMs : r.terminalAtMs,
+    approxTokens: r.approxTokens,
+    tokensPerSec,
+  };
 }
 
 /**
@@ -277,29 +336,12 @@ function insertRiver(fold: RiverFold, river: RiverAccum, existed: boolean): Rive
  * an absolute anchor (finding 4). Pure — memoize on the fold reference.
  */
 export function finalizeRivers(fold: RiverFold): River[] {
-  return fold.order.map((id) => {
-    const r = fold.rivers.get(id)!;
-    // A still-running river with a single timestamp has no measurable rate yet (0); a completed
-    // river keeps its final rate.
-    const tokensPerSec =
-      r.firstMs != null && r.lastMs != null && r.lastMs > r.firstMs
-        ? r.approxTokens / ((r.lastMs - r.firstMs) / 1000)
-        : 0;
-    return {
-      id: r.id,
-      model: r.model,
-      status: r.status,
-      output: r.output,
-      reasoning: r.reasoning,
-      tools: r.toolRuns.flatMap(splitToolCallText),
-      truncated: r.truncated,
-      firstMs: r.firstMs,
-      lastMs: r.lastMs,
-      terminalAtMs: r.status !== 'running' && r.terminalAtMs == null ? r.lastMs : r.terminalAtMs,
-      approxTokens: r.approxTokens,
-      tokensPerSec,
-    };
-  });
+  return fold.order.map((id) => finalizeRiver(fold.rivers.get(id)!));
+}
+
+/** The one terminal response retained for Theater idle mode, including after `request_remove`. */
+export function finalizeLastTerminalRiver(fold: RiverFold): River | null {
+  return fold.lastTerminal ? finalizeRiver(fold.lastTerminal) : null;
 }
 
 /**

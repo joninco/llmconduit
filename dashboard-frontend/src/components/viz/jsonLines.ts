@@ -1,21 +1,21 @@
 /**
  * Pretty-prints a JSON value into an array of LINES, each tagged with the canonical JSON path
- * (`$.messages[0].role`) of the value it introduces. This is what lets `JsonPane` tint each
- * printed line by its per-path `DiffKind` (the structural diff is path-keyed, not line-keyed):
- * the serializer is the bridge between the parsed tree the diff walks and the text highlight.js
- * colors.
+ * (`$.messages[0].role`) of the value it introduces. This is what lets `JsonPane` attach each
+ * explicit transformation annotation to its per-path `DiffKind`/`ChangeDetail` (the structural
+ * model is path-keyed, not line-keyed): the serializer bridges the parsed diff tree and rendered
+ * highlighted text.
  *
  * Mirrors `JSON.stringify(v, null, 2)` layout (2-space indent, key on the opening line) so the
  * rendered text reads like a normal pretty-print, but every line knows its path. Closing
- * brackets inherit the container's path (so a tint on a changed container also covers its
- * closing brace).
+ * brackets inherit the container's path (the renderer suppresses duplicate operation badges on
+ * those closing rows).
  */
 import { ROOT_PATH, pathIndex, pathKey } from '../../components/FlowDetail/diff';
 
 export interface JsonLine {
   /** The text of this line, already indented (no trailing newline). */
   text: string;
-  /** Canonical path of the value this line introduces (for diff tinting). */
+  /** Canonical path of the value this line introduces (for transformation annotations). */
   path: string;
   /** Indent depth (for optional gutter rendering / tests). */
   depth: number;

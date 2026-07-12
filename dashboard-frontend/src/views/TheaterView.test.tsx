@@ -53,6 +53,11 @@ describe('River — renders output/reasoning/tool deltas with tok/s + cursor', (
     expect(getByTestId('river-cursor')).not.toBeNull();
     expect(river!.tokensPerSec).toBeGreaterThan(0);
     expect(getByTestId('river-tps').textContent).toMatch(/[\d.]+ tok\/s/);
+    expect(getByTestId('river-tps').getAttribute('data-quality')).toBe('estimated');
+    // State is written in text, not encoded only by the colored dot.
+    expect(getByTestId('river-status').textContent).toContain('streaming');
+    expect(getByTestId('river-tokens').textContent).toMatch(/≈\d+ tok/);
+    expect(getByTestId('river-tokens').getAttribute('data-quality')).toBe('estimated');
     // Tool card rendered.
     expect(within(getByTestId('river-tools')).getByText('search()')).not.toBeNull();
     // Reasoning EXPANDED by default (it streams first), collapsible via the toggle.
@@ -88,8 +93,58 @@ describe('River — renders output/reasoning/tool deltas with tok/s + cursor', (
       upsert('r1', 'm', 'completed'),
       seg('r1', 'output', 'done', 1000),
     ]);
-    const { queryByTestId } = render(<River river={river!} />);
+    const { getByTestId, queryByTestId } = render(<River river={river!} />);
     expect(queryByTestId('river-cursor')).toBeNull();
+    expect(getByTestId('river-status').textContent).toContain('complete');
+    expect(getByTestId('river-elapsed').textContent).toContain('0ms');
+  });
+
+  it('ticks elapsed time while streaming and cleans up its clock on unmount', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(100_000);
+      const started = upsert('r1', 'm');
+      if (started.type !== 'request_upsert') throw new Error('fixture shape');
+      started.request.started_at_ms = 97_500;
+      const [river] = buildRivers([
+        started,
+        seg('r1', 'output', 'some streamed text', 99_000),
+        seg('r1', 'output', ' continues', 99_500),
+      ]);
+      const view = render(<River river={river!} />);
+      expect(view.getByTestId('river-elapsed').textContent).toContain('2.5s');
+      act(() => { vi.advanceTimersByTime(1_000); });
+      expect(view.getByTestId('river-elapsed').textContent).toContain('3.5s');
+      view.unmount();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('labels a failed stream and surfaces its terminal error instead of relying on red', () => {
+    const error = 'upstream timed out before the first token';
+    const [river] = buildRivers([
+      upsert('r1', 'm'),
+      seg('r1', 'tool', `failed: ${error}`, 1_500),
+      { type: 'request_status', response_id: 'r1', status: 'failed', completed_at_ms: 2_000, error },
+    ]);
+    const { getByTestId, queryByTestId } = render(<River river={river!} />);
+    expect(getByTestId('river-status').textContent).toContain('failed');
+    expect(getByTestId('river-error').textContent).toContain(error);
+    expect(getByTestId('river-error').getAttribute('data-quality')).toBe('measured');
+    // monitor.rs also emits `failed: <error>` as a tool segment; suppress that exact duplicate.
+    expect(queryByTestId('river-tools')).toBeNull();
+  });
+
+  it('makes an unreported failure detail explicit', () => {
+    const [river] = buildRivers([
+      upsert('r1', 'm'),
+      { type: 'request_status', response_id: 'r1', status: 'failed', completed_at_ms: 2_000, error: null },
+    ]);
+    const { getByTestId } = render(<River river={river!} />);
+    expect(getByTestId('river-error').textContent).toContain('No failure detail was reported.');
+    expect(getByTestId('river-error').getAttribute('data-quality')).toBe('unavailable');
   });
 });
 
@@ -189,106 +244,114 @@ function pushMonitorBare(msgs: DebugWsMessage[]): void {
   dashboardStore.getState().setConnection('live');
 }
 
-describe('TheaterView — terminated rivers linger-then-fade-then-remove (finding 4)', () => {
-  it('keeps a completed river during the linger, fades it, then removes it', () => {
+describe('TheaterView — retains the latest response and ages out older terminal rivers', () => {
+  it('keeps the latest completed response indefinitely, including after monitor removal, and ticks its stale clock', () => {
     vi.useFakeTimers();
     try {
-      // The fade is computed from the river's ABSOLUTE finish instant (`completed_at_ms`) vs the
-      // clock, so the terminal timestamp must be NOW (the fake clock) for the linger to start fresh.
       const finishedAt = Date.now();
-      const { getByTestId, queryByTestId } = render(<TheaterView />);
-      // A running river is present.
+      const { getByTestId } = render(<TheaterView />);
       act(() => {
         dashboardStore.getState().pushMonitor(upsert('r1', 'gpt-4o', 'running'), 1);
         dashboardStore.getState().pushMonitor(seg('r1', 'output', 'hi', 1000), 1);
         dashboardStore.getState().setConnection('live');
       });
-      expect(getByTestId('river')).not.toBeNull();
-
-      // Flip it terminal AT the current instant — it must NOT vanish immediately (it lingers).
       act(() => {
         dashboardStore.getState().pushMonitor({ type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: finishedAt, error: null }, 1);
       });
       expect(getByTestId('river').getAttribute('data-status')).toBe('completed');
-      expect(getByTestId('river').getAttribute('data-exiting')).toBeNull();
+      expect(getByTestId('river').getAttribute('data-retained')).toBe('true');
+      expect(getByTestId('river-retained-badge').textContent).toContain('last response');
+      expect(getByTestId('theater-view').getAttribute('data-stale')).toBe('true');
+      expect(getByTestId('theater-stale-age').textContent).toBe('00:00');
 
-      // After the linger (4s) it enters the fade phase (data-exiting), still rendered.
-      act(() => { vi.advanceTimersByTime(4_000); });
-      expect(getByTestId('river').getAttribute('data-exiting')).toBe('true');
+      // It remains after the old 4.4s removal boundary and the fixed-width clock keeps advancing.
+      act(() => { vi.advanceTimersByTime(65_000); });
+      expect(getByTestId('river').getAttribute('data-retained')).toBe('true');
+      expect(getByTestId('theater-stale-age').textContent).toBe('01:05');
 
-      // After the fade (0.4s) it is removed from the grid entirely.
-      act(() => { vi.advanceTimersByTime(400); });
-      expect(queryByTestId('river')).toBeNull();
+      // Backend monitor retention may later remove the request; Theater's bounded one-response
+      // cache intentionally survives that automatic cleanup.
+      act(() => {
+        dashboardStore.getState().pushMonitor({ type: 'request_remove', response_id: 'r1', reason: 'evicted' }, 2);
+      });
+      expect(getByTestId('river-output').textContent).toContain('hi');
+      expect(getByTestId('river').getAttribute('data-retained')).toBe('true');
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('a river that finished long ago is OMITTED immediately on (re)mount — no fresh 4s linger (finding 4)', () => {
+  it('a new running stream releases the old retained response to fade, then becomes the retained response', () => {
     vi.useFakeTimers();
     try {
-      // The river went terminal well before this mount (its `completed_at_ms` is 10s in the past,
-      // past linger+fade). The OLD bug armed a fresh `setTimeout(4s)` at mount, re-showing it for 4s;
-      // the absolute-clock lifecycle computes it as already past-fade and drops it on the first render.
-      const longAgo = Date.now() - 10_000;
-      const { queryByTestId } = render(<TheaterView />);
+      const firstFinishedAt = Date.now();
+      const { getAllByTestId, getByTestId, queryByTestId } = render(<TheaterView />);
       act(() => {
         dashboardStore.getState().pushMonitor(upsert('r1', 'gpt-4o', 'running'), 1);
-        dashboardStore.getState().pushMonitor(seg('r1', 'output', 'hi', longAgo), 1);
-        dashboardStore.getState().pushMonitor({ type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: longAgo, error: null }, 1);
+        dashboardStore.getState().pushMonitor(seg('r1', 'output', 'first', firstFinishedAt), 1);
+        dashboardStore.getState().pushMonitor({ type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: firstFinishedAt, error: null }, 1);
         dashboardStore.getState().setConnection('live');
       });
-      // Never shown — it does not restart a 4s linger on mount.
-      expect(queryByTestId('river')).toBeNull();
-      // And advancing the clock does not resurrect it.
-      act(() => { vi.advanceTimersByTime(5_000); });
-      expect(queryByTestId('river')).toBeNull();
+      expect(getByTestId('river').getAttribute('data-retained')).toBe('true');
+
+      // Running activity hides the stale clock and releases r1 into its absolute fade lifecycle.
+      act(() => {
+        dashboardStore.getState().pushMonitor(upsert('r2', 'llama', 'running'), 2);
+        dashboardStore.getState().pushMonitor(seg('r2', 'output', 'second', Date.now()), 2);
+      });
+      expect(getAllByTestId('river')).toHaveLength(2);
+      expect(queryByTestId('theater-stale-state')).toBeNull();
+      act(() => { vi.advanceTimersByTime(4_400); });
+      expect(getAllByTestId('river')).toHaveLength(1);
+      expect(getByTestId('river').getAttribute('data-river-id')).toBe('r2');
+
+      // Once r2 terminates it becomes the new permanent idle tile.
+      act(() => {
+        dashboardStore.getState().pushMonitor({ type: 'request_status', response_id: 'r2', status: 'completed', completed_at_ms: Date.now(), error: null }, 3);
+      });
+      expect(getByTestId('river').getAttribute('data-retained')).toBe('true');
+      expect(getByTestId('river-output').textContent).toContain('second');
+      expect(getByTestId('theater-stale-state')).not.toBeNull();
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('a remount does NOT restart the linger — remaining fade is computed from the finish instant (finding 4)', () => {
+  it('a long-finished response remains across Theater remounts with its absolute age', () => {
     vi.useFakeTimers();
     try {
-      // River finishes 3.9s ago: only ~0.1s of linger remains, then the 0.4s fade. On a remount it
-      // must pick up the REMAINING ~0.5s, not a fresh 4s.
-      const finishedAt = Date.now() - 3_900;
+      const finishedAt = Date.now() - 10_000;
       pushMonitorBare([
-        upsert('r1', 'gpt-4o', 'running'),
-        seg('r1', 'output', 'hi', finishedAt),
+        upsert('r1', 'm', 'running'),
+        seg('r1', 'output', 'done', finishedAt),
         { type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: finishedAt, error: null },
+        { type: 'request_remove', response_id: 'r1', reason: 'evicted' },
       ]);
-      const { queryByTestId, unmount } = render(<TheaterView />);
-      // Still within the linger tail at mount (rendered, not yet exiting).
-      expect(queryByTestId('river')).not.toBeNull();
-      // Remount (a navigation away + back): the lifecycle resumes from the absolute finish instant.
+      const { getByTestId, unmount } = render(<TheaterView />);
+      expect(getByTestId('theater-stale-age').textContent).toBe('00:10');
+      expect(getByTestId('river-output').textContent).toContain('done');
       unmount();
-      const { queryByTestId: q2 } = render(<TheaterView />);
-      expect(q2('river')).not.toBeNull();
-      // ~0.6s carries it past linger(0.1 remaining)+fade(0.4) → removed (NOT a fresh 4s window).
-      act(() => { vi.advanceTimersByTime(600); });
-      expect(q2('river')).toBeNull();
+      const remount = render(<TheaterView />);
+      expect(remount.getByTestId('theater-stale-age').textContent).toBe('00:10');
+      expect(remount.getByTestId('river').getAttribute('data-retained')).toBe('true');
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('clears its linger timers on unmount (no leaked timer fires post-unmount — StrictMode-safe)', () => {
+  it('clears the stale clock interval on unmount (StrictMode-safe)', () => {
     vi.useFakeTimers();
     try {
       const finishedAt = Date.now();
+      pushMonitorBare([
+        upsert('r1', 'm', 'running'),
+        seg('r1', 'output', 'done', finishedAt),
+        { type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: finishedAt, error: null },
+      ]);
       const { unmount } = render(<TheaterView />);
-      act(() => {
-        dashboardStore.getState().pushMonitor(upsert('r1', 'm', 'completed'), 1);
-        dashboardStore.getState().pushMonitor(seg('r1', 'output', 'done', finishedAt), 1);
-        dashboardStore.getState().pushMonitor({ type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: finishedAt, error: null }, 1);
-        dashboardStore.getState().setConnection('live');
-      });
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
       unmount();
-      // Advancing past linger+fade after unmount must not throw (timers were cleared, no setState
-      // on an unmounted tree).
-      expect(() => act(() => { vi.advanceTimersByTime(10_000); })).not.toThrow();
+      expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
     }

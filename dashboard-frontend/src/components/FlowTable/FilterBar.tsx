@@ -12,9 +12,11 @@
  * guaranteeing it always shows as an active (toggle-off-able) chip; a "clear" control also appears
  * whenever any facet is active as a single-click escape hatch.
  */
+import { useEffect, useRef } from 'react';
 import { FLOW_STATUSES } from '../../api/types';
 import { cn } from '../../lib/cn';
 import { EMPTY_FILTERS, type FlowFilters } from './filterTypes';
+import { FLOW_SEARCH_MAX_CHARS } from './flowSearch';
 
 /** Union the derived options with the active value (if any) so an unmatched selection stays visible. */
 function withSelected(options: string[], selected: string | null): string[] {
@@ -100,6 +102,8 @@ export function FilterBar({
   total,
   shown,
   onChange,
+  searchQuery = '',
+  onSearchQueryChange = () => {},
 }: {
   filters: FlowFilters;
   models: string[];
@@ -109,9 +113,31 @@ export function FilterBar({
   total: number;
   shown: number;
   onChange: (next: FlowFilters) => void;
+  searchQuery?: string;
+  onSearchQueryChange?: (query: string) => void;
 }) {
+  const searchRef = useRef<HTMLInputElement>(null);
   const toggle = <K extends keyof FlowFilters>(key: K, value: FlowFilters[K]) =>
     onChange({ ...filters, [key]: filters[key] === value ? null : value });
+
+  // `/` is the conventional log/search shortcut. Never steal it while the user is already typing
+  // in an editable control; Escape clears the focused search through the input handler below.
+  useEffect(() => {
+    const focusSearch = (event: KeyboardEvent): void => {
+      if (event.key !== '/' || event.metaKey || event.ctrlKey || event.altKey || event.defaultPrevented) return;
+      const target = event.target;
+      if (
+        target instanceof HTMLInputElement
+        || target instanceof HTMLTextAreaElement
+        || target instanceof HTMLSelectElement
+        || (target instanceof HTMLElement && target.isContentEditable)
+      ) return;
+      event.preventDefault();
+      searchRef.current?.focus();
+    };
+    window.addEventListener('keydown', focusSearch);
+    return () => window.removeEventListener('keydown', focusSearch);
+  }, []);
 
   // Fold the active value into each list so a cross-linked selection with no matching row in view
   // still renders an (active, toggle-off-able) chip instead of becoming an invisible filter.
@@ -123,10 +149,56 @@ export function FilterBar({
   const clientOptions = capWithSelected(clients, filters.client, CLIENT_CHIP_CAP);
   const clientsHidden = Math.max(0, clients.filter((c) => c !== filters.client).length - clientOptions.filter((c) => c !== filters.client).length);
   const anyActive =
-    filters.status !== null || filters.model !== null || filters.upstream !== null || filters.client !== null;
+    filters.status !== null
+    || filters.model !== null
+    || filters.upstream !== null
+    || filters.client !== null
+    || searchQuery.trim().length > 0;
 
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line bg-panel px-3 py-2" data-testid="flow-filter-bar">
+      <div className="relative flex w-full min-w-0 items-center sm:w-80" data-testid="flow-search">
+        <span className="pointer-events-none absolute left-2.5 text-xs text-text-muted" aria-hidden>⌕</span>
+        <input
+          ref={searchRef}
+          type="text"
+          role="searchbox"
+          inputMode="search"
+          value={searchQuery}
+          maxLength={FLOW_SEARCH_MAX_CHARS}
+          onChange={(event) => onSearchQueryChange(event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Escape' && searchQuery) {
+              event.preventDefault();
+              onSearchQueryChange('');
+            }
+          }}
+          placeholder="Find request, response, model, provider…"
+          aria-label="Search flows"
+          aria-keyshortcuts="/"
+          autoComplete="off"
+          spellCheck={false}
+          className="h-7 w-full rounded-md border border-line bg-bg py-1 pl-7 pr-14 font-mono text-xs text-text outline-none placeholder:font-ui placeholder:text-text-muted focus:border-accent focus:ring-1 focus:ring-accent"
+          data-testid="flow-search-input"
+          title="Flows-only search across request/response IDs, endpoint, model, provider, client, status, and failover attempts"
+        />
+        {searchQuery ? (
+          <button
+            type="button"
+            onClick={() => {
+              onSearchQueryChange('');
+              searchRef.current?.focus();
+            }}
+            className="absolute right-1.5 rounded px-1.5 py-0.5 text-[10px] text-text-muted hover:bg-panel-raised hover:text-text"
+            aria-label="Clear flow search"
+            data-testid="flow-search-clear"
+          >
+            clear
+          </button>
+        ) : (
+          <kbd className="pointer-events-none absolute right-2 rounded border border-line px-1.5 py-0.5 font-mono text-[9px] text-text-muted" aria-hidden>/</kbd>
+        )}
+      </div>
       <FilterGroup label="status">
         {FLOW_STATUSES.map((s) => (
           <Chip key={s} active={filters.status === s} onClick={() => toggle('status', s)}>
@@ -182,7 +254,10 @@ export function FilterBar({
       {anyActive && (
         <button
           type="button"
-          onClick={() => onChange(EMPTY_FILTERS)}
+          onClick={() => {
+            onChange(EMPTY_FILTERS);
+            onSearchQueryChange('');
+          }}
           className="rounded-full border border-line bg-panel px-2.5 py-0.5 text-xs text-text-muted transition-colors hover:text-text"
           data-testid="flow-filter-clear"
         >
@@ -192,13 +267,16 @@ export function FilterBar({
       <span className="ml-auto tabular-nums text-xs text-text-muted" data-testid="flow-count">
         {shown === total ? `${total} flows` : `${shown} / ${total}`}
       </span>
+      <span className="sr-only" aria-live="polite" aria-atomic="true" data-testid="flow-search-announcement">
+        {searchQuery.trim() ? `${shown} of ${total} flows match ${searchQuery.trim()}.` : ''}
+      </span>
     </div>
   );
 }
 
 function FilterGroup({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex max-w-full flex-wrap items-center gap-1.5">
       <span className="text-[10px] uppercase tracking-wide text-text-muted">{label}</span>
       {children}
     </div>

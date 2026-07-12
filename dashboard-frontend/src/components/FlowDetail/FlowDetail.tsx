@@ -8,15 +8,16 @@
  *   ┌ top bar: ← flows · status chip · id · seek badge · kill · ✕ ───────────────────────────┐
  *   ├ summary band: identity/cost/tokens dl │ context gauge + timing waterfall │ failover ────┤
  *   ├ main row (flex-1) ───────────────────────────────────────────┬ deltas rail ────────────┤
- *   │   search bar over 3 scroll-synced JSON panes                 │ live segment stream     │
+ *   │   transformation rail + 3 scroll-synced JSON panes          │ live segment stream     │
  *   │   A inbound  →  B normalized  →  C upstream                  │ (output/reasoning/tool) │
  *   │   (diff A→B left)  (combined middle)  (diff B→C right)       │                         │
  *   ├ tabs: Headers / Timeline / Error (full-width strip) ─────────┴─────────────────────────┤
  *   └──────────────────────────────────────────────────────────────────────────────────────────┘
  *
- * The structural diff (./diff) tints each JSON PATH: B is tinted vs A (added/changed), C is
- * tinted vs B, and A surfaces what B removed. The panes scroll together (useScrollSync — the
- * containers, not react-virtual). Bodies absent from `/flows/:id` (evicted under the D5
+ * The structural diff (./diff) now drives explicit operation labels + a changes-only view: each
+ * hop reports introduced/rewritten/omitted counts, and changed rows explain their counterpart
+ * value instead of relying on red/green backgrounds. The panes scroll together (useScrollSync —
+ * the containers, not react-virtual). Bodies absent from `/flows/:id` (evicted under the D5
  * body-free snapshot tradeoff, or while time-travel `seek` shows a historical cut) render the
  * pane's "body evicted" placeholder. Kill POSTs with CSRF, optimistically flips the row, and
  * shows a distinct state on 403.
@@ -40,7 +41,8 @@ import { capturedErrorBody } from '../FlowTable/failureTaxonomy';
 import { pickAttempts } from '../../api/attempts';
 import { useCatalog } from '../FlowTable/useCatalog';
 import { JsonPane } from '../viz/JsonPane';
-import { combineMiddleDiff, diffLayers } from './diff';
+import { combineMiddleDiff, describeChanges, diffLayers, summarizeChanges } from './diff';
+import { RequestTransformationBar, type RequestViewMode, type TransformationHop } from './RequestTransformationBar';
 import { joinMonitor } from './monitorJoin';
 import { mergeDeltas, normalizeRestDeltas, type MonitorSegment } from './deltas';
 import { DeltasPanel } from './DeltasPanel';
@@ -127,6 +129,9 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   // Shared search across all three layers (A inbound · B normalized · C upstream) — find a field
   // once and see how it transformed. Each JsonPane filters to matches + their ancestors.
   const [query, setQuery] = useState('');
+  // Lead with operations rather than three walls of JSON. Full bodies remain one click away, and
+  // search always scans every field regardless of this presentation mode.
+  const [requestView, setRequestView] = useState<RequestViewMode>('changes');
   const detailLoading = detail === null && detailQuery.isPending && detailQuery.fetchStatus === 'fetching';
   const detailFailed = detail === null && detailQuery.isError;
   const bodyEmptyLabel = detailLoading
@@ -288,9 +293,21 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   // Structural diffs between the captured layers (path → kind).
   const diffAB = useMemo(() => diffLayers(detail?.inbound_body, detail?.normalized), [detail?.inbound_body, detail?.normalized]);
   const diffBC = useMemo(() => diffLayers(detail?.normalized, detail?.upstream_body), [detail?.normalized, detail?.upstream_body]);
+  const changesAB = useMemo(() => describeChanges(detail?.inbound_body, detail?.normalized), [detail?.inbound_body, detail?.normalized]);
+  const changesBC = useMemo(() => describeChanges(detail?.normalized, detail?.upstream_body), [detail?.normalized, detail?.upstream_body]);
   // Pane B sits between both comparisons: it shows what A→B added/changed AND what B→C removes,
   // so it renders the COMBINED middle diff with side `both` (finding 4).
   const diffBMiddle = useMemo(() => combineMiddleDiff(diffAB, diffBC), [diffAB, diffBC]);
+  const normalizationHop = useMemo<TransformationHop>(() => ({
+    label: 'normalize',
+    available: detail?.inbound_body !== undefined && detail?.normalized !== undefined,
+    summary: summarizeChanges(changesAB),
+  }), [detail?.inbound_body, detail?.normalized, changesAB]);
+  const loweringHop = useMemo<TransformationHop>(() => ({
+    label: 'lower',
+    available: detail?.normalized !== undefined && detail?.upstream_body !== undefined,
+    summary: summarizeChanges(changesBC),
+  }), [detail?.normalized, detail?.upstream_body, changesBC]);
 
   const sync = useScrollSync(3);
   const isActive = status === 'open';
@@ -434,17 +451,57 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   );
 
   // One source of truth for the three layers, so the zoomed render and the 3-pane row feed the
-  // SAME props into JsonPane (search + per-layer diff tint keep applying in focus mode), and the
+  // SAME props into JsonPane (search + operation explanations keep applying in focus mode), and the
   // scroll-sync ref indices stay stable whether or not the siblings are mounted.
   const panes = [
-    { key: 'A' as const, label: 'A · inbound', value: detail?.inbound_body, diff: diffAB, side: 'left' as const, index: 0 },
-    { key: 'B' as const, label: 'B · normalized', value: detail?.normalized, diff: diffBMiddle, side: 'both' as const, index: 1 },
-    { key: 'C' as const, label: 'C · upstream', value: detail?.upstream_body, diff: diffBC, side: 'right' as const, index: 2 },
+    {
+      key: 'A' as const,
+      label: 'A · inbound',
+      stage: { step: 'A' as const, title: 'Client payload', subtitle: 'captured at ingress', nextLabel: 'canonical' },
+      value: detail?.inbound_body,
+      diff: diffAB,
+      incomingChanges: undefined,
+      outgoingChanges: changesAB,
+      side: 'left' as const,
+      index: 0,
+    },
+    {
+      key: 'B' as const,
+      label: 'B · normalized',
+      stage: { step: 'B' as const, title: 'Gateway canonical', subtitle: 'after adapter + policies', nextLabel: 'upstream' },
+      value: detail?.normalized,
+      diff: diffBMiddle,
+      incomingChanges: changesAB,
+      outgoingChanges: changesBC,
+      side: 'both' as const,
+      index: 1,
+    },
+    {
+      key: 'C' as const,
+      label: 'C · upstream',
+      stage: { step: 'C' as const, title: 'Provider payload', subtitle: 'captured at dispatch' },
+      value: detail?.upstream_body,
+      diff: diffBC,
+      incomingChanges: changesBC,
+      outgoingChanges: undefined,
+      side: 'right' as const,
+      index: 2,
+    },
   ];
   const zoomedPane = zoom && zoom !== 'deltas' ? panes.find((p) => p.key === zoom) ?? null : null;
   const narrowPane = narrowTab === 'A' || narrowTab === 'B' || narrowTab === 'C'
     ? panes.find((pane) => pane.key === narrowTab) ?? null
     : null;
+  const transformationBar = (
+    <RequestTransformationBar
+      query={query}
+      onQueryChange={setQuery}
+      mode={requestView}
+      onModeChange={setRequestView}
+      normalization={normalizationHop}
+      lowering={loweringHop}
+    />
+  );
 
   return (
     <section
@@ -506,13 +563,17 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
           >
             {narrowPane ? (
               <>
-                <SearchBar value={query} onChange={setQuery} />
+                {transformationBar}
                 <JsonPane
                   label={narrowPane.label}
+                  stage={narrowPane.stage}
                   value={narrowPane.value}
                   diff={narrowPane.diff}
+                  incomingChanges={narrowPane.incomingChanges}
+                  outgoingChanges={narrowPane.outgoingChanges}
                   side={narrowPane.side}
                   query={query}
+                  changesOnly={requestView === 'changes'}
                   emptyLabel={bodyEmptyLabel}
                   scrollRef={sync.refFor(narrowPane.index)}
                   onScroll={sync.bind(narrowPane.index)}
@@ -577,13 +638,17 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
             <div className="flex min-h-0 min-w-0 flex-1 flex-col" data-testid="zoom-region" data-zoom={zoom}>
               {zoomedPane ? (
                 <>
-                  <SearchBar value={query} onChange={setQuery} />
+                  {transformationBar}
                   <JsonPane
                     label={zoomedPane.label}
+                    stage={zoomedPane.stage}
                     value={zoomedPane.value}
                     diff={zoomedPane.diff}
+                    incomingChanges={zoomedPane.incomingChanges}
+                    outgoingChanges={zoomedPane.outgoingChanges}
                     side={zoomedPane.side}
                     query={query}
+                    changesOnly={requestView === 'changes'}
                     emptyLabel={bodyEmptyLabel}
                     scrollRef={sync.refFor(zoomedPane.index)}
                     onScroll={sync.bind(zoomedPane.index)}
@@ -620,7 +685,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
                   <EdgeStrip label="layers" onExpand={() => { setPanesColCollapsed(false); panesColRef.current?.expand(); }} testid="panes-strip" />
                 ) : (
                   <>
-                    <SearchBar value={query} onChange={setQuery} />
+                    {transformationBar}
                     {/* 3 scroll-synced panes with their own splitters (widen one layer as needed).
                         Each pane collapses to a 16px labeled sliver, NOT 0 — a zero-width middle
                         pane stacks its two separators on the same pixel, which makes the
@@ -656,10 +721,14 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
                             ) : (
                               <JsonPane
                                 label={p.label}
+                                stage={p.stage}
                                 value={p.value}
                                 diff={p.diff}
+                                incomingChanges={p.incomingChanges}
+                                outgoingChanges={p.outgoingChanges}
                                 side={p.side}
                                 query={query}
+                                changesOnly={requestView === 'changes'}
                                 emptyLabel={bodyEmptyLabel}
                                 scrollRef={sync.refFor(p.index)}
                                 onScroll={sync.bind(p.index)}
@@ -937,45 +1006,6 @@ function emptyBodyLabel(seeking: boolean): string {
  * tag is chosen from the SAME source `flowCost` will actually read the cost from. */
 function isFiniteNumber(v: number | null | undefined): v is number {
   return typeof v === 'number' && Number.isFinite(v);
-}
-
-/** Shared search across the three layers — one query, every pane filters + highlights. */
-function SearchBar({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  return (
-    <div
-      className="flex shrink-0 items-center gap-2 border-b border-line bg-panel-raised px-3 py-1.5"
-      data-testid="json-search-bar"
-    >
-      <div className="flex flex-1 items-center gap-2 rounded-md border border-line bg-panel px-2 py-1 transition-colors focus-within:border-accent/60">
-        <svg viewBox="0 0 16 16" className="h-3.5 w-3.5 shrink-0 text-text-muted" fill="none" aria-hidden="true">
-          <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.5" />
-          <path d="M10.5 10.5 14 14" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-        </svg>
-        <input
-          type="text"
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder="search all layers…"
-          spellCheck={false}
-          className="min-w-0 flex-1 bg-transparent font-mono text-xs text-text placeholder:text-text-muted focus:outline-none"
-          data-testid="json-search-input"
-        />
-        {value && (
-          <button
-            type="button"
-            onClick={() => onChange('')}
-            aria-label="clear search"
-            className="shrink-0 text-text-muted transition-colors hover:text-text"
-          >
-            ✕
-          </button>
-        )}
-      </div>
-      <span className="hidden shrink-0 font-mono text-[10px] uppercase tracking-[0.14em] text-text-muted sm:inline">
-        A · B · C
-      </span>
-    </div>
-  );
 }
 
 /** The drill-down top bar: back-to-table, identity + status, seek badge, kill + close. */

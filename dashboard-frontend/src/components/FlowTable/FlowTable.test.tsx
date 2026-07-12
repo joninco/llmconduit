@@ -183,6 +183,21 @@ describe('FlowTable — filtering', () => {
     fireEvent.click(chip);
     expect(getAllByTestId('flow-row')).toHaveLength(2);
   });
+
+  it('a view-local search narrows rows and gives a specific zero-result state', () => {
+    const found = renderWithQuery(
+      <FlowTable selectedId={null} onSelect={noop} searchQuery="api_fail openai" />,
+    );
+    expect(found.getAllByTestId('flow-row')).toHaveLength(1);
+    expect(found.getByTestId('flow-count').textContent).toContain('1 / 3');
+    found.unmount();
+
+    const empty = renderWithQuery(
+      <FlowTable selectedId={null} onSelect={noop} searchQuery="missing-request" />,
+    );
+    expect(empty.getByTestId('flow-table-search-empty').textContent).toContain('No flows match “missing-request”');
+    expect(empty.queryByTestId('flow-table-filtered-empty')).toBeNull();
+  });
 });
 
 describe('FlowTable — live WS update + interactions', () => {

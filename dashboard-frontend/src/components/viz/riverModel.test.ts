@@ -2,11 +2,13 @@ import { describe, it, expect } from 'vitest';
 import {
   buildRivers,
   createRiverFold,
+  finalizeLastTerminalRiver,
   finalizeRivers,
   foldRiverMessage,
   gridColumns,
   MAX_RIVERS,
   RIVER_CHANNEL_CHAR_CAP,
+  RIVER_ERROR_CHAR_CAP,
 } from './riverModel';
 import type { DebugWsMessage, DebugRequestStatus } from '../../api/types';
 
@@ -132,6 +134,27 @@ describe('buildRivers — folds the monitor ring into per-stream rivers', () => 
     expect(removed.map((r) => r.id)).toEqual(['r2']);
   });
 
+  it('retains request timing + bounded failure detail and clears the error on recovery', () => {
+    const hugeError = `upstream rejected: ${'x'.repeat(RIVER_ERROR_CHAR_CAP + 100)}`;
+    let fold = createRiverFold();
+    fold = foldRiverMessage(fold, upsert('r1', 'm'));
+    fold = foldRiverMessage(fold, {
+      type: 'request_status', response_id: 'r1', status: 'failed', completed_at_ms: 2_500, error: hugeError,
+    });
+
+    let [river] = finalizeRivers(fold);
+    expect(river).toMatchObject({ startedAtMs: 1_000, status: 'failed', terminalAtMs: 2_500 });
+    expect(river?.error).toHaveLength(RIVER_ERROR_CHAR_CAP);
+    expect(river?.error?.startsWith('upstream rejected:')).toBe(true);
+    expect(river?.error?.endsWith('…')).toBe(true);
+
+    fold = foldRiverMessage(fold, {
+      type: 'request_status', response_id: 'r1', status: 'running', completed_at_ms: null, error: null,
+    });
+    [river] = finalizeRivers(fold);
+    expect(river).toMatchObject({ status: 'running', error: null, terminalAtMs: null });
+  });
+
   it('preserves first-seen order across multiple rivers', () => {
     const rivers = buildRivers([upsert('a', 'm'), upsert('b', 'm'), upsert('c', 'm')]);
     expect(rivers.map((r) => r.id)).toEqual(['a', 'b', 'c']);
@@ -154,7 +177,11 @@ describe('incremental fold — memory caps + immutability (theater ring-eviction
     let fold = createRiverFold();
     fold = foldRiverMessage(fold, upsert('r1', 'm'));
     fold = foldRiverMessage(fold, seg('r1', 'output', 'before', 1000));
-    const captured = { rivers: new Map(fold.rivers), order: [...fold.order] }; // the baseline copy
+    const captured = {
+      rivers: new Map(fold.rivers),
+      order: [...fold.order],
+      lastTerminal: fold.lastTerminal,
+    }; // the baseline copy
     fold = foldRiverMessage(fold, seg('r1', 'output', ' after', 1100));
     expect(finalizeRivers(captured)[0]?.output).toBe('before'); // capture unchanged
     expect(finalizeRivers(fold)[0]?.output).toBe('before after');
@@ -165,6 +192,29 @@ describe('incremental fold — memory caps + immutability (theater ring-eviction
     fold = foldRiverMessage(fold, upsert('r1', 'm'));
     const next = foldRiverMessage(fold, { type: 'snapshot_done' });
     expect(next).toBe(fold);
+  });
+
+  it('retains exactly the newest terminal response after monitor removal', () => {
+    let fold = createRiverFold();
+    fold = foldRiverMessage(fold, upsert('r1', 'first'));
+    fold = foldRiverMessage(fold, seg('r1', 'output', 'first answer', 1_000));
+    fold = foldRiverMessage(fold, {
+      type: 'request_status', response_id: 'r1', status: 'completed', completed_at_ms: 2_000, error: null,
+    });
+    expect(finalizeLastTerminalRiver(fold)?.output).toBe('first answer');
+
+    // The normal active map obeys the monitor removal, while the one-response cache survives.
+    fold = foldRiverMessage(fold, { type: 'request_remove', response_id: 'r1', reason: 'evicted' });
+    expect(finalizeRivers(fold)).toEqual([]);
+    expect(finalizeLastTerminalRiver(fold)).toMatchObject({ id: 'r1', terminalAtMs: 2_000 });
+
+    // A later terminal response replaces the cache; this never grows into a completed archive.
+    fold = foldRiverMessage(fold, upsert('r2', 'second'));
+    fold = foldRiverMessage(fold, seg('r2', 'output', 'second answer', 3_000));
+    fold = foldRiverMessage(fold, {
+      type: 'request_status', response_id: 'r2', status: 'failed', completed_at_ms: 4_000, error: 'boom',
+    });
+    expect(finalizeLastTerminalRiver(fold)).toMatchObject({ id: 'r2', output: 'second answer', status: 'failed' });
   });
 
   it('head-trims a channel past RIVER_CHANNEL_CHAR_CAP and flags `truncated` (honest cap, not silent)', () => {

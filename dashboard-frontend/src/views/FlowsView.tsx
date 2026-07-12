@@ -17,7 +17,7 @@
  * while seeking; on LIVE it is the raw selection again. We do NOT rewrite the hash itself, so
  * leaving seek re-reveals the same drill-down if the flow reappears in the live store.
  */
-import { lazy, Suspense, useEffect } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { FlowTable } from '../components/FlowTable/FlowTable';
 import { FailureTaxonomy } from '../components/FlowTable/FailureTaxonomy';
 import { useDashboard } from '../store/hooks';
@@ -32,6 +32,10 @@ const FlowDetail = lazy(() =>
 
 export function FlowsView() {
   const selectedId = useHashDetail();
+  // Deliberately view-local: free-text lookup narrows the Flows instruments but is not a server-
+  // authored dashboard scope, so Overview/Sankey rollups must never claim that it applies to them.
+  // FlowsView stays mounted while detail is open, preserving the query across drill-in/back.
+  const [searchQuery, setSearchQuery] = useState('');
   const seeking = useDashboard((s) => s.connection === 'seeking');
   // During seek the store IS the frozen cut; a selection not in it is a future flow → suppress
   // (no live detail fetch). Live: the raw selection stands. The hash itself is left untouched,
@@ -56,8 +60,13 @@ export function FlowsView() {
           panel renders only when flows are observed (else it's absent — don't-lie-with-zeros).
           Kept MOUNTED (hidden) while the drill-down is open so table state survives dismiss. */}
       <div className={cn('min-h-0 min-w-0 flex-1 flex-col overflow-y-auto lg:overflow-hidden', effectiveId ? 'hidden' : 'flex')}>
-        <FailureTaxonomy />
-        <FlowTable selectedId={effectiveId} onSelect={(id) => navigate('flows', id)} />
+        <FailureTaxonomy searchQuery={searchQuery} />
+        <FlowTable
+          selectedId={effectiveId}
+          onSelect={(id) => navigate('flows', id)}
+          searchQuery={searchQuery}
+          onSearchQueryChange={setSearchQuery}
+        />
       </div>
       {effectiveId && (
         <Suspense

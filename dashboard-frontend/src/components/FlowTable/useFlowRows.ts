@@ -17,6 +17,7 @@ import type { FlowSummary } from '../../api/types';
 import { useDashboard } from '../../store/hooks';
 import { getConnection, queryKeys } from '../../api/connection';
 import type { FlowFilters } from './filterTypes';
+import { flowMatchesSearch } from './flowSearch';
 
 export interface FlowRowsResult {
   /** Filtered rows, newest-on-top (the array the virtualizer renders). */
@@ -78,7 +79,7 @@ function mergeLiveWithRest(live: FlowSummary, rest: FlowSummary | undefined): Fl
   return rest && rest.revision > live.revision ? rest : live;
 }
 
-function applyFilters(rows: FlowSummary[], f: FlowFilters): FlowSummary[] {
+function applyFilters(rows: FlowSummary[], f: FlowFilters, searchQuery: string): FlowSummary[] {
   return rows.filter((row) => {
     if (f.status && row.status !== f.status) return false;
     if (f.model && row.model_requested !== f.model && row.model_served !== f.model) return false;
@@ -93,6 +94,7 @@ function applyFilters(rows: FlowSummary[], f: FlowFilters): FlowSummary[] {
     // Gap 15: the per-client facet matches the row's `client_label` exactly. An unattributed row
     // (no label) never matches a client filter (it can't be claimed by a client).
     if (f.client && row.client_label !== f.client) return false;
+    if (!flowMatchesSearch(row, searchQuery)) return false;
     return true;
   });
 }
@@ -119,7 +121,7 @@ function clientsByVolume(rows: FlowSummary[]): string[] {
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([label]) => label);
 }
 
-export function useFlowRows(filters: FlowFilters): FlowRowsResult {
+export function useFlowRows(filters: FlowFilters, searchQuery = ''): FlowRowsResult {
   const order = useDashboard((s) => s.flowOrder);
   const flows = useDashboard((s) => s.flows);
   const reconcileFlowRows = useDashboard((s) => s.reconcileFlowRows);
@@ -158,7 +160,7 @@ export function useFlowRows(filters: FlowFilters): FlowRowsResult {
     () => mergeRows(order, flows, queryData?.flows ?? []),
     [order, flows, queryData],
   );
-  const rows = useMemo(() => applyFilters(merged, filters), [merged, filters]);
+  const rows = useMemo(() => applyFilters(merged, filters, searchQuery), [merged, filters, searchQuery]);
   const models = useMemo(() => distinct(merged, (r) => [r.model_requested, r.model_served]), [merged]);
   const upstreams = useMemo(() => distinct(merged, (r) => [r.upstream_target]), [merged]);
   // Gap 15: the distinct `client_label`s for the per-client filter, ordered by DESCENDING volume so the

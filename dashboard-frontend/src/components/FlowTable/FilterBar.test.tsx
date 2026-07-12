@@ -14,6 +14,7 @@ afterEach(cleanup);
 
 function renderBar(over: Partial<Parameters<typeof FilterBar>[0]> = {}) {
   const onChange = vi.fn();
+  const onSearchQueryChange = vi.fn();
   const props = {
     filters: EMPTY_FILTERS as FlowFilters,
     models: ['gpt-4o'],
@@ -22,10 +23,11 @@ function renderBar(over: Partial<Parameters<typeof FilterBar>[0]> = {}) {
     total: 3,
     shown: 3,
     onChange,
+    onSearchQueryChange,
     ...over,
   };
   const r = render(<FilterBar {...props} />);
-  return { ...r, onChange };
+  return { ...r, onChange, onSearchQueryChange };
 }
 
 /** The chips inside a labelled group (status/model/upstream). */
@@ -92,6 +94,40 @@ describe('FilterBar — active filter is always visible + clearable (D12 R5 MED)
   it('hides the `clear` control when no facet is active', () => {
     const { container } = renderBar({ filters: EMPTY_FILTERS });
     expect(within(container).queryByTestId('flow-filter-clear')).toBeNull();
+  });
+});
+
+describe('FilterBar — direct flow lookup', () => {
+  it('focuses search with `/` and exposes the shortcut accessibly', () => {
+    const { getByRole } = renderBar();
+    const input = getByRole('searchbox', { name: 'Search flows' });
+    expect(input.getAttribute('aria-keyshortcuts')).toBe('/');
+    fireEvent.keyDown(window, { key: '/' });
+    expect(document.activeElement).toBe(input);
+  });
+
+  it('emits typed queries, clears with Escape, and announces the result count', () => {
+    const { getByRole, getByTestId, onSearchQueryChange } = renderBar({
+      searchQuery: 'api_123',
+      shown: 1,
+      total: 4,
+    });
+    const input = getByRole('searchbox', { name: 'Search flows' });
+    fireEvent.change(input, { target: { value: 'response_xyz' } });
+    expect(onSearchQueryChange).toHaveBeenCalledWith('response_xyz');
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(onSearchQueryChange).toHaveBeenCalledWith('');
+    expect(getByTestId('flow-search-announcement').textContent).toContain('1 of 4 flows match api_123');
+  });
+
+  it('shows a dedicated clear control and includes search in clear-all', () => {
+    const { getByTestId, onChange, onSearchQueryChange } = renderBar({ searchQuery: 'api_123' });
+    fireEvent.click(getByTestId('flow-search-clear'));
+    expect(onSearchQueryChange).toHaveBeenCalledWith('');
+
+    fireEvent.click(getByTestId('flow-filter-clear'));
+    expect(onChange).toHaveBeenCalledWith(EMPTY_FILTERS);
+    expect(onSearchQueryChange).toHaveBeenCalledWith('');
   });
 });
 

@@ -1,26 +1,26 @@
 /**
  * JsonPane — a per-path COLLAPSIBLE + SEARCHABLE JSON viewer with highlight.js syntax coloring
- * and per-JSON-path diff tints.
+ * and explicit, color-independent transformation annotations.
  *
  * The structural diff (./FlowDetail/diff) is keyed by JSON PATH, and `toJsonLines` serializes the
- * value into path-tagged lines, so each rendered line looks up its `DiffKind` tint by path. On top
- * of that flat list, `jsonFold` pairs each container's open/close lines and computes the visible
- * rows: collapsed containers render as a single `{ … } N` summary, and an active search query
- * filters to matching lines plus their ancestors (auto-expanded), flagging matches.
+ * value into path-tagged lines. `ChangeMap`s then explain the actual operation at a path: what was
+ * introduced, what value was rewritten, and what will be omitted from the next layer. On top of
+ * that flat list, `jsonFold` pairs each container's open/close lines and computes the visible rows:
+ * collapsed containers render as a single `{ … } N` summary, an active search filters to matching
+ * lines + ancestors, and changes-only mode shows operation roots instead of walls of tinted JSON.
  *
  * Rendered with React (not the old imperative highlight build) so the fold chevrons + search state
  * are ordinary event handlers. The final rows are fixed-height virtualized: only the viewport plus
  * overscan mounts a `JsonRow`, so highlight.js runs only for visible lines. The DOM contract remains
- * `jsonpane-{code,scroll,empty}-<label>` and `.json-line[data-path]` (`[data-diff]` when tinted).
+ * `jsonpane-{code,scroll,empty}-<label>` and `.json-line[data-path]` (`[data-diff]` when changed).
  */
 import { useCallback, useMemo, useRef, useState, type MutableRefObject } from 'react';
 import { observeElementRect, useVirtualizer, type Rect, type Virtualizer } from '@tanstack/react-virtual';
 import hljs from 'highlight.js/lib/core';
 import json from 'highlight.js/lib/languages/json';
-import { colors } from '../../design/tokens';
-import type { DiffKind, DiffMap } from '../FlowDetail/diff';
+import type { ChangeDetail, ChangeMap, DiffKind, DiffMap } from '../FlowDetail/diff';
 import { toJsonLines } from './jsonLines';
-import { buildFoldModel, computeRows, type FoldRow } from './jsonFold';
+import { buildFoldModel, computeRows, isCloseLine, type FoldRow } from './jsonFold';
 
 let registered = false;
 function ensureJsonLanguage(): void {
@@ -45,19 +45,120 @@ function escapeHtml(s: string): string {
 
 export type DiffSide = 'left' | 'right' | 'both';
 
-/** Background tint (solid color OR gradient) for a path's `DiffKind` on this pane's side. */
-function tintFor(kind: DiffKind | undefined, side: DiffSide): string | undefined {
-  if (!kind) return undefined;
-  if (kind === 'changed') return colors.diffContextBg;
-  if (kind === 'added') return side === 'left' ? undefined : colors.diffAddBg;
-  if (kind === 'removed') return side === 'right' ? undefined : colors.diffRemoveBg;
-  if (kind === 'added-removed' || kind === 'changed-removed') {
-    const introduced = kind === 'added-removed' ? colors.diffAddBg : colors.diffContextBg;
-    if (side === 'left') return colors.diffRemoveBg;
-    if (side === 'right') return introduced;
-    return `linear-gradient(${introduced} 0 50%, ${colors.diffRemoveBg} 50% 100%)`;
+export interface JsonStage {
+  step: 'A' | 'B' | 'C';
+  title: string;
+  subtitle: string;
+  nextLabel?: string;
+}
+
+type SignalTone = 'introduced' | 'rewritten' | 'omitted';
+
+interface ChangeSignal {
+  key: string;
+  glyph: string;
+  label: string;
+  detail?: string;
+  tone: SignalTone;
+}
+
+/** Compact counterpart value for an inline operation label; never stringify a giant prompt. */
+function valuePreview(value: unknown): string {
+  if (Array.isArray(value)) return `array · ${value.length.toLocaleString()} items`;
+  if (typeof value === 'object' && value !== null) {
+    return `object · ${Object.keys(value as Record<string, unknown>).length.toLocaleString()} fields`;
   }
-  return undefined;
+  if (typeof value === 'string') {
+    const clipped = value.length > 44 ? `${value.slice(0, 41)}…` : value;
+    return JSON.stringify(clipped);
+  }
+  return JSON.stringify(value) ?? String(value);
+}
+
+function incomingSignal(change: ChangeDetail | undefined): ChangeSignal | null {
+  if (!change || change.kind === 'removed') return null;
+  if (change.kind === 'added') {
+    return {
+      key: 'incoming-added',
+      glyph: '+',
+      label: 'introduced here',
+      tone: 'introduced',
+    };
+  }
+  return {
+    key: 'incoming-changed',
+    glyph: '←',
+    label: 'was',
+    detail: valuePreview(change.before),
+    tone: 'rewritten',
+  };
+}
+
+function outgoingSignal(change: ChangeDetail | undefined, nextLabel?: string): ChangeSignal | null {
+  if (!change || change.kind === 'added') return null;
+  if (change.kind === 'removed') {
+    const label = nextLabel === 'upstream'
+      ? 'not sent upstream'
+      : nextLabel === 'canonical'
+        ? 'not in canonical'
+        : `not sent to ${nextLabel ?? 'next layer'}`;
+    return {
+      key: 'outgoing-removed',
+      glyph: '−',
+      label,
+      tone: 'omitted',
+    };
+  }
+  return {
+    key: 'outgoing-changed',
+    glyph: '→',
+    label: 'becomes',
+    detail: valuePreview(change.after),
+    tone: 'rewritten',
+  };
+}
+
+/** Compatibility fallback for callers that provide only the structural paint map. */
+function fallbackSignals(kind: DiffKind | undefined, side: DiffSide): ChangeSignal[] {
+  if (!kind || kind === 'unchanged') return [];
+  const signals: ChangeSignal[] = [];
+  if ((kind === 'added' || kind === 'added-removed') && side !== 'left') {
+    signals.push({ key: 'fallback-added', glyph: '+', label: 'introduced', tone: 'introduced' });
+  }
+  if ((kind === 'changed' || kind === 'changed-removed') && side !== 'left') {
+    signals.push({ key: 'fallback-changed', glyph: '~', label: 'rewritten', tone: 'rewritten' });
+  }
+  if ((kind === 'removed' || kind === 'added-removed' || kind === 'changed-removed') && side !== 'right') {
+    signals.push({ key: 'fallback-removed', glyph: '−', label: 'omitted next', tone: 'omitted' });
+  }
+  // A left-hand changed value is still useful even though its richer label would normally come
+  // from `outgoingChanges` (the fallback has no counterpart value to show).
+  if (kind === 'changed' && side === 'left') {
+    signals.push({ key: 'fallback-changed-next', glyph: '→', label: 'rewritten next', tone: 'rewritten' });
+  }
+  return signals;
+}
+
+function operationPaths(
+  incoming: ChangeMap | undefined,
+  outgoing: ChangeMap | undefined,
+  diff: DiffMap | undefined,
+  side: DiffSide,
+): ReadonlySet<string> {
+  const paths = new Set<string>();
+  if (incoming !== undefined || outgoing !== undefined) {
+    for (const [path, change] of incoming ?? []) {
+      if (change.kind === 'added' || change.kind === 'changed') paths.add(path);
+    }
+    for (const [path, change] of outgoing ?? []) {
+      if (change.kind === 'removed' || change.kind === 'changed') paths.add(path);
+    }
+    return paths;
+  }
+  for (const [path, kind] of diff ?? []) {
+    if (fallbackSignals(kind, side).length > 0) paths.add(path);
+  }
+  return paths;
 }
 
 const PAD_BASE = 6;
@@ -84,12 +185,20 @@ function observePaneRect(
 
 export interface JsonPaneProps {
   value: unknown;
+  /** Descendant-aware structural classification retained for DOM diagnostics/tests. */
   diff?: DiffMap;
+  /** Concise transformations from the previous layer into this layer. */
+  incomingChanges?: ChangeMap;
+  /** Concise transformations from this layer into the next layer. */
+  outgoingChanges?: ChangeMap;
   side?: DiffSide;
   label: string;
+  stage?: JsonStage;
   emptyLabel?: string;
   /** Shared search query (from the inspector). Empty ⇒ full document with fold state applied. */
   query?: string;
+  /** Show operation roots + context only. A non-empty search always searches the whole body. */
+  changesOnly?: boolean;
   className?: string;
   scrollRef?: React.RefObject<HTMLDivElement>;
   onScroll?: React.UIEventHandler<HTMLDivElement>;
@@ -103,10 +212,14 @@ export interface JsonPaneProps {
 export function JsonPane({
   value,
   diff,
+  incomingChanges,
+  outgoingChanges,
   side = 'right',
   label,
+  stage,
   emptyLabel = 'body evicted',
   query = '',
+  changesOnly = false,
   className,
   scrollRef,
   onScroll,
@@ -117,9 +230,13 @@ export function JsonPane({
 
   const lines = useMemo(() => toJsonLines(value), [value]);
   const model = useMemo(() => buildFoldModel(lines), [lines]);
+  const focusedPaths = useMemo(
+    () => operationPaths(incomingChanges, outgoingChanges, diff, side),
+    [incomingChanges, outgoingChanges, diff, side],
+  );
   const { rows, matchCount } = useMemo(
-    () => computeRows(lines, model, collapsed, query),
-    [lines, model, collapsed, query],
+    () => computeRows(lines, model, collapsed, query, changesOnly ? focusedPaths : undefined),
+    [lines, model, collapsed, query, changesOnly, focusedPaths],
   );
   const renderedRows = rows.length > JSON_RENDER_LINE_CAP
     ? rows.slice(0, JSON_RENDER_LINE_CAP)
@@ -180,14 +297,38 @@ export function JsonPane({
             : undefined
         }
       >
-        <span className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-[0.12em] text-text-muted">
-          {label}
+        <span className="flex min-w-0 items-center gap-2">
+          {stage ? (
+            <>
+              <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-accent/50 font-mono text-[10px] font-semibold text-accent">
+                {stage.step}
+              </span>
+              <span className="min-w-0 leading-tight">
+                <span className="block truncate text-[11px] font-semibold uppercase tracking-[0.11em] text-text">
+                  {stage.title}
+                </span>
+                <span className="block truncate text-[9px] uppercase tracking-[0.08em] text-text-muted">
+                  {stage.subtitle}
+                </span>
+              </span>
+            </>
+          ) : (
+            <span className="text-xs font-medium uppercase tracking-[0.12em] text-text-muted">{label}</span>
+          )}
           {searching && (
             <span
               className="rounded-sm bg-status-cooling/15 px-1 font-mono text-[10px] tracking-normal text-status-cooling"
               data-testid={`jsonpane-matches-${label}`}
             >
               {matchCount}
+            </span>
+          )}
+          {changesOnly && !searching && (
+            <span
+              className="shrink-0 rounded-sm border border-accent/30 px-1 font-mono text-[9px] uppercase tracking-normal text-accent"
+              data-testid={`jsonpane-change-count-${label}`}
+            >
+              {focusedPaths.size} ops
             </span>
           )}
         </span>
@@ -203,7 +344,7 @@ export function JsonPane({
               {omittedVisibleRows > 0 ? ` · ${omittedVisibleRows.toLocaleString()} omitted` : ''}
             </span>
           )}
-          {hasValue && !searching && model.containerPaths.length > 0 && (
+          {hasValue && !searching && !changesOnly && model.containerPaths.length > 0 && (
             <button
               type="button"
               onClick={toggleAll}
@@ -230,10 +371,20 @@ export function JsonPane({
       <div
         ref={setScrollElement}
         onScroll={onScroll}
-        className="min-h-0 flex-1 overflow-auto bg-panel"
+        className="min-h-0 flex-1 overflow-auto bg-panel focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
         data-testid={`jsonpane-scroll-${label}`}
+        tabIndex={0}
+        aria-label={`${stage?.title ?? label} JSON`}
       >
-        {hasValue ? (
+        {hasValue && changesOnly && !searching && renderedRows.length === 0 ? (
+          <div
+            className="flex h-full flex-col items-center justify-center gap-1 px-4 py-6 text-center"
+            data-testid={`jsonpane-no-changes-${label}`}
+          >
+            <span className="font-mono text-[11px] uppercase tracking-[0.12em] text-text-muted">no operations</span>
+            <span className="text-[10px] text-text-muted">This stage carries the request through unchanged.</span>
+          </div>
+        ) : hasValue ? (
           <code
             className="hljs block font-mono text-xs"
             data-testid={`jsonpane-code-${label}`}
@@ -248,6 +399,16 @@ export function JsonPane({
             {virtualizer.getVirtualItems().map((item) => {
               const row = renderedRows[item.index];
               if (!row) return null;
+              const diffKind = diff?.get(row.line.path);
+              const hasRichChanges = incomingChanges !== undefined || outgoingChanges !== undefined;
+              const signals = isCloseLine(row.line.text)
+                ? []
+                : hasRichChanges
+                ? [
+                    incomingSignal(incomingChanges?.get(row.line.path)),
+                    outgoingSignal(outgoingChanges?.get(row.line.path), stage?.nextLabel),
+                  ].filter((signal): signal is ChangeSignal => signal !== null)
+                : fallbackSignals(diffKind, side);
               return (
                 <div
                   key={item.key}
@@ -263,9 +424,10 @@ export function JsonPane({
                 >
                   <JsonRow
                     row={row}
-                    tint={tintFor(diff?.get(row.line.path), side)}
-                    diffKind={diff?.get(row.line.path)}
+                    signals={signals}
+                    diffKind={diffKind}
                     searching={searching}
+                    focused={changesOnly && !searching}
                     onToggle={toggle}
                   />
                 </div>
@@ -287,28 +449,32 @@ export function JsonPane({
 
 function JsonRow({
   row,
-  tint,
+  signals,
   diffKind,
   searching,
+  focused,
   onToggle,
 }: {
   row: FoldRow;
-  tint: string | undefined;
+  signals: ChangeSignal[];
   diffKind: DiffKind | undefined;
   searching: boolean;
+  focused: boolean;
   onToggle: (path: string) => void;
 }) {
   const { line, foldable, folded, isMatch, block } = row;
   const content = line.text.slice(line.depth * 2); // strip indent (paddingLeft renders depth)
   const html = useMemo(() => highlightJson(content), [content]);
-  const showChevron = foldable && !searching;
+  const showChevron = foldable && !searching && !focused;
+  const marked = signals.length > 0;
 
   return (
     <div
-      className={`json-line flex h-5 items-start border-l-2 leading-5 ${isMatch ? 'border-l-status-cooling' : 'border-l-transparent'}`}
+      className={`json-line flex h-5 items-start border-l-2 leading-5 ${isMatch ? 'border-l-status-cooling' : marked ? 'border-l-accent/70' : 'border-l-transparent'}`}
       data-path={line.path}
       data-diff={diffKind ? diffKind : undefined}
-      style={{ background: tint, paddingLeft: PAD_BASE + line.depth * PER_DEPTH }}
+      data-operation={marked ? signals.map((signal) => signal.tone).join(' ') : undefined}
+      style={{ paddingLeft: PAD_BASE + line.depth * PER_DEPTH }}
     >
       {showChevron ? (
         <button
@@ -320,6 +486,8 @@ function JsonRow({
         >
           {folded ? '▸' : '▾'}
         </button>
+      ) : focused && folded ? (
+        <span className="mr-0.5 w-3 shrink-0 select-none text-center text-accent" aria-hidden>▸</span>
       ) : (
         <span className="mr-0.5 w-3 shrink-0" aria-hidden />
       )}
@@ -330,6 +498,28 @@ function JsonRow({
           <span className="ml-1.5 rounded-sm bg-line/60 px-1 text-[10px] text-text-muted">{block.childCount}</span>
         </span>
       )}
+      {signals.map((signal) => <ChangeBadge key={signal.key} signal={signal} />)}
     </div>
+  );
+}
+
+const SIGNAL_CLASSES: Record<SignalTone, string> = {
+  introduced: 'border-accent/40 bg-accent/10 text-accent',
+  rewritten: 'border-status-cooling/40 bg-status-cooling/10 text-status-cooling',
+  omitted: 'border-meta/40 bg-meta/10 text-meta',
+};
+
+function ChangeBadge({ signal }: { signal: ChangeSignal }) {
+  const explanation = signal.detail ? `${signal.label} ${signal.detail}` : signal.label;
+  return (
+    <span
+      className={`ml-2 inline-flex h-4 shrink-0 items-center gap-1 rounded-sm border px-1 font-mono text-[9px] leading-none ${SIGNAL_CLASSES[signal.tone]}`}
+      title={explanation}
+      aria-label={explanation}
+    >
+      <span className="text-[11px] font-semibold" aria-hidden>{signal.glyph}</span>
+      <span className="uppercase tracking-[0.06em]">{signal.label}</span>
+      {signal.detail && <span className="max-w-64 truncate normal-case tracking-normal text-text-muted">{signal.detail}</span>}
+    </span>
   );
 }

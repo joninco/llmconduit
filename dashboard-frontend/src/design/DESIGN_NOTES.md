@@ -34,7 +34,13 @@ The **Argus eye** masthead mark (`NavTabs.tsx`) + tracked `ARGUS` wordmark with
 - **Inspector JSON** (`viz/JsonPane` + `viz/jsonFold`): per-path collapsible tree (iris
   chevrons, per-pane collapse-all, `{ … } N` summaries) + a SHARED search across all three
   layers (A·B·C) — each pane filters to matches + ancestors, amber match marker + count chip.
-  Reuses the existing path-keyed structural diff + highlight.js; DOM contract preserved.
+  The transformation view leads with a named Client payload → Gateway canonical → Provider payload
+  rail and operation counts per hop. It defaults to operation roots + ancestor context, folding a
+  whole added/dropped subtree into one summary; “all JSON” restores the complete trees. Rows use
+  symbols + plain-language badges (`introduced here`, `was …`, `becomes …`, `not sent upstream`)
+  instead of red/green washes, so meaning is explicit and color-independent. Shared search always
+  scans the complete bodies. Reuses the path-keyed structural diff + highlight.js; DOM contract
+  preserved.
 
 ## Future passes
 - Substring (not line-level) match highlight in the inspector; LIVE indicator as a radar
