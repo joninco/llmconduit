@@ -995,49 +995,111 @@ pub struct PhaseTimings {
     /// Request ingress — when the FlowStore first `open`ed the record (≈ `started_ms`).
     /// Always `Some` once a record exists; the explicit phase value the waterfall
     /// anchors the other phases against.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ingress_ms: Option<u128>,
     /// Monotonic offset from flow ingress. Present on newly captured records; legacy
     /// snapshots without offsets continue to use ordered epoch timestamps as fallback.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ingress_offset_ms: Option<u128>,
     /// Inbound→canonical normalization settled — stamped when the engine captures the
     /// normalized canonical body (`set_normalized`). `None` if the flow errored before
     /// normalization (an extractor/JSON rejection caught by the L0 guard).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub normalization_done_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub normalization_done_offset_ms: Option<u128>,
     /// Upstream routing/lowering decision — stamped when the engine commits the actual
     /// on-wire upstream request (`set_upstream` at the leaf). `None` if the flow never
     /// reached the wire (pre-spawn lowering/budget failure, replay-only).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub routing_decision_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub routing_decision_offset_ms: Option<u128>,
     /// True TTFT — the wall-clock instant the FIRST canonical **content** SSE delta was
     /// emitted to the client. NOT reasoning, tool-argument, refusal, or signature
     /// deltas: a stream that emits reasoning/tool deltas before content does NOT stamp
     /// this early (first-write-wins on the content arm only). `None` if the flow errored
     /// before any content delta.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub first_content_delta_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub first_content_delta_offset_ms: Option<u128>,
     /// Stream completion — stamped when `run_turn` finishes emitting the terminal
     /// `response.completed`/`response.incomplete`. `None` if the flow errored or was
     /// cancelled mid-stream.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub stream_end_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub stream_end_offset_ms: Option<u128>,
     /// Terminal finalize — stamped when the flow reaches its terminal state
     /// (`finalize`), for EVERY terminal (completed, failed, cancelled). Always `Some`
     /// once the flow is terminal; the right edge of the waterfall.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub finalize_ms: Option<u128>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_millis",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub finalize_offset_ms: Option<u128>,
+}
+
+/// Deserialize one optional millisecond timestamp through `u64`, the largest integer CBOR can
+/// represent. This is intentionally attached to the fields inside the flattened `PhaseTimings`:
+/// Serde's flatten buffer asks formats to deserialize the destination type directly, and
+/// `serde_cbor` cannot satisfy that request for `u128` even though the encoded value fits in a
+/// CBOR `u64`. Epoch milliseconds and monotonic request offsets fit in `u64`; the in-memory `u128`
+/// remains unchanged for the rest of the timing code.
+fn deserialize_optional_millis<'de, D>(deserializer: D) -> Result<Option<u128>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <Option<u64> as serde::Deserialize>::deserialize(deserializer)
+        .map(|value| value.map(u128::from))
 }
 
 impl PhaseTimings {

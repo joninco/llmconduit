@@ -841,7 +841,20 @@ mod tests {
             finished_ms: Some(2_000),
             elapsed_ms: Some(1_000),
             terminal_reason: Some("response.completed".to_string()),
-            phases: PhaseTimings::default(),
+            phases: PhaseTimings {
+                ingress_ms: Some(1_000),
+                ingress_offset_ms: Some(0),
+                normalization_done_ms: Some(1_025),
+                normalization_done_offset_ms: Some(25),
+                routing_decision_ms: Some(1_050),
+                routing_decision_offset_ms: Some(50),
+                first_content_delta_ms: Some(1_500),
+                first_content_delta_offset_ms: Some(500),
+                stream_end_ms: Some(1_950),
+                stream_end_offset_ms: Some(950),
+                finalize_ms: Some(2_000),
+                finalize_offset_ms: Some(1_000),
+            },
             attempts: Vec::new(),
             first_upstream_byte_ms: None,
             client_label: Some("test-client".to_string()),
@@ -878,11 +891,23 @@ mod tests {
         let loaded = loaded.expect("writer persisted cut");
         assert_eq!(loaded.snapshot.cursors.monitor_seq, 7);
         assert_eq!(loaded.snapshot.summaries[0].api_call_id, "api_persisted");
+        assert_eq!(loaded.snapshot.summaries[0].phases.ingress_ms, Some(1_000));
+        assert_eq!(
+            loaded.snapshot.summaries[0].phases.finalize_offset_ms,
+            Some(1_000)
+        );
         let flow = history
             .flow_summary_at("api_persisted", 5_000)
             .await
             .expect("flow version indexed");
         assert_eq!(flow.revision, 4);
+        let historical_rows = history.flow_summaries_as_of(5_000).await;
+        assert_eq!(historical_rows.len(), 1);
+        assert_eq!(historical_rows[0].api_call_id, "api_persisted");
+        assert_eq!(
+            historical_rows[0].phases.first_content_delta_ms,
+            Some(1_500)
+        );
 
         // An unchanged long-running flow retains the same revision across cuts. Its first-observed
         // row must survive retention cleanup while it remains the newest version, otherwise it
