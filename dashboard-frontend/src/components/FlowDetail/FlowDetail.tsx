@@ -28,7 +28,7 @@ import type { CostConfidence, DebugSegment, FlowDetail as FlowDetailDto, FlowSum
 import { useDashboard } from '../../store/hooks';
 import { Button } from '../ui/Button';
 import { StatusChip } from '../FlowTable/StatusChip';
-import { fmtElapsed, fmtModelPair, fmtTokens } from '../FlowTable/format';
+import { fmtElapsed, fmtTokens } from '../FlowTable/format';
 import { costDisplay, elapsedMs, flowCost } from '../FlowTable/flowModel';
 import { tokenEconomics } from '../FlowTable/tokenEconomics';
 import { contextLimitFor, contextUtilization, type ContextUtilization } from '../FlowTable/contextUtilization';
@@ -53,6 +53,7 @@ import { usePersistedFlag } from './layoutPrefs';
 import { EdgeStrip } from '../ui/EdgeStrip';
 import { cn } from '../../lib/cn';
 import { useMediaQuery } from '../../lib/useMediaQuery';
+import { EmptyState } from '../ui/EmptyState';
 
 type Tab = 'headers' | 'captures' | 'timeline' | 'error';
 
@@ -989,7 +990,7 @@ function DeltasRail({
           )}
         </span>
       </div>
-      <div className="min-h-0 flex-1 overflow-auto">
+      <div className="min-h-0 flex-1 overflow-auto" tabIndex={0} role="region" aria-label="Streamed response deltas">
         <DeltasPanel segments={segments} />
       </div>
     </div>
@@ -1030,10 +1031,33 @@ function TopBar({
   onKill: () => void;
   onClose: () => void;
 }) {
+  const [copied, setCopied] = useState(false);
   const status = flow?.status ?? detail?.status ?? 'open';
   // The request line lives on the row (`FlowSummary`) only — `/flows/:id` does not carry it.
   const method = flow?.method ?? '';
   const uri = flow?.uri ?? '';
+  const copyId = async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(apiCallId);
+      } else {
+        const input = document.createElement('textarea');
+        input.value = apiCallId;
+        input.setAttribute('readonly', '');
+        input.style.position = 'fixed';
+        input.style.opacity = '0';
+        document.body.append(input);
+        input.select();
+        const copied = document.execCommand('copy');
+        input.remove();
+        if (!copied) throw new Error('copy command rejected');
+      }
+      setCopied(true);
+      globalThis.setTimeout(() => setCopied(false), 1_500);
+    } catch {
+      setCopied(false);
+    }
+  };
   return (
     <header className="flex min-w-0 shrink-0 items-center gap-2 border-b border-line bg-panel-raised px-2 py-2 sm:gap-3 sm:px-3">
       <button
@@ -1046,12 +1070,22 @@ function TopBar({
         <span aria-hidden="true">←</span> flows
       </button>
       <StatusChip status={status} terminalReason={flow?.terminal_reason ?? detail?.terminal_reason} />
-      <span className="min-w-0 flex-1 truncate font-mono text-sm text-text sm:flex-none" title={apiCallId}>{apiCallId}</span>
       {(method || uri) && (
-        <span className="hidden truncate font-mono text-xs text-text-muted md:inline" title={`${method} ${uri}`}>
+        <span className="hidden min-w-0 truncate text-xs font-medium text-text md:inline" title={`${method} ${uri}`}>
           {method} {uri}
         </span>
       )}
+      <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-text-muted" title={apiCallId}>{apiCallId}</span>
+      <button
+        type="button"
+        onClick={() => void copyId()}
+        aria-label="Copy full request ID"
+        title="Copy full request ID"
+        className="min-h-8 shrink-0 rounded border border-line px-2 text-[11px] text-text-muted hover:border-accent/50 hover:text-text focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        data-testid="copy-request-id"
+      >
+        {copied ? 'Copied' : 'Copy ID'}
+      </button>
       {seeking && (
         <span className="rounded-sm bg-status-cooling/15 px-1.5 py-0.5 text-[10px] uppercase text-status-cooling" data-testid="seek-badge">
           snapshot
@@ -1112,173 +1146,161 @@ function SummaryBand({
   collapsed: boolean;
   onToggle: () => void;
 }) {
-  // Gap 07: render the dollar STRING + the `estimated` flag together via the shared contract, so an
-  // `unavailable` cost reads `—` (never `$0.00`) even if a stray number rode with the tag, and an
-  // estimated figure is labelled — identical to the FlowTable + Sankey $ surfaces.
   const costView = costDisplay(cost, costConfidence);
   const modelReq = flow?.model_requested ?? detail?.model_requested;
   const modelServed = flow?.model_served ?? detail?.model_served;
-  const upstream = flow?.upstream_target ?? detail?.upstream_target ?? '—';
-  // Elapsed: live = `elapsedMs` (which ticks an OPEN flow against `now`). SEEK coherence
-  // (finding 6): a frozen cut must NOT read wall-clock `Date.now()` — that would leak time elapsed
-  // AFTER the seeked instant. We pass the frozen cut `at_ms` as `now`, so an OPEN historical flow
-  // reads its elapsed AS OF the cut (`at_ms - started_ms`), consistent with the table (which uses
-  // the same `at_ms`); a finished flow still derives `finished-started` from the frozen row. `detail`
-  // here is already the FROZEN detail (null while seeking), so non-body surfaces never read live.
+  const upstream = flow?.upstream_target ?? detail?.upstream_target ?? null;
+  const status = flow?.status ?? detail?.status ?? 'open';
   const elapsed = flow
     ? elapsedMs(flow, seeking ? seekAtMs ?? flow.started_ms : Date.now())
     : (seeking ? null : detail?.elapsed_ms ?? null);
-
-  const chevron = (
-    <button
-      type="button"
-      onClick={onToggle}
-      aria-expanded={!collapsed}
-      aria-label={collapsed ? 'expand summary' : 'collapse summary'}
-      data-testid="summary-toggle"
-      className="shrink-0 self-start rounded-sm px-1 py-0.5 text-[10px] text-text-muted transition-colors hover:text-accent"
-    >
-      {collapsed ? '▸' : '▾'}
-    </button>
-  );
-
-  if (collapsed) {
-    // Collapsed-to-strip: ONE line — model · upstream · cost · elapsed — built from the SAME
-    // formatted values the full band renders (nothing re-derived), so collapsing never changes
-    // a figure or its confidence tag.
-    return (
-      <div
-        className="flex shrink-0 items-center gap-2 overflow-hidden border-b border-line bg-panel-raised/60 px-3 py-1 text-xs"
-        data-testid="summary-line"
-      >
-        {chevron}
-        <span className="truncate font-mono text-text">{fmtModelPair(modelReq, modelServed)}</span>
-        <span className="shrink-0 text-line">·</span>
-        <span className="truncate font-mono text-text">{upstream}</span>
-        <span className="shrink-0 text-line">·</span>
-        <span className="shrink-0 tabular-nums text-text">
-          <CostCell costView={costView} />
-        </span>
-        <span className="shrink-0 text-line">·</span>
-        <span className="shrink-0 tabular-nums text-text">{fmtElapsed(elapsed)}</span>
-      </div>
-    );
-  }
+  const totalMs = latency.total.valueMs ?? elapsed;
+  const route = formatModelRoute(modelReq, modelServed);
+  const failover = failoverSummary(attempts);
 
   return (
-    <div className="flex shrink-0 flex-wrap gap-x-8 gap-y-2 border-b border-line bg-panel-raised/60 px-3 py-2">
-      {chevron}
-      {/* Identity + cost + token facts. */}
-      <dl className="grid shrink-0 grid-cols-[auto_1fr] content-start gap-x-3 gap-y-0.5 text-xs">
-        <dt className="text-text-muted">model</dt>
-        <dd className="font-mono text-text">{fmtModelPair(modelReq, modelServed)}</dd>
-        <dt className="text-text-muted">upstream</dt>
-        <dd className="font-mono text-text">{upstream}</dd>
-        <dt className="text-text-muted">cost / elapsed</dt>
-        <dd className="tabular-nums text-text">
-          <CostCell costView={costView} />
-          <span className="text-line"> · </span>
-          {fmtElapsed(elapsed)}
-        </dd>
-        {/* Gap 07: the cached/reasoning token breakdown. An UNREPORTED class renders `—`
-            (via `fmtTokens`), NEVER a fabricated `0`; a measured `0` reads `0`. */}
-        <dt className="text-text-muted">cached / reasoning</dt>
-        <dd className="tabular-nums text-text" data-testid="usage-subcounts">
-          <span title="cache-read prompt tokens (— = upstream did not report)">{fmtTokens(usage?.cached)}</span>
-          <span className="text-line"> · </span>
-          <span title="reasoning tokens (— = upstream did not report)">{fmtTokens(usage?.reasoning)}</span>
-        </dd>
-        {usageAnomalyCount > 0 && (
-          <>
-            <dt className="text-status-cooling">usage quality</dt>
-            <dd
-              className="text-status-cooling"
-              data-testid="usage-anomalies"
-              data-quality="partial"
-              title={normalizedUsage ? `calculation copy: ${JSON.stringify(normalizedUsage)}` : undefined}
-            >
-              partial · {usageAnomalyCount} normalized anomaly {usageAnomalyCount === 1 ? 'class' : 'classes'}
-            </dd>
-          </>
-        )}
-        {/* Gap 08: the cache economics line, MIRRORING the table tokens-cell popover. The cache-hit
-            rate is `derived` (`—` when cached unreported, never a 0% miss); "$ saved" is `derived`
-            and shows only with a CONFIGURED cached price (presence) + a reported cached count —
-            otherwise `—` (no fabricated saving). */}
-        <dt className="text-text-muted">cache hit / $ saved</dt>
-        <dd className="tabular-nums text-text" data-testid="cache-economics">
-          <span data-testid="cache-hit" data-quality={econ.cacheHit.quality} title="cache-hit rate cached/prompt (derived; — = cached unreported)">
-            {econ.cacheHit.value}
-          </span>
-          <span className="text-line"> · </span>
-          <span
-            data-testid="cache-saved"
-            data-quality={econ.saved.quality}
-            title={econ.cachedPriceConfigured
-              ? '$ saved by serving cached tokens at the cached rate (derived)'
-              : '$ saved unavailable — no configured cached price for this model'}
-          >
-            {econ.saved.value}
-          </span>
-          {/* The "$ saved" figure is DERIVED — labelled so an operator never reads it as a billed
-              (measured) cost. Only rendered when a real saving figure is shown. */}
-          {econ.saved.quality === 'derived' && (
-            <span
-              className="ml-1.5 rounded-sm bg-accent/15 px-1 py-0.5 text-[10px] uppercase tracking-wide text-accent"
-              data-testid="saved-derived"
-              title="cache saving is a derived figure (input rate − cached rate)"
-            >
-              derived
-            </span>
-          )}
-        </dd>
-      </dl>
+    <div className="shrink-0 border-b border-line bg-panel-raised/60" data-testid={collapsed ? 'summary-line' : 'request-summary'}>
+      <div className="flex items-center justify-between gap-3 px-3 pt-2">
+        <h2 className="text-xs font-semibold text-text">Request summary</h2>
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={!collapsed}
+          aria-controls="request-technical-details"
+          aria-label={collapsed ? 'Show timing and routing details' : 'Hide timing and routing details'}
+          data-testid="summary-toggle"
+          className="min-h-8 rounded px-2 text-[11px] text-text-muted transition-colors hover:bg-panel hover:text-text"
+        >
+          {collapsed ? 'Show technical details ▸' : 'Hide technical details ▾'}
+        </button>
+      </div>
 
-      {/* Context gauge + latency waterfall — the widest column (the bars want the room). */}
-      <dl className="grid min-w-72 max-w-2xl flex-1 grid-cols-[auto_1fr] content-start gap-x-3 gap-y-1 text-xs">
-        {/* Gap 09: the context-window utilization gauge (% of the input window the PROMPT consumed +
-            remaining headroom + a near/over badge). Numerator is `Usage.prompt` only (spec 09 /
-            FEATURES item 4) — the completion is not counted. `derived` only with a known model
-            `context_limit` (gap-06) + reported prompt usage; UNKNOWN capacity or unreported prompt ⇒
-            `—` and an empty dashed track, NEVER a fabricated 0%/100%. */}
-        <dt className="self-start text-text-muted" title="context-window utilization: prompt (input) tokens vs the model's context window">context</dt>
-        <dd className="min-w-0">
-          <ContextGauge util={contextUtil} />
-        </dd>
-        {/* Gap 10: the per-flow latency breakdown — a "Timing" line (TTFT/wire TTFB/total/tok-s)
-            + a phase waterfall (queue → routing → upstream → prefill → generation → finalize). TTFT
-            is `measured` from the gap-02 first-content-delta, else a labelled `estimated`
-            first-visible-activity fallback from the monitor output segments; a phase with a missing
-            endpoint renders `—` (no bar), never a fabricated 0ms. */}
-        <dt className="self-start text-text-muted" title="latency breakdown: where the turn spent its wall-clock — provider prefill/TTFT vs generation">timing</dt>
-        <dd className="min-w-0">
-          <LatencyBreakdown model={latency} />
-        </dd>
-      </dl>
+      <div className="grid min-w-0 grid-cols-2 gap-px px-3 pb-3 sm:grid-cols-4 lg:grid-cols-6 xl:grid-cols-9" data-testid="request-summary-grid">
+        <SummaryMetric label="Outcome" primary>
+          <StatusChip status={status} terminalReason={flow?.terminal_reason ?? detail?.terminal_reason} />
+        </SummaryMetric>
+        <SummaryMetric label="Requested → served" className="col-span-2" primary title={route}>
+          <span className="break-words font-mono">{route}</span>
+        </SummaryMetric>
+        <SummaryMetric label="Provider" primary title={upstream ?? undefined}>
+          <span className="break-words font-mono">{upstream ?? 'Unavailable'}</span>
+        </SummaryMetric>
+        <SummaryMetric label="Total time" primary quality={totalMs === null ? 'unavailable' : 'measured'}>
+          {summaryElapsed(totalMs, 'Unavailable')}
+        </SummaryMetric>
+        <SummaryMetric label="First token" primary quality={latency.ttft.quality} title={latency.ttft.detail}>
+          {summaryElapsed(latency.ttft.valueMs, 'Not captured')}
+        </SummaryMetric>
+        <SummaryMetric label="Input / output" primary quality={usage ? 'measured' : 'unavailable'}>
+          {summaryTokens(usage?.prompt)} / {summaryTokens(usage?.completion)}
+        </SummaryMetric>
+        <SummaryMetric label="Cost" primary quality={costConfidence === 'unavailable' ? 'unavailable' : costConfidence === 'estimated' ? 'estimated' : 'derived'}>
+          <CostCell costView={costView} unavailableText="Unavailable" />
+        </SummaryMetric>
+        <SummaryMetric
+          label="Failover"
+          className={cn('col-span-2 sm:col-span-1', attempts.isFailover && 'border-status-down/40')}
+          primary
+          quality={attempts.hasTrace ? 'measured' : 'unavailable'}
+        >
+          <span className={attempts.isFailover ? 'text-status-cooling' : undefined}>{failover}</span>
+        </SummaryMetric>
+      </div>
 
-      {/* Gap 11: the failover / attempt-trace stepper — one node per recorded `attempts[]` entry
-          (provider, status/error_class, duration, first upstream byte, failover_reason), the served
-          node visually distinct. Rendered ONLY when an attempt was recorded: a single attempt is a
-          single node (no fake failover); ≥2 is the chain. A per-attempt unmeasured time reads `—`,
-          never `0`. Absent ⇒ the column is omitted entirely (no empty stepper). */}
-      {attempts.hasTrace && (
-        <dl className="grid min-w-64 max-w-xl flex-1 grid-cols-[auto_1fr] content-start gap-x-3 gap-y-0.5 text-xs">
-          <dt className="self-start text-text-muted" title="failover trace: which provider failed, why, how long, and what served">failover</dt>
-          <dd className="min-w-0">
-            <AttemptTrace model={attempts} />
-          </dd>
-        </dl>
+      {!collapsed && (
+        <div id="request-technical-details" className="grid max-h-32 gap-4 overflow-auto border-t border-line/60 px-3 py-3 xl:grid-cols-[minmax(24rem,2fr)_minmax(18rem,1fr)]" data-testid="request-technical-details" tabIndex={0} role="region" aria-label="Request timing, routing, and usage details">
+          <section className="min-w-0" aria-labelledby="request-timing-title">
+            <h3 id="request-timing-title" className="mb-2 text-xs font-medium text-text-muted">Timing and context</h3>
+            <div className="mb-3"><LatencyBreakdown model={latency} /></div>
+            <ContextGauge util={contextUtil} />
+          </section>
+          <section className="min-w-0" aria-labelledby="request-routing-title">
+            <h3 id="request-routing-title" className="mb-2 text-xs font-medium text-text-muted">Routing, failover, and usage</h3>
+            {attempts.hasTrace ? <AttemptTrace model={attempts} /> : <p className="mb-3 text-xs text-text-muted">Attempt trace was not captured.</p>}
+            <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+              <dt className="text-text-muted">cached / reasoning</dt>
+              <dd className="tabular-nums text-text" data-testid="usage-subcounts">
+                <span title="cache-read prompt tokens; Not captured means the upstream did not report this class">{summaryTokens(usage?.cached)}</span>
+                <span className="text-line"> / </span>
+                <span title="reasoning tokens; Not captured means the upstream did not report this class">{summaryTokens(usage?.reasoning)}</span>
+              </dd>
+              <dt className="text-text-muted">cache hit / saved</dt>
+              <dd className="tabular-nums text-text" data-testid="cache-economics">
+                <span data-testid="cache-hit" data-quality={econ.cacheHit.quality} title="cache-hit rate cached/prompt (derived; — = cached unreported)">{econ.cacheHit.value}</span>
+                <span className="text-line"> · </span>
+                <span data-testid="cache-saved" data-quality={econ.saved.quality} title={econ.cachedPriceConfigured ? '$ saved by serving cached tokens at the cached rate (derived)' : '$ saved unavailable — no configured cached price for this model'}>{econ.saved.value}</span>
+                {econ.saved.quality === 'derived' && (
+                  <span className="ml-1.5 rounded-sm bg-accent/15 px-1 py-0.5 text-[10px] text-accent" data-testid="saved-derived" title="cache saving is a derived figure (input rate − cached rate)">derived</span>
+                )}
+              </dd>
+              {usageAnomalyCount > 0 && (
+                <>
+                  <dt className="text-status-cooling">usage quality</dt>
+                  <dd className="text-status-cooling" data-testid="usage-anomalies" data-quality="partial" title={normalizedUsage ? `calculation copy: ${JSON.stringify(normalizedUsage)}` : undefined}>
+                    Partial · {usageAnomalyCount} normalized anomaly {usageAnomalyCount === 1 ? 'class' : 'classes'}
+                  </dd>
+                </>
+              )}
+            </dl>
+          </section>
+        </div>
       )}
     </div>
   );
 }
 
+function SummaryMetric({
+  label,
+  children,
+  primary = false,
+  className,
+  quality,
+  title,
+}: {
+  label: string;
+  children: React.ReactNode;
+  primary?: boolean;
+  className?: string;
+  quality?: string;
+  title?: string;
+}) {
+  return (
+    <div className={cn('min-w-0 border-l border-line/60 px-2 py-2 first:border-l-0', className)} data-quality={quality} title={title}>
+      <div className="mb-1 text-[11px] text-text-muted">{label}</div>
+      <div className={cn('min-w-0 tabular-nums text-text', primary ? 'text-sm font-semibold' : 'text-xs')}>{children}</div>
+    </div>
+  );
+}
+
+function summaryElapsed(value: number | null | undefined, missing: string): string {
+  return value === null || value === undefined ? missing : fmtElapsed(value);
+}
+
+function summaryTokens(value: number | null | undefined): string {
+  return value === null || value === undefined ? 'Not captured' : fmtTokens(value);
+}
+
+function formatModelRoute(requested: string | null | undefined, served: string | null | undefined): string {
+  const req = requested?.trim();
+  const actual = served?.trim();
+  if (req && actual) return req === actual ? actual : `${req} → ${actual}`;
+  return actual || req || 'Unavailable';
+}
+
+function failoverSummary(model: AttemptTraceModel): string {
+  if (!model.hasTrace) return 'Not captured';
+  if (!model.isFailover) return 'No failover';
+  if (model.servedIndex === null) return `Failed · ${model.failedCount} attempts`;
+  const served = model.nodes[model.servedIndex];
+  return `${model.failedCount} failed → ${served?.provider ?? served?.step ?? 'served'}`;
+}
+
 /** The cost value + its confidence badge — ONE renderer, so the collapsed one-liner and the full
  * band show the IDENTICAL formatted pair (gap 07: the value and its tag must never desync). */
-function CostCell({ costView }: { costView: ReturnType<typeof costDisplay> }) {
+function CostCell({ costView, unavailableText }: { costView: ReturnType<typeof costDisplay>; unavailableText?: string }) {
   return (
     <>
-      <span className="text-meta" data-testid="detail-cost" data-confidence={costView.confidence}>{costView.value}</span>
+      <span className="text-meta" data-testid="detail-cost" data-confidence={costView.confidence}>{costView.value === '—' && unavailableText ? unavailableText : costView.value}</span>
       {/* Gap 07: an `estimated` cost MUST be labelled (the cross-cutting rule) — a small
           tag so an operator never mistakes a best-effort figure for a confident one. An
           `unavailable` cost already reads as `—`; `confident` needs no badge. */}
@@ -1377,9 +1399,16 @@ function TabButton({
 }
 
 function HeadersTab({ headers }: { headers?: Record<string, string> }) {
+  if (headers === undefined) {
+    return (
+      <EmptyState kind="unavailable" testId="headers-unavailable">
+        Header capture was not provided for this request. It may have been disabled or the detail may have been evicted.
+      </EmptyState>
+    );
+  }
   const entries = headers ? Object.entries(headers) : [];
   if (entries.length === 0) {
-    return <div className="px-3 py-3 text-xs italic text-text-muted" data-testid="headers-empty">No inbound headers captured.</div>;
+    return <EmptyState kind="empty" testId="headers-empty">No inbound headers were present.</EmptyState>;
   }
   return (
     <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 px-3 py-2 font-mono text-xs" data-testid="headers-tab">
@@ -1394,9 +1423,20 @@ function HeadersTab({ headers }: { headers?: Record<string, string> }) {
 }
 
 function CapturedSectionsTab({ detail }: { detail: FlowDetailDto | null }) {
+  if (detail === null) {
+    return (
+      <EmptyState kind="unavailable">
+        Captured I/O is unavailable in this view. Live detail may have been evicted or is not available for a historical cut.
+      </EmptyState>
+    );
+  }
   const sections = detail?.captured_sections ?? [];
   if (sections.length === 0) {
-    return <div className="px-3 py-3 text-xs italic text-text-muted">No durable captured sections are available.</div>;
+    return (
+      <EmptyState kind="disabled">
+        Durable I/O capture was not enabled for this request.
+      </EmptyState>
+    );
   }
   return (
     <div className="space-y-2 p-3" data-testid="captured-sections-tab">
@@ -1443,7 +1483,7 @@ function ErrorTab({ detail, liveFlow, joinError, seeking }: { detail: FlowDetail
   // live body is suppressed (review round-3 HIGH). A clean completed flow with a benign
   // `terminal_reason` shows that reason (below) but no capture block (it is not an error).
   if (!isError && !reason) {
-    return <div className="px-3 py-3 text-xs italic text-text-muted" data-testid="error-empty">No error.</div>;
+    return <EmptyState kind="not-applicable" testId="error-empty">No error occurred for this request.</EmptyState>;
   }
 
   // The captured body is LIVE-detail only. While SEEKING a historical flow there is no live body, so

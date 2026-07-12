@@ -76,7 +76,10 @@ export function metricUnavailable(sample: InstantMetricSample | null, metric: Me
   if (metric === 'active_streams_now') return false;
   if (!sample.ready) return true;
   if ((metric === 'failure_pct' || metric === 'cancellation_pct') && sample.terminal_requests === 0) return true;
-  if ((metric === 'p50_ms' || metric === 'p95_ms' || metric === 'p99_ms') && sample.latency_samples === 0) return true;
+  if (metric === 'p50_ms' && sample.latency_samples === 0) return true;
+  // A single observation is a real median, but it is not an operationally useful tail percentile.
+  // Keep p95/p99 unavailable until the window contains at least two latency observations.
+  if ((metric === 'p95_ms' || metric === 'p99_ms') && sample.latency_samples < 2) return true;
   if (metric === 'reported_tokens_per_sec' && sample.usage_samples === 0) return true;
   if (metric === 'cost_per_min' && sample.priced_samples === 0) return true;
   const value = sample[metric];

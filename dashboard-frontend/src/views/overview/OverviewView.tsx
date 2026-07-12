@@ -3,7 +3,7 @@
  * `/dashboard/api/overview` cut selected by the shared URL window/filters and, while seeking,
  * the retained `at` instant. Provider attempts are deliberately global and labelled as such.
  */
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import type {
   FlowStatus,
@@ -29,6 +29,8 @@ import { cn } from '../../lib/cn';
 import { useTopologyQuery, topologyProviderKey } from '../../store/useTopologyQuery';
 import { EngineMetricsCard } from '../../components/viz/EngineMetricsCard';
 import { StaleFallbackBanner } from '../../components/StaleFallbackBanner';
+import { deriveDashboardStatus } from '../../lib/dashboardStatus';
+import { OperationalStatus } from '../../components/ui/OperationalStatus';
 
 const DASH = '—';
 const TOP_ROWS = 5;
@@ -75,8 +77,8 @@ export function OverviewView() {
   return (
     <div className="min-h-0 min-w-0 flex-1 overflow-auto p-3 sm:p-4" data-testid="overview-view">
       <div className="mb-3 flex flex-wrap items-baseline gap-x-2 gap-y-1">
-        <h1 className="text-sm font-semibold uppercase tracking-[0.18em] text-text">control room</h1>
-        <span className="text-[10px] uppercase tracking-[0.14em] text-text-muted">
+        <h1 className="text-base font-semibold text-text">Control room</h1>
+        <span className="text-[11px] text-text-muted">
           terminal {hashScope.window} rollups · server cut
         </span>
         {seeking && (
@@ -86,10 +88,12 @@ export function OverviewView() {
         )}
       </div>
 
+      {!openOnly && overview.data && <OverviewHeadline response={overview.data} />}
+
       <section className="mb-3" aria-labelledby="engine-health-title" data-testid="engine-health-section">
         <div className="mb-2 flex items-baseline gap-2">
-          <h2 id="engine-health-title" className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">Engine health</h2>
-          <span className="text-[9px] text-text-muted">backend m1 · scheduler / cache / throughput</span>
+          <h2 id="engine-health-title" className="text-sm font-semibold text-text">Engine health</h2>
+          <span className="text-[11px] text-text-muted">Backend m1 · scheduler, cache, and throughput</span>
         </div>
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
           {topologyNodes
@@ -131,6 +135,93 @@ export function OverviewView() {
       )}
     </div>
   );
+}
+
+function OverviewHeadline({ response }: { response: OverviewResponse }) {
+  const connection = useDashboard((state) => state.connection);
+  const metrics = useDashboard((state) => state.metrics);
+  const hasDashboardData = useDashboard((state) => state.metrics !== null || state.flows.size > 0 || state.topologyNodes.length > 0);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = globalThis.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => globalThis.clearInterval(id);
+  }, []);
+  const instant = metrics?.instant ?? null;
+  const status = deriveDashboardStatus({
+    connection,
+    hasDashboardData,
+    generatedAtMs: metrics?.generated_at_ms ?? null,
+    activeStreams: instant?.active_streams_now ?? 0,
+    lastActivityAtMs: metrics?.last_activity?.at_ms ?? null,
+    nowMs,
+  });
+  const scoped = Boolean(response.scope.status || response.scope.model || response.scope.upstream || response.scope.client);
+  const failureRate = response.totals.requests > 0 ? response.totals.failures / response.totals.requests * 100 : null;
+  const p95Available = Boolean(instant && instant.latency_samples >= 2 && instant.p95_ms !== null);
+  const throughput = metrics?.engine_throughput?.generated_tokens_per_sec ?? instant?.reported_tokens_per_sec ?? null;
+  const throughputSamples = metrics?.engine_throughput
+    ? `${metrics.engine_throughput.measured_sources}/${metrics.engine_throughput.total_sources} engines`
+    : `${instant?.usage_samples ?? 0} usage samples`;
+  const health = connection === 'error' || connection === 'closed'
+    ? { value: 'Disconnected', cls: 'text-status-down', detail: 'Dashboard transport requires attention.' }
+    : status.freshness.label === 'Stale'
+      ? { value: 'Metrics stale', cls: 'text-status-cooling', detail: status.freshness.detail }
+      : response.totals.failures > 0
+        ? { value: 'Degraded', cls: 'text-status-down', detail: `${response.totals.failures} failed terminal flow${response.totals.failures === 1 ? '' : 's'} in scope.` }
+        : response.totals.requests === 0
+          ? { value: 'No terminal traffic', cls: 'text-text-muted', detail: 'No completed requests are in the selected window.' }
+          : { value: 'Healthy', cls: 'text-status-healthy', detail: 'No failures in the selected window.' };
+
+  return (
+    <section className="mb-4" aria-labelledby="overview-headline-title" data-testid="overview-headline">
+      <div className="mb-2 flex min-w-0 flex-wrap items-center justify-between gap-2">
+        <h2 id="overview-headline-title" className="text-sm font-semibold text-text">Operational picture</h2>
+        <OperationalStatus model={status} />
+      </div>
+      <div className="grid min-w-0 grid-cols-2 gap-px overflow-hidden rounded-md border border-line bg-line md:grid-cols-3 xl:grid-cols-6">
+        <HeadlineMetric label="Overall health" value={health.value} className={health.cls} detail={health.detail} />
+        <HeadlineMetric label="Active traffic" value={`${instant?.active_streams_now ?? 0}`} className={(instant?.active_streams_now ?? 0) > 0 ? 'text-status-healthy' : 'text-text'} detail="Global · current open requests" />
+        <HeadlineMetric
+          label="Failure rate"
+          value={failureRate === null ? 'Unavailable' : `${failureRate.toFixed(failureRate === 0 ? 0 : 1)}%`}
+          className={failureRate !== null && failureRate > 0 ? 'text-status-down' : 'text-text'}
+          detail={`${response.totals.requests} terminal · ${scoped ? 'Scoped' : 'Global'} · last ${response.scope.window}`}
+        />
+        <HeadlineMetric
+          label="P95 latency"
+          value={p95Available ? fmtHeadlineMs(instant!.p95_ms!) : 'Unavailable'}
+          className={p95Available ? 'text-text' : 'text-text-muted'}
+          detail={instant && instant.latency_samples < 2 ? `Not enough samples · ${instant.latency_samples} request` : `${instant?.latency_samples ?? 0} requests · Global · latest interval`}
+        />
+        <HeadlineMetric
+          label="Throughput"
+          value={throughput === null ? 'Unavailable' : `${fmtTokens(throughput)}/s`}
+          className={throughput === null ? 'text-text-muted' : 'text-status-healthy'}
+          detail={`${throughputSamples} · Global · latest interval`}
+        />
+        <HeadlineMetric
+          label="Data freshness"
+          value={status.freshness.label}
+          className={status.freshness.label === 'Fresh' ? 'text-status-healthy' : status.freshness.label === 'Stale' ? 'text-status-cooling' : 'text-text-muted'}
+          detail={status.freshness.detail}
+        />
+      </div>
+    </section>
+  );
+}
+
+function HeadlineMetric({ label, value, detail, className }: { label: string; value: string; detail: string; className: string }) {
+  return (
+    <div className="min-w-0 bg-panel px-3 py-2.5" title={detail}>
+      <div className="text-[11px] font-medium text-text-muted">{label}</div>
+      <div className={cn('mt-0.5 break-words font-mono text-lg font-semibold tabular-nums', className)}>{value}</div>
+      <div className="mt-1 text-[10px] leading-tight text-text-muted">{detail}</div>
+    </div>
+  );
+}
+
+function fmtHeadlineMs(ms: number): string {
+  return ms >= 1_000 ? `${(ms / 1_000).toFixed(ms >= 10_000 ? 1 : 2)}s` : `${Math.round(ms)}ms`;
 }
 
 function OverviewContent({ response }: { response: OverviewResponse }) {
@@ -180,47 +271,82 @@ function OverviewContent({ response }: { response: OverviewResponse }) {
         </div>
       )}
 
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-2 2xl:grid-cols-3">
-        <CostSeriesTile response={response} />
-        <ProviderAttemptsTile response={response} />
-        <LeaderboardTile
-          testId="overview-top-models-volume"
-          title="served models · volume"
-          rows={response.served_models}
-          mode="volume"
-          facet="model"
-          quality={response.data_quality}
-        />
-        <LeaderboardTile
-          testId="overview-top-models-cost"
-          title="served models · cost"
-          rows={response.served_models}
-          mode="cost"
-          facet="model"
-          quality={response.data_quality}
-        />
-        <LeaderboardTile
-          testId="overview-top-providers-volume"
-          title="served providers · volume · Scoped"
-          rows={response.providers}
-          mode="volume"
-          facet="upstream"
-          quality={response.data_quality}
-        />
-        <LeaderboardTile
-          testId="overview-top-providers-cost"
-          title="served providers · cost · Scoped"
-          rows={response.providers}
-          mode="cost"
-          facet="upstream"
-          quality={response.data_quality}
-        />
-        <FailureTile response={response} />
-        <ClientTile response={response} />
-        <ContextTile response={response} />
-        <TokenMixTile tokens={response.tokens} quality={response.data_quality} />
-      </div>
+      <section className="mb-4" aria-labelledby="overview-operations-title">
+        <h2 id="overview-operations-title" className="mb-2 text-sm font-semibold text-text">Flow and provider health</h2>
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-2 2xl:grid-cols-5">
+          <FlowOutcomesTile response={response} />
+          <ProviderAttemptsTile response={response} />
+          <FailureTile response={response} />
+          <CostSeriesTile response={response} />
+        </div>
+      </section>
+
+      <section className="mb-4" aria-labelledby="overview-attribution-title">
+        <h2 id="overview-attribution-title" className="mb-2 text-sm font-semibold text-text">Served traffic</h2>
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+          <DimensionGroup title="Served models" subtitle="Volume and cost share one scoped population">
+            <LeaderboardTile testId="overview-top-models-volume" title="By volume" rows={response.served_models} mode="volume" facet="model" quality={response.data_quality} />
+            <LeaderboardTile testId="overview-top-models-cost" title="By cost" rows={response.served_models} mode="cost" facet="model" quality={response.data_quality} />
+          </DimensionGroup>
+          <DimensionGroup title="Served providers" subtitle="Scoped terminal flows; provider attempts above remain Global">
+            <LeaderboardTile testId="overview-top-providers-volume" title="By volume" rows={response.providers} mode="volume" facet="upstream" quality={response.data_quality} />
+            <LeaderboardTile testId="overview-top-providers-cost" title="By cost" rows={response.providers} mode="cost" facet="upstream" quality={response.data_quality} />
+          </DimensionGroup>
+        </div>
+      </section>
+
+      <section aria-labelledby="overview-resources-title">
+        <h2 id="overview-resources-title" className="mb-2 text-sm font-semibold text-text">Clients and resource use</h2>
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
+          <ClientTile response={response} />
+          <ContextTile response={response} />
+          <TokenMixTile tokens={response.tokens} quality={response.data_quality} />
+        </div>
+      </section>
     </>
+  );
+}
+
+function FlowOutcomesTile({ response }: { response: OverviewResponse }) {
+  const available = response.totals.requests > 0;
+  return (
+    <Panel className="p-3" data-testid="overview-flow-outcomes" data-quality={available ? response.data_quality : 'unavailable'}>
+      <div className="mb-2 flex items-baseline justify-between gap-2">
+        <span className="text-xs font-semibold text-text">Flow outcomes</span>
+        <span className="text-[10px] text-text-muted">{response.totals.requests} terminal · last {response.scope.window}</span>
+      </div>
+      {available ? (
+        <dl className="grid grid-cols-3 gap-px overflow-hidden rounded border border-line/60 bg-line/60">
+          <OutcomeFigure label="Succeeded" value={response.totals.successes} className="text-status-healthy" />
+          <OutcomeFigure label="Failed" value={response.totals.failures} className={response.totals.failures > 0 ? 'text-status-down' : 'text-text'} />
+          <OutcomeFigure label="Cancelled" value={response.totals.cancellations} className="text-status-cooling" />
+        </dl>
+      ) : (
+        <p className="text-xs text-text-muted">No terminal flows in this scoped window.</p>
+      )}
+      <p className="mt-2 text-[10px] text-text-muted">Flow rollups count final client outcomes. Provider attempts count every dispatch, including failed primaries.</p>
+    </Panel>
+  );
+}
+
+function OutcomeFigure({ label, value, className }: { label: string; value: number; className: string }) {
+  return (
+    <div className="bg-panel-raised px-2 py-2">
+      <dt className="text-[10px] text-text-muted">{label}</dt>
+      <dd className={cn('font-mono text-xl font-semibold tabular-nums', className)}>{value}</dd>
+    </div>
+  );
+}
+
+function DimensionGroup({ title, subtitle, children }: { title: string; subtitle: string; children: ReactNode }) {
+  return (
+    <Panel className="min-w-0 p-3">
+      <div className="mb-3">
+        <h3 className="text-xs font-semibold text-text">{title}</h3>
+        <p className="text-[10px] text-text-muted">{subtitle}</p>
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">{children}</div>
+    </Panel>
   );
 }
 
@@ -233,15 +359,16 @@ function CostSeriesTile({ response }: { response: OverviewResponse }) {
   return (
     <Panel className="flex min-w-0 flex-col gap-2 p-3" data-testid="overview-cost-trend" data-quality={quality}>
       <div className="flex flex-wrap items-baseline justify-between gap-1">
-        <span className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">scoped cost · server series</span>
+        <span className="text-xs font-semibold text-text">Scoped cost</span>
         <QualityBadge quality={quality} />
       </div>
       <div className="flex flex-wrap items-end gap-x-5 gap-y-2">
         <div>
-          <div className="text-[9px] uppercase tracking-wide text-text-muted">window total</div>
+          <div className="text-[10px] text-text-muted">Window total · {response.cost.samples} priced samples</div>
           <div className={cn('font-mono text-2xl font-semibold tabular-nums', QUALITY_CLASS[quality])} data-testid="overview-cost-total">
-            {available ? fmtCost(response.cost.total_usd) : DASH}
+            {available ? fmtCost(response.cost.total_usd) : 'Unavailable'}
           </div>
+          {!available && <p className="mt-1 text-[10px] text-text-muted">No pricing rule matched a usage-bearing request in this scope.</p>}
         </div>
         <div className="font-mono text-xs tabular-nums text-text-muted">
           {response.cost.samples} priced / {response.totals.requests} requests
@@ -265,9 +392,9 @@ function ProviderAttemptsTile({ response }: { response: OverviewResponse }) {
     .slice(0, TOP_ROWS);
   const available = providers.length > 0;
   return (
-    <Panel className="flex flex-col gap-2 p-3" data-testid="overview-providers" data-available={String(available)} data-quality={aggregate.data_quality}>
+    <Panel className="flex flex-col gap-2 p-3 2xl:col-span-2" data-testid="overview-providers" data-available={String(available)} data-quality={aggregate.data_quality}>
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">provider attempts · latency / error</span>
+        <span className="text-xs font-semibold text-text">Provider attempts · latency and error</span>
         <span className="rounded border border-line px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-text-muted">Global</span>
       </div>
       {!available ? (
@@ -320,14 +447,14 @@ function LeaderboardTile({
   const visible = ranked.slice(0, TOP_ROWS);
   const available = visible.length > 0;
   return (
-    <Panel className="flex flex-col gap-2 p-3" data-testid={testId} data-available={String(available)} data-quality={quality}>
+    <div className="flex min-w-0 flex-col gap-2 border-t border-line/60 pt-2" data-testid={testId} data-available={String(available)} data-quality={quality}>
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">{title}</span>
+        <span className="text-xs font-medium text-text-muted">{title}</span>
         {ranked.length > visible.length && <span className="text-[9px] text-text-muted">+{ranked.length - visible.length} more</span>}
       </div>
       {!available ? (
         <p className="px-1 py-2 text-xs italic text-text-muted" data-testid={`${testId}-unavailable`} data-quality="unavailable">
-          {mode === 'cost' ? `No priced groups · ${DASH}` : `No terminal flows · ${DASH}`}
+          {mode === 'cost' ? 'Cost unavailable — no priced groups.' : `No terminal flows · ${DASH}`}
         </p>
       ) : (
         <ol className="flex flex-col gap-1">
@@ -351,7 +478,7 @@ function LeaderboardTile({
           ))}
         </ol>
       )}
-    </Panel>
+    </div>
   );
 }
 
@@ -381,7 +508,7 @@ function FailureTile({ response }: { response: OverviewResponse }) {
   return (
     <Panel className="flex flex-col gap-2 p-3" data-testid="overview-failures" data-available={String(response.totals.requests > 0)} data-quality={quality}>
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">failures · bounded reason</span>
+        <span className="text-xs font-semibold text-text">Failures by reason</span>
         <span className={cn('font-mono text-sm font-semibold tabular-nums', rate !== null && rate > ERROR_RATE_THRESHOLD ? 'text-status-down' : QUALITY_CLASS[quality])} data-testid="overview-failures-rate" data-quality={quality}>
           {rate === null ? DASH : `${rate.toFixed(1)}%`}
         </span>
@@ -410,7 +537,7 @@ function ClientTile({ response }: { response: OverviewResponse }) {
   const rows = [...response.clients].sort((a, b) => b.requests - a.requests).slice(0, TOP_ROWS);
   return (
     <Panel className="flex flex-col gap-2 p-3" data-testid="overview-clients" data-available={String(rows.length > 0)} data-quality={response.data_quality}>
-      <span className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">clients · scoped terminal rollup</span>
+      <span className="text-xs font-semibold text-text">Clients · scoped terminal rollup</span>
       {rows.length === 0 ? (
         <p className="px-1 py-2 text-xs italic text-text-muted" data-testid="overview-clients-unavailable" data-quality="unavailable">No attributed client samples · {DASH}</p>
       ) : (
@@ -443,18 +570,18 @@ function ContextTile({ response }: { response: OverviewResponse }) {
   return (
     <Panel className="flex flex-col gap-3 p-3" data-testid="overview-context" data-available={String(available)} data-quality={context.data_quality}>
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">context pressure</span>
+        <span className="text-xs font-semibold text-text">Context pressure</span>
         <QualityBadge quality={context.data_quality} />
       </div>
       <div className="grid grid-cols-2 gap-3">
         <div>
-          <div className="text-[9px] uppercase tracking-wide text-text-muted">average utilization</div>
+          <div className="text-[10px] text-text-muted">Average utilization</div>
           <div className={cn('font-mono text-2xl font-semibold tabular-nums', pressure !== null && pressure >= 90 ? 'text-status-down' : pressure !== null && pressure >= 75 ? 'text-status-cooling' : QUALITY_CLASS[context.data_quality])} data-testid="overview-context-pressure">
             {available ? `${pressure!.toFixed(1)}%` : DASH}
           </div>
         </div>
         <div className="text-right">
-          <div className="text-[9px] uppercase tracking-wide text-text-muted">effective route limit</div>
+          <div className="text-[10px] text-text-muted">Effective route limit</div>
           <div className="font-mono text-sm tabular-nums text-text" data-testid="overview-context-limit" data-quality={context.effective_route_limit_min === null ? 'unavailable' : 'derived'}>
             {fmtTokens(context.effective_route_limit_min)} tok
           </div>
@@ -487,7 +614,7 @@ function TokenMixTile({ tokens, quality }: { tokens: OverviewTokens; quality: Ov
   return (
     <Panel className="flex flex-col gap-2 p-3" data-testid="overview-token-mix" data-available={String(available)} data-quality={available ? quality : 'unavailable'}>
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-[0.14em] text-text-muted">token mix · terminal totals</span>
+        <span className="text-xs font-semibold text-text">Token mix · terminal totals</span>
         <span className="font-mono text-[9px] tabular-nums text-text-muted">{tokens.samples} usage samples</span>
       </div>
       {!available ? (

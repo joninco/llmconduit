@@ -156,7 +156,7 @@ describe('chips', () => {
     expect(byKey.accepted_per_sec).toBe('0.0'); // genuine idle zero, also numeric
   });
 
-  it('keeps sparse percentile values visible and tags each one partial', () => {
+  it('keeps a one-sample median visible but withholds misleading tail percentiles', () => {
     const chips = deriveChips(win({
       latency_samples: 1,
       p50_ms: 125,
@@ -166,10 +166,13 @@ describe('chips', () => {
       p95_quality: 'partial',
       p99_quality: 'partial',
     }), null);
-    for (const key of ['p50_ms', 'p95_ms', 'p99_ms'] as const) {
+    const p50 = chips.find((candidate) => candidate.key === 'p50_ms')!;
+    expect(p50.value).toBe('125');
+    expect(p50.quality).toBe('partial');
+    for (const key of ['p95_ms', 'p99_ms'] as const) {
       const chip = chips.find((candidate) => candidate.key === key)!;
-      expect(chip.value).toBe('125');
-      expect(chip.quality).toBe('partial');
+      expect(chip.value).toBe('—');
+      expect(chip.quality).toBe('unavailable');
       expect(chip.details).toContain('1 latency samples');
     }
   });

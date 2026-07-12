@@ -28,15 +28,21 @@ test.describe('Argus dashboard', () => {
     // Let the mock deliver its snapshot + live frames (incl. the metric_tick).
     await page.waitForTimeout(800);
 
-    // tok/s + $/min + active are the fields the OLD WS tile hard-coded to 0 — they must
-    // now carry real values (the mock seeds them > 0), proving live flows reach the strip.
-    for (const key of ['active_streams_now', 'reported_tokens_per_sec', 'cost_per_min', 'accepted_per_sec']) {
+    // The priority row stays visible without scrolling; secondary values live behind the
+    // intentional More metrics disclosure.
+    for (const key of ['active_streams_now', 'reported_tokens_per_sec']) {
       const value = page.getByTestId(`chip-${key}`).getByTestId('chip-value');
       await expect(value).toBeVisible();
       const text = (await value.textContent())?.trim() ?? '';
       expect(text, `${key} must be measured, not unavailable`).not.toBe('—');
       // A real, non-zero reading (the mock's seeded window is all > 0).
       expect(text, `${key} reads a real number`).toMatch(/[1-9]/);
+    }
+    await page.getByTestId('more-metrics').locator('summary').click();
+    for (const key of ['cost_per_min', 'accepted_per_sec']) {
+      const value = page.getByTestId(`chip-${key}`).getByTestId('chip-value');
+      await expect(value).toBeVisible();
+      expect((await value.textContent())?.trim(), `${key} must be measured`).not.toBe('—');
     }
 
     // Every chip exposes provenance. The counter-backed token source is deliberately
@@ -463,10 +469,10 @@ test.describe('Argus dashboard', () => {
     await openView(page, VIEWS[4]!); // Overview
     await page.waitForTimeout(600);
 
-    // StatsStrip is the sole headline. Overview begins with the server-cut provenance instead of
-    // duplicating those global tiles.
+    // Overview leads with a compact operational picture, then exposes the exact server-cut
+    // provenance so live-interval values cannot be mistaken for scoped window rollups.
     await expect(page.getByTestId('overview-view')).toBeVisible();
-    await expect(page.getByTestId('overview-headline')).toHaveCount(0);
+    await expect(page.getByTestId('overview-headline')).toBeVisible();
     await expect(page.getByTestId('overview-provenance')).toHaveAttribute('data-quality', 'measured');
     await expect(page.getByTestId('overview-provenance')).toContainText('Flow rollups · Global');
     await expect(page.getByTestId('overview-provenance')).toContainText('Provider attempts · Global');
@@ -545,6 +551,30 @@ test.describe('Argus dashboard', () => {
     await expect(page.getByTestId('overview-failure-group').first()).toHaveJSProperty('tagName', 'BUTTON');
 
     expect(consoleErrors, 'console errors on the control-room overview').toEqual([]);
+  });
+
+  test('metrics and overview avoid ordinary page-level horizontal scrolling across target widths', async ({ page, consoleErrors }) => {
+    await login(page);
+    await openView(page, VIEWS[4]!);
+    const viewports = [
+      { width: 1920, height: 1080 },
+      { width: 1440, height: 900 },
+      { width: 1280, height: 800 },
+      { width: 1024, height: 768 },
+      { width: 768, height: 1024 },
+    ];
+    for (const viewport of viewports) {
+      await page.setViewportSize(viewport);
+      await page.waitForTimeout(100);
+      const overflow = await page.evaluate(() => ({
+        page: document.documentElement.scrollWidth - document.documentElement.clientWidth,
+        body: document.body.scrollWidth - document.body.clientWidth,
+      }));
+      expect(overflow.page, `${viewport.width}px document overflow`).toBeLessThanOrEqual(1);
+      expect(overflow.body, `${viewport.width}px body overflow`).toBeLessThanOrEqual(1);
+      await expect(page.getByTestId('primary-metrics')).toBeVisible();
+    }
+    expect(consoleErrors).toEqual([]);
   });
 
   test('request transformation inspector explains each hop and offers compact/full views', async ({ page, consoleErrors }) => {
@@ -789,7 +819,7 @@ test.describe('Argus dashboard', () => {
 
     // Restore both: click the chrome strip; drag the drawer splitter back down.
     await page.getByTestId('shell-chrome-strip').click();
-    await expect(page.getByTestId('chip-accepted_per_sec')).toBeVisible();
+    await expect(page.getByTestId('chip-active_streams_now')).toBeVisible();
     const d2 = (await page.getByTestId('split-drawer').boundingBox())!;
     await page.mouse.move(d2.x + 400, d2.y + 1);
     await page.mouse.down();

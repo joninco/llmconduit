@@ -127,8 +127,8 @@ describe('OverviewView — authoritative query scope', () => {
     expect(queryAllByText('llama-served').length).toBeGreaterThan(0);
     expect(queryByText('local-only-model')).toBeNull();
     expect(queryByText('local-only-provider')).toBeNull();
-    // The global StatsStrip is the one headline; Overview no longer repeats it.
-    expect(queryByTestId('overview-headline')).toBeNull();
+    // The control-room headline is operationally prioritized but still reads only server-cut data.
+    expect(queryByTestId('overview-headline')).toBeTruthy();
   });
 });
 
@@ -171,7 +171,7 @@ describe('OverviewView — exact server rollups and honest quality', () => {
     expect(getByTestId('overview-failures-rate').textContent).toBe('—');
     expect(getByTestId('overview-context-pressure').textContent).toBe('—');
     expect(getByTestId('overview-token-mix').getAttribute('data-available')).toBe('false');
-    expect(getByTestId('overview-cost-total').textContent).toBe('—');
+    expect(getByTestId('overview-cost-total').textContent).toBe('Unavailable');
   });
 
   it('labels provider-attempt health Global even when flow rollups are scoped', async () => {

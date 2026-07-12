@@ -153,27 +153,26 @@ describe('StatsStrip — chips', () => {
 });
 
 describe('StatsStrip — connection semantics', () => {
-  it('distinguishes initial loading, stale reconnect, and transport failure', () => {
+  it('distinguishes initial connection, reconnecting retained data, and disconnect', () => {
     const { getByTestId } = renderWithQuery(<StatsStrip />);
     act(() => dashboardStore.getState().setConnection('connecting'));
-    expect(getByTestId('connection-state').textContent).toBe('connecting');
-    expect(getByTestId('connection-state').getAttribute('data-stale')).toBeNull();
+    expect(getByTestId('status-connection').textContent).toContain('Connecting');
 
     pushMetrics(metrics(1));
     act(() => {
       dashboardStore.getState().setConnection('live');
       dashboardStore.getState().setConnection('connecting');
     });
-    expect(getByTestId('connection-state').textContent).toContain('reconnecting · stale');
-    expect(getByTestId('connection-state').getAttribute('data-stale')).toBe('true');
+    expect(getByTestId('status-connection').textContent).toContain('Reconnecting');
+    expect(getByTestId('status-freshness')).toBeTruthy();
 
     act(() => dashboardStore.getState().setConnection('error'));
-    expect(getByTestId('connection-state').textContent).toBe('error');
+    expect(getByTestId('status-connection').textContent).toContain('Disconnected');
   });
 });
 
 describe('StatsStrip — instantaneous idle retention', () => {
-  it('shows current instantaneous cuts while active, then freezes the last cut with a counting stale timer', () => {
+  it('shows current instantaneous cuts while active, then freezes values while traffic becomes idle', () => {
     vi.useFakeTimers();
     vi.setSystemTime(10_000);
     const { getByTestId } = renderWithQuery(<StatsStrip />);
@@ -231,17 +230,14 @@ describe('StatsStrip — instantaneous idle retention', () => {
     expect(value('active_streams_now')).toBe('0.0');
     expect(value('reported_tokens_per_sec')).toBe('75.0');
     expect(getByTestId('chip-reported_tokens_per_sec').textContent).toContain('engine gen tok/s');
-    expect(getByTestId('stats-strip').getAttribute('data-metrics-state')).toBe('stale');
-    expect(getByTestId('chip-accepted_per_sec').getAttribute('data-stale')).toBe('true');
-    expect(getByTestId('stats-strip').firstElementChild).toBe(getByTestId('stats-activity-state'));
-    expect(getByTestId('stats-stale-age').textContent).toBe('00:01');
+    expect(getByTestId('stats-strip').getAttribute('data-metrics-state')).toBe('retained');
+    expect(getByTestId('chip-accepted_per_sec').getAttribute('data-retained')).toBe('true');
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(getByTestId('status-traffic').textContent).toContain('Idle');
+    expect(getByTestId('status-traffic').getAttribute('title')).toContain('Last request');
 
     act(() => vi.advanceTimersByTime(4_000));
-    expect(getByTestId('stats-stale-age').textContent).toBe('00:05');
-
-    vi.setSystemTime(90_071_000);
-    act(() => vi.advanceTimersByTime(1_000));
-    expect(getByTestId('stats-stale-age').textContent).toBe('1d 01:01:02');
+    expect(getByTestId('status-traffic').getAttribute('title')).toContain('6s ago');
   });
 
   it('uses an explicit idle/no-request state before any request has been observed', () => {
@@ -255,8 +251,8 @@ describe('StatsStrip — instantaneous idle retention', () => {
         active_streams_now: 0,
       }),
     }));
-    expect(getByTestId('stats-activity-state').getAttribute('data-state')).toBe('empty');
-    expect(getByTestId('stats-activity-state').textContent).toContain('idle · no request yet');
+    expect(getByTestId('status-traffic').getAttribute('data-state')).toBe('idle');
+    expect(getByTestId('status-traffic').getAttribute('title')).toContain('No request has been observed yet');
   });
 });
 

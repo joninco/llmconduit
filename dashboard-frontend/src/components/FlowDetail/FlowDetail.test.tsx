@@ -93,6 +93,77 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     expect(c.scrollTop).toBe(40);
   });
 
+  it('summarizes a successful request without opening technical sections', async () => {
+    const started = 1_700_000_000_000;
+    seedFlows([makeFlow({
+      api_call_id: 'api_summary_success',
+      status: 'completed',
+      model_requested: 'client-model',
+      model_served: 'served-model',
+      upstream_target: 'provider-a',
+      started_ms: started,
+      finished_ms: started + 900,
+      usage: { prompt: 10, completion: 5, total: 15 },
+      attempts: [{ provider: 'provider-a', model: 'served-model', start_ms: started, end_ms: started + 900, status: 'served' }],
+    })]);
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_summary_success" onClose={noop} />);
+    const summary = getByTestId('request-summary-grid');
+    expect(summary.textContent).toContain('2xx');
+    expect(summary.textContent).toContain('client-model → served-model');
+    expect(summary.textContent).toContain('10 / 5');
+    expect(summary.textContent).toContain('No failover');
+  });
+
+  it('keeps long identities inspectable, copies the full ID, and surfaces failover in the summary', async () => {
+    const longId = `api_${'x'.repeat(256)}`;
+    const longRequested = `requested/${'r'.repeat(180)}`;
+    const longServed = `served/${'s'.repeat(180)}`;
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    const started = 1_700_000_000_000;
+    seedFlows([makeFlow({
+      api_call_id: longId,
+      status: 'completed',
+      model_requested: longRequested,
+      model_served: longServed,
+      upstream_target: 'provider-b',
+      started_ms: started,
+      finished_ms: started + 1_400,
+      usage: { prompt: 2_048, completion: 512, total: 2_560 },
+      attempts: [
+        { provider: 'provider-a', model: longServed, start_ms: started, end_ms: started + 200, status: 'failed', error_class: 'timeout', failover_reason: 'provider_failed' },
+        { provider: 'provider-b', model: longServed, start_ms: started + 200, end_ms: started + 1_400, status: 'served' },
+      ],
+    })]);
+    const { getByTestId } = renderWithQuery(<FlowDetail apiCallId={longId} onClose={noop} />);
+    expect(document.querySelector(`[title="${longId}"]`)).toBeTruthy();
+    expect(getByTestId('request-summary-grid').textContent).toContain('1 failed → provider-b');
+    expect(getByTestId('request-summary-grid').textContent).toContain(longRequested);
+    fireEvent.click(getByTestId('copy-request-id'));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(longId));
+    await waitFor(() => expect(getByTestId('copy-request-id').textContent).toBe('Copied'));
+  });
+
+  it('distinguishes empty headers from disabled durable capture', async () => {
+    seedFlows([makeFlow({ api_call_id: 'api_capture_states', status: 'completed' })]);
+    const detail: FlowDetailDto = {
+      flow_seq: 1,
+      revision: 1,
+      api_call_id: 'api_capture_states',
+      status: 'completed',
+      cost_confidence: 'unavailable',
+      deltas: [],
+      started_ms: 1_700_000_000_000,
+      inbound_headers: {},
+      captured_sections: [],
+    };
+    const { getByTestId, getByRole, queryClient } = renderWithQuery(<FlowDetail apiCallId="api_capture_states" onClose={noop} />);
+    act(() => queryClient.setQueryData(['flows', 'api_capture_states'], detail));
+    await waitFor(() => expect(getByTestId('headers-empty').textContent).toContain('No inbound headers were present'));
+    fireEvent.click(getByRole('tab', { name: 'Captured I/O' }));
+    expect(getByTestId('tabpanel-captures').querySelector('[data-state="disabled"]')?.textContent).toContain('not enabled');
+  });
+
   it('Timeline tab populates from monitor event_append; deltas render output + tool card', async () => {
     const { getByTestId, getByRole } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
     await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
@@ -248,7 +319,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_001" onClose={noop} />);
     // Wait for the detail query to resolve.
     await waitFor(() => expect(getByTestId('jsonpane-code-A · inbound').querySelectorAll('.json-line').length).toBeGreaterThan(0));
-    await waitFor(() => expect(getByTestId('detail-cost').textContent).toContain('—'));
+    await waitFor(() => expect(getByTestId('detail-cost').textContent).toContain('Unavailable'));
   });
 
   it('kill button is gated OFF (disabled, no POST) when mutations are disabled', async () => {
@@ -267,7 +338,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
   // Gap 07 — the inspector header renders `—` for UNREPORTED cached/reasoning (never a fake
   // `0`) and LABELS an `estimated` cost as such. `api_g07` is unknown to the mock so /flows/:id
   // 404s and the SEEDED live row drives the header (usage cached/reasoning absent, tag estimated).
-  it('renders — for unreported cached/reasoning and labels an estimated cost', async () => {
+  it('labels unreported cached/reasoning as not captured and labels an estimated cost', async () => {
     seedFlows([
       makeFlow({
         api_call_id: 'api_g07',
@@ -284,9 +355,9 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     const { getByTestId } = renderWithQuery(<FlowDetail apiCallId="api_g07" onClose={noop} />);
     await waitFor(() => expect(getByTestId('flow-detail')).toBeTruthy());
 
-    // The cached/reasoning subcounts both render the unavailable marker, NOT `0`.
+    // The cached/reasoning subcounts distinguish missing capture from a measured zero.
     const sub = getByTestId('usage-subcounts');
-    expect(sub.textContent).toContain('—');
+    expect(sub.textContent).toContain('Not captured');
     expect(sub.textContent).not.toContain('0');
 
     // The estimated cost is LABELLED (the cross-cutting rule): an `est` badge is present.
@@ -782,7 +853,7 @@ describe('FlowDetail — ErrorTab captured upstream body (gap 14)', () => {
     fireEvent.click(getByRole('tab', { name: 'Error' }));
     // A clean success ⇒ "No error." (no capture-disabled nag on a non-error flow).
     await waitFor(() => expect(getByTestId('error-empty')).toBeTruthy());
-    expect(getByTestId('error-empty').textContent).toContain('No error.');
+    expect(getByTestId('error-empty').textContent).toContain('No error occurred');
     expect(queryByTestId('error-capture')).toBeNull();
   });
 });
@@ -898,7 +969,7 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     // Headers: the live REST auth header is withheld while seeking (frozen cut has no headers).
     // Headers IS the default tab — re-clicking the ACTIVE tab now collapses the drawer (the
     // DevTools console-drawer gesture), so assert the already-shown panel directly.
-    expect(getByTestId('headers-empty')).toBeTruthy();
+    expect(getByTestId('headers-unavailable').textContent).toContain('not provided');
   });
 
   it('while seeking, an OUT-of-cut selection fetches no detail and shows evicted panes (finding 1)', async () => {

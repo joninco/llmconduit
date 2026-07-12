@@ -33,7 +33,6 @@ import { useMetricStream } from '../../store/useMetricStream';
 import { getConnection, queryKeys } from '../../api/connection';
 import { Panel } from '../ui/Panel';
 import { cn } from '../../lib/cn';
-import { formatStaleAge } from '../../lib/staleAge';
 import { Sparkline } from '../../viz/Sparkline';
 import {
   appendTick,
@@ -52,6 +51,16 @@ import {
 } from './metricHistory';
 import { deriveChips, deltaGlyph, type ChipDescriptor } from './chips';
 import { updateHashScope, useHashScope } from '../../router/useHashRoute';
+import { deriveDashboardStatus } from '../../lib/dashboardStatus';
+import { OperationalStatus } from '../ui/OperationalStatus';
+
+const PRIMARY_METRICS = new Set([
+  'active_streams_now',
+  'failure_pct',
+  'p50_ms',
+  'p95_ms',
+  'reported_tokens_per_sec',
+]);
 
 export function StatsStrip() {
   const scope = useHashScope();
@@ -128,34 +137,78 @@ export function StatsStrip() {
     ? latestEngineThroughput(history, engineThroughput.sampled_at_ms)
     : null;
   const chips = deriveChips(cur, prev, engineThroughput, previousEngineThroughput);
+  const primaryChips = chips.filter((chip) => PRIMARY_METRICS.has(chip.key));
+  const secondaryChips = chips.filter((chip) => !PRIMARY_METRICS.has(chip.key));
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = globalThis.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => globalThis.clearInterval(id);
+  }, []);
+  const operationalStatus = deriveDashboardStatus({
+    connection,
+    hasDashboardData,
+    generatedAtMs: currentMetrics?.generated_at_ms ?? null,
+    activeStreams: currentInstant?.active_streams_now ?? 0,
+    lastActivityAtMs: retainedActivity?.at_ms ?? null,
+    nowMs: seeking ? (seekAtMs ?? nowMs) : nowMs,
+  });
 
   return (
     <Panel
-      className="m-2 mb-0 flex snap-x snap-mandatory items-center gap-1 overflow-x-auto px-2 py-1 sm:m-4 sm:mb-0"
+      className="m-2 mb-0 min-w-0 overflow-hidden p-2 sm:m-4 sm:mb-0 sm:p-3"
       data-testid="stats-strip"
-      data-metrics-state={showingRetained ? 'stale' : idle ? 'empty' : currentInstant ? 'instant' : 'empty'}
+      data-metrics-state={showingRetained ? 'retained' : idle ? 'empty' : currentInstant ? 'instant' : 'empty'}
     >
-      <ActivityState
-        activeStreams={currentInstant?.active_streams_now ?? 0}
-        lastActivityAtMs={retainedActivity?.at_ms ?? null}
-        seeking={seeking}
-        seekAtMs={seekAtMs}
-      />
-      {chips.map((chip) => (
-        <ChipCell key={chip.key} chip={chip} series={seriesFor(visibleHistory, chip.key, chip.source)} stale={showingRetained} />
-      ))}
-      <div className="ml-auto flex items-center gap-2 pr-1">
-        <span
-          className="rounded border border-border px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted"
-          title="Gateway-wide metrics; URL flow filters do not change these values."
-          aria-label="Global gateway metrics, unaffected by flow filters"
-          data-testid="stats-global-badge"
-        >
-          Global
-        </span>
-        <WindowSelector value={window} onChange={(next) => updateHashScope({ window: next })} />
-        <ConnectionDot state={connection} hasData={hasDashboardData} />
+      <div className="mb-2 flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2">
+        <div className="mr-auto min-w-0">
+          <div className="flex items-center gap-2">
+            <h2 className="text-xs font-semibold text-text">Gateway metrics</h2>
+            <span
+              className="rounded border border-border px-1.5 py-0.5 text-[10px] font-medium text-muted"
+              title="Gateway-wide metrics; URL flow filters do not change these values."
+              aria-label="Global gateway metrics, unaffected by flow filters"
+              data-testid="stats-global-badge"
+            >
+              Global
+            </span>
+          </div>
+          <OperationalStatus model={operationalStatus} />
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <span className="hidden text-[11px] text-text-muted sm:inline">Trend window</span>
+          <WindowSelector value={window} onChange={(next) => updateHashScope({ window: next })} />
+        </div>
       </div>
+
+      <div className="grid min-w-0 grid-cols-2 gap-px overflow-hidden rounded border border-line/60 bg-line/60 sm:grid-cols-3 lg:grid-cols-5" data-testid="primary-metrics">
+        {primaryChips.map((chip) => (
+          <ChipCell
+            key={chip.key}
+            chip={chip}
+            series={seriesFor(visibleHistory, chip.key, chip.source)}
+            retained={showingRetained}
+            scope={metricScope(chip, cur, showingRetained)}
+            primary
+          />
+        ))}
+      </div>
+
+      <details className="mt-2" data-testid="more-metrics">
+        <summary className="inline-flex min-h-8 cursor-pointer items-center rounded px-1 text-[11px] font-medium text-text-muted hover:text-text">
+          More metrics <span className="ml-1 text-[10px]">({secondaryChips.length})</span>
+        </summary>
+        <div className="mt-1 grid min-w-0 grid-cols-2 gap-px overflow-hidden rounded border border-line/60 bg-line/60 sm:grid-cols-3 lg:grid-cols-5">
+          {secondaryChips.map((chip) => (
+            <ChipCell
+              key={chip.key}
+              chip={chip}
+              series={seriesFor(visibleHistory, chip.key, chip.source)}
+              retained={showingRetained}
+              scope={metricScope(chip, cur, showingRetained)}
+            />
+          ))}
+        </div>
+      </details>
     </Panel>
   );
 }
@@ -187,30 +240,38 @@ const QUALITY_LABEL: Record<ChipDescriptor['quality'], string> = {
 function ChipCell({
   chip,
   series,
-  stale,
+  retained,
+  scope,
+  primary = false,
 }: {
   chip: ChipDescriptor;
   series: { times: number[]; values: number[] };
-  stale: boolean;
+  retained: boolean;
+  scope: string;
+  primary?: boolean;
 }) {
   const qualityText = QUALITY_LABEL[chip.quality];
   return (
     <div
-      className="flex shrink-0 snap-start flex-col gap-1 border-l border-line/50 px-3 py-1 first:border-l-0"
+      className="flex min-w-0 flex-col gap-1 bg-panel px-2.5 py-2"
       data-testid={`chip-${chip.key}`}
-      data-stale={stale ? 'true' : undefined}
+      data-retained={retained ? 'true' : undefined}
       // Provenance exposed to the DOM (finding 4): tests + tooling can assert the tag, and
       // the `title` gives operators a hover hint. EVERY chip carries one of
       // measured/derived/estimated/unavailable.
       data-quality={chip.quality}
       data-source={chip.source}
-      title={`${stale ? 'Stale retained sample. ' : ''}${chip.label}: ${qualityText}. ${chip.details}`}
+      title={`${retained ? 'Retained last-activity sample. ' : ''}${chip.label}: ${qualityText}. ${chip.details}`}
       aria-description={chip.details}
     >
-      <span className="text-[10px] uppercase tracking-[0.14em] text-text-muted">{chip.label}</span>
+      <span className="text-[11px] font-medium text-text-muted">{chip.label}</span>
       <div className="flex items-baseline gap-1">
         <span
-          className={cn('font-mono text-xl font-semibold tabular-nums tracking-tight', ACCENT_TEXT[chip.accent])}
+          className={cn(
+            'font-mono font-semibold tabular-nums tracking-tight',
+            primary ? 'text-xl sm:text-2xl' : 'text-lg',
+            ACCENT_TEXT[chip.accent],
+          )}
           data-testid="chip-value"
           // Make the provenance available to assistive tech without cluttering the visual
           // (the value reads e.g. "142 (derived from observed samples or counter deltas)").
@@ -222,9 +283,31 @@ function ChipCell({
           {deltaGlyph(chip.delta)}
         </span>
       </div>
-      <Sparkline data={series.values} timestamps={series.times} stroke={chip.sparkStroke} label={`${chip.label} trend`} />
+      <div className="flex min-w-0 items-end gap-2">
+        <span className="min-w-0 flex-1 text-[10px] leading-tight text-text-muted" data-testid="metric-scope">{scope}</span>
+        <span className="w-12 shrink-0 sm:w-16">
+          <Sparkline data={series.values} timestamps={series.times} stroke={chip.sparkStroke} label={`${chip.label} trend`} />
+        </span>
+      </div>
     </div>
   );
+}
+
+function metricScope(chip: ChipDescriptor, sample: MetricsResponse['instant'] | null, retained: boolean): string {
+  if (chip.key === 'active_streams_now') return 'Global · current';
+  if (!sample) return 'Global · no interval';
+  const interval = retained ? 'last active interval' : 'latest interval';
+  if (chip.key === 'failure_pct' || chip.key === 'cancellation_pct') {
+    return `${sample.terminal_requests} terminal · ${interval}`;
+  }
+  if (chip.key === 'p50_ms' || chip.key === 'p95_ms' || chip.key === 'p99_ms') {
+    return sample.latency_samples < 2 && chip.key !== 'p50_ms'
+      ? 'Not enough samples'
+      : `${sample.latency_samples} ${sample.latency_samples === 1 ? 'request' : 'requests'} · ${interval}`;
+  }
+  if (chip.key === 'reported_tokens_per_sec') return `${sample.usage_samples} usage samples · ${interval}`;
+  if (chip.key === 'cost_per_min') return `${sample.priced_samples} priced · ${interval}`;
+  return `Global · ${interval}`;
 }
 
 /** 1m/5m/1h history selector — changes sparkline depth, never the instantaneous chip value. */
@@ -246,77 +329,5 @@ function WindowSelector({ value, onChange }: { value: WindowKey; onChange: (w: W
         </button>
       ))}
     </div>
-  );
-}
-
-/** Live/idle mode indicator. The clock owns its timer so chip sparklines do not rerender each second. */
-function ActivityState({
-  activeStreams,
-  lastActivityAtMs,
-  seeking,
-  seekAtMs,
-}: {
-  activeStreams: number;
-  lastActivityAtMs: number | null;
-  seeking: boolean;
-  seekAtMs: number | null;
-}) {
-  const [nowMs, setNowMs] = useState(() => Date.now());
-  useEffect(() => {
-    if (activeStreams > 0 || lastActivityAtMs === null || seeking) return;
-    setNowMs(Date.now());
-    const id = globalThis.setInterval(() => setNowMs(Date.now()), 1_000);
-    return () => globalThis.clearInterval(id);
-  }, [activeStreams, lastActivityAtMs, seeking]);
-
-  if (activeStreams > 0) {
-    return null;
-  }
-  if (lastActivityAtMs === null) {
-    return (
-      <span
-        className="sticky left-0 z-10 shrink-0 rounded border border-line bg-panel px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-text-muted"
-        data-testid="stats-activity-state"
-        data-state="empty"
-      >
-        idle · no request yet
-      </span>
-    );
-  }
-
-  const clockAtMs = seeking ? (seekAtMs ?? lastActivityAtMs) : nowMs;
-  const age = formatStaleAge(clockAtMs - lastActivityAtMs);
-  return (
-    <span
-      className="sticky left-0 z-10 flex shrink-0 items-baseline gap-2 rounded border-2 border-status-cooling/70 bg-panel px-2.5 py-1 text-status-cooling shadow-lg"
-      role="status"
-      aria-label={`Statistics stale for ${age} since the last request`}
-      data-testid="stats-activity-state"
-      data-state={seeking ? 'historical' : 'stale'}
-      data-stale="true"
-    >
-      <span className="text-[10px] font-bold uppercase tracking-[0.14em]">{seeking ? 'historical' : 'stats stale'}</span>
-      <span className="font-mono text-lg font-bold tabular-nums leading-none" data-testid="stats-stale-age">{age}</span>
-      <span className="text-[10px] font-semibold uppercase tracking-wide">since last request</span>
-    </span>
-  );
-}
-
-function ConnectionDot({ state, hasData }: { state: string; hasData: boolean }) {
-  const color =
-    state === 'live' ? 'bg-status-healthy'
-    : state === 'connecting' || state === 'seeking' ? 'bg-status-cooling'
-    : state === 'error' ? 'bg-status-down'
-    : 'bg-text-muted';
-  const label = state === 'connecting' && hasData ? 'reconnecting · stale' : state;
-  return (
-    <span
-      className="flex items-center gap-2 text-[10px] uppercase tracking-[0.14em] text-text-muted"
-      data-testid="connection-state"
-      data-stale={state === 'connecting' && hasData ? 'true' : undefined}
-    >
-      <span className={`h-2 w-2 rounded-full ${color}`} aria-hidden />
-      {label}
-    </span>
   );
 }

@@ -151,9 +151,9 @@ function Dashboard() {
           id="shell-chrome"
           collapsible
           collapsedSize={14}
-          defaultSize={176}
-          minSize={80}
-          maxSize={260}
+          defaultSize={242}
+          minSize={112}
+          maxSize={420}
           groupResizeBehavior="preserve-pixel-size"
           panelRef={chromeRef}
           onResize={onChromeResize}
