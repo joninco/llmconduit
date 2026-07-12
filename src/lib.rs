@@ -129,14 +129,6 @@ pub fn build_app_with_gateway_and_options(
     } else {
         crate::metrics::MetricsLayer::disabled()
     };
-    // F1 (Topic F) durable per-turn capture: opt-in, config-only gate --
-    // constructed regardless of `--with-debug-ui` (works even when the debug
-    // UI/dashboard is off). `disabled()` is a zero-op sink (no thread, no
-    // alloc, no fs) when `turn_capture_dir` is unset.
-    let turn_capture = match config.turn_capture_dir.clone() {
-        Some(dir) => crate::turn_capture::TurnCapture::enabled(dir),
-        None => crate::turn_capture::TurnCapture::disabled(),
-    };
     // Durable dashboard cuts are independently opt-in through an env-only path, but
     // remain gated by `--with-debug-ui` so a production-disabled dashboard retains its
     // zero-task/zero-IO behavior. Large bodies continue to live in `turn_capture_dir`.
@@ -144,6 +136,20 @@ pub fn build_app_with_gateway_and_options(
         options.with_debug_ui,
         config.turn_capture_dir.clone(),
     );
+    let durable_cursors = dashboard_history.bootstrap_cursors();
+    flow_store.hydrate_sequence(durable_cursors.flow_seq);
+    monitor.hydrate_sequence(durable_cursors.monitor_seq);
+    let durable_terminals = dashboard_history.bootstrap_terminal_summaries();
+    metrics.hydrate_archive(durable_cursors, durable_terminals.as_slice());
+    metrics.hydrate_last_activity(dashboard_history.bootstrap_last_activity());
+    // F1 durable per-turn capture remains independently usable without the dashboard,
+    // but when both are enabled its final artifact publication is acknowledged by the
+    // same archive that owns flow history.
+    let turn_capture = match config.turn_capture_dir.clone() {
+        Some(dir) => crate::turn_capture::TurnCapture::enabled(dir)
+            .with_dashboard_history(dashboard_history.clone()),
+        None => crate::turn_capture::TurnCapture::disabled(),
+    };
     // Routing mode is engaged by explicit `upstreams` OR ad-hoc `model_routes`
     // (G7); routes alone are enough to switch the gateway into the routing
     // client so route-name/glob matching applies.
@@ -305,6 +311,7 @@ pub fn build_app_with_gateway_and_options(
     // the originals move into Gateway. The task takes the fixed FlowStore→Metrics order,
     // broadcasts one immutable shared cut, and persists that same cut every fifth tick.
     let publisher_flow_store = flow_store.clone();
+    let flow_history_receiver = flow_store.subscribe();
     let publisher_metrics = metrics.clone();
     let publisher_monitor = monitor.clone();
     let publisher_history = dashboard_history.clone();
@@ -330,9 +337,12 @@ pub fn build_app_with_gateway_and_options(
     // this bootstrap cut removes the pre-first-tick recomputation race while sharing
     // the same sequence allocator and FlowStore→Metrics lock order.
     if options.with_debug_ui {
+        let topology = gateway.provider_health_publisher();
+        topology.hydrate_sequence(durable_cursors.topology_seq);
+        topology.publish(gateway.upstream_health());
         let _ = gateway.metrics().publish_metrics_cut(
             gateway.flow_store(),
-            &gateway.provider_health_publisher(),
+            &topology,
             gateway.debug_snapshot().last_sequence,
             false,
         );
@@ -360,6 +370,12 @@ pub fn build_app_with_gateway_and_options(
             gateway.dashboard_history().clone(),
             gateway.subscribe_monitor(),
         );
+        if let Some(receiver) = flow_history_receiver {
+            crate::dashboard_history::spawn_flow_history_task(
+                gateway.dashboard_history().clone(),
+                receiver,
+            );
+        }
     }
     let router_options = RouterOptions {
         with_debug_ui: options.with_debug_ui,

@@ -7,7 +7,7 @@ import type { ProviderLatency } from '../../api/types';
 function per(over: Partial<ProviderLatency> = {}): ProviderLatency {
   return {
     provider: 'vllm-a', data_quality: 'derived', samples: 50, served: 48, failed: 2,
-    p50: 82, p95: 190, p99: 240, error_rate: 4, errors: { http_status: 2 }, ...over,
+    p50: 82, p95: 190, p99: 240, error_rate: 4, errors: { http_status: 2 }, stale: false, ...over,
   };
 }
 

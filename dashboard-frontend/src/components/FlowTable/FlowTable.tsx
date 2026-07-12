@@ -102,7 +102,10 @@ export function FlowTable({
   // FilterBar below remains the in-table editor (its onChange writes the same store).
   const filters = useFlowFilter((s) => s.filters);
   const setFilters = flowFilterStore.getState().setFilters;
-  const { rows, total, models, upstreams, clients, loadState, retry } = useFlowRows(filters, searchQuery);
+  const {
+    rows, total, models, upstreams, clients, loadState, retry, hasMore, loadingMore, loadMore, summary,
+    populationKnown,
+  } = useFlowRows(filters, searchQuery);
   // Gap 09: the per-model context-window capacities (gap-06 nullable `context_limit`), for the
   // aggregate context-pressure stat. A `null`/absent window is UNKNOWN ⇒ that flow is excluded from
   // the pressure figures (never a fabricated 0%/100%).
@@ -274,17 +277,30 @@ export function FlowTable({
               loadState={loadState}
               filtered={filtered}
               searchQuery={searchQuery}
-              total={total}
+              populationKnown={populationKnown}
               seeking={seeking}
               onRetry={retry}
             />
+          )}
+          {rows.length > 0 && hasMore && (
+            <div className="sticky bottom-0 flex justify-center border-t border-line bg-panel/95 px-3 py-2 backdrop-blur">
+              <button
+                type="button"
+                className="rounded border border-line bg-panel-raised px-3 py-1 text-xs text-text-muted hover:border-accent/60 hover:text-text disabled:opacity-60"
+                onClick={loadMore}
+                disabled={loadingMore}
+                data-testid="flow-load-more"
+              >
+                {loadingMore ? 'Loading…' : `Load older requests · ${rows.length} / ${total}`}
+              </button>
+            </div>
           )}
         </div>
       </div>
       {/* Gap 09: the AGGREGATE context-pressure stat — peak context-window utilization + near/over
           counts across the SAME filtered rows. An always-visible stat under the table (outside the
           virtualized scroll container, so it does not affect row layout). */}
-      <ContextPressure rows={rows} limits={contextLimits} />
+      <ContextPressure rows={rows} limits={contextLimits} archive={summary?.context} archiveTotal={summary?.total} />
       {/* Gap 08: the AGGREGATE cache-hit rate / "$ saved" by model, rolled up over the SAME filtered
           rows the table shows. A collapsed secondary surface under the table (never inside the
           virtualized scroll container, so it does not affect row layout). */}
@@ -292,7 +308,7 @@ export function FlowTable({
       {/* Gap 15: the AGGREGATE "by client" roll-up — cost / errors / latency per non-secret client
           (key-hash / configured-id / weak-UA), over the SAME filtered rows. A collapsed secondary
           surface under the table; its rows cross-link into the per-client filter. */}
-      <ClientRollup rows={rows} />
+      <ClientRollup rows={rows} archive={summary ?? undefined} />
     </div>
   );
 }
@@ -301,28 +317,29 @@ function FlowTableEmptyState({
   loadState,
   filtered,
   searchQuery,
-  total,
+  populationKnown,
   seeking,
   onRetry,
 }: {
   loadState: 'loading' | 'ready' | 'error';
   filtered: boolean;
   searchQuery: string;
-  total: number;
+  populationKnown: boolean;
   seeking: boolean;
   onRetry: () => void;
 }) {
   // A known in-memory population plus zero matches is already an honest search/filter result even
   // if the background REST reconciliation is loading or stale. Do not replace that useful answer
   // with a generic transport state; the parent renders the stale-data warning when appropriate.
-  if (total > 0 && searchQuery.trim()) {
+  const populationResolved = populationKnown || loadState === 'ready';
+  if (populationResolved && searchQuery.trim()) {
     return (
       <div className="px-3 py-6 text-center text-xs text-text-muted" data-testid="flow-table-search-empty">
         No flows match “{searchQuery.trim()}”. Try an API call ID, response ID, endpoint, model, provider, or client.
       </div>
     );
   }
-  if (total > 0 && filtered) {
+  if (populationResolved && filtered) {
     return (
       <div className="px-3 py-6 text-center text-xs text-text-muted" data-testid="flow-table-filtered-empty">
         No flows match the current filters.

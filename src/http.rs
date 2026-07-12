@@ -6,12 +6,15 @@ use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
 use crate::adapters::responses_to_chat;
 use crate::dashboard_api::dashboard_catalog;
+use crate::dashboard_api::dashboard_durability;
 use crate::dashboard_api::dashboard_flow_detail;
+use crate::dashboard_api::dashboard_flow_summary;
 use crate::dashboard_api::dashboard_flows;
 use crate::dashboard_api::dashboard_history;
 use crate::dashboard_api::dashboard_metrics;
 use crate::dashboard_api::dashboard_overview;
 use crate::dashboard_api::dashboard_snapshot;
+use crate::dashboard_api::dashboard_theater;
 use crate::dashboard_api::dashboard_topology;
 use crate::dashboard_auth::DashboardAuth;
 use crate::dashboard_auth::MutationDenied;
@@ -70,6 +73,7 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
@@ -192,6 +196,9 @@ fn protected_routes(auth: Arc<DashboardAuth>) -> Router<Arc<Gateway>> {
         .route("/dashboard/api/catalog", get(dashboard_catalog))
         .route("/dashboard/api/snapshot", get(dashboard_snapshot))
         .route("/dashboard/api/history", get(dashboard_history))
+        .route("/dashboard/api/durability", get(dashboard_durability))
+        .route("/dashboard/api/theater", get(dashboard_theater))
+        .route("/dashboard/api/flows/summary", get(dashboard_flow_summary))
         .route_layer(middleware::map_response(dashboard_api_no_store));
 
     // The `/debug` HTML/JS endpoints share the same session gate but stamp their own
@@ -612,7 +619,33 @@ async fn log_api_call(
             client,
             gateway.metrics(),
         );
-        gateway.flow_store().middleware_guard(&api_call_id)
+        let guard = gateway.flow_store().middleware_guard(&api_call_id);
+        if let Some((summary, record_seq)) = gateway.flow_store().summary_with_seq(&api_call_id)
+            && let Err(error) = gateway
+                .dashboard_history()
+                .persist_flow_summary(
+                    summary,
+                    crate::dashboard_flow::FlowMutationPhase::Open,
+                    record_seq,
+                )
+                .await
+        {
+            tracing::error!(api_call_id = %api_call_id, %error, "failed to persist flow ingress");
+            if gateway.dashboard_history().is_required() {
+                drop(guard);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "error": {
+                            "code": "dashboard_persistence_failed",
+                            "message": "durable request storage is unavailable"
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+        guard
     } else {
         None
     };
@@ -662,7 +695,57 @@ async fn log_api_call(
         .map(|state| crate::turn_capture::MiddlewareCaptureGuard::new(Arc::clone(state)));
 
     let request = Request::from_parts(parts, Body::from(body_bytes));
-    let response = next.run(request).await;
+    let mut response = next.run(request).await;
+    // Resolve the L0 fallback now, while the middleware can still await durable
+    // storage and replace response headers/status. `None` means the engine claimed
+    // the flow and owns its normal terminal path. This closes the required-mode
+    // extractor-rejection gap where relying on Drop would run only after a gated
+    // non-streaming body had already waited for artifact assembly.
+    if let Some((summary, record_seq)) = _l0_guard
+        .as_ref()
+        .and_then(crate::dashboard_flow::MiddlewareGuard::finalize_unclaimed)
+    {
+        if let Some(state) = &turn_capture_state {
+            state.engine_done("failed", Some("unhandled"));
+        }
+        gateway.metrics().record_response(
+            crate::dashboard_flow::FlowStatus::Failed,
+            summary.model_served.as_deref(),
+            &summary.uri,
+            summary.upstream_target.as_deref(),
+            summary.elapsed_ms.unwrap_or_default(),
+        );
+        let terminal_write = gateway
+            .dashboard_history()
+            .persist_flow_summary(
+                summary,
+                crate::dashboard_flow::FlowMutationPhase::Terminal,
+                record_seq,
+            )
+            .await;
+        let activity_cut = gateway.metrics().publish_metrics_cut(
+            gateway.flow_store(),
+            &gateway.provider_health_publisher(),
+            gateway.debug_snapshot().last_sequence,
+            true,
+        );
+        let activity_write = if let Some(cut) = activity_cut.as_ref().and_then(|published| {
+            gateway
+                .metrics()
+                .snapshot_at(published.taken_at_ms)
+                .filter(|snapshot| snapshot.taken_at_ms == published.taken_at_ms)
+        }) {
+            gateway.dashboard_history().persist_cut(cut).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = terminal_write.and(activity_write) {
+            tracing::error!(api_call_id = %api_call_id, %error, "failed to persist unclaimed terminal flow");
+            if gateway.dashboard_history().is_required() {
+                response = persistence_failure_response(uri.path());
+            }
+        }
+    }
     // F1b served-body tee (spec Design #4): wrap the outbound response `Body` so
     // every served byte — streaming SSE, non-streaming JSON, or a handler error
     // body — is copied to the `served_response` section; its `Drop` marks
@@ -673,7 +756,17 @@ async fn log_api_call(
     // after the gate inserted the `ApiCallId` extension) is teed too — only the
     // PRE-body-read 413/400 rejections above (no turn minted) are out of scope.
     let response = match turn_capture_state {
-        Some(state) => tee_served_body(response, state),
+        Some(state)
+            if state.durability_required()
+                && !response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.starts_with("text/event-stream")) =>
+        {
+            gate_required_nonstream_response(response, state, uri.path()).await
+        }
+        Some(state) => tee_served_body(response, state, uri.path()),
         None => response,
     };
     // Per-request model-resolution audit: the handler tags the response with the
@@ -1568,6 +1661,60 @@ struct TeeBody {
     /// that many bytes is a clean end even if hyper stops polling the
     /// Content-Length body before it yields `Ready(None)`.
     exact_len: Option<u64>,
+    surface: CaptureSurface,
+    held_terminal: Option<Frame<Bytes>>,
+    publication: Option<PublicationFuture>,
+    terminal_gate_done: bool,
+}
+
+type PublicationFuture = Pin<Box<dyn Future<Output = Result<std::path::PathBuf, String>> + Send>>;
+
+#[derive(Debug, Clone, Copy)]
+enum CaptureSurface {
+    Responses,
+    Chat,
+    Anthropic,
+    Json,
+}
+
+impl CaptureSurface {
+    fn for_path(path: &str, streaming: bool) -> Self {
+        if !streaming {
+            return Self::Json;
+        }
+        match path {
+            "/v1/messages" => Self::Anthropic,
+            "/v1/chat/completions" => Self::Chat,
+            _ => Self::Responses,
+        }
+    }
+
+    fn is_terminal(self, bytes: &[u8], forwarded: u64, exact_len: Option<u64>) -> bool {
+        if exact_len.is_some_and(|length| forwarded >= length) {
+            return true;
+        }
+        let contains = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
+        match self {
+            Self::Responses => {
+                contains(b"event: response.completed")
+                    || contains(b"event: response.incomplete")
+                    || contains(b"event: response.failed")
+            }
+            Self::Chat => contains(b"data: [DONE]"),
+            Self::Anthropic => contains(b"event: message_stop") || contains(b"event: error"),
+            Self::Json => exact_len.is_some_and(|length| forwarded >= length),
+        }
+    }
+
+    fn persistence_failure_frame(self) -> Option<Frame<Bytes>> {
+        let bytes = match self {
+            Self::Responses => b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"dashboard_persistence_failed\",\"message\":\"durable response storage is unavailable\"}}}\n\n".as_slice(),
+            Self::Chat => b"data: {\"error\":{\"code\":\"dashboard_persistence_failed\",\"message\":\"durable response storage is unavailable\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n".as_slice(),
+            Self::Anthropic => b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"durable response storage is unavailable\"}}\n\n".as_slice(),
+            Self::Json => return None,
+        };
+        Some(Frame::data(Bytes::copy_from_slice(bytes)))
+    }
 }
 
 impl http_body::Body for TeeBody {
@@ -1580,6 +1727,35 @@ impl http_body::Body for TeeBody {
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         // `axum::body::Body` is `Unpin`, so the fields can be reached by `&mut`.
         let this = self.get_mut();
+
+        if let Some(publication) = this.publication.as_mut() {
+            match publication.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(_)) => {
+                    this.publication = None;
+                    this.terminal_gate_done = true;
+                    this.clean_eos = true;
+                    return Poll::Ready(this.held_terminal.take().map(Ok));
+                }
+                Poll::Ready(Err(error)) => {
+                    tracing::error!(
+                        api_call_id = %this.state.api_call_id,
+                        %error,
+                        "required turn artifact failed before terminal delivery"
+                    );
+                    this.publication = None;
+                    this.terminal_gate_done = true;
+                    this.clean_eos = true;
+                    this.held_terminal = None;
+                    if let Some(frame) = this.surface.persistence_failure_frame() {
+                        return Poll::Ready(Some(Ok(frame)));
+                    }
+                    return Poll::Ready(Some(Err(axum::Error::new(std::io::Error::other(
+                        "dashboard persistence failed before response delivery",
+                    )))));
+                }
+            }
+        }
 
         // Bounded-memory back-pressure (F1b review #1): reserve a slot in the
         // served-section writer channel BEFORE pulling the next frame. If the disk
@@ -1605,6 +1781,7 @@ impl http_body::Body for TeeBody {
 
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
+                let mut gate_terminal = false;
                 if let Some(data) = frame.data_ref()
                     && !data.is_empty()
                 {
@@ -1619,6 +1796,24 @@ impl http_body::Body for TeeBody {
                         this.served_sink = None;
                         this.state.mark_served_degraded();
                     }
+                    gate_terminal = this.state.durability_required()
+                        && !this.terminal_gate_done
+                        && this
+                            .surface
+                            .is_terminal(data, this.forwarded, this.exact_len);
+                }
+                if gate_terminal {
+                    // The terminal bytes have entered the backpressured capture sink,
+                    // but are not visible to the client yet. Closing the section
+                    // resolves the both-done barrier; publication + SQLite artifact
+                    // indexing must complete before this frame is released.
+                    this.served_sink = None;
+                    this.state.served_done(false);
+                    let state = Arc::clone(&this.state);
+                    this.held_terminal = Some(frame);
+                    this.publication = Some(Box::pin(async move { state.wait_published().await }));
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -1664,9 +1859,15 @@ impl Drop for TeeBody {
 fn tee_served_body(
     response: Response,
     state: Arc<crate::turn_capture::TurnCaptureState>,
+    path: &str,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let exact_len = http_body::Body::size_hint(&body).exact();
+    let streaming = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/event-stream"));
     // F1c (finding #2): record that the served tee is now installed BEFORE the
     // `MiddlewareCaptureGuard` served backstop can drop (it drops when `log_api_call`
     // returns, AFTER this runs). With the tee installed, the tee's own `Drop` owns
@@ -1683,8 +1884,85 @@ fn tee_served_body(
         clean_eos: false,
         forwarded: 0,
         exact_len,
+        surface: CaptureSurface::for_path(path, streaming),
+        held_terminal: None,
+        publication: None,
+        terminal_gate_done: false,
     };
     Response::from_parts(parts, Body::new(tee))
+}
+
+/// Required-mode non-streaming responses are small, already-collected protocol
+/// documents. Buffer them once at the middleware boundary so status + headers remain
+/// mutable until the served section, artifact fsync/rename, and SQLite manifest commit
+/// all acknowledge. This is the only way to return a real HTTP 500 on persistence
+/// failure; a body wrapper would discover the failure after the original 200 headers
+/// were already sent.
+async fn gate_required_nonstream_response(
+    response: Response,
+    state: Arc<crate::turn_capture::TurnCaptureState>,
+    path: &str,
+) -> Response {
+    state.mark_served_tee_installed();
+    let (parts, body) = response.into_parts();
+    let bytes = match to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            state.mark_served_degraded();
+            state.served_done(true);
+            tracing::error!(api_call_id = %state.api_call_id, %error, "failed to collect required non-streaming response");
+            return persistence_failure_response(path);
+        }
+    };
+    let mut captured = false;
+    if let Some(mut sink) = state.served_sink() {
+        let reserved = futures::future::poll_fn(|cx| sink.poll_reserve(cx)).await;
+        if reserved.is_ok() && sink.send(bytes.to_vec()).is_ok() {
+            captured = true;
+        }
+    }
+    if !captured {
+        state.mark_served_degraded();
+    }
+    state.served_done(!captured);
+    match state.wait_published().await {
+        Ok(_) => Response::from_parts(parts, Body::from(bytes)),
+        Err(error) => {
+            tracing::error!(
+                api_call_id = %state.api_call_id,
+                %error,
+                "required non-streaming response persistence failed before delivery"
+            );
+            persistence_failure_response(path)
+        }
+    }
+}
+
+fn persistence_failure_response(path: &str) -> Response {
+    if path == "/v1/messages" {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "message": "durable response storage is unavailable"
+                }
+            })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": {
+                "code": "dashboard_persistence_failed",
+                "message": "durable response storage is unavailable",
+                "type": "server_error"
+            }
+        })),
+    )
+        .into_response()
 }
 
 fn stream_chat_completions_response(
@@ -2245,11 +2523,13 @@ fn model_id_from_value(model: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::CaptureSurface;
     use super::body_log_fields;
     use super::responses_wire_event_data;
     use super::should_proxy_response_header;
     use axum::body::Bytes;
-    use axum::http::HeaderName;
+    use axum::http::{HeaderName, StatusCode};
+    use axum::response::IntoResponse as _;
     use sha2::Digest as _;
 
     /// Finding 1: the inbound redaction produces IDENTICAL redacted output on the
@@ -2476,5 +2756,126 @@ mod tests {
             data: serde_json::json!({ "type": "response.created" }),
         };
         assert_eq!(responses_wire_event_data(&event), event.data.to_string());
+    }
+
+    #[test]
+    fn durability_failure_frames_are_native_to_each_streaming_protocol() {
+        let cases = [
+            (
+                CaptureSurface::Responses,
+                "event: response.failed",
+                "dashboard_persistence_failed",
+            ),
+            (CaptureSurface::Chat, "data: {\"error\"", "data: [DONE]"),
+            (CaptureSurface::Anthropic, "event: error", "api_error"),
+        ];
+        for (surface, marker, detail) in cases {
+            let frame = surface
+                .persistence_failure_frame()
+                .expect("streaming surface has a failure frame");
+            let bytes = frame.into_data().expect("failure frame is data");
+            let text = String::from_utf8(bytes.to_vec()).expect("failure frame is utf8");
+            assert!(text.contains(marker), "{surface:?}: {text}");
+            assert!(text.contains(detail), "{surface:?}: {text}");
+        }
+        assert!(CaptureSurface::Json.persistence_failure_frame().is_none());
+    }
+
+    #[test]
+    fn terminal_gate_recognizes_success_and_failure_endings() {
+        assert!(CaptureSurface::Responses.is_terminal(
+            b"event: response.completed\ndata: {}\n\n",
+            0,
+            None,
+        ));
+        assert!(CaptureSurface::Responses.is_terminal(
+            b"event: response.failed\ndata: {}\n\n",
+            0,
+            None,
+        ));
+        assert!(CaptureSurface::Chat.is_terminal(b"data: [DONE]\n\n", 0, None));
+        assert!(CaptureSurface::Anthropic.is_terminal(
+            b"event: message_stop\ndata: {}\n\n",
+            0,
+            None,
+        ));
+        assert!(CaptureSurface::Json.is_terminal(b"{}", 2, Some(2)));
+        assert!(!CaptureSurface::Responses.is_terminal(
+            b"event: response.output_text.delta\ndata: {}\n\n",
+            0,
+            None,
+        ));
+    }
+
+    #[tokio::test]
+    async fn required_nonstream_gate_returns_http_error_when_artifact_publish_fails() {
+        let root = std::env::temp_dir().join(format!(
+            "llmconduit-nonstream-gate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let artifacts = root.join("artifacts");
+        std::fs::create_dir_all(&artifacts).expect("artifact dir");
+        let history = crate::dashboard_history::DashboardHistory::required_for_test(
+            root.join("history.sqlite3"),
+            artifacts.clone(),
+        );
+        let capture = crate::turn_capture::TurnCapture::enabled(artifacts.clone())
+            .with_dashboard_history(history);
+        let state = capture
+            .start("api_nonstream_fail", Some("model-a".to_string()), 1)
+            .expect("capture state");
+        state.write_inbound_request(br#"{"model":"model-a"}"#);
+        state.engine_done("completed", Some("response.completed"));
+        std::fs::create_dir(artifacts.join("api_nonstream_fail.json"))
+            .expect("directory blocks final artifact rename");
+        let response = (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"result": "would-have-succeeded"})),
+        )
+            .into_response();
+        let gated =
+            super::gate_required_nonstream_response(response, state, "/v1/chat/completions").await;
+        assert_eq!(gated.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = axum::body::to_bytes(gated.into_body(), 64 * 1024)
+            .await
+            .expect("error body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert_eq!(body["error"]["code"], "dashboard_persistence_failed");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn required_nonstream_gate_releases_original_response_after_commit() {
+        let root = std::env::temp_dir().join(format!(
+            "llmconduit-nonstream-success-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let artifacts = root.join("artifacts");
+        std::fs::create_dir_all(&artifacts).expect("artifact dir");
+        let history = crate::dashboard_history::DashboardHistory::required_for_test(
+            root.join("history.sqlite3"),
+            artifacts.clone(),
+        );
+        let capture = crate::turn_capture::TurnCapture::enabled(artifacts.clone())
+            .with_dashboard_history(history);
+        let state = capture
+            .start("api_nonstream_ok", Some("model-a".to_string()), 1)
+            .expect("capture state");
+        state.write_inbound_request(br#"{"model":"model-a"}"#);
+        state.engine_done("completed", Some("response.completed"));
+        let response = (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({"result": "ok"})),
+        )
+            .into_response();
+        let gated = super::gate_required_nonstream_response(response, state, "/v1/responses").await;
+        assert_eq!(gated.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(gated.into_body(), 64 * 1024)
+            .await
+            .expect("success body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("success json");
+        assert_eq!(body["result"], "ok");
+        assert!(artifacts.join("api_nonstream_ok.json").is_file());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -20,7 +20,7 @@ describe('ScopeBar announcements', () => {
     expect(getByTestId('scope-announcement').textContent).toBe('');
 
     act(() => flowFilterStore.getState().setFilters({ status: 'failed', model: null, upstream: null, client: null }));
-    await waitFor(() => expect(getByTestId('scope-announcement').textContent).toContain('Showing 1 of 2 flows'));
+    await waitFor(() => expect(getByTestId('scope-announcement').textContent).toContain('Showing 1 of 1 flows'));
     const filterMessage = getByTestId('scope-announcement').textContent;
 
     act(() => dashboardStore.getState().upsertFlow(makeFlow({ api_call_id: 'c', status: 'failed' })));

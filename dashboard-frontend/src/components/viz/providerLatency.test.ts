@@ -25,6 +25,7 @@ function per(over: Partial<ProviderLatency> = {}): ProviderLatency {
     p99: 240,
     error_rate: 4,
     errors: { http_status: 2 },
+    stale: false,
     ...over,
   };
 }

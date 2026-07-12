@@ -19,6 +19,7 @@ import { flowFilterStore } from '../store/flowFilterStore';
 import { navigate } from '../router/useHashRoute';
 import { Panel } from '../components/ui/Panel';
 import { CooldownTooltip } from '../components/viz/CooldownTooltip';
+import { StaleFallbackBanner } from '../components/StaleFallbackBanner';
 
 export function TopologyView() {
   // Seed nodes/edges/prices from `/topology` (LIVE-only; never overwrites a seek cut) — finding 5.
@@ -65,6 +66,9 @@ export function TopologyView() {
     }
     return map;
   }, [nodes, perProviderById]);
+  const staleAsOfMs = Object.values(perProviderByNode)
+    .filter((metrics) => metrics.stale && metrics.as_of_ms != null)
+    .reduce<number | null>((latest, metrics) => Math.max(latest ?? 0, metrics.as_of_ms!), null);
 
   function onSelectUpstream(id: string): void {
     // Filter the FlowTable to this upstream target, then jump to the flows view so the cross-link
@@ -87,6 +91,7 @@ export function TopologyView() {
           </span>
         )}
       </header>
+      {!seeking && staleAsOfMs !== null && <StaleFallbackBanner asOfMs={staleAsOfMs} surface="topology" />}
       {loadState === 'error' && nodes.length > 0 && !seeking && (
         <div className="mb-3 flex items-center gap-3 rounded border border-status-cooling/40 bg-status-cooling/10 px-3 py-2 text-xs" role="alert" data-testid="topology-stale">
           <span>Provider topology could not refresh. Showing the last available state.</span>

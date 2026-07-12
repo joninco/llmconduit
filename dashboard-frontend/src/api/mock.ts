@@ -16,6 +16,7 @@ import type {
   DebugWsMessage,
   FlowDetail,
   FlowSummary,
+  FlowListSummaryResponse,
   FlowsResponse,
   HistoryResponse,
   MetricsResponse,
@@ -28,10 +29,12 @@ import type {
   ProviderLatency,
   SnapshotFrame,
   SnapshotResponse,
+  TheaterResponse,
   TopologyResponse,
   WsServerMessage,
 } from './types';
 import type { WsLike } from './ws';
+import { flowMatchesSearch } from '../components/FlowTable/flowSearch';
 
 const MOCK_CSRF = 'mock-csrf-token';
 
@@ -58,11 +61,11 @@ const NODES: ProviderHealth[] = [
 const PER_PROVIDER: Record<string, ProviderLatency> = {
   'vllm-a': {
     provider: 'vllm-a', data_quality: 'derived', samples: 248, served: 248, failed: 0,
-    p50: 88, p95: 210, p99: 320, error_rate: 0, errors: {},
+    p50: 88, p95: 210, p99: 320, error_rate: 0, errors: {}, stale: false,
   },
   'vllm-b': {
     provider: 'vllm-b', data_quality: 'derived', samples: 75, served: 63, failed: 12,
-    p50: 240, p95: 1100, p99: 2400, error_rate: 16, errors: { connect: 7, timeout: 5 },
+    p50: 240, p95: 1100, p99: 2400, error_rate: 16, errors: { connect: 7, timeout: 5 }, stale: false,
   },
   // openai: intentionally ABSENT (zero in-window samples → unavailable tile + neutral node).
 };
@@ -432,6 +435,7 @@ function buildOverview(qs: URLSearchParams): OverviewResponse {
     metrics_seq: 1,
     scope: {
       window,
+      mode: requestedAt === null ? 'live' : 'historical',
       requested_at_ms: requestedAt,
       selected_at_ms: requestedAt ?? generatedAt,
       status,
@@ -508,7 +512,7 @@ function buildTopology(): TopologyResponse {
 function buildSnapshot(): SnapshotFrame {
   return {
     type: 'snapshot',
-      schema_version: 5,
+      schema_version: 6,
     cursors: { flow_seq: 3, metrics_seq: 1, topology_seq: 1, monitor_seq: 5 , backend_metrics_seq: 0},
     flows: seedFlows(),
     metrics: buildMetrics(),
@@ -569,9 +573,89 @@ function json(body: unknown, status = 200): Response {
     status,
     headers: {
       'Content-Type': 'application/json',
-      'X-LLMConduit-Dashboard-Schema': '5',
+      'X-LLMConduit-Dashboard-Schema': '6',
     },
   });
+}
+
+function filteredMockFlows(qs: URLSearchParams): FlowSummary[] {
+  let flows = seedFlows();
+  const status = qs.get('status');
+  if (status) flows = flows.filter((flow) => flow.status === status);
+  const model = qs.get('model');
+  if (model) flows = flows.filter((flow) => flow.model_requested === model || flow.model_served === model);
+  const upstream = qs.get('upstream');
+  if (upstream) flows = flows.filter((flow) =>
+    flow.upstream_target === upstream || flow.attempts?.some((attempt) => attempt.provider === upstream));
+  const client = qs.get('client');
+  if (client) flows = flows.filter((flow) => flow.client_label === client);
+  const search = qs.get('q');
+  if (search) flows = flows.filter((flow) => flowMatchesSearch(flow, search));
+  return flows;
+}
+
+function facet(values: Array<string | null | undefined>): Array<{ key: string; count: number }> {
+  const counts = new Map<string, number>();
+  for (const value of values) if (value) counts.set(value, (counts.get(value) ?? 0) + 1);
+  return [...counts].map(([key, count]) => ({ key, count }))
+    .sort((left, right) => right.count - left.count || left.key.localeCompare(right.key));
+}
+
+function buildFlowListSummary(qs: URLSearchParams): FlowListSummaryResponse {
+  const flows = filteredMockFlows(qs);
+  const failures = flows.filter((flow) => flow.status === 'failed').map((flow) => ({
+    provider: flow.attempts?.at(-1)?.provider ?? flow.upstream_target ?? 'unknown',
+    model: flow.model_served ?? flow.model_requested ?? 'unknown',
+    reason: flow.attempts?.at(-1)?.error_class ?? 'unclassified',
+    count: 1,
+    total: flows.filter((candidate) =>
+      (candidate.attempts?.at(-1)?.provider ?? candidate.upstream_target ?? 'unknown')
+        === (flow.attempts?.at(-1)?.provider ?? flow.upstream_target ?? 'unknown')
+      && (candidate.model_served ?? candidate.model_requested ?? 'unknown')
+        === (flow.model_served ?? flow.model_requested ?? 'unknown')).length,
+  }));
+  const clientRows = facet(flows.map((flow) => flow.client_label)).map(({ key, count }) => {
+    const members = flows.filter((flow) => flow.client_label === key);
+    const priced = members.filter((flow) => flow.cost != null);
+    const timed = members.filter((flow) => flow.elapsed_ms != null);
+    return {
+      key,
+      count,
+      failed: members.filter((flow) => flow.status === 'failed').length,
+      source: members.find((flow) => flow.client_source)?.client_source ?? null,
+      cost_usd: priced.length > 0 ? priced.reduce((sum, flow) => sum + (flow.cost ?? 0), 0) : null,
+      cost_confidence: priced.some((flow) => flow.cost_confidence === 'estimated') ? 'estimated' as const
+        : priced.length > 0 ? 'confident' as const : 'unavailable' as const,
+      priced: priced.length,
+      average_latency_ms: timed.length > 0
+        ? timed.reduce((sum, flow) => sum + (flow.elapsed_ms ?? 0), 0) / timed.length : null,
+      timed: timed.length,
+    };
+  });
+  const measurable = flows.flatMap((flow) => {
+    const limit = CATALOG.find((entry) => entry.id === (flow.model_served ?? flow.model_requested))?.context_limit;
+    return flow.usage && limit && limit > 0 ? [flow.usage.prompt / limit * 100] : [];
+  });
+  return {
+    total: flows.length,
+    models: facet(flows.flatMap((flow) => [flow.model_requested, flow.model_served])),
+    upstreams: facet(flows.flatMap((flow) => [
+      flow.upstream_target,
+      ...(flow.attempts?.map((attempt) => attempt.provider) ?? []),
+    ])),
+    clients: clientRows,
+    unattributed: flows.filter((flow) => !flow.client_label).length,
+    statuses: facet(flows.map((flow) => flow.status)),
+    failures,
+    context: {
+      measurable: measurable.length,
+      near_limit: measurable.filter((pct) => pct >= 85).length,
+      over_limit: measurable.filter((pct) => pct >= 100).length,
+      peak_pct: measurable.length > 0 ? Math.max(...measurable) : null,
+    },
+    as_of_event_id: 3,
+    generated_at_ms: Date.now(),
+  };
 }
 
 /** Captures kill POSTs so tests can assert the CSRF header round-tripped. */
@@ -615,15 +699,42 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
 
   // -- Reads --
   if (path === '/dashboard/api/flows') {
-    let flows = seedFlows();
-    const status = qs.get('status');
-    if (status) flows = flows.filter((f) => f.status === status);
-    const model = qs.get('model');
-    if (model) flows = flows.filter((f) => f.model_requested === model || f.model_served === model);
-    const upstream = qs.get('upstream');
-    if (upstream) flows = flows.filter((f) => f.upstream_target === upstream);
-    const resp: FlowsResponse = { flows, total: flows.length, flow_seq: 3 };
+    const all = filteredMockFlows(qs);
+    const limit = Math.max(1, Number(qs.get('limit') ?? 100));
+    const page = Math.max(1, Number(qs.get('page') ?? 1));
+    const flows = all.slice((page - 1) * limit, page * limit);
+    const resp: FlowsResponse = {
+      flows, total: all.length, flow_seq: 3, next_cursor: null,
+      as_of_event_id: 3, generated_at_ms: Date.now(),
+    };
     return json(resp);
+  }
+  if (path === '/dashboard/api/flows/summary') return json(buildFlowListSummary(qs));
+  if (path === '/dashboard/api/durability') {
+    return json({
+      state: 'healthy', mode: 'required', last_commit_ms: Date.now() - 1_000,
+      pending_commits: 0, database_bytes: 256 * 1024, artifact_bytes: 96 * 1024,
+      archived_flows: seedFlows().length, terminal_flows: seedFlows().filter((flow) => flow.status !== 'open').length,
+      retained_cuts: 720, tiers: { activity: 6, fine_5s: 714, minute_1m: 0, coarse_15m: 0 },
+    });
+  }
+  if (path === '/dashboard/api/theater') {
+    const flow = [...seedFlows()].sort((left, right) =>
+      (right.finished_ms ?? right.started_ms) - (left.finished_ms ?? left.started_ms))[0];
+    const theater: TheaterResponse = {
+      generated_at_ms: Date.now(), monitor_seq: 5, data_quality: flow ? 'measured' : 'unavailable',
+      last_terminal: flow ? {
+        id: flow.response_id ?? flow.api_call_id,
+        api_call_id: flow.api_call_id,
+        model: flow.model_served ?? flow.model_requested ?? null,
+        status: flow.status === 'completed' ? 'completed' : 'failed',
+        started_at_ms: flow.started_ms,
+        terminal_at_ms: flow.finished_ms ?? flow.started_ms,
+        output: 'This response was restored from the durable turn artifact.',
+        reasoning: '', tools: [], truncated: false, approx_tokens: 14, tokens_per_sec: 0,
+      } : null,
+    };
+    return json(theater);
   }
   const detailMatch = path.match(/^\/dashboard\/api\/flows\/([^/]+)$/);
   if (detailMatch) {
@@ -645,6 +756,9 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
         at_ms,
         cursors: { flow_seq: 3, metrics_seq: index + 1, topology_seq: 1, monitor_seq: 5 , backend_metrics_seq: 0},
         instant,
+        resolution_ms: 5_000,
+        cut_kind: index % 12 === 0 ? 'activity' : 'periodic',
+        archive_event_id: index + 1,
       };
     });
     const history: HistoryResponse = {
@@ -665,6 +779,7 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
       cursors: { flow_seq: 3, metrics_seq: 1, topology_seq: 1, monitor_seq: 5 , backend_metrics_seq: 0},
       at_ms: atMs,
       summaries: seedFlows(),
+      flows_total: seedFlows().length,
       metrics: buildMetrics(),
       topology: buildTopology(),
       history: {

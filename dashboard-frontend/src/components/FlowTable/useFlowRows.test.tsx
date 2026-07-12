@@ -8,7 +8,7 @@ import type { FlowFilters } from './filterTypes';
 import { getConnection } from '../../api/connection';
 import { dashboardStore } from '../../store/dashboardStore';
 import { makeFlow, resetWorld, seedFlows } from '../testHarness';
-import type { FlowSummary, FlowsResponse } from '../../api/types';
+import type { FlowListSummaryResponse, FlowSummary, FlowsResponse } from '../../api/types';
 
 /**
  * useFlowRows merges the live WS store with the `/flows` REST list. These lock two contracts the
@@ -28,15 +28,24 @@ function renderRows(filters: FlowFilters = EMPTY_FILTERS, searchQuery = '') {
 
 /** A `fetch` stub answering ONLY `/flows` with the given list; everything else 404s. */
 function stubFlowsFetch(flows: FlowSummary[], flowSeq = 0): void {
-  const body: FlowsResponse = { flows, total: flows.length, flow_seq: flowSeq };
+  const body: FlowsResponse = {
+    flows, total: flows.length, flow_seq: flowSeq, as_of_event_id: flowSeq,
+    generated_at_ms: Date.now(),
+  };
+  const summary: FlowListSummaryResponse = {
+    total: flows.length,
+    models: [], upstreams: [], clients: [], unattributed: 0, statuses: [], failures: [],
+    context: { measurable: 0, near_limit: 0, over_limit: 0, peak_pct: null },
+    as_of_event_id: flowSeq, generated_at_ms: Date.now(),
+  };
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = typeof input === 'string' ? input : input.toString();
     if (url.includes('/flows')) {
-      return new Response(JSON.stringify(body), {
+      return new Response(JSON.stringify(url.includes('/flows/summary') ? summary : body), {
         status: 200,
         headers: {
           'Content-Type': 'application/json',
-          'X-LLMConduit-Dashboard-Schema': '5',
+          'X-LLMConduit-Dashboard-Schema': '6',
         },
       });
     }
@@ -58,6 +67,54 @@ describe('useFlowRows — REST query enabled for the real backend (finding 2)', 
     const { result } = renderRows();
     await waitFor(() => expect(result.current.rows.some((r) => r.api_call_id === 'api_rest_only')).toBe(true));
     expect(globalThis.fetch).toHaveBeenCalled();
+  });
+
+  it('loads stable keyset pages and reports loaded / matching totals', async () => {
+    const first = [
+      makeFlow({ api_call_id: 'api_page_3', started_ms: 3_000 }),
+      makeFlow({ api_call_id: 'api_page_2', started_ms: 2_000 }),
+    ];
+    const second = [makeFlow({ api_call_id: 'api_page_1', started_ms: 1_000 })];
+    const summary: FlowListSummaryResponse = {
+      total: 3,
+      models: [], upstreams: [], clients: [], unattributed: 3, statuses: [], failures: [],
+      context: { measurable: 0, near_limit: 0, over_limit: 0, peak_pct: null },
+      as_of_event_id: 7, generated_at_ms: 3_000,
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(input instanceof Request ? input.url : String(input), 'http://localhost');
+      const body = url.pathname.endsWith('/flows/summary')
+        ? summary
+        : {
+            flows: url.searchParams.get('cursor') === 'cursor-1' ? second : first,
+            total: 3,
+            flow_seq: 7,
+            next_cursor: url.searchParams.get('cursor') === 'cursor-1' ? null : 'cursor-1',
+            as_of_event_id: 7,
+            generated_at_ms: 3_000,
+          } satisfies FlowsResponse;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-LLMConduit-Dashboard-Schema': '6',
+        },
+      });
+    }));
+
+    const { result } = renderRows();
+    await waitFor(() => expect(result.current.rows).toHaveLength(2));
+    expect(result.current.loaded).toBe(2);
+    expect(result.current.total).toBe(3);
+    expect(result.current.hasMore).toBe(true);
+    act(() => result.current.loadMore());
+    await waitFor(() => expect(result.current.rows).toHaveLength(3));
+    expect(result.current.rows.map((row) => row.api_call_id)).toEqual([
+      'api_page_3', 'api_page_2', 'api_page_1',
+    ]);
+    expect(result.current.loaded).toBe(3);
+    expect(result.current.total).toBe(3);
+    expect(result.current.hasMore).toBe(false);
   });
 });
 
@@ -110,7 +167,7 @@ describe('useFlowRows — complete rows reconcile by revision', () => {
     expect(row?.cost).toBe(2);
   });
 
-  it('removes rows absent from a strictly newer authoritative REST cut', async () => {
+  it('does not treat an omitted live-cache row as an archive deletion', async () => {
     const retained = makeFlow({ api_call_id: 'api_retained', revision: 2, status: 'completed' });
     stubFlowsFetch([retained], 5);
     seedFlows([
@@ -119,8 +176,9 @@ describe('useFlowRows — complete rows reconcile by revision', () => {
     ]);
 
     const { result } = renderRows();
-    await waitFor(() => expect(result.current.rows.map((row) => row.api_call_id)).toEqual(['api_retained']));
-    expect(dashboardStore.getState().cursors.flow_seq).toBe(5);
+    await waitFor(() => expect(result.current.rows.map((row) => row.api_call_id)).toEqual([
+      'api_retained', 'api_evicted_open',
+    ]));
   });
 });
 
@@ -157,7 +215,7 @@ describe('useFlowRows — view-local multi-field search', () => {
     vi.restoreAllMocks();
   });
 
-  it('searches the merged population and keeps total as the pre-search denominator', async () => {
+  it('searches the merged population and reports the matching population', async () => {
     stubFlowsFetch([]);
     seedFlows([
       makeFlow({ api_call_id: 'api_success', status: 'completed', response_id: 'resp_123', upstream_target: 'provider-b' }),
@@ -173,7 +231,7 @@ describe('useFlowRows — view-local multi-field search', () => {
     const { result } = renderRows(EMPTY_FILTERS, 'provider-a timeout');
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
     expect(result.current.rows.map((row) => row.api_call_id)).toEqual(['api_failover']);
-    expect(result.current.total).toBe(2);
+    expect(result.current.total).toBe(1);
   });
 });
 

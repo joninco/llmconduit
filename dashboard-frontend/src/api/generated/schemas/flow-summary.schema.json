@@ -1,0 +1,250 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DurableFlowRollup",
+  "type": "object",
+  "properties": {
+    "as_of_event_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "clients": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DurableClientRollup"
+      }
+    },
+    "context": {
+      "$ref": "#/$defs/DurableContextRollup"
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DurableFailureCount"
+      }
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "format": "uint128",
+      "minimum": 0
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DurableFacetCount"
+      }
+    },
+    "statuses": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DurableFacetCount"
+      }
+    },
+    "total": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "unattributed": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "upstreams": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/DurableFacetCount"
+      }
+    }
+  },
+  "required": [
+    "total",
+    "models",
+    "upstreams",
+    "clients",
+    "unattributed",
+    "statuses",
+    "failures",
+    "context",
+    "as_of_event_id",
+    "generated_at_ms"
+  ],
+  "$defs": {
+    "ClientSource": {
+      "description": "Gap 04 — the PROVENANCE of a flow's `client_label`: WHICH non-secret signal the\nattribution was derived from. Tagged so the dashboard (spec 15) can render the\nweaker User-Agent fallback DIFFERENTLY from the stronger key-hash / configured-id\nattribution — a `user_agent`-sourced label is NOT an identity claim. Serializes\nsnake_case; `Deserialize` so the body-free [`SnapshotFlowSummary`] round-trips on\nthe WS/snapshot wire (AGENTS.md: no new wire field without a round-trip test).\n\nPriority order (strongest → weakest), honored by [`ClientAttribution::derive`]:\n`KeyHash` → `ConfiguredHeader` → `UserAgent`. There is NO proxy auth-principal\nsource today (the proxy forwards keys, it does not authenticate a principal), so\none is deliberately absent until such a seam exists (spec 04 / Codex review).",
+      "oneOf": [
+        {
+          "description": "Derived from a non-reversible SHA-256 digest of the inbound API key (the raw\nkey is NEVER stored/emitted; only a short hex prefix of its hash becomes the\nlabel). The strongest attribution seam: the same caller key groups stably.",
+          "type": "string",
+          "const": "key_hash"
+        },
+        {
+          "description": "Derived from an operator-configured NON-SECRET request header (e.g.\n`x-client-id`) — an explicit caller-supplied identity. Stronger than UA, but\ncaller-asserted (unverified), so weaker than the key-hash.",
+          "type": "string",
+          "const": "configured_header"
+        },
+        {
+          "description": "Derived from the `User-Agent` header. A WEAK, labelled fallback only — NOT an\nidentity model (any caller can spoof it). Present so a flow with no key and no\nconfigured id still shows SOMETHING, clearly tagged as the weakest source.",
+          "type": "string",
+          "const": "user_agent"
+        }
+      ]
+    },
+    "DurableClientRollup": {
+      "type": "object",
+      "properties": {
+        "average_latency_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "cost_confidence": {
+          "$ref": "#/$defs/TerminalCostConfidence"
+        },
+        "cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "key": {
+          "type": "string"
+        },
+        "priced": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "key",
+        "count",
+        "failed",
+        "source",
+        "cost_usd",
+        "cost_confidence",
+        "priced",
+        "average_latency_ms",
+        "timed"
+      ]
+    },
+    "DurableContextRollup": {
+      "type": "object",
+      "properties": {
+        "measurable": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "near_limit": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "over_limit": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "peak_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "measurable",
+        "near_limit",
+        "over_limit",
+        "peak_pct"
+      ]
+    },
+    "DurableFacetCount": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "count"
+      ]
+    },
+    "DurableFailureCount": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "total": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "provider",
+        "model",
+        "reason",
+        "count",
+        "total"
+      ]
+    },
+    "TerminalCostConfidence": {
+      "description": "Confidence attached to a terminal-time price. This lives with the evict-safe\nterminal payload (rather than the REST projection) so historical overview cuts keep\nthe rate table decision that was true when the request finished.",
+      "type": "string",
+      "enum": [
+        "confident",
+        "estimated",
+        "unavailable"
+      ]
+    }
+  }
+}

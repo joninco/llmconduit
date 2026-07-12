@@ -10,10 +10,12 @@
 import type {
   CatalogEntry,
   FlowDetail,
+  FlowListSummaryResponse,
   FlowsQuery,
   FlowsResponse,
   HistoryQuery,
   HistoryResponse,
+  DurabilityStatusResponse,
   KillResponse,
   LoginRequest,
   MetricsResponse,
@@ -21,6 +23,7 @@ import type {
   OverviewResponse,
   SnapshotResponse,
   TopologyResponse,
+  TheaterResponse,
 } from './types';
 import type { ContractValidator } from './contractValidator';
 import {
@@ -34,12 +37,15 @@ export type FetchImpl = typeof fetch;
 type RestValidatorName =
   | 'validateCatalog'
   | 'validateFlowDetail'
+  | 'validateFlowSummary'
   | 'validateFlows'
+  | 'validateDurability'
   | 'validateHistory'
   | 'validateKill'
   | 'validateMetrics'
   | 'validateOverview'
   | 'validateSnapshot'
+  | 'validateTheater'
   | 'validateTopology';
 type RestValidatorsModule = typeof import('./generated/validators-rest');
 
@@ -53,13 +59,16 @@ async function loadRestValidator(name: RestValidatorName): Promise<ContractValid
   let validator: ContractValidator<unknown>;
   switch (name) {
     case 'validateCatalog': validator = validators.validateCatalog; break;
+    case 'validateDurability': validator = validators.validateDurability; break;
     case 'validateFlowDetail': validator = validators.validateFlowDetail; break;
+    case 'validateFlowSummary': validator = validators.validateFlowSummary; break;
     case 'validateFlows': validator = validators.validateFlows; break;
     case 'validateHistory': validator = validators.validateHistory; break;
     case 'validateKill': validator = validators.validateKill; break;
     case 'validateMetrics': validator = validators.validateMetrics; break;
     case 'validateOverview': validator = validators.validateOverview; break;
     case 'validateSnapshot': validator = validators.validateSnapshot; break;
+    case 'validateTheater': validator = validators.validateTheater; break;
     case 'validateTopology': validator = validators.validateTopology; break;
   }
   if (typeof validator !== 'function') {
@@ -197,6 +206,20 @@ export class DashboardClient {
   flows(query: FlowsQuery = {}): Promise<FlowsResponse> {
     const qs = buildQuery(query);
     return this.request<FlowsResponse>(`/flows${qs}`, 'validateFlows');
+  }
+
+  flowSummary(query: FlowsQuery = {}): Promise<FlowListSummaryResponse> {
+    const qs = buildQuery(query);
+    return this.request<FlowListSummaryResponse>(`/flows/summary${qs}`, 'validateFlowSummary');
+  }
+
+  durability(): Promise<DurabilityStatusResponse> {
+    return this.request<DurabilityStatusResponse>('/durability', 'validateDurability');
+  }
+
+  theater(cutId?: number): Promise<TheaterResponse> {
+    const suffix = cutId === undefined ? '' : `?cut_id=${encodeURIComponent(String(cutId))}`;
+    return this.request<TheaterResponse>(`/theater${suffix}`, 'validateTheater');
   }
 
   flowDetail(id: string, cutId?: number): Promise<FlowDetail> {

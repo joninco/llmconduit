@@ -300,6 +300,8 @@ export interface ProviderLatency {
   error_rate: number;
   /** Bounded per-class failure tally (gap 03 taxonomy); absent classes omitted. */
   errors: ProviderErrorDistribution;
+  as_of_ms?: number | null;
+  stale: boolean;
 }
 
 /**
@@ -747,6 +749,9 @@ export interface FlowsResponse {
   flows: FlowSummary[];
   total: number;
   flow_seq: number;
+  next_cursor?: string | null;
+  as_of_event_id: number;
+  generated_at_ms: number;
 }
 
 /** Query params for the flow list. */
@@ -754,6 +759,9 @@ export interface FlowsQuery {
   status?: FlowStatus;
   model?: string;
   upstream?: string;
+  client?: string;
+  q?: string;
+  cursor?: string;
   page?: number;
   limit?: number;
   cut_id?: number;
@@ -961,6 +969,7 @@ export interface SnapshotResponse {
   cursors: SeqCursors;
   at_ms: number;
   summaries: SnapshotFlowSummary[];
+  flows_total: number;
   metrics: MetricsResponse | null;
   topology: TopologyResponse | null;
   history: SnapshotHistoryMetadata;
@@ -973,7 +982,11 @@ export interface HistoryPoint {
   at_ms: number;
   cursors: SeqCursors;
   instant: InstantMetricSample;
+  last_activity?: LastActivitySample | null;
   engine_throughput?: EngineThroughputSample | null;
+  resolution_ms: number;
+  cut_kind: string;
+  archive_event_id: number;
 }
 
 export interface HistoryResponse {
@@ -990,6 +1003,11 @@ export interface HistoryQuery {
   to?: number;
   limit?: number;
 }
+
+export type FlowListSummaryResponse = import('./generated/contracts').DurableFlowRollup;
+export type DurabilityStatusResponse = import('./generated/contracts').DurabilityStatusResponse;
+export type TheaterResponse = import('./generated/contracts').TheaterResponse;
+export type TheaterRiver = import('./generated/contracts').TheaterRiver;
 
 /** `POST /dashboard/api/flows/:id/kill` */
 export interface KillResponse {

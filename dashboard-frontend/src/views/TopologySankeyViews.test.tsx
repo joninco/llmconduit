@@ -29,7 +29,7 @@ function overview(over: Partial<OverviewResponse> = {}): OverviewResponse {
   return {
     generated_at_ms: 1000,
     metrics_seq: 1,
-    scope: { window: 'm1', requested_at_ms: null, selected_at_ms: 1000, status: null, model: null, upstream: null, client: null },
+    scope: { window: 'm1', mode: 'live', requested_at_ms: null, selected_at_ms: 1000, status: null, model: null, upstream: null, client: null },
     data_quality: 'measured',
     overflow: { dimension_limit: 64, slot_folded_samples: 0, aggregate_folded_samples: 0, provider_folded_samples: 0, overflowed: false, unattributable_requests: 0 },
     totals: { requests: 1, successes: 1, failures: 0, cancellations: 0, tokens, cost },
@@ -123,7 +123,7 @@ describe('SankeyView — authoritative Overview lanes', () => {
       });
     });
     const response = overview({
-      scope: { window: 'm5', requested_at_ms: at, selected_at_ms: at, status: null, model: null, upstream: null, client: null },
+      scope: { window: 'm5', mode: 'historical', requested_at_ms: at, selected_at_ms: at, status: null, model: null, upstream: null, client: null },
       lanes: [{ provider: 'vllm-b', model: 'frozen-model', requests: 1, tokens: { samples: 1, prompt: 1, completion: 1, cached: null, reasoning: null }, cost: { samples: 1, total_usd: 1, confidence: 'estimated' } }],
       cost: { samples: 1, total_usd: 1, confidence: 'estimated' },
     });

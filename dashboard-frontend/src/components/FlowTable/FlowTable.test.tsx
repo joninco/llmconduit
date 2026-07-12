@@ -173,7 +173,7 @@ describe('FlowTable — filtering', () => {
     const rows = getAllByTestId('flow-row');
     expect(rows).toHaveLength(1);
     expect(within(rows[0]!).getByText('running')).toBeTruthy();
-    expect(getByTestId('flow-count').textContent).toContain('1 / 3');
+    expect(getByTestId('flow-count').textContent).toContain('1 loaded / 1 matching');
   });
 
   it('a model chip narrows the rows', () => {
@@ -189,7 +189,7 @@ describe('FlowTable — filtering', () => {
       <FlowTable selectedId={null} onSelect={noop} searchQuery="api_fail openai" />,
     );
     expect(found.getAllByTestId('flow-row')).toHaveLength(1);
-    expect(found.getByTestId('flow-count').textContent).toContain('1 / 3');
+    expect(found.getByTestId('flow-count').textContent).toContain('1 loaded / 1 matching');
     found.unmount();
 
     const empty = renderWithQuery(
@@ -319,7 +319,7 @@ describe('FlowTable — live WS update + interactions', () => {
       .closest('button')!;
     fireEvent.click(chip);
     expect(getAllByTestId('flow-row')).toHaveLength(2);
-    expect(getByTestId('flow-count').textContent).toContain('2 / 3');
+    expect(getByTestId('flow-count').textContent).toContain('2 loaded / 2 matching');
   });
 });
 
@@ -346,12 +346,33 @@ describe('FlowTable — loading, failure, empty, and filtered-empty states', () 
   it('distinguishes an honest unfiltered empty result from filtered-empty', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
-      const body = url.includes('/catalog') ? [] : { flows: [], total: 0, flow_seq: 0 };
+      const body = url.includes('/catalog')
+        ? []
+        : url.includes('/flows/summary')
+          ? {
+              as_of_event_id: 0,
+              clients: [],
+              context: { measurable: 0, near_limit: 0, over_limit: 0, peak_pct: null },
+              failures: [],
+              generated_at_ms: Date.now(),
+              models: [],
+              statuses: [],
+              total: 0,
+              unattributed: 0,
+              upstreams: [],
+            }
+          : {
+              as_of_event_id: 0,
+              flow_seq: 0,
+              flows: [],
+              generated_at_ms: Date.now(),
+              total: 0,
+            };
       return new Response(JSON.stringify(body), {
         status: 200,
         headers: {
           'Content-Type': 'application/json',
-          'X-LLMConduit-Dashboard-Schema': '5',
+          'X-LLMConduit-Dashboard-Schema': '6',
         },
       });
     }));

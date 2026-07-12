@@ -13,6 +13,7 @@ function snap(atMs: number): SnapshotResponse {
     cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
     at_ms: atMs,
     summaries: [],
+    flows_total: 0,
     metrics: null,
     topology: null,
     history: { oldest_at_ms: atMs, newest_at_ms: atMs, retained_bytes: 0, quota_bytes: 64 * 1024 * 1024, retained_cuts: 1 },

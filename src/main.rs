@@ -119,10 +119,10 @@ fn log_debug_ui_status(
 
 /// Spawn opt-in age-based cleanup of debug/request-log dump files. No-op unless
 /// `debug_log_max_age_hours` is set. Cleanup runs on the blocking pool, never
-/// blocking serve startup. The artifact/dump prune spans every configured log
-/// directory; the destructive orphan `.work/` sweep is scoped to `turn_capture_dir`
-/// ALONE (F1f review r1 — turn capture is the sole creator of `.work/<id>/` subdirs,
-/// so the sweep must never touch a request-log dir).
+/// blocking serve startup. A configured dashboard archive excludes its permanent
+/// turn artifacts and owns synchronous crash recovery itself; unrelated request logs
+/// retain age rotation. In legacy mode, the destructive orphan `.work/` sweep remains
+/// scoped to `turn_capture_dir` alone.
 fn run_debug_log_cleanup(config: &Config) {
     let max_age_hours = config.debug_log_max_age_hours;
     if max_age_hours.is_none() {

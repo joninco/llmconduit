@@ -1286,6 +1286,8 @@ fn provider_latency_from_sample(provider: &str, sample: &ProviderSample) -> Prov
         p99: percentile(100, 0.99),
         error_rate: finite_ms(error_rate),
         errors: sample.errors,
+        as_of_ms: None,
+        stale: false,
     }
 }
 
@@ -1344,6 +1346,10 @@ pub struct ProviderLatency {
     pub error_rate: f64,
     /// Bounded per-class failure tally (gap 03 taxonomy). Absent classes are omitted.
     pub errors: ProviderErrorDistribution,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of_ms: Option<u128>,
+    #[serde(default)]
+    pub stale: bool,
 }
 
 /// Cross-cutting quality tag for Overview values. `partial` is explicit whenever a
@@ -2841,6 +2847,91 @@ impl MetricsLayer {
         self.enabled
     }
 
+    /// Seed the most recent request-bearing interval recovered from the durable
+    /// dashboard archive. Active streams and current interval counters remain fresh
+    /// process state; only the explicitly stale fallback crosses a restart.
+    pub fn hydrate_last_activity(&self, recovered: Option<LastActivitySample>) {
+        if !self.enabled {
+            return;
+        }
+        let Some(recovered) = recovered else {
+            return;
+        };
+        let mut state = self.lock();
+        if state
+            .last_activity
+            .as_ref()
+            .is_none_or(|current| recovered.at_ms > current.at_ms)
+        {
+            state.last_activity = Some(recovered);
+        }
+    }
+
+    /// Rebuild the last hour of request/attempt rings from terminal facts while keeping the new
+    /// process's instantaneous counters empty. This makes restart reads continuous without ever
+    /// pretending archived requests are currently active.
+    pub fn hydrate_archive(
+        &self,
+        cursors: DomainCursors,
+        summaries: &[crate::dashboard_flow::SnapshotFlowSummary],
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let now_epoch = now_epoch_s();
+        let cutoff = now_epoch.saturating_sub(60 * 60).saturating_add(1);
+        let mut state = self.lock();
+        for summary in summaries {
+            let started_epoch = (summary.started_ms / 1_000).min(u128::from(u64::MAX)) as u64;
+            if started_epoch >= cutoff && started_epoch <= now_epoch {
+                state.record_accepted(started_epoch);
+            }
+            let Some(finished_ms) = summary.finished_ms else {
+                continue;
+            };
+            let finished_epoch = (finished_ms / 1_000).min(u128::from(u64::MAX)) as u64;
+            if finished_epoch < cutoff || finished_epoch > now_epoch {
+                continue;
+            }
+            let inputs = TerminalMetricsInputs {
+                model_requested: summary.model_requested.clone(),
+                model_served: summary.model_served.clone(),
+                endpoint: summary.uri.clone(),
+                upstream: summary.upstream_target.clone(),
+                client_label: summary.client_label.clone(),
+                usage: summary.usage,
+                attempts: summary.attempts.clone(),
+                failure_reason: crate::dashboard_flow::TerminalReasonClass::from_terminal(
+                    summary.terminal_reason.as_deref(),
+                    &summary.attempts,
+                ),
+                cost_usd: summary.terminal_cost_usd,
+                cost_confidence: summary.terminal_cost_confidence,
+                cache_price_impact_usd: summary.cache_price_impact_usd,
+                effective_route_limit: summary.effective_route_limit,
+            };
+            let key = BucketKey {
+                status: StatusClass::from_status(summary.status),
+                model: label_or_unknown(summary.model_served.as_deref()),
+                endpoint: summary.uri.clone(),
+                upstream: label_or_unknown(summary.upstream_target.as_deref()),
+            };
+            state.record_terminal(
+                finished_epoch,
+                &key,
+                summary.elapsed_ms.unwrap_or_default() as f64,
+                summary.usage,
+                &summary.attempts,
+                Some(&inputs),
+            );
+        }
+        // Replaying facts must not appear as a burst in the first post-restart instant cut.
+        state.instant = InstantAccumulator::default();
+        state.instant_started_ms = now_ms();
+        state.metrics_seq = state.metrics_seq.max(cursors.metrics_seq);
+        state.presentation_seq = state.presentation_seq.max(cursors.metrics_seq);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, MetricsState> {
         self.state
             .as_ref()
@@ -3480,8 +3571,9 @@ pub fn spawn_metrics_publisher_task_with_history(
             if persist_snapshot
                 && let (Some(published), Some(snapshot)) = (published, metrics.latest_snapshot())
                 && snapshot.taken_at_ms == published.taken_at_ms
+                && let Err(error) = history.persist_cut(snapshot).await
             {
-                history.persist_cut(snapshot);
+                tracing::error!(%error, "failed to persist coordinated dashboard cut");
             }
         }
     }))

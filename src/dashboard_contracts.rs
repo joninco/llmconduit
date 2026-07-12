@@ -10,7 +10,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 
 /// Current dashboard bootstrap, REST, and WebSocket schema version.
-pub const DASHBOARD_SCHEMA_VERSION: u32 = 5;
+pub const DASHBOARD_SCHEMA_VERSION: u32 = 6;
 
 /// Header carried by every `/dashboard/api/*` response.
 pub const DASHBOARD_SCHEMA_HEADER: &str = "x-llmconduit-dashboard-schema";
@@ -40,6 +40,7 @@ pub struct DashboardContracts {
     pub ws_snapshot: crate::dashboard_ws::SnapshotMessage,
     pub ws_frame: crate::dashboard_ws::DashboardFrame,
     pub flows_response: crate::dashboard_api::FlowsResponse,
+    pub flow_summary: crate::dashboard_history::DurableFlowRollup,
     pub flow_detail: crate::dashboard_api::FlowDetailBody,
     pub metrics_response: crate::dashboard_ws::MetricsSnapshot,
     pub overview_response: crate::dashboard_api::OverviewResponse,
@@ -47,6 +48,8 @@ pub struct DashboardContracts {
     pub catalog_response: Vec<crate::dashboard_api::CatalogEntry>,
     pub snapshot_response: crate::dashboard_api::SnapshotResponse,
     pub history_response: crate::dashboard_api::HistoryResponse,
+    pub theater_response: crate::dashboard_api::TheaterResponse,
+    pub durability_status: crate::dashboard_api::DurabilityStatusResponse,
     pub kill_response: KillResponse,
     pub login_request: crate::dashboard_auth::LoginRequest,
 }
@@ -68,10 +71,18 @@ pub fn root_schemas() -> BTreeMap<&'static str, schemars::Schema> {
             "flows",
             wire_schema_for::<crate::dashboard_api::FlowsResponse>(),
         ),
+        (
+            "flow-summary",
+            wire_schema_for::<crate::dashboard_history::DurableFlowRollup>(),
+        ),
         ("kill", wire_schema_for::<KillResponse>()),
         (
             "history",
             wire_schema_for::<crate::dashboard_api::HistoryResponse>(),
+        ),
+        (
+            "durability",
+            wire_schema_for::<crate::dashboard_api::DurabilityStatusResponse>(),
         ),
         (
             "metrics",
@@ -88,6 +99,10 @@ pub fn root_schemas() -> BTreeMap<&'static str, schemars::Schema> {
         (
             "topology",
             wire_schema_for::<crate::dashboard_ws::TopologySnapshot>(),
+        ),
+        (
+            "theater",
+            wire_schema_for::<crate::dashboard_api::TheaterResponse>(),
         ),
         (
             "ws-frame",
@@ -142,13 +157,16 @@ mod tests {
             vec![
                 "bootstrap",
                 "catalog",
+                "durability",
                 "flow-detail",
+                "flow-summary",
                 "flows",
                 "history",
                 "kill",
                 "metrics",
                 "overview",
                 "snapshot",
+                "theater",
                 "topology",
                 "ws-frame",
                 "ws-snapshot",

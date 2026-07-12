@@ -75,6 +75,9 @@ export interface ProviderLatencyModel {
   samplesText: string;
   /** The per-class failure distribution (only occurring classes; empty when none / absent). */
   errors: ProviderErrorRow[];
+  /** True when the current request window was empty and this came from an older archive cut. */
+  stale: boolean;
+  asOfMs: number | null;
 }
 
 /** Human label for a bounded error class (the gap-03 taxonomy), e.g. `http_status` → "http status". */
@@ -155,6 +158,8 @@ export function buildProviderLatency(
       errorRate: UNAVAILABLE_FIGURE,
       samplesText: '—',
       errors: [],
+      stale: false,
+      asOfMs: null,
     };
   }
 
@@ -174,6 +179,8 @@ export function buildProviderLatency(
     errorRate: { text: fmtErrorRate(per.error_rate), quality: 'measured' },
     samplesText: `${per.served}/${per.samples}`,
     errors: errorRows(per.errors),
+    stale: per.stale,
+    asOfMs: per.as_of_ms ?? null,
   };
 }
 

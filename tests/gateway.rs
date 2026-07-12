@@ -6640,6 +6640,10 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
             .any(|row| { row["api_call_id"] == serde_json::json!(api_call_id) }),
         "the streamed flow appears in /flows"
     );
+    let live_rollup = d13_json(d13_get(&app, "/dashboard/api/flows/summary").await).await;
+    assert_eq!(live_rollup["total"], serde_json::json!(1));
+    assert_eq!(live_rollup["statuses"][0]["key"], "completed");
+    assert_eq!(live_rollup["statuses"][0]["count"], 1);
 
     // (2) `/flows/:id` shows the THREE bodies + usage + deltas + flow_seq.
     let expected_delta_watermark = gateway.debug_snapshot().last_sequence;
@@ -6790,14 +6794,30 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
     assert!(snapshot["cursors"]["topology_seq"].is_u64());
     assert!(snapshot["cursors"]["monitor_seq"].is_u64());
     assert!(snapshot["at_ms"].as_u64().unwrap() > 0);
-    // The summaries are BODY-FREE: a summary row carries NO inbound_body/normalized/
-    // upstream_body keys (only the detail endpoint carries bodies).
-    let summary = snapshot["summaries"]
+    // Snapshot bodies stay bounded: flow rows are fetched through the cut-scoped
+    // paged endpoint instead of embedding the whole historical population.
+    assert_eq!(snapshot["summaries"], serde_json::json!([]));
+    assert_eq!(snapshot["flows_total"], serde_json::json!(1));
+    let cut_id = snapshot["cut_id"].as_u64().expect("snapshot cut id");
+    let cut_flows = d13_json(
+        d13_get(
+            &app,
+            &format!("/dashboard/api/flows?cut_id={cut_id}&limit=100"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(cut_flows["total"], serde_json::json!(1));
+    assert_eq!(
+        cut_flows["as_of_event_id"], snapshot["cursors"]["flow_seq"],
+        "best-effort cut watermark is the exact frozen flow cursor"
+    );
+    let summary = cut_flows["flows"]
         .as_array()
         .unwrap()
         .iter()
         .find(|row| row["api_call_id"] == serde_json::json!(api_call_id))
-        .expect("the flow is in the snapshot summaries");
+        .expect("the flow is in the cut-scoped page");
     assert!(
         summary.get("inbound_body").is_none(),
         "snapshot summaries are BODY-FREE"
@@ -6810,6 +6830,29 @@ async fn d13_end_to_end_streamed_flow_through_real_router() {
         summary.get("upstream_body").is_none(),
         "snapshot summaries are BODY-FREE"
     );
+    let cut_rollup = d13_json(
+        d13_get(
+            &app,
+            &format!("/dashboard/api/flows/summary?cut_id={cut_id}"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(cut_rollup["total"], serde_json::json!(1));
+    assert_eq!(cut_rollup["as_of_event_id"], cut_flows["as_of_event_id"]);
+    let historical_detail = d13_json(
+        d13_get(
+            &app,
+            &format!("/dashboard/api/flows/{api_call_id}?cut_id={cut_id}"),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(historical_detail["api_call_id"], api_call_id);
+    assert_eq!(historical_detail["detail_source"], "durable");
+    let theater =
+        d13_json(d13_get(&app, &format!("/dashboard/api/theater?cut_id={cut_id}")).await).await;
+    assert_eq!(theater["last_terminal"]["api_call_id"], api_call_id);
     // The snapshot still reshapes metrics + topology into their REST bodies.
     assert!(snapshot["metrics"]["metrics_seq"].is_u64());
     assert!(snapshot["topology"]["price_table"].is_object());

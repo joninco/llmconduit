@@ -1,6 +1,6 @@
 /** Dashboard wire-version negotiation shared by bootstrap, REST, and WS. */
 
-export const DASHBOARD_SCHEMA_VERSION = 5;
+export const DASHBOARD_SCHEMA_VERSION = 6;
 export const DASHBOARD_SCHEMA_HEADER = 'X-LLMConduit-Dashboard-Schema';
 
 const RELOAD_MARKER = 'llmconduit.dashboard.schema-reload';

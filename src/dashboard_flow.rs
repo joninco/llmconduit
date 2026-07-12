@@ -611,7 +611,10 @@ pub enum TerminalReasonClass {
 }
 
 impl TerminalReasonClass {
-    fn from_terminal(terminal_reason: Option<&str>, attempts: &[Attempt]) -> TerminalReasonClass {
+    pub(crate) fn from_terminal(
+        terminal_reason: Option<&str>,
+        attempts: &[Attempt],
+    ) -> TerminalReasonClass {
         if let Some(class) = attempts
             .iter()
             .rev()
@@ -1283,7 +1286,7 @@ pub struct SnapshotFlowSummary {
 }
 
 impl SnapshotFlowSummary {
-    fn from_record(record: &FlowRecord) -> Self {
+    pub(crate) fn from_record(record: &FlowRecord) -> Self {
         Self {
             revision: record.revision,
             api_call_id: record.api_call_id.clone(),
@@ -1441,6 +1444,16 @@ impl DashboardFlowStore {
             return 0;
         }
         self.lock().seq
+    }
+
+    /// Restore the durable domain watermark before the first new mutation. Rows stay on disk;
+    /// only the counter is hydrated so a reconnecting browser never rejects post-restart frames.
+    pub fn hydrate_sequence(&self, floor: u64) {
+        if !self.enabled {
+            return;
+        }
+        let mut state = self.lock();
+        state.seq = state.seq.max(floor);
     }
 
     /// Subscribe to authoritative post-mutation records. `None` is the disabled
@@ -1759,7 +1772,7 @@ impl DashboardFlowStore {
         status: FlowStatus,
         terminal_reason: Option<String>,
         serving_provider: Option<String>,
-    ) {
+    ) -> Option<(SnapshotFlowSummary, u64)> {
         self.finalize_atomic(
             api_call_id,
             status,
@@ -1772,7 +1785,7 @@ impl DashboardFlowStore {
             TerminalCostConfidence::Unavailable,
             None,
             None,
-        );
+        )
     }
 
     /// Commit the complete terminal record in one FlowStore mutation. This is the
@@ -1793,9 +1806,9 @@ impl DashboardFlowStore {
         terminal_cost_confidence: TerminalCostConfidence,
         cache_price_impact_usd: Option<f64>,
         effective_route_limit: Option<i64>,
-    ) {
+    ) -> Option<(SnapshotFlowSummary, u64)> {
         if !self.enabled {
-            return;
+            return None;
         }
         let terminal_reason = terminal_reason.map(cap_scalar);
         let serving_provider = serving_provider.map(cap_scalar);
@@ -1841,8 +1854,13 @@ impl DashboardFlowStore {
             record.cache_price_impact_usd = cache_price_impact_usd;
             record.effective_route_limit = effective_route_limit;
         });
+        let durable = state
+            .by_id
+            .get(api_call_id)
+            .map(|record| (SnapshotFlowSummary::from_record(record), record.record_seq));
         state.enforce_caps(self.summary_quota_bytes);
         self.publish_locked(&state, api_call_id, FlowMutationPhase::Terminal);
+        durable
     }
 
     /// Attach token usage (D3). UPSERT semantics: the caller passes the running
@@ -2133,6 +2151,20 @@ impl DashboardFlowStore {
         Some((Arc::clone(record), seq))
     }
 
+    /// Resolve a body-free durable projection and its exact record watermark in one
+    /// lock hold. Required-mode ingress uses this immediately after `open` so the
+    /// accepted request is committed before upstream dispatch.
+    pub fn summary_with_seq(&self, id: &str) -> Option<(SnapshotFlowSummary, u64)> {
+        if !self.enabled {
+            return None;
+        }
+        let mut state = self.lock();
+        state.prune_expired(now_ms());
+        let api_call_id = state.resolve_id(id)?;
+        let record = state.by_id.get(&api_call_id)?;
+        Some((SnapshotFlowSummary::from_record(record), record.record_seq))
+    }
+
     /// Body-free snapshot summaries, newest-first. Empty when disabled. Prunes
     /// expired records first.
     pub fn snapshot_summaries(&self) -> Vec<SnapshotFlowSummary> {
@@ -2261,11 +2293,12 @@ pub struct MiddlewareGuard {
     claim: Arc<AtomicU8>,
 }
 
-impl Drop for MiddlewareGuard {
-    fn drop(&mut self) {
-        // Finalize ONLY if still OpenL0 (the engine never claimed it). Race-free:
-        // the CAS atomically transfers ownership; a concurrent L1 claim makes this
-        // fail and L1 finalizes instead.
+impl MiddlewareGuard {
+    /// Resolve the L0 fallback before the HTTP middleware returns. Required durability
+    /// calls this after `next.run` so an extractor rejection can be archived and its
+    /// artifact committed before the non-streaming error response is released. The
+    /// CAS keeps it inert for every request already claimed by the engine.
+    pub fn finalize_unclaimed(&self) -> Option<(SnapshotFlowSummary, u64)> {
         if self
             .claim
             .compare_exchange(
@@ -2276,13 +2309,23 @@ impl Drop for MiddlewareGuard {
             )
             .is_ok()
         {
-            self.store.finalize(
+            return self.store.finalize(
                 &self.api_call_id,
                 FlowStatus::Failed,
                 Some("unhandled".to_string()),
                 None,
             );
         }
+        None
+    }
+}
+
+impl Drop for MiddlewareGuard {
+    fn drop(&mut self) {
+        // Finalize ONLY if still OpenL0 (the engine never claimed it). Race-free:
+        // the CAS atomically transfers ownership; a concurrent L1 claim makes this
+        // fail and L1 finalizes instead.
+        let _ = self.finalize_unclaimed();
     }
 }
 
@@ -2452,7 +2495,11 @@ impl TelemetryGuard {
     /// metrics inputs from the guard's own evict-safe sources (claim-captured endpoint +
     /// the shared ServingToken; D5 R3 MEDIUM) so the engine's metrics record never
     /// re-reads the (possibly-evicted) record.
-    pub fn finalize(&self, status: FlowStatus, terminal_reason: Option<String>) {
+    pub fn finalize(
+        &self,
+        status: FlowStatus,
+        terminal_reason: Option<String>,
+    ) -> Option<(SnapshotFlowSummary, u64)> {
         if self
             .claim
             .compare_exchange(
@@ -2523,7 +2570,7 @@ impl TelemetryGuard {
             // socket can never observe a terminal row missing its final trace/body and no
             // three-step sequence churn occurs.
             let pending_response_body = self.serving.take_pending_response_body();
-            self.store.finalize_atomic(
+            let durable = self.store.finalize_atomic(
                 &self.api_call_id,
                 status,
                 terminal_reason,
@@ -2543,6 +2590,9 @@ impl TelemetryGuard {
             // not the 512-record history. Inside the CAS guard so a double finalize (the
             // Drop after an explicit call) does not double-remove.
             self.abort_hub.remove(&self.api_call_id);
+            durable
+        } else {
+            None
         }
     }
 }

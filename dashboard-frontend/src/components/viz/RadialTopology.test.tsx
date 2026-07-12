@@ -180,7 +180,7 @@ describe('RadialTopology — per-provider emphasis: sizing + error ring (gap 13)
   function per(over: Partial<ProviderLatency>): ProviderLatency {
     return {
       provider: 'p', data_quality: 'derived', samples: 50, served: 50, failed: 0,
-      p50: 80, p95: 100, p99: 120, error_rate: 0, errors: {}, ...over,
+      p50: 80, p95: 100, p99: 120, error_rate: 0, errors: {}, stale: false, ...over,
     };
   }
   const radiusOf = (container: HTMLElement, id: string): number =>

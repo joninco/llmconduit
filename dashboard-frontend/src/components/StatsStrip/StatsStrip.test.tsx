@@ -238,6 +238,10 @@ describe('StatsStrip — instantaneous idle retention', () => {
 
     act(() => vi.advanceTimersByTime(4_000));
     expect(getByTestId('stats-stale-age').textContent).toBe('00:05');
+
+    vi.setSystemTime(90_071_000);
+    act(() => vi.advanceTimersByTime(1_000));
+    expect(getByTestId('stats-stale-age').textContent).toBe('1d 01:01:02');
   });
 
   it('uses an explicit idle/no-request state before any request has been observed', () => {

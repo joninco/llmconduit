@@ -17,12 +17,65 @@
 import { useMemo } from 'react';
 import { useDashboard, useFlowFilter } from '../../store/hooks';
 import { useFlowRows } from './useFlowRows';
-import { failureTaxonomy, UNAVAILABLE, type FailureGroup, type FailureTaxonomy as FailureTaxonomyModel } from './failureTaxonomy';
+import {
+  failureTaxonomy, fmtFailureRate, UNAVAILABLE, type FailureGroup,
+  type FailureReasonRow, type FailureTaxonomy as FailureTaxonomyModel,
+} from './failureTaxonomy';
+import type { FlowListSummaryResponse } from '../../api/types';
 import { Panel } from '../ui/Panel';
 import { cn } from '../../lib/cn';
 
 /** Error-rate threshold (%) above which the chip + a group turns red (mirrors the stats strip's err%). */
 export const FAILURE_RATE_THRESHOLD = 5;
+
+const ATTEMPT_REASONS = new Set(['connect', 'http_status', 'timeout', 'stream', 'terminal', 'other']);
+
+function archiveFailureTaxonomy(archive: FlowListSummaryResponse): FailureTaxonomyModel {
+  const grouped = new Map<string, FailureGroup>();
+  for (const failure of archive.failures) {
+    const key = `${failure.provider}|${failure.model}`;
+    let group = grouped.get(key);
+    if (!group) {
+      group = {
+        key,
+        provider: failure.provider,
+        model: failure.model,
+        total: failure.total,
+        failed: 0,
+        errorRatePct: 0,
+        errorRateText: '0%',
+        reasons: [],
+      };
+      grouped.set(key, group);
+    }
+    group.failed += failure.count;
+    const source: FailureReasonRow['source'] = ATTEMPT_REASONS.has(failure.reason)
+      ? 'error_class'
+      : failure.reason === 'unclassified' ? 'unclassified' : 'terminal_reason';
+    group.reasons.push({
+      key: source === 'error_class' ? `class:${failure.reason}` : source === 'terminal_reason' ? `terminal:${failure.reason}` : '__unclassified__',
+      label: failure.reason === 'unclassified' ? 'unclassified' : failure.reason.replaceAll('_', ' '),
+      source,
+      count: failure.count,
+    });
+  }
+  const groups = [...grouped.values()].map((group) => {
+    const errorRatePct = group.total > 0 ? group.failed / group.total * 100 : 0;
+    group.reasons.sort((left, right) => right.count - left.count || left.label.localeCompare(right.label));
+    return { ...group, errorRatePct, errorRateText: fmtFailureRate(errorRatePct) };
+  }).sort((left, right) => right.failed - left.failed || right.errorRatePct - left.errorRatePct || left.key.localeCompare(right.key));
+  const totalFailed = archive.statuses.find((status) => status.key === 'failed')?.count ?? 0;
+  const overallErrorRatePct = archive.total > 0 ? totalFailed / archive.total * 100 : 0;
+  return {
+    available: archive.total > 0,
+    totalFlows: archive.total,
+    totalFailed,
+    overallErrorRatePct,
+    overallErrorRateText: archive.total > 0 ? fmtFailureRate(overallErrorRatePct) : UNAVAILABLE,
+    overallQuality: archive.total > 0 ? 'derived' : 'unavailable',
+    groups,
+  };
+}
 
 /**
  * The aggregate failure panel. Self-contained: reads the filtered flow rows + builds the model. ALWAYS
@@ -33,9 +86,12 @@ export const FAILURE_RATE_THRESHOLD = 5;
  */
 export function FailureTaxonomy({ searchQuery = '' }: { searchQuery?: string }) {
   const filters = useFlowFilter((s) => s.filters);
-  const { rows } = useFlowRows(filters, searchQuery);
+  const { rows, summary } = useFlowRows(filters, searchQuery);
   const seeking = useDashboard((s) => s.connection === 'seeking');
-  const model = useMemo(() => failureTaxonomy(rows), [rows]);
+  const model = useMemo(
+    () => summary ? archiveFailureTaxonomy(summary) : failureTaxonomy(rows),
+    [rows, summary],
+  );
   const observed = model.available;
 
   return (

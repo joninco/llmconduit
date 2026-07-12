@@ -13,8 +13,14 @@
         "$ref": "#/$defs/CatalogEntry"
       }
     },
+    "durability_status": {
+      "$ref": "#/$defs/DurabilityStatusResponse"
+    },
     "flow_detail": {
       "$ref": "#/$defs/FlowDetailBody"
+    },
+    "flow_summary": {
+      "$ref": "#/$defs/DurableFlowRollup"
     },
     "flows_response": {
       "$ref": "#/$defs/FlowsResponse"
@@ -37,6 +43,9 @@
     "snapshot_response": {
       "$ref": "#/$defs/SnapshotResponse"
     },
+    "theater_response": {
+      "$ref": "#/$defs/TheaterResponse"
+    },
     "topology_response": {
       "$ref": "#/$defs/TopologySnapshot"
     },
@@ -52,6 +61,7 @@
     "ws_snapshot",
     "ws_frame",
     "flows_response",
+    "flow_summary",
     "flow_detail",
     "metrics_response",
     "overview_response",
@@ -59,6 +69,8 @@
     "catalog_response",
     "snapshot_response",
     "history_response",
+    "theater_response",
+    "durability_status",
     "kill_response",
     "login_request"
   ],
@@ -1646,6 +1658,324 @@
         "monitor"
       ]
     },
+    "DurabilityStatusResponse": {
+      "type": "object",
+      "properties": {
+        "archived_flows": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "artifact_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "database_bytes": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "error_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_commit_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
+        "mode": {
+          "type": "string"
+        },
+        "pending_commits": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "retained_cuts": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "state": {
+          "type": "string"
+        },
+        "terminal_flows": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "tiers": {
+          "$ref": "#/$defs/DurabilityTierCounts"
+        }
+      },
+      "required": [
+        "mode",
+        "state",
+        "last_commit_ms",
+        "pending_commits",
+        "database_bytes",
+        "artifact_bytes",
+        "archived_flows",
+        "terminal_flows",
+        "retained_cuts",
+        "tiers"
+      ]
+    },
+    "DurabilityTierCounts": {
+      "type": "object",
+      "properties": {
+        "activity": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "coarse_15m": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "fine_5s": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "minute_1m": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "activity",
+        "fine_5s",
+        "minute_1m",
+        "coarse_15m"
+      ]
+    },
+    "DurableClientRollup": {
+      "type": "object",
+      "properties": {
+        "average_latency_ms": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "cost_confidence": {
+          "$ref": "#/$defs/TerminalCostConfidence"
+        },
+        "cost_usd": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "key": {
+          "type": "string"
+        },
+        "priced": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ClientSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "timed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "key",
+        "count",
+        "failed",
+        "source",
+        "cost_usd",
+        "cost_confidence",
+        "priced",
+        "average_latency_ms",
+        "timed"
+      ]
+    },
+    "DurableContextRollup": {
+      "type": "object",
+      "properties": {
+        "measurable": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "near_limit": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "over_limit": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "peak_pct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        }
+      },
+      "required": [
+        "measurable",
+        "near_limit",
+        "over_limit",
+        "peak_pct"
+      ]
+    },
+    "DurableFacetCount": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "count"
+      ]
+    },
+    "DurableFailureCount": {
+      "type": "object",
+      "properties": {
+        "count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "total": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "provider",
+        "model",
+        "reason",
+        "count",
+        "total"
+      ]
+    },
+    "DurableFlowRollup": {
+      "type": "object",
+      "properties": {
+        "as_of_event_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "clients": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DurableClientRollup"
+          }
+        },
+        "context": {
+          "$ref": "#/$defs/DurableContextRollup"
+        },
+        "failures": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DurableFailureCount"
+          }
+        },
+        "generated_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DurableFacetCount"
+          }
+        },
+        "statuses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DurableFacetCount"
+          }
+        },
+        "total": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "unattributed": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "upstreams": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DurableFacetCount"
+          }
+        }
+      },
+      "required": [
+        "total",
+        "models",
+        "upstreams",
+        "clients",
+        "unattributed",
+        "statuses",
+        "failures",
+        "context",
+        "as_of_event_id",
+        "generated_at_ms"
+      ]
+    },
     "EngineThroughputSample": {
       "description": "Physically de-duplicated per-request output-token throughput from the newest\nsuccessful Prometheus TPOT interval across configured engines. The value is the\ninverse mean `request_time_per_output_token_seconds`; speculative accepted tokens\nare already reflected in that shorter output-token time and are never double-counted.\nOne physical `/metrics` endpoint contributes once even when several logical routes\npoint at it.",
       "type": "object",
@@ -2379,6 +2709,11 @@
       "description": "`GET /dashboard/api/flows` — the paged flow list + total + the FlowStore\ndomain cursor. Matches the frozen `FlowsResponse`.",
       "type": "object",
       "properties": {
+        "as_of_event_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "flow_seq": {
           "type": "integer",
           "format": "uint64",
@@ -2390,6 +2725,17 @@
             "$ref": "#/$defs/FlowRow"
           }
         },
+        "generated_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "total": {
           "description": "Total rows AFTER filtering but BEFORE paging (so the SPA can page).",
           "type": "integer",
@@ -2400,12 +2746,19 @@
       "required": [
         "flows",
         "total",
-        "flow_seq"
+        "flow_seq",
+        "as_of_event_id",
+        "generated_at_ms"
       ]
     },
     "HistoryPoint": {
       "type": "object",
       "properties": {
+        "archive_event_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
         "at_ms": {
           "type": "integer",
           "format": "uint128",
@@ -2419,6 +2772,9 @@
           "format": "uint64",
           "minimum": 0
         },
+        "cut_kind": {
+          "type": "string"
+        },
         "engine_throughput": {
           "anyOf": [
             {
@@ -2431,13 +2787,31 @@
         },
         "instant": {
           "$ref": "#/$defs/InstantMetricSample"
+        },
+        "last_activity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LastActivitySample"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resolution_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "required": [
         "cut_id",
         "at_ms",
         "cursors",
-        "instant"
+        "instant",
+        "resolution_ms",
+        "cut_kind",
+        "archive_event_id"
       ]
     },
     "HistoryResponse": {
@@ -3201,6 +3575,9 @@
           "format": "uint64",
           "minimum": 0
         },
+        "mode": {
+          "$ref": "#/$defs/OverviewScopeMode"
+        },
         "model": {
           "type": [
             "string",
@@ -3241,12 +3618,21 @@
       },
       "required": [
         "window",
+        "mode",
         "requested_at_ms",
         "selected_at_ms",
         "status",
         "model",
         "upstream",
         "client"
+      ]
+    },
+    "OverviewScopeMode": {
+      "type": "string",
+      "enum": [
+        "live",
+        "historical",
+        "stale_fallback"
       ]
     },
     "OverviewTokens": {
@@ -3382,6 +3768,14 @@
       "description": "Gap 12 — the public per-provider latency + error-distribution DTO (additive on the\nD4 topology node; consumed by spec 13). Percentiles are `derived` ms over the\nprovider's ATTEMPT-latency histogram (a FAILED primary's latency is included — spec\n12 — so final-served latency alone cannot hide an unhealthy provider). `error_rate`\nis the percentage of the provider's attempts that FAILED. A provider with zero\nin-window samples is ABSENT (don't-lie-with-zeros), so a present DTO always has\n`samples >= 1`. All floats are finite (the frozen finite-number wire contract).",
       "type": "object",
       "properties": {
+        "as_of_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
         "data_quality": {
           "description": "DQ tag — always `derived` for a present entry (the `unavailable` case is absence).",
           "$ref": "#/$defs/ProviderMetricQuality"
@@ -3440,6 +3834,10 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "stale": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -3452,7 +3850,8 @@
         "p95",
         "p99",
         "error_rate",
-        "errors"
+        "errors",
+        "stale"
       ]
     },
     "ProviderMetricQuality": {
@@ -3641,6 +4040,11 @@
           "description": "Whether this selected cut dropped its oldest flow summaries to fit the quota.",
           "type": "boolean"
         },
+        "flows_total": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
         "history": {
           "description": "Bounds and memory use of the retained historical-cut ring.",
           "$ref": "#/$defs/SnapshotHistoryMetadata"
@@ -3683,6 +4087,7 @@
         "cursors",
         "at_ms",
         "summaries",
+        "flows_total",
         "metrics",
         "topology",
         "history",
@@ -3703,6 +4108,106 @@
         "confident",
         "estimated",
         "unavailable"
+      ]
+    },
+    "TheaterResponse": {
+      "type": "object",
+      "properties": {
+        "data_quality": {
+          "type": "string"
+        },
+        "generated_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "last_terminal": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TheaterRiver"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "monitor_seq": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "generated_at_ms",
+        "monitor_seq",
+        "data_quality"
+      ]
+    },
+    "TheaterRiver": {
+      "type": "object",
+      "properties": {
+        "api_call_id": {
+          "type": "string"
+        },
+        "approx_tokens": {
+          "type": "number",
+          "format": "double"
+        },
+        "id": {
+          "type": "string"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output": {
+          "type": "string"
+        },
+        "reasoning": {
+          "type": "string"
+        },
+        "started_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "status": {
+          "type": "string"
+        },
+        "terminal_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "tokens_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "api_call_id",
+        "model",
+        "status",
+        "started_at_ms",
+        "terminal_at_ms",
+        "output",
+        "reasoning",
+        "tools",
+        "truncated",
+        "approx_tokens",
+        "tokens_per_sec"
       ]
     },
     "TopologyEdge": {

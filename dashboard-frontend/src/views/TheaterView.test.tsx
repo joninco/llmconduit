@@ -216,11 +216,12 @@ describe('TheaterView — live rivers from segment_append, auto-grid, fullscreen
     expect(getByTestId('river-reasoning').textContent).toBe('the plan');
   });
 
-  it('empty monitor → an explicit empty state, no grid', () => {
+  it('empty monitor restores the last durable response instead of going blank', async () => {
     const { getByTestId, queryByTestId } = render(<TheaterView />);
     act(() => dashboardStore.getState().setConnection('live'));
-    expect(getByTestId('theater-empty')).not.toBeNull();
-    expect(queryByTestId('theater-grid')).toBeNull();
+    await waitFor(() => expect(getByTestId('river-retained-badge')).not.toBeNull());
+    expect(queryByTestId('theater-empty')).toBeNull();
+    expect(getByTestId('theater-grid')).not.toBeNull();
   });
 });
 
@@ -268,6 +269,11 @@ describe('TheaterView — retains the latest response and ages out older termina
       act(() => { vi.advanceTimersByTime(65_000); });
       expect(getByTestId('river').getAttribute('data-retained')).toBe('true');
       expect(getByTestId('theater-stale-age').textContent).toBe('01:05');
+
+      // The shared stale formatter remains concise across day boundaries.
+      vi.setSystemTime(finishedAt + 90_061_000);
+      act(() => { vi.advanceTimersByTime(1_000); });
+      expect(getByTestId('theater-stale-age').textContent).toBe('1d 01:01:02');
 
       // Backend monitor retention may later remove the request; Theater's bounded one-response
       // cache intentionally survives that automatic cleanup.

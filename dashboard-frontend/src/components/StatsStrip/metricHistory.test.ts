@@ -36,6 +36,7 @@ describe('instant metric history', () => {
   it('merges retained/live points, deduplicates identity, sorts, and prunes past one hour', () => {
     const retained: HistoryPoint[] = [{
       cut_id: 1, at_ms: 3_600_000, cursors: { flow_seq: 0, metrics_seq: 2, topology_seq: 0, monitor_seq: 0, backend_metrics_seq: 0 }, instant: instant(2),
+      resolution_ms: 5_000, cut_kind: 'periodic', archive_event_id: 1,
     }];
     let live = appendTick(emptyHistory(), tick(2, 3_600_000, 99));
     live = appendTick(live, tick(3, 7_200_001, 3));

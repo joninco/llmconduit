@@ -544,13 +544,25 @@ fn candidate_context_floor(plan: &crate::upstream::BackendCandidatePlan) -> Opti
 /// it `Completed` -- but its response was CUT SHORT, so the capture artifact must not
 /// claim `completed` (don't-lie-with-zeros); it maps to `incomplete`. Failed /
 /// cancelled turns are the `Err` arm and never reach this type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum TurnCompletion {
     /// The turn ended on a genuine stop (upstream `response.completed`).
-    Completed,
+    Completed(SseEvent),
     /// The turn was truncated by the upstream output-token cap (`finish_reason:
     /// length` ⇒ `response.incomplete`).
-    Incomplete,
+    Incomplete(SseEvent),
+}
+
+impl TurnCompletion {
+    fn is_incomplete(&self) -> bool {
+        matches!(self, Self::Incomplete(_))
+    }
+
+    fn terminal_event(&self) -> &SseEvent {
+        match self {
+            Self::Completed(event) | Self::Incomplete(event) => event,
+        }
+    }
 }
 
 /// F1c: map the engine's terminal `FlowStatus` to the turn-capture artifact status
@@ -1350,10 +1362,10 @@ impl Gateway {
         // or budgeting below) must finalize the record `Failed` with the correct
         // reason — NOT fall through to the `Drop` fallback's `Cancelled`. Helper to
         // finalize-then-return on the `?` paths without duplicating the guard plumbing.
-        let finalize_pre_spawn_err = |err: AppError| -> AppError {
-            if let Some(guard) = &telemetry_guard {
+        let finalize_pre_spawn_err = |err: AppError| {
+            let durable = if let Some(guard) = &telemetry_guard {
                 self.prepare_terminal_pricing(guard);
-                guard.finalize(
+                let durable = guard.finalize(
                     crate::dashboard_flow::FlowStatus::Failed,
                     Some(err.to_string()),
                 );
@@ -1367,7 +1379,10 @@ impl Gateway {
                     crate::dashboard_flow::FlowStatus::Failed,
                     guard.elapsed().as_millis(),
                 );
-            }
+                durable
+            } else {
+                None
+            };
             // F1c: a pre-spawn failure (bad request / lowering / budget) is always
             // `failed`. Record it on the capture guard so the artifact carries the
             // terminal reason; the served side is the error body the handler returns
@@ -1376,7 +1391,7 @@ impl Gateway {
             if let Some(guard) = &capture_guard {
                 guard.finalize("failed", Some(&err.to_string()));
             }
-            err
+            (err, durable)
         };
 
         // E2b residual-image safety pass: the TRUE choke point for "no raw
@@ -1397,9 +1412,26 @@ impl Gateway {
                 // Reject BEFORE dispatch: a bad-request 4xx via `AppError::
                 // bad_request` (400), never `AppError::upstream` (502) — the
                 // provider is not contacted at all, so it is never cooled.
-                return Err(finalize_pre_spawn_err(AppError::bad_request(
+                let (err, durable) = finalize_pre_spawn_err(AppError::bad_request(
                     "upstream model is text-only; images are not supported",
-                )));
+                ));
+                if let Some((summary, record_seq)) = durable
+                    && let Err(error) = self
+                        .dashboard_history()
+                        .persist_flow_summary(
+                            summary,
+                            crate::dashboard_flow::FlowMutationPhase::Terminal,
+                            record_seq,
+                        )
+                        .await
+                    && self.dashboard_history().is_required()
+                {
+                    tracing::error!(%error, "failed to persist pre-spawn flow failure");
+                    return Err(AppError::internal(
+                        "dashboard durability commit failed before error response",
+                    ));
+                }
+                return Err(err);
             }
             let degraded_images = crate::vision::degrade_residual_images(&mut request.input);
             if degraded_images > 0 {
@@ -1432,10 +1464,29 @@ impl Gateway {
             }
         }
 
-        let (baseline_record, prefix_len) = self
-            .find_replay_baseline(&request)
-            .await
-            .map_err(&finalize_pre_spawn_err)?;
+        let (baseline_record, prefix_len) = match self.find_replay_baseline(&request).await {
+            Ok(value) => value,
+            Err(err) => {
+                let (err, durable) = finalize_pre_spawn_err(err);
+                if let Some((summary, record_seq)) = durable
+                    && let Err(error) = self
+                        .dashboard_history()
+                        .persist_flow_summary(
+                            summary,
+                            crate::dashboard_flow::FlowMutationPhase::Terminal,
+                            record_seq,
+                        )
+                        .await
+                    && self.dashboard_history().is_required()
+                {
+                    tracing::error!(%error, "failed to persist replay-baseline failure");
+                    return Err(AppError::internal(
+                        "dashboard durability commit failed before error response",
+                    ));
+                }
+                return Err(err);
+            }
+        };
         let mut tail_request = request.clone();
         tail_request.input = request.input[prefix_len..].to_vec();
         if self.config.brave_api_key.is_none() {
@@ -1491,7 +1542,7 @@ impl Gateway {
         let roles = self
             .config
             .resolve_roles_config_for_resolved_model(&request.model, &resolved_model);
-        let lowered = lower_request_with_image_agent_and_roles(
+        let lowered = match lower_request_with_image_agent_and_roles(
             &tail_request,
             baseline_record
                 .as_ref()
@@ -1499,8 +1550,29 @@ impl Gateway {
                 .unwrap_or_default(),
             vision_session.is_some(),
             roles,
-        )
-        .map_err(&finalize_pre_spawn_err)?;
+        ) {
+            Ok(lowered) => lowered,
+            Err(err) => {
+                let (err, durable) = finalize_pre_spawn_err(err);
+                if let Some((summary, record_seq)) = durable
+                    && let Err(error) = self
+                        .dashboard_history()
+                        .persist_flow_summary(
+                            summary,
+                            crate::dashboard_flow::FlowMutationPhase::Terminal,
+                            record_seq,
+                        )
+                        .await
+                    && self.dashboard_history().is_required()
+                {
+                    tracing::error!(%error, "failed to persist request-lowering failure");
+                    return Err(AppError::internal(
+                        "dashboard durability commit failed before error response",
+                    ));
+                }
+                return Err(err);
+            }
+        };
 
         // G3 pre-flight context budgeting (T9: candidate-set seam). Estimate
         // over the LOWERED upstream payload (`lowered.messages`/`tools`/scalars)
@@ -1608,7 +1680,7 @@ impl Gateway {
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
         tokio::spawn(async move {
-            let result = gateway
+            let mut result = gateway
                 .run_turn(
                     response_id.clone(),
                     request,
@@ -1625,7 +1697,7 @@ impl Gateway {
                     vision_session,
                     // D1 (R1 #9): the engine binds `response_id → api_call_id` at
                     // the RequestStarted emission seam inside `run_turn`, not here.
-                    api_call_id,
+                    api_call_id.clone(),
                     // D2/D3: the shared serving token (tagged by routing/failover,
                     // read by the guard at finalize) threaded onto every per-turn
                     // `BackendChatRequest`.
@@ -1633,9 +1705,18 @@ impl Gateway {
                     tx.clone(),
                     // D6: the flow's kill token, composed with every `tx.closed()`
                     // client-hangup check inside `run_turn` + its helpers.
-                    abort_token,
+                    abort_token.clone(),
                 )
                 .await;
+            if result.is_ok()
+                && let Some(api_call_id) = &api_call_id
+            {
+                // The terminal event is fully assembled and held at this point. Stamp
+                // stream-end before the terminal FlowStore mutation so the durable
+                // summary remains one coherent final revision; actual client delivery
+                // follows the archive acknowledgement below.
+                gateway.flow_store().stamp_stream_end(api_call_id);
+            }
             // D3 L1: finalize the flow record at THIS single choke point (the spawned
             // body) from the typed `result`, then let the guard drop. `is_cancelled()`
             // (HTTP 499 — client hung up) ⇒ `Cancelled`; any other error ⇒ `Failed`;
@@ -1665,13 +1746,59 @@ impl Gateway {
             };
             if let Some(guard) = &telemetry_guard {
                 gateway.prepare_terminal_pricing(guard);
-                guard.finalize(status, Some(reason.clone()));
+                let durable = guard.finalize(status, Some(reason.clone()));
                 // D5: record the terminal into the metrics rings (sources served
                 // model + endpoint + upstream + final usage from the guard's own
                 // evict-safe inputs — no `detail()` re-read — + the guard's monotonic
                 // latency). No-op when the metrics layer is off. Runs AFTER
                 // `guard.finalize`, which assembled those inputs.
                 gateway.record_terminal_metrics(guard, status, guard.elapsed().as_millis());
+                if let Some((summary, record_seq)) = durable {
+                    let terminal_write = gateway
+                        .dashboard_history()
+                        .persist_flow_summary(
+                            summary,
+                            crate::dashboard_flow::FlowMutationPhase::Terminal,
+                            record_seq,
+                        )
+                        .await;
+                    if let Err(error) = terminal_write {
+                        tracing::error!(api_call_id = %guard.api_call_id(), %error, "failed to persist terminal flow");
+                        if gateway.dashboard_history().is_required() && result.is_ok() {
+                            result = Err(AppError::internal(
+                                "dashboard durability commit failed before terminal response",
+                            ));
+                        }
+                    } else if gateway.dashboard_history().is_enabled() {
+                        // A request can start and finish between periodic five-second cuts. Publish
+                        // and durably acknowledge an exact activity anchor now so an immediate
+                        // restart still has a selectable scrubber point with matching metrics/flows.
+                        let topology = gateway.provider_health_publisher();
+                        let published = gateway.metrics().publish_metrics_cut(
+                            gateway.flow_store(),
+                            &topology,
+                            gateway.monitor.last_sequence(),
+                            true,
+                        );
+                        let activity_cut = published.as_ref().and_then(|cut| {
+                            gateway
+                                .metrics()
+                                .snapshot_at(cut.taken_at_ms)
+                                .filter(|snapshot| snapshot.taken_at_ms == cut.taken_at_ms)
+                        });
+                        if let Some(activity_cut) = activity_cut
+                            && let Err(error) =
+                                gateway.dashboard_history().persist_cut(activity_cut).await
+                        {
+                            tracing::error!(api_call_id = %guard.api_call_id(), %error, "failed to persist terminal activity cut");
+                            if gateway.dashboard_history().is_required() && result.is_ok() {
+                                result = Err(AppError::internal(
+                                    "dashboard activity cut failed before terminal response",
+                                ));
+                            }
+                        }
+                    }
+                }
             }
             // F1c: report the SAME engine terminal to the capture guard (status +
             // reason come from the engine seam ONLY, never the served tee). Idempotent
@@ -1683,10 +1810,28 @@ impl Gateway {
             // `Completed`. Genuine stop / failed / cancelled map from the `FlowStatus`.
             if let Some(guard) = &capture_guard {
                 let (capture_status, capture_reason) = match &result {
-                    Ok(TurnCompletion::Incomplete) => ("incomplete", "response.incomplete"),
+                    Ok(turn) if turn.is_incomplete() => ("incomplete", "response.incomplete"),
                     _ => (flow_status_artifact_str(status), reason.as_str()),
                 };
                 guard.finalize(capture_status, Some(capture_reason));
+            }
+            if let Ok(turn) = &result {
+                if gateway
+                    .send_event(&tx, turn.terminal_event().clone(), &abort_token)
+                    .await
+                    .is_err()
+                {
+                    gateway
+                        .monitor
+                        .emit_with(response_id.as_str(), || MonitorEventKind::Failed {
+                            message: "client disconnected before durable terminal delivery"
+                                .to_string(),
+                        });
+                    return;
+                }
+                gateway
+                    .monitor
+                    .emit(response_id.clone(), MonitorEventKind::Completed);
             }
             if let Err(err) = &result {
                 if tx.is_closed() {
@@ -3055,32 +3200,14 @@ impl Gateway {
                 images: final_preview.images,
             }
         });
-        if is_incomplete {
-            self.send_event(&tx, incomplete_event(resource), &abort_token)
-                .await?;
-        } else {
-            self.send_event(&tx, completed_event(resource), &abort_token)
-                .await?;
-        }
-        // Gap 02: the terminal `response.completed`/`response.incomplete` has been
-        // emitted — stamp the `stream_end` phase. This is the clean-completion edge
-        // (the spawned closure's `guard.finalize` stamps `finalize` immediately after);
-        // a flow that errored/cancelled before here never reaches this `?`-guarded path,
-        // so `stream_end` stays `None` for it. Gated on `api_call_id` so the production
-        // hot path skips the call. The `?`s above mean we only reach here on a clean
-        // emit, which is exactly the semantics we want.
-        if let Some(api_call_id) = &api_call_id {
-            self.flow_store().stamp_stream_end(api_call_id);
-        }
-        self.monitor.emit(response_id, MonitorEventKind::Completed);
-        // F1c (finding #3): carry the terminal shape to the seam so the capture
-        // artifact records `incomplete` for a max-token truncation. `is_incomplete`
-        // was already derived above from the upstream `finish_reason` (the same bit
-        // that chose `response.incomplete` vs `response.completed`).
+        // Hold the terminal event at the engine seam. The spawned owner first commits
+        // the terminal flow to the durable dashboard archive, then releases this event
+        // to the client. Deltas still stream immediately; only success acknowledgement
+        // is gated on durability.
         Ok(if is_incomplete {
-            TurnCompletion::Incomplete
+            TurnCompletion::Incomplete(incomplete_event(resource))
         } else {
-            TurnCompletion::Completed
+            TurnCompletion::Completed(completed_event(resource))
         })
     }
 

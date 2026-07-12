@@ -11,6 +11,7 @@ import { useHashScope } from '../router/useHashRoute';
 import { flowFilterStore } from '../store/flowFilterStore';
 import { navigate } from '../router/useHashRoute';
 import { Panel } from '../components/ui/Panel';
+import { StaleFallbackBanner } from '../components/StaleFallbackBanner';
 
 const WINDOW_SECONDS = { m1: 60, m5: 300, h1: 3_600 } as const;
 
@@ -56,7 +57,15 @@ function AuthoritativeSankey({ response, seeking }: { response: OverviewResponse
     [response.lanes, seconds],
   );
   const cost = costPerMinute(response, seconds);
-  return <SankeyChrome model={model} cost={cost} seeking={seeking} window={response.scope.window} />;
+  return (
+    <SankeyChrome
+      model={model}
+      cost={cost}
+      seeking={seeking}
+      window={response.scope.window}
+      staleAsOfMs={response.scope.mode === 'stale_fallback' ? response.scope.selected_at_ms : null}
+    />
+  );
 }
 
 function costPerMinute(response: OverviewResponse, seconds: number): CostDisplay {
@@ -86,11 +95,13 @@ function SankeyChrome({
   cost,
   seeking,
   window,
+  staleAsOfMs,
 }: {
   model: SankeyModel;
   cost: CostDisplay;
   seeking: boolean;
   window: 'm1' | 'm5' | 'h1';
+  staleAsOfMs: number | null;
 }) {
   function onSelect(modelName: string, upstream: string | null): void {
     const filters = flowFilterStore.getState().filters;
@@ -123,6 +134,7 @@ function SankeyChrome({
           </span>
         )}
       </header>
+      {staleAsOfMs !== null && <StaleFallbackBanner asOfMs={staleAsOfMs} surface="sankey" />}
       <div className="mb-2 flex items-center gap-2 text-[10px] text-text-muted" aria-label="Band terminal cost legend" data-testid="sankey-cost-legend">
         <span>terminal cost</span>
         <span className="h-2.5 w-7 rounded-sm border border-line bg-accent" aria-hidden />

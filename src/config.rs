@@ -4403,11 +4403,10 @@ model_profiles:
         );
     }
 
-    /// AC-2 (F1a): `debug_log_dirs()` includes the configured
-    /// `turn_capture_dir` so the existing `debug_log_max_age_hours` rotation
-    /// covers turn-capture artifacts too. Pushed AS-IS (it already IS the
-    /// directory `<api_call_id>.json` artifacts land in, unlike the
-    /// request-log FILE paths above whose *parent* directory is extracted).
+    /// AC-2 (F1a): `debug_log_dirs()` includes the configured `turn_capture_dir` for
+    /// legacy best-effort cleanup. `spawn_cleanup` excludes this directory when a
+    /// dashboard archive owns its completed artifacts permanently. Pushed AS-IS (it
+    /// already IS the directory, unlike request-log FILE paths whose parent is used).
     #[test]
     fn debug_log_dirs_includes_turn_capture_dir() {
         let config = Config::from_persisted(&PersistedConfig {

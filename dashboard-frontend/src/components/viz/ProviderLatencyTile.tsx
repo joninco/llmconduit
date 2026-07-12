@@ -86,6 +86,15 @@ export function ProviderLatencyTile({ model }: { model: ProviderLatencyModel }) 
     >
       <div className="mb-0.5 flex items-center gap-1">
         <span className="text-[10px] uppercase tracking-wide text-text-muted">per-provider</span>
+        {model.stale && (
+          <span
+            className="rounded-sm border border-status-cooling/50 bg-status-cooling/10 px-1 py-px text-[8px] uppercase tracking-wide text-status-cooling"
+            data-testid="provider-latency-stale"
+            title={model.asOfMs === null ? 'restored from an older request-bearing window' : `restored from ${new Date(model.asOfMs).toLocaleString()}`}
+          >
+            stale fallback
+          </span>
+        )}
         {(model.isOverflow || model.isUnknown) && (
           <span
             className="rounded-sm bg-meta/15 px-1 py-px text-[8px] uppercase tracking-wide text-meta"

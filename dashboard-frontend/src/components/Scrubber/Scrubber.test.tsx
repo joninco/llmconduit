@@ -168,6 +168,7 @@ describe('Scrubber — seek + LIVE', () => {
     const { socket, client } = getConnection();
     const snapSpy = vi.spyOn(client, 'snapshot').mockResolvedValue({
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0}, at_ms: Date.now(), summaries: [], metrics: null, topology: null,
+      flows_total: 0,
       history: { oldest_at_ms: null, newest_at_ms: null, retained_bytes: 0, quota_bytes: 64 * 1024 * 1024, retained_cuts: 0 },
       flow_summaries_truncated: false,
     });
@@ -247,6 +248,7 @@ describe('Scrubber — seek + LIVE', () => {
       .mockResolvedValueOnce({
         cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
         at_ms: Date.now(), summaries: [], metrics: null, topology: null,
+        flows_total: 0,
         history: { oldest_at_ms: null, newest_at_ms: null, retained_bytes: 0, quota_bytes: 64 * 1024 * 1024, retained_cuts: 0 },
         flow_summaries_truncated: false,
       });

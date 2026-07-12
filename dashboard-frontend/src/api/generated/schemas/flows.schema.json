@@ -4,6 +4,11 @@
   "description": "`GET /dashboard/api/flows` — the paged flow list + total + the FlowStore\ndomain cursor. Matches the frozen `FlowsResponse`.",
   "type": "object",
   "properties": {
+    "as_of_event_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
     "flow_seq": {
       "type": "integer",
       "format": "uint64",
@@ -15,6 +20,17 @@
         "$ref": "#/$defs/FlowRow"
       }
     },
+    "generated_at_ms": {
+      "type": "integer",
+      "format": "uint128",
+      "minimum": 0
+    },
+    "next_cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "total": {
       "description": "Total rows AFTER filtering but BEFORE paging (so the SPA can page).",
       "type": "integer",
@@ -25,7 +41,9 @@
   "required": [
     "flows",
     "total",
-    "flow_seq"
+    "flow_seq",
+    "as_of_event_id",
+    "generated_at_ms"
   ],
   "$defs": {
     "Attempt": {

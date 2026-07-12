@@ -96,6 +96,7 @@ pub struct TurnCapture {
 #[derive(Debug)]
 struct TurnCaptureInner {
     dir: PathBuf,
+    history: crate::dashboard_history::DashboardHistory,
     /// Live per-turn states keyed by `api_call_id`, populated by [`start`] so a
     /// later seam that only has the id (the engine terminal in F1c, the
     /// upstream request/response taps in F1d/F1e) can reach the SAME state.
@@ -119,9 +120,23 @@ impl TurnCapture {
         Self {
             inner: Some(Arc::new(TurnCaptureInner {
                 dir,
+                history: crate::dashboard_history::DashboardHistory::disabled(),
                 registry: Mutex::new(HashMap::new()),
             })),
         }
+    }
+
+    /// Attach the durable dashboard archive. Artifact publication is acknowledged
+    /// only after the manifest is indexed there, allowing required mode to hold the
+    /// terminal response until both file and SQLite state are durable.
+    pub fn with_dashboard_history(
+        mut self,
+        history: crate::dashboard_history::DashboardHistory,
+    ) -> Self {
+        if let Some(inner) = self.inner.as_mut().and_then(Arc::get_mut) {
+            inner.history = history;
+        }
+        self
     }
 
     /// Whether this handle will do any work. `false` for `disabled()`.
@@ -353,6 +368,7 @@ pub struct TurnCaptureState {
     /// `engine_done`/`served_done`, plus the section flush) -- the turn's finish
     /// time for the `finished_ms` outcome field.
     finished_ms: AtomicU64,
+    completion: tokio::sync::watch::Sender<Option<Result<PathBuf, String>>>,
 }
 
 impl TurnCaptureState {
@@ -372,6 +388,7 @@ impl TurnCaptureState {
         let upstream_response =
             Mutex::new(Arc::new(Section::new(work_dir.join("upstream_response"))));
         let served_response = Section::new(work_dir.join("served_response"));
+        let (completion, _) = tokio::sync::watch::channel(None);
         Self {
             api_call_id,
             model_requested,
@@ -396,6 +413,26 @@ impl TurnCaptureState {
             served_tee_installed: AtomicBool::new(false),
             barrier: Mutex::new(AssemblyBarrier::default()),
             finished_ms: AtomicU64::new(0),
+            completion,
+        }
+    }
+
+    pub fn durability_required(&self) -> bool {
+        self.inner
+            .upgrade()
+            .is_some_and(|inner| inner.history.is_required())
+    }
+
+    pub async fn wait_published(&self) -> Result<PathBuf, String> {
+        let mut receiver = self.completion.subscribe();
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result;
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| "turn-capture completion channel closed".to_string())?;
         }
     }
 
@@ -1005,13 +1042,35 @@ impl TurnCaptureState {
         // The assembly reads the section temp files, JSON-escapes them, writes the
         // artifact, renames, and deletes the work dir -- all synchronous std::fs, so
         // it runs on the blocking pool (AGENTS.md: no blocking IO on the runtime).
-        if let Err(err) = tokio::task::spawn_blocking(move || state.assemble_blocking()).await {
+        let result = match tokio::task::spawn_blocking(move || state.assemble_blocking()).await {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(error) => Err(format!("turn-capture assembly task panicked: {error}")),
+        };
+        let result = match result {
+            Ok(path) => {
+                let history = self.inner.upgrade().map(|inner| inner.history.clone());
+                if let Some(history) = history {
+                    match history
+                        .index_artifact(self.api_call_id.clone(), path.clone())
+                        .await
+                    {
+                        Ok(()) => Ok(path),
+                        Err(error) => Err(error.to_string()),
+                    }
+                } else {
+                    Ok(path)
+                }
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = &result {
             tracing::warn!(
                 api_call_id = %self.api_call_id,
-                error = %err,
-                "turn-capture: assembly task panicked"
+                %error,
+                "turn-capture: durable artifact publication failed"
             );
         }
+        self.completion.send_replace(Some(result));
     }
 
     /// F1c (blocking): fully build the tmp artifact by STREAMING every section into
@@ -1027,13 +1086,12 @@ impl TurnCaptureState {
     /// F1f's age-based `.work` sweep (the documented backstop). A work-dir-delete
     /// failure NEVER blocks publishing a valid capture nor the registry eviction,
     /// and a tmp-build failure NEVER publishes a partial/empty final.
-    fn assemble_blocking(&self) {
-        if let Err(err) = std::fs::create_dir_all(&self.capture_dir) {
-            tracing::warn!(
-                dir = %self.capture_dir.display(),
-                error = %err,
-                "turn-capture: failed to create capture dir"
-            );
+    fn assemble_blocking(&self) -> std::io::Result<PathBuf> {
+        std::fs::create_dir_all(&self.capture_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&self.capture_dir, std::fs::Permissions::from_mode(0o700))?;
         }
         let tmp = self
             .capture_dir
@@ -1056,13 +1114,15 @@ impl TurnCaptureState {
                 // (4) Publish LAST: atomic rename of the fully-written tmp over the
                 // final name so a reader (or the sweep) never sees a half-written file.
                 if let Err(err) = std::fs::rename(&tmp, &final_path) {
-                    tracing::warn!(
-                        path = %final_path.display(),
-                        error = %err,
-                        "turn-capture: failed to publish artifact (rename)"
-                    );
                     let _ = std::fs::remove_file(&tmp);
+                    return Err(err);
                 }
+                // Persist the directory entry as well as the file contents before
+                // required mode can release a terminal response.
+                if let Ok(directory) = std::fs::File::open(&self.capture_dir) {
+                    directory.sync_all()?;
+                }
+                Ok(final_path)
             }
             Err(err) => {
                 // (1) failed: NEVER publish a partial/empty final. Drop the tmp, but
@@ -1075,6 +1135,7 @@ impl TurnCaptureState {
                 let _ = std::fs::remove_file(&tmp);
                 self.evict_registry();
                 self.remove_work_dir_best_effort();
+                Err(err)
             }
         }
     }
@@ -1123,6 +1184,11 @@ impl TurnCaptureState {
     /// parses), a JSON string (valid UTF-8), or a base64 string (non-UTF-8).
     fn write_artifact_file(&self, tmp: &Path) -> std::io::Result<()> {
         let file = std::fs::File::create(tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         let mut w = std::io::BufWriter::new(file);
 
         w.write_all(b"{\"api_call_id\":")?;
@@ -3055,7 +3121,7 @@ mod tests {
 
         // Assemble on the blocking pool, mirroring `finalize_and_assemble`.
         let assemble_state = Arc::clone(&state);
-        tokio::task::spawn_blocking(move || assemble_state.assemble_blocking())
+        let _ = tokio::task::spawn_blocking(move || assemble_state.assemble_blocking())
             .await
             .expect("assemble task");
 

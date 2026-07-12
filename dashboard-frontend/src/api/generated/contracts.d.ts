@@ -23,6 +23,12 @@ export type FlowDetailSource = "live" | "durable";
  */
 export type FlowStatus = "open" | "completed" | "failed" | "cancelled";
 /**
+ * Confidence attached to a terminal-time price. This lives with the evict-safe
+ * terminal payload (rather than the REST projection) so historical overview cuts keep
+ * the rate table decision that was true when the request finished.
+ */
+export type TerminalCostConfidence = "confident" | "estimated" | "unavailable";
+/**
  * Gap 04 — the PROVENANCE of a flow's `client_label`: WHICH non-secret signal the
  * attribution was derived from. Tagged so the dashboard (spec 15) can render the
  * weaker User-Agent fallback DIFFERENTLY from the stronger key-hash / configured-id
@@ -38,12 +44,6 @@ export type FlowStatus = "open" | "completed" | "failed" | "cancelled";
 export type ClientSource = "key_hash" | "configured_header" | "user_agent";
 export type BackendMetricsCoverage = "full" | "partial";
 /**
- * Confidence attached to a terminal-time price. This lives with the evict-safe
- * terminal payload (rather than the REST projection) so historical overview cuts keep
- * the rate table decision that was true when the request finished.
- */
-export type TerminalCostConfidence = "confident" | "estimated" | "unavailable";
-/**
  * Data quality for one instantaneous metric value. Percentiles are still emitted for
  * sparse intervals; `Partial` tells consumers that the nearest-rank estimate has fewer
  * than the recommended number of observations.
@@ -57,6 +57,7 @@ export type QuantileMethod = "log_histogram_nearest_rank";
  */
 export type OverviewDataQuality = "measured" | "derived" | "partial" | "unavailable";
 export type OverviewMetricScope = "global";
+export type OverviewScopeMode = "live" | "historical" | "stale_fallback";
 /**
  * Exact server-side Overview window. Kept to the three MetricsLayer ring spans so a
  * live and historical request always selects the same retained population.
@@ -293,7 +294,9 @@ export type Domain = "flow" | "metrics" | "topology" | "monitor";
 export interface DashboardContracts {
   bootstrap: DashboardBootstrap;
   catalog_response: CatalogEntry[];
+  durability_status: DurabilityStatusResponse;
   flow_detail: FlowDetailBody;
+  flow_summary: DurableFlowRollup;
   flows_response: FlowsResponse;
   history_response: HistoryResponse;
   kill_response: KillResponse;
@@ -301,6 +304,7 @@ export interface DashboardContracts {
   metrics_response: MetricsSnapshot;
   overview_response: OverviewResponse;
   snapshot_response: SnapshotResponse;
+  theater_response: TheaterResponse;
   topology_response: TopologySnapshot;
   ws_frame: DashboardFrame;
   ws_snapshot: SnapshotMessage;
@@ -339,6 +343,25 @@ export interface CatalogEntry {
    */
   context_limit?: number | null;
   id: string;
+}
+export interface DurabilityStatusResponse {
+  archived_flows: number;
+  artifact_bytes: number;
+  database_bytes: number;
+  error_code?: string | null;
+  last_commit_ms: number | null;
+  mode: string;
+  pending_commits: number;
+  retained_cuts: number;
+  state: string;
+  terminal_flows: number;
+  tiers: DurabilityTierCounts;
+}
+export interface DurabilityTierCounts {
+  activity: number;
+  coarse_15m: number;
+  fine_5s: number;
+  minute_1m: number;
 }
 /**
  * `GET /dashboard/api/flows/:id` — the 3-pane inspector body. Carries the summary
@@ -632,13 +655,56 @@ export interface FlowUpstreamResponse {
    */
   truncated: boolean;
 }
+export interface DurableFlowRollup {
+  as_of_event_id: number;
+  clients: DurableClientRollup[];
+  context: DurableContextRollup;
+  failures: DurableFailureCount[];
+  generated_at_ms: number;
+  models: DurableFacetCount[];
+  statuses: DurableFacetCount[];
+  total: number;
+  unattributed: number;
+  upstreams: DurableFacetCount[];
+}
+export interface DurableClientRollup {
+  average_latency_ms: number | null;
+  cost_confidence: TerminalCostConfidence;
+  cost_usd: number | null;
+  count: number;
+  failed: number;
+  key: string;
+  priced: number;
+  source: ClientSource | null;
+  timed: number;
+}
+export interface DurableContextRollup {
+  measurable: number;
+  near_limit: number;
+  over_limit: number;
+  peak_pct: number | null;
+}
+export interface DurableFailureCount {
+  count: number;
+  model: string;
+  provider: string;
+  reason: string;
+  total: number;
+}
+export interface DurableFacetCount {
+  count: number;
+  key: string;
+}
 /**
  * `GET /dashboard/api/flows` — the paged flow list + total + the FlowStore
  * domain cursor. Matches the frozen `FlowsResponse`.
  */
 export interface FlowsResponse {
+  as_of_event_id: number;
   flow_seq: number;
   flows: FlowRow[];
+  generated_at_ms: number;
+  next_cursor?: string | null;
   /**
    * Total rows AFTER filtering but BEFORE paging (so the SPA can page).
    */
@@ -779,11 +845,15 @@ export interface HistoryResponse {
   retained_cuts: number;
 }
 export interface HistoryPoint {
+  archive_event_id: number;
   at_ms: number;
   cursors: SeqCursors;
   cut_id: number;
+  cut_kind: string;
   engine_throughput?: EngineThroughputSample | null;
   instant: InstantMetricSample;
+  last_activity?: LastActivitySample | null;
+  resolution_ms: number;
 }
 /**
  * The four per-domain cursors carried on the initial [`SnapshotMessage`] — the
@@ -849,6 +919,15 @@ export interface InstantMetricSample {
   usage_samples: number;
 }
 /**
+ * The most recent reset-on-publish interval that observed a request. Idle cuts
+ * carry this alongside their truthful empty [`InstantMetricSample`] so the dashboard
+ * can keep the last useful instantaneous figures visible while explicitly aging them.
+ */
+export interface LastActivitySample {
+  at_ms: number;
+  instant: InstantMetricSample;
+}
+/**
  * Successful `POST /dashboard/api/flows/:id/kill` response.
  */
 export interface KillResponse {
@@ -877,15 +956,6 @@ export interface MetricsSnapshot {
    */
   last_activity?: LastActivitySample | null;
   metrics_seq: number;
-}
-/**
- * The most recent reset-on-publish interval that observed a request. Idle cuts
- * carry this alongside their truthful empty [`InstantMetricSample`] so the dashboard
- * can keep the last useful instantaneous figures visible while explicitly aging them.
- */
-export interface LastActivitySample {
-  at_ms: number;
-  instant: InstantMetricSample;
 }
 /**
  * `GET /dashboard/api/overview`: an immutable exact-window rollup. The aggregate is
@@ -975,6 +1045,7 @@ export interface OverviewProviderAttempts {
  * `samples >= 1`. All floats are finite (the frozen finite-number wire contract).
  */
 export interface ProviderLatency {
+  as_of_ms?: number | null;
   /**
    * DQ tag — always `derived` for a present entry (the `unavailable` case is absence).
    */
@@ -1015,6 +1086,7 @@ export interface ProviderLatency {
    * Of `samples`, the count that SERVED (produced the first chunk).
    */
   served: number;
+  stale: boolean;
 }
 /**
  * Bounded per-class failure tally (gap 03 taxonomy). Absent classes are omitted.
@@ -1030,6 +1102,7 @@ export interface ProviderErrorDistribution {
 export interface OverviewScope {
   client: string | null;
   cut_id?: number | null;
+  mode: OverviewScopeMode;
   model: string | null;
   requested_at_ms: number | null;
   selected_at_ms: number | null;
@@ -1063,6 +1136,7 @@ export interface SnapshotResponse {
    * Whether this selected cut dropped its oldest flow summaries to fit the quota.
    */
   flow_summaries_truncated: boolean;
+  flows_total: number;
   history: SnapshotHistoryMetadata;
   metrics: MetricsSnapshot | null;
   /**
@@ -1331,6 +1405,26 @@ export interface ModelPrice {
    * USD per 1k COMPLETION (output) tokens.
    */
   output_per_1k: number;
+}
+export interface TheaterResponse {
+  data_quality: string;
+  generated_at_ms: number;
+  last_terminal?: TheaterRiver | null;
+  monitor_seq: number;
+}
+export interface TheaterRiver {
+  api_call_id: string;
+  approx_tokens: number;
+  id: string;
+  model: string | null;
+  output: string;
+  reasoning: string;
+  started_at_ms: number;
+  status: string;
+  terminal_at_ms: number;
+  tokens_per_sec: number;
+  tools: string[];
+  truncated: boolean;
 }
 /**
  * The batched WS envelope: ONE frame per source update (e.g. one `DebugUpdate`),

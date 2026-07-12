@@ -20,7 +20,7 @@
  *    actually measurable.
  */
 import { useMemo } from 'react';
-import type { FlowSummary } from '../../api/types';
+import type { FlowListSummaryResponse, FlowSummary } from '../../api/types';
 import { aggregateContextPressure, type ContextLimitMap, type UtilRisk } from './contextUtilization';
 import { cn } from '../../lib/cn';
 
@@ -34,13 +34,28 @@ const RISK_TEXT: Record<Exclude<UtilRisk, 'none'>, string> = {
 export function ContextPressure({
   rows,
   limits,
+  archive,
+  archiveTotal,
 }: {
   rows: FlowSummary[];
   limits: ContextLimitMap;
+  archive?: FlowListSummaryResponse['context'];
+  archiveTotal?: number;
 }) {
-  const agg = useMemo(() => aggregateContextPressure(rows, limits), [rows, limits]);
-  const measurable = agg.measuredFlows > 0;
-  const risk = agg.peakRisk === 'none' ? 'ok' : agg.peakRisk;
+  const local = useMemo(() => aggregateContextPressure(rows, limits), [rows, limits]);
+  const measuredFlows = archive?.measurable ?? local.measuredFlows;
+  const totalFlows = archive ? archiveTotal ?? Math.max(archive.measurable, rows.length) : local.totalFlows;
+  const nearCount = archive?.near_limit ?? local.nearCount;
+  const overCount = archive?.over_limit ?? local.overCount;
+  const peakPct = archive ? archive.peak_pct : null;
+  const peakRisk: UtilRisk = archive
+    ? peakPct === null ? 'none' : peakPct >= 100 ? 'over' : peakPct >= 85 ? 'near' : 'ok'
+    : local.peakRisk;
+  const peakLabel = archive
+    ? peakPct === null ? '—' : `${peakPct.toFixed(1)}%`
+    : local.peakLabel;
+  const measurable = measuredFlows > 0;
+  const risk = peakRisk === 'none' ? 'ok' : peakRisk;
 
   return (
     <section
@@ -57,23 +72,23 @@ export function ContextPressure({
           className={cn('font-mono tabular-nums', measurable ? RISK_TEXT[risk] : 'text-text-muted')}
           data-testid="context-pressure-peak"
           data-quality={measurable ? 'derived' : 'unavailable'}
-          data-risk={agg.peakRisk}
+          data-risk={peakRisk}
         >
-          {agg.peakLabel}
+          {peakLabel}
         </span>
       </span>
 
       {/* Near/over-limit counts — only ever count MEASURED flows. */}
       <span className="flex items-baseline gap-1" title="flows at/over the near-limit threshold (≥85% / ≥100% of the model window)">
         <span className="text-text-muted">near/over</span>
-        <span className="font-mono tabular-nums text-status-cooling" data-testid="context-pressure-near">{agg.nearCount}</span>
+        <span className="font-mono tabular-nums text-status-cooling" data-testid="context-pressure-near">{nearCount}</span>
         <span className="text-line">/</span>
-        <span className="font-mono tabular-nums text-status-down" data-testid="context-pressure-over">{agg.overCount}</span>
+        <span className="font-mono tabular-nums text-status-down" data-testid="context-pressure-over">{overCount}</span>
       </span>
 
       {/* Coverage: how much of the set is measurable (the don't-lie-with-zeros honesty). */}
       <span className="ml-auto font-mono tabular-nums text-text-muted" data-testid="context-pressure-coverage">
-        {agg.measuredFlows}/{agg.totalFlows} measured
+        {measuredFlows}/{totalFlows} measured
       </span>
     </section>
   );

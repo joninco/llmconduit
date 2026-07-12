@@ -33,6 +33,7 @@ import { flowFilterStore } from './store/flowFilterStore';
 import { authStore } from './store/authStore';
 import { ScopeBar } from './components/ScopeBar';
 import { useMediaQuery } from './lib/useMediaQuery';
+import { DurabilityBanner } from './components/DurabilityBanner';
 
 export function App() {
   const authed = useAuth((s) => s.authenticated);
@@ -117,6 +118,7 @@ function Dashboard() {
   return (
     <div className="flex h-full flex-col bg-bg text-text">
       <NavTabs active={route} onLogout={onLogout} />
+      <DurabilityBanner />
       <DashboardAnnouncements />
       <ScopeBar />
       {narrow ? (

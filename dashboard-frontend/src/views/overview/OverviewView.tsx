@@ -28,6 +28,7 @@ import { fmtCost, fmtTokens } from '../../components/FlowTable/format';
 import { cn } from '../../lib/cn';
 import { useTopologyQuery, topologyProviderKey } from '../../store/useTopologyQuery';
 import { EngineMetricsCard } from '../../components/viz/EngineMetricsCard';
+import { StaleFallbackBanner } from '../../components/StaleFallbackBanner';
 
 const DASH = '—';
 const TOP_ROWS = 5;
@@ -140,6 +141,9 @@ function OverviewContent({ response }: { response: OverviewResponse }) {
 
   return (
     <>
+      {response.scope.mode === 'stale_fallback' && response.scope.selected_at_ms !== null && (
+        <StaleFallbackBanner asOfMs={response.scope.selected_at_ms} surface="overview" />
+      )}
       <section
         className="mb-3 flex flex-wrap items-center gap-2 rounded-md border border-line bg-panel px-3 py-2 text-[10px]"
         aria-label="Overview aggregate provenance"

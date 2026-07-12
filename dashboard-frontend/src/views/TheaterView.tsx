@@ -12,13 +12,37 @@
  * or incomplete history. Leaving seek returns to the live rivers.
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useQuery } from '@tanstack/react-query';
 import { River } from '../components/viz/River';
 import { gridColumns } from '../components/viz/riverModel';
 import { useLingeringRivers } from '../components/viz/useLingeringRivers';
 import { useLastTerminalRiver, useLiveRivers } from '../components/viz/useLiveRivers';
 import { useDashboard } from '../store/hooks';
-import type { FlowSummary } from '../api/types';
+import type { FlowSummary, TheaterRiver } from '../api/types';
 import { formatStaleAge } from '../lib/staleAge';
+import { getConnection, queryKeys } from '../api/connection';
+import type { River as RiverData } from '../components/viz/riverModel';
+
+/** Convert the permanent backend projection into the same presentational model as live deltas. */
+function restoredRiver(value: TheaterRiver | null | undefined): RiverData | null {
+  if (!value) return null;
+  return {
+    id: value.id,
+    model: value.model,
+    status: value.status === 'completed' ? 'completed' : 'failed',
+    startedAtMs: value.started_at_ms,
+    error: null,
+    output: value.output,
+    reasoning: value.reasoning,
+    tools: value.tools,
+    truncated: value.truncated,
+    firstMs: value.started_at_ms,
+    lastMs: value.terminal_at_ms,
+    terminalAtMs: value.terminal_at_ms,
+    approxTokens: value.approx_tokens,
+    tokensPerSec: value.tokens_per_sec,
+  };
+}
 
 export function TheaterView() {
   const seeking = useDashboard((s) => s.connection === 'seeking');
@@ -37,7 +61,18 @@ function LiveTheater() {
   const fullscreenToggleRef = useRef<HTMLButtonElement>(null);
   const wasFullscreenRef = useRef(false);
   const liveRivers = useLiveRivers();
-  const lastTerminal = useLastTerminalRiver();
+  const liveLastTerminal = useLastTerminalRiver();
+  const { client, queryClient } = getConnection();
+  const archive = useQuery({
+    queryKey: queryKeys.theater(),
+    queryFn: () => client.theater(),
+    gcTime: Infinity,
+  }, queryClient);
+  const archivedLastTerminal = useMemo(
+    () => restoredRiver(archive.data?.last_terminal),
+    [archive.data],
+  );
+  const lastTerminal = liveLastTerminal ?? archivedLastTerminal;
   const activeCount = liveRivers.filter((river) => river.status === 'running').length;
   // Older terminated tiles still linger/fade, but the newest terminal response is retained while
   // no stream is active — including after monitor eviction. The hook owns boundary timers.
@@ -173,6 +208,19 @@ function HistoricalTheater() {
   const flows = useDashboard((s) => s.flows);
   const summaries = useMemo(() => [...flows.values()], [flows]);
   const rivers = useLiveRivers();
+  const seekCutId = useDashboard((s) => s.seekCutId);
+  const { client, queryClient } = getConnection();
+  const archive = useQuery({
+    queryKey: queryKeys.theater(seekCutId ?? undefined),
+    queryFn: () => client.theater(seekCutId ?? undefined),
+    enabled: seekCutId !== null,
+    gcTime: Infinity,
+  }, queryClient);
+  const archivedRiver = useMemo(
+    () => seekCutId === null ? null : restoredRiver(archive.data?.last_terminal),
+    [archive.data, seekCutId],
+  );
+  const historicalRivers = rivers.length > 0 ? rivers : archivedRiver ? [archivedRiver] : [];
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-bg p-4" data-testid="theater-view-historical">
@@ -185,13 +233,15 @@ function HistoricalTheater() {
           historical — persisted transcript; deltas not replayed when unavailable
         </span>
       </header>
-      {rivers.length > 0 ? (
+      {historicalRivers.length > 0 ? (
         <div
           className="grid min-h-0 flex-1 gap-3"
-          style={{ gridTemplateColumns: `repeat(${gridColumns(rivers.length)}, minmax(0, 1fr))` }}
+          style={{ gridTemplateColumns: `repeat(${gridColumns(historicalRivers.length)}, minmax(0, 1fr))` }}
           data-testid="theater-historical-rivers"
         >
-          {rivers.map((river) => <River key={river.id} river={river} exiting={false} />)}
+          {historicalRivers.map((river) => (
+            <River key={river.id} river={river} exiting={false} retained={river.id === archivedRiver?.id} />
+          ))}
         </div>
       ) : summaries.length === 0 ? (
         <div className="flex flex-1 items-center justify-center text-sm text-text-muted" data-testid="theater-historical-empty">

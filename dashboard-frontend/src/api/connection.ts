@@ -17,13 +17,16 @@ import { authStore } from '../store/authStore';
 import { dashboardStore } from '../store/dashboardStore';
 import { flowFilterStore } from '../store/flowFilterStore';
 import { resetHashScope } from '../router/useHashRoute';
-import type { DashboardBootstrap, DashboardFrame, OverviewQuery } from './types';
+import type { DashboardBootstrap, DashboardFrame, FlowsQuery, OverviewQuery } from './types';
 import { DashboardSchemaMismatchError, DASHBOARD_SCHEMA_VERSION } from './schemaVersion';
 import { DashboardContractError } from './validation';
 
 /** Stable query keys; the WS invalidation + the views both reference these. */
 export const queryKeys = {
   flows: ['flows'] as const,
+  flowPages: (query: FlowsQuery) => ['flows', 'pages', query] as const,
+  flowSummaryRoot: ['flows', 'summary'] as const,
+  flowSummary: (query: FlowsQuery) => ['flows', 'summary', query] as const,
   flowDetail: (id: string) => ['flows', id] as const,
   historicalFlowDetail: (id: string, cutId: number) => ['flows', id, 'cut', cutId] as const,
   metrics: ['metrics'] as const,
@@ -39,6 +42,8 @@ export const queryKeys = {
     query.client ?? null,
   ] as const,
   topology: ['topology'] as const,
+  theater: (cutId?: number) => ['theater', cutId ?? 'live'] as const,
+  durability: ['durability'] as const,
   history: ['history'] as const,
   catalog: ['catalog'] as const,
 } as const;
@@ -161,19 +166,28 @@ export function teardownSession(): void {
 /** Maps an accepted WS frame to the smallest REST query set that can actually be stale. */
 function invalidateForFrame(queryClient: QueryClient, frame: DashboardFrame): void {
   switch (frame.domain) {
-    case 'flow':
+    case 'flow': {
       // Full live rows already patched the list store. Only a terminal transition can finish body,
       // header, delta, or error capture, so refresh exactly that flow's detail query. A Set avoids
       // duplicate invalidations if a future batched frame repeats the same terminal row.
-      for (const id of new Set(
+      const terminalIds = new Set(
         frame.batch.flatMap((payload) =>
           payload.type === 'flow_status' && payload.phase === 'terminal'
             ? [payload.api_call_id]
             : []),
-      )) {
+      );
+      if (terminalIds.size > 0) {
+        // Terminal commit changes the archive-wide aggregates and permanent Theater projection;
+        // list rows themselves were already overlaid by the complete WS row.
+        void queryClient.invalidateQueries({ queryKey: queryKeys.flowSummaryRoot });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.theater() });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.durability });
+      }
+      for (const id of terminalIds) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.flowDetail(id), exact: true });
       }
       return;
+    }
     case 'metrics':
       void queryClient.invalidateQueries({ queryKey: queryKeys.metrics });
       // The process-level metrics publisher owns Overview cuts too. Refresh every mounted

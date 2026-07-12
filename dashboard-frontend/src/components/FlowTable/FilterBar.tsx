@@ -265,7 +265,7 @@ export function FilterBar({
         </button>
       )}
       <span className="ml-auto tabular-nums text-xs text-text-muted" data-testid="flow-count">
-        {shown === total ? `${total} flows` : `${shown} / ${total}`}
+        {shown} loaded / {total} matching
       </span>
       <span className="sr-only" aria-live="polite" aria-atomic="true" data-testid="flow-search-announcement">
         {searchQuery.trim() ? `${shown} of ${total} flows match ${searchQuery.trim()}.` : ''}

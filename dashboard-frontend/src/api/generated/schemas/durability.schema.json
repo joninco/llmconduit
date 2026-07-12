@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DurabilityStatusResponse",
+  "type": "object",
+  "properties": {
+    "archived_flows": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "artifact_bytes": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "database_bytes": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "error_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "last_commit_ms": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint128",
+      "minimum": 0
+    },
+    "mode": {
+      "type": "string"
+    },
+    "pending_commits": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "retained_cuts": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "state": {
+      "type": "string"
+    },
+    "terminal_flows": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "tiers": {
+      "$ref": "#/$defs/DurabilityTierCounts"
+    }
+  },
+  "required": [
+    "mode",
+    "state",
+    "last_commit_ms",
+    "pending_commits",
+    "database_bytes",
+    "artifact_bytes",
+    "archived_flows",
+    "terminal_flows",
+    "retained_cuts",
+    "tiers"
+  ],
+  "$defs": {
+    "DurabilityTierCounts": {
+      "type": "object",
+      "properties": {
+        "activity": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "coarse_15m": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "fine_5s": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "minute_1m": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "activity",
+        "fine_5s",
+        "minute_1m",
+        "coarse_15m"
+      ]
+    }
+  }
+}

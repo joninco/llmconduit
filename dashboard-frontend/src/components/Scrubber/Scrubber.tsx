@@ -76,7 +76,7 @@ export function Scrubber({ socket }: { socket: DashboardSocket }) {
   // ring-derived memos below recompute without needing `version` in their dep arrays.
   const historyQuery = useQuery({
     queryKey: ['history'],
-    queryFn: () => client.history({ limit: 10_000 }),
+    queryFn: () => client.history({ limit: 2_000 }),
     staleTime: 5_000,
     refetchInterval: seeking ? false : 5_000,
   });

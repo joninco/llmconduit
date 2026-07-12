@@ -164,25 +164,40 @@ The authoritative per-flow record store with capped/redacted body capture.
 | `BODY_CAP` | 128 KiB | Single captured body max |
 | `SCALAR_CAP` | 4 KiB | Per dynamic scalar string max |
 
+These caps apply only to the live cache. Eviction never deletes the durable flow, terminal fact,
+attempt facts, Theater projection, or turn artifact used by REST and historical dashboard views.
+
 ### Env for response capture
 
 `LLMCONDUIT_DASHBOARD_CAPTURE_UPSTREAM_RESPONSE` (line 73) — off by default, arms gap-05 upstream error body capture.
 
 ### Durable dashboard history
 
-`LLMCONDUIT_DASHBOARD_HISTORY_DB=/path/to/dashboard.sqlite3` enables SQLite history when
-`--with-debug-ui` is active. `LLMCONDUIT_DASHBOARD_HISTORY_RETENTION_HOURS` controls retention
-(default 24 hours). The store uses WAL mode and a dedicated bounded writer queue; request handling
-never performs SQLite I/O. Every five-second coordinated cut persists metrics, topology, flow
-versions, and domain cursors. Monitor updates are persisted separately through the cut's monitor
-cursor, so historical Theater and flow timelines replay only data known at that cut.
+`LLMCONDUIT_DASHBOARD_HISTORY_DB=/path/to/dashboard.sqlite3` enables the durable archive when
+`--with-debug-ui` is active. The store uses SQLite WAL with `synchronous=FULL`, a bounded
+backpressured writer, acknowledged lifecycle commits, append-only flow versions, terminal and
+per-attempt facts, permanent Theater projections, artifact manifests, and persisted domain
+high-watermarks. Ingress is committed before dispatch. In required mode, a successful terminal
+response is not released until its capture artifact is fsynced/published and the archive has
+acknowledged the commit.
 
-Large bodies remain in the existing atomic `turn_capture_dir/<api_call_id>.json` artifacts rather
-than in SQLite/WAL. The artifact now contains inbound, normalized, final upstream request, raw final
-upstream response, and served response sections when available. SQLite indexes those files at
-startup, and flow detail also resolves the deterministic path for newly completed turns. Retention
-of the artifact files remains governed by `debug_log_max_age_hours`; align it with the SQLite
-retention if historical cuts must retain full captured I/O for the same duration.
+Set `LLMCONDUIT_DASHBOARD_DURABILITY=required` in production. Required mode fails startup when the
+history database or `turn_capture_dir` is missing/unwritable; the default best-effort mode keeps
+development configurations explicit and non-fatal. Startup recovers pending artifacts and
+previous-process open flows before traffic is served, then hydrates the last hour of request and
+provider metrics, the latest Theater response, last activity, and per-domain sequence cursors.
+
+Flows, terminal facts, attempts, Theater projections, and artifacts are permanent. Only redundant
+presentation cuts compact: activity anchors stay forever, periodic cuts retain five-second
+resolution for 24 hours, one-minute resolution through 30 days, and fifteen-minute resolution
+thereafter. `debug_log_max_age_hours` continues to rotate unrelated request logs but no longer
+removes completed artifacts owned by a configured dashboard archive.
+
+Large bodies remain in atomic `turn_capture_dir/<api_call_id>.json` artifacts rather than in
+SQLite/WAL. Artifacts retain the existing redaction, cap, and partial/truncated rules and can contain
+inbound, normalized, final upstream request, raw final upstream response, and served response
+sections. SQLite stores their checksums/manifests and indexes pre-existing files during migration.
+Directories are restricted to `0700` and completed files to `0600` on Unix.
 
 ## WebSocket (`dashboard_ws.rs`)
 

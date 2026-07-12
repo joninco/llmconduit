@@ -11,9 +11,9 @@
  * regardless of source. Filtering + the distinct model/upstream option lists are derived here so
  * the table and filter bar share one computation.
  */
-import { useEffect, useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
-import type { FlowSummary } from '../../api/types';
+import { useMemo } from 'react';
+import { useInfiniteQuery, useQuery } from '@tanstack/react-query';
+import type { FlowListSummaryResponse, FlowSummary, FlowsQuery } from '../../api/types';
 import { useDashboard } from '../../store/hooks';
 import { getConnection, queryKeys } from '../../api/connection';
 import type { FlowFilters } from './filterTypes';
@@ -22,8 +22,12 @@ import { flowMatchesSearch } from './flowSearch';
 export interface FlowRowsResult {
   /** Filtered rows, newest-on-top (the array the virtualizer renders). */
   rows: FlowSummary[];
-  /** Total rows BEFORE filtering (for the "shown / total" readout). */
+  /** Archive-wide matching total after server-side filters and before paging. */
   total: number;
+  /** Rows presently loaded into the paged query/live overlay. */
+  loaded: number;
+  /** At least one archived/live row is known before applying the current filters. */
+  populationKnown: boolean;
   /** Distinct model values present (requested or served) for the filter chips. */
   models: string[];
   /** Distinct upstream targets present for the filter chips. */
@@ -32,6 +36,13 @@ export interface FlowRowsResult {
   clients: string[];
   /** REST-list state, kept separate from an honest empty/filtered-empty result. */
   loadState: 'loading' | 'ready' | 'error';
+  /** Archive-wide server-authored aggregates for the complete filtered population. */
+  summary: FlowListSummaryResponse | null;
+  /** Whether another stable keyset page exists. */
+  hasMore: boolean;
+  loadingMore: boolean;
+  /** Fetch the next stable archive page. */
+  loadMore: () => void;
   /** Retry a failed/stale REST list without disturbing authoritative live rows. */
   retry: () => void;
 }
@@ -124,58 +135,98 @@ function clientsByVolume(rows: FlowSummary[]): string[] {
 export function useFlowRows(filters: FlowFilters, searchQuery = ''): FlowRowsResult {
   const order = useDashboard((s) => s.flowOrder);
   const flows = useDashboard((s) => s.flows);
-  const reconcileFlowRows = useDashboard((s) => s.reconcileFlowRows);
   // Time-travel: while seeking (D11 paused on a historical cut), the store holds the FROZEN
   // snapshot summaries. Merging the live `/flows` REST list (or live WS rows) here would leak
   // flows/state from AFTER the seeked timestamp into the frozen view, so we render the snapshot
   // rows ALONE while seeking and resume the live merge on LIVE (HIGH finding 1).
   const seeking = useDashboard((s) => s.connection === 'seeking');
+  const seekCutId = useDashboard((s) => s.seekCutId);
   const { client } = getConnection();
+
+  const request = useMemo<FlowsQuery>(() => ({
+    status: filters.status ?? undefined,
+    model: filters.model ?? undefined,
+    upstream: filters.upstream ?? undefined,
+    client: filters.client ?? undefined,
+    q: searchQuery.trim() || undefined,
+    cut_id: seeking ? seekCutId ?? undefined : undefined,
+    limit: 100,
+  }), [filters, searchQuery, seekCutId, seeking]);
 
   // The REST list seeds rows the live store has not seen and reconciles a missed event by revision.
   // Complete live mutations patch the list directly, so progress does not refetch this query.
   // Enabled for BOTH the real backend (where it is authoritative) and the mock (its `mockFetch`
   // answers `/flows`). Component tests that drive the store directly seed `resetWorld()` with a
   // real bootstrap and no live server, so the fetch simply fails/stays empty without churn.
-  // DISABLED while seeking: the REST list is live (post-seek) data that must not bleed into the
-  // frozen snapshot (finding 1).
-  const query = useQuery({
-    queryKey: queryKeys.flows,
-    queryFn: () => client.flows(),
-    enabled: !seeking,
-    // FlowStore count/TTL/quota evictions have no row payload to broadcast. A small, bounded
-    // unfiltered reconciliation closes that gap even on routes that never remount (ScopeBar keeps
-    // this hook mounted globally), while WS mutations remain the low-latency progress path.
-    refetchInterval: seeking ? false : 5_000,
-    refetchIntervalInBackground: false,
+  // Each cursor freezes an `as_of_event_id`, so new arrivals cannot shift or duplicate older pages.
+  // Legacy historical cuts have no keyset cursor; their fallback page number is still immutable.
+  const query = useInfiniteQuery({
+    queryKey: queryKeys.flowPages(request),
+    queryFn: ({ pageParam }) => client.flows({ ...request, ...pageParam }),
+    initialPageParam: {} as { cursor?: string; page?: number },
+    getNextPageParam: (last, pages) => {
+      if (last.next_cursor) return { cursor: last.next_cursor };
+      const loaded = pages.reduce((sum, page) => sum + page.flows.length, 0);
+      return loaded < last.total ? { page: pages.length + 1 } : undefined;
+    },
+    enabled: !seeking || seekCutId !== null,
   });
-  // Ignore any cached REST result while seeking so the frozen snapshot stands alone.
-  const queryData = seeking ? undefined : query.data;
 
-  useEffect(() => {
-    if (queryData) reconcileFlowRows(queryData.flows, queryData.flow_seq);
-  }, [queryData, reconcileFlowRows]);
+  const summaryQuery = useQuery({
+    queryKey: queryKeys.flowSummary(request),
+    queryFn: () => client.flowSummary(request),
+    enabled: !seeking || seekCutId !== null,
+  });
+  const queryPages = useMemo(() => query.data?.pages ?? [], [query.data?.pages]);
+  const queryFlows = useMemo(
+    () => queryPages.flatMap((page) => page.flows),
+    [queryPages],
+  );
 
   const merged = useMemo(
-    () => mergeRows(order, flows, queryData?.flows ?? []),
-    [order, flows, queryData],
+    // A frozen seek must never overlay post-cut WS rows. Its durable pages alone are authoritative.
+    () => seeking
+      ? seekCutId === null ? mergeRows(order, flows, []) : queryFlows
+      : mergeRows(order, flows, queryFlows),
+    [order, flows, queryFlows, seekCutId, seeking],
   );
   const rows = useMemo(() => applyFilters(merged, filters, searchQuery), [merged, filters, searchQuery]);
-  const models = useMemo(() => distinct(merged, (r) => [r.model_requested, r.model_served]), [merged]);
-  const upstreams = useMemo(() => distinct(merged, (r) => [r.upstream_target]), [merged]);
+  const models = useMemo(
+    () => summaryQuery.data?.models.map((item) => item.key)
+      ?? distinct(merged, (r) => [r.model_requested, r.model_served]),
+    [merged, summaryQuery.data],
+  );
+  const upstreams = useMemo(
+    () => summaryQuery.data?.upstreams.map((item) => item.key)
+      ?? distinct(merged, (r) => [r.upstream_target, ...(r.attempts?.map((attempt) => attempt.provider) ?? [])]),
+    [merged, summaryQuery.data],
+  );
   // Gap 15: the distinct `client_label`s for the per-client filter, ordered by DESCENDING volume so the
   // FilterBar can cap to the top-N busiest (high-cardinality defense — review MEDIUM). Unattributed rows
   // have no label ⇒ contribute nothing (an absent attribution is never a filterable client).
-  const clients = useMemo(() => clientsByVolume(merged), [merged]);
+  const clients = useMemo(
+    () => summaryQuery.data?.clients.map((item) => item.key) ?? clientsByVolume(merged),
+    [merged, summaryQuery.data],
+  );
 
-  const loadState = seeking ? 'ready' : query.isError ? 'error' : query.isPending ? 'loading' : 'ready';
+  const loadState = query.isError ? 'error' : query.isPending ? 'loading' : 'ready';
+  const serverTotal = summaryQuery.data?.total ?? queryPages[0]?.total;
   return {
     rows,
-    total: merged.length,
+    total: Math.max(serverTotal ?? 0, rows.length),
+    loaded: rows.length,
+    populationKnown: merged.length > 0,
     models,
     upstreams,
     clients,
     loadState,
-    retry: () => { void query.refetch(); },
+    summary: summaryQuery.data ?? null,
+    hasMore: Boolean(query.hasNextPage),
+    loadingMore: query.isFetchingNextPage,
+    loadMore: () => { void query.fetchNextPage(); },
+    retry: () => {
+      void query.refetch();
+      void summaryQuery.refetch();
+    },
   };
 }

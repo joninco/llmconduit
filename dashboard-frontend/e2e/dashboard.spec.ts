@@ -406,11 +406,11 @@ test.describe('Argus dashboard', () => {
     // Cross-link: clicking the key-hash client row SETS the per-client filter → the table narrows to
     // that client's 2 flows (api_001 + api_002). The filter chip is then active + toggle-off-able.
     await khRow.getByTestId('client-rollup-pick').click();
-    await expect(page.getByTestId('flow-count')).toContainText('2 / 6');
+    await expect(page.getByTestId('flow-count')).toHaveText('2 loaded / 2 matching');
     await expect(page.getByTestId('flow-row')).toHaveCount(2);
     // The active client chip clears via the filter-bar clear control, restoring all rows.
     await page.getByTestId('flow-filter-clear').click();
-    await expect(page.getByTestId('flow-count')).toContainText('6 flows');
+    await expect(page.getByTestId('flow-count')).toHaveText('6 loaded / 6 matching');
 
     expect(consoleErrors, 'console errors on the client attribution surface').toEqual([]);
   });
@@ -604,7 +604,7 @@ test.describe('Argus dashboard', () => {
 
     // Terms AND across fields: pasted id + served provider + visible status alias.
     await search.fill('api_003 openai 5xx');
-    await expect(page.getByTestId('flow-count')).toHaveText('1 / 6');
+    await expect(page.getByTestId('flow-count')).toHaveText('1 loaded / 1 matching');
     await expect(page.getByTestId('flow-row')).toHaveCount(1);
     await expect(page.getByTestId('flow-row')).toContainText('api_003');
     await expect(page.getByTestId('failure-taxonomy')).toHaveAttribute('data-available', 'true');
@@ -621,7 +621,7 @@ test.describe('Argus dashboard', () => {
     // Escape clears lookup only; it never writes an unsupported free-text server scope into the URL.
     await search.press('Escape');
     await expect(search).toHaveValue('');
-    await expect(page.getByTestId('flow-count')).toHaveText('6 flows');
+    await expect(page.getByTestId('flow-count')).toHaveText('6 loaded / 6 matching');
     expect(new URL(page.url()).hash).not.toContain('query=');
     expect(new URL(page.url()).hash).not.toContain('q=');
 

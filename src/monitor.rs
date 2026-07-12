@@ -311,6 +311,15 @@ impl MonitorHub {
             .last_sequence
     }
 
+    /// Restore only the transcript cursor; retained messages continue to load lazily from SQLite.
+    pub fn hydrate_sequence(&self, floor: u64) {
+        if !self.enabled {
+            return;
+        }
+        let mut state = self.state.lock().expect("monitor state lock poisoned");
+        state.last_sequence = state.last_sequence.max(floor);
+    }
+
     pub fn emit(&self, response_id: impl Into<String>, kind: MonitorEventKind) {
         self.emit_with(response_id, || kind);
     }

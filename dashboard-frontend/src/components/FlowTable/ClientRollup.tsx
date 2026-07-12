@@ -24,15 +24,51 @@
  * so filtering re-scopes the roll-up too.
  */
 import { useMemo, useState } from 'react';
-import type { FlowSummary } from '../../api/types';
-import { clientRollup, fmtLatency, type ClientRollupRow } from './clientAttribution';
+import type { FlowListSummaryResponse, FlowSummary } from '../../api/types';
+import {
+  clientRollup, costConfidenceQuality, fmtLatency, fmtRate, sourceStrength, strengthQuality,
+  type ClientRollup as ClientRollupModel, type ClientRollupRow,
+} from './clientAttribution';
 import { flowFilterStore } from '../../store/flowFilterStore';
 import { fmtCost } from './format';
 import { cn } from '../../lib/cn';
 
-export function ClientRollup({ rows }: { rows: FlowSummary[] }) {
+function archiveClientRollup(archive: FlowListSummaryResponse): ClientRollupModel {
+  return {
+    available: archive.clients.length > 0,
+    totalFlows: archive.total,
+    unattributedFlows: archive.unattributed,
+    rows: archive.clients.map((client) => {
+      const source = client.source ?? null;
+      const strength = sourceStrength(source);
+      const errorRatePct = client.count > 0 ? client.failed / client.count * 100 : 0;
+      const costConfidence = client.priced > 0 ? client.cost_confidence : 'unavailable';
+      return {
+        key: client.key,
+        label: client.key,
+        source,
+        strength,
+        attributionQuality: strengthQuality(strength),
+        weak: strength === 'weak',
+        total: client.count,
+        failed: client.failed,
+        errorRatePct,
+        errorRateText: fmtRate(errorRatePct),
+        cost: client.cost_usd,
+        costConfidence,
+        costQuality: costConfidenceQuality(costConfidence),
+        pricedFlows: client.priced,
+        avgLatencyMs: client.average_latency_ms,
+        latencyQuality: client.average_latency_ms === null ? 'unavailable' : 'derived',
+        timedFlows: client.timed,
+      };
+    }),
+  };
+}
+
+export function ClientRollup({ rows, archive }: { rows: FlowSummary[]; archive?: FlowListSummaryResponse }) {
   const [open, setOpen] = useState(false);
-  const model = useMemo(() => clientRollup(rows), [rows]);
+  const model = useMemo(() => archive ? archiveClientRollup(archive) : clientRollup(rows), [archive, rows]);
   const setClient = flowFilterStore.getState().setClient;
 
   return (

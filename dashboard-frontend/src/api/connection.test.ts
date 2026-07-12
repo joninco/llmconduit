@@ -79,7 +79,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     // Prime snapshot so live frames apply.
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 5,
+      schema_version: 6,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
@@ -94,12 +94,12 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
-  it('a terminal row invalidates exactly that flow detail, never the flow-list family', () => {
+  it('a terminal row refreshes its detail and archive-wide terminal projections, never flow pages', () => {
     const { socket, queryClient } = getConnection();
     const spy = vi.spyOn(queryClient, 'invalidateQueries');
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 5,
+      schema_version: 6,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
@@ -107,8 +107,11 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
       domain: 'flow', seq: 1,
       batch: [flowPayload({ phase: 'terminal', revision: 2, status: 'completed' })],
     });
-    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledTimes(4);
     expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.flowDetail('api_r1'), exact: true });
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.flowSummaryRoot });
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.theater() });
+    expect(spy).toHaveBeenCalledWith({ queryKey: queryKeys.durability });
     expect(spy).not.toHaveBeenCalledWith({ queryKey: queryKeys.flows });
   });
 
@@ -116,7 +119,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 5,
+      schema_version: 6,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
@@ -148,7 +151,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 5,
+      schema_version: 6,
       cursors: { flow_seq: 5, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
@@ -165,7 +168,7 @@ describe('connection — WS-driven REST invalidation (finding 10)', () => {
     const { socket, queryClient } = getConnection();
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 5,
+      schema_version: 6,
       cursors: { flow_seq: 0, metrics_seq: 0, topology_seq: 0, monitor_seq: 0 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
@@ -185,7 +188,7 @@ describe('teardownSession — clears cache + resets stores + disconnects WS (fin
     queryClient.setQueryData(queryKeys.flows, { flows: [], total: 0, flow_seq: 1 });
     socket.handleParsed({
       type: 'snapshot',
-      schema_version: 5,
+      schema_version: 6,
       cursors: { flow_seq: 1, metrics_seq: 0, topology_seq: 0, monitor_seq: 5 , backend_metrics_seq: 0},
       flows: [], metrics: null, topology: null,
     });
@@ -247,7 +250,7 @@ describe('connection — fatal REST roots surface through dashboardStore', () =>
       authenticated: true,
       csrf_token: 'csrf',
       mutations_enabled: false,
-      schema_version: 5,
+      schema_version: 6,
     };
   });
   afterEach(() => {
@@ -260,7 +263,7 @@ describe('connection — fatal REST roots surface through dashboardStore', () =>
   it('turns a REST contract failure into the explicit fatal shell state', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', {
       status: 200,
-      headers: { 'X-LLMConduit-Dashboard-Schema': '5' },
+      headers: { 'X-LLMConduit-Dashboard-Schema': '6' },
     })));
     const { client } = getConnection();
 

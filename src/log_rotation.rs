@@ -4,19 +4,13 @@
 //! with no rotation, so the directory holding dump files can grow unbounded.
 //! This module deletes eligible dump files older than a configurable max age.
 //!
-//! F1f (durable turn capture) reuses the SAME age window for two surfaces under a
-//! `turn_capture_dir`: [`cleanup_dump_files`] prunes the published
-//! `<api_call_id>.json` artifacts (top-level `*.json`), and
-//! [`cleanup_orphan_work_dirs`] sweeps orphaned per-turn `.work/<id>/` section dirs
-//! left behind when a process crashes before `TurnCaptureState::finalize_and_assemble`
-//! could delete them. Both run in the same [`spawn_cleanup`] pass, but with DISTINCT
-//! scopes — the artifact/dump prune spans every `Config::debug_log_dirs()` entry, while
-//! the destructive `.work` sweep is scoped to `turn_capture_dir` ALONE (turn capture is
-//! the sole creator of `.work/<id>/` subdirs, and only under `turn_capture_dir`, so the
-//! sweep must never run over a request-log dir — F1f review r1). Neither reclaims an
-//! in-flight turn (its section files carry fresh mtimes, so it is younger than the
-//! window — and the production caller only runs cleanup at startup, before any turn is
-//! registered).
+//! Without a configured dashboard archive, F1f turn capture reuses the same age window
+//! for published `<api_call_id>.json` artifacts and crash-orphaned `.work/<id>`/temporary
+//! files. Once `LLMCONDUIT_DASHBOARD_HISTORY_DB` owns those artifacts, this legacy rotator
+//! skips the entire capture directory: synchronous archive recovery validates, publishes,
+//! indexes, and removes only safe crash residue before traffic is served. Completed archive
+//! artifacts are permanent; `debug_log_max_age_hours` continues to rotate unrelated request
+//! logs.
 //!
 //! The core [`cleanup_dump_files`] / [`cleanup_orphan_work_dirs`] functions are
 //! synchronous and take an injected `now`, so tests can age entries out by passing a
@@ -272,10 +266,9 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
 /// Run [`cleanup_dump_files`] AND [`cleanup_orphan_work_dirs`] on the blocking thread
 /// pool (one pass, one `now`) and log the outcome.
 ///
-/// Two DISTINCT surfaces with DISTINCT scopes:
-/// - [`cleanup_dump_files`] age-rotates the published `<id>.json` artifacts + the
-///   request-log dump files across EVERY active dump dir (`dump_dirs` =
-///   `Config::debug_log_dirs()`).
+/// Two DISTINCT surfaces with DISTINCT scopes when no archive owns turn capture:
+/// - [`cleanup_dump_files`] age-rotates published `<id>.json` artifacts + request-log
+///   dump files across active dump dirs (`dump_dirs` = `Config::debug_log_dirs()`).
 /// - [`cleanup_orphan_work_dirs`] sweeps orphaned per-turn `.work/<id>/` section dirs,
 ///   which ONLY turn capture ever creates and ONLY under `turn_capture_dir`. The
 ///   destructive `remove_dir_all` sweep is therefore scoped to `turn_capture_dir`
@@ -284,8 +277,9 @@ fn newest_mtime(dir: &Path) -> Option<SystemTime> {
 ///   `None` `turn_capture_dir` ⇒ the sweep does nothing.
 ///
 /// Returns immediately if `max_age_hours` is `None` (the feature is opt-in) or `0`.
-/// The spawned task is detached: cleanup is best-effort and must never block startup
-/// or fail the server.
+/// A configured archive excludes `turn_capture_dir` from both operations; its synchronous
+/// startup recovery owns crash residue and completed artifacts permanently. The spawned task
+/// is detached: legacy cleanup is best-effort and must never block startup or fail the server.
 pub fn spawn_cleanup(
     dump_dirs: Vec<PathBuf>,
     turn_capture_dir: Option<PathBuf>,
@@ -300,6 +294,20 @@ pub fn spawn_cleanup(
         return;
     }
     let max_age = Duration::from_secs(max_age_hours.saturating_mul(3600));
+    let durability_disabled = std::env::var("LLMCONDUIT_DASHBOARD_DURABILITY")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "off" | "disabled" | "0" | "false" | "no"
+            )
+        });
+    // Any configured dashboard archive owns completed turn artifacts permanently. Its synchronous
+    // startup recovery handles `.work`/temporary files before serving; the legacy age rotator must
+    // never race that recovery or erase an archived payload, even in best-effort development mode.
+    let preserve_dashboard_artifacts = !durability_disabled
+        && std::env::var_os("LLMCONDUIT_DASHBOARD_HISTORY_DB")
+            .is_some_and(|value| !value.is_empty());
     tokio::task::spawn_blocking(move || {
         // One `now` for both surfaces so the artifact prune and the `.work` sweep
         // apply an identical cutoff.
@@ -307,6 +315,9 @@ pub fn spawn_cleanup(
         // Age-rotate the published artifacts + request-log dump files across every
         // active dump dir.
         for dir in &dump_dirs {
+            if preserve_dashboard_artifacts && turn_capture_dir.as_deref() == Some(dir.as_path()) {
+                continue;
+            }
             let deleted = cleanup_dump_files(dir, max_age, now);
             if deleted > 0 {
                 tracing::info!(
@@ -321,7 +332,9 @@ pub fn spawn_cleanup(
         // `.work/<api_call_id>/` subdirs, so running this destructive sweep over a
         // request-log dir could `remove_dir_all` an unrelated `.work/` subtree it does
         // not own (F1f review r1, HIGH).
-        if let Some(capture_dir) = turn_capture_dir.as_ref() {
+        if let Some(capture_dir) = turn_capture_dir.as_ref()
+            && !preserve_dashboard_artifacts
+        {
             let swept = cleanup_orphan_work_dirs(capture_dir, max_age, now);
             if swept > 0 {
                 tracing::info!(

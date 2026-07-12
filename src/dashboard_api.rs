@@ -33,6 +33,7 @@ use crate::dashboard_flow::FlowRecord;
 use crate::dashboard_flow::FlowStatus;
 use crate::dashboard_flow::FlowUsage;
 use crate::dashboard_flow::PhaseTimings;
+use crate::dashboard_flow::SnapshotFlowSummary;
 #[cfg(test)]
 use crate::dashboard_ws::MetricWindow;
 use crate::dashboard_ws::MetricsSnapshot;
@@ -251,6 +252,10 @@ pub struct FlowsResponse {
     /// Total rows AFTER filtering but BEFORE paging (so the SPA can page).
     pub total: usize,
     pub flow_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub as_of_event_id: u64,
+    pub generated_at_ms: u128,
 }
 
 /// Query params for `GET /dashboard/api/flows`. All optional; `status`/`model`/
@@ -261,6 +266,9 @@ pub struct FlowsQuery {
     pub status: Option<String>,
     pub model: Option<String>,
     pub upstream: Option<String>,
+    pub client: Option<String>,
+    pub q: Option<String>,
+    pub cursor: Option<String>,
     pub page: Option<usize>,
     pub limit: Option<usize>,
 }
@@ -421,6 +429,31 @@ pub struct CapturedSection {
     pub content: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct TheaterRiver {
+    pub id: String,
+    pub api_call_id: String,
+    pub model: Option<String>,
+    pub status: String,
+    pub started_at_ms: u128,
+    pub terminal_at_ms: u128,
+    pub output: String,
+    pub reasoning: String,
+    pub tools: Vec<String>,
+    pub truncated: bool,
+    pub approx_tokens: f64,
+    pub tokens_per_sec: f64,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct TheaterResponse {
+    pub generated_at_ms: u128,
+    pub monitor_seq: u64,
+    pub data_quality: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_terminal: Option<TheaterRiver>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct FlowDetailQuery {
     pub cut_id: Option<u64>,
@@ -464,6 +497,7 @@ pub struct SnapshotResponse {
     pub cursors: SeqCursors,
     pub at_ms: u128,
     pub summaries: Vec<FlowRow>,
+    pub flows_total: usize,
     pub metrics: Option<MetricsSnapshot>,
     pub topology: Option<TopologySnapshot>,
     /// Bounds and memory use of the retained historical-cut ring.
@@ -514,6 +548,7 @@ pub struct OverviewQuery {
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct OverviewScope {
     pub window: OverviewWindow,
+    pub mode: OverviewScopeMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cut_id: Option<u64>,
     pub requested_at_ms: Option<u128>,
@@ -522,6 +557,14 @@ pub struct OverviewScope {
     pub model: Option<String>,
     pub upstream: Option<String>,
     pub client: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OverviewScopeMode {
+    Live,
+    Historical,
+    StaleFallback,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -543,7 +586,12 @@ pub struct HistoryPoint {
     pub cursors: SeqCursors,
     pub instant: crate::metrics::InstantMetricSample,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<crate::metrics::LastActivitySample>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub engine_throughput: Option<crate::backend_metrics::EngineThroughputSample>,
+    pub resolution_ms: u64,
+    pub cut_kind: String,
+    pub archive_event_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -554,6 +602,30 @@ pub struct HistoryResponse {
     pub database_bytes: usize,
     pub dropped_writes: u64,
     pub points: Vec<HistoryPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct DurabilityTierCounts {
+    pub activity: usize,
+    pub fine_5s: usize,
+    pub minute_1m: usize,
+    pub coarse_15m: usize,
+}
+
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
+pub struct DurabilityStatusResponse {
+    pub mode: String,
+    pub state: String,
+    pub last_commit_ms: Option<u128>,
+    pub pending_commits: usize,
+    pub database_bytes: usize,
+    pub artifact_bytes: usize,
+    pub archived_flows: usize,
+    pub terminal_flows: usize,
+    pub retained_cuts: usize,
+    pub tiers: DurabilityTierCounts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 
 /// `GET /dashboard/api/overview`: an immutable exact-window rollup. The aggregate is
@@ -1049,6 +1121,302 @@ async fn durable_sections(
     .unwrap_or_default()
 }
 
+const THEATER_TEXT_CAP: usize = 1_500_000;
+const THEATER_TOOL_CAP: usize = 300_000;
+
+#[derive(Default)]
+struct TheaterText {
+    output: String,
+    reasoning: String,
+    tools: Vec<String>,
+    truncated: bool,
+}
+
+fn append_theater(target: &mut String, value: &str, cap: usize, truncated: &mut bool) {
+    if value.is_empty() {
+        return;
+    }
+    target.push_str(value);
+    if target.len() > cap {
+        let split = target.len().saturating_sub(cap);
+        let split = target
+            .char_indices()
+            .map(|(index, _)| index)
+            .find(|index| *index >= split)
+            .unwrap_or(split);
+        target.drain(..split);
+        *truncated = true;
+    }
+}
+
+fn extract_tool_arguments(value: &serde_json::Value, text: &mut TheaterText) {
+    let Some(calls) = value.as_array() else {
+        return;
+    };
+    for call in calls {
+        let arguments = call
+            .pointer("/function/arguments")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| call.get("partial_json").and_then(serde_json::Value::as_str));
+        if let Some(arguments) = arguments {
+            if text.tools.is_empty() {
+                text.tools.push(String::new());
+            }
+            let tool = text.tools.last_mut().expect("tool exists");
+            append_theater(tool, arguments, THEATER_TOOL_CAP, &mut text.truncated);
+        }
+    }
+}
+
+fn extract_stream_event(value: &serde_json::Value, text: &mut TheaterText) {
+    if let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) {
+        for choice in choices {
+            let delta = choice.get("delta").or_else(|| choice.get("message"));
+            if let Some(delta) = delta {
+                if let Some(content) = delta.get("content").and_then(serde_json::Value::as_str) {
+                    append_theater(
+                        &mut text.output,
+                        content,
+                        THEATER_TEXT_CAP,
+                        &mut text.truncated,
+                    );
+                }
+                if let Some(reasoning) = delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    append_theater(
+                        &mut text.reasoning,
+                        reasoning,
+                        THEATER_TEXT_CAP,
+                        &mut text.truncated,
+                    );
+                }
+                if let Some(calls) = delta.get("tool_calls") {
+                    extract_tool_arguments(calls, text);
+                }
+            }
+        }
+    }
+    let event_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if let Some(delta) = value.get("delta") {
+        if let Some(delta_text) = delta.as_str() {
+            let reasoning = event_type.contains("reasoning") || event_type.contains("thinking");
+            append_theater(
+                if reasoning {
+                    &mut text.reasoning
+                } else {
+                    &mut text.output
+                },
+                delta_text,
+                THEATER_TEXT_CAP,
+                &mut text.truncated,
+            );
+        } else if let Some(delta_type) = delta.get("type").and_then(serde_json::Value::as_str) {
+            let value = delta
+                .get("text")
+                .or_else(|| delta.get("thinking"))
+                .or_else(|| delta.get("partial_json"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if delta_type.contains("json") {
+                if text.tools.is_empty() {
+                    text.tools.push(String::new());
+                }
+                let tool = text.tools.last_mut().expect("tool exists");
+                append_theater(tool, value, THEATER_TOOL_CAP, &mut text.truncated);
+            } else {
+                append_theater(
+                    if delta_type.contains("thinking") {
+                        &mut text.reasoning
+                    } else {
+                        &mut text.output
+                    },
+                    value,
+                    THEATER_TEXT_CAP,
+                    &mut text.truncated,
+                );
+            }
+        }
+    }
+}
+
+fn extract_full_content(value: &serde_json::Value, text: &mut TheaterText) {
+    if let Some(content) = value.get("content") {
+        match content {
+            serde_json::Value::String(content) => append_theater(
+                &mut text.output,
+                content,
+                THEATER_TEXT_CAP,
+                &mut text.truncated,
+            ),
+            serde_json::Value::Array(blocks) => {
+                for block in blocks {
+                    let kind = block
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default();
+                    if let Some(value) = block
+                        .get("text")
+                        .or_else(|| block.get("thinking"))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        append_theater(
+                            if kind.contains("reasoning") || kind.contains("thinking") {
+                                &mut text.reasoning
+                            } else {
+                                &mut text.output
+                            },
+                            value,
+                            THEATER_TEXT_CAP,
+                            &mut text.truncated,
+                        );
+                    }
+                    if kind.contains("tool")
+                        && let Some(input) = block.get("input")
+                    {
+                        let rendered = input.to_string();
+                        let mut tool = String::new();
+                        append_theater(&mut tool, &rendered, THEATER_TOOL_CAP, &mut text.truncated);
+                        text.tools.push(tool);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(output) = value.get("output").and_then(serde_json::Value::as_array) {
+        for item in output {
+            extract_full_content(item, text);
+        }
+    }
+    if value.get("choices").is_some() {
+        extract_stream_event(value, text);
+    }
+}
+
+fn theater_text_from_section(section: &CapturedSection) -> TheaterText {
+    let mut text = TheaterText {
+        truncated: section.partial,
+        ..TheaterText::default()
+    };
+    if section.encoding == "base64" {
+        text.truncated = true;
+        return text;
+    }
+    match &section.content {
+        serde_json::Value::String(raw) => {
+            let mut saw_event = false;
+            for line in raw.lines() {
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+                    saw_event = true;
+                    extract_stream_event(&value, &mut text);
+                }
+            }
+            if !saw_event {
+                append_theater(&mut text.output, raw, THEATER_TEXT_CAP, &mut text.truncated);
+            }
+        }
+        value => extract_full_content(value, &mut text),
+    }
+    text
+}
+
+async fn durable_theater_river(
+    gateway: &Gateway,
+    summary: &crate::dashboard_flow::SnapshotFlowSummary,
+) -> TheaterRiver {
+    let sections = durable_sections(gateway.dashboard_history(), &summary.api_call_id).await;
+    let served = sections
+        .iter()
+        .find(|section| section.name == "served_response");
+    let text = served.map(theater_text_from_section).unwrap_or_default();
+    let terminal_at_ms = summary.finished_ms.unwrap_or(summary.started_ms);
+    let elapsed_seconds = summary.elapsed_ms.unwrap_or_default() as f64 / 1_000.0;
+    let approx_tokens = (text.output.chars().count() + text.reasoning.chars().count()) as f64 / 4.0;
+    TheaterRiver {
+        id: summary
+            .response_id
+            .clone()
+            .unwrap_or_else(|| summary.api_call_id.clone()),
+        api_call_id: summary.api_call_id.clone(),
+        model: summary
+            .model_served
+            .clone()
+            .or_else(|| summary.model_requested.clone()),
+        status: flow_status_key_for_wire(summary.status).to_string(),
+        started_at_ms: summary.started_ms,
+        terminal_at_ms,
+        output: text.output,
+        reasoning: text.reasoning,
+        tools: text.tools,
+        truncated: text.truncated,
+        approx_tokens,
+        tokens_per_sec: if elapsed_seconds > 0.0 {
+            approx_tokens / elapsed_seconds
+        } else {
+            0.0
+        },
+    }
+}
+
+fn flow_status_key_for_wire(status: FlowStatus) -> &'static str {
+    match status {
+        FlowStatus::Open => "running",
+        FlowStatus::Completed => "completed",
+        FlowStatus::Failed => "failed",
+        FlowStatus::Cancelled => "failed",
+    }
+}
+
+/// One historical population selected by the public `cut_id`. Production cuts come
+/// from SQLite; the exact in-memory timestamp fallback keeps an explicitly best-effort
+/// development dashboard coherent when no archive path is configured. Never use a
+/// nearest in-memory cut here: every sibling API must describe the same population.
+struct HistoricalFlowView {
+    snapshot: Arc<crate::metrics::DashboardSnapshot>,
+    summaries: Vec<SnapshotFlowSummary>,
+    archive_event_id: u64,
+    durable: bool,
+}
+
+async fn historical_flow_view(gateway: &Gateway, cut_id: u64) -> Option<HistoricalFlowView> {
+    if let Some(cut) = gateway.dashboard_history().cut_by_id(cut_id).await {
+        let summaries = gateway
+            .dashboard_history()
+            .flow_summaries_as_of(cut_id)
+            .await;
+        return Some(HistoricalFlowView {
+            snapshot: cut.snapshot,
+            summaries,
+            archive_event_id: cut.archive_event_id,
+            durable: true,
+        });
+    }
+
+    let snapshot = gateway.metrics().snapshot_at(u128::from(cut_id))?;
+    if u64::try_from(snapshot.taken_at_ms).ok() != Some(cut_id) {
+        return None;
+    }
+    Some(HistoricalFlowView {
+        summaries: snapshot.summaries.clone(),
+        archive_event_id: snapshot.cursors.flow_seq,
+        snapshot,
+        durable: false,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Handlers (each `State(Arc<Gateway>)`; no-store + auth applied by the route layer)
 // ---------------------------------------------------------------------------
@@ -1061,81 +1429,273 @@ pub async fn dashboard_flows(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<FlowsQuery>,
 ) -> Response {
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    let page = query.page.unwrap_or(1).max(1);
+    let status_filter = query.status.as_deref().and_then(parse_status_filter);
+    let model_filter = query.model.as_deref().map(str::to_ascii_lowercase);
+    let upstream_filter = query.upstream.as_deref().map(str::to_ascii_lowercase);
+    let client_filter = query.client.as_deref().map(str::to_ascii_lowercase);
+    let search_filter = query.q.as_deref().map(str::to_ascii_lowercase);
     if let Some(cut_id) = query.cut_id {
-        let Some(cut) = gateway.dashboard_history().cut_by_id(cut_id).await else {
+        let Some(cut) = historical_flow_view(gateway.as_ref(), cut_id).await else {
             return json_no_store(
                 StatusCode::NOT_FOUND,
                 &serde_json::json!({"error": {"code": "historical_cut_not_found", "cut_id": cut_id}}),
             );
         };
-        let status_filter = query.status.as_deref().and_then(parse_status_filter);
-        let model_filter = query.model.as_deref().map(str::to_ascii_lowercase);
-        let upstream_filter = query.upstream.as_deref().map(str::to_ascii_lowercase);
-        let mut rows: Vec<FlowRow> = gateway
-            .dashboard_history()
-            .flow_summaries_as_of(cut_id)
-            .await
+        let mut rows: Vec<FlowRow> = cut
+            .summaries
             .iter()
             .map(|summary| FlowRow::from_summary(summary, gateway.as_ref()))
             .filter(|row| {
-                status_filter.is_none_or(|status| row.status == status)
-                    && model_filter.as_ref().is_none_or(|wanted| {
-                        row.model_requested
-                            .as_deref()
-                            .into_iter()
-                            .chain(row.model_served.as_deref())
-                            .any(|model| model.to_ascii_lowercase().contains(wanted))
-                    })
-                    && upstream_filter.as_ref().is_none_or(|wanted| {
-                        row.upstream_target
-                            .as_deref()
-                            .is_some_and(|target| target.to_ascii_lowercase().contains(wanted))
-                    })
+                flow_row_matches(
+                    row,
+                    status_filter,
+                    model_filter.as_deref(),
+                    upstream_filter.as_deref(),
+                    client_filter.as_deref(),
+                    search_filter.as_deref(),
+                )
             })
             .collect();
-        rows.sort_by_key(|row| std::cmp::Reverse(row.started_ms));
+        rows.sort_by(|left, right| {
+            right
+                .started_ms
+                .cmp(&left.started_ms)
+                .then_with(|| right.api_call_id.cmp(&left.api_call_id))
+        });
         let total = rows.len();
         return json_no_store(
             StatusCode::OK,
             &FlowsResponse {
-                flows: apply_paging(rows, query.page, query.limit),
+                flows: apply_paging(rows, Some(page), Some(limit)),
                 total,
                 flow_seq: cut.snapshot.cursors.flow_seq,
+                next_cursor: None,
+                as_of_event_id: cut.archive_event_id,
+                generated_at_ms: cut.snapshot.taken_at_ms,
             },
         );
     }
     let (records, flow_seq) = gateway.flow_store().list_with_seq();
-    let status_filter = query.status.as_deref().and_then(parse_status_filter);
-    let model_filter = query.model.as_deref().map(str::to_ascii_lowercase);
-    let upstream_filter = query.upstream.as_deref().map(str::to_ascii_lowercase);
-
-    let rows: Vec<FlowRow> = records
+    let live_rows: Vec<FlowRow> = records
         .iter()
-        .filter(|record| {
-            status_filter.is_none_or(|status| record.status == status)
-                && model_filter
-                    .as_ref()
-                    .is_none_or(|wanted| record_matches_model(record, wanted))
-                && upstream_filter.as_ref().is_none_or(|wanted| {
-                    record
-                        .upstream_target
-                        .as_deref()
-                        .is_some_and(|target| target.to_ascii_lowercase().contains(wanted))
-                })
-        })
         .map(|record| FlowRow::from_record(record, gateway.as_ref()))
+        .filter(|row| {
+            flow_row_matches(
+                row,
+                status_filter,
+                model_filter.as_deref(),
+                upstream_filter.as_deref(),
+                client_filter.as_deref(),
+                search_filter.as_deref(),
+            )
+        })
         .collect();
 
-    let total = rows.len();
-    let paged = apply_paging(rows, query.page, query.limit);
+    let durable = gateway
+        .dashboard_history()
+        .latest_flow_page(
+            crate::dashboard_history::DurableFlowFilter {
+                status: status_filter,
+                model: query.model.clone(),
+                upstream: query.upstream.clone(),
+                client: query.client.clone(),
+                search: query.q.clone(),
+            },
+            query.cursor.clone(),
+            limit,
+            if query.cursor.is_none() {
+                page.saturating_sub(1).saturating_mul(limit)
+            } else {
+                0
+            },
+        )
+        .await;
+    let durable = match durable {
+        Ok(page) => page,
+        Err(error) => {
+            return json_no_store(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": {"code": "invalid_flow_cursor", "message": error.to_string()}}),
+            );
+        }
+    };
+    let mut by_id = durable
+        .summaries
+        .iter()
+        .map(|summary| {
+            (
+                summary.api_call_id.clone(),
+                FlowRow::from_summary(summary, gateway.as_ref()),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut live_only = 0usize;
+    for row in live_rows {
+        match by_id.get(&row.api_call_id) {
+            Some(current) if current.revision > row.revision => {}
+            Some(_) => {
+                by_id.insert(row.api_call_id.clone(), row);
+            }
+            None if query.cursor.is_none() && page == 1 => {
+                live_only = live_only.saturating_add(1);
+                by_id.insert(row.api_call_id.clone(), row);
+            }
+            None => {}
+        }
+    }
+    let mut rows = by_id.into_values().collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        right
+            .started_ms
+            .cmp(&left.started_ms)
+            .then_with(|| right.api_call_id.cmp(&left.api_call_id))
+    });
+    rows.truncate(limit);
     json_no_store(
         StatusCode::OK,
         &FlowsResponse {
-            flows: paged,
-            total,
+            flows: rows,
+            total: durable.total.saturating_add(live_only),
             flow_seq,
+            next_cursor: durable.next_cursor,
+            as_of_event_id: durable.as_of_event_id,
+            generated_at_ms: durable.generated_at_ms,
         },
     )
+}
+
+pub async fn dashboard_theater(
+    State(gateway): State<Arc<Gateway>>,
+    Query(query): Query<HistoricalCutQuery>,
+) -> Response {
+    let (summary, monitor_seq, generated_at_ms) = if let Some(cut_id) = query.cut_id {
+        let Some(cut) = historical_flow_view(gateway.as_ref(), cut_id).await else {
+            return json_no_store(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": {"code": "historical_cut_not_found", "cut_id": cut_id}}),
+            );
+        };
+        let summary = cut
+            .summaries
+            .into_iter()
+            .filter(|summary| summary.status != FlowStatus::Open)
+            .max_by_key(|summary| summary.finished_ms.unwrap_or(summary.started_ms));
+        (
+            summary,
+            cut.snapshot.cursors.monitor_seq,
+            cut.snapshot.taken_at_ms,
+        )
+    } else {
+        let latest_cut = gateway.dashboard_history().latest_cut().await;
+        (
+            gateway.dashboard_history().latest_terminal_summary().await,
+            latest_cut.as_ref().map_or_else(
+                || gateway.debug_snapshot().last_sequence,
+                |cut| cut.snapshot.cursors.monitor_seq,
+            ),
+            dashboard_now_ms(),
+        )
+    };
+    let last_terminal = match summary.as_ref() {
+        Some(summary) => Some(durable_theater_river(gateway.as_ref(), summary).await),
+        None => None,
+    };
+    let data_quality = match &last_terminal {
+        Some(river) if river.truncated => "partial",
+        Some(river) if !river.output.is_empty() || !river.reasoning.is_empty() => "measured",
+        Some(_) => "unavailable",
+        None => "unavailable",
+    };
+    json_no_store(
+        StatusCode::OK,
+        &TheaterResponse {
+            generated_at_ms,
+            monitor_seq,
+            data_quality: data_quality.to_string(),
+            last_terminal,
+        },
+    )
+}
+
+pub async fn dashboard_flow_summary(
+    State(gateway): State<Arc<Gateway>>,
+    Query(query): Query<FlowsQuery>,
+) -> Response {
+    if let Some(cut_id) = query.cut_id {
+        let Some(cut) = historical_flow_view(gateway.as_ref(), cut_id).await else {
+            return json_no_store(
+                StatusCode::NOT_FOUND,
+                &serde_json::json!({"error": {"code": "historical_cut_not_found", "cut_id": cut_id}}),
+            );
+        };
+        let status = query.status.as_deref().and_then(parse_status_filter);
+        let model = query.model.as_deref().map(str::to_ascii_lowercase);
+        let upstream = query.upstream.as_deref().map(str::to_ascii_lowercase);
+        let client = query.client.as_deref().map(str::to_ascii_lowercase);
+        let search = query.q.as_deref().map(str::to_ascii_lowercase);
+        let summaries = cut.summaries.into_iter().filter(|summary| {
+            flow_row_matches(
+                &FlowRow::from_summary(summary, gateway.as_ref()),
+                status,
+                model.as_deref(),
+                upstream.as_deref(),
+                client.as_deref(),
+                search.as_deref(),
+            )
+        });
+        let rollup = crate::dashboard_history::rollup_flow_summaries(
+            summaries,
+            cut.archive_event_id,
+            cut.snapshot.taken_at_ms,
+        );
+        return json_no_store(StatusCode::OK, &rollup);
+    }
+    if !gateway.dashboard_history().is_enabled() {
+        // Explicit best-effort/dev mode still has a truthful archive-sized surface: its
+        // complete population is the current FlowStore. This prevents a configured
+        // filter from turning facet chips and rollups into fabricated empty data merely
+        // because SQLite was intentionally not armed.
+        let status = query.status.as_deref().and_then(parse_status_filter);
+        let model = query.model.as_deref().map(str::to_ascii_lowercase);
+        let upstream = query.upstream.as_deref().map(str::to_ascii_lowercase);
+        let client = query.client.as_deref().map(str::to_ascii_lowercase);
+        let search = query.q.as_deref().map(str::to_ascii_lowercase);
+        let (records, flow_seq) = gateway.flow_store().list_with_seq();
+        let summaries = records.into_iter().filter_map(|record| {
+            let summary = SnapshotFlowSummary::from_record(&record);
+            flow_row_matches(
+                &FlowRow::from_summary(&summary, gateway.as_ref()),
+                status,
+                model.as_deref(),
+                upstream.as_deref(),
+                client.as_deref(),
+                search.as_deref(),
+            )
+            .then_some(summary)
+        });
+        let rollup = crate::dashboard_history::rollup_flow_summaries(
+            summaries,
+            flow_seq,
+            dashboard_now_ms(),
+        );
+        return json_no_store(StatusCode::OK, &rollup);
+    }
+    let filter = crate::dashboard_history::DurableFlowFilter {
+        status: query.status.as_deref().and_then(parse_status_filter),
+        model: query.model,
+        upstream: query.upstream,
+        client: query.client,
+        search: query.q,
+    };
+    match gateway.dashboard_history().flow_rollup(filter).await {
+        Ok(rollup) => json_no_store(StatusCode::OK, &rollup),
+        Err(error) => json_no_store(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &serde_json::json!({"error": {"code": "flow_summary_failed", "message": error.to_string()}}),
+        ),
+    }
 }
 
 /// `GET /dashboard/api/flows/:id` — the 3-pane inspector body (`:id == api_call_id`,
@@ -1212,18 +1772,16 @@ pub async fn dashboard_flow_detail(
         return json_no_store(StatusCode::OK, &body);
     }
 
-    let (summary, flow_seq, monitor_seq) = if let Some(cut_id) = query.cut_id {
-        let Some(cut) = gateway.dashboard_history().cut_by_id(cut_id).await else {
+    let (summary, flow_seq, monitor_seq, durable_cut) = if let Some(cut_id) = query.cut_id {
+        let Some(cut) = historical_flow_view(gateway.as_ref(), cut_id).await else {
             return json_no_store(
                 StatusCode::NOT_FOUND,
                 &serde_json::json!({"error": {"code": "historical_cut_not_found", "cut_id": cut_id}}),
             );
         };
-        let Some(summary) = gateway
-            .dashboard_history()
-            .flow_summary_at(&id, cut_id)
-            .await
-        else {
+        let Some(summary) = cut.summaries.into_iter().find(|summary| {
+            summary.api_call_id == id || summary.response_id.as_deref() == Some(id.as_str())
+        }) else {
             return json_no_store(
                 StatusCode::NOT_FOUND,
                 &serde_json::json!({"error": {"code": "historical_flow_not_found", "cut_id": cut_id, "api_call_id": id}}),
@@ -1233,6 +1791,7 @@ pub async fn dashboard_flow_detail(
             summary,
             cut.snapshot.cursors.flow_seq,
             cut.snapshot.cursors.monitor_seq,
+            cut.durable,
         )
     } else {
         let Some(summary) = gateway.dashboard_history().latest_flow_summary(&id).await else {
@@ -1250,6 +1809,7 @@ pub async fn dashboard_flow_detail(
             latest
                 .as_ref()
                 .map_or(0, |cut| cut.snapshot.cursors.monitor_seq),
+            true,
         )
     };
     let captured_sections =
@@ -1260,10 +1820,17 @@ pub async fn dashboard_flow_detail(
             .find(|section| section.name == name)
             .map(|section| section.content.clone())
     };
-    let messages = gateway
-        .dashboard_history()
-        .monitor_messages_through(monitor_seq)
-        .await;
+    let messages = if durable_cut {
+        gateway
+            .dashboard_history()
+            .monitor_messages_through(monitor_seq)
+            .await
+    } else {
+        // The best-effort in-memory cut stores the monitor cursor but not an event log.
+        // An empty transcript is honest; replaying today's live snapshot could leak
+        // post-cut deltas into a historical inspector.
+        Vec::new()
+    };
     let (deltas, deltas_through_monitor_seq) = replay_deltas(
         summary.response_id.as_deref(),
         DebugSnapshot {
@@ -1320,7 +1887,7 @@ pub async fn dashboard_metrics(
     Query(query): Query<HistoricalCutQuery>,
 ) -> Response {
     if let Some(cut_id) = query.cut_id {
-        let Some(cut) = gateway.dashboard_history().cut_by_id(cut_id).await else {
+        let Some(cut) = historical_flow_view(gateway.as_ref(), cut_id).await else {
             return json_no_store(
                 StatusCode::NOT_FOUND,
                 &serde_json::json!({"error": {"code": "historical_cut_not_found", "cut_id": cut_id}}),
@@ -1392,71 +1959,111 @@ pub async fn dashboard_overview(
         upstream: upstream.clone(),
         client: client.clone(),
     };
-    let requested_at_ms = query.at.map(u128::from);
+    let historical_requested = query.cut_id.is_some() || query.at.is_some();
+    let query_at_ms = query.at.map(u128::from);
+    let requested_at_ms = query_at_ms.unwrap_or_else(dashboard_now_ms);
 
-    let (generated_at_ms, metrics_seq, selected_at_ms, selected_cut_id, mut aggregate) =
-        if let Some(cut_id) = query.cut_id {
-            if let Some(cut) = gateway.dashboard_history().cut_by_id(cut_id).await {
-                (
-                    cut.snapshot.taken_at_ms,
-                    cut.snapshot.cursors.metrics_seq,
-                    Some(cut.snapshot.taken_at_ms),
-                    Some(cut.cut_id),
-                    overview_window_report(&cut.snapshot.metrics, query.window).overview(&filter),
-                )
-            } else {
-                let mut empty =
-                    overview_window_report(&MetricsView::default(), query.window).overview(&filter);
-                empty.data_quality = OverviewDataQuality::Unavailable;
-                (
-                    requested_at_ms.unwrap_or(cut_id as u128),
-                    0,
-                    None,
-                    Some(cut_id),
-                    empty,
-                )
-            }
-        } else if let Some(at) = requested_at_ms {
-            if let Some(cut) = gateway.metrics().nearest_snapshot(at) {
-                (
-                    cut.taken_at_ms,
-                    cut.cursors.metrics_seq,
-                    Some(cut.taken_at_ms),
-                    u64::try_from(cut.taken_at_ms).ok(),
-                    overview_window_report(&cut.metrics, query.window).overview(&filter),
-                )
-            } else if let Some(cut) = gateway
-                .dashboard_history()
-                .nearest_cut(at.min(u64::MAX as u128) as u64)
-                .await
-            {
-                (
-                    cut.snapshot.taken_at_ms,
-                    cut.snapshot.cursors.metrics_seq,
-                    Some(cut.snapshot.taken_at_ms),
-                    Some(cut.cut_id),
-                    overview_window_report(&cut.snapshot.metrics, query.window).overview(&filter),
-                )
-            } else {
-                let mut empty =
-                    overview_window_report(&MetricsView::default(), query.window).overview(&filter);
-                empty.data_quality = OverviewDataQuality::Unavailable;
-                (at, 0, None, None, empty)
-            }
-        } else if let Some(cut) = gateway.metrics().latest_published_metrics() {
+    let (
+        mut generated_at_ms,
+        mut metrics_seq,
+        mut selected_at_ms,
+        mut selected_cut_id,
+        mut aggregate,
+    ) = if let Some(cut_id) = query.cut_id {
+        if let Some(cut) = gateway.dashboard_history().cut_by_id(cut_id).await {
             (
-                cut.taken_at_ms,
-                cut.cursors.metrics_seq,
-                Some(cut.taken_at_ms),
-                None,
-                overview_window_report(&cut.view, query.window).overview(&filter),
+                cut.snapshot.taken_at_ms,
+                cut.snapshot.cursors.metrics_seq,
+                Some(cut.snapshot.taken_at_ms),
+                Some(cut.cut_id),
+                overview_window_report(&cut.snapshot.metrics, query.window).overview(&filter),
             )
         } else {
             let mut empty =
                 overview_window_report(&MetricsView::default(), query.window).overview(&filter);
             empty.data_quality = OverviewDataQuality::Unavailable;
-            (dashboard_now_ms(), 0, None, None, empty)
-        };
+            (requested_at_ms, 0, None, Some(cut_id), empty)
+        }
+    } else if let Some(at) = query_at_ms {
+        if let Some(cut) = gateway.metrics().nearest_snapshot(at) {
+            (
+                cut.taken_at_ms,
+                cut.cursors.metrics_seq,
+                Some(cut.taken_at_ms),
+                u64::try_from(cut.taken_at_ms).ok(),
+                overview_window_report(&cut.metrics, query.window).overview(&filter),
+            )
+        } else if let Some(cut) = gateway
+            .dashboard_history()
+            .nearest_cut(at.min(u64::MAX as u128) as u64)
+            .await
+        {
+            (
+                cut.snapshot.taken_at_ms,
+                cut.snapshot.cursors.metrics_seq,
+                Some(cut.snapshot.taken_at_ms),
+                Some(cut.cut_id),
+                overview_window_report(&cut.snapshot.metrics, query.window).overview(&filter),
+            )
+        } else {
+            let mut empty =
+                overview_window_report(&MetricsView::default(), query.window).overview(&filter);
+            empty.data_quality = OverviewDataQuality::Unavailable;
+            (at, 0, None, None, empty)
+        }
+    } else if let Some(cut) = gateway.metrics().latest_published_metrics() {
+        (
+            cut.taken_at_ms,
+            cut.cursors.metrics_seq,
+            Some(cut.taken_at_ms),
+            None,
+            overview_window_report(&cut.view, query.window).overview(&filter),
+        )
+    } else {
+        let mut empty =
+            overview_window_report(&MetricsView::default(), query.window).overview(&filter);
+        empty.data_quality = OverviewDataQuality::Unavailable;
+        (dashboard_now_ms(), 0, None, None, empty)
+    };
+    let mut scope_mode = if historical_requested {
+        OverviewScopeMode::Historical
+    } else {
+        OverviewScopeMode::Live
+    };
+
+    if matches!(scope_mode, OverviewScopeMode::Live) && aggregate.totals.requests == 0 {
+        let latest = gateway
+            .dashboard_history()
+            .latest_terminal_matching(crate::dashboard_history::DurableFlowFilter {
+                status,
+                model: model.clone(),
+                upstream: upstream.clone(),
+                client: client.clone(),
+                search: None,
+            })
+            .await;
+        if let Some(summary) = latest {
+            let anchor = summary.finished_ms.unwrap_or(summary.started_ms);
+            let anchor = anchor.min(u64::MAX as u128) as u64;
+            let cut = gateway
+                .dashboard_history()
+                .cut_at_or_after(anchor)
+                .await
+                .or(gateway.dashboard_history().nearest_cut(anchor).await);
+            if let Some(cut) = cut {
+                let fallback =
+                    overview_window_report(&cut.snapshot.metrics, query.window).overview(&filter);
+                if fallback.totals.requests > 0 {
+                    generated_at_ms = cut.snapshot.taken_at_ms;
+                    metrics_seq = cut.snapshot.cursors.metrics_seq;
+                    selected_at_ms = Some(cut.snapshot.taken_at_ms);
+                    selected_cut_id = Some(cut.cut_id);
+                    aggregate = fallback;
+                    scope_mode = OverviewScopeMode::StaleFallback;
+                }
+            }
+        }
+    }
 
     // A filtered query over a window with bounded overflow is necessarily partial: the
     // fixed `__other__` key no longer carries enough identity to prove whether a folded
@@ -1473,8 +2080,9 @@ pub async fn dashboard_overview(
             metrics_seq,
             scope: OverviewScope {
                 window: query.window,
+                mode: scope_mode,
                 cut_id: selected_cut_id,
-                requested_at_ms,
+                requested_at_ms: Some(requested_at_ms),
                 selected_at_ms,
                 status: status_scope,
                 model,
@@ -1510,21 +2118,61 @@ pub async fn dashboard_topology(
             ),
         );
     }
-    let body = if let Some(cut) = gateway.metrics().latest_published_metrics() {
-        topology_body(
-            &cut.topology,
-            gateway.price_table(),
-            &cut.view.window_1m,
-            &cut.backend_metrics,
-        )
-    } else {
-        topology_body(
-            &ProviderHealthSnapshot::default(),
-            gateway.price_table(),
-            &MetricsView::default().window_1m,
-            &crate::backend_metrics::BackendMetricsSnapshot::default(),
-        )
-    };
+    let (live_topology, live_metrics, live_backend) =
+        if let Some(cut) = gateway.metrics().latest_published_metrics() {
+            (
+                (*cut.topology).clone(),
+                cut.view.window_1m.clone(),
+                (*cut.backend_metrics).clone(),
+            )
+        } else {
+            (
+                ProviderHealthSnapshot::default(),
+                MetricsView::default().window_1m,
+                crate::backend_metrics::BackendMetricsSnapshot::default(),
+            )
+        };
+    let mut body = topology_body(
+        &live_topology,
+        gateway.price_table(),
+        &live_metrics,
+        &live_backend,
+    );
+    // Provider health remains point-in-time LIVE. Only the request-derived attempt metrics/edges
+    // fall back when the current m1 window is empty, and every restored provider DTO says exactly
+    // which old cut it came from.
+    if body.nodes.iter().all(|node| node.per_provider.is_none())
+        && let Some(summary) = gateway.dashboard_history().latest_terminal_summary().await
+    {
+        let anchor = summary.finished_ms.unwrap_or(summary.started_ms);
+        let anchor = anchor.min(u64::MAX as u128) as u64;
+        let cut = gateway
+            .dashboard_history()
+            .cut_at_or_after(anchor)
+            .await
+            .or(gateway.dashboard_history().nearest_cut(anchor).await);
+        if let Some(cut) = cut {
+            let mut fallback = topology_body(
+                &live_topology,
+                gateway.price_table(),
+                &cut.snapshot.metrics.window_1m,
+                &live_backend,
+            );
+            if fallback
+                .nodes
+                .iter()
+                .any(|node| node.per_provider.is_some())
+            {
+                for node in &mut fallback.nodes {
+                    if let Some(metrics) = node.per_provider.as_mut() {
+                        metrics.as_of_ms = Some(cut.snapshot.taken_at_ms);
+                        metrics.stale = true;
+                    }
+                }
+                body = fallback;
+            }
+        }
+    }
     json_no_store(StatusCode::OK, &body)
 }
 
@@ -1610,6 +2258,7 @@ pub async fn dashboard_snapshot(
                 cursors: SeqCursors::default(),
                 at_ms: at_query.unwrap_or(0),
                 summaries: Vec::new(),
+                flows_total: 0,
                 metrics: None,
                 topology: None,
                 history,
@@ -1633,10 +2282,11 @@ pub async fn dashboard_snapshot(
     } else {
         cut.summaries.as_slice()
     };
-    let summaries: Vec<FlowRow> = summary_source
-        .iter()
-        .map(|summary| FlowRow::from_summary(summary, gateway.as_ref()))
-        .collect();
+    let flows_total = summary_source.len();
+    // Flow rows are intentionally not embedded in a snapshot. The paged `/flows?cut_id=` read is
+    // bound to this cut's archive watermark and can represent an unbounded archive without making
+    // every scrubber drag transfer the whole population.
+    let summaries: Vec<FlowRow> = Vec::new();
     // Reshape the cut's body-free metrics view into the REST `/metrics` shape, with
     // the cut's own `metrics_seq` cursor. `active_streams` is derived from the FROZEN
     // cut's open summaries (D13 R1 HIGH) — NOT the live FlowStore — so a historical
@@ -1678,6 +2328,7 @@ pub async fn dashboard_snapshot(
             },
             at_ms: cut.taken_at_ms,
             summaries,
+            flows_total,
             metrics,
             topology,
             history,
@@ -1695,42 +2346,49 @@ pub async fn dashboard_history(
     Query(query): Query<HistoryQuery>,
 ) -> Response {
     let metadata = gateway.dashboard_history().metadata().await;
-    let durable_cuts = gateway
-        .dashboard_history()
-        .cuts_between(query.from, query.to)
-        .await;
-    // Durable writes are asynchronous and may lag or drop under pressure. Merge them
-    // with the bounded in-memory five-second ring and deduplicate by the coordinated cut
-    // timestamp (also the durable cut id), preferring the durable row when both exist.
-    let mut merged =
-        std::collections::BTreeMap::<u128, crate::dashboard_history::HistoricalCut>::new();
-    for snapshot in gateway.metrics().snapshots_between(query.from, query.to) {
-        let Ok(cut_id) = u64::try_from(snapshot.taken_at_ms) else {
-            continue;
-        };
-        merged.insert(
-            snapshot.taken_at_ms,
-            crate::dashboard_history::HistoricalCut { cut_id, snapshot },
-        );
-    }
-    for cut in durable_cuts {
-        merged.insert(cut.snapshot.taken_at_ms, cut);
-    }
-    let cuts = merged.into_values().collect::<Vec<_>>();
     let limit = query.limit.unwrap_or(2_000).clamp(2, 10_000);
-    let retained_cuts = cuts.len();
-    let oldest_at_ms = cuts.first().map(|cut| cut.snapshot.taken_at_ms);
-    let newest_at_ms = cuts.last().map(|cut| cut.snapshot.taken_at_ms);
-    let selected: Vec<_> = if cuts.len() <= limit {
-        cuts
+    let durable = gateway
+        .dashboard_history()
+        .sampled_cuts_between(query.from, query.to, limit)
+        .await;
+    let (selected, retained_cuts, oldest_at_ms, newest_at_ms) = if durable.retained_cuts > 0 {
+        (
+            durable.cuts,
+            durable.retained_cuts,
+            durable.oldest_at_ms,
+            durable.newest_at_ms,
+        )
     } else {
-        let last = cuts.len() - 1;
-        (0..limit)
-            .map(|index| {
-                let source = index.saturating_mul(last) / (limit - 1);
-                cuts[source].clone()
+        let cuts = gateway
+            .metrics()
+            .snapshots_between(query.from, query.to)
+            .into_iter()
+            .filter_map(|snapshot| {
+                let cut_id = u64::try_from(snapshot.taken_at_ms).ok()?;
+                Some(crate::dashboard_history::HistoricalCut {
+                    cut_id,
+                    snapshot,
+                    resolution_ms: 5_000,
+                    cut_kind: "memory".to_string(),
+                    archive_event_id: 0,
+                })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        let retained = cuts.len();
+        let oldest = cuts.first().map(|cut| cut.snapshot.taken_at_ms);
+        let newest = cuts.last().map(|cut| cut.snapshot.taken_at_ms);
+        let selected = if retained <= limit {
+            cuts
+        } else {
+            let last = retained - 1;
+            (0..limit)
+                .map(|slot| {
+                    let index = slot.saturating_mul(last) / (limit - 1);
+                    cuts[index].clone()
+                })
+                .collect()
+        };
+        (selected, retained, oldest, newest)
     };
     let points: Vec<HistoryPoint> = selected
         .into_iter()
@@ -1745,7 +2403,11 @@ pub async fn dashboard_history(
                 backend_metrics_seq: cut.snapshot.cursors.backend_metrics_seq,
             },
             instant: cut.snapshot.instant.clone(),
+            last_activity: cut.snapshot.last_activity.clone(),
             engine_throughput: cut.snapshot.engine_throughput.clone(),
+            resolution_ms: cut.resolution_ms,
+            cut_kind: cut.cut_kind,
+            archive_event_id: cut.archive_event_id,
         })
         .collect();
     json_no_store(
@@ -1761,22 +2423,172 @@ pub async fn dashboard_history(
     )
 }
 
+pub async fn dashboard_durability(State(gateway): State<Arc<Gateway>>) -> Response {
+    let metadata = gateway.dashboard_history().metadata().await;
+    let enabled = gateway.dashboard_history().is_enabled();
+    let state = if !enabled {
+        "disabled"
+    } else if metadata.dropped_writes > 0 {
+        "degraded"
+    } else {
+        "healthy"
+    };
+    let mode = match metadata.mode {
+        crate::dashboard_history::DurabilityMode::Disabled => "disabled",
+        crate::dashboard_history::DurabilityMode::BestEffort => "best_effort",
+        crate::dashboard_history::DurabilityMode::Required => "required",
+    };
+    json_no_store(
+        StatusCode::OK,
+        &DurabilityStatusResponse {
+            mode: mode.to_string(),
+            state: state.to_string(),
+            last_commit_ms: metadata.last_commit_ms,
+            pending_commits: metadata.pending_commits,
+            database_bytes: metadata.database_bytes,
+            artifact_bytes: metadata.artifact_bytes,
+            archived_flows: metadata.archived_flows,
+            terminal_flows: metadata.terminal_flows,
+            retained_cuts: metadata.retained_cuts,
+            tiers: DurabilityTierCounts {
+                activity: metadata.activity_cuts,
+                fine_5s: metadata.fine_cuts,
+                minute_1m: metadata.minute_cuts,
+                coarse_15m: metadata.coarse_cuts,
+            },
+            error_code: (state == "degraded").then(|| "archive_write_failed".to_string()),
+        },
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
 
-/// Whether a record's served OR requested model contains the (lowercased) filter
-/// substring — the `model=` filter matches either identity so a row is findable by
-/// what the client asked for OR what served it.
-fn record_matches_model(record: &FlowRecord, wanted: &str) -> bool {
-    record
-        .model_served
-        .as_deref()
-        .is_some_and(|model| model.to_ascii_lowercase().contains(wanted))
-        || record
-            .model_requested
+fn flow_row_matches(
+    row: &FlowRow,
+    status: Option<FlowStatus>,
+    model: Option<&str>,
+    upstream: Option<&str>,
+    client: Option<&str>,
+    search: Option<&str>,
+) -> bool {
+    if status.is_some_and(|wanted| row.status != wanted) {
+        return false;
+    }
+    if model.is_some_and(|wanted| {
+        !row.model_requested
             .as_deref()
-            .is_some_and(|model| model.to_ascii_lowercase().contains(wanted))
+            .into_iter()
+            .chain(row.model_served.as_deref())
+            .any(|value| value.to_ascii_lowercase().contains(wanted))
+    }) {
+        return false;
+    }
+    if upstream.is_some_and(|wanted| {
+        !row.upstream_target
+            .as_deref()
+            .is_some_and(|value| value.to_ascii_lowercase().contains(wanted))
+            && !row.attempts.iter().any(|attempt| {
+                attempt
+                    .provider
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(wanted))
+            })
+    }) {
+        return false;
+    }
+    if client.is_some_and(|wanted| {
+        row.client_label
+            .as_deref()
+            .is_none_or(|value| value.to_ascii_lowercase() != wanted)
+    }) {
+        return false;
+    }
+    if let Some(query) = search {
+        let terms = query
+            .chars()
+            .take(256)
+            .collect::<String>()
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .take(8)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let status_aliases = match row.status {
+            FlowStatus::Open => "open running streaming live",
+            FlowStatus::Completed => "completed complete success successful 2xx",
+            FlowStatus::Failed => "failed failure error 5xx",
+            FlowStatus::Cancelled => "cancelled canceled cancel 499",
+        };
+        let mut fields = vec![
+            row.api_call_id.clone(),
+            row.response_id.clone().unwrap_or_default(),
+            row.method.clone(),
+            row.uri.clone(),
+            flow_status_search_key(row.status).to_string(),
+            status_aliases.to_string(),
+            row.model_requested.clone().unwrap_or_default(),
+            row.model_served.clone().unwrap_or_default(),
+            row.upstream_target.clone().unwrap_or_default(),
+            row.client_label.clone().unwrap_or_default(),
+            row.client_source
+                .as_ref()
+                .map(search_enum_key)
+                .unwrap_or_default(),
+            row.terminal_reason.clone().unwrap_or_default(),
+        ];
+        if row.model_requested.is_some()
+            && row.model_served.is_some()
+            && row.model_requested != row.model_served
+        {
+            fields.push("failover fallback".to_string());
+        }
+        for attempt in &row.attempts {
+            fields.extend([
+                attempt.provider.clone().unwrap_or_default(),
+                attempt.model.clone().unwrap_or_default(),
+                search_enum_key(&attempt.status),
+                attempt
+                    .error_class
+                    .as_ref()
+                    .map(search_enum_key)
+                    .unwrap_or_default(),
+                attempt
+                    .failover_reason
+                    .as_ref()
+                    .map(search_enum_key)
+                    .unwrap_or_default(),
+            ]);
+        }
+        let fields = fields
+            .into_iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        if !terms
+            .iter()
+            .all(|term| fields.iter().any(|field| field.contains(term)))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn flow_status_search_key(status: FlowStatus) -> &'static str {
+    match status {
+        FlowStatus::Open => "open",
+        FlowStatus::Completed => "completed",
+        FlowStatus::Failed => "failed",
+        FlowStatus::Cancelled => "cancelled",
+    }
+}
+
+fn search_enum_key<T: Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 fn overview_window_report(view: &MetricsView, window: OverviewWindow) -> &WindowReport {
@@ -1898,6 +2710,7 @@ mod tests {
             metrics_seq: 7,
             scope: OverviewScope {
                 window: OverviewWindow::M5,
+                mode: OverviewScopeMode::Live,
                 cut_id: None,
                 requested_at_ms: None,
                 selected_at_ms: Some(123),

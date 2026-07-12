@@ -335,6 +335,11 @@ impl Default for ProviderHealthPublisher {
 }
 
 impl ProviderHealthPublisher {
+    /// Restore the persisted topology watermark before the initial publication.
+    pub fn hydrate_sequence(&self, floor: u64) {
+        self.version.fetch_max(floor, Ordering::Relaxed);
+    }
+
     /// Publish a fresh health vector as the next versioned snapshot. Bumps the
     /// monotonic version, builds an immutable `Arc<ProviderHealthSnapshot>`, and
     /// atomically swaps it in. Called by the coalesced 1 s publication tick and

@@ -25,6 +25,11 @@
       "description": "Whether this selected cut dropped its oldest flow summaries to fit the quota.",
       "type": "boolean"
     },
+    "flows_total": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
     "history": {
       "description": "Bounds and memory use of the retained historical-cut ring.",
       "$ref": "#/$defs/SnapshotHistoryMetadata"
@@ -67,6 +72,7 @@
     "cursors",
     "at_ms",
     "summaries",
+    "flows_total",
     "metrics",
     "topology",
     "history",
@@ -1835,6 +1841,14 @@
       "description": "Gap 12 — the public per-provider latency + error-distribution DTO (additive on the\nD4 topology node; consumed by spec 13). Percentiles are `derived` ms over the\nprovider's ATTEMPT-latency histogram (a FAILED primary's latency is included — spec\n12 — so final-served latency alone cannot hide an unhealthy provider). `error_rate`\nis the percentage of the provider's attempts that FAILED. A provider with zero\nin-window samples is ABSENT (don't-lie-with-zeros), so a present DTO always has\n`samples >= 1`. All floats are finite (the frozen finite-number wire contract).",
       "type": "object",
       "properties": {
+        "as_of_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint128",
+          "minimum": 0
+        },
         "data_quality": {
           "description": "DQ tag — always `derived` for a present entry (the `unavailable` case is absence).",
           "$ref": "#/$defs/ProviderMetricQuality"
@@ -1893,6 +1907,10 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "stale": {
+          "type": "boolean",
+          "default": false
         }
       },
       "required": [
@@ -1905,7 +1923,8 @@
         "p95",
         "p99",
         "error_rate",
-        "errors"
+        "errors",
+        "stale"
       ]
     },
     "ProviderMetricQuality": {

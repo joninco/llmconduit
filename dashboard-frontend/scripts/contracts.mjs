@@ -61,17 +61,20 @@ async function generate(output) {
     { file: 'bootstrap', exported: 'validateBootstrap', type: 'DashboardBootstrap', definition: 'DashboardBootstrap', group: 'initial' },
     { file: 'catalog', exported: 'validateCatalog', type: 'CatalogEntry[]', definition: null, group: 'rest' },
     { file: 'flow-detail', exported: 'validateFlowDetail', type: 'FlowDetailBody', definition: 'FlowDetailBody', group: 'rest' },
+    { file: 'flow-summary', exported: 'validateFlowSummary', type: 'DurableFlowRollup', definition: 'DurableFlowRollup', group: 'rest' },
     { file: 'flows', exported: 'validateFlows', type: 'FlowsResponse', definition: 'FlowsResponse', group: 'rest' },
+    { file: 'durability', exported: 'validateDurability', type: 'DurabilityStatusResponse', definition: 'DurabilityStatusResponse', group: 'rest' },
     { file: 'history', exported: 'validateHistory', type: 'HistoryResponse', definition: 'HistoryResponse', group: 'rest' },
     { file: 'kill', exported: 'validateKill', type: 'KillResponse', definition: 'KillResponse', group: 'rest' },
     { file: 'metrics', exported: 'validateMetrics', type: 'MetricsSnapshot', definition: 'MetricsSnapshot', group: 'rest' },
     { file: 'overview', exported: 'validateOverview', type: 'OverviewResponse', definition: 'OverviewResponse', group: 'rest' },
     { file: 'snapshot', exported: 'validateSnapshot', type: 'SnapshotResponse', definition: 'SnapshotResponse', group: 'rest' },
     { file: 'topology', exported: 'validateTopology', type: 'TopologySnapshot', definition: 'TopologySnapshot', group: 'rest' },
+    { file: 'theater', exported: 'validateTheater', type: 'TheaterResponse', definition: 'TheaterResponse', group: 'rest' },
     { file: 'ws-frame', exported: 'validateWsFrame', type: 'DashboardFrame', definition: 'DashboardFrame', group: 'initial' },
     { file: 'ws-snapshot', exported: 'validateWsSnapshot', type: 'SnapshotMessage', definition: 'SnapshotMessage', group: 'initial' },
   ];
-  const commonId = 'urn:llmconduit:dashboard:contracts:v5';
+  const commonId = 'urn:llmconduit:dashboard:contracts:v6';
   declarationsSchema.$id = commonId;
   for (const group of ['initial', 'rest']) {
     const selected = roots.filter((root) => root.group === group);
@@ -85,7 +88,7 @@ async function generate(output) {
     ajv.addSchema(declarationsSchema, commonId);
     const exports = {};
     for (const root of selected) {
-      const id = `urn:llmconduit:dashboard:${root.file}:v5`;
+      const id = `urn:llmconduit:dashboard:${root.file}:v6`;
       const target = root.definition
         ? { $ref: `${commonId}#/$defs/${root.definition}` }
         : { type: 'array', items: { $ref: `${commonId}#/$defs/CatalogEntry` } };

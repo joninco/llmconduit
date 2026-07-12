@@ -21,6 +21,7 @@ function response(over: Partial<OverviewResponse> = {}): OverviewResponse {
     metrics_seq: 42,
     scope: {
       window: 'm1',
+      mode: 'live',
       requested_at_ms: null,
       selected_at_ms: now,
       status: null,
@@ -57,7 +58,7 @@ function response(over: Partial<OverviewResponse> = {}): OverviewResponse {
       data_quality: 'derived',
       providers: [{
         provider: 'vllm-a', data_quality: 'derived', samples: 10, served: 8, failed: 2,
-        p50: 90, p95: 240, p99: 600, error_rate: 20, errors: { timeout: 2 },
+        p50: 90, p95: 240, p99: 600, error_rate: 20, errors: { timeout: 2 }, stale: false,
       }],
     },
     ...over,

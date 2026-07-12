@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TheaterResponse",
+  "type": "object",
+  "properties": {
+    "data_quality": {
+      "type": "string"
+    },
+    "generated_at_ms": {
+      "type": "integer",
+      "format": "uint128",
+      "minimum": 0
+    },
+    "last_terminal": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TheaterRiver"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "monitor_seq": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "generated_at_ms",
+    "monitor_seq",
+    "data_quality"
+  ],
+  "$defs": {
+    "TheaterRiver": {
+      "type": "object",
+      "properties": {
+        "api_call_id": {
+          "type": "string"
+        },
+        "approx_tokens": {
+          "type": "number",
+          "format": "double"
+        },
+        "id": {
+          "type": "string"
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output": {
+          "type": "string"
+        },
+        "reasoning": {
+          "type": "string"
+        },
+        "started_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "status": {
+          "type": "string"
+        },
+        "terminal_at_ms": {
+          "type": "integer",
+          "format": "uint128",
+          "minimum": 0
+        },
+        "tokens_per_sec": {
+          "type": "number",
+          "format": "double"
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "api_call_id",
+        "model",
+        "status",
+        "started_at_ms",
+        "terminal_at_ms",
+        "output",
+        "reasoning",
+        "tools",
+        "truncated",
+        "approx_tokens",
+        "tokens_per_sec"
+      ]
+    }
+  }
+}
