@@ -18,6 +18,7 @@ import { useDashboard } from '../../store/hooks';
 import { getConnection, queryKeys } from '../../api/connection';
 import type { FlowFilters } from './filterTypes';
 import { flowMatchesSearch } from './flowSearch';
+import type { FlowSort, SortDirection } from '../../router/flowViewState';
 
 export interface FlowRowsResult {
   /** Filtered rows, newest-on-top (the array the virtualizer renders). */
@@ -52,6 +53,8 @@ function mergeRows(
   order: string[],
   flows: Map<string, FlowSummary>,
   queryFlows: FlowSummary[],
+  sort: FlowSort,
+  direction: SortDirection,
 ): FlowSummary[] {
   // Both sources now carry the same complete revisioned FlowRow. Index REST by id and select one
   // whole revision on conflict; field-by-field backfill could combine values that never coexisted.
@@ -76,8 +79,34 @@ function mergeRows(
   // live rows were emitted first (finding 4). Stable tiebreak keeps deterministic ordering for
   // equal timestamps. (`flowOrder` already tracks live newest-prepended, so for an all-live list
   // this preserves the existing order.)
-  merged.sort((a, b) => b.started_ms - a.started_ms);
+  merged.sort(flowComparator(sort, direction));
   return merged;
+}
+
+function flowComparator(sort: FlowSort, direction: SortDirection): (a: FlowSummary, b: FlowSummary) => number {
+  const multiplier = direction === 'desc' ? -1 : 1;
+  const optional = <T,>(a: T | null | undefined, b: T | null | undefined, compare: (x: T, y: T) => number): number => {
+    if (a == null && b == null) return 0;
+    if (a == null) return 1;
+    if (b == null) return -1;
+    return compare(a, b) * multiplier;
+  };
+  return (a, b) => {
+    let result = 0;
+    switch (sort) {
+      case 'started': result = (a.started_ms - b.started_ms) * multiplier; break;
+      case 'id': result = a.api_call_id.localeCompare(b.api_call_id) * multiplier; break;
+      case 'client': result = optional(a.client_label, b.client_label, (x, y) => x.localeCompare(y)); break;
+      case 'endpoint': result = a.uri.localeCompare(b.uri) * multiplier; break;
+      case 'model': result = optional(a.model_served ?? a.model_requested, b.model_served ?? b.model_requested, (x, y) => x.localeCompare(y)); break;
+      case 'upstream': result = optional(a.upstream_target, b.upstream_target, (x, y) => x.localeCompare(y)); break;
+      case 'status': result = a.status.localeCompare(b.status) * multiplier; break;
+      case 'tokens': result = optional(a.usage?.total, b.usage?.total, (x, y) => x - y); break;
+      case 'cost': result = optional(a.cost, b.cost, (x, y) => x - y); break;
+      case 'latency': result = optional(a.elapsed_ms, b.elapsed_ms, (x, y) => x - y); break;
+    }
+    return result || a.api_call_id.localeCompare(b.api_call_id) * multiplier;
+  };
 }
 
 /**
@@ -132,7 +161,12 @@ function clientsByVolume(rows: FlowSummary[]): string[] {
   return [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([label]) => label);
 }
 
-export function useFlowRows(filters: FlowFilters, searchQuery = ''): FlowRowsResult {
+export function useFlowRows(
+  filters: FlowFilters,
+  searchQuery = '',
+  sort: FlowSort = 'started',
+  direction: SortDirection = 'desc',
+): FlowRowsResult {
   const order = useDashboard((s) => s.flowOrder);
   const flows = useDashboard((s) => s.flows);
   // Time-travel: while seeking (D11 paused on a historical cut), the store holds the FROZEN
@@ -151,7 +185,9 @@ export function useFlowRows(filters: FlowFilters, searchQuery = ''): FlowRowsRes
     q: searchQuery.trim() || undefined,
     cut_id: seeking ? seekCutId ?? undefined : undefined,
     limit: 100,
-  }), [filters, searchQuery, seekCutId, seeking]);
+    sort,
+    direction,
+  }), [direction, filters, searchQuery, seekCutId, seeking, sort]);
 
   // The REST list seeds rows the live store has not seen and reconciles a missed event by revision.
   // Complete live mutations patch the list directly, so progress does not refetch this query.
@@ -186,9 +222,9 @@ export function useFlowRows(filters: FlowFilters, searchQuery = ''): FlowRowsRes
   const merged = useMemo(
     // A frozen seek must never overlay post-cut WS rows. Its durable pages alone are authoritative.
     () => seeking
-      ? seekCutId === null ? mergeRows(order, flows, []) : queryFlows
-      : mergeRows(order, flows, queryFlows),
-    [order, flows, queryFlows, seekCutId, seeking],
+      ? seekCutId === null ? mergeRows(order, flows, [], sort, direction) : [...queryFlows].sort(flowComparator(sort, direction))
+      : mergeRows(order, flows, queryFlows, sort, direction),
+    [direction, order, flows, queryFlows, seekCutId, seeking, sort],
   );
   const rows = useMemo(() => applyFilters(merged, filters, searchQuery), [merged, filters, searchQuery]);
   const models = useMemo(

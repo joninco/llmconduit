@@ -25,6 +25,7 @@
  */
 import type { AttemptErrorClass, ProviderErrorDistribution, ProviderLatency } from '../../api/types';
 import { ATTEMPT_ERROR_CLASSES } from '../../api/types';
+import { fmtLatency, fmtPercent } from '../FlowTable/format';
 
 /** Provenance of a per-provider figure — mirrors the dashboard's measured/derived/unavailable tags. */
 export type Quality = 'measured' | 'derived' | 'partial' | 'estimated' | 'unavailable';
@@ -92,8 +93,7 @@ const ERROR_CLASS_LABEL: Record<AttemptErrorClass, string> = {
 
 /** Format a `derived` latency (ms) for a tile, or `—` when unavailable. Rounds (sub-ms is noise). */
 export function fmtProviderLatencyMs(ms: number | null): string {
-  if (ms === null || !Number.isFinite(ms)) return '—';
-  return `${Math.round(ms)}ms`;
+  return fmtLatency(ms);
 }
 
 /**
@@ -102,10 +102,7 @@ export function fmtProviderLatencyMs(ms: number | null): string {
  * decimal under 10% (so 4.2% is visible), whole percent otherwise.
  */
 export function fmtErrorRate(pct: number | null): string {
-  if (pct === null || !Number.isFinite(pct)) return '—';
-  if (pct === 0) return '0%';
-  if (pct < 10) return `${pct.toFixed(1)}%`;
-  return `${Math.round(pct)}%`;
+  return fmtPercent(pct);
 }
 
 /** Resolve a provider key to its display label (overflow/sentinel keys labelled honestly, spec 13). */

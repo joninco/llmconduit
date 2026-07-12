@@ -12,6 +12,7 @@ import { flowFilterStore } from '../store/flowFilterStore';
 import { navigate } from '../router/useHashRoute';
 import { Panel } from '../components/ui/Panel';
 import { StaleFallbackBanner } from '../components/StaleFallbackBanner';
+import { fmtCost, fmtCostRate, fmtTokens } from '../components/FlowTable/format';
 
 const WINDOW_SECONDS = { m1: 60, m5: 300, h1: 3_600 } as const;
 
@@ -74,7 +75,7 @@ function costPerMinute(response: OverviewResponse, seconds: number): CostDisplay
     return { value: '—', estimated: false, confidence: 'unavailable' };
   }
   return {
-    value: `$${(aggregate.total_usd * 60 / seconds).toFixed(2)}`,
+    value: fmtCost(aggregate.total_usd * 60 / seconds),
     estimated: aggregate.confidence === 'estimated',
     confidence: aggregate.confidence as CostConfidence,
   };
@@ -117,7 +118,7 @@ function SankeyChrome({
           client → gateway → model · band = tokens reported by terminal flows / {window} · click a band to filter flows
         </p>
         <span className="ml-auto flex items-center gap-1 tabular-nums text-sm text-meta">
-          <span data-testid="sankey-cost-per-min" data-confidence={cost.confidence}>{cost.value}/min</span>
+          <span data-testid="sankey-cost-per-min" data-confidence={cost.confidence}>{cost.value === '—' ? '—' : `${cost.value}/min`}</span>
           {cost.estimated && (
             <span
               className="shrink-0 rounded-sm bg-status-cooling/15 px-1 text-[9px] uppercase tracking-wide text-status-cooling"
@@ -147,6 +148,8 @@ function SankeyChrome({
       <Panel className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4">
         {model.links.length === 0 ? (
           <p className="text-sm text-text-muted" data-testid="sankey-empty">No terminal flow reported tokens in this window.</p>
+        ) : model.nodes.filter((node) => node.model).length === 1 ? (
+          <SingleLaneSummary model={model} window={window} onSelect={onSelect} />
         ) : (
           <TokenSankey model={model} onSelectModel={onSelect} />
         )}
@@ -184,6 +187,32 @@ function SankeyChrome({
         </div>
       )}
     </div>
+  );
+}
+
+function SingleLaneSummary({ model, window, onSelect }: { model: SankeyModel; window: 'm1' | 'm5' | 'h1'; onSelect: (modelName: string, upstream: string | null) => void }) {
+  const node = model.nodes.find((candidate) => candidate.model)!;
+  const lane = model.links.find((candidate) => candidate.target === node.id)!;
+  const seconds = WINDOW_SECONDS[window];
+  const rate = lane.costAvailable === false ? '—' : fmtCostRate(lane.cost * 60 / seconds);
+  return (
+    <button
+      type="button"
+      className="w-full max-w-2xl rounded-lg border border-accent/40 bg-panel-raised p-5 text-left hover:border-accent focus-visible:ring-2 focus-visible:ring-accent"
+      onClick={() => onSelect(node.model!, node.upstream ?? null)}
+      data-testid="single-lane-summary"
+      data-model={node.model}
+      data-upstream={node.upstream ?? ''}
+    >
+      <div className="flex items-center gap-3 text-sm"><span className="text-text-muted">client</span><span aria-hidden>→</span><span className="text-text-muted">gateway</span><span aria-hidden>→</span><strong className="truncate text-accent">{node.label}</strong></div>
+      <dl className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
+        <div><dt className="text-[10px] uppercase text-text-muted">reported tokens / {window}</dt><dd className="font-mono text-lg tabular-nums">{fmtTokens(lane.value)}</dd></div>
+        <div><dt className="text-[10px] uppercase text-text-muted">terminal cost</dt><dd className="font-mono text-lg tabular-nums">{lane.costAvailable === false ? '—' : fmtCost(lane.cost)}</dd></div>
+        <div><dt className="text-[10px] uppercase text-text-muted">normalized cost rate</dt><dd className="font-mono text-lg tabular-nums">{rate}</dd></div>
+        <div><dt className="text-[10px] uppercase text-text-muted">population</dt><dd className="text-sm">terminal flows with reported tokens</dd></div>
+      </dl>
+      <p className="mt-3 text-[11px] text-text-muted">Cost is the server-authored terminal-flow total for this lane over {window}, normalized to one minute for comparison. Click to filter Flows by this provider and served model.</p>
+    </button>
   );
 }
 

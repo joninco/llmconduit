@@ -130,6 +130,13 @@ function writeHash(path: string, scope: HashScope, replace: boolean): void {
   if (scope.model) query.set('model', scope.model);
   if (scope.upstream) query.set('upstream', scope.upstream);
   if (scope.client) query.set('client', scope.client);
+  if (path.split('/')[0] === 'flows') {
+    const current = hashParts().query;
+    for (const key of ['q', 'sort', 'direction']) {
+      const value = current.get(key);
+      if (value) query.set(key, value);
+    }
+  }
   const next = `#/${path}${query.size > 0 ? `?${query}` : ''}`;
   if (window.location.hash === next) return;
   if (replace) window.history.replaceState(null, '', next);

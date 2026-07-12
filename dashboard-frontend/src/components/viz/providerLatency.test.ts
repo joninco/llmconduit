@@ -32,7 +32,7 @@ function per(over: Partial<ProviderLatency> = {}): ProviderLatency {
 
 describe('providerLatency — formatters (don\'t-lie-with-zeros)', () => {
   it('fmtProviderLatencyMs rounds a derived latency, — when null/non-finite', () => {
-    expect(fmtProviderLatencyMs(82.4)).toBe('82ms');
+    expect(fmtProviderLatencyMs(82.4)).toBe('82 ms');
     expect(fmtProviderLatencyMs(null)).toBe('—');
     expect(fmtProviderLatencyMs(Number.NaN)).toBe('—');
   });
@@ -40,7 +40,7 @@ describe('providerLatency — formatters (don\'t-lie-with-zeros)', () => {
   it('fmtErrorRate renders a MEASURED 0 as 0% (distinct from the unavailable —)', () => {
     expect(fmtErrorRate(0)).toBe('0%'); // all-served measured zero — NOT —
     expect(fmtErrorRate(4.2)).toBe('4.2%');
-    expect(fmtErrorRate(33.33)).toBe('33%');
+    expect(fmtErrorRate(33.33)).toBe('33.3%');
     expect(fmtErrorRate(null)).toBe('—'); // unavailable — distinct from a measured 0%
   });
 });
@@ -49,10 +49,10 @@ describe('providerLatency — buildProviderLatency present (a derived measuremen
   it('tags percentiles derived + the error rate measured, with samples context', () => {
     const m = buildProviderLatency(per());
     expect(m.available).toBe(true);
-    expect(m.p50).toEqual({ text: '82ms', quality: 'derived' });
-    expect(m.p95).toEqual({ text: '190ms', quality: 'derived' });
-    expect(m.p99).toEqual({ text: '240ms', quality: 'derived' });
-    expect(m.errorRate).toEqual({ text: '4.0%', quality: 'measured' });
+    expect(m.p50).toEqual({ text: '82 ms', quality: 'derived' });
+    expect(m.p95).toEqual({ text: '190 ms', quality: 'derived' });
+    expect(m.p99).toEqual({ text: '240 ms', quality: 'derived' });
+    expect(m.errorRate).toEqual({ text: '4%', quality: 'measured' });
     expect(m.samplesText).toBe('48/50');
   });
 

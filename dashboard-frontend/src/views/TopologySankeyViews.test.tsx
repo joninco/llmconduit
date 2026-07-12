@@ -90,9 +90,9 @@ describe('SankeyView — authoritative Overview lanes', () => {
     getConnection().queryClient.setQueryData(queryKeys.overview({ window: 'm1' }), overview());
     const { container, getByTestId } = renderWithQuery(<SankeyView />);
     expect(getByTestId('sankey-cost-per-min').textContent).toBe('$2.50/min');
-    const band = container.querySelector('[data-testid="sankey-band"][data-model="gpt-4o"]')!;
-    expect(band).not.toBeNull();
-    fireEvent.click(band);
+    const lane = container.querySelector('[data-testid="single-lane-summary"][data-model="gpt-4o"]')!;
+    expect(lane).not.toBeNull();
+    fireEvent.click(lane);
     expect(flowFilterStore.getState().filters.model).toBe('gpt-4o');
     expect(flowFilterStore.getState().filters.upstream).toBe('vllm-a');
   });
@@ -109,7 +109,7 @@ describe('SankeyView — authoritative Overview lanes', () => {
     getConnection().queryClient.setQueryData(queryKeys.overview({ window: 'm1' }), response);
     const { getByTestId } = renderWithQuery(<SankeyView />);
     expect(getByTestId('sankey-companion-table').textContent).toContain('111,994');
-    expect(getByTestId('sankey-cost-per-min').textContent).toBe('—/min');
+    expect(getByTestId('sankey-cost-per-min').textContent).toBe('—');
   });
 
   it('uses the selected historical cut and labels it', () => {

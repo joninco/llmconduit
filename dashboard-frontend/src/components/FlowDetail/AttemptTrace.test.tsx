@@ -45,7 +45,7 @@ describe('AttemptTrace component (gap 11)', () => {
     // Failed attempt duration 800ms (measured).
     const durA = getByTestId('attempt-duration-0');
     expect(durA.getAttribute('data-quality')).toBe('measured');
-    expect(durA.textContent).toBe('800ms');
+    expect(durA.textContent).toBe('800 ms');
 
     // Expand the FAILED node: its first byte is UNAVAILABLE (—, never 0) — no header arrived.
     fireEvent.click(getByTestId('attempt-toggle-0'));
@@ -57,7 +57,7 @@ describe('AttemptTrace component (gap 11)', () => {
     fireEvent.click(getByTestId('attempt-toggle-1'));
     const byteB = getByTestId('attempt-firstbyte-1');
     expect(byteB.getAttribute('data-quality')).toBe('measured');
-    expect(byteB.textContent).toBe('300ms');
+    expect(byteB.textContent).toBe('300 ms');
     // The expanded detail exposes the model + the failover reason on the failed node.
     expect(getByTestId('attempt-detail-1').textContent).toContain('gpt-4o');
     expect(getByTestId('attempt-failover-0').textContent).toContain('failover');
@@ -93,7 +93,7 @@ describe('AttemptTrace component (gap 11)', () => {
     const { getByTestId } = renderTrace([zero]);
     const dur = getByTestId('attempt-duration-0');
     expect(dur.getAttribute('data-quality')).toBe('measured');
-    expect(dur.textContent).toBe('0ms');
+    expect(dur.textContent).toBe('0 ms');
   });
 
   it('flags a clock-disordered legacy attempt as unavailable', () => {

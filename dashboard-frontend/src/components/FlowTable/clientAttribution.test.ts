@@ -219,8 +219,8 @@ describe('fmtRate / fmtLatency — formatting + don\'t-lie-with-zeros', () => {
   });
 
   it('latency renders ms under a second, s above; null reads —', () => {
-    expect(fmtLatency(820)).toBe('820ms');
-    expect(fmtLatency(2400)).toBe('2.4s');
+    expect(fmtLatency(820)).toBe('820 ms');
+    expect(fmtLatency(2400)).toBe('2.4 s');
     expect(fmtLatency(null)).toBe(UNAVAILABLE);
   });
 });

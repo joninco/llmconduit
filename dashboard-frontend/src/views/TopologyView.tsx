@@ -20,6 +20,7 @@ import { navigate } from '../router/useHashRoute';
 import { Panel } from '../components/ui/Panel';
 import { CooldownTooltip } from '../components/viz/CooldownTooltip';
 import { StaleFallbackBanner } from '../components/StaleFallbackBanner';
+import { fmtLatency, fmtPercent, fmtSamples } from '../components/FlowTable/format';
 
 export function TopologyView() {
   // Seed nodes/edges/prices from `/topology` (LIVE-only; never overwrites a seek cut) — finding 5.
@@ -112,6 +113,35 @@ export function TopologyView() {
               {seeking ? 'No providers in this historical snapshot.' : 'No providers configured or reporting.'}
             </p>
           )
+        ) : nodes.length <= 3 ? (
+          <div className="flex w-full flex-wrap items-stretch justify-center gap-3" data-testid="compact-topology">
+            <div className="flex min-w-40 items-center justify-center rounded-md border border-accent/40 bg-accent/10 px-4 py-3 text-center">
+              <div><div className="text-[10px] uppercase tracking-[0.14em] text-text-muted">gateway</div><div className="mt-1 font-mono text-sm text-text">llmconduit</div></div>
+            </div>
+            <div className="flex items-center text-xl text-text-muted" aria-hidden>→</div>
+            {nodes.map((node) => {
+              const health = perProviderFor(node.id);
+              const freshAt = health?.as_of_ms ?? node.catalog_fetched_ms;
+              return (
+                <button
+                  key={node.id}
+                  type="button"
+                  className="min-w-56 rounded-md border border-line bg-panel-raised p-3 text-left hover:border-accent focus-visible:ring-2 focus-visible:ring-accent"
+                  onClick={() => onSelectUpstream(node.id)}
+                  data-testid="compact-provider"
+                  data-node-id={node.id}
+                >
+                  <div className="flex items-center justify-between gap-2"><strong className="truncate text-sm text-text">{node.name}</strong><span className="text-[10px] uppercase text-text-muted">{node.status}</span></div>
+                  <dl className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]">
+                    <dt className="text-text-muted">Attempt population</dt><dd className="text-right tabular-nums">{health ? fmtSamples(health.samples, 'attempt') : '—'}</dd>
+                    <dt className="text-text-muted">Provider-attempt P95</dt><dd className="text-right tabular-nums">{fmtLatency(health?.p95 ?? null)}</dd>
+                    <dt className="text-text-muted">Attempt errors</dt><dd className="text-right tabular-nums">{health ? fmtPercent(health.error_rate) : '—'}</dd>
+                    <dt className="text-text-muted">Freshness</dt><dd className="text-right tabular-nums">{freshAt ? fmtElapsedAge(clock - freshAt) : '—'}</dd>
+                  </dl>
+                </button>
+              );
+            })}
+          </div>
         ) : (
           <RadialTopology
             nodes={nodes}
@@ -163,4 +193,10 @@ export function TopologyView() {
       )}
     </div>
   );
+}
+
+function fmtElapsedAge(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—';
+  if (ms < 60_000) return `${Math.max(0, Math.round(ms / 1000))} s ago`;
+  return `${Math.round(ms / 60_000)} min ago`;
 }

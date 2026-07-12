@@ -545,7 +545,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     expect(getByTestId('context-util-pct').textContent).not.toBe('53.1%'); // not the inflated total
     // A real fill + a real headroom (64.0k left of 128k).
     expect(getByTestId('context-gauge-fill').style.width).toBe('50%');
-    expect(getByTestId('context-headroom').textContent).toContain('64.0k left');
+    expect(getByTestId('context-headroom').textContent).toContain('64k left');
   });
 
   // Gap 09 — a flow on a model WITHOUT a known window (the mock catalog's `mystery-model` =
@@ -632,7 +632,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
 
     // TTFT is MEASURED (first content − ingress = 450ms) — no est badge.
     await waitFor(() => expect(getByTestId('latency-ttft').getAttribute('data-quality')).toBe('measured'));
-    expect(getByTestId('latency-ttft').textContent).toContain('450ms');
+    expect(getByTestId('latency-ttft').textContent).toContain('450 ms');
     expect(getByTestId('latency-ttft').querySelector('[data-testid="latency-quality-badge"]')).toBeNull();
     // Wire TTFB is measured (270ms) and the upstream-wait segment is enriched.
     expect(getByTestId('latency-ttfb').getAttribute('data-quality')).toBe('measured');
@@ -671,7 +671,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     // A live monitor `output` segment 300ms after started_ms supplies the DERIVED fallback.
     pushMonitor({ type: 'segment_append', response_id: 'resp_g10b', segment: { timestamp_ms: t0 + 300, kind: 'output', text: 'Hi' } }, 4);
     await waitFor(() => expect(getByTestId('latency-ttft').getAttribute('data-quality')).toBe('estimated'));
-    expect(getByTestId('latency-ttft').textContent).toContain('300ms');
+    expect(getByTestId('latency-ttft').textContent).toContain('300 ms');
     // It is LABELLED `est` (a derived first-visible-activity figure, not the measured upstream byte).
     const badge = getByTestId('latency-ttft').querySelector('[data-testid="latency-quality-badge"]');
     expect(badge?.textContent).toBe('est');
@@ -715,7 +715,7 @@ describe('FlowDetail — 3-pane inspector (mock backend)', () => {
     // The REST detail's served attempt surfaces ⇒ wire TTFB is MEASURED (270ms), not unavailable —
     // proving the empty live [] did not suppress the populated trace.
     await waitFor(() => expect(getByTestId('latency-ttfb').getAttribute('data-quality')).toBe('measured'));
-    expect(getByTestId('latency-ttfb').textContent).toContain('270ms');
+    expect(getByTestId('latency-ttfb').textContent).toContain('270 ms');
     // The upstream-wait segment is likewise enriched from the served attempt's first byte.
     expect(getByTestId('latency-seg-upstream').getAttribute('data-quality')).toBe('measured');
   });
@@ -935,7 +935,7 @@ describe('FlowDetail — time-travel seek + body eviction', () => {
     expect(text).not.toContain('$1.00'); // 0.9999 would round to $1.00
     // Elapsed for the OPEN frozen flow = at_ms - started_ms = 5000ms → 5.0s. NOT the live detail's
     // 999000ms (→ 16m39s) and NOT a wall-clock Date.now() tick.
-    expect(text).toContain('5.0s');
+    expect(text).toContain('5 s');
     expect(text).not.toContain('16m');
   });
 
@@ -1285,10 +1285,30 @@ describe('FlowDetail — narrow single-pane accessibility', () => {
     const origin = getByTestId('flow-origin');
     act(() => origin.focus());
     fireEvent.click(origin);
-    await waitFor(() => expect(document.activeElement).toBe(getByTestId('flow-detail')));
+    await waitFor(() => expect(document.activeElement?.textContent).toBe('Request summary'));
 
     fireEvent.click(getByTestId('detail-back'));
     await waitFor(() => expect(queryByTestId('flow-detail')).toBeNull());
     await waitFor(() => expect(document.activeElement).toBe(origin));
+  });
+
+  it('resets detail-owned scroll and focuses the summary when the request changes', async () => {
+    stubNarrowViewport();
+    seedFlows([
+      makeFlow({ api_call_id: 'api_001', response_id: 'resp_001' }),
+      makeFlow({ api_call_id: 'api_002', response_id: 'resp_002' }),
+    ]);
+    function RequestChangeHarness() {
+      const [id, setId] = useState('api_001');
+      return <><button type="button" onClick={() => setId('api_002')}>next request</button><FlowDetail apiCallId={id} onClose={noop} /></>;
+    }
+    const view = renderWithQuery(<RequestChangeHarness />);
+    const panel = view.getByTestId('narrow-tabpanel-A');
+    panel.scrollTop = 240;
+    panel.scrollLeft = 80;
+    fireEvent.click(view.getByRole('button', { name: 'next request' }));
+    expect(panel.scrollTop).toBe(0);
+    expect(panel.scrollLeft).toBe(0);
+    await waitFor(() => expect(document.activeElement?.textContent).toBe('Request summary'));
   });
 });

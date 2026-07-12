@@ -102,9 +102,10 @@ test('reduced motion and forced colors retain accessible topology alternatives',
   await page.getByRole('tab', { name: 'Topology' }).click();
   await expect(page.getByTestId('topology-companion-table')).toBeVisible();
   await expect(page.getByTestId('topo-particle')).toHaveCount(0);
-  const node = page.getByTestId('topo-node').first();
+  const node = page.getByTestId('compact-provider').first();
   await node.focus();
-  await expect(page.getByRole('tooltip')).toBeVisible();
+  await expect(node).toBeFocused();
+  await expect(page.getByTestId('topology-companion-table')).toBeVisible();
   await assertAxe(page, { forcedColors: true });
   expect(consoleErrors, 'console errors in forced-colors/reduced-motion').toEqual([]);
 });

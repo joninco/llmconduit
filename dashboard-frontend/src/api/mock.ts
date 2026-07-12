@@ -700,6 +700,31 @@ export const mockFetch: typeof fetch = async (input, init): Promise<Response> =>
   // -- Reads --
   if (path === '/dashboard/api/flows') {
     const all = filteredMockFlows(qs);
+    const sort = qs.get('sort') ?? 'started';
+    const multiplier = qs.get('direction') === 'asc' ? 1 : -1;
+    const value = (flow: FlowSummary): string | number | null | undefined => {
+      switch (sort) {
+        case 'id': return flow.api_call_id;
+        case 'client': return flow.client_label;
+        case 'endpoint': return flow.uri;
+        case 'model': return flow.model_served ?? flow.model_requested;
+        case 'upstream': return flow.upstream_target;
+        case 'status': return flow.status;
+        case 'tokens': return flow.usage?.total;
+        case 'cost': return flow.cost;
+        case 'latency': return flow.elapsed_ms;
+        default: return flow.started_ms;
+      }
+    };
+    all.sort((left, right) => {
+      const a = value(left);
+      const b = value(right);
+      if (a == null && b == null) return left.api_call_id.localeCompare(right.api_call_id) * multiplier;
+      if (a == null) return 1;
+      if (b == null) return -1;
+      const compared = typeof a === 'number' && typeof b === 'number' ? a - b : String(a).localeCompare(String(b));
+      return compared * multiplier || left.api_call_id.localeCompare(right.api_call_id) * multiplier;
+    });
     const limit = Math.max(1, Number(qs.get('limit') ?? 100));
     const page = Math.max(1, Number(qs.get('page') ?? 1));
     const flows = all.slice((page - 1) * limit, page * limit);

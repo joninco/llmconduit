@@ -12,11 +12,13 @@
 import {
   Component,
   Suspense,
+  lazy,
   useCallback,
   useEffect,
   useRef,
   useState,
   type ComponentType,
+  type ErrorInfo,
   type ReactNode,
 } from 'react';
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from 'react-resizable-panels';
@@ -24,7 +26,6 @@ import { getConnection, teardownSession } from './api/connection';
 import { useAuth, useDashboard } from './store/hooks';
 import { LoginShell } from './components/LoginShell';
 import { NavTabs } from './components/NavTabs';
-import { StatsStrip } from './components/StatsStrip/StatsStrip';
 import { Scrubber } from './components/Scrubber/Scrubber';
 import { EdgeStrip } from './components/ui/EdgeStrip';
 import { useHashRoute, useHashScope } from './router/useHashRoute';
@@ -34,6 +35,16 @@ import { authStore } from './store/authStore';
 import { ScopeBar } from './components/ScopeBar';
 import { useMediaQuery } from './lib/useMediaQuery';
 import { DurabilityBanner } from './components/DurabilityBanner';
+
+const StatsStrip = lazy(() => import('./components/StatsStrip/StatsStrip').then((module) => ({ default: module.StatsStrip })));
+
+function LazyStatsStrip() {
+  return (
+    <Suspense fallback={<div className="m-2 h-24 animate-pulse rounded-md border border-line bg-panel sm:m-4" role="status" aria-label="Loading gateway metrics" />}>
+      <StatsStrip />
+    </Suspense>
+  );
+}
 
 export function App() {
   const authed = useAuth((s) => s.authenticated);
@@ -128,7 +139,7 @@ function Dashboard() {
               Metrics · timeline
             </summary>
             <div className="max-h-[42vh] overflow-auto pb-2">
-              <StatsStrip />
+              <LazyStatsStrip />
               <Scrubber socket={socket} />
             </div>
           </details>
@@ -171,7 +182,7 @@ function Dashboard() {
           ) : (
             <>
               {/* stats-strip slot */}
-              <StatsStrip />
+              <LazyStatsStrip />
               {/* scrubber slot */}
               <Scrubber socket={socket} />
             </>
@@ -204,31 +215,69 @@ export function RouteContent({ ActiveView, routeKey }: { ActiveView: ComponentTy
         }
       >
         <ActiveView />
+        <RouteLoaded />
       </Suspense>
     </RouteErrorBoundary>
   );
 }
 
-export class RouteErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
-  state = { error: null as Error | null };
+function RouteLoaded() {
+  useEffect(() => {
+    try { window.sessionStorage.removeItem('argus:chunk-recovery:v1'); } catch { /* storage unavailable */ }
+  }, []);
+  return null;
+}
+
+export class RouteErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null; chunkFailure: boolean }
+> {
+  state = { error: null as Error | null, chunkFailure: false };
 
   static getDerivedStateFromError(error: Error) {
-    return { error };
+    return { error, chunkFailure: false };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('[ARGUS] route render failed', {
+      kind: 'render-or-chunk-load',
+      message: error.message,
+      route: window.location.href,
+      componentStack: info.componentStack,
+    });
+    void import('./lib/chunkRecovery').then(({ armChunkRecovery, isChunkLoadError }) => {
+      if (!isChunkLoadError(error)) return;
+      this.setState({ chunkFailure: true });
+      if (armChunkRecovery(window.sessionStorage, window.location.href)) {
+        console.warn('[ARGUS] dashboard assets changed; reloading this route once');
+        window.location.reload();
+      }
+    });
   }
 
   render() {
     if (!this.state.error) return this.props.children;
+    const title = this.state.chunkFailure ? 'ARGUS was updated while this view was loading' : 'This view could not be rendered';
+    const explanation = this.state.chunkFailure
+      ? 'The dashboard tried a fresh reload, but this view still could not load. Your route, filters, and query are preserved.'
+      : 'An unexpected rendering error occurred in this view.';
     return (
       <section className="m-auto max-w-lg rounded-lg border border-status-down/50 bg-panel p-6" role="alert">
-        <h1 className="font-ui text-lg font-semibold">This view could not be rendered</h1>
-        <p className="mt-2 text-sm text-text-muted">{this.state.error.message || 'Unexpected route error.'}</p>
+        <h1 className="font-ui text-lg font-semibold">{title}</h1>
+        <p className="mt-2 text-sm text-text-muted">{explanation}</p>
         <button
           type="button"
           className="mt-4 rounded bg-accent px-3 py-2 text-sm text-bg focus-visible:ring-2 focus-visible:ring-accent"
           onClick={() => window.location.reload()}
         >
-          Retry
+          {this.state.chunkFailure ? 'Reload Dashboard' : 'Retry'}
         </button>
+        <details className="mt-4 text-xs text-text-muted">
+          <summary className="cursor-pointer select-none text-accent">Technical details</summary>
+          <code className="mt-2 block break-all rounded border border-line bg-bg p-2">
+            {this.state.error.message || 'Unexpected route error.'}
+          </code>
+        </details>
       </section>
     );
   }

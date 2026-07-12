@@ -85,7 +85,7 @@ export function ProviderLatencyTile({ model }: { model: ProviderLatencyModel }) 
       data-available={model.available ? 'true' : 'false'}
     >
       <div className="mb-0.5 flex items-center gap-1">
-        <span className="text-[10px] uppercase tracking-wide text-text-muted">per-provider</span>
+        <span className="text-[10px] uppercase tracking-wide text-text-muted">provider attempts · m1</span>
         {model.stale && (
           <span
             className="rounded-sm border border-status-cooling/50 bg-status-cooling/10 px-1 py-px text-[8px] uppercase tracking-wide text-status-cooling"
@@ -111,6 +111,8 @@ export function ProviderLatencyTile({ model }: { model: ProviderLatencyModel }) 
       </div>
 
       {model.available ? (
+        <>
+        <p className="mb-1 text-[9px] text-text-muted">{model.samplesText} attempts · includes failed primaries · histogram-derived percentiles</p>
         <dl className="grid grid-cols-2 gap-x-2 gap-y-0.5">
           <FigureRow testId="provider-p50" label="p50" figure={model.p50} badge />
           <FigureRow testId="provider-p95" label="p95" figure={model.p95} />
@@ -121,6 +123,7 @@ export function ProviderLatencyTile({ model }: { model: ProviderLatencyModel }) 
             {model.samplesText}
           </dd>
         </dl>
+        </>
       ) : (
         // Absent ⇒ the no-samples state: an explicit `—` line, NEVER fabricated 0ms/0%.
         <p className="tabular-nums text-text-muted" data-testid="provider-latency-unavailable" data-quality="unavailable">

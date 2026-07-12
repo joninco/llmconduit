@@ -21,12 +21,12 @@ describe('ProviderLatencyTile (gap 13)', () => {
   it('renders per-provider p50/p95/p99 (derived) + a measured error rate', () => {
     const { getByTestId } = renderTile(per());
     expect(getByTestId('provider-latency-tile')).toHaveAttribute('data-available', 'true');
-    expect(getByTestId('provider-p50')).toHaveTextContent('82ms');
+    expect(getByTestId('provider-p50')).toHaveTextContent('82 ms');
     expect(getByTestId('provider-p50')).toHaveAttribute('data-quality', 'derived');
-    expect(getByTestId('provider-p95')).toHaveTextContent('190ms');
-    expect(getByTestId('provider-p99')).toHaveTextContent('240ms');
+    expect(getByTestId('provider-p95')).toHaveTextContent('190 ms');
+    expect(getByTestId('provider-p99')).toHaveTextContent('240 ms');
     const err = getByTestId('provider-error-rate');
-    expect(err).toHaveTextContent('4.0%');
+    expect(err).toHaveTextContent('4%');
     expect(err).toHaveAttribute('data-quality', 'measured');
     expect(getByTestId('provider-samples')).toHaveTextContent('48/50');
   });

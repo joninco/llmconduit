@@ -50,6 +50,25 @@ afterEach(() => {
 });
 
 describe('StatsStrip — chips', () => {
+  it.each([320, 375, 768, 1024, 1440])('keeps metric cards structurally unclipped at %ipx', (width) => {
+    const { getByTestId } = renderWithQuery(<div style={{ width }}><StatsStrip /></div>);
+    pushMetrics(metrics(1));
+    expect(getByTestId('stats-strip').className).not.toContain('overflow-hidden');
+    expect(getByTestId('primary-metrics').className).not.toContain('overflow-hidden');
+    for (const key of CHIP_METRICS) expect(getByTestId(`chip-${key}`).className).toContain('min-w-0');
+  });
+
+  it('uses a controlled accessible disclosure whose state survives live metric updates', () => {
+    const { getByRole } = renderWithQuery(<StatsStrip />);
+    const button = getByRole('button', { name: /More metrics/ });
+    expect(button.getAttribute('aria-expanded')).toBe('false');
+    fireEvent.click(button);
+    expect(button.getAttribute('aria-expanded')).toBe('true');
+    expect(button.getAttribute('aria-controls')).toBe('secondary-metrics');
+    pushMetrics(metrics(2));
+    expect(getByRole('button', { name: /Fewer metrics/ }).getAttribute('aria-expanded')).toBe('true');
+  });
+
   it('renders every chip with a tabular-nums value', () => {
     const { getByTestId } = renderWithQuery(<StatsStrip />);
     pushMetrics(metrics(1, {}, { m1: { accepted_per_sec: 7.5, reported_tokens_per_sec: 1500 } }));
@@ -61,7 +80,7 @@ describe('StatsStrip — chips', () => {
     // The m1 window value surfaced (req/s chip shows 7.5).
     expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('7.5');
     // tokens compaction.
-    expect(within(getByTestId('chip-reported_tokens_per_sec')).getByTestId('chip-value').textContent).toBe('1.5k');
+    expect(within(getByTestId('chip-reported_tokens_per_sec')).getByTestId('chip-value').textContent).toBe('1.5k tok/s');
   });
 
   it('uses backend generation counters when present and exposes source plus coverage', () => {
@@ -77,7 +96,7 @@ describe('StatsStrip — chips', () => {
     }));
     const chip = getByTestId('chip-reported_tokens_per_sec');
     expect(chip.textContent).toContain('engine gen tok/s');
-    expect(within(chip).getByTestId('chip-value').textContent).toBe('288');
+    expect(within(chip).getByTestId('chip-value').textContent).toBe('288 tok/s');
     expect(chip.getAttribute('data-source')).toBe('engine');
     expect(chip.getAttribute('data-quality')).toBe('partial');
     expect(chip.getAttribute('title')).toContain('1/2 physically distinct metrics sources');
@@ -92,7 +111,7 @@ describe('StatsStrip — chips', () => {
     // A second, third frame deepens the series; the chip value reflects the latest.
     pushMetrics(metrics(2, {}, { m1: { accepted_per_sec: 2 } }));
     pushMetrics(metrics(3, {}, { m1: { accepted_per_sec: 3 } }));
-    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('3.0');
+    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('3');
   });
 
   it('turns the err% chip red above the 5% threshold', () => {
@@ -125,7 +144,7 @@ describe('StatsStrip — chips', () => {
     expect(val('failure_pct')).toBe('—');
     // The genuinely-measured req/s + the live active count stay numeric.
     expect(val('accepted_per_sec')).toBe('2.5');
-    expect(val('active_streams_now')).toBe('4.0');
+    expect(val('active_streams_now')).toBe('4');
   });
 
   // Gap 01 finding 4 — provenance/quality is rendered on every chip (data-quality).
@@ -227,8 +246,8 @@ describe('StatsStrip — instantaneous idle retention', () => {
 
     // Request-derived values stay on the last instantaneous cut, but the live active count is 0.
     expect(value('accepted_per_sec')).toBe('6.5');
-    expect(value('active_streams_now')).toBe('0.0');
-    expect(value('reported_tokens_per_sec')).toBe('75.0');
+    expect(value('active_streams_now')).toBe('0');
+    expect(value('reported_tokens_per_sec')).toBe('75 tok/s');
     expect(getByTestId('chip-reported_tokens_per_sec').textContent).toContain('engine gen tok/s');
     expect(getByTestId('stats-strip').getAttribute('data-metrics-state')).toBe('retained');
     expect(getByTestId('chip-accepted_per_sec').getAttribute('data-retained')).toBe('true');
@@ -264,7 +283,7 @@ describe('StatsStrip — seek isolation (D11 R5)', () => {
     // Two LIVE ticks build the live history; chip reads the latest live (2) with an UP delta.
     pushMetrics(metrics(1, {}, { m1: { accepted_per_sec: 1 } }));
     pushMetrics(metrics(2, {}, { m1: { accepted_per_sec: 2 } }));
-    expect(value()).toBe('2.0');
+    expect(value()).toBe('2');
     expect(delta()).toBe('▲');
 
     // SEEK: install a FROZEN cut (reqs/s = 42) atomically with connection='seeking'.
@@ -281,16 +300,16 @@ describe('StatsStrip — seek isolation (D11 R5)', () => {
       });
     });
     // Chip CURRENT value reads the frozen sample and compares it with the preceding historical point.
-    expect(value()).toBe('42.0');
+    expect(value()).toBe('42');
     expect(delta()).toBe('▲');
 
     // RESUME: restore baseline (live seq 2) atomically with connection='live' → chip back on live.
     act(() => dashboardStore.getState().restoreLiveBaseline(baseline));
-    expect(value()).toBe('2.0');
+    expect(value()).toBe('2');
 
     // A NEW live tick continues the live history cleanly — the frozen 42 left no trace.
     pushMetrics(metrics(3, {}, { m1: { accepted_per_sec: 3 } }));
-    expect(value()).toBe('3.0');
+    expect(value()).toBe('3');
     expect(delta()).toBe('▲'); // 3 > 2 (the prior LIVE sample, not the frozen 42)
   });
 });
@@ -301,15 +320,15 @@ describe('StatsStrip — history horizon selector', () => {
     // Legacy-shaped override arguments are deliberately distinct; only the instant m1 value exists.
     pushMetrics(metrics(1, {}, { m1: { accepted_per_sec: 1 }, m5: { accepted_per_sec: 5 }, h1: { accepted_per_sec: 9 } }));
     // Default window is 1m.
-    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('1.0');
+    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('1');
 
     // Switch to 5m.
     fireEvent.click(getByText('5m'));
-    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('1.0');
+    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('1');
 
     // Switch to 1h.
     fireEvent.click(getByText('1h'));
-    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('1.0');
+    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('chip-value').textContent).toBe('1');
 
     // aria-pressed tracks the active window.
     expect(getByText('1h').getAttribute('aria-pressed')).toBe('true');

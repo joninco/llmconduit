@@ -271,6 +271,8 @@ pub struct FlowsQuery {
     pub cursor: Option<String>,
     pub page: Option<usize>,
     pub limit: Option<usize>,
+    pub sort: Option<String>,
+    pub direction: Option<String>,
 }
 
 /// One streamed delta replayed into the inspector (from the MonitorHub snapshot,
@@ -1421,6 +1423,125 @@ async fn historical_flow_view(gateway: &Gateway, cut_id: u64) -> Option<Historic
 // Handlers (each `State(Arc<Gateway>)`; no-store + auth applied by the route layer)
 // ---------------------------------------------------------------------------
 
+fn requested_flow_sort(query: &FlowsQuery) -> (crate::dashboard_history::DurableFlowSort, bool) {
+    use crate::dashboard_history::DurableFlowSort;
+    let sort = match query.sort.as_deref() {
+        Some("latency") => DurableFlowSort::Latency,
+        Some("status") => DurableFlowSort::Status,
+        Some("model") => DurableFlowSort::Model,
+        Some("upstream") => DurableFlowSort::Upstream,
+        Some("tokens") => DurableFlowSort::Tokens,
+        Some("cost") => DurableFlowSort::Cost,
+        Some("client") => DurableFlowSort::Client,
+        Some("endpoint") => DurableFlowSort::Endpoint,
+        Some("id") => DurableFlowSort::Id,
+        _ => DurableFlowSort::Started,
+    };
+    (sort, !matches!(query.direction.as_deref(), Some("asc")))
+}
+
+fn sort_flow_rows(
+    rows: &mut [FlowRow],
+    sort: crate::dashboard_history::DurableFlowSort,
+    descending: bool,
+) {
+    use crate::dashboard_history::DurableFlowSort;
+    use std::cmp::Ordering;
+
+    fn optional<T: Ord>(left: Option<T>, right: Option<T>, descending: bool) -> Ordering {
+        match (left, right) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(left), Some(right)) => {
+                let order = left.cmp(&right);
+                if descending { order.reverse() } else { order }
+            }
+        }
+    }
+
+    rows.sort_by(|left, right| {
+        let order = match sort {
+            DurableFlowSort::Started => left.started_ms.cmp(&right.started_ms),
+            DurableFlowSort::Latency => optional(left.elapsed_ms, right.elapsed_ms, descending),
+            DurableFlowSort::Status => {
+                format!("{:?}", left.status).cmp(&format!("{:?}", right.status))
+            }
+            DurableFlowSort::Model => optional(
+                left.model_served
+                    .as_ref()
+                    .or(left.model_requested.as_ref())
+                    .map(|v| v.to_ascii_lowercase()),
+                right
+                    .model_served
+                    .as_ref()
+                    .or(right.model_requested.as_ref())
+                    .map(|v| v.to_ascii_lowercase()),
+                descending,
+            ),
+            DurableFlowSort::Upstream => optional(
+                left.upstream_target
+                    .as_ref()
+                    .map(|v| v.to_ascii_lowercase()),
+                right
+                    .upstream_target
+                    .as_ref()
+                    .map(|v| v.to_ascii_lowercase()),
+                descending,
+            ),
+            DurableFlowSort::Tokens => optional(
+                left.usage.map(|v| v.total),
+                right.usage.map(|v| v.total),
+                descending,
+            ),
+            DurableFlowSort::Cost => match (left.cost, right.cost) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => {
+                    if descending {
+                        left.total_cmp(&right).reverse()
+                    } else {
+                        left.total_cmp(&right)
+                    }
+                }
+            },
+            DurableFlowSort::Client => optional(
+                left.client_label.as_ref().map(|v| v.to_ascii_lowercase()),
+                right.client_label.as_ref().map(|v| v.to_ascii_lowercase()),
+                descending,
+            ),
+            DurableFlowSort::Endpoint => left
+                .uri
+                .to_ascii_lowercase()
+                .cmp(&right.uri.to_ascii_lowercase()),
+            DurableFlowSort::Id => left.api_call_id.cmp(&right.api_call_id),
+        };
+        let primary = if matches!(
+            sort,
+            DurableFlowSort::Latency
+                | DurableFlowSort::Model
+                | DurableFlowSort::Upstream
+                | DurableFlowSort::Tokens
+                | DurableFlowSort::Cost
+                | DurableFlowSort::Client
+        ) {
+            order
+        } else if descending {
+            order.reverse()
+        } else {
+            order
+        };
+        primary.then_with(|| {
+            if descending {
+                right.api_call_id.cmp(&left.api_call_id)
+            } else {
+                left.api_call_id.cmp(&right.api_call_id)
+            }
+        })
+    });
+}
+
 /// `GET /dashboard/api/flows?status=&model=&upstream=&page=&limit=` — the flow
 /// table. Lists newest-first from the FlowStore (D1), filters by status/model/
 /// upstream, pages, and stamps the FlowStore domain `flow_seq`. Each row carries
@@ -1429,6 +1550,7 @@ pub async fn dashboard_flows(
     State(gateway): State<Arc<Gateway>>,
     Query(query): Query<FlowsQuery>,
 ) -> Response {
+    let (sort, descending) = requested_flow_sort(&query);
     let limit = query.limit.unwrap_or(100).clamp(1, 500);
     let page = query.page.unwrap_or(1).max(1);
     let status_filter = query.status.as_deref().and_then(parse_status_filter);
@@ -1458,12 +1580,7 @@ pub async fn dashboard_flows(
                 )
             })
             .collect();
-        rows.sort_by(|left, right| {
-            right
-                .started_ms
-                .cmp(&left.started_ms)
-                .then_with(|| right.api_call_id.cmp(&left.api_call_id))
-        });
+        sort_flow_rows(&mut rows, sort, descending);
         let total = rows.len();
         return json_no_store(
             StatusCode::OK,
@@ -1502,6 +1619,8 @@ pub async fn dashboard_flows(
                 upstream: query.upstream.clone(),
                 client: query.client.clone(),
                 search: query.q.clone(),
+                sort,
+                descending,
             },
             query.cursor.clone(),
             limit,
@@ -1546,12 +1665,7 @@ pub async fn dashboard_flows(
         }
     }
     let mut rows = by_id.into_values().collect::<Vec<_>>();
-    rows.sort_by(|left, right| {
-        right
-            .started_ms
-            .cmp(&left.started_ms)
-            .then_with(|| right.api_call_id.cmp(&left.api_call_id))
-    });
+    sort_flow_rows(&mut rows, sort, descending);
     rows.truncate(limit);
     json_no_store(
         StatusCode::OK,
@@ -1688,6 +1802,7 @@ pub async fn dashboard_flow_summary(
         upstream: query.upstream,
         client: query.client,
         search: query.q,
+        ..crate::dashboard_history::DurableFlowFilter::default()
     };
     match gateway.dashboard_history().flow_rollup(filter).await {
         Ok(rollup) => json_no_store(StatusCode::OK, &rollup),
@@ -2040,6 +2155,7 @@ pub async fn dashboard_overview(
                 upstream: upstream.clone(),
                 client: client.clone(),
                 search: None,
+                ..crate::dashboard_history::DurableFlowFilter::default()
             })
             .await;
         if let Some(summary) = latest {
@@ -2935,6 +3051,70 @@ mod tests {
         assert_eq!(apply_paging(rows(5), None, None).len(), 5);
         // Out-of-range page ⇒ empty.
         assert!(apply_paging(rows(3), Some(9), Some(2)).is_empty());
+    }
+
+    #[test]
+    fn flow_sort_is_stable_and_keeps_unavailable_values_last() {
+        let row = |id: &str, elapsed_ms: Option<u128>, total: Option<i64>| FlowRow {
+            revision: 1,
+            api_call_id: id.to_string(),
+            response_id: None,
+            method: "POST".to_string(),
+            uri: "/v1/responses".to_string(),
+            model_requested: Some("m".to_string()),
+            model_served: Some("m".to_string()),
+            upstream_target: Some("p".to_string()),
+            usage: total.map(|total| FlowUsage {
+                prompt: total,
+                completion: 0,
+                total,
+                cached: None,
+                reasoning: None,
+            }),
+            normalized_usage: None,
+            usage_anomaly_count: 0,
+            effective_route_limit: None,
+            cache_price_impact_usd: None,
+            status: FlowStatus::Completed,
+            started_ms: 1,
+            finished_ms: None,
+            elapsed_ms,
+            terminal_reason: None,
+            client_label: None,
+            client_source: None,
+            cost: None,
+            cost_confidence: CostConfidence::Unavailable,
+            phases: PhaseTimings::default(),
+            attempts: Vec::new(),
+            first_upstream_byte_ms: None,
+        };
+        let mut rows = vec![
+            row("z", None, None),
+            row("b", Some(20), Some(3)),
+            row("a", Some(20), Some(2)),
+        ];
+        sort_flow_rows(
+            &mut rows,
+            crate::dashboard_history::DurableFlowSort::Latency,
+            false,
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.api_call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "z"]
+        );
+        sort_flow_rows(
+            &mut rows,
+            crate::dashboard_history::DurableFlowSort::Tokens,
+            true,
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.api_call_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a", "z"]
+        );
     }
 
     /// Gap 04 review F3: `FlowRow` carries the OPTIONAL `client_label`/`client_source`

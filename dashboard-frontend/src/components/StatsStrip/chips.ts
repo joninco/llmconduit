@@ -6,6 +6,7 @@
  * flow-table formatters where they fit (tokens), and adds small local ones for rates/latency/%.
  */
 import type { CostConfidence, EngineThroughputSample, InstantMetricSample } from '../../api/types';
+import { fmtCostRate, fmtLatency, fmtPercent, fmtRate, fmtTokensPerSec } from '../FlowTable/format';
 import { colors } from '../../design/tokens';
 import { metricUnavailable, type MetricKey, type MetricSource } from './metricHistory';
 
@@ -74,32 +75,7 @@ function metricDetails(window: InstantMetricSample | null, key: MetricKey): stri
 }
 
 /** Round-trip-safe compact rate (`4.2`, `142`, `1.2k`). */
-function fmtRate(n: number): string {
-  if (!Number.isFinite(n)) return '—';
-  if (n === 0) return '0.0';
-  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
-  if (n >= 100) return String(Math.round(n));
-  if (n >= 1) return n.toFixed(1);
-  if (n >= 0.1) return n.toFixed(2);
-  if (n >= 0.01) return n.toFixed(3);
-  if (n >= 0.001) return n.toFixed(4);
-  return n.toPrecision(2);
-}
-
-/** Latency ms → integer ms (`920`). */
-function fmtMs(n: number): string {
-  return Number.isFinite(n) ? String(Math.round(n)) : '—';
-}
-
-/** Percent → 1dp (`1.1`). */
-function fmtPct(n: number): string {
-  return Number.isFinite(n) ? n.toFixed(1) : '—';
-}
-
-/** Dollars/min → 2dp (`0.21`). */
-function fmtMoney(n: number): string {
-  return Number.isFinite(n) ? n.toFixed(2) : '—';
-}
+const fmtBareRate = (n: number) => fmtRate(n, '');
 
 /** Compare a metric field across two samples → delta direction (with a small epsilon). */
 function deltaDir(cur: number, prev: number | undefined): DeltaDir {
@@ -150,19 +126,19 @@ interface MetricSpec {
 }
 
 const METRIC_SPECS: readonly MetricSpec[] = [
-  { key: 'accepted_per_sec', label: 'inbound/s', fmt: fmtRate, stroke: colors.accent, accent: 'accent', quality: 'measured' },
-  { key: 'terminal_per_sec', label: 'done/s', fmt: fmtRate, stroke: colors.accent, accent: 'text', quality: 'measured' },
-  { key: 'active_streams_now', label: 'active now', fmt: fmtRate, stroke: colors.accent, accent: 'text', quality: 'measured' },
-  { key: 'failure_pct', label: 'fail %', fmt: fmtPct, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
-  { key: 'cancellation_pct', label: 'cancel %', fmt: fmtPct, stroke: colors.statusCooling, accent: 'text', quality: 'derived' },
-  { key: 'p50_ms', label: 'p50 e2e ms', fmt: fmtMs, stroke: colors.statusHealthy, accent: 'text', quality: 'derived' },
-  { key: 'p95_ms', label: 'p95 e2e ms', fmt: fmtMs, stroke: colors.statusCooling, accent: 'text', quality: 'derived' },
-  { key: 'p99_ms', label: 'p99 e2e ms', fmt: fmtMs, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
-  { key: 'reported_tokens_per_sec', label: 'reported tok/s', fmt: fmtRate, stroke: colors.statusHealthy, accent: 'healthy', quality: 'derived' },
+  { key: 'accepted_per_sec', label: 'inbound req/s', fmt: fmtBareRate, stroke: colors.accent, accent: 'accent', quality: 'measured' },
+  { key: 'terminal_per_sec', label: 'done req/s', fmt: fmtBareRate, stroke: colors.accent, accent: 'text', quality: 'measured' },
+  { key: 'active_streams_now', label: 'active now', fmt: fmtBareRate, stroke: colors.accent, accent: 'text', quality: 'measured' },
+  { key: 'failure_pct', label: 'failures', fmt: fmtPercent, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
+  { key: 'cancellation_pct', label: 'cancellations', fmt: fmtPercent, stroke: colors.statusCooling, accent: 'text', quality: 'derived' },
+  { key: 'p50_ms', label: 'gateway E2E p50', fmt: fmtLatency, stroke: colors.statusHealthy, accent: 'text', quality: 'derived' },
+  { key: 'p95_ms', label: 'gateway E2E p95', fmt: fmtLatency, stroke: colors.statusCooling, accent: 'text', quality: 'derived' },
+  { key: 'p99_ms', label: 'gateway E2E p99', fmt: fmtLatency, stroke: colors.statusDown, accent: 'text', quality: 'derived' },
+  { key: 'reported_tokens_per_sec', label: 'reported throughput', fmt: fmtTokensPerSec, stroke: colors.statusHealthy, accent: 'healthy', quality: 'derived' },
   // $/min: the static tier here is a FALLBACK only — its real quality is derived per-sample from
   // the backend `cost_confidence` (gap 07 finding 5, see `costQuality`), so a confident aggregate
   // reads `derived` and an estimated one reads `estimated` (no longer always `estimated`).
-  { key: 'cost_per_min', label: '$/min', fmt: fmtMoney, stroke: colors.meta, accent: 'meta', quality: 'estimated' },
+  { key: 'cost_per_min', label: 'cost rate', fmt: fmtCostRate, stroke: colors.meta, accent: 'meta', quality: 'estimated' },
 ];
 
 /** The unavailable / no-data marker (a value that cannot be measured renders this, never `0`). */

@@ -136,13 +136,44 @@ pub struct HistoricalCutSelection {
     pub newest_at_ms: Option<u128>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DurableFlowFilter {
     pub status: Option<FlowStatus>,
     pub model: Option<String>,
     pub upstream: Option<String>,
     pub client: Option<String>,
     pub search: Option<String>,
+    pub sort: DurableFlowSort,
+    pub descending: bool,
+}
+
+impl Default for DurableFlowFilter {
+    fn default() -> Self {
+        Self {
+            status: None,
+            model: None,
+            upstream: None,
+            client: None,
+            search: None,
+            sort: DurableFlowSort::Started,
+            descending: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DurableFlowSort {
+    #[default]
+    Started,
+    Latency,
+    Status,
+    Model,
+    Upstream,
+    Tokens,
+    Cost,
+    Client,
+    Endpoint,
+    Id,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -209,6 +240,12 @@ struct DurableCursor {
     started_ms: i64,
     api_call_id: String,
     as_of_event_id: i64,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    sort: Option<String>,
+    #[serde(default)]
+    descending: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2097,6 +2134,29 @@ fn load_latest_flow_page_sync(
                 })
         })
         .transpose()?;
+    let sort_name = match filter.sort {
+        DurableFlowSort::Started => "started",
+        DurableFlowSort::Latency => "latency",
+        DurableFlowSort::Status => "status",
+        DurableFlowSort::Model => "model",
+        DurableFlowSort::Upstream => "upstream",
+        DurableFlowSort::Tokens => "tokens",
+        DurableFlowSort::Cost => "cost",
+        DurableFlowSort::Client => "client",
+        DurableFlowSort::Endpoint => "endpoint",
+        DurableFlowSort::Id => "id",
+    };
+    if let Some(value) = &cursor
+        && (value.sort.as_deref().unwrap_or("started") != sort_name
+            || value.descending.unwrap_or(true) != filter.descending)
+    {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    let keyset = filter.sort == DurableFlowSort::Started && filter.descending;
+    let page_offset = cursor
+        .as_ref()
+        .and_then(|value| value.offset)
+        .unwrap_or(offset);
     let as_of_event_id = if let Some(cursor) = &cursor {
         cursor.as_of_event_id
     } else {
@@ -2115,8 +2175,12 @@ fn load_latest_flow_page_sync(
         .upstream
         .map(|value| format!("%{}%", value.trim().to_ascii_lowercase()));
     let client = filter.client.map(|value| value.trim().to_ascii_lowercase());
-    let before_started = cursor.as_ref().map(|cursor| cursor.started_ms);
-    let before_id = cursor.as_ref().map(|cursor| cursor.api_call_id.as_str());
+    let before_started = keyset
+        .then(|| cursor.as_ref().map(|value| value.started_ms))
+        .flatten();
+    let before_id = keyset
+        .then(|| cursor.as_ref().map(|value| value.api_call_id.as_str()))
+        .flatten();
     let where_clause = "event_id <= :as_of
          AND (:status IS NULL OR status = :status)
          AND (:model IS NULL OR lower(COALESCE(model_requested, '')) LIKE :model
@@ -2164,10 +2228,32 @@ fn load_latest_flow_page_sync(
         },
         |row| row.get(0),
     )?;
+    let sort_expr = match filter.sort {
+        DurableFlowSort::Started => "started_ms",
+        DurableFlowSort::Latency => {
+            "(SELECT elapsed_ms FROM terminal_facts tf WHERE tf.api_call_id = flows_latest.api_call_id)"
+        }
+        DurableFlowSort::Status => "status",
+        DurableFlowSort::Model => "lower(COALESCE(model_served, model_requested))",
+        DurableFlowSort::Upstream => "lower(upstream_target)",
+        DurableFlowSort::Tokens => {
+            "(SELECT total_tokens FROM terminal_facts tf WHERE tf.api_call_id = flows_latest.api_call_id)"
+        }
+        DurableFlowSort::Cost => {
+            "(SELECT cost_usd FROM terminal_facts tf WHERE tf.api_call_id = flows_latest.api_call_id)"
+        }
+        DurableFlowSort::Client => "lower(client_label)",
+        DurableFlowSort::Endpoint => "lower(uri)",
+        DurableFlowSort::Id => "api_call_id",
+    };
+    let direction = if filter.descending { "DESC" } else { "ASC" };
+    let order = format!(
+        "CASE WHEN {sort_expr} IS NULL THEN 1 ELSE 0 END ASC, {sort_expr} {direction}, api_call_id {direction}"
+    );
     let sql = format!(
         "SELECT summary, started_ms, api_call_id
          FROM flows_latest WHERE {where_clause}
-         ORDER BY started_ms DESC, api_call_id DESC LIMIT :limit OFFSET :offset"
+         ORDER BY {order} LIMIT :limit OFFSET :offset"
     );
     let fetch_limit = limit.saturating_add(1).min(501) as i64;
     let mut statement = connection.prepare(&sql)?;
@@ -2188,7 +2274,7 @@ fn load_latest_flow_page_sync(
         ":before_started": before_started,
         ":before_id": before_id,
         ":limit": fetch_limit,
-        ":offset": offset.min(i64::MAX as usize) as i64,
+        ":offset": page_offset.min(i64::MAX as usize) as i64,
     })?;
     let mut decoded = Vec::<(SnapshotFlowSummary, i64, String)>::new();
     while let Some(row) = rows.next()? {
@@ -2205,6 +2291,9 @@ fn load_latest_flow_page_sync(
                 started_ms: *started_ms,
                 api_call_id: api_call_id.clone(),
                 as_of_event_id,
+                offset: (!keyset).then_some(page_offset.saturating_add(limit)),
+                sort: Some(sort_name.to_string()),
+                descending: Some(filter.descending),
             };
             serde_json::to_vec(&cursor)
                 .ok()
@@ -3363,6 +3452,32 @@ mod tests {
                 .iter()
                 .all(|flow| flow.api_call_id != "api_new")
         );
+        let sorted_filter = DurableFlowFilter {
+            sort: DurableFlowSort::Status,
+            descending: false,
+            ..DurableFlowFilter::default()
+        };
+        let sorted_first = history
+            .latest_flow_page(sorted_filter.clone(), None, 5, 0)
+            .await
+            .expect("sorted first page");
+        let sorted_cursor = sorted_first.next_cursor.clone().expect("sorted cursor");
+        let sorted_second = history
+            .latest_flow_page(sorted_filter, Some(sorted_cursor), 5, 0)
+            .await
+            .expect("sorted second page");
+        let first_ids = sorted_first
+            .summaries
+            .iter()
+            .map(|flow| &flow.api_call_id)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            sorted_second
+                .summaries
+                .iter()
+                .all(|flow| !first_ids.contains(&flow.api_call_id))
+        );
+        assert_eq!(sorted_second.total, sorted_first.total);
         let rollup = history
             .flow_rollup(DurableFlowFilter::default())
             .await

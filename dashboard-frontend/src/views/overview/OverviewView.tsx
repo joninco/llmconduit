@@ -24,13 +24,12 @@ import { Panel } from '../../components/ui/Panel';
 import { Sparkline } from '../../viz/Sparkline';
 import { ProviderLatencyTile } from '../../components/viz/ProviderLatencyTile';
 import { buildProviderLatency } from '../../components/viz/providerLatency';
-import { fmtCost, fmtTokens } from '../../components/FlowTable/format';
+import { fmtCost, fmtLatency, fmtPercent, fmtTokens, fmtTokensPerSec } from '../../components/FlowTable/format';
 import { cn } from '../../lib/cn';
 import { useTopologyQuery, topologyProviderKey } from '../../store/useTopologyQuery';
 import { EngineMetricsCard } from '../../components/viz/EngineMetricsCard';
 import { StaleFallbackBanner } from '../../components/StaleFallbackBanner';
 import { deriveDashboardStatus } from '../../lib/dashboardStatus';
-import { OperationalStatus } from '../../components/ui/OperationalStatus';
 
 const DASH = '—';
 const TOP_ROWS = 5;
@@ -176,26 +175,25 @@ function OverviewHeadline({ response }: { response: OverviewResponse }) {
     <section className="mb-4" aria-labelledby="overview-headline-title" data-testid="overview-headline">
       <div className="mb-2 flex min-w-0 flex-wrap items-center justify-between gap-2">
         <h2 id="overview-headline-title" className="text-sm font-semibold text-text">Operational picture</h2>
-        <OperationalStatus model={status} />
       </div>
-      <div className="grid min-w-0 grid-cols-2 gap-px overflow-hidden rounded-md border border-line bg-line md:grid-cols-3 xl:grid-cols-6">
+      <div className="grid min-w-0 grid-cols-2 gap-px rounded-md border border-line bg-line md:grid-cols-3 xl:grid-cols-6">
         <HeadlineMetric label="Overall health" value={health.value} className={health.cls} detail={health.detail} />
         <HeadlineMetric label="Active traffic" value={`${instant?.active_streams_now ?? 0}`} className={(instant?.active_streams_now ?? 0) > 0 ? 'text-status-healthy' : 'text-text'} detail="Global · current open requests" />
         <HeadlineMetric
           label="Failure rate"
-          value={failureRate === null ? 'Unavailable' : `${failureRate.toFixed(failureRate === 0 ? 0 : 1)}%`}
+          value={failureRate === null ? 'Unavailable' : fmtPercent(failureRate)}
           className={failureRate !== null && failureRate > 0 ? 'text-status-down' : 'text-text'}
           detail={`${response.totals.requests} terminal · ${scoped ? 'Scoped' : 'Global'} · last ${response.scope.window}`}
         />
         <HeadlineMetric
-          label="P95 latency"
-          value={p95Available ? fmtHeadlineMs(instant!.p95_ms!) : 'Unavailable'}
+          label="Gateway E2E P95"
+          value={p95Available ? fmtLatency(instant!.p95_ms!) : 'Unavailable'}
           className={p95Available ? 'text-text' : 'text-text-muted'}
-          detail={instant && instant.latency_samples < 2 ? `Not enough samples · ${instant.latency_samples} request` : `${instant?.latency_samples ?? 0} requests · Global · latest interval`}
+          detail={instant && instant.latency_samples < 2 ? `Latest publisher interval · Gateway E2E · ${instant.latency_samples} sample · insufficient` : `Latest publisher interval · Gateway E2E · ${instant?.latency_samples ?? 0} terminal requests · measured`}
         />
         <HeadlineMetric
           label="Throughput"
-          value={throughput === null ? 'Unavailable' : `${fmtTokens(throughput)}/s`}
+          value={throughput === null ? 'Unavailable' : fmtTokensPerSec(throughput)}
           className={throughput === null ? 'text-text-muted' : 'text-status-healthy'}
           detail={`${throughputSamples} · Global · latest interval`}
         />
@@ -218,10 +216,6 @@ function HeadlineMetric({ label, value, detail, className }: { label: string; va
       <div className="mt-1 text-[10px] leading-tight text-text-muted">{detail}</div>
     </div>
   );
-}
-
-function fmtHeadlineMs(ms: number): string {
-  return ms >= 1_000 ? `${(ms / 1_000).toFixed(ms >= 10_000 ? 1 : 2)}s` : `${Math.round(ms)}ms`;
 }
 
 function OverviewContent({ response }: { response: OverviewResponse }) {
@@ -510,7 +504,7 @@ function FailureTile({ response }: { response: OverviewResponse }) {
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-xs font-semibold text-text">Failures by reason</span>
         <span className={cn('font-mono text-sm font-semibold tabular-nums', rate !== null && rate > ERROR_RATE_THRESHOLD ? 'text-status-down' : QUALITY_CLASS[quality])} data-testid="overview-failures-rate" data-quality={quality}>
-          {rate === null ? DASH : `${rate.toFixed(1)}%`}
+          {rate === null ? DASH : fmtPercent(rate)}
         </span>
       </div>
       {response.totals.requests === 0 ? (
@@ -577,7 +571,7 @@ function ContextTile({ response }: { response: OverviewResponse }) {
         <div>
           <div className="text-[10px] text-text-muted">Average utilization</div>
           <div className={cn('font-mono text-2xl font-semibold tabular-nums', pressure !== null && pressure >= 90 ? 'text-status-down' : pressure !== null && pressure >= 75 ? 'text-status-cooling' : QUALITY_CLASS[context.data_quality])} data-testid="overview-context-pressure">
-            {available ? `${pressure!.toFixed(1)}%` : DASH}
+            {available ? fmtPercent(pressure) : DASH}
           </div>
         </div>
         <div className="text-right">

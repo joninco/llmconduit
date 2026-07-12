@@ -38,7 +38,7 @@ test.describe('Argus dashboard', () => {
       // A real, non-zero reading (the mock's seeded window is all > 0).
       expect(text, `${key} reads a real number`).toMatch(/[1-9]/);
     }
-    await page.getByTestId('more-metrics').locator('summary').click();
+    await page.getByTestId('more-metrics').getByRole('button', { name: /More metrics/ }).click();
     for (const key of ['cost_per_min', 'accepted_per_sec']) {
       const value = page.getByTestId(`chip-${key}`).getByTestId('chip-value');
       await expect(value).toBeVisible();
@@ -238,57 +238,24 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on the failover trace').toEqual([]);
   });
 
-  // Gap 13: the topology tooltip shows PER-PROVIDER p50/p95/p99 + error rate (replacing the old
-  // GLOBAL p99), and nodes are sized/colored by per-provider latency/error. The per-provider data
-  // comes from the REST `/topology` node (the WS frame carries it ABSENT) — so the tooltip reads the
-  // REST path. Asserts the three states: a healthy provider (measured 0% — NOT —), a degrading one
-  // (real percentiles + an error distribution + a degrading node), and an unavailable one (`—`,
-  // never a fabricated 0ms/0%, neutral node).
-  test('topology per-provider tooltip + node states (gap 13)', async ({ page, consoleErrors }) => {
+  // Small deployments use the adaptive compact topology: the same REST-authored provider-attempt
+  // metrics are readable without spending the canvas on a sparse radial graph. The companion table
+  // remains the accessible fallback and larger deployments retain the full graph/tooltip path.
+  test('compact topology exposes per-provider attempt health (gap 13)', async ({ page, consoleErrors }) => {
     await login(page);
     await openView(page, VIEWS[1]!); // Topology
-    // Let d3-force settle so the nodes sit at stable, hoverable positions.
-    await page.waitForTimeout(800);
-
-    // vllm-a (healthy, all-served): the tile shows derived percentiles + a MEASURED 0% error rate
-    // (distinct from the unavailable `—`). Hover its node; the tooltip renders the per-provider tile.
-    await page.locator('[data-node-id="vllm-a"]').hover();
-    const tip = page.getByTestId('cooldown-tooltip');
-    await expect(tip).toBeVisible();
-    const tileA = tip.getByTestId('provider-latency-tile');
-    await expect(tileA).toHaveAttribute('data-available', 'true');
-    await expect(tip.getByTestId('provider-p50')).toHaveAttribute('data-quality', 'derived');
-    await expect(tip.getByTestId('provider-p50')).not.toContainText('—');
-    const errA = tip.getByTestId('provider-error-rate');
-    await expect(errA).toHaveAttribute('data-quality', 'measured');
-    await expect(errA).toContainText('0%'); // a real measured zero — NOT — and NOT absent
-    await expect(errA).not.toContainText('—');
-    // The healthy node is NEUTRAL (nominal emphasis, no error ring).
-    expect(await page.locator('[data-node-id="vllm-a"]').getAttribute('data-emphasis')).toBe('nominal');
-
-    // vllm-b (cooling, degrading): real derived percentiles + a per-class error distribution, and the
-    // node is emphasized `degrading`. Move the hover to it.
-    await page.locator('[data-node-id="vllm-b"]').hover();
-    const tileB = page.getByTestId('cooldown-tooltip').getByTestId('provider-latency-tile');
-    await expect(tileB).toHaveAttribute('data-available', 'true');
-    const errB = page.getByTestId('cooldown-tooltip').getByTestId('provider-error-rate');
-    await expect(errB).toHaveAttribute('data-quality', 'measured');
-    await expect(errB).not.toHaveText('—'); // a measured, elevated rate
-    // The error distribution lists the classes that occurred (connect + timeout in the mock).
-    await expect(page.getByTestId('cooldown-tooltip').getByTestId('provider-error-distribution')).toBeVisible();
-    await expect(page.getByTestId('cooldown-tooltip').getByTestId('provider-error-connect')).toBeVisible();
-    expect(await page.locator('[data-node-id="vllm-b"]').getAttribute('data-emphasis')).toBe('degrading');
-    await expect(page.locator('[data-node-id="vllm-b"] [data-testid="topo-error-ring"]')).toBeVisible();
-
-    // openai (down, ZERO in-window samples): per-provider is ABSENT → the tile reads `—`
-    // (unavailable), NEVER a fabricated 0ms/0%; the node stays NEUTRAL (not 0-sized / not healthy).
-    await page.locator('[data-node-id="openai"]').hover();
-    const tileC = page.getByTestId('cooldown-tooltip').getByTestId('provider-latency-tile');
-    await expect(tileC).toHaveAttribute('data-available', 'false');
-    const unavail = page.getByTestId('cooldown-tooltip').getByTestId('provider-latency-unavailable');
-    await expect(unavail).toHaveAttribute('data-quality', 'unavailable');
-    await expect(unavail).toContainText('—');
-    expect(await page.locator('[data-node-id="openai"]').getAttribute('data-emphasis')).toBe('unavailable');
+    const compact = page.getByTestId('compact-topology');
+    await expect(compact).toBeVisible();
+    const a = compact.locator('[data-node-id="vllm-a"]');
+    await expect(a).toContainText('Provider-attempt P95');
+    await expect(a).toContainText('Attempt errors');
+    await expect(a).not.toContainText('—');
+    const b = compact.locator('[data-node-id="vllm-b"]');
+    await expect(b).toContainText('cooling');
+    await expect(b).not.toContainText('—');
+    const unavailable = compact.locator('[data-node-id="openai"]');
+    await expect(unavailable).toContainText('—');
+    await expect(page.getByTestId('topology-companion-table')).toBeVisible();
 
     expect(consoleErrors, 'console errors on the per-provider tooltip').toEqual([]);
   });
@@ -658,7 +625,7 @@ test.describe('Argus dashboard', () => {
     expect(consoleErrors, 'console errors on flow lookup').toEqual([]);
   });
 
-  test('theater retains the last response after its old fade window and marks it stale', async ({ page, consoleErrors }) => {
+  test('theater retains the last response after its old fade window and marks it idle', async ({ page, consoleErrors }) => {
     await login(page);
     await openView(page, VIEWS.find((view) => view.name === 'theater')!);
 
@@ -666,11 +633,10 @@ test.describe('Argus dashboard', () => {
     // retained tile and is clearly distinguished from active streaming output.
     const river = page.getByTestId('river');
     await expect(river).toHaveAttribute('data-retained', 'true');
-    await expect(river).toHaveAttribute('data-stale', 'true');
     await expect(river.getByTestId('river-output')).toContainText('Hello, world');
     await expect(page.getByTestId('theater-view')).toContainText('0 active');
-    await expect(page.getByTestId('theater-stale-state')).toBeVisible();
-    await expect(page.getByTestId('theater-stale-age')).toHaveText('00:00');
+    await expect(page.getByTestId('theater-state')).toHaveAttribute('data-state', 'idle');
+    await expect(page.getByTestId('theater-idle-age')).toContainText('last response');
     // Status is text-first (not just a colored dot), and the compact telemetry is honest about
     // estimated tokens plus an unavailable rate when the mock has no measurable timestamp span.
     await expect(river.getByTestId('river-status')).toHaveText(/complete/i);

@@ -96,11 +96,14 @@ export function LatencyBreakdown({ model }: { model: LatencyBreakdownModel }) {
 
   return (
     <div className="flex flex-col gap-1.5" data-testid="latency-breakdown">
+      <p className="text-[10px] leading-tight text-text-muted" data-testid="selected-latency-scope">
+        Selected request · one gateway flow · phase timestamps below · provenance is shown per value
+      </p>
       {/* Headline timing figures — the "Timing" line. */}
       <div className="grid grid-cols-4 gap-2">
         <FigureCell
           testId="latency-ttft"
-          label="TTFT"
+          label="client-visible TTFT"
           value={fmtElapsed(ttft.valueMs)}
           quality={ttft.quality}
           detail={ttft.detail}
@@ -114,7 +117,7 @@ export function LatencyBreakdown({ model }: { model: LatencyBreakdownModel }) {
         />
         <FigureCell
           testId="latency-total"
-          label="total"
+          label="gateway E2E total"
           value={fmtElapsed(total.valueMs)}
           quality={total.quality}
           detail={total.detail}

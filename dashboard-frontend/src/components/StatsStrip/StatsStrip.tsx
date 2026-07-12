@@ -139,6 +139,7 @@ export function StatsStrip() {
   const chips = deriveChips(cur, prev, engineThroughput, previousEngineThroughput);
   const primaryChips = chips.filter((chip) => PRIMARY_METRICS.has(chip.key));
   const secondaryChips = chips.filter((chip) => !PRIMARY_METRICS.has(chip.key));
+  const [moreMetricsOpen, setMoreMetricsOpen] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     const id = globalThis.setInterval(() => setNowMs(Date.now()), 1_000);
@@ -155,7 +156,7 @@ export function StatsStrip() {
 
   return (
     <Panel
-      className="m-2 mb-0 min-w-0 overflow-hidden p-2 sm:m-4 sm:mb-0 sm:p-3"
+      className="m-2 mb-0 min-w-0 p-2 sm:m-4 sm:mb-0 sm:p-3"
       data-testid="stats-strip"
       data-metrics-state={showingRetained ? 'retained' : idle ? 'empty' : currentInstant ? 'instant' : 'empty'}
     >
@@ -180,7 +181,7 @@ export function StatsStrip() {
         </div>
       </div>
 
-      <div className="grid min-w-0 grid-cols-2 gap-px overflow-hidden rounded border border-line/60 bg-line/60 sm:grid-cols-3 lg:grid-cols-5" data-testid="primary-metrics">
+      <div className="grid min-w-0 grid-cols-2 gap-px rounded border border-line/60 bg-line/60 sm:grid-cols-3 lg:grid-cols-5" data-testid="primary-metrics">
         {primaryChips.map((chip) => (
           <ChipCell
             key={chip.key}
@@ -193,11 +194,17 @@ export function StatsStrip() {
         ))}
       </div>
 
-      <details className="mt-2" data-testid="more-metrics">
-        <summary className="inline-flex min-h-8 cursor-pointer items-center rounded px-1 text-[11px] font-medium text-text-muted hover:text-text">
-          More metrics <span className="ml-1 text-[10px]">({secondaryChips.length})</span>
-        </summary>
-        <div className="mt-1 grid min-w-0 grid-cols-2 gap-px overflow-hidden rounded border border-line/60 bg-line/60 sm:grid-cols-3 lg:grid-cols-5">
+      <div className="mt-2" data-testid="more-metrics">
+        <button
+          type="button"
+          className="inline-flex min-h-8 items-center rounded px-1 text-[11px] font-medium text-text-muted hover:text-text focus-visible:ring-2 focus-visible:ring-accent"
+          aria-expanded={moreMetricsOpen}
+          aria-controls="secondary-metrics"
+          onClick={() => setMoreMetricsOpen((open) => !open)}
+        >
+          {moreMetricsOpen ? 'Fewer metrics' : 'More metrics'} <span className="ml-1 text-[10px]">({secondaryChips.length})</span>
+        </button>
+        <div id="secondary-metrics" hidden={!moreMetricsOpen} className="mt-1 grid min-w-0 grid-cols-2 gap-px rounded border border-line/60 bg-line/60 sm:grid-cols-3 lg:grid-cols-5">
           {secondaryChips.map((chip) => (
             <ChipCell
               key={chip.key}
@@ -208,7 +215,7 @@ export function StatsStrip() {
             />
           ))}
         </div>
-      </details>
+      </div>
     </Panel>
   );
 }
@@ -253,7 +260,7 @@ function ChipCell({
   const qualityText = QUALITY_LABEL[chip.quality];
   return (
     <div
-      className="flex min-w-0 flex-col gap-1 bg-panel px-2.5 py-2"
+      className="flex min-w-0 flex-col gap-1 overflow-visible bg-panel px-2.5 py-2"
       data-testid={`chip-${chip.key}`}
       data-retained={retained ? 'true' : undefined}
       // Provenance exposed to the DOM (finding 4): tests + tooling can assert the tag, and
@@ -285,8 +292,8 @@ function ChipCell({
       </div>
       <div className="flex min-w-0 items-end gap-2">
         <span className="min-w-0 flex-1 text-[10px] leading-tight text-text-muted" data-testid="metric-scope">{scope}</span>
-        <span className="w-12 shrink-0 sm:w-16">
-          <Sparkline data={series.values} timestamps={series.times} stroke={chip.sparkStroke} label={`${chip.label} trend`} />
+        <span className="w-12 min-w-0 shrink sm:w-16">
+          <Sparkline width={48} data={series.values} timestamps={series.times} stroke={chip.sparkStroke} label={`${chip.label} trend`} />
         </span>
       </div>
     </div>
@@ -302,8 +309,8 @@ function metricScope(chip: ChipDescriptor, sample: MetricsResponse['instant'] | 
   }
   if (chip.key === 'p50_ms' || chip.key === 'p95_ms' || chip.key === 'p99_ms') {
     return sample.latency_samples < 2 && chip.key !== 'p50_ms'
-      ? 'Not enough samples'
-      : `${sample.latency_samples} ${sample.latency_samples === 1 ? 'request' : 'requests'} · ${interval}`;
+      ? `Gateway E2E · ${interval} · ${sample.latency_samples} sample · insufficient`
+      : `Gateway E2E · ${interval} · ${sample.latency_samples} terminal ${sample.latency_samples === 1 ? 'request' : 'requests'} · ${chip.quality}`;
   }
   if (chip.key === 'reported_tokens_per_sec') return `${sample.usage_samples} usage samples · ${interval}`;
   if (chip.key === 'cost_per_min') return `${sample.priced_samples} priced · ${interval}`;

@@ -45,17 +45,17 @@ describe('chips', () => {
     const chips = deriveChips(win({ accepted_per_sec: 4.2, p95_ms: 920, failure_pct: 1.1, reported_tokens_per_sec: 1500, cost_per_min: 0.21 }), null);
     const byKey = Object.fromEntries(chips.map((c) => [c.key, c.value]));
     expect(byKey.accepted_per_sec).toBe('4.2');
-    expect(byKey.p95_ms).toBe('920');
-    expect(byKey.failure_pct).toBe('1.1');
-    expect(byKey.reported_tokens_per_sec).toBe('1.5k'); // fmtTokens compaction
-    expect(byKey.cost_per_min).toBe('0.21');
+    expect(byKey.p95_ms).toBe('920 ms');
+    expect(byKey.failure_pct).toBe('1.1%');
+    expect(byKey.reported_tokens_per_sec).toBe('1.5k tok/s');
+    expect(byKey.cost_per_min).toBe('$0.21/min');
   });
 
   it('never formats a nonzero rate as zero', () => {
     const tiny = deriveChips(win({ accepted_per_sec: 0.001111, reported_tokens_per_sec: 31.109 }), null);
     const byKey = Object.fromEntries(tiny.map((chip) => [chip.key, chip.value]));
     expect(byKey.accepted_per_sec).toBe('0.0011');
-    expect(byKey.reported_tokens_per_sec).toBe('31.1');
+    expect(byKey.reported_tokens_per_sec).toBe('31 tok/s');
   });
 
   it('prefers physically de-duplicated engine generation throughput and labels the source', () => {
@@ -65,7 +65,7 @@ describe('chips', () => {
       engine(),
     ).find((candidate) => candidate.key === 'reported_tokens_per_sec')!;
     expect(chip.label).toBe('engine gen tok/s');
-    expect(chip.value).toBe('321');
+    expect(chip.value).toBe('321 tok/s');
     expect(chip.source).toBe('engine');
     expect(chip.quality).toBe('derived');
     expect(chip.details).toContain('2/2 physically distinct metrics sources');
@@ -80,15 +80,15 @@ describe('chips', () => {
       null,
       engine({ generated_tokens_per_sec: 0, measured_sources: 1, total_sources: 3, coverage: 'partial' }),
     ).find((candidate) => candidate.key === 'reported_tokens_per_sec')!;
-    expect(chip.value).toBe('0.0');
+    expect(chip.value).toBe('0 tok/s');
     expect(chip.quality).toBe('partial');
   });
 
   it('falls back to reported response usage when no engine interval is available', () => {
     const chip = deriveChips(win({ reported_tokens_per_sec: 142 }), null)
       .find((candidate) => candidate.key === 'reported_tokens_per_sec')!;
-    expect(chip.label).toBe('reported tok/s');
-    expect(chip.value).toBe('142');
+    expect(chip.label).toBe('reported throughput');
+    expect(chip.value).toBe('142 tok/s');
     expect(chip.source).toBe('reported');
   });
 
@@ -142,7 +142,7 @@ describe('chips', () => {
     expect(byKey.cost_per_min).toBe('—');
     // req/s + active_streams_now are NOT sample-derived → they show real values.
     expect(byKey.accepted_per_sec).toBe('2.5');
-    expect(byKey.active_streams_now).toBe('4.0');
+    expect(byKey.active_streams_now).toBe('4');
   });
 
   it('distinguishes a GENUINE measured zero (latency_samples > 0) from unavailable', () => {
@@ -150,10 +150,10 @@ describe('chips', () => {
     // are honest zeros and render numerically, NOT "—".
     const chips = deriveChips(win({ latency_samples: 12, failure_pct: 0, p50_ms: 0, cost_per_min: 0, accepted_per_sec: 0 }), null);
     const byKey = Object.fromEntries(chips.map((c) => [c.key, c.value]));
-    expect(byKey.failure_pct).toBe('0.0');
-    expect(byKey.p50_ms).toBe('0');
-    expect(byKey.cost_per_min).toBe('0.00');
-    expect(byKey.accepted_per_sec).toBe('0.0'); // genuine idle zero, also numeric
+    expect(byKey.failure_pct).toBe('0%');
+    expect(byKey.p50_ms).toBe('0 ms');
+    expect(byKey.cost_per_min).toBe('$0.00/min');
+    expect(byKey.accepted_per_sec).toBe('0'); // genuine idle zero, also numeric
   });
 
   it('keeps a one-sample median visible but withholds misleading tail percentiles', () => {
@@ -167,7 +167,7 @@ describe('chips', () => {
       p99_quality: 'partial',
     }), null);
     const p50 = chips.find((candidate) => candidate.key === 'p50_ms')!;
-    expect(p50.value).toBe('125');
+    expect(p50.value).toBe('125 ms');
     expect(p50.quality).toBe('partial');
     for (const key of ['p95_ms', 'p99_ms'] as const) {
       const chip = chips.find((candidate) => candidate.key === key)!;
@@ -194,8 +194,8 @@ describe('chips', () => {
     // priced_samples 0 too. Latency/err% are real; tok/s + $/min are unmeasurable → "—".
     const chips = deriveChips(win({ latency_samples: 12, usage_samples: 0, priced_samples: 0, p50_ms: 200, reported_tokens_per_sec: 0, cost_per_min: 0 }), null);
     const byKey = Object.fromEntries(chips.map((c) => [c.key, c.value]));
-    expect(byKey.p50_ms).toBe('200'); // latency measured (latency_samples > 0)
-    expect(byKey.failure_pct).toBe('1.1');
+    expect(byKey.p50_ms).toBe('200 ms'); // latency measured (latency_samples > 0)
+    expect(byKey.failure_pct).toBe('1.1%');
     expect(byKey.reported_tokens_per_sec).toBe('—'); // no usage sample → unmeasurable
     expect(byKey.cost_per_min).toBe('—'); // no priced usage sample → unmeasurable
   });
@@ -205,7 +205,7 @@ describe('chips', () => {
     // $/min is unmeasurable ("—"), distinct from a genuine $0.00. tok/s renders normally.
     const chips = deriveChips(win({ latency_samples: 8, usage_samples: 8, priced_samples: 0, reported_tokens_per_sec: 142, cost_per_min: 0 }), null);
     const byKey = Object.fromEntries(chips.map((c) => [c.key, c.value]));
-    expect(byKey.reported_tokens_per_sec).toBe('142'); // usage present → measurable
+    expect(byKey.reported_tokens_per_sec).toBe('142 tok/s'); // usage present → measurable
     expect(byKey.cost_per_min).toBe('—'); // no priced sample → unavailable, not $0.00
   });
 
@@ -256,13 +256,13 @@ describe('chips', () => {
   // confident aggregate cost from an estimated one.
   it('a CONFIDENT aggregate $/min reads as "derived", not "estimated"', () => {
     const chip = deriveChips(win({ cost_confidence: 'confident' }), null).find((c) => c.key === 'cost_per_min')!;
-    expect(chip.value).toBe('0.21'); // a real, rendered number
+    expect(chip.value).toBe('$0.21/min'); // a real, rendered number
     expect(chip.quality).toBe('derived'); // confident ⇒ a real computed cost, not a modelled estimate
   });
 
   it('an ESTIMATED aggregate $/min stays labelled "estimated"', () => {
     const chip = deriveChips(win({ cost_confidence: 'estimated' }), null).find((c) => c.key === 'cost_per_min')!;
-    expect(chip.value).toBe('0.21');
+    expect(chip.value).toBe('$0.21/min');
     expect(chip.quality).toBe('estimated'); // a priced bucket bills cached at the default 0.0 (or an unpriced bucket bears usage)
   });
 

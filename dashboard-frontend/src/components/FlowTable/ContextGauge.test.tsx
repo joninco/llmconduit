@@ -24,7 +24,7 @@ describe('ContextGauge — per-flow context-window utilization (gap 09)', () => 
     // No near/over badge at 18%.
     expect(gauge.querySelector('[data-testid="context-risk-badge"]')).toBeNull();
     // Caption shows prompt / capacity.
-    expect(getByTestId('context-gauge-caption').textContent).toContain('6.0k / 32.8k');
+    expect(getByTestId('context-gauge-caption').textContent).toContain('6k / 32.8k');
   });
 
   it('flags a NEAR-limit flow with an amber `near` badge', () => {

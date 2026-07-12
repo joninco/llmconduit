@@ -22,7 +22,7 @@
  * pane's "body evicted" placeholder. Kill POSTs with CSRF, optimistically flips the row, and
  * shows a distinct state on 403.
  */
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Group, Panel, Separator, useDefaultLayout, usePanelRef } from 'react-resizable-panels';
 import type { CostConfidence, DebugSegment, FlowDetail as FlowDetailDto, FlowSummary, Usage } from '../../api/types';
 import { useDashboard } from '../../store/hooks';
@@ -141,13 +141,29 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
       ? 'body unavailable — load failed'
       : emptyBodyLabel(seeking);
 
+  // A request change is a new reading context. Reset every detail-owned scroll viewport before
+  // paint and focus the summary heading, while the keyed component still preserves the originating
+  // table's scroll/focus for Back. This covers direct URLs and async body arrival without landing
+  // a new request on the previous request's Headers/Timeline depth.
+  useLayoutEffect(() => {
+    const root = detailRef.current;
+    if (!root) return;
+    root.scrollTop = 0;
+    root.querySelectorAll<HTMLElement>('[data-detail-scroll], [role="tabpanel"]').forEach((node) => {
+      node.scrollTop = 0;
+      node.scrollLeft = 0;
+    });
+    root.querySelector<HTMLElement>('[data-testid="request-summary"] h2, [data-testid="summary-line"] h2')
+      ?.focus({ preventScroll: true });
+  }, [apiCallId]);
+
   // Move keyboard focus into the takeover on open. On every unmount path (back button, close,
   // Escape/browser navigation), restore the originating flow trigger once the hidden table becomes
   // visible again. The connected-node guard keeps StrictMode's effect replay from stealing focus.
   useEffect(() => {
     const detailNode = detailRef.current;
     const opener = openerRef.current;
-    detailNode?.focus({ preventScroll: true });
+    if (!detailNode?.contains(document.activeElement)) detailNode?.focus({ preventScroll: true });
     return () => {
       requestAnimationFrame(() => {
         if (!detailNode?.isConnected) restoreFlowTrigger(apiCallId, opener);
@@ -164,6 +180,15 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
   const [summaryCollapsed, setSummaryCollapsed] = usePersistedFlag('summary-collapsed', false);
   const [drawerCollapsed, setDrawerCollapsed] = usePersistedFlag('drawer-collapsed', false);
   const [railCollapsed, setRailCollapsed] = usePersistedFlag('rail-collapsed', false);
+  useLayoutEffect(() => {
+    const key = 'argus-flowdetail-last-request';
+    try {
+      if (window.localStorage.getItem(key) !== apiCallId) setSummaryCollapsed(false);
+      window.localStorage.setItem(key, apiCallId);
+    } catch {
+      setSummaryCollapsed(false);
+    }
+  }, [apiCallId, setSummaryCollapsed]);
   const railRef = usePanelRef();
   const drawerRef = usePanelRef();
   // Per-pane + panes-column collapse (NOT persisted flags — the persisted %-layout restores the
@@ -560,6 +585,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
             aria-labelledby={narrowTabId(narrowTab)}
             tabIndex={0}
             className="flex min-h-0 min-w-0 flex-1 flex-col overflow-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent"
+            data-detail-scroll
             data-testid={`narrow-tabpanel-${narrowTab}`}
           >
             {narrowPane ? (
@@ -588,7 +614,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
             ) : narrowTab === 'captures' ? (
               <CapturedSectionsTab detail={frozenDetail} />
             ) : narrowTab === 'timeline' ? (
-              <Timeline events={join.events} />
+              <Timeline events={join.events} startedAtMs={liveFlow?.started_ms ?? frozenDetail?.started_ms} />
             ) : (
               <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} seeking={seeking} />
             )}
@@ -797,7 +823,7 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
                   metadata leaks; Timeline reads the cut-bounded monitor join (finding 1). */}
               {tab === 'headers' && <HeadersTab headers={frozenDetail?.inbound_headers} />}
               {tab === 'captures' && <CapturedSectionsTab detail={frozenDetail} />}
-              {tab === 'timeline' && <Timeline events={join.events} />}
+              {tab === 'timeline' && <Timeline events={join.events} startedAtMs={liveFlow?.started_ms ?? frozenDetail?.started_ms} />}
               {tab === 'error' && <ErrorTab detail={frozenDetail} liveFlow={liveFlow} joinError={join.error} seeking={seeking} />}
             </div>
           )}
@@ -1161,7 +1187,7 @@ function SummaryBand({
   return (
     <div className="shrink-0 border-b border-line bg-panel-raised/60" data-testid={collapsed ? 'summary-line' : 'request-summary'}>
       <div className="flex items-center justify-between gap-3 px-3 pt-2">
-        <h2 className="text-xs font-semibold text-text">Request summary</h2>
+        <h2 tabIndex={-1} className="text-xs font-semibold text-text outline-none">Request summary</h2>
         <button
           type="button"
           onClick={onToggle}

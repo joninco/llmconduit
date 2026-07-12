@@ -94,6 +94,23 @@ export function FailureTaxonomy({ searchQuery = '' }: { searchQuery?: string }) 
   );
   const observed = model.available;
 
+  if (observed && model.groups.length === 0) {
+    return (
+      <Panel className="m-2 flex items-center gap-3 px-3 py-2" data-testid="failure-taxonomy" data-available="true">
+        <span className="h-2 w-2 shrink-0 rounded-full bg-status-healthy" aria-hidden />
+        <span className="text-xs font-semibold text-status-healthy" data-testid="failure-none">No failures</span>
+        <span className="text-[11px] tabular-nums text-text-muted">0 / {model.totalFlows} observed flows</span>
+        <span className="sr-only" data-testid="failure-error-rate" data-quality="derived"><span data-testid="failure-error-rate-value">0%</span></span>
+        <details className="ml-auto text-[11px] text-text-muted">
+          <summary className="cursor-pointer text-accent">How failures are grouped</summary>
+          <p className="mt-2 max-w-lg leading-relaxed">
+            Failures are grouped by provider, served model, and bounded terminal or attempt error class. The rate is derived from failed divided by observed flows in the selected population.
+          </p>
+        </details>
+      </Panel>
+    );
+  }
+
   return (
     <Panel className="m-2 flex flex-col gap-2 p-3" data-testid="failure-taxonomy" data-available={observed ? 'true' : 'false'}>
       <div className="flex items-center justify-between gap-2">

@@ -96,7 +96,7 @@ describe('River — renders output/reasoning/tool deltas with tok/s + cursor', (
     const { getByTestId, queryByTestId } = render(<River river={river!} />);
     expect(queryByTestId('river-cursor')).toBeNull();
     expect(getByTestId('river-status').textContent).toContain('complete');
-    expect(getByTestId('river-elapsed').textContent).toContain('0ms');
+    expect(getByTestId('river-elapsed').textContent).toContain('0 ms');
   });
 
   it('ticks elapsed time while streaming and cleans up its clock on unmount', () => {
@@ -112,9 +112,9 @@ describe('River — renders output/reasoning/tool deltas with tok/s + cursor', (
         seg('r1', 'output', ' continues', 99_500),
       ]);
       const view = render(<River river={river!} />);
-      expect(view.getByTestId('river-elapsed').textContent).toContain('2.5s');
+      expect(view.getByTestId('river-elapsed').textContent).toContain('2.5 s');
       act(() => { vi.advanceTimersByTime(1_000); });
-      expect(view.getByTestId('river-elapsed').textContent).toContain('3.5s');
+      expect(view.getByTestId('river-elapsed').textContent).toContain('3.5 s');
       view.unmount();
       expect(vi.getTimerCount()).toBe(0);
     } finally {
@@ -262,18 +262,18 @@ describe('TheaterView — retains the latest response and ages out older termina
       expect(getByTestId('river').getAttribute('data-status')).toBe('completed');
       expect(getByTestId('river').getAttribute('data-retained')).toBe('true');
       expect(getByTestId('river-retained-badge').textContent).toContain('last response');
-      expect(getByTestId('theater-view').getAttribute('data-stale')).toBe('true');
-      expect(getByTestId('theater-stale-age').textContent).toBe('00:00');
+      expect(getByTestId('theater-state').getAttribute('data-state')).toBe('idle');
+      expect(getByTestId('theater-idle-age').textContent).toContain('last response 00:00 ago');
 
       // It remains after the old 4.4s removal boundary and the fixed-width clock keeps advancing.
       act(() => { vi.advanceTimersByTime(65_000); });
       expect(getByTestId('river').getAttribute('data-retained')).toBe('true');
-      expect(getByTestId('theater-stale-age').textContent).toBe('01:05');
+      expect(getByTestId('theater-idle-age').textContent).toContain('last response 01:05 ago');
 
       // The shared stale formatter remains concise across day boundaries.
       vi.setSystemTime(finishedAt + 90_061_000);
       act(() => { vi.advanceTimersByTime(1_000); });
-      expect(getByTestId('theater-stale-age').textContent).toBe('1d 01:01:02');
+      expect(getByTestId('theater-idle-age').textContent).toContain('last response 1d 01:01:02 ago');
 
       // Backend monitor retention may later remove the request; Theater's bounded one-response
       // cache intentionally survives that automatic cleanup.
@@ -291,7 +291,7 @@ describe('TheaterView — retains the latest response and ages out older termina
     vi.useFakeTimers();
     try {
       const firstFinishedAt = Date.now();
-      const { getAllByTestId, getByTestId, queryByTestId } = render(<TheaterView />);
+      const { getAllByTestId, getByTestId } = render(<TheaterView />);
       act(() => {
         dashboardStore.getState().pushMonitor(upsert('r1', 'gpt-4o', 'running'), 1);
         dashboardStore.getState().pushMonitor(seg('r1', 'output', 'first', firstFinishedAt), 1);
@@ -306,7 +306,7 @@ describe('TheaterView — retains the latest response and ages out older termina
         dashboardStore.getState().pushMonitor(seg('r2', 'output', 'second', Date.now()), 2);
       });
       expect(getAllByTestId('river')).toHaveLength(2);
-      expect(queryByTestId('theater-stale-state')).toBeNull();
+      expect(getByTestId('theater-state').getAttribute('data-state')).toBe('active');
       act(() => { vi.advanceTimersByTime(4_400); });
       expect(getAllByTestId('river')).toHaveLength(1);
       expect(getByTestId('river').getAttribute('data-river-id')).toBe('r2');
@@ -317,7 +317,7 @@ describe('TheaterView — retains the latest response and ages out older termina
       });
       expect(getByTestId('river').getAttribute('data-retained')).toBe('true');
       expect(getByTestId('river-output').textContent).toContain('second');
-      expect(getByTestId('theater-stale-state')).not.toBeNull();
+      expect(getByTestId('theater-state').getAttribute('data-state')).toBe('idle');
     } finally {
       vi.useRealTimers();
     }
@@ -334,11 +334,11 @@ describe('TheaterView — retains the latest response and ages out older termina
         { type: 'request_remove', response_id: 'r1', reason: 'evicted' },
       ]);
       const { getByTestId, unmount } = render(<TheaterView />);
-      expect(getByTestId('theater-stale-age').textContent).toBe('00:10');
+      expect(getByTestId('theater-idle-age').textContent).toContain('last response 00:10 ago');
       expect(getByTestId('river-output').textContent).toContain('done');
       unmount();
       const remount = render(<TheaterView />);
-      expect(remount.getByTestId('theater-stale-age').textContent).toBe('00:10');
+      expect(remount.getByTestId('theater-idle-age').textContent).toContain('last response 00:10 ago');
       expect(remount.getByTestId('river').getAttribute('data-retained')).toBe('true');
     } finally {
       vi.useRealTimers();

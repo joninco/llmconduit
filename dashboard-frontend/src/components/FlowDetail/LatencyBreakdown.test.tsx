@@ -33,7 +33,7 @@ describe('LatencyBreakdown component (gap 10)', () => {
     // TTFT is measured ⇒ no estimated badge inside the TTFT cell.
     const ttft = getByTestId('latency-ttft');
     expect(ttft.getAttribute('data-quality')).toBe('measured');
-    expect(ttft.textContent).toContain('450ms');
+    expect(ttft.textContent).toContain('450 ms');
     expect(ttft.querySelector('[data-testid="latency-quality-badge"]')).toBeNull();
 
     // tok/s is derived (500/s) and labelled derived.
@@ -89,7 +89,7 @@ describe('LatencyBreakdown component (gap 10)', () => {
     expect(prefill.textContent).toContain('routing');
     expect(prefill.textContent).not.toContain('prefill →');
     // A real (derived) duration renders — not `—`, not a fabricated 0.
-    expect(getByTestId('latency-dur-prefill').textContent).toBe('350ms');
+    expect(getByTestId('latency-dur-prefill').textContent).toBe('350 ms');
     // The segment still gets a bar fill (it IS a known span), with the derived provenance attribute.
     expect(getByTestId('latency-seg-prefill').getAttribute('data-quality')).toBe('derived');
     // Wire TTFB headline is unavailable (no first byte measured) ⇒ `—`.

@@ -127,6 +127,19 @@ describe('FlowTable — desktop ARIA grid keyboard model', () => {
     rows.forEach((row) => expect(within(row).getAllByRole('gridcell')).toHaveLength(10));
   });
 
+  it('exposes sortable headers with aria-sort and delegates complete-population sort intent', () => {
+    seedFlows([makeFlow({ api_call_id: 'api_sort' })]);
+    const onSortChange = vi.fn();
+    const { getByRole } = renderWithQuery(
+      <FlowTable selectedId={null} onSelect={noop} sort="started" direction="desc" onSortChange={onSortChange} />,
+    );
+    expect(getByRole('columnheader', { name: /time/ }).getAttribute('aria-sort')).toBe('descending');
+    fireEvent.click(getByRole('button', { name: /time/ }));
+    expect(onSortChange).toHaveBeenCalledWith('started', 'asc');
+    fireEvent.click(getByRole('button', { name: 'model' }));
+    expect(onSortChange).toHaveBeenCalledWith('model', 'asc');
+  });
+
   it('roves one row tab stop with arrows/Home/End and activates with Enter/Space', () => {
     const { rows, onSelect } = renderGrid();
     const [first, second, third] = rows;

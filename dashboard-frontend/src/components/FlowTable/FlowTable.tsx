@@ -27,6 +27,7 @@ import { FilterBar } from './FilterBar';
 import { useFlowRows } from './useFlowRows';
 import { useCatalog } from './useCatalog';
 import { useMediaQuery } from '../../lib/useMediaQuery';
+import type { FlowSort, SortDirection } from '../../router/flowViewState';
 
 const ROW_HEIGHT = 30;
 const CARD_HEIGHT = 144;
@@ -91,12 +92,18 @@ export function FlowTable({
   onSelect,
   searchQuery = '',
   onSearchQueryChange = () => {},
+  sort = 'started',
+  direction = 'desc',
+  onSortChange = () => {},
 }: {
   selectedId: string | null;
   onSelect: (apiCallId: string) => void;
   /** Flows-only lookup; kept out of global hash scope because server rollups cannot apply it. */
   searchQuery?: string;
   onSearchQueryChange?: (query: string) => void;
+  sort?: FlowSort;
+  direction?: SortDirection;
+  onSortChange?: (sort: FlowSort, direction: SortDirection) => void;
 }) {
   // The filter lives in the SHARED store (D12) so Topology/Sankey clicks can drive it; the
   // FilterBar below remains the in-table editor (its onChange writes the same store).
@@ -105,7 +112,7 @@ export function FlowTable({
   const {
     rows, total, models, upstreams, clients, loadState, retry, hasMore, loadingMore, loadMore, summary,
     populationKnown,
-  } = useFlowRows(filters, searchQuery);
+  } = useFlowRows(filters, searchQuery, sort, direction);
   // Gap 09: the per-model context-window capacities (gap-06 nullable `context_limit`), for the
   // aggregate context-pressure stat. A `null`/absent window is UNKNOWN ⇒ that flow is excluded from
   // the pressure figures (never a fabricated 0%/100%).
@@ -221,7 +228,7 @@ export function FlowTable({
         aria-rowcount={narrow ? undefined : rows.length + 1}
         data-testid={narrow ? 'flow-card-list' : 'flow-grid'}
       >
-        {!narrow && <HeaderRow />}
+        {!narrow && <HeaderRow sort={sort} direction={direction} onSortChange={onSortChange} />}
         <div
           ref={scrollRef}
           className={cn('flex-1 overflow-auto', narrow ? 'min-h-64' : 'min-h-0')}
@@ -372,7 +379,25 @@ function FlowTableEmptyState({
   );
 }
 
-function HeaderRow() {
+const NUMERIC_SORTS = new Set<FlowSort>(['started', 'tokens', 'cost', 'latency']);
+
+function HeaderRow({ sort, direction, onSortChange }: { sort: FlowSort; direction: SortDirection; onSortChange: (sort: FlowSort, direction: SortDirection) => void }) {
+  const header = (field: FlowSort, label: string, align = '') => {
+    const active = sort === field;
+    const next = active ? (direction === 'asc' ? 'desc' : 'asc') : (NUMERIC_SORTS.has(field) ? 'desc' : 'asc');
+    return (
+      <span role="columnheader" aria-sort={active ? (direction === 'asc' ? 'ascending' : 'descending') : 'none'} className={align}>
+        <button
+          type="button"
+          className="w-full rounded text-inherit hover:text-text focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+          onClick={() => onSortChange(field, next)}
+          title={`Sort the complete matching population by ${label}`}
+        >
+          {label}{active ? (direction === 'asc' ? ' ↑' : ' ↓') : ''}
+        </button>
+      </span>
+    );
+  };
   return (
     <div
       role="row"
@@ -382,16 +407,16 @@ function HeaderRow() {
         'border-b border-line bg-panel-raised py-1.5 text-[10px] uppercase tracking-[0.14em] text-text-muted',
       )}
     >
-      <span role="columnheader">time</span>
-      <span role="columnheader">id</span>
-      <span role="columnheader">client</span>
-      <span role="columnheader">endpoint</span>
-      <span role="columnheader">model</span>
-      <span role="columnheader">upstream</span>
-      <span role="columnheader">status</span>
-      <span role="columnheader" className="text-right">tokens</span>
-      <span role="columnheader" className="text-right">cost</span>
-      <span role="columnheader" className="text-right">elapsed</span>
+      {header('started', 'time')}
+      {header('id', 'id')}
+      {header('client', 'client')}
+      {header('endpoint', 'endpoint')}
+      {header('model', 'model')}
+      {header('upstream', 'upstream')}
+      {header('status', 'status')}
+      {header('tokens', 'tokens', 'text-right')}
+      {header('cost', 'cost', 'text-right')}
+      {header('latency', 'elapsed', 'text-right')}
     </div>
   );
 }

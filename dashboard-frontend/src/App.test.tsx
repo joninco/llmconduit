@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App, DashboardAnnouncements, RouteContent, RouteErrorBoundary } from './App';
 import { dashboardStore } from './store/dashboardStore';
 import { makeFlow, resetWorld } from './components/testHarness';
+import { chunkRecoveryStorageKey } from './lib/chunkRecovery';
 
 function Bomb(): never {
   throw new Error('route exploded');
@@ -12,8 +13,15 @@ function SafeRoute() {
   return <div>safe route</div>;
 }
 
+function ChunkBomb(): never {
+  throw new Error('Failed to fetch dynamically imported module: /assets/old-view.js');
+}
+
 beforeEach(() => resetWorld());
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  sessionStorage.removeItem(chunkRecoveryStorageKey);
+  vi.restoreAllMocks();
+});
 
 describe('route-level failure handling', () => {
   it('contains a render failure and presents an explicit retry surface', () => {
@@ -31,6 +39,16 @@ describe('route-level failure handling', () => {
     expect(rendered.getByRole('alert')).toBeTruthy();
     rendered.rerender(<RouteContent ActiveView={SafeRoute} routeKey="topology" />);
     expect(rendered.getByText('safe route')).toBeTruthy();
+  });
+
+  it('shows the deployment-specific recovery state after the guarded reload already ran', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    sessionStorage.setItem(chunkRecoveryStorageKey, JSON.stringify({ href: window.location.href, at: Date.now() }));
+    const view = render(<RouteErrorBoundary><ChunkBomb /></RouteErrorBoundary>);
+    await waitFor(() => expect(view.getByRole('alert').textContent).toContain('ARGUS was updated'));
+    expect(view.getByRole('button', { name: 'Reload Dashboard' })).toBeTruthy();
+    expect(view.getByText('Technical details')).toBeTruthy();
   });
 
   it('renders the explicit upgrade screen for a fatal root contract', () => {

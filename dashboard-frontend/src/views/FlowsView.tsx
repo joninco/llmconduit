@@ -17,11 +17,12 @@
  * while seeking; on LIVE it is the raw selection again. We do NOT rewrite the hash itself, so
  * leaving seek re-reveals the same drill-down if the flow reappears in the live store.
  */
-import { lazy, Suspense, useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect } from 'react';
 import { FlowTable } from '../components/FlowTable/FlowTable';
 import { FailureTaxonomy } from '../components/FlowTable/FailureTaxonomy';
 import { useDashboard } from '../store/hooks';
 import { navigate, useHashDetail } from '../router/useHashRoute';
+import { updateFlowViewState, useFlowViewState } from '../router/flowViewState';
 import { cn } from '../lib/cn';
 
 // The inspector pulls in highlight.js and the JSON/diff machinery. Keep that cost behind
@@ -35,7 +36,8 @@ export function FlowsView() {
   // Deliberately view-local: free-text lookup narrows the Flows instruments but is not a server-
   // authored dashboard scope, so Overview/Sankey rollups must never claim that it applies to them.
   // FlowsView stays mounted while detail is open, preserving the query across drill-in/back.
-  const [searchQuery, setSearchQuery] = useState('');
+  const flowView = useFlowViewState();
+  const searchQuery = flowView.q;
   const seeking = useDashboard((s) => s.connection === 'seeking');
   // During seek the store IS the frozen cut; a selection not in it is a future flow → suppress
   // (no live detail fetch). Live: the raw selection stands. The hash itself is left untouched,
@@ -65,7 +67,10 @@ export function FlowsView() {
           selectedId={effectiveId}
           onSelect={(id) => navigate('flows', id)}
           searchQuery={searchQuery}
-          onSearchQueryChange={setSearchQuery}
+          onSearchQueryChange={(q) => updateFlowViewState({ q })}
+          sort={flowView.sort}
+          direction={flowView.direction}
+          onSortChange={(sort, direction) => updateFlowViewState({ sort, direction })}
         />
       </div>
       {effectiveId && (

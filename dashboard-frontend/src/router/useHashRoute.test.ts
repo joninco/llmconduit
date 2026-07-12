@@ -8,6 +8,7 @@ import {
   useHashDetail,
   useHashRoute,
 } from './useHashRoute';
+import { readFlowViewState, updateFlowViewState } from './flowViewState';
 
 afterEach(() => {
   cleanup();
@@ -61,5 +62,15 @@ describe('dashboard hash routing and shared scope', () => {
     // URLSearchParams may replace malformed bytes, but the parser stays total and never admits an
     // out-of-contract window/status value.
     expect(typeof scope.model === 'string' || scope.model === null).toBe(true);
+  });
+
+  it('persists flow search and full-population sorting in the URL across detail navigation', () => {
+    act(() => navigate('flows'));
+    act(() => updateFlowViewState({ q: 'api 123', sort: 'latency', direction: 'asc' }));
+    expect(readFlowViewState()).toEqual({ q: 'api 123', sort: 'latency', direction: 'asc' });
+    expect(window.location.hash).toContain('q=api+123');
+    expect(window.location.hash).toContain('sort=latency');
+    act(() => navigate('flows', 'api/123'));
+    expect(readFlowViewState()).toEqual({ q: 'api 123', sort: 'latency', direction: 'asc' });
   });
 });

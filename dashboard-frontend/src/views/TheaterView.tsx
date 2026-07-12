@@ -22,6 +22,7 @@ import type { FlowSummary, TheaterRiver } from '../api/types';
 import { formatStaleAge } from '../lib/staleAge';
 import { getConnection, queryKeys } from '../api/connection';
 import type { River as RiverData } from '../components/viz/riverModel';
+import { navigate } from '../router/useHashRoute';
 
 /** Convert the permanent backend projection into the same presentational model as live deltas. */
 function restoredRiver(value: TheaterRiver | null | undefined): RiverData | null {
@@ -74,13 +75,54 @@ function LiveTheater() {
   );
   const lastTerminal = liveLastTerminal ?? archivedLastTerminal;
   const activeCount = liveRivers.filter((river) => river.status === 'running').length;
+  const [theaterNow, setTheaterNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (activeCount === 0) return;
+    const id = globalThis.setInterval(() => setTheaterNow(Date.now()), 1_000);
+    return () => globalThis.clearInterval(id);
+  }, [activeCount]);
   // Older terminated tiles still linger/fade, but the newest terminal response is retained while
   // no stream is active — including after monitor eviction. The hook owns boundary timers.
   const rivers = useLingeringRivers(liveRivers, { retainLast: lastTerminal });
+  const flowMap = useDashboard((state) => state.flows);
+  const connection = useDashboard((state) => state.connection);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [pinnedId, setPinnedId] = useState<string | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [followTail, setFollowTail] = useState(true);
+  const [jumpToken, setJumpToken] = useState(0);
+  const [query, setQuery] = useState('');
+  const [modelFilter, setModelFilter] = useState('');
+  const [providerFilter, setProviderFilter] = useState('');
+  const [clientFilter, setClientFilter] = useState('');
+  const [statusFilter, setStatusFilter] = useState('');
+  const pausedRivers = useRef(rivers);
+  if (!paused) pausedRivers.current = rivers;
+  const availableRivers = paused ? pausedRivers.current : rivers;
+  const flowByResponse = useMemo(() => new Map(
+    [...flowMap.values()].filter((flow) => flow.response_id).map((flow) => [flow.response_id!, flow]),
+  ), [flowMap]);
+  const flowFor = (river: RiverData) => flowByResponse.get(river.id);
+  const models = [...new Set(availableRivers.map((river) => river.model).filter(Boolean) as string[])].sort();
+  const providers = [...new Set(availableRivers.map((river) => flowFor(river)?.upstream_target).filter(Boolean) as string[])].sort();
+  const clients = [...new Set(availableRivers.map((river) => flowFor(river)?.client_label).filter(Boolean) as string[])].sort();
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleRivers = availableRivers.filter((river) => {
+    const flow = flowFor(river);
+    if (modelFilter && river.model !== modelFilter) return false;
+    if (providerFilter && flow?.upstream_target !== providerFilter) return false;
+    if (clientFilter && flow?.client_label !== clientFilter) return false;
+    if (statusFilter && river.status !== statusFilter) return false;
+    if (normalizedQuery && !`${river.id} ${river.model ?? ''} ${river.output} ${river.reasoning} ${river.tools.join(' ')}`.toLowerCase().includes(normalizedQuery)) return false;
+    return true;
+  });
+  const effectiveSelectedId = pinnedId ?? selectedId ?? visibleRivers[0]?.id ?? null;
+  const selectedRiver = availableRivers.find((river) => river.id === effectiveSelectedId) ?? null;
+  const selectedFlow = selectedRiver ? flowFor(selectedRiver) : undefined;
   const lastResponseAtMs = activeCount === 0
     ? lastTerminal?.terminalAtMs ?? lastTerminal?.lastMs ?? null
     : null;
-  const cols = gridColumns(rivers.length);
+  const cols = gridColumns(visibleRivers.length);
 
   useEffect(() => {
     if (!fullscreen) {
@@ -114,7 +156,16 @@ function LiveTheater() {
       <header className="mb-3 flex flex-wrap items-center gap-3">
         <h2 id="theater-title" className="text-base font-semibold text-text">Theater</h2>
         <p className="text-sm text-text-muted">live streams · {activeCount} active</p>
-        {lastResponseAtMs !== null && <TheaterStaleState lastResponseAtMs={lastResponseAtMs} />}
+        <TheaterState
+          connection={connection}
+          activeCount={activeCount}
+          selected={selectedRiver}
+          lastResponseAtMs={lastResponseAtMs}
+          stalled={liveRivers.some((river) => {
+            const lastActivity = river.lastMs ?? river.startedAtMs ?? river.firstMs;
+            return river.status === 'running' && lastActivity != null && theaterNow - lastActivity > 30_000;
+          })}
+        />
         <button
           ref={fullscreenToggleRef}
           type="button"
@@ -126,10 +177,27 @@ function LiveTheater() {
           {fullscreen ? 'exit fullscreen' : 'fullscreen'}
         </button>
       </header>
-      {rivers.length === 0 ? (
+      <div className="mb-3 flex flex-wrap items-center gap-2 rounded border border-line bg-panel px-2 py-2" aria-label="Theater controls">
+        <label className="text-[10px] text-text-muted">stream <select className="ml-1 h-7 max-w-48 rounded border border-line bg-bg px-1 text-xs text-text" value={effectiveSelectedId ?? ''} onChange={(event) => setSelectedId(event.target.value || null)}>{availableRivers.map((river) => <option key={river.id} value={river.id}>{river.model ?? river.id} · {river.status}</option>)}</select></label>
+        <button type="button" className="rounded border border-line px-2 py-1 text-xs text-text-muted" aria-pressed={pinnedId !== null} disabled={!effectiveSelectedId} onClick={() => setPinnedId((id) => id ? null : effectiveSelectedId)}>{pinnedId ? 'Unpin' : 'Pin'}</button>
+        <button type="button" className="rounded border border-line px-2 py-1 text-xs text-text-muted" aria-pressed={paused} onClick={() => setPaused((value) => !value)}>{paused ? 'Resume updates' : 'Pause updates'}</button>
+        <button type="button" className="rounded border border-line px-2 py-1 text-xs text-text-muted" aria-pressed={followTail} onClick={() => setFollowTail((value) => !value)}>{followTail ? 'Following tail' : 'Follow tail'}</button>
+        <button type="button" className="rounded border border-line px-2 py-1 text-xs text-text-muted" onClick={() => { setFollowTail(true); setJumpToken((value) => value + 1); }}>Jump latest</button>
+        <button type="button" className="rounded border border-line px-2 py-1 text-xs text-text-muted" disabled={!selectedRiver} onClick={() => { if (selectedRiver) void navigator.clipboard?.writeText(`${selectedRiver.reasoning}${selectedRiver.reasoning ? '\n\n' : ''}${selectedRiver.output}${selectedRiver.tools.length ? `\n\n${selectedRiver.tools.join('\n')}` : ''}`); }}>Copy transcript</button>
+        <button type="button" className="rounded border border-line px-2 py-1 text-xs text-accent disabled:text-text-muted" disabled={!selectedFlow} onClick={() => { if (selectedFlow) navigate('flows', selectedFlow.api_call_id); }}>Open request</button>
+        <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search streams" className="h-7 min-w-40 flex-1 rounded border border-line bg-bg px-2 text-xs text-text" />
+        <select aria-label="Filter theater by model" className="h-7 rounded border border-line bg-bg px-1 text-xs" value={modelFilter} onChange={(event) => setModelFilter(event.target.value)}><option value="">all models</option>{models.map((value) => <option key={value}>{value}</option>)}</select>
+        <select aria-label="Filter theater by provider" className="h-7 rounded border border-line bg-bg px-1 text-xs" value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)}><option value="">all providers</option>{providers.map((value) => <option key={value}>{value}</option>)}</select>
+        <select aria-label="Filter theater by client" className="h-7 rounded border border-line bg-bg px-1 text-xs" value={clientFilter} onChange={(event) => setClientFilter(event.target.value)}><option value="">all clients</option>{clients.map((value) => <option key={value}>{value}</option>)}</select>
+        <select aria-label="Filter theater by status" className="h-7 rounded border border-line bg-bg px-1 text-xs" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="">all status</option><option value="running">running</option><option value="completed">completed</option><option value="failed">failed</option></select>
+        <button type="button" className="rounded px-2 py-1 text-xs text-accent" onClick={() => { setQuery(''); setModelFilter(''); setProviderFilter(''); setClientFilter(''); setStatusFilter(''); }}>Clear</button>
+      </div>
+      {availableRivers.length === 0 ? (
         <div className="flex flex-1 items-center justify-center text-sm text-text-muted" data-testid="theater-empty">
-          No active streams. Live output appears here as requests stream.
+          No responses yet. Live output appears here as requests stream.
         </div>
+      ) : visibleRivers.length === 0 ? (
+        <div className="flex flex-1 items-center justify-center text-sm text-text-muted">No streams match the current controls.</div>
       ) : (
         <div
           className="grid min-h-0 flex-1 gap-3"
@@ -137,8 +205,8 @@ function LiveTheater() {
           data-testid="theater-grid"
           data-cols={cols}
         >
-          {rivers.map((river) => (
-            <River key={river.id} river={river} exiting={river.exiting} retained={river.retained} />
+          {visibleRivers.map((river) => (
+            <River key={river.id} river={river} exiting={river.exiting} retained={river.retained} selected={river.id === effectiveSelectedId} onSelect={() => setSelectedId(river.id)} followTail={followTail} jumpToken={jumpToken} onFollowChange={setFollowTail} />
           ))}
         </div>
       )}
@@ -153,7 +221,6 @@ function LiveTheater() {
         className="fixed inset-0 z-40 m-0 hidden h-[100dvh] max-h-none w-screen max-w-none flex-col border-0 bg-bg p-4 text-text backdrop:bg-black/70 open:flex"
         data-testid="theater-view"
         data-fullscreen="true"
-        data-stale={lastResponseAtMs !== null ? 'true' : undefined}
         onCancel={(event) => {
           event.preventDefault();
           setFullscreen(false);
@@ -168,7 +235,6 @@ function LiveTheater() {
     <div
       className="flex min-h-0 min-w-0 flex-1 flex-col bg-bg p-4"
       data-testid="theater-view"
-      data-stale={lastResponseAtMs !== null ? 'true' : undefined}
     >
       {content}
     </div>
@@ -176,7 +242,7 @@ function LiveTheater() {
 }
 
 /** Same fixed-width, once-per-second stale clock used by the Stats strip. */
-function TheaterStaleState({ lastResponseAtMs }: { lastResponseAtMs: number }) {
+function TheaterState({ lastResponseAtMs, activeCount, connection, selected, stalled }: { lastResponseAtMs: number | null; activeCount: number; connection: string; selected: RiverData | null; stalled: boolean }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
   useEffect(() => {
     setNowMs(Date.now());
@@ -184,18 +250,20 @@ function TheaterStaleState({ lastResponseAtMs }: { lastResponseAtMs: number }) {
     return () => globalThis.clearInterval(id);
   }, [lastResponseAtMs]);
 
-  const age = formatStaleAge(nowMs - lastResponseAtMs);
+  const age = lastResponseAtMs === null ? null : formatStaleAge(nowMs - lastResponseAtMs);
+  const disconnected = connection === 'closed' || connection === 'error';
+  const label = disconnected ? 'disconnected' : stalled ? 'stalled' : activeCount > 0 ? 'active' : age ? 'idle' : 'no responses yet';
+  const detail = [selected ? `selected · ${selected.model ?? selected.id}` : null, age ? `last response ${age} ago` : null].filter(Boolean).join(' · ');
   return (
     <span
-      className="flex shrink-0 items-baseline gap-2 rounded border-2 border-status-cooling/70 bg-panel px-2.5 py-1 text-status-cooling shadow-lg"
+      className="flex shrink-0 items-baseline gap-2 rounded border border-line bg-panel px-2.5 py-1 text-text-muted"
       role="status"
-      aria-label={`Theater response stale for ${age} since the last response`}
-      data-testid="theater-stale-state"
-      data-stale="true"
+      aria-label={`Theater ${label}${detail ? `, ${detail}` : ''}`}
+      data-testid="theater-state"
+      data-state={label.replaceAll(' ', '-')}
     >
-      <span className="text-[10px] font-bold uppercase tracking-[0.14em]">response stale</span>
-      <span className="font-mono text-lg font-bold tabular-nums leading-none" data-testid="theater-stale-age">{age}</span>
-      <span className="hidden text-[10px] font-semibold uppercase tracking-wide sm:inline">since last response</span>
+      <span className="text-[10px] font-bold uppercase tracking-[0.14em]">{label}</span>
+      {detail && <span className="text-[10px] text-text-muted" data-testid={age ? 'theater-idle-age' : undefined}>{detail}</span>}
     </span>
   );
 }

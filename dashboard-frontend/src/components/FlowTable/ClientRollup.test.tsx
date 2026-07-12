@@ -67,7 +67,7 @@ describe('ClientRollup — aggregate by client with source-strength tags + cross
     expect(cost.textContent).toContain('$');
     const lat = keyRow.querySelector('[data-testid="client-rollup-latency"]')!;
     expect(lat.getAttribute('data-quality')).toBe('derived');
-    expect(lat.textContent).toBe('3.0s'); // mean of 2000 + 4000
+    expect(lat.textContent).toBe('3 s'); // mean of 2000 + 4000
     // The strong source tag reads measured.
     expect(keyRow.querySelector('[data-testid="client-rollup-source"]')!.getAttribute('data-quality')).toBe('measured');
 

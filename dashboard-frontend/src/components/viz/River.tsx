@@ -46,11 +46,21 @@ export function River({
   river,
   exiting = false,
   retained = false,
+  followTail = true,
+  jumpToken = 0,
+  selected = false,
+  onSelect,
+  onFollowChange,
 }: {
   river: RiverData;
   exiting?: boolean;
   /** Latest completed response kept visible while Theater is idle. */
   retained?: boolean;
+  followTail?: boolean;
+  jumpToken?: number;
+  selected?: boolean;
+  onSelect?: () => void;
+  onFollowChange?: (following: boolean) => void;
 }) {
   // Reasoning is EXPANDED by default — it streams before the output, so hiding it made the tile
   // look empty during the thinking phase. The toggle collapses it for output-only reading.
@@ -79,6 +89,11 @@ export function River({
   // Follow pin: true while the view should track the stream's tail. A ref (not state) — toggling
   // it must not re-render, and the scroll handler + append effect both read the latest value.
   const stickRef = useRef(true);
+  useEffect(() => {
+    stickRef.current = followTail;
+    const el = bodyRef.current;
+    if (el && followTail) el.scrollTop = el.scrollHeight;
+  }, [followTail, jumpToken]);
 
   // Re-pin to the bottom whenever streamed content grows (any channel) while the pin is engaged.
   // Keyed on total streamed chars, not array/string identity, so one effect covers all channels.
@@ -95,7 +110,11 @@ export function River({
   // programmatic re-pin above also fires this handler, landing at the bottom → stays engaged.
   const onBodyScroll = (): void => {
     const el = bodyRef.current;
-    if (el) stickRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < STICK_THRESHOLD_PX;
+    if (el) {
+      const following = el.scrollHeight - el.scrollTop - el.clientHeight < STICK_THRESHOLD_PX;
+      stickRef.current = following;
+      onFollowChange?.(following);
+    }
   };
 
   return (
@@ -105,13 +124,15 @@ export function River({
       data-status={river.status}
       data-exiting={exiting || undefined}
       data-retained={retained || undefined}
-      data-stale={retained || undefined}
+      data-selected={selected || undefined}
+      onClick={onSelect}
       // `river-tile` carries the CSS entrance; `river-tile-exiting` swaps it for the linger-then-fade
       // exit while a terminated tile is being removed (finding 4; reduced-motion → ~instant).
       className={cn(
         'river-tile flex min-h-0 min-w-0 flex-col overflow-hidden rounded-md border border-line bg-panel',
         exiting && 'river-tile-exiting',
         retained && 'border-status-cooling/60',
+        selected && 'ring-2 ring-accent',
       )}
     >
       <div className="shrink-0 border-b border-line bg-panel-raised/30">

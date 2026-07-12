@@ -27,6 +27,7 @@
  *    guarantees only the hash prefix exists); it never derives or surfaces a raw key.
  */
 import type { ClientSource, CostConfidence, FlowSummary } from '../../api/types';
+import { fmtLatency as sharedLatency, fmtPercent } from './format';
 
 /** Provenance of a figure — mirrors the dashboard's measured/derived/estimated/unavailable tags. */
 export type Quality = 'measured' | 'derived' | 'estimated' | 'unavailable';
@@ -356,15 +357,10 @@ export function clientRollup(flows: readonly FlowSummary[] | null | undefined): 
  * unavailable `—`. One decimal under 10% (so 4.2% is visible), whole percent otherwise.
  */
 export function fmtRate(pct: number | null): string {
-  if (pct === null || !Number.isFinite(pct)) return UNAVAILABLE;
-  if (pct === 0) return '0%';
-  if (pct < 10) return `${pct.toFixed(1)}%`;
-  return `${Math.round(pct)}%`;
+  return fmtPercent(pct);
 }
 
 /** Format a mean latency (ms) for a client row, or `—` when unavailable. Sub-second in ms, else s. */
 export function fmtLatency(ms: number | null): string {
-  if (ms === null || !Number.isFinite(ms)) return UNAVAILABLE;
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
+  return sharedLatency(ms);
 }

@@ -8,7 +8,7 @@ import { useEffect, useRef, useState } from 'react';
 export function ScopeBar() {
   const filters = useFlowFilter((state) => state.filters);
   const scope = useHashScope();
-  const { rows, total } = useFlowRows(filters);
+  const { rows, total, loadState } = useFlowRows(filters);
   const active = [
     filters.status && ['status', filters.status],
     filters.model && ['model', filters.model],
@@ -16,7 +16,6 @@ export function ScopeBar() {
     filters.client && ['client', filters.client],
   ].filter(Boolean) as [string, string][];
   const scoped = active.length > 0;
-  const coverage = total > 0 ? Math.round((rows.length / total) * 100) : null;
   const filterKey = JSON.stringify(filters);
   const previousFilterKey = useRef(filterKey);
   const [announcement, setAnnouncement] = useState('');
@@ -50,8 +49,12 @@ export function ScopeBar() {
           {key}: {value} ×
         </button>
       ))}
-      <span className="ml-auto shrink-0 text-text-muted">
-        {rows.length}/{total} flows{coverage === null ? ' · coverage —' : ` · ${coverage}% coverage`}
+      <span
+        className="ml-auto shrink-0 text-text-muted"
+        title="Rows loaded is the number of matching request rows currently fetched into this browser. Matching total is the server-counted filtered archive population before paging."
+        data-testid="flow-population-coverage"
+      >
+        Rows loaded {rows.length} / matching total {loadState === 'ready' ? total : '—'}
       </span>
       {scoped && (
         <button

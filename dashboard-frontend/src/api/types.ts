@@ -765,6 +765,8 @@ export interface FlowsQuery {
   page?: number;
   limit?: number;
   cut_id?: number;
+  sort?: 'started' | 'id' | 'client' | 'endpoint' | 'model' | 'upstream' | 'status' | 'tokens' | 'cost' | 'latency';
+  direction?: 'asc' | 'desc';
 }
 
 // ---------------------------------------------------------------------------
