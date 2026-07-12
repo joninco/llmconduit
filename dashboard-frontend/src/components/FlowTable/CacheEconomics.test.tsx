@@ -28,6 +28,19 @@ describe('CacheEconomics — aggregate cache-hit by model (gap 08)', () => {
     expect(summary).toContain('hit');
   });
 
+  it('headline picks the BEST measured hit rate, not the heaviest model (R2)', () => {
+    const rows = [
+      // Heavy model, low rate: 900 cached / 9000 prompt = 10%.
+      makeFlow({ api_call_id: 'h1', model_served: 'heavy', cost_confidence: 'confident', usage: { prompt: 9000, completion: 100, total: 9100, cached: 900 } }),
+      // Light model, high rate: 800 cached / 1000 prompt = 80%.
+      makeFlow({ api_call_id: 'l1', model_served: 'light', cost_confidence: 'confident', usage: { prompt: 1000, completion: 100, total: 1100, cached: 800 } }),
+    ];
+    const { getByTestId } = render(<CacheEconomics rows={rows} />);
+    const summary = getByTestId('cache-economics-summary').textContent!;
+    expect(summary).toContain('light');
+    expect(summary).toContain('80.0%');
+  });
+
   it('shows a derived hit rate + $ saved for a confident gpt-4o group (no est badge)', () => {
     const rows = [
       makeFlow({ api_call_id: 'a', model_served: 'gpt-4o', cost_confidence: 'confident', usage: { prompt: 1000, completion: 100, total: 1100, cached: 200 }, cache_price_impact_usd: -0.0005 }),

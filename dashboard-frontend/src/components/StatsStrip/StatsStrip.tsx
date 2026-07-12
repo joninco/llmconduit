@@ -130,6 +130,9 @@ export function CompactStatsStrip({ onExpand }: { onExpand: () => void }) {
       <span className="text-[11px] text-text-muted" title={`${engine !== null ? 'Engine generation throughput · latest generation-associated interval' : `Reported throughput · ${interval}`}`}>
         {engine !== null ? 'gen' : 'reported'}{' '}
         <span className="font-mono font-semibold tabular-nums text-status-healthy" data-testid="compact-toks">{tokPerSec}</span>
+        {/* R2: an idle tab must not present the generation figure as current — the engine
+            interval is tied to the LAST generation, and the qualifier says so visibly. */}
+        {showingRetained && <span className="ml-1 text-[10px]">· last gen</span>}
       </span>
       <button
         type="button"
@@ -390,9 +393,11 @@ function ChipCell({
       </div>
       <div className="flex min-w-0 items-end gap-2">
         <span className="min-w-0 flex-1 text-[10px] leading-tight text-text-muted" data-testid="metric-scope">{scope}</span>
-        <span className="w-12 min-w-0 shrink sm:w-16">
-          <Sparkline width={48} data={series.values} timestamps={series.times} stroke={chip.sparkStroke} label={`${chip.label} trend`} />
-        </span>
+        {chip.spark !== false && (
+          <span className="w-12 min-w-0 shrink sm:w-16">
+            <Sparkline width={48} data={series.values} timestamps={series.times} stroke={chip.sparkStroke} label={`${chip.label} trend`} />
+          </span>
+        )}
       </div>
     </div>
   );

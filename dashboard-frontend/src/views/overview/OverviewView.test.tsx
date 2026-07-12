@@ -179,7 +179,7 @@ describe('OverviewView — exact server rollups and honest quality', () => {
     const { getByTestId, getByText } = renderWithQuery(<OverviewView />);
 
     await waitFor(() => expect(getByTestId('overview-provider')).toBeTruthy());
-    expect(getByText('Provider attempts · Global')).toBeTruthy();
+    expect(getByText((_, el) => el?.textContent === 'Provider attempts · Global' && el.tagName === 'SPAN')).toBeTruthy();
     expect(getByTestId('overview-provider').tagName).toBe('BUTTON');
     expect(getByTestId('provider-p50').getAttribute('data-quality')).toBe('derived');
   });

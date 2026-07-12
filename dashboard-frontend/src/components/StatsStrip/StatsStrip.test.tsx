@@ -336,6 +336,19 @@ describe('StatsStrip — history horizon selector', () => {
   });
 });
 
+describe('StatsStrip — total-mode sparkline suppression (R2)', () => {
+  it('omits the sparkline DOM node for the cost chip in window-total mode', () => {
+    const { getByTestId, getByRole } = renderWithQuery(<StatsStrip />);
+    // 1 priced sample → cost renders as a window TOTAL → its rate sparkline must not render.
+    pushMetrics(metrics(1, {}, { m1: { latency_samples: 8, usage_samples: 8, priced_samples: 1, cost_per_min: 0.3, interval_duration_ms: 60_000 } }));
+    fireEvent.click(getByRole('button', { name: /More metrics/ }));
+    const cost = getByTestId('chip-cost_per_min');
+    expect(within(cost).queryByTestId('sparkline')).toBeNull();
+    // A rate-mode chip keeps its sparkline.
+    expect(within(getByTestId('chip-accepted_per_sec')).getByTestId('sparkline')).toBeTruthy();
+  });
+});
+
 describe('CompactStatsStrip (U4)', () => {
   it('renders the one-line pulse: operational status + p50 + tok/s + expand control', () => {
     const { getByTestId } = renderWithQuery(<CompactStatsStrip onExpand={() => {}} />);

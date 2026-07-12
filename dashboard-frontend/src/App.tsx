@@ -103,11 +103,10 @@ function Dashboard() {
   const ActiveView = VIEW_BY_ROUTE[route];
   const narrow = useMediaQuery('(max-width: 1023px)');
   const [stripPinnedFull, setStripPinnedFull] = useState(readStripPin);
-  const compactStrip = route !== 'overview' && !stripPinnedFull;
-  const pinStrip = useCallback((pinned: boolean) => {
-    writeStripPin(pinned);
-    setStripPinnedFull(pinned);
-  }, []);
+  // R2: the compact shell has no Scrubber, so time travel must force the full band — otherwise
+  // non-Overview tabs can neither enter a seek nor show the LIVE/adjust controls mid-seek.
+  const seeking = useDashboard((s) => s.connection === 'seeking');
+  const compactStrip = route !== 'overview' && !stripPinnedFull && !seeking;
 
   useEffect(() => {
     flowFilterStore.getState().hydrate({
@@ -134,6 +133,14 @@ function Dashboard() {
     else if (!chromeCollapsed && h.isCollapsed()) h.expand();
   }, [chromeCollapsed, chromeRef]);
 
+  const pinStrip = useCallback((pinned: boolean) => {
+    writeStripPin(pinned);
+    setStripPinnedFull(pinned);
+    // R2: "Expand metrics" must land on the full band — a stale collapsed chrome flag would
+    // otherwise remount the group showing only the drag-collapse edge strip.
+    if (pinned) setChromeCollapsed(false);
+  }, []);
+
   // Open the WS once on mount; close on unmount. StrictMode double-mounts in dev — the
   // socket.connect()/disconnect() pair is idempotent so no duplicate pipe leaks.
   useEffect(() => {
@@ -159,7 +166,10 @@ function Dashboard() {
       <ScopeBar />
       {narrow ? (
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="mobile-shell">
-          <details className="shrink-0 border-b border-line bg-panel" open>
+          {/* R2/U4: the metrics disclosure defaults OPEN only on Overview; other tabs start
+              with their content, not a ~42vh metrics band. `key` remounts per route so the
+              per-route default applies even after a manual toggle. */}
+          <details key={route} className="shrink-0 border-b border-line bg-panel" open={route === 'overview'}>
             <summary className="cursor-pointer px-4 py-2 text-xs font-medium uppercase tracking-[0.14em] text-text-muted">
               Metrics · timeline
             </summary>

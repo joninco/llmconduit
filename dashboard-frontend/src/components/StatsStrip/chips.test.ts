@@ -338,6 +338,14 @@ describe('chips', () => {
     expect(chip.delta).toBe('flat');
   });
 
+  it('suppresses the sparkline in total mode (rate series beside a total misleads)', () => {
+    const total = deriveChips(win({ latency_samples: 8, usage_samples: 8, priced_samples: 1, cost_per_min: 0.3, interval_duration_ms: 60_000 }), null)
+      .find((c) => c.key === 'cost_per_min')!;
+    expect(total.spark).toBe(false);
+    const rate = deriveChips(win(), null).find((c) => c.key === 'cost_per_min')!;
+    expect(rate.spark).toBe(true);
+  });
+
   it('shows the cost TOTAL on a retained (idle) window even with many priced samples', () => {
     const chip = deriveChips(win({ cost_per_min: 0.21, interval_duration_ms: 60_000 }), null, null, null, { retained: true })
       .find((c) => c.key === 'cost_per_min')!;

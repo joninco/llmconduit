@@ -635,13 +635,15 @@ export function FlowDetail({ apiCallId, onClose }: { apiCallId: string; onClose:
             summary band lives INSIDE the main panel, so a drawer dragged to the top swallows it
             too — the drawer reaches the drill-down's top bar. */}
         {/* U3: a %-only minimum let a persisted drawer layout crush the summary band (and the
-            waterfall inside it) to a sliver. A pixel floor keeps the summary + technical region
-            readable at any drag position; dragging past it still snaps to the full collapse. */}
+            waterfall inside it) to a sliver. The pixel floor must hold the summary header +
+            metric grid (~180px) PLUS the technical region's own 160px minimum (R2 — 240px could
+            not, so a dragged minimum still clipped the waterfall behind overflow:hidden);
+            dragging past the floor still snaps to the full collapse. */}
         <Panel
           id="detail-main"
           collapsible
           collapsedSize={0}
-          minSize={240}
+          minSize={384}
           className="flex min-h-0 min-w-0 flex-col"
           style={{ overflow: 'hidden' }}
         >

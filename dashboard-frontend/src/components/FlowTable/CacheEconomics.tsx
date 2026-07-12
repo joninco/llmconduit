@@ -41,8 +41,15 @@ export function CacheEconomics({
   const measuredGroups = aggregates.filter((a) => a.hitRate.quality !== 'unavailable').length;
   // U12 — the collapsed header must carry a NUMBER worth expanding for, not just group counts:
   // the best measured hit rate when one exists, else how many flows reported cached at all
-  // (quantifying WHY nothing is measured).
-  const topMeasured = aggregates.find((a) => a.hitRate.quality !== 'unavailable') ?? null;
+  // (quantifying WHY nothing is measured). "Best" is the actual max RATE (R2: aggregates sort
+  // by volume, so first-measured was the heaviest model, not the best one).
+  const topMeasured = aggregates
+    .filter((a) => a.hitRate.quality !== 'unavailable')
+    .reduce<CacheAggregateRow | null>((best, a) => {
+      const rate = Number.parseFloat(a.hitRate.value);
+      const bestRate = best === null ? -1 : Number.parseFloat(best.hitRate.value);
+      return Number.isFinite(rate) && rate > bestRate ? a : best;
+    }, null);
   const reportedFlows = aggregates.reduce((n, a) => n + a.reportedSamples, 0);
   const totalFlows = aggregates.reduce((n, a) => n + a.totalSamples, 0);
   const headline = aggregates.length === 0

@@ -24,24 +24,42 @@ import { fmtElapsed, fmtTokens, fmtTokensPerSec } from '../FlowTable/format';
 /** Lines shown before a pretty-printed tool payload folds behind an expand control (U8). */
 const TOOL_FOLD_LINES = 10;
 
+/** Characters shown before a pretty payload folds even without enough newlines (R2: a 300KB
+ * single-line string value is "3 lines" — fold must trigger on bulk, not just line count). */
+const TOOL_FOLD_CHARS = 2_000;
+
 /**
- * One tool call: JSON payloads pretty-print (2-space) and fold past TOOL_FOLD_LINES with an
- * explicit line count — no more single-line JSON walls. Non-JSON content renders unchanged.
- * Display-only: transcript copy elsewhere still yields the raw payload.
+ * One tool call: JSON payloads pretty-print (2-space) and fold past TOOL_FOLD_LINES lines or
+ * TOOL_FOLD_CHARS characters — no more single-line JSON walls. Non-JSON content renders
+ * unchanged. Display-only: transcript copy elsewhere still yields the raw payload.
  */
-function ToolCard({ text }: { text: string }) {
-  const parsed = useMemo(() => splitJsonTail(text), [text]);
+export function ToolCard({ text }: { text: string }) {
+  // Parse AND stringify are memoized per text (R2: re-stringifying a large payload on every
+  // streaming re-render is wasted work) and the stringify is guarded — pathologically deep
+  // JSON throws RangeError, which must degrade to the raw text, never to the route error
+  // boundary taking the whole Theater down.
+  const pretty = useMemo(() => {
+    const parsed = splitJsonTail(text);
+    if (!parsed) return null;
+    try {
+      return { prefix: parsed.prefix, body: JSON.stringify(parsed.value, null, 2) };
+    } catch {
+      return null;
+    }
+  }, [text]);
   const [expanded, setExpanded] = useState(false);
-  if (!parsed) {
+  if (!pretty) {
     return <div className="rounded-sm border border-line bg-panel-raised px-2 py-1 text-[11px] text-meta">{text}</div>;
   }
-  const pretty = JSON.stringify(parsed.value, null, 2);
-  const lines = pretty.split('\n');
-  const foldable = lines.length > TOOL_FOLD_LINES;
-  const shown = foldable && !expanded ? lines.slice(0, TOOL_FOLD_LINES).join('\n') : pretty;
+  const lines = pretty.body.split('\n');
+  const foldable = lines.length > TOOL_FOLD_LINES || pretty.body.length > TOOL_FOLD_CHARS;
+  const shown = foldable && !expanded
+    ? lines.slice(0, TOOL_FOLD_LINES).join('\n').slice(0, TOOL_FOLD_CHARS)
+    : pretty.body;
+  const hiddenChars = pretty.body.length - shown.length;
   return (
     <div className="rounded-sm border border-line bg-panel-raised px-2 py-1 text-[11px] text-meta" data-testid="river-tool-card">
-      {parsed.prefix && <p className="break-words text-text-muted">{parsed.prefix}</p>}
+      {pretty.prefix && <p className="break-words text-text-muted">{pretty.prefix}</p>}
       <pre className="mt-0.5 overflow-x-auto whitespace-pre-wrap break-words" data-testid="river-tool-json">{shown}</pre>
       {foldable && (
         <button
@@ -51,7 +69,11 @@ function ToolCard({ text }: { text: string }) {
           onClick={() => setExpanded((v) => !v)}
           data-testid="river-tool-fold"
         >
-          {expanded ? '▾ collapse' : `▸ ${lines.length - TOOL_FOLD_LINES} more lines`}
+          {expanded
+            ? '▾ collapse'
+            : lines.length > TOOL_FOLD_LINES
+              ? `▸ ${lines.length - TOOL_FOLD_LINES} more lines`
+              : `▸ ${Math.ceil(hiddenChars / 1024)} KB more`}
         </button>
       )}
     </div>

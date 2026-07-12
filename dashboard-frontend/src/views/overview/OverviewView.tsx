@@ -241,7 +241,7 @@ function OverviewContent({ response }: { response: OverviewResponse }) {
           Flow rollups · {scoped ? 'Scoped' : 'Global'}
         </span>
         <span className="rounded border border-line px-1.5 py-0.5 uppercase tracking-wide text-text-muted">
-          Provider attempts · Global
+          Provider <Term term="attempt">attempts</Term> · Global
         </span>
         <span className="font-mono tabular-nums text-text-muted">{response.totals.requests} <Term term="terminal">terminal</Term> <Term term="flow">flows</Term></span>
         <span className="font-mono tabular-nums text-text-muted">

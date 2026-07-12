@@ -365,18 +365,26 @@ export function gridColumns(n: number): number {
 
 /**
  * Split a tool-card string into a human prefix + a parseable JSON tail (U8). Tool lines arrive
- * as `tool arguments <id>: {"command": …}` — the tail is what deserves pretty-printing. Returns
- * null when no parseable JSON object/array is found (the card renders as plain text).
+ * as `tool arguments <id>: {"command": …}` — the tail is what deserves pretty-printing. Tries
+ * successive `{`/`[` positions (R2: a brace inside the tool id must not kill pretty-printing of
+ * the real object that follows), bounded to a few attempts. Returns null when nothing parses
+ * (the card renders as plain text).
  */
 export function splitJsonTail(text: string): { prefix: string; value: unknown } | null {
-  for (const opener of ['{', '[']) {
-    const at = text.indexOf(opener);
-    if (at === -1) continue;
-    const tail = text.slice(at).trim();
+  const candidates: number[] = [];
+  for (let from = 0; candidates.length < 8; ) {
+    const brace = text.indexOf('{', from);
+    const bracket = text.indexOf('[', from);
+    const at = brace === -1 ? bracket : bracket === -1 ? brace : Math.min(brace, bracket);
+    if (at === -1) break;
+    candidates.push(at);
+    from = at + 1;
+  }
+  for (const at of candidates.slice(0, 4)) {
     try {
-      return { prefix: text.slice(0, at).trimEnd(), value: JSON.parse(tail) };
+      return { prefix: text.slice(0, at).trimEnd(), value: JSON.parse(text.slice(at).trim()) };
     } catch {
-      // fall through — try the other opener or give up
+      // try the next opener
     }
   }
   return null;

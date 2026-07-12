@@ -64,6 +64,11 @@ export interface ChipDescriptor {
    * collapsed low-n latency chip, "· last active" on a retained engine tok/s.
    */
   valueSuffix?: string;
+  /**
+   * When false the chip renders NO sparkline (R2): the history series is a per-minute RATE, so
+   * drawing it beside a displayed interval TOTAL pairs a rising spark with a falling number.
+   */
+  spark?: boolean;
   /** The telemetry seam supplying this value; exposed in the DOM and tooltip. */
   source: MetricSource;
   /** uPlot stroke as hex for the sparkline (mirrors `stroke`, kept explicit for clarity). */
@@ -275,6 +280,7 @@ export function deriveChips(
       delta,
       quality,
       valueSuffix,
+      spark: !costAsTotal,
       source: useEngine ? 'engine' : spec.key === 'reported_tokens_per_sec' ? 'reported' : 'gateway',
       sparkStroke: spec.stroke,
       details: useEngine ? engineThroughputDetails(engineThroughput) : metricDetails(cur, spec.key),

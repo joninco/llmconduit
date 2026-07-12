@@ -580,8 +580,10 @@ function FlowRow({
       <span role="gridcell" className="relative text-right tabular-nums text-text-muted">
         {fmtElapsed(elapsed)}
         {/* U5 — proportional latency bar so outliers pop without reading every number. Linear
-            vs the max elapsed among LOADED rows; aria-hidden (the number is the datum). */}
-        {elapsed !== null && maxElapsedMs > 0 && (
+            vs the max elapsed among LOADED rows; aria-hidden (the number is the datum). Open
+            rows carry no bar (R2): their elapsed grows past the terminal max and would pin a
+            meaningless 100% while still running. */}
+        {flow.status !== 'open' && elapsed !== null && maxElapsedMs > 0 && (
           <span
             aria-hidden
             data-testid="elapsed-bar"

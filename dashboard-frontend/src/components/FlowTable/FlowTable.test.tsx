@@ -285,12 +285,14 @@ describe('FlowTable — live WS update + interactions', () => {
     expect(within(second!).getByText('/v1/responses')).toBeTruthy();
   });
 
-  it('renders a proportional elapsed bar scaled to the loaded max', () => {
+  it('renders a proportional elapsed bar scaled to the loaded max; open rows carry none', () => {
     seedFlows([
+      makeFlow({ api_call_id: 'api_open', status: 'open', started_ms: 1_700_000_000_200, elapsed_ms: null, finished_ms: null }),
       makeFlow({ api_call_id: 'api_slow', status: 'completed', started_ms: 1_700_000_000_100, elapsed_ms: 4_000 }),
       makeFlow({ api_call_id: 'api_fast', status: 'completed', started_ms: 1_700_000_000_000, elapsed_ms: 1_000 }),
     ]);
     const { getAllByTestId } = renderWithQuery(<FlowTable selectedId={null} onSelect={noop} />);
+    // R2: an open row's growing elapsed would pin a meaningless 100% — it gets no bar.
     const bars = getAllByTestId('elapsed-bar');
     expect(bars).toHaveLength(2);
     expect(bars[0]!.style.width).toBe('100%');
