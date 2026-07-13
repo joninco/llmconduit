@@ -17,6 +17,7 @@
     "e2e": "playwright test",
     "e2e:real": "playwright test --config playwright.real.config.ts",
     "e2e:update": "playwright test --update-snapshots",
+    "demo:production": "node e2e/record-production-demo.mjs",
     "shot": "node e2e/shot.mjs"
   },
   "dependencies": {
