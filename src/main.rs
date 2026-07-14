@@ -52,6 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let path = resolve_config_path(config)?;
             let config = Config::from_env_file_and_routes(Some(&path), &model_route)?;
             let bind_addr = config.bind_addr;
+            llmconduit::api_auth::validate_startup(
+                bind_addr,
+                &llmconduit::api_auth::ApiAuthEnv::from_process_env(),
+            )?;
             run_debug_log_cleanup(&config);
             let (app, gateway) = build_app_with_gateway_and_options(
                 config,
@@ -69,6 +73,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let path = resolve_config_path(None)?;
             let config = Config::from_env_and_file(Some(&path))?;
             let bind_addr = config.bind_addr;
+            llmconduit::api_auth::validate_startup(
+                bind_addr,
+                &llmconduit::api_auth::ApiAuthEnv::from_process_env(),
+            )?;
             run_debug_log_cleanup(&config);
             let (app, gateway) = build_app_with_gateway_and_options(config, None, app_options);
             let listener = TcpListener::bind(bind_addr).await?;

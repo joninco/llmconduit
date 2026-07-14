@@ -48,8 +48,10 @@ pub use strip::IMAGE_AGENT_SYSTEM_PROMPT;
 pub use strip::analyze_image_tool_parameters;
 pub use strip::analyze_image_tool_spec;
 pub use strip::degrade_residual_images;
+pub use strip::has_agent_images;
 pub use strip::has_residual_images;
 pub use strip::latest_user_message_has_images;
+pub use strip::request_has_agent_images;
 pub use strip::tool_is_analyze_image;
 
 // Re-exported from the sibling redaction module so `crate::vision::redact_*`

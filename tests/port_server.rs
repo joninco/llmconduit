@@ -279,7 +279,7 @@ async fn preflight_image_generation_call_in_input_does_not_change_budget() {
 async fn preflight_reasoning_summary_does_not_change_budget() {
     // Field-level class guard: lowering keeps only `reasoning_effort`, dropping
     // `reasoning.summary`. Because the estimate is computed over the LOWERED
-    // payload, a large `reasoning.summary` must charge ZERO budget bytes —
+    // payload, an accepted `reasoning.summary` must charge ZERO budget bytes —
     // identical cap with and without it, never a false 400. A canonical-request
     // estimator (serializing `request.reasoning`) would over-count here.
     let context_limit = 4_096;
@@ -290,18 +290,18 @@ async fn preflight_reasoning_summary_does_not_change_budget() {
         recorded_max_output_tokens(request, context_limit).await
     };
 
-    let with_big_summary = {
+    let with_summary = {
         let mut request = base_request(vec![user_message("hello")]);
         request.max_output_tokens = Some(1_000_000);
         request.reasoning = Some(ReasoningRequest {
             effort: Some("medium".to_string()),
-            summary: Some("s".repeat(50_000)),
+            summary: Some("detailed".to_string()),
         });
         recorded_max_output_tokens(request, context_limit).await
     };
 
     assert_eq!(
-        with_big_summary, without_summary,
+        with_summary, without_summary,
         "a dropped reasoning.summary must not change the budget"
     );
 }
@@ -364,11 +364,14 @@ fn config_for(server_uri: &str) -> Config {
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
+        api_log_body_mode: Default::default(),
+        upstream_request_log_body_mode: Default::default(),
         upstream_chat_kwargs: serde_json::Map::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
+        responses_capabilities: Default::default(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -379,6 +382,8 @@ fn config_for(server_uri: &str) -> Config {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        response_store: Default::default(),
+        replay: Default::default(),
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -417,7 +422,7 @@ async fn preflight_defers_estimated_context_exhaustion_to_upstream() {
         .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
-                .set_body_string("data: [DONE]\n\n"),
+                .set_body_string(minimal_chat_sse_body()),
         )
         .mount(&server)
         .await;
@@ -462,13 +467,13 @@ async fn preflight_defers_estimated_context_exhaustion_to_upstream() {
     );
 }
 
-/// T9: in ROUTING mode, G3 budgeting reads the candidate's context limit from
-/// the routing layer's `BackendCandidatePlan` (per-provider `/v1/models`), not
-/// the pre-routing engine union catalog. A routing provider whose primary
-/// reports a context window must cap an explicit `max_output_tokens` to that
-/// window minus the estimated input and the fixed 128 margin.
+/// T9: in ROUTING mode, legacy Chat budgeting reads the candidate's context
+/// limit from the routing layer's `BackendCandidatePlan` (per-provider
+/// `/v1/models`), not the pre-routing engine union catalog. Raw Responses
+/// rejects an impossible explicit output limit; Chat retains its historical
+/// preflight capping behavior.
 #[tokio::test]
-async fn preflight_routing_caps_against_provider_context_window() {
+async fn chat_preflight_routing_caps_against_provider_context_window() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -495,6 +500,7 @@ async fn preflight_routing_caps_against_provider_context_window() {
         upstream_model: None,
         upstream_chat_kwargs: serde_json::Map::new(),
         upstream_request_log_path: None,
+        responses_capabilities: None,
         fallback_upstreams: Vec::new(),
     }];
 
@@ -503,14 +509,14 @@ async fn preflight_routing_caps_against_provider_context_window() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/responses")
+                .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     json!({
                         "model": "routed-model",
                         "stream": false,
-                        "input": "hello",
-                        "max_output_tokens": 1_000_000,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "max_tokens": 1_000_000,
                     })
                     .to_string(),
                 ))
@@ -587,6 +593,7 @@ async fn preflight_top_level_failover_no_ops_without_candidate_limit() {
         exposed_model: None,
         upstream_chat_kwargs: serde_json::Map::new(),
         upstream_request_log_path: None,
+        responses_capabilities: None,
     }];
     // The primary also serves (top-level fallback_upstreams ⇒ FailoverUpstreamClient
     // with the primary as provider 0 + the fallback as provider 1).

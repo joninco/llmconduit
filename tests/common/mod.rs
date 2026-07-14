@@ -45,6 +45,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_stream::wrappers::ReceiverStream;
@@ -63,6 +64,7 @@ pub struct MockUpstream {
     responses: Arc<Mutex<VecDeque<ChunkBatch>>>,
     supported_models: Arc<Mutex<Vec<String>>>,
     supported_model_queries: Arc<Mutex<usize>>,
+    catalog_error: Arc<AtomicBool>,
     context_limits: Arc<Mutex<Vec<(String, i64)>>>,
     /// When `Some`, the full pre-first-chunk candidate backend model set this
     /// upstream reports for G4 native-vision gating (round-2 #1) — used to
@@ -73,10 +75,18 @@ pub struct MockUpstream {
     /// test config by the gateway harness so the mock's leaf-mirror applies the
     /// SAME profile kwargs the production leaf would (T1). Empty by default.
     finalization_policies: Arc<std::sync::Mutex<llmconduit::upstream::BackendFinalizationPolicies>>,
+    responses_capabilities:
+        Arc<std::sync::Mutex<llmconduit::responses_capabilities::ResponsesCapabilities>>,
 }
 
 impl MockUpstream {
-    pub async fn push_response(&self, chunks: ChunkBatch) {
+    pub async fn push_response(&self, mut chunks: ChunkBatch) {
+        append_test_stop_if_needed(&mut chunks);
+        self.responses.lock().await.push_back(chunks);
+    }
+
+    /// Queue a deliberately unterminated stream for malformed-upstream tests.
+    pub async fn push_unterminated_response(&self, chunks: ChunkBatch) {
         self.responses.lock().await.push_back(chunks);
     }
 
@@ -90,6 +100,16 @@ impl MockUpstream {
         *self.finalization_policies.lock().expect("policies lock") = policies;
     }
 
+    pub fn set_responses_capabilities(
+        &self,
+        capabilities: llmconduit::responses_capabilities::ResponsesCapabilities,
+    ) {
+        *self
+            .responses_capabilities
+            .lock()
+            .expect("capabilities lock") = capabilities;
+    }
+
     pub async fn requests(&self) -> Vec<ChatCompletionRequest> {
         self.requests.lock().await.clone()
     }
@@ -100,6 +120,10 @@ impl MockUpstream {
         S: Into<String>,
     {
         *self.supported_models.lock().await = models.into_iter().map(Into::into).collect();
+    }
+
+    pub fn set_catalog_error(&self, enabled: bool) {
+        self.catalog_error.store(enabled, Ordering::SeqCst);
     }
 
     pub async fn supported_model_queries(&self) -> usize {
@@ -128,6 +152,30 @@ impl MockUpstream {
         *self.candidate_models.lock().expect("candidate models lock") =
             Some(models.into_iter().map(Into::into).collect());
     }
+}
+
+fn append_test_stop_if_needed(chunks: &mut ChunkBatch) {
+    if chunks.iter().any(Result::is_err)
+        || chunks
+            .iter()
+            .filter_map(|chunk| chunk.as_ref().ok())
+            .any(|chunk| {
+                chunk
+                    .choices
+                    .iter()
+                    .any(|choice| choice.finish_reason.is_some())
+            })
+    {
+        return;
+    }
+    let Some(id) = chunks
+        .iter()
+        .rev()
+        .find_map(|chunk| chunk.as_ref().ok().map(|chunk| chunk.id.clone()))
+    else {
+        return;
+    };
+    chunks.push(Ok(finish_chunk(&id, "stop")));
 }
 
 #[async_trait]
@@ -168,6 +216,11 @@ impl UpstreamClient for MockUpstream {
 
     async fn supported_model_catalog(&self) -> Result<Vec<UpstreamModelEntry>, AppError> {
         *self.supported_model_queries.lock().await += 1;
+        if self.catalog_error.load(Ordering::SeqCst) {
+            return Err(AppError::upstream(
+                "sentinel provider catalog failure details",
+            ));
+        }
         let limits = self.context_limits.lock().await.clone();
         Ok(self
             .supported_models
@@ -221,6 +274,25 @@ impl UpstreamClient for MockUpstream {
         }];
         llmconduit::upstream::BackendCandidatePlan { candidates }
     }
+
+    async fn responses_capability_plan(
+        &self,
+        requested_model: &str,
+    ) -> llmconduit::responses_capabilities::CapabilityPlan {
+        llmconduit::responses_capabilities::CapabilityPlan {
+            candidates: vec![llmconduit::responses_capabilities::CapabilityCandidate {
+                target: llmconduit::responses_capabilities::CapabilityTarget {
+                    provider: "primary".to_string(),
+                    model: requested_model.to_string(),
+                },
+                capabilities: self
+                    .responses_capabilities
+                    .lock()
+                    .expect("capabilities lock")
+                    .clone(),
+            }],
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +343,7 @@ pub fn test_gateway_with_config(
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
     );
+    upstream.set_responses_capabilities(config.responses_capabilities.resolve());
     // These shared port_* tests never exercise the image agent (off in
     // `test_config`), so a real `ReqwestVisionClient` that is never called and a
     // cache derived from config satisfy the constructor.
@@ -306,6 +379,7 @@ pub fn test_gateway_with_config_and_replay_store(
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
     );
+    upstream.set_responses_capabilities(config.responses_capabilities.resolve());
     let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
         llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
     );
@@ -429,6 +503,7 @@ pub fn test_gateway_with_vision(
     vision: MockVisionClient,
     config: Config,
 ) -> Arc<Gateway> {
+    upstream.set_responses_capabilities(config.responses_capabilities.resolve());
     let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(vision);
     let image_cache = Arc::new(llmconduit::vision::ImageCache::from_config(&config));
     Arc::new(Gateway::new(
@@ -490,12 +565,16 @@ pub fn test_config() -> Config {
         upstream_model: None,
         system_prompt_prefix: None,
         upstream_request_log_path: None,
+        api_log_body_mode: llmconduit::config::LogBodyMode::Metadata,
+        upstream_request_log_body_mode: llmconduit::config::LogBodyMode::Metadata,
         turn_capture_dir: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: BTreeMap::new(),
+        responses_capabilities:
+            llmconduit::responses_capabilities::ResponsesCapabilitiesConfig::default(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -506,6 +585,8 @@ pub fn test_config() -> Config {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        response_store: llmconduit::config::ResponseStoreConfig::default(),
+        replay: llmconduit::config::ReplayConfig::default(),
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -531,7 +612,7 @@ pub fn config_from_yaml(yaml: &str) -> Config {
 pub fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
     ResponsesRequest {
         model: "glm-5.1".to_string(),
-        instructions: String::new(),
+        instructions: String::new().into(),
         input,
         tools: Vec::new(),
         tool_choice: json!("auto"),
@@ -546,9 +627,10 @@ pub fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_retention: None,
         text: None,
-        client_metadata: None,
         previous_response_id: None,
+        llmconduit_replay: None,
         temperature: None,
         top_p: None,
         max_output_tokens: None,
@@ -578,6 +660,7 @@ pub fn user_message(text: &str) -> ResponseItem {
 
 pub fn content_chunk(id: &str, content: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -598,6 +681,7 @@ pub fn content_chunk(id: &str, content: &str) -> ChatCompletionChunk {
 
 pub fn finish_chunk(id: &str, finish_reason: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -618,6 +702,7 @@ pub fn finish_chunk(id: &str, finish_reason: &str) -> ChatCompletionChunk {
 
 pub fn reasoning_chunk(id: &str, reasoning: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -638,6 +723,7 @@ pub fn reasoning_chunk(id: &str, reasoning: &str) -> ChatCompletionChunk {
 
 pub fn nested_thinking_chunk(id: &str, thinking: &str, signature: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -666,6 +752,7 @@ pub fn tool_call_chunk(
     arguments: &str,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -702,6 +789,7 @@ pub fn usage_chunk(
     total_tokens: u64,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         usage: Some(ChunkUsage {
             prompt_tokens: prompt_tokens.try_into().expect("prompt_tokens fits in i64"),

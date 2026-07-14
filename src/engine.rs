@@ -6,6 +6,7 @@ use crate::adapters::responses_to_chat::LoweredTurn;
 use crate::adapters::responses_to_chat::ToolKind;
 use crate::adapters::responses_to_chat::{
     lower_request_with_image_agent_and_roles, merge_adjacent_if_configured, shape_tail_message,
+    validate_structured_output,
 };
 use crate::config::Config;
 use crate::config::UnsupportedImagePolicy;
@@ -19,7 +20,6 @@ use crate::models::chat::StreamOptions;
 use crate::models::responses::DeltaPayload;
 use crate::models::responses::FailedError;
 use crate::models::responses::FailedPayload;
-use crate::models::responses::FailedResponse;
 use crate::models::responses::OutputItemPayload;
 use crate::models::responses::ReasoningDeltaPayload;
 use crate::models::responses::ReasoningSignatureDeltaPayload;
@@ -29,7 +29,6 @@ use crate::models::responses::ResponseInputTokensDetails;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponseOutputTokensDetails;
 use crate::models::responses::ResponseResource;
-use crate::models::responses::ResponseStub;
 use crate::models::responses::ResponseUsage;
 use crate::models::responses::ResponsesEnvelope;
 use crate::models::responses::ResponsesRequest;
@@ -60,6 +59,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -92,6 +92,17 @@ const MAX_UNKNOWN_TOOL_COUNTER_KEYS: usize = 256;
 /// E1: the bounded catch-all `{provider, served_model}` a counter key folds into
 /// once [`MAX_UNKNOWN_TOOL_COUNTER_KEYS`] distinct keys are tracked.
 const UNKNOWN_TOOL_COUNTER_OVERFLOW_KEY: &str = "__other__";
+
+/// Bound provider/model labels for raw-to-public function-call identity
+/// accounting. The counters never retain call ids, names, or arguments; once
+/// this many label pairs are present, new pairs fold into a fixed catch-all.
+const MAX_FUNCTION_CALL_IDENTITY_COUNTER_KEYS: usize = 256;
+const FUNCTION_CALL_IDENTITY_COUNTER_OVERFLOW_KEY: &str = "__other__";
+
+/// Keep synthesized public argument deltas small enough for bounded-channel
+/// backpressure to remain effective even when an upstream produced many small
+/// fragments that canonical validation reassembled into a large JSON string.
+const PUBLIC_TOOL_ARGUMENT_DELTA_MAX_BYTES: usize = 64 * 1024;
 
 /// E1: synthetic tool result injected for a VALID call that was tainted (NOT run)
 /// because a sibling call in the same batch referenced an unoffered tool.
@@ -130,10 +141,69 @@ impl UnknownToolOutcome {
 /// E1: key for the bounded unknown-tool-call counter.
 type UnknownToolCounterKey = (String, String, UnknownToolOutcome);
 
+/// Best-effort rollback for a prepared/published response whose terminal event
+/// was cancelled or could not be delivered. Prepared rows are fail-closed and
+/// invisible; bounded retries handle transient SQLite lock contention for a
+/// row that had already been published.
+async fn discard_response_state(
+    store: Arc<dyn crate::response_store::ResponseStore>,
+    response_id: String,
+) {
+    let mut last_error = None;
+    for attempt in 0..3 {
+        match store.delete(&response_id).await {
+            Ok(()) => return,
+            Err(error) => last_error = Some(error),
+        }
+        if attempt < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(25 * (attempt + 1))).await;
+        }
+    }
+    if let Some(error) = last_error {
+        tracing::error!(%error, %response_id, "failed to roll back response state after bounded retries");
+    }
+}
+
+type FunctionCallIdentityCounterKey = (String, String);
+
+/// Process-wide diagnostic accounting for the upstream-tool-call to public-item
+/// conversion seam. `raw_upstream_calls` is partitioned into served, hidden, and
+/// rejected calls; `identity_mismatches` is an additional subset of served calls
+/// whose raw and public identities did not match exactly.
+///
+/// This intentionally records cardinalities only. It never stores raw call ids,
+/// tool names, or arguments, keeping memory and sensitive-data exposure bounded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FunctionCallIdentitySnapshot {
+    pub raw_upstream_calls: u64,
+    pub served_public_calls: u64,
+    pub hidden_calls: u64,
+    pub rejected_calls: u64,
+    pub identity_mismatches: u64,
+}
+
+impl FunctionCallIdentitySnapshot {
+    fn add_assign_saturating(&mut self, other: Self) {
+        self.raw_upstream_calls = self
+            .raw_upstream_calls
+            .saturating_add(other.raw_upstream_calls);
+        self.served_public_calls = self
+            .served_public_calls
+            .saturating_add(other.served_public_calls);
+        self.hidden_calls = self.hidden_calls.saturating_add(other.hidden_calls);
+        self.rejected_calls = self.rejected_calls.saturating_add(other.rejected_calls);
+        self.identity_mismatches = self
+            .identity_mismatches
+            .saturating_add(other.identity_mismatches);
+    }
+}
+
 #[derive(Clone)]
 pub struct Gateway {
     config: Config,
     replay_store: ReplayStore,
+    replay_enabled: bool,
+    response_store: Arc<dyn crate::response_store::ResponseStore>,
     upstream: Arc<dyn UpstreamClient>,
     search: Arc<dyn SearchClient>,
     vision: Arc<dyn VisionClient>,
@@ -150,7 +220,14 @@ pub struct Gateway {
     /// case the auth-gated routes are simply not registered. NEVER built from
     /// the persisted `Config` (secrets are read from the environment).
     dashboard_auth: Option<Arc<crate::dashboard_auth::DashboardAuth>>,
+    /// Environment-only authentication for `/v1/*`. `None` is valid only for
+    /// loopback development or an explicit insecure startup override.
+    api_auth: Option<Arc<crate::api_auth::ApiAuth>>,
     upstream_model_catalog: Arc<Mutex<Option<CachedUpstreamModelCatalog>>>,
+    /// Single-flight gate for catalog refreshes. This is deliberately separate
+    /// from `upstream_model_catalog`: readers hold the cache mutex only long
+    /// enough to clone/publish a snapshot, never across network or body I/O.
+    upstream_model_catalog_refresh: Arc<Mutex<()>>,
     /// D4 published topology health: the latest versioned
     /// `Arc<ProviderHealthSnapshot>`, swapped by the publication task (1 s tick +
     /// cooldown-deadline wake) when `--with-debug-ui` is on. Always present (a
@@ -202,6 +279,13 @@ pub struct Gateway {
     /// are NEVER labels (cardinality). `Arc<Mutex<..>>` so a cloned `Gateway`
     /// shares one count, mirroring `model_fallback_warned`.
     unknown_tool_call_counts: Arc<std::sync::Mutex<BTreeMap<UnknownToolCounterKey, u64>>>,
+    /// Bounded, always-on raw-to-public function-call identity accounting keyed
+    /// by `{provider, served_model}`. Cloned gateways share this process-wide
+    /// aggregate. Raw identities themselves are compared and immediately
+    /// discarded; only the fixed counters above are retained.
+    function_call_identity_counts: Arc<
+        std::sync::Mutex<BTreeMap<FunctionCallIdentityCounterKey, FunctionCallIdentitySnapshot>>,
+    >,
     /// Process-wide negative capability cache for the optional backend
     /// `/tokenize` endpoint. The routing implementation probes all eligible
     /// candidates before returning unsupported.
@@ -547,20 +631,34 @@ fn candidate_context_floor(plan: &crate::upstream::BackendCandidatePlan) -> Opti
 #[derive(Debug, Clone)]
 enum TurnCompletion {
     /// The turn ended on a genuine stop (upstream `response.completed`).
-    Completed(SseEvent),
+    Completed {
+        event: SseEvent,
+        replay_record: Option<ReplayRecord>,
+    },
     /// The turn was truncated by the upstream output-token cap (`finish_reason:
     /// length` ⇒ `response.incomplete`).
-    Incomplete(SseEvent),
+    Incomplete {
+        event: SseEvent,
+        replay_record: Option<ReplayRecord>,
+    },
 }
 
 impl TurnCompletion {
     fn is_incomplete(&self) -> bool {
-        matches!(self, Self::Incomplete(_))
+        matches!(self, Self::Incomplete { .. })
     }
 
     fn terminal_event(&self) -> &SseEvent {
         match self {
-            Self::Completed(event) | Self::Incomplete(event) => event,
+            Self::Completed { event, .. } | Self::Incomplete { event, .. } => event,
+        }
+    }
+
+    fn take_replay_record(&mut self) -> Option<ReplayRecord> {
+        match self {
+            Self::Completed { replay_record, .. } | Self::Incomplete { replay_record, .. } => {
+                replay_record.take()
+            }
         }
     }
 }
@@ -613,7 +711,49 @@ fn build_upstream_extra_body(
     );
     remove_defaults_shadowed_by_request_extra(&mut extra_body, &request.extra_body);
     for (key, value) in &request.extra_body {
+        if ResponsesRequest::is_typed_field_name(key) {
+            continue;
+        }
         merge_request_extra_value(&mut extra_body, key, value);
+    }
+    let forward_prompt_cache_key = extra_body
+        .remove(crate::responses_capabilities::FORWARD_PROMPT_CACHE_KEY_EXTENSION)
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    // Local cache-affinity is a gateway-only SHA-256 namespace. It must never
+    // become an arbitrary vendor kwarg on the Chat Completions request.
+    extra_body.remove(crate::responses_capabilities::PROMPT_CACHE_AFFINITY_EXTENSION);
+    if forward_prompt_cache_key && let Some(key) = &request.prompt_cache_key {
+        extra_body.insert("prompt_cache_key".to_string(), Value::String(key.clone()));
+    }
+    if let Some(retention) = &request.prompt_cache_retention {
+        extra_body.insert(
+            "prompt_cache_retention".to_string(),
+            Value::String(retention.clone()),
+        );
+    }
+    if let Some(tier) = &request.service_tier {
+        extra_body.insert("service_tier".to_string(), Value::String(tier.clone()));
+    }
+    if let Some(verbosity) = request
+        .text
+        .as_ref()
+        .and_then(|controls| controls.verbosity.as_ref())
+    {
+        extra_body.insert("verbosity".to_string(), Value::String(verbosity.clone()));
+    }
+    if request.truncation.as_ref().and_then(Value::as_str) == Some("auto") {
+        extra_body.insert("truncation".to_string(), Value::String("auto".to_string()));
+    }
+    if let Some(summary) = request
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.summary.as_ref())
+    {
+        extra_body.insert(
+            "reasoning_summary".to_string(),
+            Value::String(summary.clone()),
+        );
     }
     extra_body
 }
@@ -739,6 +879,13 @@ impl Gateway {
         Self {
             config,
             replay_store,
+            // Replay is an independent, explicitly-enabled optimization. The
+            // safe default applies to embedded/direct constructors as well as
+            // the application DI path.
+            replay_enabled: false,
+            response_store: Arc::new(crate::response_store::ResponseStoreHandle::memory(
+                1000, 720,
+            )),
             upstream,
             search,
             vision,
@@ -748,7 +895,9 @@ impl Gateway {
             flow_store,
             abort_hub,
             dashboard_auth: None,
+            api_auth: None,
             upstream_model_catalog: Arc::new(Mutex::new(None)),
+            upstream_model_catalog_refresh: Arc::new(Mutex::new(())),
             provider_health: ProviderHealthPublisher::default(),
             // D5: disabled by default (zero overhead); the DI root attaches an
             // enabled layer via `with_metrics` in the `--with-debug-ui` branch.
@@ -760,6 +909,7 @@ impl Gateway {
             dashboard_history: crate::dashboard_history::DashboardHistory::disabled(),
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            function_call_identity_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             tokenize_capability: Arc::new(std::sync::Mutex::new(TokenizeCapability::Unknown)),
         }
     }
@@ -797,6 +947,74 @@ impl Gateway {
         self.unknown_tool_call_counts
             .lock()
             .expect("unknown tool counter lock poisoned")
+            .clone()
+    }
+
+    /// Record one finalized upstream turn without semantic deduplication. Every
+    /// resolved accumulator contributes independently, even when two calls have
+    /// identical names and arguments. A batch tainted by an unknown call exposes
+    /// none of its otherwise-valid calls as terminal public items, so those calls
+    /// are explicitly `hidden`; the unknown calls are `rejected`. Gateway-owned
+    /// image-analysis calls are also hidden. Other public call item variants,
+    /// including `web_search_call`, retain an identity and count as served.
+    fn record_function_call_identities(
+        &self,
+        provider: &str,
+        served_model: &str,
+        finalized: &FinalizedAssistantTurn,
+    ) {
+        if finalized.tool_calls.is_empty() && finalized.rejected_tool_calls.is_empty() {
+            return;
+        }
+
+        let tainted = !finalized.rejected_tool_calls.is_empty();
+        let mut delta = FunctionCallIdentitySnapshot::default();
+        for call in &finalized.tool_calls {
+            delta.raw_upstream_calls = delta.raw_upstream_calls.saturating_add(1);
+            if tainted || matches!(call.kind, ToolKind::ImageAnalysis) {
+                delta.hidden_calls = delta.hidden_calls.saturating_add(1);
+                continue;
+            }
+
+            delta.served_public_calls = delta.served_public_calls.saturating_add(1);
+            let raw_identity = call.raw_upstream_call_id.as_deref();
+            let public_identity = public_tool_call_identity(&call.public_item);
+            if !matches!((raw_identity, public_identity), (Some(raw), Some(public)) if raw == public)
+            {
+                delta.identity_mismatches = delta.identity_mismatches.saturating_add(1);
+            }
+        }
+        for _ in &finalized.rejected_tool_calls {
+            delta.raw_upstream_calls = delta.raw_upstream_calls.saturating_add(1);
+            delta.rejected_calls = delta.rejected_calls.saturating_add(1);
+        }
+
+        let mut counts = self
+            .function_call_identity_counts
+            .lock()
+            .expect("function call identity counter lock poisoned");
+        let requested_key = (provider.to_string(), served_model.to_string());
+        let key = if counts.contains_key(&requested_key)
+            || counts.len() < MAX_FUNCTION_CALL_IDENTITY_COUNTER_KEYS
+        {
+            requested_key
+        } else {
+            (
+                FUNCTION_CALL_IDENTITY_COUNTER_OVERFLOW_KEY.to_string(),
+                FUNCTION_CALL_IDENTITY_COUNTER_OVERFLOW_KEY.to_string(),
+            )
+        };
+        counts.entry(key).or_default().add_assign_saturating(delta);
+    }
+
+    /// Snapshot bounded per-provider/model identity accounting for tests and
+    /// diagnostics. The returned map contains counters only, never call content.
+    pub fn function_call_identity_counts(
+        &self,
+    ) -> BTreeMap<FunctionCallIdentityCounterKey, FunctionCallIdentitySnapshot> {
+        self.function_call_identity_counts
+            .lock()
+            .expect("function call identity counter lock poisoned")
             .clone()
     }
 
@@ -943,6 +1161,32 @@ impl Gateway {
         self.dashboard_auth.clone()
     }
 
+    pub fn with_api_auth(mut self, auth: Option<Arc<crate::api_auth::ApiAuth>>) -> Self {
+        self.api_auth = auth;
+        self
+    }
+
+    pub fn api_auth(&self) -> Option<Arc<crate::api_auth::ApiAuth>> {
+        self.api_auth.clone()
+    }
+
+    pub fn with_response_store(
+        mut self,
+        response_store: Arc<dyn crate::response_store::ResponseStore>,
+    ) -> Self {
+        self.response_store = response_store;
+        self
+    }
+
+    pub fn response_store(&self) -> &(dyn crate::response_store::ResponseStore + 'static) {
+        self.response_store.as_ref()
+    }
+
+    pub fn with_replay_enabled(mut self, enabled: bool) -> Self {
+        self.replay_enabled = enabled;
+        self
+    }
+
     /// Access the dashboard FlowStore (D1). `is_enabled()` is `false` when the
     /// debug UI is off, in which case every store op is a no-op.
     pub fn flow_store(&self) -> &crate::dashboard_flow::DashboardFlowStore {
@@ -1081,6 +1325,64 @@ impl Gateway {
         self.normalize_upstream_model(&configured_model).await
     }
 
+    /// Strict model resolution for raw Responses ingress. Chat and Anthropic
+    /// retain their historical default-model fallback, but Responses requires
+    /// an explicit catalog model or configured alias and must not fail open
+    /// when `/v1/models` is unavailable or empty.
+    pub async fn resolve_responses_model(&self, request_model: &str) -> AppResult<String> {
+        let explicit_alias = self.config.explicit_response_model_alias(request_model);
+        let request_route = self.config.matches_model_route(request_model);
+        let catalog = match self.load_upstream_model_catalog().await {
+            Ok(catalog) => catalog,
+            Err(error) if explicit_alias.is_some() || request_route => {
+                tracing::warn!(
+                    model = request_model,
+                    %error,
+                    "model catalog unavailable; using an explicitly configured Responses alias"
+                );
+                return Ok(explicit_alias.unwrap_or_else(|| request_model.to_string()));
+            }
+            Err(error) => {
+                tracing::warn!(model = request_model, %error, "failed to validate Responses model");
+                return Err(
+                    AppError::upstream("could not load the upstream model catalog")
+                        .with_code("model_catalog_unavailable"),
+                );
+            }
+        };
+
+        let catalog_match = |candidate: &str| {
+            catalog
+                .exact_id(candidate)
+                .or_else(|| catalog.canonical_unique(candidate))
+        };
+        let request_is_known =
+            catalog_match(request_model).is_some() || request_route || explicit_alias.is_some();
+        if !request_is_known {
+            return Err(AppError::not_found("the requested model was not found")
+                .with_code("model_not_found")
+                .with_param("model"));
+        }
+
+        let configured_model = self.config.resolve_upstream_model(request_model);
+        if self.config.matches_model_route(&configured_model) {
+            return Ok(configured_model);
+        }
+        if let Some(resolved) = catalog_match(&configured_model) {
+            return Ok(resolved);
+        }
+        if explicit_alias.is_some() || request_route {
+            // The configured route/alias is itself the authority for models
+            // intentionally absent from a provider's catalog.
+            return Ok(configured_model);
+        }
+
+        Err(
+            AppError::upstream("the configured upstream model is not present in the model catalog")
+                .with_code("model_configuration_error"),
+        )
+    }
+
     /// Decide whether the Chat output converter must suppress
     /// `reasoning_content` for this inbound request. We suppress whenever the
     /// inbound Chat client did NOT request reasoning, for ALL models and
@@ -1155,15 +1457,17 @@ impl Gateway {
         Ok(())
     }
 
-    /// Forward one gated `function_call_arguments` delta: mirror it to the
-    /// monitor hub and stream it as an SSE event. This is the single emission
-    /// path the [`ToolDeltaGate`] feeds — previously inlined (and duplicated)
-    /// across the fast path, the `Emit`/flush branches, and the turn-end flush.
+    /// Forward one validated `function_call_arguments` delta: mirror it to the
+    /// monitor hub and stream it as an SSE event. Client-visible function
+    /// arguments are emitted only after the complete upstream tool-call batch
+    /// has passed name, JSON, and strict-schema validation, so a later rejected
+    /// call cannot leave an already-announced public item dangling.
     async fn emit_function_call_delta(
         &self,
         response_id: &str,
         tx: &mpsc::Sender<SseEvent>,
         emission: DeltaEmission,
+        event_state: &ResponseEventState,
         abort_token: &tokio_util::sync::CancellationToken,
     ) -> AppResult<()> {
         let DeltaEmission {
@@ -1183,66 +1487,39 @@ impl Gateway {
         });
         self.send_event(
             tx,
-            function_call_args_delta_event(call_id, name, delta),
+            function_call_args_delta_event(
+                event_state.function_target(&call_id)?,
+                call_id,
+                name,
+                delta,
+            ),
             abort_token,
         )
         .await
     }
 
-    /// Drive a [`ToolDeltaGate`] decision to the wire, in order. `None` emits
-    /// nothing; `One` forwards the single delta; `Flush` emits the gate's
-    /// moved-out buffered fragments (iterated in place, no copy) then the
-    /// optional trailing delta. Allocation-free beyond the `String`s the gate
-    /// already owns.
-    async fn drive_delta_decision(
+    async fn resolve_stored_item_references(
         &self,
-        response_id: &str,
-        tx: &mpsc::Sender<SseEvent>,
-        decision: DeltaDecision,
-        abort_token: &tokio_util::sync::CancellationToken,
+        items: &mut [ResponseItem],
+        base: &str,
     ) -> AppResult<()> {
-        match decision {
-            DeltaDecision::None => {}
-            DeltaDecision::One(emission) => {
-                self.emit_function_call_delta(response_id, tx, emission, abort_token)
-                    .await?;
-            }
-            DeltaDecision::Flush {
-                call_id,
-                buffered,
-                trailing,
-            } => {
-                // One `call_id.clone()` per buffered fragment: each fragment is a
-                // distinct emission that needs its own owned id, exactly as the
-                // pre-T3 inline loop did (parity, no regression). The trailing
-                // delta is the id's last use, so it MOVES `call_id` (no clone).
-                for (name, delta) in buffered {
-                    self.emit_function_call_delta(
-                        response_id,
-                        tx,
-                        DeltaEmission {
-                            call_id: call_id.clone(),
-                            name,
-                            delta,
-                        },
-                        abort_token,
-                    )
-                    .await?;
-                }
-                if let Some((name, delta)) = trailing {
-                    self.emit_function_call_delta(
-                        response_id,
-                        tx,
-                        DeltaEmission {
-                            call_id,
-                            name,
-                            delta,
-                        },
-                        abort_token,
-                    )
-                    .await?;
-                }
-            }
+        for (index, item) in items.iter_mut().enumerate() {
+            let ResponseItem::ItemReference { id } = item else {
+                continue;
+            };
+            let referenced = self
+                .response_store
+                .find_item(id)
+                .await
+                .map_err(|error| {
+                    AppError::internal(format!("failed to resolve stored item: {error}"))
+                })?
+                .ok_or_else(|| {
+                    AppError::not_found("stored response item was not found")
+                        .with_code("item_not_found")
+                        .with_param(format!("{base}[{index}].id"))
+                })?;
+            *item = referenced;
         }
         Ok(())
     }
@@ -1262,9 +1539,23 @@ impl Gateway {
 
     pub async fn stream_responses_with_api_call_id(
         self: Arc<Self>,
-        request: ResponsesRequest,
+        mut request: ResponsesRequest,
         api_call_id: Option<String>,
     ) -> AppResult<ReceiverStream<SseEvent>> {
+        // Public resources echo the caller's instruction union, not gateway
+        // prefixes or expanded stored-item bodies used only for lowering.
+        let caller_instructions = request.instructions.clone();
+        let enforce_responses_capabilities = request
+            .extra_body
+            .remove(crate::responses_capabilities::ENFORCE_EXTENSION)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        if let Some(items) = request.instructions.items_mut() {
+            self.resolve_stored_item_references(items, "instructions")
+                .await?;
+        }
+        self.resolve_stored_item_references(&mut request.input, "input")
+            .await?;
         // D2/D3: ONE serving token per flow, allocated here (not per turn) so the L1
         // telemetry guard built BELOW and every per-turn `BackendChatRequest` in
         // `run_turn` share the SAME `Arc` — the failover/routing layers tag
@@ -1314,6 +1605,86 @@ impl Gateway {
                 .state(id)
                 .map(|state| crate::turn_capture::CaptureGuard::new(state, abort_token.clone()))
         });
+        // Every error after the observability guards are claimed must finalize
+        // them as failed, including a missing/expired previous_response_id.
+        let finalize_pre_spawn_err = |err: AppError| {
+            let durable = if let Some(guard) = &telemetry_guard {
+                self.prepare_terminal_pricing(guard);
+                let durable = guard.finalize(
+                    crate::dashboard_flow::FlowStatus::Failed,
+                    Some(err.to_string()),
+                );
+                self.record_terminal_metrics(
+                    guard,
+                    crate::dashboard_flow::FlowStatus::Failed,
+                    guard.elapsed().as_millis(),
+                );
+                durable
+            } else {
+                None
+            };
+            if let Some(guard) = &capture_guard {
+                guard.finalize("failed", Some(&err.to_string()));
+            }
+            (err, durable)
+        };
+
+        if let Some(previous_response_id) = request.previous_response_id.clone() {
+            let previous = match self.response_store.get(&previous_response_id).await {
+                Ok(Some(previous)) => previous,
+                Ok(None) => {
+                    let error = AppError::not_found(
+                        "previous response was not found or is no longer stored",
+                    )
+                    .with_code("response_not_found")
+                    .with_param("previous_response_id");
+                    let (error, durable) = finalize_pre_spawn_err(error);
+                    if let Some((summary, record_seq)) = durable {
+                        self.dashboard_history()
+                            .persist_flow_summary(
+                                summary,
+                                crate::dashboard_flow::FlowMutationPhase::Terminal,
+                                record_seq,
+                            )
+                            .await
+                            .map_err(|persist_error| {
+                                tracing::error!(%persist_error, "failed to persist response-state lookup failure");
+                                AppError::internal(
+                                    "dashboard durability commit failed before error response",
+                                )
+                            })?;
+                    }
+                    return Err(error);
+                }
+                Err(store_error) => {
+                    let error =
+                        AppError::internal(format!("failed to read response state: {store_error}"));
+                    let (error, durable) = finalize_pre_spawn_err(error);
+                    if let Some((summary, record_seq)) = durable {
+                        self.dashboard_history()
+                            .persist_flow_summary(
+                                summary,
+                                crate::dashboard_flow::FlowMutationPhase::Terminal,
+                                record_seq,
+                            )
+                            .await
+                            .map_err(|persist_error| {
+                                tracing::error!(%persist_error, "failed to persist response-state error");
+                                AppError::internal(
+                                    "dashboard durability commit failed before error response",
+                                )
+                            })?;
+                    }
+                    return Err(error);
+                }
+            };
+            if request.model.trim().is_empty() {
+                request.model = previous.requested_model;
+            }
+            let mut combined = previous.history;
+            combined.extend(std::mem::take(&mut request.input));
+            request.input = combined;
+        }
         // D2 (D13 R1 HIGH): the ORIGINAL request model, captured BEFORE resolution so
         // the flow record's `model_requested` reflects what the CLIENT asked for (an
         // alias / ad-hoc route / profile name), distinct from the resolved/served
@@ -1335,64 +1706,123 @@ impl Gateway {
         // reads or depends on this value.
         let response_id = format!("resp_{}", Uuid::new_v4().simple());
 
-        // G4/E2b: the resolved-backend native-vision decision, computed ONCE
-        // and shared between G4 gating (`activate_image_agent`, which used to
-        // recompute this itself) and the E2b residual-image pass below, so the
-        // two can never disagree about whether this backend is safe to receive
-        // raw images. Must be computed unconditionally (not just when G4's own
-        // earlier gates pass) because E2b runs regardless of whether the G4
-        // agent activated.
-        let native_vision = self
-            .backend_is_native_vision(&request.model, &resolved_model, request_genuine)
+        // Raw Responses ingress is capability-gated against the selected
+        // primary's provider+served-model declaration. Incompatible fallbacks
+        // are omitted from this request without cooldown or health mutation.
+        // Chat and Anthropic ingress preserve their existing contracts and do
+        // not arm the consumed internal marker.
+        let capability_validation = if enforce_responses_capabilities {
+            let plan = self
+                .upstream
+                .responses_capability_plan(&resolved_model)
+                .await;
+            crate::responses_capabilities::validate_and_prepare(&mut request, &plan)
+        } else {
+            Ok(crate::responses_capabilities::CapabilityAllowlist::unrestricted())
+        };
+
+        let capability_allowlist = match capability_validation {
+            Ok(allowlist) => allowlist,
+            Err(err) => {
+                let (err, durable) = finalize_pre_spawn_err(err);
+                if let Some((summary, record_seq)) = durable
+                    && let Err(error) = self
+                        .dashboard_history()
+                        .persist_flow_summary(
+                            summary,
+                            crate::dashboard_flow::FlowMutationPhase::Terminal,
+                            record_seq,
+                        )
+                        .await
+                    && self.dashboard_history().is_required()
+                {
+                    tracing::error!(%error, "failed to persist capability-validation failure");
+                    return Err(AppError::internal(
+                        "dashboard durability commit failed before error response",
+                    ));
+                }
+                return Err(err);
+            }
+        };
+
+        // Raw Responses image handling is selected by the primary provider's
+        // declared capability. Converted Chat/Anthropic requests carry no raw
+        // policy and retain the gateway-wide legacy agent/placeholder behavior.
+        let raw_image_policy = capability_allowlist.input_image_policy();
+        let backend_native_vision = self
+            .backend_is_native_vision(
+                &request.model,
+                &resolved_model,
+                request_genuine,
+                &capability_allowlist,
+            )
             .await;
 
-        // G4 image-agent strip/cache seam. This runs AFTER model/profile
-        // resolution + system-prompt prefix but BEFORE replay lookup/lowering so
-        // that (a) gating sees the resolved/profiled backend, not the raw request
-        // model, and (b) replay hashes and the lowered upstream payload only ever
-        // see `[Image #N]` placeholder TEXT, never image bytes. When gating
-        // activates, `strip_and_cache_images` mutates `request` in place
-        // (images → placeholders, inject one `analyzeImage` tool + system
-        // instruction, dedup) and returns a per-turn session id; we then lower
-        // with the image agent active so `analyzeImage` classifies as the
-        // server-side tool and thread the session id to the executor.
-        let vision_session = self.activate_image_agent(&mut request, native_vision).await;
-
-        // D3: a pre-spawn early return (replay baseline lookup, lowering/validation,
-        // or budgeting below) must finalize the record `Failed` with the correct
-        // reason — NOT fall through to the `Drop` fallback's `Cancelled`. Helper to
-        // finalize-then-return on the `?` paths without duplicating the guard plumbing.
-        let finalize_pre_spawn_err = |err: AppError| {
-            let durable = if let Some(guard) = &telemetry_guard {
-                self.prepare_terminal_pricing(guard);
-                let durable = guard.finalize(
-                    crate::dashboard_flow::FlowStatus::Failed,
-                    Some(err.to_string()),
-                );
-                // D5: record the terminal into the metrics rings at the SAME seam as
-                // the finalize (co-located so a pre-spawn failure is counted exactly
-                // once, with the guard's monotonic latency, from the guard's own
-                // evict-safe inputs). No-op when metrics off. Runs AFTER the finalize
-                // above, which assembled those inputs.
-                self.record_terminal_metrics(
-                    guard,
-                    crate::dashboard_flow::FlowStatus::Failed,
-                    guard.elapsed().as_millis(),
-                );
-                durable
-            } else {
-                None
-            };
-            // F1c: a pre-spawn failure (bad request / lowering / budget) is always
-            // `failed`. Record it on the capture guard so the artifact carries the
-            // terminal reason; the served side is the error body the handler returns
-            // (teed by the HTTP layer), so the both-`done` barrier still resolves and
-            // writes a `status:"failed"` artifact — never a hang (AC-7). Idempotent.
-            if let Some(guard) = &capture_guard {
-                guard.finalize("failed", Some(&err.to_string()));
+        // G4 image-agent strip/cache seam. Agent capability mode deliberately
+        // forces the all-content traversal; legacy ingress keeps the established
+        // latest-user-message activation contract.
+        let vision_session = match raw_image_policy {
+            Some(crate::responses_capabilities::InputImageCapability::Agent) => {
+                self.activate_image_agent(&mut request, false, true).await
             }
-            (err, durable)
+            None => {
+                self.activate_image_agent(&mut request, backend_native_vision, false)
+                    .await
+            }
+            Some(
+                crate::responses_capabilities::InputImageCapability::Native
+                | crate::responses_capabilities::InputImageCapability::Placeholder
+                | crate::responses_capabilities::InputImageCapability::Reject,
+            ) => None,
         };
+
+        let residual_images = request
+            .instructions
+            .items()
+            .is_some_and(crate::vision::has_residual_images)
+            || crate::vision::has_residual_images(&request.input);
+        let raw_policy_failure = match raw_image_policy {
+            Some(crate::responses_capabilities::InputImageCapability::Native)
+                if residual_images && !backend_native_vision =>
+            {
+                Some("the selected backend is not configured for native image input")
+            }
+            Some(crate::responses_capabilities::InputImageCapability::Agent) if residual_images => {
+                Some("the configured image agent could not process this image input")
+            }
+            Some(crate::responses_capabilities::InputImageCapability::Reject)
+                if residual_images =>
+            {
+                Some("image input is not supported by the selected backend")
+            }
+            _ => None,
+        };
+        if let Some(message) = raw_policy_failure {
+            let param = crate::responses_capabilities::first_input_image_parameter(&request)
+                .unwrap_or_else(|| "input".to_string());
+            let (err, durable) = finalize_pre_spawn_err(
+                AppError::bad_request(message)
+                    .with_code("unsupported_parameter")
+                    .with_param(param),
+            );
+            if let Some((summary, record_seq)) = durable
+                && let Err(error) = self
+                    .dashboard_history()
+                    .persist_flow_summary(
+                        summary,
+                        crate::dashboard_flow::FlowMutationPhase::Terminal,
+                        record_seq,
+                    )
+                    .await
+                && self.dashboard_history().is_required()
+            {
+                tracing::error!(%error, "failed to persist pre-spawn image failure");
+                return Err(AppError::internal(
+                    "dashboard durability commit failed before error response",
+                ));
+            }
+            return Err(err);
+        }
 
         // E2b residual-image safety pass: the TRUE choke point for "no raw
         // image reaches a non-native-vision backend". `activate_image_agent`
@@ -1405,9 +1835,20 @@ impl Gateway {
         // native-vision passthrough, and never double-transforms what the
         // active strip already rewrote to `InputText` (there is nothing left
         // of type `InputImage` for it to find there).
-        if !native_vision {
-            if self.config.unsupported_image_policy == UnsupportedImagePolicy::Reject
-                && crate::vision::has_residual_images(&request.input)
+        let use_legacy_image_policy = raw_image_policy.is_none() && !backend_native_vision;
+        let degrade_images = matches!(
+            raw_image_policy,
+            Some(crate::responses_capabilities::InputImageCapability::Placeholder)
+        ) || (use_legacy_image_policy
+            && self.config.unsupported_image_policy == UnsupportedImagePolicy::Placeholder);
+        if degrade_images || use_legacy_image_policy {
+            if use_legacy_image_policy
+                && self.config.unsupported_image_policy == UnsupportedImagePolicy::Reject
+                && (request
+                    .instructions
+                    .items()
+                    .is_some_and(crate::vision::has_residual_images)
+                    || crate::vision::has_residual_images(&request.input))
             {
                 // Reject BEFORE dispatch: a bad-request 4xx via `AppError::
                 // bad_request` (400), never `AppError::upstream` (502) — the
@@ -1433,7 +1874,16 @@ impl Gateway {
                 }
                 return Err(err);
             }
-            let degraded_images = crate::vision::degrade_residual_images(&mut request.input);
+            let degraded_images = if degrade_images {
+                let instruction_images = request
+                    .instructions
+                    .items_mut()
+                    .map(|items| crate::vision::degrade_residual_images(items))
+                    .unwrap_or(0);
+                instruction_images + crate::vision::degrade_residual_images(&mut request.input)
+            } else {
+                0
+            };
             if degraded_images > 0 {
                 // MVP observability (AC-6): a WARN log plus a monitor phase via
                 // `emit_with` (no-op under `MonitorHub::disabled()`). The
@@ -1460,7 +1910,7 @@ impl Gateway {
                 // POST-transform items: two DIFFERENT images collapsing to
                 // byte-identical placeholder text at the same position would
                 // otherwise collide and serve the wrong cached response.
-                request.store = false;
+                request.llmconduit_replay = Some(false);
             }
         }
 
@@ -1532,7 +1982,7 @@ impl Gateway {
         }
         // Lower the canonical request to the upstream chat payload BEFORE
         // budgeting. The `?` surfaces any lowering/validation error (invalid
-        // tool_choice, unsupported `previous_response_id`, duplicate tools, …)
+        // tool_choice, unresolved item references, duplicate tools, …)
         // exactly as before, so the client sees the same canonical error;
         // budgeting only runs on a successful lowering (never a new error path).
         // `lower_request` is a pure transform and `find_replay_baseline` above is
@@ -1637,7 +2087,40 @@ impl Gateway {
         // finding.
         let estimated_input_tokens =
             estimate_input_tokens(&lowered, self.config.flatten_content, &resolved_model);
-        if let Some(limit) = limit {
+        if enforce_responses_capabilities
+            && let (Some(limit), Some(requested)) = (limit, request.max_output_tokens)
+            && requested > limit
+        {
+            // Raw Responses preserves the caller's output budget verbatim.  A
+            // budget larger than the entire advertised context window is the
+            // one deterministically impossible case we can reject without a
+            // tokenizer; never silently shrink it into a different request.
+            let (err, durable) = finalize_pre_spawn_err(
+                AppError::bad_request(
+                    "max_output_tokens exceeds the selected model context window",
+                )
+                .with_code("invalid_value")
+                .with_param("max_output_tokens"),
+            );
+            if let Some((summary, record_seq)) = durable
+                && let Err(error) = self
+                    .dashboard_history()
+                    .persist_flow_summary(
+                        summary,
+                        crate::dashboard_flow::FlowMutationPhase::Terminal,
+                        record_seq,
+                    )
+                    .await
+                && self.dashboard_history().is_required()
+            {
+                tracing::error!(%error, "failed to persist output-limit validation failure");
+                return Err(AppError::internal(
+                    "dashboard durability commit failed before error response",
+                ));
+            }
+            return Err(err);
+        }
+        if !enforce_responses_capabilities && let Some(limit) = limit {
             match budget_explicit_max_output_tokens(
                 request.max_output_tokens,
                 limit,
@@ -1677,6 +2160,11 @@ impl Gateway {
             .as_ref()
             .map(|record| record.internal_messages.len())
             .unwrap_or(0);
+        let mut response_template =
+            response_resource_template(response_id.clone(), &request, resolved_model.clone());
+        response_template.instructions =
+            (!caller_instructions.is_empty()).then_some(caller_instructions);
+        let failure_snapshot = FailureSnapshot::new(response_template.clone());
         let (tx, rx) = mpsc::channel(128);
         let gateway = Arc::clone(&self);
         tokio::spawn(async move {
@@ -1684,6 +2172,13 @@ impl Gateway {
                 .run_turn(
                     response_id.clone(),
                     request,
+                    response_template,
+                    failure_snapshot.clone(),
+                    capability_allowlist,
+                    // Raw Responses must preserve the requested token budget;
+                    // legacy Chat/Anthropic ingress retains the compatibility
+                    // shrink-and-retry behavior.
+                    !enforce_responses_capabilities,
                     lowered.messages,
                     replay_prefix_len,
                     lowered.tools,
@@ -1821,6 +2316,11 @@ impl Gateway {
                     .await
                     .is_err()
                 {
+                    discard_response_state(
+                        Arc::clone(&gateway.response_store),
+                        response_id.clone(),
+                    )
+                    .await;
                     gateway
                         .monitor
                         .emit_with(response_id.as_str(), || MonitorEventKind::Failed {
@@ -1833,7 +2333,18 @@ impl Gateway {
                     .monitor
                     .emit(response_id.clone(), MonitorEventKind::Completed);
             }
+            // Private replay is committed only after the public terminal event
+            // has entered the client-facing channel. A cancelled turn, a
+            // required-dashboard durability failure, or an undelivered terminal
+            // therefore never leaves replayable state behind.
+            if let Ok(turn) = &mut result
+                && let Some(record) = turn.take_replay_record()
+            {
+                gateway.replay_store.insert(record).await;
+            }
             if let Err(err) = &result {
+                discard_response_state(Arc::clone(&gateway.response_store), response_id.clone())
+                    .await;
                 if tx.is_closed() {
                     gateway
                         .monitor
@@ -1858,7 +2369,7 @@ impl Gateway {
                 let _ = gateway
                     .send_event(
                         &tx,
-                        failure_event(err),
+                        failure_event(err, failure_snapshot.resource()),
                         &tokio_util::sync::CancellationToken::new(),
                     )
                     .await;
@@ -1878,11 +2389,7 @@ impl Gateway {
         else {
             return request;
         };
-        request.instructions = if request.instructions.is_empty() {
-            prefix
-        } else {
-            format!("{prefix}\n\n{}", request.instructions)
-        };
+        request.instructions.prepend_system_text(prefix);
         request
     }
 
@@ -1907,6 +2414,7 @@ impl Gateway {
         &self,
         request: &mut ResponsesRequest,
         native_vision: bool,
+        all_responses_content: bool,
     ) -> Option<String> {
         if !self.config.image_agent_enabled || self.config.vision_url.is_none() {
             return None;
@@ -1914,7 +2422,12 @@ impl Gateway {
         if request.tool_choice == Value::String("none".to_string()) {
             return None;
         }
-        if !crate::vision::latest_user_message_has_images(&request.input) {
+        let has_images = if all_responses_content {
+            crate::vision::request_has_agent_images(request)
+        } else {
+            crate::vision::latest_user_message_has_images(&request.input)
+        };
+        if !has_images {
             return None;
         }
         if native_vision {
@@ -1925,8 +2438,13 @@ impl Gateway {
         // this session, the executor reads it, and a later turn gets a fresh id —
         // so multi-turn placeholder numbering resets exactly like claude-relay.
         let session_id = format!("vis_{}", Uuid::new_v4().simple());
-        self.image_cache
-            .strip_and_cache_images(request, &session_id);
+        if all_responses_content {
+            self.image_cache
+                .strip_and_cache_all_images(request, &session_id);
+        } else {
+            self.image_cache
+                .strip_and_cache_images(request, &session_id);
+        }
         Some(session_id)
     }
 
@@ -1973,6 +2491,7 @@ impl Gateway {
         request_model: &str,
         resolved_model: &str,
         request_genuine: bool,
+        capability_allowlist: &crate::responses_capabilities::CapabilityAllowlist,
     ) -> bool {
         // T2: the routing/failover layer owns the candidate set (typed
         // `BackendCandidatePlan`), and `request_genuine` — a byproduct of the
@@ -1983,7 +2502,11 @@ impl Gateway {
             .upstream
             .backend_candidate_plan(resolved_model)
             .await
-            .candidates;
+            .candidates
+            .into_iter()
+            .enumerate()
+            .filter(|(_, candidate)| capability_allowlist.permits_model(&candidate.model))
+            .collect::<Vec<_>>();
         if candidates.is_empty() {
             // Cell 1: unknown candidate set ⇒ strip (works for every backend).
             return false;
@@ -2001,10 +2524,10 @@ impl Gateway {
         } else {
             None
         };
-        candidates.iter().enumerate().all(|(index, candidate)| {
+        candidates.iter().all(|(index, candidate)| {
             // Cell 2a: request override applies ONLY to the genuinely-mapped
             // primary candidate; cells 2b/2c for everything else.
-            if index == 0
+            if *index == 0
                 && let Some(native) = request_override
             {
                 return native;
@@ -2031,12 +2554,20 @@ impl Gateway {
         &self,
         request: &ResponsesRequest,
     ) -> AppResult<(Option<ReplayRecord>, usize)> {
-        if !request.store {
+        if !self.replay_enabled || request.llmconduit_replay == Some(false) {
             return Ok((None, 0));
         }
         let record = self
             .replay_store
-            .longest_prefix_match(&request.model, &request.instructions, &request.input)
+            .longest_prefix_match_with_affinity(
+                &request.model,
+                request.instructions.replay_key().as_ref(),
+                request
+                    .extra_body
+                    .get(crate::responses_capabilities::PROMPT_CACHE_AFFINITY_EXTENSION)
+                    .and_then(Value::as_str),
+                &request.input,
+            )
             .await;
         if let Some(record) = record {
             let prefix_len = record.visible_history.len();
@@ -2050,6 +2581,10 @@ impl Gateway {
         &self,
         response_id: String,
         request: ResponsesRequest,
+        response_template: ResponseResource,
+        failure_snapshot: FailureSnapshot,
+        capability_allowlist: crate::responses_capabilities::CapabilityAllowlist,
+        allow_context_rebudget: bool,
         mut current_messages: Vec<ChatMessage>,
         // Length of the replayed prefix carried over from a prior turn. Role
         // shaping + adjacency merges apply ONLY to the tail
@@ -2208,7 +2743,8 @@ impl Gateway {
                     .filter(|item| {
                         matches!(
                             item,
-                            ResponseItem::FunctionCall { .. }
+                            ResponseItem::ItemReference { .. }
+                                | ResponseItem::FunctionCall { .. }
                                 | ResponseItem::FunctionCallOutput { .. }
                                 | ResponseItem::CustomToolCall { .. }
                                 | ResponseItem::CustomToolCallOutput { .. }
@@ -2224,12 +2760,16 @@ impl Gateway {
                     .input
                     .iter()
                     .map(|item| match item {
+                        ResponseItem::ItemReference { .. } => 0,
                         ResponseItem::Message { content, .. } => content
                             .iter()
                             .map(|content| match content {
                                 crate::models::responses::ContentItem::InputText { text }
                                 | crate::models::responses::ContentItem::OutputText { text } => {
                                     text.chars().count()
+                                }
+                                crate::models::responses::ContentItem::Refusal { refusal } => {
+                                    refusal.chars().count()
                                 }
                                 crate::models::responses::ContentItem::InputImage {
                                     image_url,
@@ -2311,6 +2851,7 @@ impl Gateway {
                                 crate::models::responses::WebSearchAction::Search {
                                     query,
                                     queries,
+                                    ..
                                 } => {
                                     query.as_ref().map(|q| q.chars().count()).unwrap_or(0)
                                         + queries
@@ -2352,7 +2893,7 @@ impl Gateway {
                         }
                     })
                     .sum(),
-                instructions_chars: request.instructions.chars().count(),
+                instructions_chars: request.instructions.character_count(),
             }
         });
         self.monitor.emit_with(response_id.as_str(), || {
@@ -2377,18 +2918,24 @@ impl Gateway {
         }
         self.send_event(
             &tx,
-            created_event(&response_id, estimated_input_tokens),
+            created_event(response_template.clone(), estimated_input_tokens),
             &abort_token,
         )
         .await?;
-        self.send_event(&tx, in_progress_event(&response_id), &abort_token)
-            .await?;
+        self.send_event(
+            &tx,
+            in_progress_event(response_template.clone()),
+            &abort_token,
+        )
+        .await?;
 
         let mut public_history = request.input.clone();
+        let initial_history_len = public_history.len();
         let mut response_output = Vec::new();
         let mut event_state = ResponseEventState::default();
 
         let mut accumulated_usage = AccumulatedUsage::default();
+        let mut actual_service_tier: Option<String> = None;
         let mut upstream_request_index = 0usize;
         let mut web_search_rounds = 0usize;
         // G4: independent round counter for `analyzeImage` server-tool loops, so
@@ -2410,7 +2957,11 @@ impl Gateway {
         // results are injected, the model has to be free to answer in prose.
         // Re-sending the forced tool_choice makes vLLM/Kimi emit the final
         // answer text into `function.arguments`, which then fails to parse.
-        let mut current_tool_choice = request.tool_choice.clone();
+        let mut current_tool_choice = responses_tool_choice_for_chat(&request.tool_choice);
+        let include_web_search_sources = request
+            .include
+            .iter()
+            .any(|include| include == "web_search_call.action.sources");
         #[allow(unused_assignments)]
         let mut last_finish_reason: Option<String> = None;
         let mut last_stop_sequence: Option<String>;
@@ -2612,6 +3163,8 @@ impl Gateway {
                 Some(Arc::clone(&serving_token)),
             )
             .with_thinking_override(request.thinking)
+            .with_capability_allowlist(capability_allowlist.clone())
+            .with_context_rebudget(allow_context_rebudget)
             // F1d: attach the turn-capture handle (see above) so the leaf's
             // `upstream_request` write can reach this turn's artifact.
             .with_capture(capture.clone());
@@ -2635,21 +3188,23 @@ impl Gateway {
             // single authoritative `accumulated_usage.add(turn_usage)` AFTER the inner
             // loop advances the base for the NEXT turn of a multi-turn tool loop.
             let turn_base = accumulated_usage.snapshot();
-            // G4 + E1: per-upstream-turn gate over streamed tool-call argument
-            // deltas. It buffers leading deltas (keyed by call_id) until the
-            // engine classifies the resolved tool name (`hidden` below), then
-            // DROPS hidden ones (internal `analyzeImage`, OR a hallucinated tool
-            // not in the offered set) or FLUSHES client-visible ones in order — so
-            // neither an `analyzeImage` arg fragment nor a hallucinated tool's
-            // arguments can ever leak even when a sparse upstream streams
-            // arguments before the name. The gate is a pure decision machine; the
-            // engine forwards its emissions via `emit_function_call_delta`.
+            // Per-upstream-turn quarantine for raw Chat function-argument
+            // fragments. Name-late fragments remain bounded by ToolDeltaGate,
+            // but every resolved call is dropped from this raw path. Only a
+            // fully validated, wholly clean client-tool batch receives a public
+            // lifecycle, synthesized from canonical arguments at finalization.
+            // This also keeps server tools and rejected/hallucinated siblings
+            // private without retaining a second copy of complete arguments.
             let mut tool_delta_gate = ToolDeltaGate::new();
             loop {
                 let Some(chunk) = Self::next_upstream_chunk(&mut stream, &tx, &abort_token).await?
                 else {
                     break;
                 };
+                if let Some(service_tier) = chunk.service_tier.clone() {
+                    actual_service_tier = Some(service_tier.clone());
+                    failure_snapshot.update_service_tier(service_tier);
+                }
                 if let Some(usage) = chunk.usage.clone() {
                     // D3 (R1 #2): the cumulative-aware dashboard/monitor UPSERT is the
                     // ONLY consumer of `total`, and both its sinks are dashboard-only
@@ -2701,7 +3256,7 @@ impl Gateway {
                     // the dashboard gate above.
                     turn_usage = Some(usage);
                 }
-                let emissions = state.apply_chunk(&chunk);
+                let emissions = state.try_apply_chunk(&chunk)?;
                 for emission in emissions {
                     match emission {
                         StreamEmission::OutputItemAdded(item) => {
@@ -2720,7 +3275,10 @@ impl Gateway {
                             )
                             .await?;
                         }
-                        StreamEmission::OutputTextDelta(delta) => {
+                        StreamEmission::OutputTextDelta {
+                            delta,
+                            content_index,
+                        } => {
                             let target = event_state.active_message_target()?;
                             self.monitor.emit_with(response_id.as_str(), || {
                                 MonitorEventKind::OutputTextDelta {
@@ -2729,7 +3287,12 @@ impl Gateway {
                             });
                             self.send_event(
                                 &tx,
-                                output_text_delta_event(target.item_id, target.output_index, delta),
+                                output_text_delta_event(
+                                    target.item_id,
+                                    target.output_index,
+                                    content_index,
+                                    delta,
+                                ),
                                 &abort_token,
                             )
                             .await?;
@@ -2774,7 +3337,20 @@ impl Gateway {
                             });
                             self.send_event(
                                 &tx,
-                                reasoning_text_delta_event(
+                                reasoning_raw_text_delta_event(
+                                    target.item_id,
+                                    target.output_index,
+                                    delta,
+                                ),
+                                &abort_token,
+                            )
+                            .await?;
+                        }
+                        StreamEmission::ReasoningSummaryTextDelta(delta) => {
+                            let target = event_state.active_reasoning_target()?;
+                            self.send_event(
+                                &tx,
+                                reasoning_summary_text_delta_event(
                                     target.item_id,
                                     target.output_index,
                                     delta,
@@ -2801,19 +3377,21 @@ impl Gateway {
                             name,
                             delta,
                         } => {
-                            // Classify the (possibly still-`None`) resolved tool
-                            // name against the offered registry: `None` while the
-                            // name is unknown (gate buffers), `Some(true)` for a
-                            // HIDDEN tool — internal `analyzeImage` OR a
-                            // hallucinated name not in the offered set (gate drops
-                            // its buffered + later deltas, so the client never sees
-                            // it), `Some(false)` for a client-visible tool (gate
-                            // flushes + forwards). The gate returns the
-                            // allocation-free decision; an overflow of the
-                            // pending-byte cap fails the turn cleanly.
-                            let hidden = name
-                                .as_deref()
-                                .map(|n| is_hidden_tool_name(n, &tool_registry));
+                            // Quarantine every raw Chat function-argument fragment
+                            // until the entire batch is finalized. A later call in
+                            // the same batch may resolve to an unoffered tool; if we
+                            // exposed an earlier valid call eagerly, the repair
+                            // path could neither retract it nor complete it without
+                            // falsely handing the tainted call to the client.
+                            //
+                            // `None` retains the existing bounded name-late buffer;
+                            // any resolved name is deliberately classified as
+                            // hidden here so the raw wrapper is dropped. A clean
+                            // ordinary function is re-emitted below from its fully
+                            // validated canonical arguments. Custom, local-shell,
+                            // and tool-search calls use their dedicated lifecycles
+                            // and must never expose generic function deltas.
+                            let hidden = name.as_ref().map(|_| true);
                             let decision = tool_delta_gate
                                 .on_delta(call_id, name, delta, hidden)
                                 .map_err(|_| {
@@ -2821,14 +3399,17 @@ impl Gateway {
                                         "upstream streamed too many tool-call argument bytes before a tool name",
                                     )
                                 })?;
-                            self.drive_delta_decision(&response_id, &tx, decision, &abort_token)
-                                .await?;
+                            debug_assert!(matches!(decision, DeltaDecision::None));
                         }
-                        StreamEmission::ContentPartAdded => {
+                        StreamEmission::ContentPartAdded { content_index } => {
                             let target = event_state.active_message_target()?;
                             self.send_event(
                                 &tx,
-                                content_part_added_event(target.item_id, target.output_index),
+                                content_part_added_event(
+                                    target.item_id,
+                                    target.output_index,
+                                    content_index,
+                                ),
                                 &abort_token,
                             )
                             .await?;
@@ -2837,7 +3418,12 @@ impl Gateway {
                             let target = event_state.active_message_target()?;
                             self.send_event(
                                 &tx,
-                                content_part_done_event(target.item_id, target.output_index, text),
+                                content_part_done_event(
+                                    target.item_id,
+                                    target.output_index,
+                                    0,
+                                    text,
+                                ),
                                 &abort_token,
                             )
                             .await?;
@@ -2858,6 +3444,16 @@ impl Gateway {
                             let target = event_state.active_reasoning_target()?;
                             self.send_event(
                                 &tx,
+                                reasoning_summary_text_done_event(
+                                    target.item_id.clone(),
+                                    target.output_index,
+                                    text.clone(),
+                                ),
+                                &abort_token,
+                            )
+                            .await?;
+                            self.send_event(
+                                &tx,
                                 reasoning_summary_part_done_event(
                                     target.item_id,
                                     target.output_index,
@@ -2867,52 +3463,120 @@ impl Gateway {
                             )
                             .await?;
                         }
-                        StreamEmission::RefusalDelta(delta) => {
+                        StreamEmission::RefusalPartAdded { content_index } => {
+                            let target = event_state.active_message_target()?;
+                            self.send_event(
+                                &tx,
+                                refusal_part_added_event(
+                                    target.item_id,
+                                    target.output_index,
+                                    content_index,
+                                ),
+                                &abort_token,
+                            )
+                            .await?;
+                        }
+                        StreamEmission::RefusalDelta {
+                            delta,
+                            content_index,
+                        } => {
                             self.monitor.emit_with(response_id.as_str(), || {
                                 MonitorEventKind::RefusalDelta {
                                     delta: delta.clone(),
                                 }
                             });
-                            self.send_event(&tx, refusal_delta_event(delta), &abort_token)
-                                .await?;
+                            let target = event_state.active_message_target()?;
+                            self.send_event(
+                                &tx,
+                                refusal_delta_event(
+                                    target.item_id,
+                                    target.output_index,
+                                    content_index,
+                                    delta,
+                                ),
+                                &abort_token,
+                            )
+                            .await?;
                         }
                     }
                 }
+                let mut partial_output = response_output.clone();
+                let mut live_items = state.partial_output_items(&tool_registry);
+                event_state.reconcile_partial_function_items(&mut live_items);
+                partial_output.extend(live_items);
+                event_state.sort_items(&mut partial_output);
+                failure_snapshot.update_output(partial_output);
+                if let Some(usage) = turn_usage.as_ref() {
+                    failure_snapshot.update_usage(response_usage_from_flow_usage(
+                        flow_usage_from_base_and_chunk(turn_base, usage),
+                    ));
+                }
+            }
+            // EOF is not a successful turn boundary. In particular, do this
+            // before `finalize` and every completion emitter below: otherwise a
+            // truncated upstream stream would advertise output/content/function
+            // items as completed and only then emit `response.failed`.
+            if !state.has_terminal_finish_reason() {
+                return Err(AppError::upstream(
+                    "upstream stream ended without a terminal finish reason",
+                ));
             }
             if let Some(usage) = turn_usage {
                 accumulated_usage.add(usage);
             }
             let finalized = state.finalize(&tool_registry)?;
+            if !finalized.tool_calls.is_empty() || !finalized.rejected_tool_calls.is_empty() {
+                let provider = serving_token
+                    .snapshot()
+                    .1
+                    .unwrap_or_else(|| "unknown".to_string());
+                self.record_function_call_identities(&provider, &upstream_model, &finalized);
+            }
             last_finish_reason = finalized.finish_reason.clone();
             last_stop_sequence = finalized.stop_sequence.clone();
+            let finalized_item_status = if matches!(
+                finalized.finish_reason.as_deref(),
+                Some("length" | "content_filter")
+            ) {
+                "incomplete"
+            } else {
+                "completed"
+            };
             current_messages = upstream_request.messages;
-            // G4 round-2 #5: a CLIENT tool whose arguments streamed entirely
-            // before its name (name arrived name-only, so no delta ever
-            // triggered the flush) still has its leading deltas buffered as
-            // `Pending`. Flush them now — in order, before the public items and
-            // the `function_call_arguments.done` emitted by `handle_tool_calls`
-            // — so the client receives all of its tool-arg deltas. ONLY
-            // `analyzeImage`/`ImageAnalysis` deltas are dropped; every other
-            // (client) tool's buffer is forwarded.
+            // A structured final answer is executable client data just like
+            // tool-call arguments: validate it before advertising any part or
+            // item as done. Deltas/additions have already described the live
+            // partial item and remain valid on failure, while the terminal
+            // `response.failed` snapshot projects that item as incomplete.
             //
-            // E1: SKIP this flush entirely when the batch is TAINTED (any
-            // rejected/hallucinated call present). The whole batch is discarded —
-            // no tool is handed off — so a name-only valid tool's buffered deltas
-            // must be dropped too, not streamed to the client (the gate drops them
-            // when it is discarded at turn end). The repair round re-issues them.
-            if finalized.rejected_tool_calls.is_empty() {
-                for tool_call in &finalized.tool_calls {
-                    if matches!(tool_call.kind, ToolKind::ImageAnalysis) {
-                        continue;
-                    }
-                    // Borrow the id (no clone): the gate takes `&str` and mints the
-                    // single owned id it needs for the `Flush` decision.
-                    let Some(call_id) = tool_call.internal_call.id.as_deref() else {
-                        continue;
-                    };
-                    let decision = tool_delta_gate.flush_pending_client_tool(call_id);
-                    self.drive_delta_decision(&response_id, &tx, decision, &abort_token)
-                        .await?;
+            // Tool batches are not structured text answers, even if a quirky
+            // backend labels their finish reason `stop`; validate only the
+            // clean, tool-free candidate that will actually end the turn.
+            let structured_final_candidate = finalized.finish_reason.as_deref() == Some("stop")
+                && finalized.tool_calls.is_empty()
+                && finalized.rejected_tool_calls.is_empty()
+                && request
+                    .text
+                    .as_ref()
+                    .and_then(|controls| controls.format.as_ref())
+                    .is_some_and(|format| format.kind != "text");
+            if structured_final_candidate {
+                let candidate_output = finalized
+                    .reasoning_item
+                    .iter()
+                    .chain(finalized.message_item.iter())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                validate_structured_output(request.text.as_ref(), &candidate_output)?;
+            }
+            // A name-late call can leave raw argument fragments in the gate
+            // when its name arrives in a name-only chunk. Those fragments are
+            // deliberately discarded: a clean ordinary function is emitted
+            // from its validated canonical arguments in `handle_tool_calls`,
+            // while a tainted batch exposes no client tool lifecycle at all.
+            for tool_call in &finalized.tool_calls {
+                if let Some(call_id) = tool_call.internal_call.id.as_deref() {
+                    drop(tool_delta_gate.flush_pending_client_tool(call_id));
                 }
             }
             self.emit_completed_public_items(
@@ -2920,11 +3584,15 @@ impl Gateway {
                 &tx,
                 &abort_token,
                 &finalized,
+                finalized_item_status,
                 &mut public_history,
                 &mut response_output,
                 &mut event_state,
             )
             .await?;
+            let mut completed_snapshot = response_output.clone();
+            event_state.sort_items(&mut completed_snapshot);
+            failure_snapshot.update_output(completed_snapshot);
             // D6: compose kill with hangup after emitting the completed items, before
             // deciding whether to loop for another turn.
             if tx.is_closed() || abort_token.is_cancelled() {
@@ -3071,6 +3739,7 @@ impl Gateway {
                 &tx,
                 &abort_token,
                 vision_session.as_deref(),
+                include_web_search_sources,
                 &mut current_messages,
                 roles,
                 &mut public_history,
@@ -3078,6 +3747,9 @@ impl Gateway {
                 &mut event_state,
             )
             .await?;
+            let mut completed_snapshot = response_output.clone();
+            event_state.sort_items(&mut completed_snapshot);
+            failure_snapshot.update_output(completed_snapshot);
             // Decide whether to continue the tool loop. `handle_tool_calls`
             // already handed off any CLIENT-tool batch (and a mixed batch is
             // rejected before reaching here), so a batch that ran at all and
@@ -3138,19 +3810,125 @@ impl Gateway {
             break;
         }
 
+        if last_finish_reason.is_none() {
+            return Err(AppError::upstream(
+                "upstream stream ended without a terminal finish reason",
+            ));
+        }
+        event_state.sort_items(&mut response_output);
+        event_state.sort_items(&mut public_history[initial_history_len..]);
+
+        let terminal_reason = crate::models::responses::TerminalReason::from_finish_reason(
+            last_finish_reason.as_deref(),
+        );
+        let is_incomplete = matches!(
+            terminal_reason,
+            crate::models::responses::TerminalReason::Length
+                | crate::models::responses::TerminalReason::ContentFilter
+        );
         let model_name = upstream_model.clone();
+        let stored_served_model = serving_token
+            .metrics_snapshot()
+            .0
+            .unwrap_or_else(|| model_name.clone());
         let completed_output = response_output.clone();
         let metadata = request.metadata.clone();
         if request.store {
-            self.replay_store
-                .insert(ReplayRecord {
-                    model: model_name.clone(),
-                    instructions: request.instructions,
-                    visible_history: public_history,
-                    internal_messages: current_messages,
-                })
-                .await;
+            let store = Arc::clone(&self.response_store);
+            let prepare_response_id = response_id.clone();
+            let prepare_requested_model = request.model.clone();
+            let prepare_history = public_history.clone();
+            let prepare_created_at = response_template.created_at;
+            let mut prepare_task = tokio::spawn(async move {
+                store
+                    .prepare(
+                        prepare_response_id,
+                        prepare_requested_model,
+                        stored_served_model,
+                        prepare_history,
+                        prepare_created_at,
+                    )
+                    .await
+            });
+            let prepared = tokio::select! {
+                biased;
+                _ = tx.closed() => None,
+                _ = abort_token.cancelled() => None,
+                result = &mut prepare_task => Some(result),
+            };
+            let Some(prepared) = prepared else {
+                // The blocking SQLite write cannot be force-cancelled safely.
+                // It writes only hidden state, so cleanup can finish in the
+                // background without making this cancelled response visible.
+                let store = Arc::clone(&self.response_store);
+                let cancelled_id = response_id.clone();
+                tokio::spawn(async move {
+                    let _ = prepare_task.await;
+                    discard_response_state(store, cancelled_id).await;
+                });
+                return Err(AppError::cancelled());
+            };
+            prepared
+                .map_err(|error| {
+                    AppError::internal(format!("response-store worker failed: {error}"))
+                })?
+                .map_err(|error| {
+                    AppError::internal(format!("failed to persist response state: {error}"))
+                })?;
+            if tx.is_closed() || abort_token.is_cancelled() {
+                discard_response_state(Arc::clone(&self.response_store), response_id.clone()).await;
+                return Err(AppError::cancelled());
+            }
+            let store = Arc::clone(&self.response_store);
+            let publish_response_id = response_id.clone();
+            let mut publish_task =
+                tokio::spawn(async move { store.publish(&publish_response_id).await });
+            let published = tokio::select! {
+                biased;
+                _ = tx.closed() => None,
+                _ = abort_token.cancelled() => None,
+                result = &mut publish_task => Some(result),
+            };
+            let Some(published) = published else {
+                // If the store operation has not entered blocking SQLite work,
+                // aborting prevents publication entirely. If it has, the store's
+                // owned worker permit makes the rollback wait behind that exact
+                // operation and remove any row it commits.
+                publish_task.abort();
+                let store = Arc::clone(&self.response_store);
+                let cancelled_id = response_id.clone();
+                tokio::spawn(async move {
+                    let _ = publish_task.await;
+                    discard_response_state(store, cancelled_id).await;
+                });
+                return Err(AppError::cancelled());
+            };
+            published
+                .map_err(|error| {
+                    AppError::internal(format!("response-store worker failed: {error}"))
+                })?
+                .map_err(|error| {
+                    AppError::internal(format!("failed to publish response state: {error}"))
+                })?;
+            if tx.is_closed() || abort_token.is_cancelled() {
+                discard_response_state(Arc::clone(&self.response_store), response_id.clone()).await;
+                return Err(AppError::cancelled());
+            }
         }
+        let replay_record =
+            (self.replay_enabled && request.llmconduit_replay != Some(false)).then(|| {
+                ReplayRecord {
+                    model: model_name.clone(),
+                    instructions: request.instructions.replay_key().into_owned(),
+                    cache_affinity: request
+                        .extra_body
+                        .get(crate::responses_capabilities::PROMPT_CACHE_AFFINITY_EXTENSION)
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    visible_history: public_history.clone(),
+                    internal_messages: current_messages,
+                }
+            });
 
         let usage = accumulated_usage.into_response_usage();
         // T7: typed terminal reason from the upstream finish_reason. `length` ⇒
@@ -3159,39 +3937,42 @@ impl Gateway {
         // on `reason.is_clean_stop()` (stop only), not on the event-type string
         // — a future non-stop terminal reason arriving as `response.completed`
         // can no longer wrongly promote.
-        let terminal_reason = crate::models::responses::TerminalReason::from_finish_reason(
-            last_finish_reason.as_deref(),
-        );
-        let is_incomplete = matches!(
-            terminal_reason,
-            crate::models::responses::TerminalReason::Length
-        );
-        let resource = ResponseResource {
-            id: response_id.clone(),
-            object: "response".to_string(),
-            created_at: std::time::SystemTime::now()
+        let mut resource = response_template;
+        resource.completed_at = (!is_incomplete).then(|| {
+            std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_secs() as i64,
-            status: if is_incomplete {
-                "incomplete".to_string()
-            } else {
-                "completed".to_string()
-            },
-            output: completed_output,
-            model: model_name,
-            usage,
-            metadata,
-            incomplete_details: if is_incomplete {
-                Some(crate::models::responses::IncompleteDetails {
-                    reason: "max_output_tokens".to_string(),
-                })
-            } else {
-                None
-            },
-            stop_sequence: last_stop_sequence,
-            terminal_reason: Some(terminal_reason),
+                .as_secs() as i64
+        });
+        resource.status = if is_incomplete {
+            "incomplete".to_string()
+        } else {
+            "completed".to_string()
         };
+        resource.output = completed_output;
+        resource.model = model_name;
+        resource.usage = usage;
+        resource.metadata = metadata;
+        resource.incomplete_details = if is_incomplete {
+            Some(crate::models::responses::IncompleteDetails {
+                reason: if matches!(
+                    terminal_reason,
+                    crate::models::responses::TerminalReason::ContentFilter
+                ) {
+                    "content_filter".to_string()
+                } else {
+                    "max_output_tokens".to_string()
+                },
+            })
+        } else {
+            None
+        };
+        resource.stop_sequence = last_stop_sequence;
+        // A Responses resource reports the tier the provider actually used. A
+        // requested tier may be downgraded (or simply not reported), so never
+        // manufacture response metadata by echoing the request.
+        resource.service_tier = actual_service_tier;
+        resource.terminal_reason = Some(terminal_reason);
         self.monitor.emit_with(response_id.as_str(), || {
             let final_preview = preview_json_limited_with_images(&resource, 128 * 1024);
             MonitorEventKind::FinalResponse {
@@ -3205,9 +3986,15 @@ impl Gateway {
         // to the client. Deltas still stream immediately; only success acknowledgement
         // is gated on durability.
         Ok(if is_incomplete {
-            TurnCompletion::Incomplete(incomplete_event(resource))
+            TurnCompletion::Incomplete {
+                event: incomplete_event(resource),
+                replay_record,
+            }
         } else {
-            TurnCompletion::Completed(completed_event(resource))
+            TurnCompletion::Completed {
+                event: completed_event(resource),
+                replay_record,
+            }
         })
     }
 
@@ -3332,22 +4119,38 @@ impl Gateway {
     }
 
     async fn load_upstream_model_catalog(&self) -> AppResult<UpstreamModelCatalog> {
-        let mut cache = self.upstream_model_catalog.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < UPSTREAM_MODEL_CATALOG_TTL_SECS
-        {
-            return Ok(cached.catalog.clone());
+        if let Some(catalog) = self.fresh_upstream_model_catalog().await {
+            return Ok(catalog);
         }
+
+        let _refresh = self.upstream_model_catalog_refresh.lock().await;
+        if let Some(catalog) = self.fresh_upstream_model_catalog().await {
+            return Ok(catalog);
+        }
+
         // Single `/v1/models` snapshot feeds BOTH model normalization and G3
         // context budgeting, so ids and context limits can never describe
-        // different provider states.
+        // different provider states. No cache mutex is held while the upstream
+        // response headers/body are awaited; the separate refresh gate provides
+        // single-flight behavior for an expired or empty cache.
         let entries = self.upstream.supported_model_catalog().await?;
         let catalog = UpstreamModelCatalog::from_entries(entries);
+        let mut cache = self.upstream_model_catalog.lock().await;
         *cache = Some(CachedUpstreamModelCatalog {
             fetched_at: std::time::Instant::now(),
             catalog: catalog.clone(),
         });
         Ok(catalog)
+    }
+
+    async fn fresh_upstream_model_catalog(&self) -> Option<UpstreamModelCatalog> {
+        let cache = self.upstream_model_catalog.lock().await;
+        cache
+            .as_ref()
+            .filter(|cached| {
+                cached.fetched_at.elapsed().as_secs() < UPSTREAM_MODEL_CATALOG_TTL_SECS
+            })
+            .map(|cached| cached.catalog.clone())
     }
 
     /// Context-window length the upstream reports for the resolved catalog
@@ -3396,6 +4199,7 @@ impl Gateway {
         // backpressure (no poll/select site here — the SEND is the only block point).
         abort_token: &tokio_util::sync::CancellationToken,
         finalized: &FinalizedAssistantTurn,
+        item_status: &str,
         public_history: &mut Vec<ResponseItem>,
         response_output: &mut Vec<ResponseItem>,
         event_state: &mut ResponseEventState,
@@ -3405,18 +4209,26 @@ impl Gateway {
             public_history.push(reasoning.clone());
             response_output.push(reasoning.clone());
             if finalized.reasoning_part_emitted
-                && let ResponseItem::Reasoning { ref content, .. } = reasoning
+                && let ResponseItem::Reasoning { ref summary, .. } = reasoning
             {
-                let reasoning_text = content
-                    .as_ref()
-                    .and_then(|items| items.first())
+                let reasoning_text = summary
+                    .first()
                     .map(|item| match item {
-                        crate::models::responses::ReasoningContentItem::ReasoningText { text }
-                        | crate::models::responses::ReasoningContentItem::Text { text } => {
+                        crate::models::responses::ReasoningSummaryItem::SummaryText { text } => {
                             text.clone()
                         }
                     })
                     .unwrap_or_default();
+                self.send_event(
+                    tx,
+                    reasoning_summary_text_done_event(
+                        target.item_id.clone(),
+                        target.output_index,
+                        reasoning_text.clone(),
+                    ),
+                    abort_token,
+                )
+                .await?;
                 self.send_event(
                     tx,
                     reasoning_summary_part_done_event(
@@ -3436,7 +4248,7 @@ impl Gateway {
                 });
             self.send_event(
                 tx,
-                output_item_done_event(reasoning, target.output_index),
+                output_item_done_event(reasoning, target.output_index, item_status),
                 abort_token,
             )
             .await?;
@@ -3455,11 +4267,13 @@ impl Gateway {
                     .collect::<Vec<_>>()
                     .join("");
                 if !full_text.is_empty() {
+                    let content_index = finalized.output_content_index.unwrap_or(0);
                     self.send_event(
                         tx,
                         output_text_done_event(
                             target.item_id.clone(),
                             target.output_index,
+                            content_index,
                             full_text.clone(),
                         ),
                         abort_token,
@@ -3471,6 +4285,7 @@ impl Gateway {
                             content_part_done_event(
                                 target.item_id.clone(),
                                 target.output_index,
+                                content_index,
                                 full_text,
                             ),
                             abort_token,
@@ -3478,6 +4293,31 @@ impl Gateway {
                         .await?;
                     }
                 }
+            }
+            if !finalized.refusal_text.is_empty() {
+                let content_index = finalized.refusal_content_index.unwrap_or(0);
+                self.send_event(
+                    tx,
+                    refusal_done_event(
+                        target.item_id.clone(),
+                        target.output_index,
+                        content_index,
+                        finalized.refusal_text.clone(),
+                    ),
+                    abort_token,
+                )
+                .await?;
+                self.send_event(
+                    tx,
+                    refusal_part_done_event(
+                        target.item_id.clone(),
+                        target.output_index,
+                        content_index,
+                        finalized.refusal_text.clone(),
+                    ),
+                    abort_token,
+                )
+                .await?;
             }
             public_history.push(message.clone());
             response_output.push(message.clone());
@@ -3489,15 +4329,7 @@ impl Gateway {
                 });
             self.send_event(
                 tx,
-                output_item_done_event(message, target.output_index),
-                abort_token,
-            )
-            .await?;
-        }
-        if !finalized.refusal_text.is_empty() {
-            self.send_event(
-                tx,
-                refusal_done_event(finalized.refusal_text.clone()),
+                output_item_done_event(message, target.output_index, item_status),
                 abort_token,
             )
             .await?;
@@ -3526,6 +4358,7 @@ impl Gateway {
         // stuck tool call (499) the same as a hang-up.
         abort_token: &tokio_util::sync::CancellationToken,
         vision_session: Option<&str>,
+        include_web_search_sources: bool,
         current_messages: &mut Vec<ChatMessage>,
         roles: Option<&crate::config::RolesConfig>,
         public_history: &mut Vec<ResponseItem>,
@@ -3557,16 +4390,74 @@ impl Gateway {
         }
         if has_client_tool {
             for tool_call in &finalized.tool_calls {
+                let (public_item, target, added) =
+                    event_state.finalize_function_item(tool_call.public_item.clone());
+                if added {
+                    let added_item = match &public_item {
+                        ResponseItem::FunctionCall {
+                            id,
+                            name,
+                            namespace,
+                            call_id,
+                            ..
+                        } => ResponseItem::FunctionCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            namespace: namespace.clone(),
+                            arguments: String::new(),
+                            call_id: call_id.clone(),
+                        },
+                        ResponseItem::CustomToolCall {
+                            id, call_id, name, ..
+                        } => ResponseItem::CustomToolCall {
+                            id: id.clone(),
+                            status: None,
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            input: String::new(),
+                        },
+                        _ => public_item.clone(),
+                    };
+                    self.send_event(
+                        tx,
+                        output_item_added_event(added_item, target.output_index),
+                        abort_token,
+                    )
+                    .await?;
+                }
                 if let ResponseItem::FunctionCall {
                     ref call_id,
                     ref name,
                     ref arguments,
                     ..
-                } = tool_call.public_item
+                } = public_item
                 {
+                    let mut offset = 0;
+                    while offset < arguments.len() {
+                        let mut end =
+                            (offset + PUBLIC_TOOL_ARGUMENT_DELTA_MAX_BYTES).min(arguments.len());
+                        while end > offset && !arguments.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        debug_assert!(end > offset);
+                        self.emit_function_call_delta(
+                            response_id,
+                            tx,
+                            DeltaEmission {
+                                call_id: call_id.clone(),
+                                name: Some(name.clone()),
+                                delta: arguments[offset..end].to_string(),
+                            },
+                            event_state,
+                            abort_token,
+                        )
+                        .await?;
+                        offset = end;
+                    }
                     self.send_event(
                         tx,
                         function_call_args_done_event(
+                            target.clone(),
                             call_id.clone(),
                             name.clone(),
                             arguments.clone(),
@@ -3574,24 +4465,38 @@ impl Gateway {
                         abort_token,
                     )
                     .await?;
+                } else if let ResponseItem::CustomToolCall { ref input, .. } = public_item {
+                    if !input.is_empty() {
+                        self.send_event(
+                            tx,
+                            custom_tool_call_input_delta_event(target.clone(), input.clone()),
+                            abort_token,
+                        )
+                        .await?;
+                    }
+                    self.send_event(
+                        tx,
+                        custom_tool_call_input_done_event(target.clone(), input.clone()),
+                        abort_token,
+                    )
+                    .await?;
                 }
                 self.monitor
                     .emit_with(response_id, || MonitorEventKind::ToolPhase {
                         phase: "client_tool_handoff".to_string(),
-                        detail: summarize_response_item(&tool_call.public_item),
+                        detail: summarize_response_item(&public_item),
                     });
-                let target = event_state.target_for_item(&tool_call.public_item);
-                public_history.push(tool_call.public_item.clone());
-                response_output.push(tool_call.public_item.clone());
+                public_history.push(public_item.clone());
+                response_output.push(public_item.clone());
                 self.monitor
                     .emit_with(response_id, || MonitorEventKind::ResponseItem {
                         event: "response.output_item.done".to_string(),
-                        summary: summarize_response_item(&tool_call.public_item),
-                        payload_preview: preview_json(&tool_call.public_item),
+                        summary: summarize_response_item(&public_item),
+                        payload_preview: preview_json(&public_item),
                     });
                 self.send_event(
                     tx,
-                    output_item_done_event(tool_call.public_item.clone(), target.output_index),
+                    output_item_done_event(public_item, target.output_index, "completed"),
                     abort_token,
                 )
                 .await?;
@@ -3619,6 +4524,7 @@ impl Gateway {
                     self.run_web_search(
                         response_id,
                         tool_call,
+                        include_web_search_sources,
                         tx,
                         abort_token,
                         current_messages,
@@ -3639,6 +4545,7 @@ impl Gateway {
         &self,
         response_id: &str,
         tool_call: &ResolvedToolCall,
+        include_web_search_sources: bool,
         tx: &mpsc::Sender<SseEvent>,
         // D6: the flow's kill token, composed with this executor's `tx.closed()` checks
         // so a dashboard kill cancels a stuck/slow Brave search (499) like a hang-up.
@@ -3694,7 +4601,7 @@ impl Gateway {
         // bound a slow or stalled search request would block the turn forever
         // and the client would hang behind the SSE keep-alive. Degrade
         // gracefully so the model can still produce a final answer.
-        let outcome: SearchOutcome = tokio::select! {
+        let mut outcome: SearchOutcome = tokio::select! {
             biased;
             _ = tx.closed() => return Err(AppError::cancelled()),
             // D6: a kill during the search cancels it (499), same as a hang-up.
@@ -3702,7 +4609,10 @@ impl Gateway {
             result = timeout(self.config.request_timeout, self.search.search(&query)) => match result {
                 Ok(Ok(outcome)) => outcome,
                 Ok(Err(err)) => SearchOutcome {
-                    formatted: format!("web_search failed: {err}"),
+                    formatted: format!(
+                        "web_search failed: {}.",
+                        server_tool_failure_taxonomy(&err)
+                    ),
                     sources: Vec::new(),
                 },
                 Err(_) => SearchOutcome {
@@ -3711,11 +4621,33 @@ impl Gateway {
                 },
             },
         };
+        crate::search::redact_search_outcome_credentials(
+            &mut outcome,
+            self.config.brave_api_key.as_deref(),
+        );
 
+        let mut completed_action = action.clone();
+        if include_web_search_sources
+            && let Some(crate::models::responses::WebSearchAction::Search { sources, .. }) =
+                completed_action.as_mut()
+        {
+            *sources = Some(
+                outcome
+                    .sources
+                    .iter()
+                    .map(|source| {
+                        serde_json::json!({
+                            "type": "url",
+                            "url": source.url,
+                        })
+                    })
+                    .collect(),
+            );
+        }
         let completed = ResponseItem::WebSearchCall {
             id: id.clone(),
             status: Some("completed".to_string()),
-            action: action.clone(),
+            action: completed_action,
         };
         let completed_target = event_state.target_for_item(&completed);
         public_history.push(completed.clone());
@@ -3728,7 +4660,7 @@ impl Gateway {
             });
         self.send_event(
             tx,
-            output_item_done_event(completed, completed_target.output_index),
+            output_item_done_event(completed, completed_target.output_index, "completed"),
             abort_token,
         )
         .await?;
@@ -3866,8 +4798,17 @@ impl Gateway {
                     // though `ReqwestVisionClient` already redacts at the source,
                     // so any `VisionClient` impl is covered. The error message is
                     // already redacted inside the client.
-                    Ok(Ok(outcome)) => crate::redaction::redact_vision_text(&outcome.text),
-                    Ok(Err(err)) => format!("[Vision analysis failed: {err}]"),
+                    Ok(Ok(outcome)) => crate::redaction::redact_vision_text_with_literals(
+                        &outcome.text,
+                        vision_request
+                            .images
+                            .iter()
+                            .map(|image| image.image_url.as_str()),
+                    ),
+                    Ok(Err(err)) => format!(
+                        "[Vision analysis failed: {}.]",
+                        server_tool_failure_taxonomy(&err)
+                    ),
                     Err(_) => "[Vision analysis timed out before returning a result.]".to_string(),
                 },
             }
@@ -3898,21 +4839,37 @@ impl Gateway {
     }
 }
 
-/// E1: classify a streamed tool name as HIDDEN from the client (the
-/// [`ToolDeltaGate`] drops its argument deltas) vs client-visible. A name NOT in
-/// the offered registry is hidden (a hallucinated/unoffered tool — the client
-/// must not see it before the engine soft-rejects it); the server-side
-/// `analyzeImage` tool is hidden (G4); every other offered tool is visible
-/// (forwarded — `web_search` rendering is decided downstream by the converters).
-fn is_hidden_tool_name(
-    name: &str,
-    registry: &crate::adapters::responses_to_chat::ToolRegistry,
-) -> bool {
-    let name_lc = name.to_ascii_lowercase();
-    match registry.get(&name_lc) {
-        None => true,
-        Some(ToolKind::ImageAnalysis) => true,
-        Some(_) => false,
+/// Server-tool errors are intentionally degraded into model-visible tool text.
+/// Only return a bounded gateway-owned taxonomy: an injected Search/Vision
+/// client or backend response may place credentials or image locators in the
+/// error's otherwise neutral message field.
+fn server_tool_failure_taxonomy(error: &AppError) -> &'static str {
+    match error.status.as_u16() {
+        408 | 504 => "upstream_timeout",
+        429 => "rate_limited",
+        400 | 413 | 415 | 422 => "invalid_request",
+        500 => "internal_error",
+        _ => "backend_error",
+    }
+}
+
+/// Identity projected from the canonical public call item corresponding to one
+/// upstream Chat tool call. The diagnostic seam compares this directly with the
+/// normalized upstream call id; it never compares names or arguments.
+fn public_tool_call_identity(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::FunctionCall { call_id, .. }
+        | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id),
+        ResponseItem::LocalShellCall { call_id, .. }
+        | ResponseItem::ToolSearchCall { call_id, .. } => call_id.as_deref(),
+        ResponseItem::WebSearchCall { id, .. } => id.as_deref(),
+        ResponseItem::ItemReference { .. }
+        | ResponseItem::Message { .. }
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::ImageGenerationCall { .. } => None,
     }
 }
 
@@ -3985,7 +4942,36 @@ fn relax_tool_choice_after_stripping_tool(
         {
             *tool_choice = Value::String("auto".to_string());
         }
+        Value::Object(map) if map.get("type").and_then(Value::as_str) == Some(stripped_name) => {
+            *tool_choice = Value::String("auto".to_string());
+        }
         _ => {}
+    }
+}
+
+/// Responses hosted/custom selectors use their public tool type directly. The
+/// gateway implements `web_search` and custom tools as ordinary upstream chat
+/// functions, so lower those validated selectors only at the final chat boundary.
+fn responses_tool_choice_for_chat(tool_choice: &Value) -> Value {
+    let Some(choice) = tool_choice.as_object() else {
+        return tool_choice.clone();
+    };
+    match choice.get("type").and_then(Value::as_str) {
+        Some("web_search") => serde_json::json!({
+            "type": "function",
+            "function": { "name": "web_search" }
+        }),
+        Some("custom") => choice
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|name| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": { "name": name }
+                })
+            })
+            .unwrap_or_else(|| tool_choice.clone()),
+        _ => tool_choice.clone(),
     }
 }
 
@@ -4137,6 +5123,7 @@ fn json_path_child(parent: &str, key: &str) -> String {
 
 fn summarize_response_item(item: &ResponseItem) -> String {
     match item {
+        ResponseItem::ItemReference { id } => format!("item_reference {id}"),
         ResponseItem::Message { role, content, .. } => {
             format!("{role}: {}", summarize_content(content))
         }
@@ -4217,6 +5204,12 @@ fn summarize_content(content: &[crate::models::responses::ContentItem]) -> Strin
                 }
                 text.push_str("[file]");
             }
+            crate::models::responses::ContentItem::Refusal { refusal } => {
+                if !text.is_empty() {
+                    text.push(' ');
+                }
+                text.push_str(refusal);
+            }
             crate::models::responses::ContentItem::Other(_) => {
                 if !text.is_empty() {
                     text.push(' ');
@@ -4267,8 +5260,10 @@ mod tests {
     use super::preview_json;
     use super::preview_json_limited_with_images;
     use super::preview_text;
+    use super::response_resource_template;
     use super::trailing_tool_output_items;
     use crate::models::responses::ResponseItem;
+    use crate::models::responses::ResponsesRequest;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
@@ -4387,17 +5382,17 @@ mod tests {
         let input = vec![
             ResponseItem::FunctionCallOutput {
                 call_id: "old".to_string(),
-                output: json!("old"),
+                output: json!("old").into(),
             },
             ResponseItem::message_text("assistant", "done"),
             ResponseItem::FunctionCallOutput {
                 call_id: "fn".to_string(),
-                output: json!("fn out"),
+                output: json!("fn out").into(),
             },
             ResponseItem::CustomToolCallOutput {
                 call_id: "custom".to_string(),
                 name: Some("tool".to_string()),
-                output: json!("custom out"),
+                output: json!("custom out").into(),
             },
             ResponseItem::ToolSearchOutput {
                 call_id: Some("search".to_string()),
@@ -4560,6 +5555,7 @@ mod tests {
         let action = Some(WebSearchAction::Search {
             query: Some("rust async".to_string()),
             queries: None,
+            sources: None,
         });
         let args = json!({});
         let result = extract_web_search_query(&action, &args).unwrap();
@@ -4579,6 +5575,7 @@ mod tests {
         let action = Some(WebSearchAction::Search {
             query: None,
             queries: None,
+            sources: None,
         });
         let args = json!({"query": "from args"});
         let result = extract_web_search_query(&action, &args).unwrap();
@@ -4596,10 +5593,21 @@ mod tests {
     #[test]
     fn failure_event_shape() {
         let error = crate::error::AppError::internal("test error");
-        let event = failure_event(&error);
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": "hello"
+        }))
+        .expect("request");
+        let event = failure_event(
+            &error,
+            response_resource_template("resp_test".to_string(), &request, "test-model".to_string()),
+        );
         assert_eq!(event.event, "response.failed");
         assert_eq!(event.data["type"], "response.failed");
-        assert_eq!(event.data["response"]["error"]["code"], "gateway_error");
+        assert_eq!(event.data["response"]["id"], "resp_test");
+        assert_eq!(event.data["response"]["status"], "failed");
+        assert_eq!(event.data["response"]["object"], "response");
+        assert_eq!(event.data["response"]["error"]["code"], "internal_error");
         assert_eq!(
             event.data["response"]["error"]["message"].as_str().unwrap(),
             "internal server error"
@@ -4638,25 +5646,13 @@ fn extract_web_search_query(
     }
 }
 
-fn created_event(response_id: &str, estimated_input_tokens: i64) -> SseEvent {
+fn created_event(mut response: ResponseResource, estimated_input_tokens: i64) -> SseEvent {
+    response.estimated_input_tokens = estimated_input_tokens.try_into().ok();
     json_event(
         "response.created",
         ResponsesEnvelope {
             kind: "response.created".to_string(),
-            payload: ResponseCreatedPayload {
-                response: ResponseStub {
-                    id: response_id.to_string(),
-                    // C3: ride the early G3 estimate onto `response.created` so the
-                    // Anthropic streaming converter can seed `message_start` with a
-                    // non-zero `input_tokens` instead of a hardcoded `0` -- the real
-                    // upstream tokenizer count arrives LATE (`response.completed`'s
-                    // `usage`, after `message_start` has already gone out) and
-                    // always overrides this estimate at the terminal event. `try_into`
-                    // never actually fails (`estimate_input_tokens` is a non-negative
-                    // byte count) but stays total rather than panicking.
-                    estimated_input_tokens: estimated_input_tokens.try_into().ok(),
-                },
-            },
+            payload: ResponseCreatedPayload { response },
         },
     )
 }
@@ -4681,7 +5677,11 @@ fn incomplete_event(response: ResponseResource) -> SseEvent {
     )
 }
 
-fn content_part_added_event(item_id: String, output_index: usize) -> SseEvent {
+fn content_part_added_event(
+    item_id: String,
+    output_index: usize,
+    content_index: usize,
+) -> SseEvent {
     json_event(
         "response.content_part.added",
         ResponsesEnvelope {
@@ -4689,7 +5689,7 @@ fn content_part_added_event(item_id: String, output_index: usize) -> SseEvent {
             payload: crate::models::responses::ContentPartPayload {
                 item_id,
                 output_index,
-                content_index: 0,
+                content_index,
                 part: crate::models::responses::ContentPartRef {
                     kind: "output_text".to_string(),
                     text: String::new(),
@@ -4700,7 +5700,12 @@ fn content_part_added_event(item_id: String, output_index: usize) -> SseEvent {
     )
 }
 
-fn content_part_done_event(item_id: String, output_index: usize, text: String) -> SseEvent {
+fn content_part_done_event(
+    item_id: String,
+    output_index: usize,
+    content_index: usize,
+    text: String,
+) -> SseEvent {
     json_event(
         "response.content_part.done",
         ResponsesEnvelope {
@@ -4708,7 +5713,7 @@ fn content_part_done_event(item_id: String, output_index: usize, text: String) -
             payload: crate::models::responses::ContentPartPayload {
                 item_id,
                 output_index,
-                content_index: 0,
+                content_index,
                 part: crate::models::responses::ContentPartRef {
                     kind: "output_text".to_string(),
                     text,
@@ -4759,22 +5764,106 @@ fn reasoning_summary_part_done_event(
     )
 }
 
-fn refusal_delta_event(delta: String) -> SseEvent {
+fn reasoning_summary_text_done_event(
+    item_id: String,
+    output_index: usize,
+    text: String,
+) -> SseEvent {
     json_event(
-        "response.refusal.delta",
+        "response.reasoning_summary_text.done",
         ResponsesEnvelope {
-            kind: "response.refusal.delta".to_string(),
-            payload: crate::models::responses::RefusalDeltaPayload { delta },
+            kind: "response.reasoning_summary_text.done".to_string(),
+            payload: crate::models::responses::ReasoningTextDonePayload {
+                item_id,
+                output_index,
+                summary_index: 0,
+                text,
+            },
         },
     )
 }
 
-fn refusal_done_event(refusal: String) -> SseEvent {
+fn refusal_part_added_event(
+    item_id: String,
+    output_index: usize,
+    content_index: usize,
+) -> SseEvent {
+    json_event(
+        "response.content_part.added",
+        ResponsesEnvelope {
+            kind: "response.content_part.added".to_string(),
+            payload: crate::models::responses::RefusalContentPartPayload {
+                item_id,
+                output_index,
+                content_index,
+                part: crate::models::responses::RefusalContentPartRef {
+                    kind: "refusal".to_string(),
+                    refusal: String::new(),
+                },
+            },
+        },
+    )
+}
+
+fn refusal_part_done_event(
+    item_id: String,
+    output_index: usize,
+    content_index: usize,
+    refusal: String,
+) -> SseEvent {
+    json_event(
+        "response.content_part.done",
+        ResponsesEnvelope {
+            kind: "response.content_part.done".to_string(),
+            payload: crate::models::responses::RefusalContentPartPayload {
+                item_id,
+                output_index,
+                content_index,
+                part: crate::models::responses::RefusalContentPartRef {
+                    kind: "refusal".to_string(),
+                    refusal,
+                },
+            },
+        },
+    )
+}
+
+fn refusal_delta_event(
+    item_id: String,
+    output_index: usize,
+    content_index: usize,
+    delta: String,
+) -> SseEvent {
+    json_event(
+        "response.refusal.delta",
+        ResponsesEnvelope {
+            kind: "response.refusal.delta".to_string(),
+            payload: crate::models::responses::RefusalDeltaPayload {
+                item_id,
+                output_index,
+                content_index,
+                delta,
+            },
+        },
+    )
+}
+
+fn refusal_done_event(
+    item_id: String,
+    output_index: usize,
+    content_index: usize,
+    refusal: String,
+) -> SseEvent {
     json_event(
         "response.refusal.done",
         ResponsesEnvelope {
             kind: "response.refusal.done".to_string(),
-            payload: crate::models::responses::RefusalDonePayload { refusal },
+            payload: crate::models::responses::RefusalDonePayload {
+                item_id,
+                output_index,
+                content_index,
+                refusal,
+            },
         },
     )
 }
@@ -4785,25 +5874,64 @@ struct OutputTarget {
     output_index: usize,
 }
 
+#[derive(Clone)]
+struct FailureSnapshot(Arc<StdMutex<ResponseResource>>);
+
+impl FailureSnapshot {
+    fn new(resource: ResponseResource) -> Self {
+        Self(Arc::new(StdMutex::new(resource)))
+    }
+
+    fn resource(&self) -> ResponseResource {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn update_output(&self, output: Vec<ResponseItem>) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .output = output;
+    }
+
+    fn update_usage(&self, usage: ResponseUsage) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .usage = Some(usage);
+    }
+
+    fn update_service_tier(&self, service_tier: String) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .service_tier = Some(service_tier);
+    }
+}
+
 #[derive(Default)]
 struct ResponseEventState {
     next_output_index: usize,
     output_indices: HashMap<String, usize>,
     active_message: Option<OutputTarget>,
     active_reasoning: Option<OutputTarget>,
+    function_targets: HashMap<String, OutputTarget>,
+    custom_tool_targets: HashMap<String, OutputTarget>,
 }
 
 impl ResponseEventState {
-    fn register_item(&mut self, item: &ResponseItem) -> OutputTarget {
+    fn ensure_item_target(&mut self, item: &ResponseItem) -> (OutputTarget, bool) {
         let item_id = response_item_event_id(item)
             .unwrap_or_else(|| format!("item_{}", self.next_output_index));
-        let output_index = match self.output_indices.get(&item_id) {
-            Some(index) => *index,
+        let (output_index, added) = match self.output_indices.get(&item_id) {
+            Some(index) => (*index, false),
             None => {
                 let index = self.next_output_index;
                 self.next_output_index += 1;
                 self.output_indices.insert(item_id.clone(), index);
-                index
+                (index, true)
             }
         };
         let target = OutputTarget {
@@ -4815,7 +5943,11 @@ impl ResponseEventState {
             ResponseItem::Reasoning { .. } => self.active_reasoning = Some(target.clone()),
             _ => {}
         }
-        target
+        (target, added)
+    }
+
+    fn register_item(&mut self, item: &ResponseItem) -> OutputTarget {
+        self.ensure_item_target(item).0
     }
 
     fn target_for_item(&mut self, item: &ResponseItem) -> OutputTarget {
@@ -4833,19 +5965,184 @@ impl ResponseEventState {
             .clone()
             .ok_or_else(|| AppError::internal("missing active reasoning output item"))
     }
+
+    fn ensure_function_call(
+        &mut self,
+        call_id: &str,
+        name: &str,
+    ) -> (OutputTarget, ResponseItem, bool) {
+        if let Some(target) = self.function_targets.get(call_id).cloned() {
+            let item = ResponseItem::FunctionCall {
+                id: Some(target.item_id.clone()),
+                name: name.to_string(),
+                namespace: None,
+                arguments: String::new(),
+                call_id: call_id.to_string(),
+            };
+            return (target, item, false);
+        }
+        let target = OutputTarget {
+            item_id: format!("fc_{}", Uuid::new_v4().simple()),
+            output_index: self.next_output_index,
+        };
+        self.next_output_index += 1;
+        self.output_indices
+            .insert(target.item_id.clone(), target.output_index);
+        self.function_targets
+            .insert(call_id.to_string(), target.clone());
+        let item = ResponseItem::FunctionCall {
+            id: Some(target.item_id.clone()),
+            name: name.to_string(),
+            namespace: None,
+            arguments: String::new(),
+            call_id: call_id.to_string(),
+        };
+        (target, item, true)
+    }
+
+    fn function_target(&self, call_id: &str) -> AppResult<OutputTarget> {
+        self.function_targets
+            .get(call_id)
+            .cloned()
+            .ok_or_else(|| AppError::internal("missing function output item before argument delta"))
+    }
+
+    fn ensure_custom_tool_call(
+        &mut self,
+        id: Option<String>,
+        call_id: &str,
+        name: &str,
+    ) -> (OutputTarget, ResponseItem, bool) {
+        if let Some(target) = self.custom_tool_targets.get(call_id).cloned() {
+            let item = ResponseItem::CustomToolCall {
+                id: Some(target.item_id.clone()),
+                status: None,
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                input: String::new(),
+            };
+            return (target, item, false);
+        }
+        let target = OutputTarget {
+            item_id: id.unwrap_or_else(|| format!("ctc_{}", Uuid::new_v4().simple())),
+            output_index: self.next_output_index,
+        };
+        self.next_output_index += 1;
+        self.output_indices
+            .insert(target.item_id.clone(), target.output_index);
+        self.custom_tool_targets
+            .insert(call_id.to_string(), target.clone());
+        let item = ResponseItem::CustomToolCall {
+            id: Some(target.item_id.clone()),
+            status: None,
+            call_id: call_id.to_string(),
+            name: name.to_string(),
+            input: String::new(),
+        };
+        (target, item, true)
+    }
+
+    /// Retain only function items that were actually introduced on the public
+    /// stream, and attach the exact item id allocated for their added/delta
+    /// events. Failed snapshots must describe the live stream as-is: hidden or
+    /// merely buffered calls are not public output, while exposed calls keep
+    /// stable identities even though their argument JSON may be incomplete.
+    fn reconcile_partial_function_items(&self, items: &mut Vec<ResponseItem>) {
+        items.retain_mut(|item| {
+            let ResponseItem::FunctionCall { id, call_id, .. } = item else {
+                return true;
+            };
+            let Some(target) = self.function_targets.get(call_id) else {
+                return false;
+            };
+            *id = Some(target.item_id.clone());
+            true
+        });
+    }
+
+    fn finalize_function_item(
+        &mut self,
+        mut item: ResponseItem,
+    ) -> (ResponseItem, OutputTarget, bool) {
+        if let ResponseItem::CustomToolCall {
+            id,
+            status,
+            call_id,
+            name,
+            input,
+        } = item
+        {
+            let (target, _, added) = self.ensure_custom_tool_call(id, &call_id, &name);
+            item = ResponseItem::CustomToolCall {
+                id: Some(target.item_id.clone()),
+                status,
+                call_id,
+                name,
+                input,
+            };
+            return (item, target, added);
+        }
+        let ResponseItem::FunctionCall {
+            id,
+            name,
+            namespace,
+            arguments,
+            call_id,
+        } = item
+        else {
+            match &mut item {
+                ResponseItem::ToolSearchCall { id, .. } if id.is_none() => {
+                    *id = Some(format!("tsc_{}", Uuid::new_v4().simple()));
+                }
+                ResponseItem::LocalShellCall { id, .. } if id.is_none() => {
+                    *id = Some(format!("lsc_{}", Uuid::new_v4().simple()));
+                }
+                _ => {}
+            }
+            let (target, added) = self.ensure_item_target(&item);
+            return (item, target, added);
+        };
+        let (target, _, added) = self.ensure_function_call(&call_id, &name);
+        item = ResponseItem::FunctionCall {
+            id: Some(id.unwrap_or_else(|| target.item_id.clone())),
+            name,
+            namespace,
+            arguments,
+            call_id,
+        };
+        (item, target, added)
+    }
+
+    fn sort_items(&self, items: &mut [ResponseItem]) {
+        items.sort_by_key(|item| {
+            response_item_event_id(item)
+                .and_then(|id| self.output_indices.get(&id).copied())
+                .or_else(|| match item {
+                    ResponseItem::FunctionCall { call_id, .. } => self
+                        .function_targets
+                        .get(call_id)
+                        .map(|target| target.output_index),
+                    _ => None,
+                })
+                .unwrap_or(usize::MAX)
+        });
+    }
 }
 
 fn response_item_event_id(item: &ResponseItem) -> Option<String> {
     match item {
+        ResponseItem::ItemReference { id } => Some(id.clone()),
         ResponseItem::Message { id, .. } => id.clone(),
         ResponseItem::Reasoning { id, .. } => Some(id.clone()),
         ResponseItem::FunctionCall { id, call_id, .. } => {
             id.clone().or_else(|| Some(call_id.clone()))
         }
         ResponseItem::FunctionCallOutput { call_id, .. } => Some(call_id.clone()),
-        ResponseItem::CustomToolCall { call_id, .. } => Some(call_id.clone()),
+        ResponseItem::CustomToolCall { id, call_id, .. } => {
+            id.clone().or_else(|| Some(call_id.clone()))
+        }
         ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.clone()),
-        ResponseItem::ToolSearchCall { call_id, .. } => call_id.clone(),
+        ResponseItem::ToolSearchCall { id, call_id, .. } => id.clone().or_else(|| call_id.clone()),
         ResponseItem::ToolSearchOutput { call_id, .. } => call_id.clone(),
         ResponseItem::LocalShellCall { id, call_id, .. } => id.clone().or_else(|| call_id.clone()),
         ResponseItem::WebSearchCall { id, .. } => id.clone(),
@@ -4855,6 +6152,7 @@ fn response_item_event_id(item: &ResponseItem) -> Option<String> {
 
 #[derive(Default)]
 struct AccumulatedUsage {
+    reported: bool,
     input_tokens: i64,
     output_tokens: i64,
     total_tokens: i64,
@@ -4881,6 +6179,7 @@ fn accumulate_optional(slot: &mut Option<i64>, reported: Option<i64>) {
 
 impl AccumulatedUsage {
     fn add(&mut self, usage: ChunkUsage) {
+        self.reported = true;
         self.input_tokens += usage.prompt_tokens;
         self.output_tokens += usage.completion_tokens;
         self.total_tokens += usage.total_tokens;
@@ -4911,7 +6210,7 @@ impl AccumulatedUsage {
     }
 
     fn into_response_usage(self) -> Option<ResponseUsage> {
-        if self.total_tokens == 0 {
+        if !self.reported {
             return None;
         }
         Some(ResponseUsage {
@@ -4967,6 +6266,20 @@ fn flow_usage_from_base_and_chunk(
     }
 }
 
+fn response_usage_from_flow_usage(usage: crate::dashboard_flow::FlowUsage) -> ResponseUsage {
+    ResponseUsage {
+        input_tokens: usage.prompt,
+        output_tokens: usage.completion,
+        total_tokens: usage.total,
+        input_tokens_details: Some(ResponseInputTokensDetails {
+            cached_tokens: usage.cached.unwrap_or(0),
+        }),
+        output_tokens_details: Some(ResponseOutputTokensDetails {
+            reasoning_tokens: usage.reasoning.unwrap_or(0),
+        }),
+    }
+}
+
 fn output_item_added_event(item: ResponseItem, output_index: usize) -> SseEvent {
     json_event(
         "response.output_item.added",
@@ -4977,17 +6290,33 @@ fn output_item_added_event(item: ResponseItem, output_index: usize) -> SseEvent 
     )
 }
 
-fn output_item_done_event(item: ResponseItem, output_index: usize) -> SseEvent {
-    json_event(
+fn output_item_done_event(item: ResponseItem, output_index: usize, item_status: &str) -> SseEvent {
+    let mut event = json_event(
         "response.output_item.done",
         ResponsesEnvelope {
             kind: "response.output_item.done".to_string(),
             payload: OutputItemPayload { output_index, item },
         },
-    )
+    );
+    // Canonical converters do not need output status, but the raw Responses
+    // projector does. Carry it as an internal sibling so truncated items can
+    // be projected as `incomplete` without adding non-input fields to the
+    // canonical ResponseItem variants. The HTTP projector always removes it.
+    if let Some(object) = event.data.as_object_mut() {
+        object.insert(
+            "llmconduit_item_status".to_string(),
+            Value::String(item_status.to_string()),
+        );
+    }
+    event
 }
 
-fn output_text_delta_event(item_id: String, output_index: usize, delta: String) -> SseEvent {
+fn output_text_delta_event(
+    item_id: String,
+    output_index: usize,
+    content_index: usize,
+    delta: String,
+) -> SseEvent {
     json_event(
         "response.output_text.delta",
         ResponsesEnvelope {
@@ -4995,14 +6324,33 @@ fn output_text_delta_event(item_id: String, output_index: usize, delta: String) 
             payload: DeltaPayload {
                 item_id,
                 output_index,
-                content_index: 0,
+                content_index,
                 delta,
             },
         },
     )
 }
 
-fn reasoning_text_delta_event(item_id: String, output_index: usize, delta: String) -> SseEvent {
+fn reasoning_raw_text_delta_event(item_id: String, output_index: usize, delta: String) -> SseEvent {
+    json_event(
+        "response.reasoning_text.delta",
+        ResponsesEnvelope {
+            kind: "response.reasoning_text.delta".to_string(),
+            payload: ReasoningDeltaPayload {
+                item_id,
+                output_index,
+                summary_index: 0,
+                delta,
+            },
+        },
+    )
+}
+
+fn reasoning_summary_text_delta_event(
+    item_id: String,
+    output_index: usize,
+    delta: String,
+) -> SseEvent {
     json_event(
         "response.reasoning_summary_text.delta",
         ResponsesEnvelope {
@@ -5036,47 +6384,86 @@ fn reasoning_signature_delta_event(
     )
 }
 
-fn failure_event(error: &AppError) -> SseEvent {
+fn response_resource_template(
+    response_id: String,
+    request: &ResponsesRequest,
+    served_model: String,
+) -> ResponseResource {
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    ResponseResource {
+        id: response_id,
+        object: "response".to_string(),
+        created_at,
+        completed_at: None,
+        status: "in_progress".to_string(),
+        error: None,
+        instructions: (!request.instructions.is_empty()).then(|| request.instructions.clone()),
+        max_output_tokens: request.max_output_tokens,
+        output: Vec::new(),
+        model: served_model,
+        parallel_tool_calls: request.parallel_tool_calls,
+        previous_response_id: request.previous_response_id.clone(),
+        reasoning: request.reasoning.clone(),
+        store: request.store,
+        temperature: request.temperature,
+        text: request.text.clone(),
+        tool_choice: request.tool_choice.clone(),
+        tools: request.tools.clone(),
+        top_p: request.top_p,
+        truncation: request.truncation.clone(),
+        // This is provider-reported response metadata, not a request echo. It
+        // remains unknown until an upstream Chat Completions chunk supplies it.
+        service_tier: None,
+        prompt_cache_key: request.prompt_cache_key.clone(),
+        prompt_cache_retention: request.prompt_cache_retention.clone(),
+        estimated_input_tokens: None,
+        usage: None,
+        metadata: request.metadata.clone(),
+        incomplete_details: None,
+        stop_sequence: None,
+        terminal_reason: None,
+    }
+}
+
+fn failure_event(error: &AppError, mut response: ResponseResource) -> SseEvent {
+    response.status = "failed".to_string();
+    response.completed_at = None;
+    response.error = Some(FailedError {
+        code: error
+            .code
+            .clone()
+            .unwrap_or_else(|| "gateway_error".to_string()),
+        message: error.client_message.clone(),
+    });
     json_event(
         "response.failed",
         ResponsesEnvelope {
             kind: "response.failed".to_string(),
-            payload: FailedPayload {
-                response: FailedResponse {
-                    error: FailedError {
-                        // E1: surface a structured machine code when the error
-                        // carries one (e.g. `invalid_tool_call` for an exhausted
-                        // unknown-tool repair); otherwise the historical default.
-                        code: error
-                            .code
-                            .clone()
-                            .unwrap_or_else(|| "gateway_error".to_string()),
-                        message: error.client_message.clone(),
-                    },
-                },
-            },
+            payload: FailedPayload { response },
         },
     )
 }
 
-fn in_progress_event(response_id: &str) -> SseEvent {
+fn in_progress_event(mut response: ResponseResource) -> SseEvent {
+    response.estimated_input_tokens = None;
     json_event(
         "response.in_progress",
         ResponsesEnvelope {
             kind: "response.in_progress".to_string(),
-            payload: ResponseCreatedPayload {
-                response: ResponseStub {
-                    id: response_id.to_string(),
-                    // Not carried on `response.in_progress` -- the Anthropic converter
-                    // only reads this field off `response.created` (`handle_created`).
-                    estimated_input_tokens: None,
-                },
-            },
+            payload: ResponseCreatedPayload { response },
         },
     )
 }
 
-fn output_text_done_event(item_id: String, output_index: usize, text: String) -> SseEvent {
+fn output_text_done_event(
+    item_id: String,
+    output_index: usize,
+    content_index: usize,
+    text: String,
+) -> SseEvent {
     json_event(
         "response.output_text.done",
         ResponsesEnvelope {
@@ -5084,7 +6471,7 @@ fn output_text_done_event(item_id: String, output_index: usize, text: String) ->
             payload: crate::models::responses::TextDonePayload {
                 item_id,
                 output_index,
-                content_index: 0,
+                content_index,
                 text,
             },
         },
@@ -5092,6 +6479,7 @@ fn output_text_done_event(item_id: String, output_index: usize, text: String) ->
 }
 
 fn function_call_args_delta_event(
+    target: OutputTarget,
     call_id: String,
     name: Option<String>,
     delta: String,
@@ -5101,6 +6489,8 @@ fn function_call_args_delta_event(
         ResponsesEnvelope {
             kind: "response.function_call_arguments.delta".to_string(),
             payload: crate::models::responses::FunctionCallArgsDeltaPayload {
+                item_id: target.item_id,
+                output_index: target.output_index,
                 call_id,
                 name,
                 delta,
@@ -5109,15 +6499,50 @@ fn function_call_args_delta_event(
     )
 }
 
-fn function_call_args_done_event(call_id: String, name: String, arguments: String) -> SseEvent {
+fn function_call_args_done_event(
+    target: OutputTarget,
+    call_id: String,
+    name: String,
+    arguments: String,
+) -> SseEvent {
     json_event(
         "response.function_call_arguments.done",
         ResponsesEnvelope {
             kind: "response.function_call_arguments.done".to_string(),
             payload: crate::models::responses::FunctionCallArgsDonePayload {
+                item_id: target.item_id,
+                output_index: target.output_index,
                 call_id,
                 name,
                 arguments,
+            },
+        },
+    )
+}
+
+fn custom_tool_call_input_delta_event(target: OutputTarget, delta: String) -> SseEvent {
+    json_event(
+        "response.custom_tool_call_input.delta",
+        ResponsesEnvelope {
+            kind: "response.custom_tool_call_input.delta".to_string(),
+            payload: crate::models::responses::CustomToolCallInputDeltaPayload {
+                item_id: target.item_id,
+                output_index: target.output_index,
+                delta,
+            },
+        },
+    )
+}
+
+fn custom_tool_call_input_done_event(target: OutputTarget, input: String) -> SseEvent {
+    json_event(
+        "response.custom_tool_call_input.done",
+        ResponsesEnvelope {
+            kind: "response.custom_tool_call_input.done".to_string(),
+            payload: crate::models::responses::CustomToolCallInputDonePayload {
+                item_id: target.item_id,
+                output_index: target.output_index,
+                input,
             },
         },
     )

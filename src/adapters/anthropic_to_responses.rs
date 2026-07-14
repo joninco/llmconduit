@@ -52,7 +52,7 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
 
     Ok(ResponsesRequest {
         model: request.model,
-        instructions,
+        instructions: instructions.into(),
         input,
         tools,
         tool_choice,
@@ -64,9 +64,10 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_retention: None,
         text,
-        client_metadata: None,
         previous_response_id: None,
+        llmconduit_replay: None,
         temperature: request.temperature,
         top_p: request.top_p,
         max_output_tokens: max_output_tokens.transpose()?,
@@ -121,6 +122,10 @@ fn convert_output_config(output_config: Option<Value>) -> AppResult<Option<TextC
         .get("strict")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let description = format
+        .get("description")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
 
     Ok(Some(TextControls {
         verbosity: None,
@@ -129,6 +134,7 @@ fn convert_output_config(output_config: Option<Value>) -> AppResult<Option<TextC
             strict,
             schema,
             name,
+            description,
         }),
     }))
 }
@@ -302,7 +308,7 @@ fn convert_message(
                         let (output, images) = extract_tool_result_parts(result_content)?;
                         items.push(ResponseItem::FunctionCallOutput {
                             call_id: tool_use_id.clone(),
-                            output,
+                            output: output.into(),
                         });
                         if !images.is_empty() {
                             items.push(ResponseItem::Message {
@@ -324,7 +330,7 @@ fn convert_message(
                         flush_message(items, &mut content_items);
                         items.push(ResponseItem::FunctionCallOutput {
                             call_id: tool_use_id.clone(),
-                            output: content.clone(),
+                            output: content.clone().into(),
                         });
                     }
                     AnthropicContentBlock::Thinking {
@@ -527,9 +533,9 @@ fn image_source_to_content_item(source: &AnthropicImageSource) -> AppResult<Cont
                 detail: None,
             })
         }
-        other => Err(AppError::bad_request(format!(
-            "unsupported Anthropic image source type \"{other}\""
-        ))),
+        _ => Err(AppError::bad_request(
+            "unsupported Anthropic image source type",
+        )),
     }
 }
 
@@ -862,6 +868,7 @@ mod tests {
             output_config: Some(json!({
                 "format": {
                     "type": "json_schema",
+                    "description": "A titled response.",
                     "schema": schema
                 }
             })),
@@ -875,6 +882,7 @@ mod tests {
             .expect("text format");
         assert_eq!(format.kind, "json_schema");
         assert_eq!(format.name, "response");
+        assert_eq!(format.description.as_deref(), Some("A titled response."));
         assert!(format.strict);
         assert_eq!(format.schema, schema);
     }
@@ -989,7 +997,15 @@ mod tests {
             &result.input[2],
             ResponseItem::FunctionCallOutput { call_id, output }
                 if call_id == "srvtoolu_1"
-                    && output[0]["type"] == "web_search_result"
+                    && matches!(
+                        output,
+                        crate::models::responses::FunctionCallOutputContent::Content(content)
+                            if matches!(
+                                content.first(),
+                                Some(ContentItem::Other(value))
+                                    if value["type"] == "web_search_result"
+                            )
+                    )
         ));
         assert!(matches!(
             &result.input[3],
@@ -1046,7 +1062,12 @@ mod tests {
         assert!(matches!(
             &result.input[0],
             ResponseItem::FunctionCallOutput { call_id, output }
-                if call_id == "toolu_1" && output == &json!("screenshot attached")
+                if call_id == "toolu_1"
+                    && matches!(
+                        output,
+                        crate::models::responses::FunctionCallOutputContent::Text(text)
+                            if text == "screenshot attached"
+                    )
         ));
         assert!(matches!(
             &result.input[1],

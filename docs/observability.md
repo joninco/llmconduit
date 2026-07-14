@@ -44,7 +44,7 @@ Five files under `src/dashboard_*.rs` + `src/debug_ui.rs`.
 
 **File:** `src/upstream.rs` (writer) + `src/request_log.rs` (analyzer).
 
-- **`UpstreamRequestLogger`** (upstream.rs line 901): per-provider JSONL writer. Each `log()` call (line 914) serializes the `ChatCompletionRequest` to the configured `upstream_request_log_path`, with image-URI redaction on the payload bytes.
+- **`UpstreamRequestLogger`** (upstream.rs): per-provider JSONL writer. Metadata-only is the default; `upstream_request_log_body_mode: redacted_payload` explicitly enables recursively secret-redacted and image-URI-redacted request payloads. A dedicated writer owns a 16-entry bounded queue; serving never waits for filesystem IO, overflow drops only the log entry, and power-of-two warning sampling prevents a stalled log path from amplifying disk pressure.
 - **Config paths** (config.rs line 559): top-level `upstream_request_log_path`, per-provider override, plus fallback upstream paths. All collected via `Config::debug_log_dirs()` (config.rs line 1460).
 - **`analyze_request_log`** (request_log.rs line 7): offline diff tool — reads JSONL, finds common prefixes between consecutive entries, reports differing JSON paths. Used via CLI (`main.rs` line 37).
 - **Integration:** `UpstreamRequestLogger` constructed per `UpstreamClient` in `lib.rs` (lines 171/210/254), wired at upstream call sites in `upstream.rs`.
@@ -56,7 +56,25 @@ Five files under `src/dashboard_*.rs` + `src/debug_ui.rs`.
 - **`ReplayStore`** (line 26): bounded LRU `HashMap<String, ReplayRecord>` keyed by SHA-256 hash of `(model, instructions, visible_history)`.
 - **`insert`** (line 41): evicts oldest entry when at `max_entries` capacity.
 - **`longest_prefix_match`** (line 60): finds best matching replay for repair rounds.
-- **Integration:** stored on `Gateway` (engine.rs line 136), seeded at startup (lib.rs line 102). Used by engine during repair-round injection (engine.rs around line 1900).
+- **Integration:** stored on `Gateway` and used by the engine during repair-round injection. It is
+  configured under `replay`, defaults disabled, and is independent from the public Responses
+  `store` field. The consumed `llmconduit_replay:false` extension bypasses it per request.
+
+## Responses State Store
+
+**File:** `src/response_store.rs`.
+
+- `store:true` prepares completed/incomplete canonical history in hidden state, atomically publishes
+  it immediately before the terminal event, and rolls it back when delivery is cancelled; failed and
+  cancelled turns are never referenceable.
+- The default memory backend is a TTL-aware bounded LRU with independent 64 MiB committed and
+  pending-write byte ceilings in addition to its entry limit.
+- Optional SQLite persistence uses a versioned schema, transactions, hidden prepare/publish rows,
+  expiry/LRU cleanup, restrictive Unix permissions, a two-second busy deadline, a single bounded
+  Tokio blocking lane, and a bounded memory front cache.
+- `previous_response_id` reads this store and returns a sanitized 404 for missing, expired,
+  evicted, failed, cancelled, or non-stored IDs. Stored records contain canonical items and model/
+  timestamp metadata, never HTTP headers or credentials.
 
 ## Tool Delta Gate
 

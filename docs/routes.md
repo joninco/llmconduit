@@ -32,9 +32,20 @@
 
 ### Inference API (`/v1/*`) — lines 108-118
 
-These are the primary external-facing API routes registered in `build_router`. All share the `log_api_call` middleware that enforces the inbound body cap, opens dashboard flow records (D1), and manages turn capture (F1b). The `/v1/responses`, `/v1/messages`, and `/v1/chat/completions` POST handlers go through the engine's `Gateway`; `/v1/completions` is a raw passthrough proxy.
+These are the primary external-facing API routes registered in `build_router`. All share the
+`log_api_call` middleware that enforces the inbound body cap, opens dashboard flow records (D1),
+and manages turn capture (F1b). When `LLMCONDUIT_API_TOKEN` is configured, every `/v1/*` route
+requires the same token as Bearer authorization or `x-api-key`; comparison is constant-time.
+Loopback serving may omit the token, while startup refuses wildcard/non-loopback unauthenticated
+serving unless `LLMCONDUIT_ALLOW_UNAUTHENTICATED_API=1` explicitly permits it.
+
+The `/v1/responses`, `/v1/messages`, and `/v1/chat/completions` POST handlers go through the
+engine's `Gateway`; `/v1/completions` is a raw passthrough proxy. Proxy/header forwarding uses a
+narrow allowlist and never sends inbound authorization/API-key headers, cookies, proxy credentials,
+or dashboard/session headers to an upstream.
 
 GET `/health` and GET `/` are unauthenticated, un-instrumented liveness/readiness endpoints.
+Dashboard session authentication is independent of inference API token authentication.
 
 ### Dashboard API (`/dashboard/api/*`) — lines 182-190
 

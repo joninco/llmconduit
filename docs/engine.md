@@ -75,8 +75,16 @@
 
 | Function | Line | Description |
 |-|-|-|
-| `find_replay_baseline` | 1828 | Look up a replay record by `longest_prefix_match` on model, instructions, and input. Returns `(Option<ReplayRecord>, prefix_len)`. Gated on `request.store`. |
-| *(replay store insert)* | 2942-2951 | Inside `run_turn`: insert a `ReplayRecord` (model, instructions, visible_history, internal_messages) after the turn completes, gated on `request.store`. |
+| `find_replay_baseline` | engine.rs | Look up a private replay record by `longest_prefix_match` on model, instructions, and input. Disabled unless `replay.enabled`; `llmconduit_replay:false` bypasses lookup. |
+| *(replay store insert)* | engine.rs | Insert a private `ReplayRecord` after completion only when replay is enabled and not bypassed. Responses `store` does not gate this cache. |
+
+## Responses state and capability gating
+
+| Component | Description |
+|-|-|
+| `response_store.rs` | Bounded memory or SQLite-backed canonical history for Responses `store` / `previous_response_id`. Persistence finishes before an eligible terminal event. |
+| `responses_capabilities.rs` | Resolves conservative capabilities for the selected provider+served model, rejects an incapable primary with a parameter-specific 400, and constructs a per-request allowlist that prunes only incapable nested fallbacks. |
+| `stream_responses_with_api_call_id` | Resolves stored history before lowering, applies capability validation after primary routing, consumes gateway-only extensions, and keeps Responses state independent from replay. |
 
 ## Dashboard Telemetry
 

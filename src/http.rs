@@ -35,8 +35,6 @@ use crate::models::anthropic::AnthropicRequest;
 use crate::models::chat::ChatCompletionRequest;
 use crate::models::chat::normalize_stop;
 use crate::models::responses::ResponsesRequest;
-use crate::proxy_headers::header_name_eq;
-use crate::proxy_headers::is_hop_by_hop_header;
 use crate::upstream::BackendChatRequest;
 use crate::upstream::collect_models_response;
 use axum::Extension;
@@ -78,6 +76,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -153,7 +152,31 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
             log_api_call,
         ))
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
+        // Authentication is the outermost API layer so an unauthenticated
+        // caller cannot make us buffer or log a request body. Public health,
+        // root, metrics, and dashboard routes pass through unchanged.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&gateway),
+            require_api_auth,
+        ))
         .with_state(gateway)
+}
+
+async fn require_api_auth(
+    State(gateway): State<Arc<Gateway>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !request.uri().path().starts_with("/v1/") {
+        return next.run(request).await;
+    }
+    let Some(auth) = gateway.api_auth() else {
+        return next.run(request).await;
+    };
+    if auth.authenticate(request.headers()) {
+        return next.run(request).await;
+    }
+    AppError::unauthorized("invalid or missing API key").into_response()
 }
 
 /// The D7-gated `/debug` + `/dashboard` sub-router (state `Arc<Gateway>`, merged
@@ -381,14 +404,22 @@ struct BodyLogFields {
 /// Compute the body-derived log fields for `path`/`body`, returning `None` for a
 /// dashboard auth endpoint so the caller emits no body-derived field (D7a R3 #1
 /// — the digest + length are a token-verification oracle).
-fn body_log_fields(path: &str, body: &Bytes) -> Option<BodyLogFields> {
+fn body_log_fields(
+    path: &str,
+    body: &Bytes,
+    mode: crate::config::LogBodyMode,
+) -> Option<BodyLogFields> {
     if is_dashboard_auth_path(path) {
         return None;
     }
     Some(BodyLogFields {
         bytes: body.len(),
         sha256: hex::encode(Sha256::digest(body)),
-        summary: summarize_api_body(path, body),
+        summary: if mode == crate::config::LogBodyMode::RedactedPayload {
+            summarize_api_body(path, body)
+        } else {
+            "metadata_only".to_string()
+        },
     })
 }
 
@@ -405,11 +436,7 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
 
 /// 413 response for an inbound body that exceeds `limit_bytes`.
 fn payload_too_large(limit_bytes: usize) -> Response {
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        format!("request body exceeds the {limit_bytes}-byte limit"),
-    )
-        .into_response()
+    AppError::payload_too_large(limit_bytes).into_response()
 }
 
 /// True when an `axum::body::to_bytes` error is an over-cap length-limit
@@ -502,10 +529,8 @@ async fn log_api_call(
                 error = %err,
                 "failed to read inbound API request body"
             );
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("failed to read request body: {err}"),
-            )
+            return AppError::bad_request("failed to read request body")
+                .with_code("invalid_request_body")
                 .into_response();
         }
     };
@@ -516,17 +541,20 @@ async fn log_api_call(
     // `None` there so we emit only non-body metadata; every other path logs the
     // length, hex digest, and the redacted summary.
     let is_auth_path = is_dashboard_auth_path(uri.path());
-    match body_log_fields(uri.path(), &body_bytes) {
+    let query = uri.query().unwrap_or("");
+    let query_sha256 = (!query.is_empty()).then(|| hex::encode(Sha256::digest(query.as_bytes())));
+    match body_log_fields(uri.path(), &body_bytes, gateway.config().api_log_body_mode) {
         Some(fields) => tracing::info!(
             api_call_id = %api_call_id,
             method = %method,
             path = %uri.path(),
-            query = uri.query().unwrap_or(""),
+            query_present = !query.is_empty(),
+            query_sha256 = query_sha256.as_deref().unwrap_or(""),
             content_type = %header_for_log(&headers, header::CONTENT_TYPE.as_str()),
-            user_agent = %header_for_log(&headers, header::USER_AGENT.as_str()),
+            user_agent_present = headers.contains_key(header::USER_AGENT),
             anthropic_version = %header_for_log(&headers, "anthropic-version"),
-            anthropic_beta = %header_for_log(&headers, "anthropic-beta"),
-            openai_beta = %header_for_log(&headers, "openai-beta"),
+            anthropic_beta_present = headers.contains_key("anthropic-beta"),
+            openai_beta_present = headers.contains_key("openai-beta"),
             request_id = %header_for_log(&headers, "x-request-id"),
             authorization_present = headers.contains_key(header::AUTHORIZATION),
             x_api_key_present = headers.contains_key("x-api-key"),
@@ -540,12 +568,13 @@ async fn log_api_call(
             api_call_id = %api_call_id,
             method = %method,
             path = %uri.path(),
-            query = uri.query().unwrap_or(""),
+            query_present = !query.is_empty(),
+            query_sha256 = query_sha256.as_deref().unwrap_or(""),
             content_type = %header_for_log(&headers, header::CONTENT_TYPE.as_str()),
-            user_agent = %header_for_log(&headers, header::USER_AGENT.as_str()),
+            user_agent_present = headers.contains_key(header::USER_AGENT),
             anthropic_version = %header_for_log(&headers, "anthropic-version"),
-            anthropic_beta = %header_for_log(&headers, "anthropic-beta"),
-            openai_beta = %header_for_log(&headers, "openai-beta"),
+            anthropic_beta_present = headers.contains_key("anthropic-beta"),
+            openai_beta_present = headers.contains_key("openai-beta"),
             request_id = %header_for_log(&headers, "x-request-id"),
             authorization_present = headers.contains_key(header::AUTHORIZATION),
             x_api_key_present = headers.contains_key("x-api-key"),
@@ -554,7 +583,10 @@ async fn log_api_call(
     }
     // Never dump the auth-endpoint body (it carries the token, and even its
     // length/digest are an oracle — handled above).
-    if !is_auth_path && body_bytes.len() <= API_LOG_PAYLOAD_DUMP_LIMIT_BYTES {
+    if !is_auth_path
+        && payload_logging_enabled(gateway.config().api_log_body_mode)
+        && body_bytes.len() <= API_LOG_PAYLOAD_DUMP_LIMIT_BYTES
+    {
         tracing::info!(
             api_call_id = %api_call_id,
             method = %method,
@@ -667,6 +699,9 @@ async fn log_api_call(
             .turn_capture()
             .start(&api_call_id, model_requested, epoch_millis());
         if let Some(state) = &state {
+            if gateway.config().has_backend_credentials() {
+                state.suppress_raw_response_capture();
+            }
             state.write_inbound_request(&inbound_section);
             if inbound_partial {
                 // F3 (Fable-fix): the redaction offload could not capture the body (a
@@ -850,13 +885,11 @@ fn summarize_api_body(path: &str, body: &Bytes) -> String {
     match serde_json::from_slice::<Value>(body) {
         Ok(value) => summarize_json_api_body(path, &value),
         Err(err) => {
-            // Redact image URIs from the raw preview before logging (round-4 #2):
-            // a non-JSON body could still embed a `data:`/signed image URL.
-            let preview = crate::redaction::redact_image_uris(&String::from_utf8_lossy(body));
             format!(
-                "non_json parse_error={} preview={}",
+                "non_json parse_error={} bytes={} sha256={}",
                 compact_for_log(&err.to_string()),
-                compact_for_log(&preview)
+                body.len(),
+                hex::encode(Sha256::digest(body)),
             )
         }
     }
@@ -874,12 +907,16 @@ fn payload_for_log(body: &Bytes) -> String {
             serde_json::to_string(&value)
                 .unwrap_or_else(|_| "<failed to serialize json>".to_string())
         }
-        Err(_) => {
-            // Non-JSON body: still strip image URIs from the raw text so a
-            // `data:`/signed URL in a malformed/odd payload is not logged raw.
-            crate::redaction::redact_image_uris(&String::from_utf8_lossy(body))
-        }
+        Err(_) => format!(
+            "[redacted: unparseable body {} bytes sha256={}]",
+            body.len(),
+            hex::encode(Sha256::digest(body)),
+        ),
     }
+}
+
+fn payload_logging_enabled(mode: crate::config::LogBodyMode) -> bool {
+    mode == crate::config::LogBodyMode::RedactedPayload
 }
 
 fn redact_payload_secrets(value: &mut Value) {
@@ -913,12 +950,15 @@ fn redacted_inbound_section(body: &[u8]) -> (Option<String>, Vec<u8>) {
                 .unwrap_or_else(|_| b"<failed to serialize json>".to_vec());
             (model, bytes)
         }
-        Err(_) => {
-            // Non-JSON body: still strip image URIs from the raw text so a
-            // `data:`/signed URL in a malformed/odd payload is not captured raw.
-            let redacted = crate::redaction::redact_image_uris(&String::from_utf8_lossy(body));
-            (None, redacted.into_bytes())
-        }
+        Err(_) => (
+            None,
+            format!(
+                "[redacted: unparseable body {} bytes sha256={}]",
+                body.len(),
+                hex::encode(Sha256::digest(body)),
+            )
+            .into_bytes(),
+        ),
     }
 }
 
@@ -1409,20 +1449,296 @@ fn json_type(value: &Value) -> &'static str {
 async fn post_responses(
     State(gateway): State<Arc<Gateway>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
-    Json(request): Json<ResponsesRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> AppResult<Response> {
+    if !content_type_is_json(&headers) {
+        return Err(AppError::unsupported_media_type(
+            "content-type must be application/json",
+        ));
+    }
+    let mut request = parse_responses_request(&body)?;
+    request.extra_body.insert(
+        crate::responses_capabilities::ENFORCE_EXTENSION.to_string(),
+        Value::Bool(true),
+    );
+    if request.model.trim().is_empty() {
+        return Err(AppError::bad_request("model is required")
+            .with_code("invalid_value")
+            .with_param("model"));
+    }
     let requested = request.model.clone();
-    let served = gateway.resolve_request_model(&request.model).await.0;
+    let served = gateway.resolve_responses_model(&request.model).await?;
     let wants_stream = request.stream;
+    let expose_encrypted_reasoning = request
+        .include
+        .iter()
+        .any(|include| include == "reasoning.encrypted_content");
+    let expose_reasoning_summary = request
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| reasoning.summary.as_deref())
+        .is_some_and(|summary| summary != "none");
     let stream = gateway
         .stream_responses_with_api_call_id(request, api_call_id.map(|extension| extension.0.0))
         .await?;
     let response = if wants_stream {
-        stream_responses_response(stream)
+        stream_responses_response(stream, expose_encrypted_reasoning, expose_reasoning_summary)
     } else {
-        collect_responses_response(stream).await?
+        collect_responses_response(stream, expose_encrypted_reasoning, expose_reasoning_summary)
+            .await?
     };
     Ok(with_model_headers(response, &requested, &served))
+}
+
+fn parse_responses_request(body: &[u8]) -> AppResult<ResponsesRequest> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| {
+        AppError::bad_request("invalid JSON request body").with_code("invalid_json")
+    })?;
+    if let Some(param) = known_unsupported_responses_variant(&value) {
+        return Err(AppError::unsupported_parameter(param));
+    }
+    if let Some((param, code, message)) = invalid_multimodal_responses_parameter(&value) {
+        return Err(AppError::bad_request(message)
+            .with_code(code)
+            .with_param(param));
+    }
+    serde_path_to_error::deserialize(value).map_err(|error| {
+        let path = error.path().to_string();
+        let param = (!path.is_empty() && path != ".").then_some(path);
+        let message = error.inner().to_string();
+        let code = if message.contains("missing field") {
+            "missing_required_parameter"
+        } else if message.contains("unknown variant") {
+            "invalid_value"
+        } else {
+            "invalid_type"
+        };
+        let mut app_error =
+            AppError::bad_request("invalid Responses request parameter").with_code(code);
+        if let Some(param) = param {
+            app_error = app_error.with_param(param);
+        }
+        app_error
+    })
+}
+
+fn invalid_multimodal_responses_parameter(
+    value: &Value,
+) -> Option<(String, &'static str, &'static str)> {
+    for (root, items) in ["instructions", "input"]
+        .into_iter()
+        .filter_map(|root| value.get(root)?.as_array().map(|items| (root, items)))
+    {
+        if let Some(error) = invalid_multimodal_items_parameter(items, root) {
+            return Some(error);
+        }
+    }
+    None
+}
+
+fn invalid_multimodal_items_parameter(
+    items: &[Value],
+    root: &str,
+) -> Option<(String, &'static str, &'static str)> {
+    for (item_index, item) in items.iter().enumerate() {
+        let (content, base) = if matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call_output" | "custom_tool_call_output")
+        ) {
+            (
+                item.get("output").and_then(Value::as_array),
+                format!("{root}[{item_index}].output"),
+            )
+        } else {
+            (
+                item.get("content").and_then(Value::as_array),
+                format!("{root}[{item_index}].content"),
+            )
+        };
+        let Some(content) = content else {
+            continue;
+        };
+        for (content_index, part) in content.iter().enumerate() {
+            let Some(part) = part.as_object() else {
+                continue;
+            };
+            let part_path = format!("{base}[{content_index}]");
+            match part.get("type").and_then(Value::as_str) {
+                Some("input_image") => {
+                    if let Some(image_url) = part.get("image_url")
+                        && !image_url.is_null()
+                    {
+                        match image_url {
+                            Value::String(_) => {}
+                            Value::Object(image_url) => match image_url.get("url") {
+                                Some(Value::String(_)) => {}
+                                Some(_) => {
+                                    return Some((
+                                        format!("{part_path}.image_url.url"),
+                                        "invalid_type",
+                                        "image_url.url must be a string",
+                                    ));
+                                }
+                                None => {
+                                    return Some((
+                                        format!("{part_path}.image_url.url"),
+                                        "missing_required_parameter",
+                                        "image_url.url is required",
+                                    ));
+                                }
+                            },
+                            _ => {
+                                return Some((
+                                    format!("{part_path}.image_url"),
+                                    "invalid_type",
+                                    "image_url must be a string",
+                                ));
+                            }
+                        }
+                    }
+                    for field in ["file_id", "detail"] {
+                        if part
+                            .get(field)
+                            .is_some_and(|value| !value.is_null() && !value.is_string())
+                        {
+                            return Some((
+                                format!("{part_path}.{field}"),
+                                "invalid_type",
+                                "image input fields must be strings",
+                            ));
+                        }
+                    }
+                }
+                Some("input_file") => {
+                    for field in ["file_id", "file_url", "filename", "file_data"] {
+                        if part
+                            .get(field)
+                            .is_some_and(|value| !value.is_null() && !value.is_string())
+                        {
+                            return Some((
+                                format!("{part_path}.{field}"),
+                                "invalid_type",
+                                "file input fields must be strings",
+                            ));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+fn known_unsupported_responses_variant(value: &Value) -> Option<String> {
+    // These Chat Completions spellings would otherwise fall through the
+    // flattened vendor-extension map and collide with fields the canonical
+    // lowering owns.  Vendor extensions remain accepted, but a client may not
+    // smuggle a second model/messages/token/tool/stream control onto the
+    // upstream wire.
+    const COLLIDING_TOP_LEVEL_FIELDS: &[&str] = &[
+        "audio",
+        "logit_bias",
+        "logprobs",
+        "max_completion_tokens",
+        "max_tokens",
+        "messages",
+        "modalities",
+        "n",
+        "reasoning_effort",
+        "response_format",
+        "seed",
+        "stream_options",
+        "user",
+        crate::responses_capabilities::ENFORCE_EXTENSION,
+        crate::responses_capabilities::FORWARD_PROMPT_CACHE_KEY_EXTENSION,
+        crate::responses_capabilities::PROMPT_CACHE_AFFINITY_EXTENSION,
+    ];
+    const HOSTED_TOOLS: &[&str] = &[
+        "code_interpreter",
+        "computer_use",
+        "computer_use_preview",
+        "file_search",
+        "mcp",
+    ];
+    const HOSTED_ITEMS: &[&str] = &[
+        "code_interpreter_call",
+        "computer_call",
+        "computer_call_output",
+        "file_search_call",
+        "mcp_approval_request",
+        "mcp_approval_response",
+        "mcp_call",
+        "mcp_list_tools",
+    ];
+    if let Some(object) = value.as_object()
+        && let Some(field) = COLLIDING_TOP_LEVEL_FIELDS
+            .iter()
+            .find(|field| object.contains_key(**field))
+    {
+        return Some((*field).to_string());
+    }
+    if let Some(tools) = value.get("tools").and_then(Value::as_array) {
+        for (index, tool) in tools.iter().enumerate() {
+            if tool
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| HOSTED_TOOLS.contains(&kind))
+            {
+                return Some(format!("tools[{index}].type"));
+            }
+        }
+    }
+    for (root, items) in ["instructions", "input"]
+        .into_iter()
+        .filter_map(|root| value.get(root)?.as_array().map(|items| (root, items)))
+    {
+        for (item_index, item) in items.iter().enumerate() {
+            if item
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| HOSTED_ITEMS.contains(&kind))
+            {
+                return Some(format!("{root}[{item_index}].type"));
+            }
+            let item_type = item.get("type").and_then(Value::as_str);
+            let (content, content_path) = if matches!(
+                item_type,
+                Some("function_call_output" | "custom_tool_call_output")
+            ) {
+                (
+                    item.get("output").and_then(Value::as_array),
+                    format!("{root}[{item_index}].output"),
+                )
+            } else {
+                (
+                    item.get("content").and_then(Value::as_array),
+                    format!("{root}[{item_index}].content"),
+                )
+            };
+            if let Some(content) = content {
+                for (content_index, part) in content.iter().enumerate() {
+                    if part.get("type").and_then(Value::as_str) == Some("input_audio") {
+                        return Some(format!("{content_path}[{content_index}].type"));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn content_type_is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|mime| {
+            mime.eq_ignore_ascii_case("application/json")
+                || mime.to_ascii_lowercase().ends_with("+json")
+        })
 }
 
 async fn post_messages(
@@ -1441,9 +1757,8 @@ async fn post_count_tokens(State(gateway): State<Arc<Gateway>>, body: Bytes) -> 
     let request: AnthropicRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(err) => {
-            return anthropic_error_response(AppError::bad_request(format!(
-                "invalid request body: {err}"
-            )));
+            tracing::debug!(error = %err, "invalid Anthropic count_tokens request body");
+            return anthropic_error_response(AppError::bad_request("invalid request body"));
         }
     };
     match handle_count_tokens(gateway, request).await {
@@ -1564,7 +1879,10 @@ async fn post_completions(
         .upstream_client()
         .proxy_completions(headers, body)
         .await?;
-    Ok(proxy_upstream_response(response))
+    Ok(proxy_upstream_response(
+        response,
+        gateway.config().request_timeout,
+    ))
 }
 
 /// Raw Prometheus passthrough from the first configured primary backend. This
@@ -1572,7 +1890,10 @@ async fn post_completions(
 /// gateway-owned rolling telemetry rather than backend engine exposition.
 async fn get_metrics(State(gateway): State<Arc<Gateway>>) -> AppResult<Response> {
     let response = gateway.upstream_client().proxy_metrics().await?;
-    Ok(proxy_upstream_response(response))
+    Ok(proxy_upstream_response(
+        response,
+        gateway.config().request_timeout,
+    ))
 }
 
 async fn handle_post_messages(
@@ -2068,15 +2389,36 @@ fn stream_anthropic_response(
     Ok(response)
 }
 
-fn proxy_upstream_response(response: reqwest::Response) -> Response {
+fn proxy_upstream_response(response: reqwest::Response, idle_timeout: Duration) -> Response {
+    let idle_timeout = idle_timeout.max(Duration::from_millis(1));
     let status = response.status();
     let upstream_headers = response.headers().clone();
     let mut builder = Response::builder().status(status);
     if let Some(headers) = builder.headers_mut() {
         copy_proxy_response_headers(&upstream_headers, headers);
     }
+    let mut upstream_body = Box::pin(response.bytes_stream());
+    let body = async_stream::stream! {
+        loop {
+            match tokio::time::timeout(idle_timeout, upstream_body.next()).await {
+                Ok(Some(Ok(bytes))) => yield Ok::<_, std::io::Error>(bytes),
+                Ok(Some(Err(_))) => {
+                    yield Err(std::io::Error::other("upstream response body read failed"));
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    yield Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "upstream response body idle timeout",
+                    ));
+                    break;
+                }
+            }
+        }
+    };
     builder
-        .body(Body::from_stream(response.bytes_stream()))
+        .body(Body::from_stream(body))
         .expect("valid upstream proxy response")
 }
 
@@ -2089,7 +2431,24 @@ fn copy_proxy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
 }
 
 fn should_proxy_response_header(name: &HeaderName) -> bool {
-    !is_hop_by_hop_header(name) && !header_name_eq(name, "content-length")
+    let name = name.as_str();
+    matches!(
+        name,
+        "content-type"
+            | "content-encoding"
+            | "content-language"
+            | "cache-control"
+            | "etag"
+            | "last-modified"
+            | "expires"
+            | "retry-after"
+            | "request-id"
+            | "x-request-id"
+            | "openai-request-id"
+            | "openai-processing-ms"
+            | "x-should-retry"
+    ) || name.starts_with("x-ratelimit-")
+        || name.starts_with("ratelimit-")
 }
 
 /// CR1.1: `engine.rs::created_event` stamps `estimated_input_tokens` onto the
@@ -2107,26 +2466,259 @@ fn should_proxy_response_header(name: &HeaderName) -> bool {
 /// ever carry the field (`response.in_progress` reuses the same `ResponseStub`
 /// struct but always passes `None`, which `skip_serializing_if` already
 /// omits) -- so every other event is serialized untouched with no clone.
+#[cfg(test)]
 fn responses_wire_event_data(event: &crate::engine::SseEvent) -> String {
-    if event.event != "response.created" {
-        return event.data.to_string();
-    }
+    responses_wire_event_data_inner(event, None, false, false)
+}
+
+fn responses_wire_event_data_with_sequence(
+    event: &crate::engine::SseEvent,
+    sequence_number: usize,
+    expose_encrypted_reasoning: bool,
+    expose_reasoning_summary: bool,
+) -> String {
+    responses_wire_event_data_inner(
+        event,
+        Some(sequence_number),
+        expose_encrypted_reasoning,
+        expose_reasoning_summary,
+    )
+}
+
+fn responses_wire_event_data_inner(
+    event: &crate::engine::SseEvent,
+    sequence_number: Option<usize>,
+    expose_encrypted_reasoning: bool,
+    expose_reasoning_summary: bool,
+) -> String {
     let mut data = event.data.clone();
-    if let Some(response) = data.get_mut("response").and_then(Value::as_object_mut) {
-        response.remove("estimated_input_tokens");
+    let mut item_status = None;
+    if let Some(object) = data.as_object_mut() {
+        item_status = object
+            .remove("llmconduit_item_status")
+            .and_then(|value| value.as_str().map(ToString::to_string));
+        if let Some(sequence_number) = sequence_number {
+            object.insert(
+                "sequence_number".to_string(),
+                Value::from(sequence_number as u64),
+            );
+        }
+        if event.event == "response.function_call_arguments.delta" {
+            // Canonical converters use these compatibility fields, but the
+            // public Responses events identify the call by item_id/index.
+            object.remove("call_id");
+            object.remove("name");
+        } else if event.event == "response.function_call_arguments.done" {
+            // The official done event retains the resolved function name.
+            object.remove("call_id");
+        }
+    }
+    if let Some(response) = data.get_mut("response") {
+        normalize_response_resource_for_wire(
+            response,
+            expose_encrypted_reasoning,
+            expose_reasoning_summary,
+        );
+    }
+    if let Some(item) = data.get_mut("item") {
+        let status = if event.event == "response.output_item.added" {
+            "in_progress"
+        } else {
+            item_status.as_deref().unwrap_or("completed")
+        };
+        normalize_response_item_for_wire(
+            item,
+            status,
+            expose_encrypted_reasoning,
+            expose_reasoning_summary,
+        );
+    }
+    if let Some(part) = data.get_mut("part") {
+        normalize_response_content_part_for_wire(part);
     }
     data.to_string()
 }
 
-fn stream_responses_response(stream: ReceiverStream<crate::engine::SseEvent>) -> Response {
-    let mapped = stream.map(|event| {
-        let data = responses_wire_event_data(&event);
-        Ok::<_, Infallible>(
-            axum::response::sse::Event::default()
-                .event(event.event)
-                .data(data),
-        )
-    });
+fn normalize_response_resource_for_wire(
+    response: &mut Value,
+    expose_encrypted_reasoning: bool,
+    expose_reasoning_summary: bool,
+) {
+    let Some(object) = response.as_object_mut() else {
+        return;
+    };
+    object.remove("estimated_input_tokens");
+    object.remove("terminal_reason");
+    object.remove("stop_sequence");
+    // The public Responses resource has a stable schema: nullable/defaulted
+    // properties remain present even when the permissive internal canonical
+    // representation omits them.
+    for field in [
+        "completed_at",
+        "conversation",
+        "error",
+        "incomplete_details",
+        "instructions",
+        "max_output_tokens",
+        "max_tool_calls",
+        "previous_response_id",
+        "prompt",
+        "prompt_cache_key",
+        "prompt_cache_retention",
+        "safety_identifier",
+        "service_tier",
+        "usage",
+        "user",
+    ] {
+        object.entry(field.to_string()).or_insert(Value::Null);
+    }
+    object
+        .entry("background".to_string())
+        .or_insert(Value::Bool(false));
+    object
+        .entry("parallel_tool_calls".to_string())
+        .or_insert(Value::Bool(false));
+    object
+        .entry("reasoning".to_string())
+        .or_insert_with(|| serde_json::json!({ "effort": null, "summary": null }));
+    object
+        .entry("temperature".to_string())
+        .or_insert_with(|| Value::from(1.0));
+    let text = object
+        .entry("text".to_string())
+        .or_insert_with(|| serde_json::json!({ "format": { "type": "text" } }));
+    if let Some(text) = text.as_object_mut() {
+        text.entry("format".to_string())
+            .or_insert_with(|| serde_json::json!({ "type": "text" }));
+    }
+    object
+        .entry("top_logprobs".to_string())
+        .or_insert_with(|| Value::from(0));
+    object
+        .entry("top_p".to_string())
+        .or_insert_with(|| Value::from(1.0));
+    object
+        .entry("truncation".to_string())
+        .or_insert_with(|| Value::String("disabled".to_string()));
+    object
+        .entry("metadata".to_string())
+        .or_insert_with(|| Value::Object(Default::default()));
+    let output_status = match object.get("status").and_then(Value::as_str) {
+        Some("failed" | "incomplete") => "incomplete",
+        _ => "completed",
+    };
+    if let Some(output) = object.get_mut("output").and_then(Value::as_array_mut) {
+        for item in output {
+            normalize_response_item_for_wire(
+                item,
+                output_status,
+                expose_encrypted_reasoning,
+                expose_reasoning_summary,
+            );
+        }
+    }
+}
+
+fn normalize_response_item_for_wire(
+    item: &mut Value,
+    status: &str,
+    expose_encrypted_reasoning: bool,
+    expose_reasoning_summary: bool,
+) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    // `custom_tool_call` has no public `status` member in the Responses
+    // resource schema. The permissive canonical model retains the legacy field
+    // for ingress compatibility, but raw Responses egress must omit it.
+    if object.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+        object.remove("status");
+    } else {
+        object.insert("status".to_string(), Value::String(status.to_string()));
+    }
+    if object.get("type").and_then(Value::as_str) == Some("local_shell_call")
+        && let Some(action) = object.get_mut("action").and_then(Value::as_object_mut)
+    {
+        action
+            .entry("env".to_string())
+            .or_insert_with(|| Value::Object(Default::default()));
+    }
+    object.remove("namespace");
+    // Opaque provider reasoning state is internal unless the caller explicitly
+    // requested the include and the selected provider declared passthrough.
+    // The current public projector is conservative; capability-aware opt-in is
+    // threaded by the handler before this field is ever re-enabled.
+    if !expose_encrypted_reasoning {
+        object.remove("encrypted_content");
+    }
+    if object.get("type").and_then(Value::as_str) == Some("reasoning") {
+        // `content` is provider-private reasoning/thinking. Only the separate,
+        // explicit safe-summary channel is ever eligible for public egress.
+        object.remove("content");
+        if !expose_reasoning_summary {
+            object.insert("summary".to_string(), Value::Array(Vec::new()));
+        }
+    }
+    if let Some(content) = object.get_mut("content").and_then(Value::as_array_mut) {
+        for part in content {
+            normalize_response_content_part_for_wire(part);
+        }
+    }
+}
+
+fn normalize_response_content_part_for_wire(part: &mut Value) {
+    let Some(part) = part.as_object_mut() else {
+        return;
+    };
+    if part.get("type").and_then(Value::as_str) == Some("output_text") {
+        part.entry("annotations".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        part.entry("logprobs".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+    }
+}
+
+fn is_public_responses_event(
+    event: &crate::engine::SseEvent,
+    expose_reasoning_summary: bool,
+) -> bool {
+    match event.event.as_str() {
+        "response.reasoning_text.delta"
+        | "response.reasoning_summary_text.signature_delta"
+        | "response.web_search_results" => false,
+        "response.reasoning_summary_part.added"
+        | "response.reasoning_summary_part.done"
+        | "response.reasoning_summary_text.delta"
+        | "response.reasoning_summary_text.done" => expose_reasoning_summary,
+        _ => true,
+    }
+}
+
+fn stream_responses_response(
+    stream: ReceiverStream<crate::engine::SseEvent>,
+    expose_encrypted_reasoning: bool,
+    expose_reasoning_summary: bool,
+) -> Response {
+    let mapped = stream
+        .filter_map(move |event| {
+            futures::future::ready(
+                is_public_responses_event(&event, expose_reasoning_summary).then_some(event),
+            )
+        })
+        .enumerate()
+        .map(move |(sequence_number, event)| {
+            let data = responses_wire_event_data_with_sequence(
+                &event,
+                sequence_number,
+                expose_encrypted_reasoning,
+                expose_reasoning_summary,
+            );
+            Ok::<_, Infallible>(
+                axum::response::sse::Event::default()
+                    .event(event.event)
+                    .data(data),
+            )
+        });
     let mut response = Sse::new(mapped)
         .keep_alive(axum::response::sse::KeepAlive::new())
         .into_response();
@@ -2146,6 +2738,8 @@ fn stream_responses_response(stream: ReceiverStream<crate::engine::SseEvent>) ->
 
 async fn collect_responses_response(
     stream: ReceiverStream<crate::engine::SseEvent>,
+    expose_encrypted_reasoning: bool,
+    expose_reasoning_summary: bool,
 ) -> AppResult<Response> {
     let mut final_payload: Option<Value> = None;
     let mut stream = std::pin::pin!(stream);
@@ -2176,7 +2770,14 @@ async fn collect_responses_response(
     }
 
     match final_payload {
-        Some(payload) => Ok(Json(payload).into_response()),
+        Some(mut payload) => {
+            normalize_response_resource_for_wire(
+                &mut payload,
+                expose_encrypted_reasoning,
+                expose_reasoning_summary,
+            );
+            Ok(Json(payload).into_response())
+        }
         None => Err(AppError::upstream(
             "stream ended before a final response resource was emitted",
         )),
@@ -2239,7 +2840,7 @@ fn anthropic_error_response(err: AppError) -> Response {
         "type": "error",
         "error": {
             "type": error_type,
-            "message": err.to_string(),
+            "message": err.client_message,
         }
     });
     (status, Json(body)).into_response()
@@ -2259,9 +2860,12 @@ async fn get_models(
 ) -> AppResult<Response> {
     let anthropic_models = is_anthropic_models_request(&headers);
     let response = gateway.upstream_client().list_models().await?;
-    let (status, body, etag) = collect_models_response(response).await?;
+    let (status, body, etag) =
+        collect_models_response(response, gateway.config().request_timeout).await?;
     let body = if anthropic_models {
         transform_models_response_for_anthropic(body, &query, gateway.config())?
+    } else if status.is_success() {
+        normalize_models_response_for_openai(body)
     } else {
         body
     };
@@ -2274,6 +2878,45 @@ async fn get_models(
         );
     }
     Ok((status, headers, Json(body)).into_response())
+}
+
+fn normalize_models_response_for_openai(body: Value) -> Value {
+    let data = extract_model_entries(&body)
+        .into_iter()
+        .filter_map(|entry| {
+            let id = model_id_from_value(&entry)?;
+            let mut object = entry.as_object().cloned().unwrap_or_default();
+            object.insert("id".to_string(), Value::String(id));
+            object.insert("object".to_string(), Value::String("model".to_string()));
+            if !object.get("created").is_some_and(Value::is_number) {
+                object.insert("created".to_string(), Value::from(0));
+            }
+            if !object.get("owned_by").is_some_and(Value::is_string) {
+                object.insert(
+                    "owned_by".to_string(),
+                    Value::String("llmconduit".to_string()),
+                );
+            }
+            Some(Value::Object(object))
+        })
+        .collect::<Vec<_>>();
+    let first_id = data
+        .first()
+        .and_then(model_id_from_value)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    let last_id = data
+        .last()
+        .and_then(model_id_from_value)
+        .map(Value::String)
+        .unwrap_or(Value::Null);
+    serde_json::json!({
+        "object": "list",
+        "data": data,
+        "first_id": first_id,
+        "last_id": last_id,
+        "has_more": false,
+    })
 }
 
 fn is_anthropic_models_request(headers: &HeaderMap) -> bool {
@@ -2524,13 +3167,73 @@ fn model_id_from_value(model: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::CaptureSurface;
+    use super::anthropic_error_response;
     use super::body_log_fields;
+    use super::parse_responses_request;
+    use super::payload_logging_enabled;
     use super::responses_wire_event_data;
+    use super::responses_wire_event_data_inner;
     use super::should_proxy_response_header;
     use axum::body::Bytes;
     use axum::http::{HeaderName, StatusCode};
     use axum::response::IntoResponse as _;
+    use http_body_util::BodyExt as _;
     use sha2::Digest as _;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn anthropic_error_response_never_exposes_operator_diagnostics() {
+        let response = anthropic_error_response(crate::error::AppError::upstream(
+            "provider rejected request containing SENTINEL-UPSTREAM-SECRET",
+        ));
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect Anthropic error body")
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("Anthropic error is UTF-8 JSON");
+        assert!(body.contains("the upstream request failed"));
+        assert!(!body.contains("SENTINEL-UPSTREAM-SECRET"));
+    }
+
+    #[test]
+    fn api_payload_logging_is_metadata_only_by_default() {
+        assert!(!payload_logging_enabled(Default::default()));
+        assert!(payload_logging_enabled(
+            crate::config::LogBodyMode::RedactedPayload
+        ));
+    }
+
+    #[test]
+    fn responses_rejects_chat_field_collisions_but_keeps_vendor_extensions() {
+        for field in [
+            "messages",
+            "stream_options",
+            "max_completion_tokens",
+            "response_format",
+        ] {
+            let body = serde_json::json!({
+                "model": "m",
+                "input": "hello",
+                (field): {"attacker_controlled": true}
+            });
+            let error = parse_responses_request(&serde_json::to_vec(&body).unwrap())
+                .expect_err("Chat wire collision must be rejected");
+            assert_eq!(error.param.as_deref(), Some(field));
+            assert_eq!(error.code.as_deref(), Some("unsupported_parameter"));
+        }
+
+        let request = parse_responses_request(
+            br#"{"model":"m","input":"hello","vendor_affinity":{"region":"local"}}"#,
+        )
+        .expect("non-colliding vendor extension");
+        assert_eq!(
+            request.extra_body["vendor_affinity"],
+            serde_json::json!({"region":"local"})
+        );
+    }
 
     /// Finding 1: the inbound redaction produces IDENTICAL redacted output on the
     /// inline (small) and `spawn_blocking` (large) paths — a secret-bearing field and
@@ -2599,6 +3302,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn malformed_inbound_turn_capture_retains_only_hash_and_length() {
+        let body = br#"{"api_key":"sk-MALFORMED-LEAK","messages":["#;
+        let (model, captured) = super::redacted_inbound_section(body);
+        assert!(model.is_none());
+        let captured = String::from_utf8(captured).unwrap();
+        assert_eq!(
+            captured,
+            format!(
+                "[redacted: unparseable body {} bytes sha256={}]",
+                body.len(),
+                hex::encode(sha2::Sha256::digest(body))
+            )
+        );
+        assert!(!captured.contains("sk-MALFORMED-LEAK"));
+        assert!(!captured.contains("api_key"));
+    }
+
     /// F1 (Fable-fix, BLOCKING): the large-body `spawn_blocking` offload must be
     /// handed an OWNED `Vec` copy, NOT the Arc-backed `Bytes` (which would PIN the
     /// 256 MiB inbound middleware backing for the task's lifetime — AGENTS.md line
@@ -2654,16 +3375,28 @@ mod tests {
 
         // The login endpoint suppresses every body-derived field.
         assert!(
-            body_log_fields("/dashboard/login", &body).is_none(),
+            body_log_fields(
+                "/dashboard/login",
+                &body,
+                crate::config::LogBodyMode::Metadata,
+            )
+            .is_none(),
             "login body must produce no body-derived log fields (token oracle)"
         );
         // Logout is symmetric (bodyless, but the same path class).
-        assert!(body_log_fields("/dashboard/logout", &Bytes::new()).is_none());
+        assert!(
+            body_log_fields(
+                "/dashboard/logout",
+                &Bytes::new(),
+                crate::config::LogBodyMode::Metadata,
+            )
+            .is_none()
+        );
 
         // A normal inference path still logs the length + digest + summary, and
         // that digest is over the body (never resembles the bare-token digest).
-        let normal =
-            body_log_fields("/v1/messages", &body).expect("non-auth path logs body-derived fields");
+        let normal = body_log_fields("/v1/messages", &body, crate::config::LogBodyMode::Metadata)
+            .expect("non-auth path logs body-derived fields");
         assert_eq!(normal.bytes, body.len());
         assert_eq!(normal.sha256, body_sha);
         // Sanity: the body digest is not the standalone token digest, so even the
@@ -2702,21 +3435,99 @@ mod tests {
     }
 
     #[test]
-    fn response_direction_passes_representative_passthrough_header() {
-        let name = HeaderName::from_static("content-type");
-        assert!(should_proxy_response_header(&name));
+    fn response_direction_uses_narrow_safe_allowlist() {
+        for header in [
+            "content-type",
+            "content-encoding",
+            "cache-control",
+            "etag",
+            "retry-after",
+            "x-request-id",
+            "openai-request-id",
+            "x-ratelimit-limit-requests",
+            "x-ratelimit-remaining-tokens",
+            "ratelimit-reset",
+        ] {
+            let name = HeaderName::from_bytes(header.as_bytes()).unwrap();
+            assert!(
+                should_proxy_response_header(&name),
+                "safe response header {header} should be forwarded"
+            );
+        }
+        for header in [
+            "set-cookie",
+            "www-authenticate",
+            "server",
+            "x-internal-debug",
+            "x-powered-by",
+            "content-security-policy",
+        ] {
+            let name = HeaderName::from_bytes(header.as_bytes()).unwrap();
+            assert!(
+                !should_proxy_response_header(&name),
+                "non-allowlisted response header {header} must be stripped"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_proxy_body_enforces_idle_timeout_and_header_allowlist() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test upstream");
+        let address = listener.local_addr().expect("local address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept client");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/plain\r\n\
+                      X-Request-Id: req_safe\r\n\
+                      Set-Cookie: secret=session\r\n\
+                      Server: internal-engine\r\n\
+                      X-Internal-Debug: do-not-forward\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n\
+                      3\r\nabc\r\n",
+                )
+                .await
+                .expect("write headers and first chunk");
+            std::future::pending::<()>().await;
+        });
+
+        let upstream = reqwest::get(format!("http://{address}/metrics"))
+            .await
+            .expect("receive response headers");
+        let response = super::proxy_upstream_response(upstream, Duration::from_millis(30));
+        assert_eq!(response.headers()["content-type"], "text/plain");
+        assert_eq!(response.headers()["x-request-id"], "req_safe");
+        for denied in ["set-cookie", "server", "x-internal-debug"] {
+            assert!(
+                !response.headers().contains_key(denied),
+                "response leaked non-allowlisted header {denied}"
+            );
+        }
+
+        let collected =
+            tokio::time::timeout(Duration::from_millis(500), response.into_body().collect())
+                .await
+                .expect("proxy body timeout must terminate the downstream body");
+        assert!(
+            collected.is_err(),
+            "idle upstream body must surface a body error"
+        );
+        server.abort();
     }
 
     /// CR1.1: `response.created` is the only event that can carry the
     /// internal `estimated_input_tokens` hint (`engine.rs::created_event`
     /// stamps it there for the Anthropic egress's `handle_created` to read);
     /// the raw-forward `/v1/responses` egress must strip it before it reaches
-    /// the wire. The rest of the `response` object survives untouched, and a
-    /// different event carrying an incidentally-named field is passed through
-    /// byte-identical -- the strip is scoped to `response.created` only, not
-    /// a blanket key filter.
+    /// the wire. Every resource-bearing event also receives the stable public
+    /// null/default projection.
     #[test]
-    fn responses_wire_event_data_strips_estimate_from_created_only() {
+    fn responses_wire_event_data_strips_internal_hint_and_normalizes_resources() {
         let created = crate::engine::SseEvent {
             event: "response.created".to_string(),
             data: serde_json::json!({
@@ -2739,11 +3550,12 @@ mod tests {
                 "response": { "id": "resp_1" }
             }),
         };
-        assert_eq!(
-            responses_wire_event_data(&other),
-            other.data.to_string(),
-            "non-created events must pass through untouched"
-        );
+        let projected: serde_json::Value =
+            serde_json::from_str(&responses_wire_event_data(&other)).expect("valid json");
+        assert_eq!(projected["response"]["id"], "resp_1");
+        assert_eq!(projected["response"]["parallel_tool_calls"], false);
+        assert_eq!(projected["response"]["truncation"], "disabled");
+        assert!(projected["response"].get("usage").is_some());
     }
 
     /// Defensive: a `response.created` event with no `response` object at all
@@ -2756,6 +3568,34 @@ mod tests {
             data: serde_json::json!({ "type": "response.created" }),
         };
         assert_eq!(responses_wire_event_data(&event), event.data.to_string());
+    }
+
+    #[test]
+    fn responses_encrypted_reasoning_is_exposed_only_after_validated_include() {
+        let event = crate::engine::SseEvent {
+            event: "response.output_item.done".to_string(),
+            data: serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "summary": [],
+                    "encrypted_content": "opaque-provider-state"
+                }
+            }),
+        };
+        let hidden: serde_json::Value =
+            serde_json::from_str(&responses_wire_event_data_inner(&event, None, false, false))
+                .expect("hidden projection");
+        assert!(hidden["item"].get("encrypted_content").is_none());
+
+        let exposed: serde_json::Value =
+            serde_json::from_str(&responses_wire_event_data_inner(&event, None, true, false))
+                .expect("exposed projection");
+        assert_eq!(
+            exposed["item"]["encrypted_content"],
+            "opaque-provider-state"
+        );
     }
 
     #[test]

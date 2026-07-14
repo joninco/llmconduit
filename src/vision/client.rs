@@ -11,7 +11,7 @@
 use crate::config::Config;
 use crate::error::AppError;
 use crate::error::AppResult;
-use crate::redaction::redact_vision_text;
+use crate::redaction::redact_vision_text_with_literals;
 use async_trait::async_trait;
 use serde_json::Value;
 use serde_json::json;
@@ -161,33 +161,31 @@ impl VisionClient for ReqwestVisionClient {
             .json(&body)
             .send()
             .await
-            .map_err(|err| AppError::upstream(format!("vision request failed: {err}")))?;
+            .map_err(|_| AppError::upstream("vision request failed"))?;
         if !response.status().is_success() {
             let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            // The body becomes model-visible tool text AND is logged. A vision
-            // backend that echoes the submitted `data:image`/signed URL would
-            // otherwise re-inject raw image data into the next text-backend
-            // request and the logs (G4 review #3), so redact + cap it.
+            // The engine degrades this error into model-visible tool text. Do
+            // not retain or interpolate a provider-controlled body: it can echo
+            // an image locator or credential under a neutral field name that a
+            // key-based JSON redactor cannot identify.
             return Err(AppError::upstream(format!(
-                "vision backend failed with {status}: {}",
-                redact_vision_text(&text)
+                "vision backend returned HTTP {}",
+                status.as_u16()
             )));
         }
-        let payload: Value = response
-            .json()
-            .await
-            .map_err(|err| AppError::upstream(format!("invalid vision JSON: {err}")))?;
-        if let Some(error) = payload.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-                .unwrap_or_else(|| error.to_string());
-            return Err(AppError::upstream(format!(
-                "vision backend error: {}",
-                redact_vision_text(&message)
-            )));
+        let (body, truncated) =
+            crate::redaction::read_reqwest_body_capped(response, 4 * 1024 * 1024)
+                .await
+                .map_err(|_| AppError::upstream("failed to read vision response"))?;
+        if truncated {
+            return Err(AppError::upstream("vision response was too large"));
+        }
+        let payload: Value =
+            serde_json::from_slice(&body).map_err(|_| AppError::upstream("invalid vision JSON"))?;
+        if payload.get("error").is_some() {
+            return Err(AppError::upstream(
+                "vision backend returned an error payload",
+            ));
         }
         let text = payload
             .get("choices")
@@ -203,7 +201,10 @@ impl VisionClient for ReqwestVisionClient {
         // tool result or is logged. Redacting here makes EVERY VisionOutcome
         // safe regardless of caller (the engine injects + previews it).
         Ok(VisionOutcome {
-            text: redact_vision_text(&text),
+            text: redact_vision_text_with_literals(
+                &text,
+                request.images.iter().map(|image| image.image_url.as_str()),
+            ),
         })
     }
 }
@@ -212,6 +213,11 @@ impl VisionClient for ReqwestVisionClient {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     fn cache() -> ImageCache {
         ImageCache::new(100, std::time::Duration::from_secs(300))
@@ -287,5 +293,67 @@ mod tests {
         let prompt = user["content"][1]["text"].as_str().unwrap();
         assert!(prompt.contains("Task: describe"));
         assert!(prompt.contains("Context: ctx"));
+    }
+
+    #[tokio::test]
+    async fn vision_backend_never_echoes_neutral_error_bodies_or_image_locators() {
+        const IMAGE_SECRET: &str = "s3://private-bucket/image-secret-9bce";
+        const BODY_SECRET: &str = "vision-neutral-body-secret-44ef";
+
+        let failed = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(json!({
+                "message": format!("{BODY_SECRET} {IMAGE_SECRET}"),
+            })))
+            .mount(&failed)
+            .await;
+        let failed_config =
+            crate::config::Config::from_persisted(&crate::config::PersistedConfig {
+                vision_url: Some(format!("{}/v1/chat/completions", failed.uri())),
+                vision_model: Some("vision-model".to_string()),
+                ..crate::config::PersistedConfig::default()
+            })
+            .expect("failed-backend config");
+        let request = VisionRequest {
+            image_ids: vec!["1".to_string()],
+            task: "describe".to_string(),
+            context: None,
+            images: vec![img(IMAGE_SECRET)],
+        };
+        let error = ReqwestVisionClient::new(reqwest::Client::new(), &failed_config)
+            .analyze(&request)
+            .await
+            .expect_err("non-success response must fail");
+        assert_eq!(error.message, "vision backend returned HTTP 502");
+        assert!(!error.to_string().contains(BODY_SECRET));
+        assert!(!error.to_string().contains(IMAGE_SECRET));
+
+        let succeeded = MockServer::start().await;
+        let encoded_image_secret =
+            url::form_urlencoded::byte_serialize(IMAGE_SECRET.as_bytes()).collect::<String>();
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "choices": [{"message": {"content": format!(
+                    "The neutral content field echoed {IMAGE_SECRET} and {encoded_image_secret}"
+                )}}]
+            })))
+            .mount(&succeeded)
+            .await;
+        let success_config =
+            crate::config::Config::from_persisted(&crate::config::PersistedConfig {
+                vision_url: Some(format!("{}/v1/chat/completions", succeeded.uri())),
+                vision_model: Some("vision-model".to_string()),
+                ..crate::config::PersistedConfig::default()
+            })
+            .expect("success-backend config");
+        let outcome = ReqwestVisionClient::new(reqwest::Client::new(), &success_config)
+            .analyze(&request)
+            .await
+            .expect("vision outcome");
+        assert!(!outcome.text.contains(IMAGE_SECRET));
+        assert!(!outcome.text.contains(&encoded_image_secret));
+        assert!(outcome.text.contains("<redacted secret>"));
     }
 }

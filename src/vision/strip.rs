@@ -10,6 +10,7 @@
 //! [`ImageCache::strip_and_cache_images`] method that ties them together.
 
 use crate::models::responses::ContentItem;
+use crate::models::responses::FunctionCallOutputContent;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponsesRequest;
 use crate::models::responses::ToolSpec;
@@ -113,31 +114,81 @@ impl ImageCache {
             if role != "user" {
                 continue;
             }
-            for part in content.iter_mut() {
-                if let ContentItem::InputImage {
-                    image_url: Some(image_url),
-                    detail,
-                    ..
-                } = part
-                {
-                    let key = Self::image_key(session_id, &counter.to_string());
-                    self.store(
-                        session_id,
-                        key,
-                        CachedImage {
-                            image_url: std::mem::take(image_url),
-                            detail: detail.clone(),
-                        },
-                    );
-                    *part = ContentItem::InputText {
-                        text: image_placeholder_text(counter),
-                    };
-                    counter += 1;
-                }
-            }
+            self.strip_content_images(content, session_id, &mut counter);
         }
         inject_analyze_image_tool(&mut request.tools);
         prepend_image_agent_system_prompt(request);
+    }
+
+    /// Raw Responses `input_image: agent` mode applies to every supported
+    /// content-bearing input item, including function output continuations.
+    /// Legacy Chat/Anthropic activation continues using the user-message-only
+    /// method above.
+    pub fn strip_and_cache_all_images(&self, request: &mut ResponsesRequest, session_id: &str) {
+        self.clear_session(session_id);
+        let mut counter = 1usize;
+        if let Some(items) = request.instructions.items_mut() {
+            self.strip_all_item_images(items, session_id, &mut counter);
+        }
+        self.strip_all_item_images(&mut request.input, session_id, &mut counter);
+        inject_analyze_image_tool(&mut request.tools);
+        prepend_image_agent_system_prompt(request);
+    }
+
+    fn strip_all_item_images(
+        &self,
+        items: &mut [ResponseItem],
+        session_id: &str,
+        counter: &mut usize,
+    ) {
+        for item in items {
+            match item {
+                ResponseItem::Message { content, .. } => {
+                    self.strip_content_images(content, session_id, counter);
+                }
+                ResponseItem::FunctionCallOutput {
+                    output: FunctionCallOutputContent::Content(content),
+                    ..
+                }
+                | ResponseItem::CustomToolCallOutput {
+                    output: FunctionCallOutputContent::Content(content),
+                    ..
+                } => {
+                    self.strip_content_images(content, session_id, counter);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn strip_content_images(
+        &self,
+        content: &mut [ContentItem],
+        session_id: &str,
+        counter: &mut usize,
+    ) {
+        for part in content {
+            if let ContentItem::InputImage {
+                image_url: Some(image_url),
+                detail,
+                ..
+            } = part
+            {
+                let key = Self::image_key(session_id, &counter.to_string());
+                self.store(
+                    session_id,
+                    key,
+                    CachedImage {
+                        image_url: std::mem::take(image_url),
+                        detail: detail.clone(),
+                    },
+                );
+                *part = ContentItem::InputText {
+                    text: image_placeholder_text(*counter),
+                };
+                *counter += 1;
+            }
+        }
     }
 }
 
@@ -192,11 +243,9 @@ pub fn tool_is_analyze_image(spec: &ToolSpec) -> bool {
 /// Prepend the image-agent instruction to `instructions` (the canonical home for
 /// system text), mirroring `apply_system_prompt_prefix`'s prepend convention.
 fn prepend_image_agent_system_prompt(request: &mut ResponsesRequest) {
-    request.instructions = if request.instructions.is_empty() {
-        IMAGE_AGENT_SYSTEM_PROMPT.to_string()
-    } else {
-        format!("{IMAGE_AGENT_SYSTEM_PROMPT}\n\n{}", request.instructions)
-    };
+    request
+        .instructions
+        .prepend_system_text(IMAGE_AGENT_SYSTEM_PROMPT.to_string());
 }
 
 /// Whether the LATEST user message in the canonical input carries at least one
@@ -216,6 +265,42 @@ pub fn latest_user_message_has_images(input: &[ResponseItem]) -> bool {
             } if !url.is_empty()
         )
     })
+}
+
+/// Raw Responses agent-mode activation includes function outputs and messages
+/// of every accepted role. File-id-only images intentionally remain residual:
+/// the image agent requires a URL and the final safety pass rejects them.
+pub fn has_agent_images(input: &[ResponseItem]) -> bool {
+    input.iter().any(|item| {
+        let content = match item {
+            ResponseItem::Message { content, .. } => content.as_slice(),
+            ResponseItem::FunctionCallOutput {
+                output: FunctionCallOutputContent::Content(content),
+                ..
+            }
+            | ResponseItem::CustomToolCallOutput {
+                output: FunctionCallOutputContent::Content(content),
+                ..
+            } => content.as_slice(),
+            _ => return false,
+        };
+        content.iter().any(|part| {
+            matches!(
+                part,
+                ContentItem::InputImage {
+                    image_url: Some(url),
+                    ..
+                } if !url.is_empty()
+            )
+        })
+    })
+}
+
+/// Raw Responses agent-mode scan across both structured instructions and
+/// ordinary input. Legacy ingress has only string instructions and continues
+/// using its established input-only activation policy.
+pub fn request_has_agent_images(request: &ResponsesRequest) -> bool {
+    request.instructions.items().is_some_and(has_agent_images) || has_agent_images(&request.input)
 }
 
 fn latest_user_message_content(input: &[ResponseItem]) -> Option<&[ContentItem]> {
@@ -303,6 +388,14 @@ fn message_follows_tool_output(input: &[ResponseItem], index: usize) -> bool {
 pub fn has_residual_images(input: &[ResponseItem]) -> bool {
     input.iter().any(|item| match item {
         ResponseItem::Message { content, .. } => content.iter().any(is_residual_input_image),
+        ResponseItem::FunctionCallOutput {
+            output: FunctionCallOutputContent::Content(content),
+            ..
+        }
+        | ResponseItem::CustomToolCallOutput {
+            output: FunctionCallOutputContent::Content(content),
+            ..
+        } => content.iter().any(is_residual_input_image),
         _ => false,
     })
 }
@@ -328,8 +421,28 @@ pub fn degrade_residual_images(input: &mut [ResponseItem]) -> usize {
         .collect();
     let mut degraded = 0usize;
     for (index, item) in input.iter_mut().enumerate() {
-        let ResponseItem::Message { content, .. } = item else {
-            continue;
+        let (content, placeholder) = match item {
+            ResponseItem::Message { content, .. } => {
+                let count = content
+                    .iter()
+                    .filter(|part| is_residual_input_image(part))
+                    .count();
+                let placeholder = if follows_tool_output[index] {
+                    RESIDUAL_TOOL_IMAGE_PLACEHOLDER.to_string()
+                } else {
+                    residual_user_image_placeholder_text(count)
+                };
+                (content, placeholder)
+            }
+            ResponseItem::FunctionCallOutput {
+                output: FunctionCallOutputContent::Content(content),
+                ..
+            }
+            | ResponseItem::CustomToolCallOutput {
+                output: FunctionCallOutputContent::Content(content),
+                ..
+            } => (content, RESIDUAL_TOOL_IMAGE_PLACEHOLDER.to_string()),
+            _ => continue,
         };
         // Wire-order count for THIS message, taken before any replacement so
         // `{n}` reflects the message's true original image count.
@@ -340,11 +453,6 @@ pub fn degrade_residual_images(input: &mut [ResponseItem]) -> usize {
         if count == 0 {
             continue;
         }
-        let placeholder = if follows_tool_output[index] {
-            RESIDUAL_TOOL_IMAGE_PLACEHOLDER.to_string()
-        } else {
-            residual_user_image_placeholder_text(count)
-        };
         for part in content.iter_mut() {
             if is_residual_input_image(part) {
                 *part = ContentItem::InputText {
@@ -476,7 +584,11 @@ mod tests {
         let cache = cache();
         let mut req = base_request(vec![user_with(vec![input_image("data:img")])]);
         cache.strip_and_cache_images(&mut req, "sess");
-        assert!(req.instructions.starts_with(IMAGE_AGENT_SYSTEM_PROMPT));
+        assert!(
+            req.instructions
+                .text()
+                .is_some_and(|text| text.starts_with(IMAGE_AGENT_SYSTEM_PROMPT))
+        );
         let analyze_count = req
             .tools
             .iter()
@@ -489,10 +601,11 @@ mod tests {
     fn strip_preserves_existing_instructions() {
         let cache = cache();
         let mut req = base_request(vec![user_with(vec![input_image("data:img")])]);
-        req.instructions = "Be terse.".to_string();
+        req.instructions = "Be terse.".into();
         cache.strip_and_cache_images(&mut req, "sess");
-        assert!(req.instructions.starts_with(IMAGE_AGENT_SYSTEM_PROMPT));
-        assert!(req.instructions.ends_with("Be terse."));
+        let instructions = req.instructions.text().expect("text instructions");
+        assert!(instructions.starts_with(IMAGE_AGENT_SYSTEM_PROMPT));
+        assert!(instructions.ends_with("Be terse."));
     }
 
     #[test]
@@ -712,7 +825,7 @@ mod tests {
     fn tool_output(call_id: &str) -> ResponseItem {
         ResponseItem::FunctionCallOutput {
             call_id: call_id.to_string(),
-            output: serde_json::json!("[image returned]"),
+            output: serde_json::json!("[image returned]").into(),
         }
     }
 

@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod api_auth;
 pub mod backend_metrics;
 pub mod cli;
 pub mod config;
@@ -17,11 +18,12 @@ pub mod log_rotation;
 pub mod metrics;
 pub mod models;
 pub mod monitor;
-pub(crate) mod proxy_headers;
 pub mod raw;
 pub(crate) mod redaction;
 pub mod replay;
 pub mod request_log;
+pub mod response_store;
+pub mod responses_capabilities;
 pub mod search;
 pub(crate) mod sse_guard;
 /// Crate-internal, test-only peak-allocation probe (the crate's single
@@ -53,7 +55,7 @@ pub const VERSION: &str = concat!(
     ")"
 );
 
-use crate::config::Config;
+use crate::config::{Config, ResponseStoreBackend};
 use crate::engine::Gateway;
 use crate::http::RouterOptions;
 use crate::http::build_router;
@@ -102,7 +104,32 @@ pub fn build_app_with_gateway_and_options(
         .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
         .build()
         .expect("reqwest client");
-    let replay_store = ReplayStore::new(config.max_replay_entries);
+    let replay_store = ReplayStore::new(config.replay.max_entries);
+    let response_store: Arc<dyn crate::response_store::ResponseStore> =
+        match config.response_store.backend {
+            ResponseStoreBackend::Memory => {
+                Arc::new(crate::response_store::ResponseStoreHandle::memory(
+                    config.response_store.max_entries,
+                    config.response_store.retention_hours,
+                ))
+            }
+            ResponseStoreBackend::Sqlite => Arc::new(
+                crate::response_store::ResponseStoreHandle::sqlite(
+                    config
+                        .response_store
+                        .path
+                        .clone()
+                        .expect("validated sqlite response_store.path"),
+                    config.response_store.max_entries,
+                    config.response_store.retention_hours,
+                )
+                .unwrap_or_else(|error| panic!("failed to initialize response store: {error}")),
+            ),
+        };
+    let replay_enabled = config.replay.enabled;
+    let api_auth =
+        crate::api_auth::ApiAuth::from_env(&crate::api_auth::ApiAuthEnv::from_process_env())
+            .map(Arc::new);
     let monitor = if options.with_debug_ui {
         MonitorHub::new(512)
     } else {
@@ -164,6 +191,8 @@ pub fn build_app_with_gateway_and_options(
     let flatten_content = config.flatten_content;
     let min_completion_tokens = config.min_completion_tokens;
     let max_sse_frame_bytes = config.max_sse_frame_bytes;
+    let request_timeout = config.request_timeout;
+    let upstream_request_log_body_mode = config.upstream_request_log_body_mode;
     let make_upstream_client =
         |base_url: url::Url, api_key: Option<String>, log_path: Option<std::path::PathBuf>| {
             ReqwestUpstreamClient::with_options(
@@ -176,6 +205,8 @@ pub fn build_app_with_gateway_and_options(
                 max_sse_frame_bytes,
             )
             .with_finalization_policies(finalization_policies.clone())
+            .with_request_timeout(request_timeout)
+            .with_request_log_body_mode(upstream_request_log_body_mode)
             // D2: every leaf shares the dashboard FlowStore handle (a cheap `Clone`
             // of the inner `Arc<Mutex>`; `disabled()` no-ops when the debug UI is
             // off) so the single point that sees the on-wire body can capture it.
@@ -190,6 +221,9 @@ pub fn build_app_with_gateway_and_options(
                     provider.upstream_base_url.clone(),
                     provider.upstream_api_key.clone(),
                     provider.upstream_request_log_path.clone(),
+                )
+                .with_responses_capabilities(
+                    provider.responses_capabilities.clone().unwrap_or_default(),
                 );
                 let fallback_providers = provider
                     .fallback_upstreams
@@ -201,6 +235,9 @@ pub fn build_app_with_gateway_and_options(
                                 fallback.upstream_base_url.clone(),
                                 fallback.upstream_api_key.clone(),
                                 fallback.upstream_request_log_path.clone(),
+                            )
+                            .with_responses_capabilities(
+                                fallback.responses_capabilities.clone().unwrap_or_default(),
                             ),
                             fallback.upstream_model.clone(),
                             fallback.exposed_model.clone(),
@@ -273,6 +310,9 @@ pub fn build_app_with_gateway_and_options(
                         provider.upstream_base_url.clone(),
                         provider.upstream_api_key.clone(),
                         provider.upstream_request_log_path.clone(),
+                    )
+                    .with_responses_capabilities(
+                        provider.responses_capabilities.clone().unwrap_or_default(),
                     ),
                     provider.upstream_model.clone(),
                     provider.exposed_model.clone(),
@@ -328,6 +368,9 @@ pub fn build_app_with_gateway_and_options(
             flow_store,
         )
         .with_dashboard_auth(dashboard_auth)
+        .with_api_auth(api_auth)
+        .with_response_store(response_store)
+        .with_replay_enabled(replay_enabled)
         .with_metrics(metrics)
         .with_turn_capture(turn_capture)
         .with_dashboard_history(dashboard_history),

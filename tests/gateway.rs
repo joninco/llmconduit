@@ -20,6 +20,7 @@ use llmconduit::models::chat::PromptTokensDetails;
 use llmconduit::models::responses::ContentItem;
 use llmconduit::models::responses::NamespaceToolSpec;
 use llmconduit::models::responses::ReasoningSummaryItem;
+use llmconduit::models::responses::ResponseInstructions;
 use llmconduit::models::responses::ResponseItem;
 use llmconduit::models::responses::ResponsesRequest;
 use llmconduit::models::responses::ToolSpec;
@@ -70,14 +71,17 @@ struct MockUpstream {
     /// SAME profile kwargs the production leaf would (T1). Empty by default
     /// (most tests don't assert kwargs).
     finalization_policies: Arc<StdMutex<llmconduit::upstream::BackendFinalizationPolicies>>,
+    responses_capabilities:
+        Arc<StdMutex<llmconduit::responses_capabilities::ResponsesCapabilities>>,
     token_count: Arc<Mutex<Option<u64>>>,
 }
 
 impl MockUpstream {
     async fn push_response(
         &self,
-        chunks: Vec<Result<ChatCompletionChunk, llmconduit::error::AppError>>,
+        mut chunks: Vec<Result<ChatCompletionChunk, llmconduit::error::AppError>>,
     ) {
+        append_test_stop_if_needed(&mut chunks);
         self.responses.lock().await.push_back(chunks);
     }
 
@@ -93,6 +97,16 @@ impl MockUpstream {
         policies: llmconduit::upstream::BackendFinalizationPolicies,
     ) {
         *self.finalization_policies.lock().expect("policies lock") = policies;
+    }
+
+    fn set_responses_capabilities(
+        &self,
+        capabilities: llmconduit::responses_capabilities::ResponsesCapabilities,
+    ) {
+        *self
+            .responses_capabilities
+            .lock()
+            .expect("capabilities lock") = capabilities;
     }
 
     async fn requests(&self) -> Vec<ChatCompletionRequest> {
@@ -121,6 +135,32 @@ impl MockUpstream {
     async fn supported_model_queries(&self) -> usize {
         *self.supported_model_queries.lock().await
     }
+}
+
+fn append_test_stop_if_needed(
+    chunks: &mut Vec<Result<ChatCompletionChunk, llmconduit::error::AppError>>,
+) {
+    if chunks.iter().any(Result::is_err)
+        || chunks
+            .iter()
+            .filter_map(|chunk| chunk.as_ref().ok())
+            .any(|chunk| {
+                chunk
+                    .choices
+                    .iter()
+                    .any(|choice| choice.finish_reason.is_some())
+            })
+    {
+        return;
+    }
+    let Some(id) = chunks
+        .iter()
+        .rev()
+        .find_map(|chunk| chunk.as_ref().ok().map(|chunk| chunk.id.clone()))
+    else {
+        return;
+    };
+    chunks.push(Ok(finish_chunk(&id, "stop")));
 }
 
 #[async_trait]
@@ -192,6 +232,25 @@ impl UpstreamClient for MockUpstream {
                     .map(|(_, limit)| *limit),
             })
             .collect())
+    }
+
+    async fn responses_capability_plan(
+        &self,
+        requested_model: &str,
+    ) -> llmconduit::responses_capabilities::CapabilityPlan {
+        llmconduit::responses_capabilities::CapabilityPlan {
+            candidates: vec![llmconduit::responses_capabilities::CapabilityCandidate {
+                target: llmconduit::responses_capabilities::CapabilityTarget {
+                    provider: "primary".to_string(),
+                    model: requested_model.to_string(),
+                },
+                capabilities: self
+                    .responses_capabilities
+                    .lock()
+                    .expect("capabilities lock")
+                    .clone(),
+            }],
+        }
     }
 }
 
@@ -387,6 +446,7 @@ impl UpstreamClient for FloodThenParkUpstream {
 #[derive(Clone, Default)]
 struct MockSearch {
     queries: Arc<Mutex<Vec<String>>>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 #[async_trait]
@@ -396,6 +456,9 @@ impl SearchClient for MockSearch {
         query: &str,
     ) -> Result<llmconduit::search::SearchOutcome, llmconduit::error::AppError> {
         self.queries.lock().await.push(query.to_string());
+        if let Some(message) = self.failure.lock().await.clone() {
+            return Err(llmconduit::error::AppError::upstream(message));
+        }
         Ok(llmconduit::search::SearchOutcome {
             formatted: format!("Search result for {query}"),
             sources: vec![llmconduit::search::SearchSource {
@@ -403,6 +466,12 @@ impl SearchClient for MockSearch {
                 url: "https://example.com/result".to_string(),
             }],
         })
+    }
+}
+
+impl MockSearch {
+    async fn fail_with(&self, message: impl Into<String>) {
+        *self.failure.lock().await = Some(message.into());
     }
 }
 
@@ -421,7 +490,7 @@ async fn streams_function_call_turn() {
 
     let request = ResponsesRequest {
         model: "glm-5.1".to_string(),
-        instructions: String::new(),
+        instructions: String::new().into(),
         input: vec![user_message("hello")],
         tools: vec![ToolSpec::Function {
             name: "echo".to_string(),
@@ -442,9 +511,10 @@ async fn streams_function_call_turn() {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_retention: None,
         text: None,
-        client_metadata: None,
         previous_response_id: None,
+        llmconduit_replay: None,
         temperature: None,
         top_p: None,
         max_output_tokens: None,
@@ -464,6 +534,7 @@ async fn streams_function_call_turn() {
         vec![
             "response.created",
             "response.in_progress",
+            "response.output_item.added",
             "response.function_call_arguments.delta",
             "response.function_call_arguments.done",
             "response.output_item.done",
@@ -481,6 +552,140 @@ async fn streams_function_call_turn() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].parallel_tool_calls, Some(true));
     assert_eq!(requests[0].tools.as_ref().map(Vec::len), Some(1));
+}
+
+#[tokio::test]
+async fn duplicate_semantic_function_calls_keep_distinct_ids_and_zero_mismatches() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(two_tool_call_chunk(
+            "chat-identity",
+            ("call_a", "echo"),
+            ("call_b", "echo"),
+            Some(r#"{"value":"same"}"#),
+        ))])
+        .await;
+    let gateway = test_gateway(upstream, MockSearch::default());
+
+    let mut request = base_request(vec![user_message("call echo twice")]);
+    request.tools = vec![ToolSpec::Function {
+        name: "echo".to_string(),
+        description: "Echo a value".to_string(),
+        strict: false,
+        parameters: json!({
+            "type": "object",
+            "properties": { "value": { "type": "string" } },
+            "required": ["value"]
+        }),
+    }];
+
+    let events = collect_stream(gateway.clone().stream_responses(request).await.unwrap()).await;
+    let call_ids = done_items(&events)
+        .into_iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCall { call_id, .. } => Some(call_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(call_ids, vec!["call_a", "call_b"]);
+
+    let counts = gateway.function_call_identity_counts();
+    assert_eq!(counts.len(), 1);
+    let snapshot = counts.values().next().copied().unwrap();
+    assert_eq!(snapshot.raw_upstream_calls, 2);
+    assert_eq!(snapshot.served_public_calls, 2);
+    assert_eq!(snapshot.hidden_calls, 0);
+    assert_eq!(snapshot.rejected_calls, 0);
+    assert_eq!(snapshot.identity_mismatches, 0);
+}
+
+#[tokio::test]
+async fn function_identity_counter_compares_raw_upstream_id_to_minted_public_id() {
+    let upstream = MockUpstream::default();
+    let mut chunk = tool_call_chunk(
+        "chat-missing-raw-id",
+        "placeholder-removed",
+        "echo",
+        r#"{"value":"hello"}"#,
+    );
+    chunk.choices[0]
+        .delta
+        .tool_calls
+        .as_mut()
+        .expect("tool calls")[0]
+        .id = None;
+    upstream.push_response(vec![Ok(chunk)]).await;
+    let gateway = test_gateway(upstream, MockSearch::default());
+
+    let mut request = base_request(vec![user_message("call echo")]);
+    request.tools = vec![ToolSpec::Function {
+        name: "echo".to_string(),
+        description: "Echo a value".to_string(),
+        strict: false,
+        parameters: json!({
+            "type": "object",
+            "properties": { "value": { "type": "string" } }
+        }),
+    }];
+
+    let events = collect_stream(gateway.clone().stream_responses(request).await.unwrap()).await;
+    let public_call_id = done_items(&events)
+        .into_iter()
+        .find_map(|item| match item {
+            ResponseItem::FunctionCall { call_id, .. } => Some(call_id),
+            _ => None,
+        })
+        .expect("served function call");
+    assert!(public_call_id.starts_with("call_"));
+    assert_ne!(public_call_id, "placeholder-removed");
+
+    let counts = gateway.function_call_identity_counts();
+    let snapshot = counts.values().next().copied().unwrap();
+    assert_eq!(snapshot.raw_upstream_calls, 1);
+    assert_eq!(snapshot.served_public_calls, 1);
+    assert_eq!(snapshot.identity_mismatches, 1);
+}
+
+#[tokio::test]
+async fn function_identity_counters_explain_tainted_and_rejected_calls() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(two_tool_call_chunk(
+            "chat-tainted",
+            ("call_valid", "echo"),
+            ("call_rejected", "unoffered"),
+            None,
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-repaired", "recovered"))])
+        .await;
+    let gateway = test_gateway(upstream, MockSearch::default());
+
+    let mut request = base_request(vec![user_message("repair an invalid tool batch")]);
+    request.tools = vec![ToolSpec::Function {
+        name: "echo".to_string(),
+        description: "Echo a value".to_string(),
+        strict: false,
+        parameters: json!({ "type": "object" }),
+    }];
+
+    let events = collect_stream(gateway.clone().stream_responses(request).await.unwrap()).await;
+    assert!(
+        done_items(&events)
+            .iter()
+            .all(|item| !matches!(item, ResponseItem::FunctionCall { .. })),
+        "the valid sibling in a rejected batch is intentionally hidden"
+    );
+
+    let counts = gateway.function_call_identity_counts();
+    assert_eq!(counts.len(), 1);
+    let snapshot = counts.values().next().copied().unwrap();
+    assert_eq!(snapshot.raw_upstream_calls, 2);
+    assert_eq!(snapshot.served_public_calls, 0);
+    assert_eq!(snapshot.hidden_calls, 1);
+    assert_eq!(snapshot.rejected_calls, 1);
+    assert_eq!(snapshot.identity_mismatches, 0);
 }
 
 #[tokio::test]
@@ -537,6 +742,7 @@ async fn streams_legacy_function_call_turn() {
         vec![
             "response.created",
             "response.in_progress",
+            "response.output_item.added",
             "response.function_call_arguments.delta",
             "response.function_call_arguments.done",
             "response.output_item.done",
@@ -575,7 +781,7 @@ async fn flattens_namespace_tools_for_upstream_and_preserves_namespace_in_output
 
     let request = ResponsesRequest {
         model: "glm-5.1".to_string(),
-        instructions: String::new(),
+        instructions: String::new().into(),
         input: vec![user_message("what's on my calendar?")],
         tools: vec![ToolSpec::Namespace {
             name: "mcp__calendar".to_string(),
@@ -600,9 +806,10 @@ async fn flattens_namespace_tools_for_upstream_and_preserves_namespace_in_output
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_retention: None,
         text: None,
-        client_metadata: None,
         previous_response_id: None,
+        llmconduit_replay: None,
         temperature: None,
         top_p: None,
         max_output_tokens: None,
@@ -660,11 +867,14 @@ async fn uses_configured_upstream_model_override() {
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
+            api_log_body_mode: Default::default(),
+            upstream_request_log_body_mode: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
+            responses_capabilities: Default::default(),
             model_routes: Vec::new(),
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -675,6 +885,8 @@ async fn uses_configured_upstream_model_override() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: Default::default(),
+            replay: Default::default(),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -689,13 +901,16 @@ async fn uses_configured_upstream_model_override() {
         },
     );
 
-    let _ = collect_stream(
-        gateway
-            .stream_responses(base_request(vec![user_message("hello")]))
-            .await
-            .expect("stream"),
-    )
-    .await;
+    let mut request = base_request(vec![user_message("hello")]);
+    request.instructions = ResponseInstructions::Items(vec![ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "Caller instruction.".to_string(),
+        }],
+        phase: None,
+    }]);
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
@@ -749,11 +964,14 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
+            api_log_body_mode: Default::default(),
+            upstream_request_log_body_mode: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
+            responses_capabilities: Default::default(),
             model_routes: Vec::new(),
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -764,6 +982,8 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: Default::default(),
+            replay: Default::default(),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -829,6 +1049,31 @@ async fn reuses_cached_upstream_model_catalog_across_requests() {
     assert_eq!(requests[0].model, "glm-5.1");
     assert_eq!(requests[1].model, "glm-5.1");
     assert_eq!(upstream.supported_model_queries().await, 1);
+}
+
+#[tokio::test]
+async fn concurrent_model_catalog_misses_are_single_flight() {
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["glm-5.1"]).await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let gateway = Arc::clone(&gateway);
+        tasks.push(tokio::spawn(async move {
+            gateway.resolve_request_model("GLM 5 1").await
+        }));
+    }
+    for task in tasks {
+        let (model, genuine) = task.await.expect("catalog resolver task");
+        assert_eq!(model, "glm-5.1");
+        assert!(genuine);
+    }
+    assert_eq!(
+        upstream.supported_model_queries().await,
+        1,
+        "an empty cache must trigger exactly one upstream refresh"
+    );
 }
 
 #[tokio::test]
@@ -944,11 +1189,17 @@ async fn responses_stream_events_include_item_identity_and_generated_output_only
 
     let reasoning_delta = events
         .iter()
-        .find(|event| event["_event"] == "response.reasoning_summary_text.delta")
+        .find(|event| event["_event"] == "response.reasoning_text.delta")
         .expect("reasoning delta");
     assert_eq!(reasoning_delta["item_id"], reasoning_id);
     assert_eq!(reasoning_delta["output_index"], 0);
     assert_eq!(reasoning_delta["summary_index"], 0);
+    assert!(
+        events
+            .iter()
+            .all(|event| event["_event"] != "response.reasoning_summary_text.delta"),
+        "private reasoning must not be promoted to a safe summary channel"
+    );
 
     let message_added = events
         .iter()
@@ -992,7 +1243,7 @@ async fn responses_stream_events_include_item_identity_and_generated_output_only
 }
 
 #[tokio::test]
-async fn normalizes_developer_messages_to_system_for_upstream() {
+async fn preserves_developer_messages_for_upstream() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
@@ -1016,7 +1267,7 @@ async fn normalizes_developer_messages_to_system_for_upstream() {
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].messages.len(), 2);
-    assert_eq!(requests[0].messages[0].role, "system");
+    assert_eq!(requests[0].messages[0].role, "developer");
     assert_eq!(
         requests[0].messages[0]
             .content
@@ -1100,6 +1351,8 @@ async fn forwards_configured_upstream_chat_kwargs() {
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
+            api_log_body_mode: Default::default(),
+            upstream_request_log_body_mode: Default::default(),
             upstream_chat_kwargs: JsonMap::from_iter([(
                 "clear_thinking".to_string(),
                 json!(false),
@@ -1108,6 +1361,7 @@ async fn forwards_configured_upstream_chat_kwargs() {
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
+            responses_capabilities: Default::default(),
             model_routes: Vec::new(),
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -1118,6 +1372,8 @@ async fn forwards_configured_upstream_chat_kwargs() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: Default::default(),
+            replay: Default::default(),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -1165,6 +1421,8 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
+            api_log_body_mode: Default::default(),
+            upstream_request_log_body_mode: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
@@ -1185,6 +1443,7 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
                     ..Default::default()
                 },
             )]),
+            responses_capabilities: Default::default(),
             model_routes: Vec::new(),
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -1195,6 +1454,8 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: Default::default(),
+            replay: Default::default(),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -1332,6 +1593,36 @@ async fn request_values_override_configured_upstream_defaults_and_merge_chat_tem
 }
 
 #[tokio::test]
+async fn responses_client_metadata_vendor_extension_reaches_upstream() {
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
+        .await;
+    let gateway = test_gateway(upstream.clone(), MockSearch::default());
+    let client_metadata = json!({
+        "x-codex-installation-id": "installation-123",
+        "traceparent": "00-opaque-trace-opaque-span-01"
+    });
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "glm-5.1",
+        "input": "hello",
+        "stream": true,
+        "store": false,
+        "client_metadata": client_metadata.clone()
+    }))
+    .expect("valid Responses request");
+
+    let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].extra_body.get("client_metadata"),
+        Some(&client_metadata)
+    );
+}
+
+#[tokio::test]
 async fn hides_web_search_loop_but_replays_internal_tool_result() {
     let upstream = MockUpstream::default();
     upstream
@@ -1373,7 +1664,6 @@ async fn hides_web_search_loop_but_replays_internal_tool_result() {
         vec![
             "response.created",
             "response.in_progress",
-            "response.function_call_arguments.delta",
             "response.output_item.added",
             "response.output_item.done",
             "response.web_search_results",
@@ -1422,6 +1712,54 @@ async fn hides_web_search_loop_but_replays_internal_tool_result() {
     assert_eq!(requests[2].messages.len(), 5);
     assert_eq!(requests[2].messages[2].role, "tool");
     assert_eq!(requests[2].messages[3].role, "assistant");
+}
+
+#[tokio::test]
+async fn web_search_failure_tool_text_never_echoes_backend_error_secrets() {
+    const SENTINEL: &str = "search-error-neutral-secret-f5d8";
+    let upstream = MockUpstream::default();
+    upstream
+        .push_response(vec![Ok(tool_call_chunk(
+            "chat-1",
+            "call_ws_1",
+            "web_search",
+            "{\"query\":\"weather seattle\"}",
+        ))])
+        .await;
+    upstream
+        .push_response(vec![Ok(content_chunk("chat-2", "Search unavailable."))])
+        .await;
+    let search = MockSearch::default();
+    search
+        .fail_with(format!(
+            "backend reflected {SENTINEL}, test-key, and https://signed.test/image?token=abc"
+        ))
+        .await;
+    let gateway = test_gateway(upstream.clone(), search);
+
+    let mut request = base_request(vec![user_message("weather?")]);
+    request.tools = vec![ToolSpec::WebSearch {
+        external_web_access: Some(true),
+        filters: None,
+        user_location: None,
+        search_context_size: None,
+        search_content_types: None,
+    }];
+    let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
+    assert!(event_names(&events).contains(&"response.completed"));
+
+    let requests = upstream.requests().await;
+    let tool_text = requests[1]
+        .messages
+        .iter()
+        .find(|message| message.role == "tool")
+        .and_then(|message| message.content.as_ref())
+        .and_then(serde_json::Value::as_str)
+        .expect("model-visible search tool result");
+    assert_eq!(tool_text, "web_search failed: backend_error.");
+    assert!(!tool_text.contains(SENTINEL));
+    assert!(!tool_text.contains("test-key"));
+    assert!(!tool_text.contains("signed.test"));
 }
 
 #[tokio::test]
@@ -1656,6 +1994,7 @@ async fn degrades_gracefully_when_web_search_replay_baseline_is_missing() {
             action: Some(llmconduit::models::responses::WebSearchAction::Search {
                 query: Some("weather seattle".to_string()),
                 queries: None,
+                sources: None,
             }),
         },
         ResponseItem::message_text("assistant", "It is rainy."),
@@ -2846,6 +3185,7 @@ async fn fallback_models_endpoint_filters_to_provider_model_override() {
         exposed_model: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstream_request_log_path: None,
+        responses_capabilities: None,
     }];
 
     let app = llmconduit::build_app(config);
@@ -2870,8 +3210,16 @@ async fn fallback_models_endpoint_filters_to_provider_model_override() {
         json!({
             "object": "list",
             "data": [
-                {"id": "fallback-model", "object": "model", "owned_by": "fallback"}
-            ]
+                {
+                    "id": "fallback-model",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "fallback"
+                }
+            ],
+            "has_more": false,
+            "first_id": "fallback-model",
+            "last_id": "fallback-model"
         })
     );
 }
@@ -2913,6 +3261,7 @@ async fn fallback_models_endpoint_without_provider_model_override_passes_list_th
         exposed_model: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstream_request_log_path: None,
+        responses_capabilities: None,
     }];
 
     let app = llmconduit::build_app(config);
@@ -2938,7 +3287,29 @@ async fn fallback_models_endpoint_without_provider_model_override_passes_list_th
         .await
         .expect("read body");
     let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
-    assert_eq!(body, fallback_body);
+    assert_eq!(
+        body,
+        json!({
+            "object": "list",
+            "data": [
+                {
+                    "id": "fallback-a",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "llmconduit"
+                },
+                {
+                    "id": "fallback-b",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "llmconduit"
+                }
+            ],
+            "has_more": false,
+            "first_id": "fallback-a",
+            "last_id": "fallback-b"
+        })
+    );
 }
 
 #[tokio::test]
@@ -2964,11 +3335,14 @@ async fn proxies_models_endpoint_with_etag() {
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
+        api_log_body_mode: Default::default(),
+        upstream_request_log_body_mode: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
+        responses_capabilities: Default::default(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -2979,6 +3353,8 @@ async fn proxies_models_endpoint_with_etag() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        response_store: Default::default(),
+        replay: Default::default(),
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -3017,7 +3393,16 @@ async fn proxies_models_endpoint_with_etag() {
     assert_eq!(
         body,
         json!({
-            "data": [{"id": "glm-5.1"}]
+            "object": "list",
+            "data": [{
+                "id": "glm-5.1",
+                "object": "model",
+                "created": 0,
+                "owned_by": "llmconduit"
+            }],
+            "has_more": false,
+            "first_id": "glm-5.1",
+            "last_id": "glm-5.1"
         })
     );
 }
@@ -3042,11 +3427,14 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
+        api_log_body_mode: Default::default(),
+        upstream_request_log_body_mode: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
+        responses_capabilities: Default::default(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -3057,6 +3445,8 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        response_store: Default::default(),
+        replay: Default::default(),
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -3126,11 +3516,14 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
+        api_log_body_mode: Default::default(),
+        upstream_request_log_body_mode: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
+        responses_capabilities: Default::default(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -3141,6 +3534,8 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        response_store: Default::default(),
+        replay: Default::default(),
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -3213,11 +3608,14 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
+        api_log_body_mode: Default::default(),
+        upstream_request_log_body_mode: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
+        responses_capabilities: Default::default(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -3228,6 +3626,8 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        response_store: Default::default(),
+        replay: Default::default(),
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -3292,6 +3692,7 @@ async fn proxies_completions_endpoint_passthrough() {
         .respond_with(
             ResponseTemplate::new(202)
                 .insert_header("x-upstream", "yes")
+                .insert_header("x-request-id", "req-completions-1")
                 .set_body_json(upstream_body.clone()),
         )
         .mount(&server)
@@ -3305,11 +3706,14 @@ async fn proxies_completions_endpoint_passthrough() {
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
+        api_log_body_mode: Default::default(),
+        upstream_request_log_body_mode: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
+        responses_capabilities: Default::default(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -3320,6 +3724,8 @@ async fn proxies_completions_endpoint_passthrough() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        response_store: Default::default(),
+        replay: Default::default(),
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -3350,12 +3756,13 @@ async fn proxies_completions_endpoint_passthrough() {
         .expect("response");
 
     assert_eq!(response.status().as_u16(), 202);
+    assert!(response.headers().get("x-upstream").is_none());
     assert_eq!(
         response
             .headers()
-            .get("x-upstream")
+            .get("x-request-id")
             .and_then(|value| value.to_str().ok()),
-        Some("yes")
+        Some("req-completions-1")
     );
     let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
@@ -3379,6 +3786,7 @@ async fn proxies_metrics_endpoint_from_backend_root() {
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/plain; version=0.0.4; charset=utf-8")
                 .insert_header("x-upstream", "metrics")
+                .insert_header("x-request-id", "req-metrics-1")
                 .set_body_string(metrics),
         )
         .expect(1)
@@ -3407,12 +3815,13 @@ async fn proxies_metrics_endpoint_from_backend_root() {
             .and_then(|value| value.to_str().ok()),
         Some("text/plain")
     );
+    assert!(response.headers().get("x-upstream").is_none());
     assert_eq!(
         response
             .headers()
-            .get("x-upstream")
+            .get("x-request-id")
             .and_then(|value| value.to_str().ok()),
-        Some("metrics")
+        Some("req-metrics-1")
     );
     let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
         .await
@@ -3451,6 +3860,7 @@ async fn metrics_passthrough_does_not_substitute_a_fallback_provider() {
         exposed_model: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstream_request_log_path: None,
+        responses_capabilities: None,
     }];
     let app = llmconduit::build_app(config);
     let response = app
@@ -3471,7 +3881,7 @@ async fn metrics_passthrough_does_not_substitute_a_fallback_provider() {
 }
 
 #[tokio::test]
-async fn merges_instructions_and_developer_into_single_system_message() {
+async fn preserves_instructions_and_developer_as_distinct_roles() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
@@ -3491,7 +3901,7 @@ async fn merges_instructions_and_developer_into_single_system_message() {
         },
         user_message("how are you?"),
     ]);
-    request.instructions = "You are a helpful assistant.".to_string();
+    request.instructions = "You are a helpful assistant.".into();
 
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
@@ -3506,7 +3916,7 @@ async fn merges_instructions_and_developer_into_single_system_message() {
         Some("You are a helpful assistant.")
     );
     // Mid-conversation developer message stays in place (not hoisted)
-    assert_eq!(requests[0].messages[3].role, "system");
+    assert_eq!(requests[0].messages[3].role, "developer");
     assert_eq!(
         requests[0].messages[3]
             .content
@@ -3517,7 +3927,7 @@ async fn merges_instructions_and_developer_into_single_system_message() {
 }
 
 #[tokio::test]
-async fn merges_multiple_developer_messages_scattered_in_history() {
+async fn preserves_multiple_developer_messages_scattered_in_history() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
@@ -3555,7 +3965,7 @@ async fn merges_multiple_developer_messages_scattered_in_history() {
         },
         user_message("bye"),
     ]);
-    request.instructions = "base".to_string();
+    request.instructions = "base".into();
 
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
@@ -3565,13 +3975,16 @@ async fn merges_multiple_developer_messages_scattered_in_history() {
     assert_eq!(messages[0].role, "system");
     assert_eq!(
         messages[0].content.as_ref().and_then(|v| v.as_str()),
-        Some("base\n\nfirst instruction")
+        Some("base")
     );
+    assert_eq!(messages[1].role, "developer");
     let system_count = messages.iter().filter(|m| m.role == "system").count();
-    assert_eq!(
-        system_count, 3,
-        "initial block coalesced, mid-conversation stay in place"
-    );
+    assert_eq!(system_count, 1);
+    let developer_count = messages
+        .iter()
+        .filter(|message| message.role == "developer")
+        .count();
+    assert_eq!(developer_count, 3);
 }
 
 #[tokio::test]
@@ -3602,7 +4015,7 @@ async fn no_system_message_when_no_instructions_and_no_developer() {
 }
 
 #[tokio::test]
-async fn developer_only_no_instructions_produces_single_system_message() {
+async fn developer_only_no_instructions_preserves_developer_messages() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
@@ -3633,21 +4046,29 @@ async fn developer_only_no_instructions_produces_single_system_message() {
 
     let requests = upstream.requests().await;
     let messages = &requests[0].messages;
-    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[0].role, "developer");
     assert_eq!(
         messages[0].content.as_ref().and_then(|v| v.as_str()),
-        Some("instruction A\n\ninstruction B")
+        Some("instruction A")
     );
-    assert_eq!(messages[1].role, "user");
+    assert_eq!(messages[1].role, "developer");
+    assert_eq!(
+        messages[1].content.as_ref().and_then(|v| v.as_str()),
+        Some("instruction B")
+    );
+    assert_eq!(messages[2].role, "user");
     let system_count = messages.iter().filter(|m| m.role == "system").count();
-    assert_eq!(system_count, 1);
+    assert_eq!(system_count, 0);
 }
 
 #[tokio::test]
 async fn function_call_history_with_developer_message_produces_correct_ordering() {
     let upstream = MockUpstream::default();
     upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "result is 555"))])
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "result is 555")),
+            Ok(finish_chunk("chat-1", "stop")),
+        ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
 
@@ -3662,7 +4083,7 @@ async fn function_call_history_with_developer_message_produces_correct_ordering(
         },
         ResponseItem::FunctionCallOutput {
             call_id: "call_001".to_string(),
-            output: serde_json::Value::String("555".to_string()),
+            output: serde_json::Value::String("555".to_string()).into(),
         },
         ResponseItem::message_text("assistant", "15 * 37 = 555"),
         ResponseItem::Message {
@@ -3675,7 +4096,7 @@ async fn function_call_history_with_developer_message_produces_correct_ordering(
         },
         user_message("now add 45"),
     ]);
-    request.instructions = "You are a calculator.".to_string();
+    request.instructions = "You are a calculator.".into();
     request.tools = vec![ToolSpec::Function {
         name: "calculator".to_string(),
         description: "Evaluate math".to_string(),
@@ -3709,21 +4130,24 @@ async fn function_call_history_with_developer_message_produces_correct_ordering(
     assert_eq!(messages[3].role, "tool");
     assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_001"));
     assert_eq!(messages[4].role, "assistant");
-    assert_eq!(messages[5].role, "system");
+    assert_eq!(messages[5].role, "developer");
     assert_eq!(
         messages[5].content.as_ref().and_then(|v| v.as_str()),
         Some("show work step by step")
     );
     assert_eq!(messages[6].role, "user");
     let system_count = messages.iter().filter(|m| m.role == "system").count();
-    assert_eq!(system_count, 2);
+    assert_eq!(system_count, 1);
 }
 
 #[tokio::test]
 async fn multiple_function_calls_interleaved_with_developer_messages() {
     let upstream = MockUpstream::default();
     upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "done"))])
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "done")),
+            Ok(finish_chunk("chat-1", "stop")),
+        ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
 
@@ -3738,7 +4162,7 @@ async fn multiple_function_calls_interleaved_with_developer_messages() {
         },
         ResponseItem::FunctionCallOutput {
             call_id: "call_w1".to_string(),
-            output: serde_json::Value::String("72F".to_string()),
+            output: serde_json::Value::String("72F".to_string()).into(),
         },
         ResponseItem::FunctionCall {
             id: None,
@@ -3749,7 +4173,7 @@ async fn multiple_function_calls_interleaved_with_developer_messages() {
         },
         ResponseItem::FunctionCallOutput {
             call_id: "call_t1".to_string(),
-            output: serde_json::Value::String("2:30 PM".to_string()),
+            output: serde_json::Value::String("2:30 PM".to_string()).into(),
         },
         ResponseItem::message_text("assistant", "NYC: 72F, 2:30 PM"),
         ResponseItem::Message {
@@ -3762,7 +4186,7 @@ async fn multiple_function_calls_interleaved_with_developer_messages() {
         },
         user_message("what about London?"),
     ]);
-    request.instructions = "You have weather and time tools.".to_string();
+    request.instructions = "You have weather and time tools.".into();
     request.tools = vec![
         ToolSpec::Function {
             name: "get_weather".to_string(),
@@ -3799,7 +4223,7 @@ async fn multiple_function_calls_interleaved_with_developer_messages() {
             "assistant",
             "tool",
             "assistant",
-            "system",
+            "developer",
             "user"
         ]
     );
@@ -3809,7 +4233,10 @@ async fn multiple_function_calls_interleaved_with_developer_messages() {
 async fn reasoning_with_developer_message_preserves_reasoning_content() {
     let upstream = MockUpstream::default();
     upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "5x^4"))])
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "5x^4")),
+            Ok(finish_chunk("chat-1", "stop")),
+        ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
 
@@ -3834,7 +4261,7 @@ async fn reasoning_with_developer_message_preserves_reasoning_content() {
         },
         user_message("what about x^5?"),
     ]);
-    request.instructions = "You are a math tutor.".to_string();
+    request.instructions = "You are a math tutor.".into();
 
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     assert!(event_names(&events).contains(&"response.completed"));
@@ -3853,7 +4280,7 @@ async fn reasoning_with_developer_message_preserves_reasoning_content() {
         Some("power rule"),
         "reasoning should be attached to the following assistant message"
     );
-    assert_eq!(messages[3].role, "system");
+    assert_eq!(messages[3].role, "developer");
     assert_eq!(
         messages[3].content.as_ref().and_then(|v| v.as_str()),
         Some("show derivation steps")
@@ -3865,13 +4292,17 @@ async fn reasoning_with_developer_message_preserves_reasoning_content() {
 async fn custom_tool_call_with_developer_message() {
     let upstream = MockUpstream::default();
     upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "result"))])
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "result")),
+            Ok(finish_chunk("chat-1", "stop")),
+        ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
 
     let mut request = base_request(vec![
         user_message("run my script"),
         ResponseItem::CustomToolCall {
+            id: None,
             status: Some("completed".to_string()),
             call_id: "call_ct1".to_string(),
             name: "run_script".to_string(),
@@ -3880,7 +4311,7 @@ async fn custom_tool_call_with_developer_message() {
         ResponseItem::CustomToolCallOutput {
             call_id: "call_ct1".to_string(),
             name: Some("run_script".to_string()),
-            output: serde_json::Value::String("hello".to_string()),
+            output: serde_json::Value::String("hello".to_string()).into(),
         },
         ResponseItem::message_text("assistant", "script printed hello"),
         ResponseItem::Message {
@@ -3893,15 +4324,11 @@ async fn custom_tool_call_with_developer_message() {
         },
         user_message("run it again with different input"),
     ]);
-    request.instructions = "You can run scripts.".to_string();
+    request.instructions = "You can run scripts.".into();
     request.tools = vec![ToolSpec::Custom {
         name: "run_script".to_string(),
         description: "Run a Python script".to_string(),
-        format: llmconduit::models::responses::CustomToolFormat {
-            kind: "text".to_string(),
-            syntax: "python".to_string(),
-            definition: "Python code to execute".to_string(),
-        },
+        format: llmconduit::models::responses::CustomToolFormat::Text,
     }];
 
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
@@ -3915,13 +4342,13 @@ async fn custom_tool_call_with_developer_message() {
         Some("You can run scripts.")
     );
     let system_count = messages.iter().filter(|m| m.role == "system").count();
-    assert_eq!(system_count, 2);
+    assert_eq!(system_count, 1);
     assert_eq!(messages[1].role, "user");
     assert_eq!(messages[2].role, "assistant");
     assert!(messages[2].tool_calls.is_some());
     assert_eq!(messages[3].role, "tool");
     assert_eq!(messages[4].role, "assistant");
-    assert_eq!(messages[5].role, "system");
+    assert_eq!(messages[5].role, "developer");
     assert_eq!(
         messages[5].content.as_ref().and_then(|v| v.as_str()),
         Some("always explain what the script does")
@@ -3933,7 +4360,10 @@ async fn custom_tool_call_with_developer_message() {
 async fn local_shell_call_in_history_with_developer_message() {
     let upstream = MockUpstream::default();
     upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "ok")),
+            Ok(finish_chunk("chat-1", "stop")),
+        ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
 
@@ -3955,7 +4385,7 @@ async fn local_shell_call_in_history_with_developer_message() {
         },
         ResponseItem::FunctionCallOutput {
             call_id: "call_ls1".to_string(),
-            output: serde_json::Value::String("file1.txt\nfile2.txt".to_string()),
+            output: serde_json::Value::String("file1.txt\nfile2.txt".to_string()).into(),
         },
         ResponseItem::message_text("assistant", "found 2 files"),
         ResponseItem::Message {
@@ -3968,7 +4398,7 @@ async fn local_shell_call_in_history_with_developer_message() {
         },
         user_message("show details"),
     ]);
-    request.instructions = "You can run shell commands.".to_string();
+    request.instructions = "You can run shell commands.".into();
     request.tools = vec![ToolSpec::LocalShell {}];
 
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
@@ -3978,7 +4408,7 @@ async fn local_shell_call_in_history_with_developer_message() {
     let messages = &requests[0].messages;
     assert_eq!(messages[0].role, "system");
     let system_count = messages.iter().filter(|m| m.role == "system").count();
-    assert_eq!(system_count, 2);
+    assert_eq!(system_count, 1);
     let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
     assert_eq!(
         roles,
@@ -3988,7 +4418,7 @@ async fn local_shell_call_in_history_with_developer_message() {
             "assistant",
             "tool",
             "assistant",
-            "system",
+            "developer",
             "user"
         ]
     );
@@ -4013,7 +4443,7 @@ async fn long_multi_turn_conversation_no_system_drift() {
         ResponseItem::message_text("assistant", "4"),
         user_message("next"),
     ]);
-    request.instructions = "You count numbers.".to_string();
+    request.instructions = "You count numbers.".into();
 
     let events = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
     assert!(event_names(&events).contains(&"response.completed"));
@@ -4045,7 +4475,7 @@ async fn system_role_in_input_merged_with_instructions() {
         },
         user_message("hello"),
     ]);
-    request.instructions = "base instructions".to_string();
+    request.instructions = "base instructions".into();
 
     let _ = collect_stream(gateway.stream_responses(request).await.expect("stream")).await;
 
@@ -4084,7 +4514,7 @@ async fn tool_call_triggers_new_function_call_response_item() {
         },
         ResponseItem::FunctionCallOutput {
             call_id: "call_001".to_string(),
-            output: serde_json::Value::String("555".to_string()),
+            output: serde_json::Value::String("555".to_string()).into(),
         },
         ResponseItem::message_text("assistant", "555"),
         user_message("add 45"),
@@ -4129,6 +4559,7 @@ async fn response_completed_includes_usage_from_upstream() {
         .push_response(vec![
             Ok(content_chunk("chat-1", "hello")),
             Ok(ChatCompletionChunk {
+                service_tier: None,
                 id: "chat-1".to_string(),
                 choices: vec![],
                 usage: Some(ChunkUsage {
@@ -4403,6 +4834,7 @@ async fn response_completed_accumulates_usage_across_web_search_rounds() {
                 r#"{"query":"rust async"}"#,
             )),
             Ok(ChatCompletionChunk {
+                service_tier: None,
                 id: "chat-1".to_string(),
                 choices: vec![],
                 usage: Some(ChunkUsage {
@@ -4421,6 +4853,7 @@ async fn response_completed_accumulates_usage_across_web_search_rounds() {
         .push_response(vec![
             Ok(content_chunk("chat-2", "found it")),
             Ok(ChatCompletionChunk {
+                service_tier: None,
                 id: "chat-2".to_string(),
                 choices: vec![],
                 usage: Some(ChunkUsage {
@@ -4467,7 +4900,7 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
 
     let request = ResponsesRequest {
         model: "glm-5.1".to_string(),
-        instructions: "You are helpful.".to_string(),
+        instructions: "You are helpful.".into(),
         input: vec![
             user_message("explore the codebase"),
             // Assistant reasoning (from a previous turn)
@@ -4501,7 +4934,7 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
             // Tool result
             ResponseItem::FunctionCallOutput {
                 call_id: "call_abc".to_string(),
-                output: json!("file1.rs\nfile2.rs"),
+                output: json!("file1.rs\nfile2.rs").into(),
             },
         ],
         tools: vec![ToolSpec::Function {
@@ -4523,9 +4956,10 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_retention: None,
         text: None,
-        client_metadata: None,
         previous_response_id: None,
+        llmconduit_replay: None,
         temperature: None,
         top_p: None,
         max_output_tokens: None,
@@ -4575,7 +5009,7 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
 
     let request = ResponsesRequest {
         model: "glm-5.1".to_string(),
-        instructions: "You are helpful.".to_string(),
+        instructions: "You are helpful.".into(),
         input: vec![
             user_message("read two files"),
             // Three tool calls from the same assistant turn
@@ -4602,15 +5036,15 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call_1".to_string(),
-                output: json!("contents of a.rs"),
+                output: json!("contents of a.rs").into(),
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call_2".to_string(),
-                output: json!("contents of b.rs"),
+                output: json!("contents of b.rs").into(),
             },
             ResponseItem::FunctionCallOutput {
                 call_id: "call_3".to_string(),
-                output: json!("no matches"),
+                output: json!("no matches").into(),
             },
         ],
         tools: vec![
@@ -4636,9 +5070,10 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_retention: None,
         text: None,
-        client_metadata: None,
         previous_response_id: None,
+        llmconduit_replay: None,
         temperature: None,
         top_p: None,
         max_output_tokens: None,
@@ -4685,6 +5120,7 @@ fn test_gateway_with_flow_store(upstream: MockUpstream, search: MockSearch) -> A
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
     );
+    upstream.set_responses_capabilities(config.responses_capabilities.resolve());
     let vision: Arc<dyn llmconduit::vision::VisionClient> = Arc::new(
         llmconduit::vision::ReqwestVisionClient::new(reqwest::Client::new(), &config),
     );
@@ -5378,8 +5814,8 @@ async fn d3_no_usage_chunk_leaves_usage_none() {
 
 #[tokio::test]
 async fn d3_pre_spawn_error_finalizes_failed_not_cancelled() {
-    // A PRE-SPAWN early return (here an unsupported `previous_response_id`, which
-    // fails canonical lowering BEFORE the tokio::spawn) must finalize the record
+    // A PRE-SPAWN early return (here a missing `previous_response_id`, which
+    // fails state resolution BEFORE the tokio::spawn) must finalize the record
     // Failed — NOT leave it Open and NOT fall through to the Drop fallback's
     // Cancelled — with no usage (none was upserted before the spawn). This is the
     // engine.rs lowering/budget pre-spawn seam.
@@ -7326,6 +7762,7 @@ fn test_gateway_with_config_and_raw_output(
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
     );
+    upstream.set_responses_capabilities(config.responses_capabilities.resolve());
     // Non-image-agent tests get a no-op vision client; the cache is built from
     // config and never activated unless `image_agent_enabled` + `vision_url`.
     // A real (never-called) `ReqwestVisionClient` keeps this builder independent
@@ -7356,11 +7793,14 @@ fn test_config() -> Config {
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
+        api_log_body_mode: Default::default(),
+        upstream_request_log_body_mode: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
+        responses_capabilities: Default::default(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -7371,6 +7811,8 @@ fn test_config() -> Config {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        response_store: Default::default(),
+        replay: Default::default(),
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -7388,7 +7830,7 @@ fn test_config() -> Config {
 fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
     ResponsesRequest {
         model: "glm-5.1".to_string(),
-        instructions: String::new(),
+        instructions: String::new().into(),
         input,
         tools: Vec::new(),
         tool_choice: json!("auto"),
@@ -7403,9 +7845,10 @@ fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_retention: None,
         text: None,
-        client_metadata: None,
         previous_response_id: None,
+        llmconduit_replay: None,
         temperature: None,
         top_p: None,
         max_output_tokens: None,
@@ -7431,6 +7874,7 @@ fn user_message(text: &str) -> ResponseItem {
 
 fn content_chunk(id: &str, content: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -7449,11 +7893,33 @@ fn content_chunk(id: &str, content: &str) -> ChatCompletionChunk {
     }
 }
 
+fn finish_chunk(id: &str, finish_reason: &str) -> ChatCompletionChunk {
+    ChatCompletionChunk {
+        service_tier: None,
+        id: id.to_string(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatDelta {
+                content: None,
+                reasoning_content: None,
+                tool_calls: None,
+                function_call: None,
+                refusal: None,
+                extra: Default::default(),
+            },
+            finish_reason: Some(finish_reason.to_string()),
+            stop_reason: None,
+        }],
+        usage: None,
+    }
+}
+
 /// A terminal chunk carrying `finish_reason: "length"` (upstream max-output-token
 /// truncation) so the engine derives `response.incomplete` for the turn. Used by the
 /// F1c finding-#3 test to assert the capture artifact maps `length` → `incomplete`.
 fn length_finish_chunk(id: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -7474,6 +7940,7 @@ fn length_finish_chunk(id: &str) -> ChatCompletionChunk {
 
 fn reasoning_chunk(id: &str, reasoning: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -7494,6 +7961,7 @@ fn reasoning_chunk(id: &str, reasoning: &str) -> ChatCompletionChunk {
 
 fn nested_thinking_chunk(id: &str, thinking: &str, signature: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -7520,6 +7988,7 @@ fn nested_thinking_chunk(id: &str, thinking: &str, signature: &str) -> ChatCompl
 
 fn tool_call_chunk(id: &str, call_id: &str, name: &str, arguments: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -7546,8 +8015,44 @@ fn tool_call_chunk(id: &str, call_id: &str, name: &str, arguments: &str) -> Chat
     }
 }
 
+fn two_tool_call_chunk(
+    id: &str,
+    first: (&str, &str),
+    second: (&str, &str),
+    arguments: Option<&str>,
+) -> ChatCompletionChunk {
+    let call = |index, (call_id, name): (&str, &str)| ChatToolCall {
+        id: Some(call_id.to_string()),
+        index: Some(index),
+        kind: "function".to_string(),
+        function: ChatFunctionCall {
+            name: Some(name.to_string()),
+            arguments: arguments.map(|value| serde_json::Value::String(value.to_string())),
+        },
+    };
+    ChatCompletionChunk {
+        service_tier: None,
+        id: id.to_string(),
+        choices: vec![ChatChunkChoice {
+            index: 0,
+            delta: ChatDelta {
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(vec![call(0, first), call(1, second)]),
+                function_call: None,
+                refusal: None,
+                extra: Default::default(),
+            },
+            finish_reason: Some("tool_calls".to_string()),
+            stop_reason: None,
+        }],
+        usage: None,
+    }
+}
+
 fn legacy_function_call_chunk(id: &str, name: &str, arguments: &str) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -7578,6 +8083,7 @@ fn usage_chunk(
     reasoning_tokens: Option<u64>,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         usage: Some(ChunkUsage {
             prompt_tokens: prompt_tokens.try_into().expect("prompt_tokens fits in i64"),
@@ -7776,6 +8282,7 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
             upstream_model: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
             fallback_upstreams: vec![FallbackUpstreamConfig {
                 name: "fallback".to_string(),
                 upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
@@ -7784,6 +8291,7 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
                 exposed_model: None,
                 upstream_chat_kwargs: JsonMap::new(),
                 upstream_request_log_path: None,
+                responses_capabilities: None,
             }],
         },
         UpstreamConfig {
@@ -7793,6 +8301,7 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
             upstream_model: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
             fallback_upstreams: Vec::new(),
         },
     ];
@@ -7853,7 +8362,7 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "second"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -7870,6 +8379,7 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
             upstream_model: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
             fallback_upstreams: Vec::new(),
         },
         UpstreamConfig {
@@ -7879,6 +8389,7 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
             upstream_model: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
             fallback_upstreams: Vec::new(),
         },
     ];
@@ -7956,7 +8467,7 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "first"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -7973,6 +8484,7 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
             upstream_model: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
             fallback_upstreams: Vec::new(),
         },
         UpstreamConfig {
@@ -7982,6 +8494,7 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
             upstream_model: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
             fallback_upstreams: Vec::new(),
         },
     ];
@@ -8077,7 +8590,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "fallback"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -8095,6 +8608,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
             upstream_model: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
             fallback_upstreams: vec![FallbackUpstreamConfig {
                 name: "fallback".to_string(),
                 upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
@@ -8103,6 +8617,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
                 exposed_model: None,
                 upstream_chat_kwargs: JsonMap::new(),
                 upstream_request_log_path: None,
+                responses_capabilities: None,
             }],
         },
         UpstreamConfig {
@@ -8112,6 +8627,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
             upstream_model: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
             fallback_upstreams: Vec::new(),
         },
     ];
@@ -8197,7 +8713,7 @@ async fn exposed_fallback_model_alias_is_listed_and_routes_to_declaring_fallback
                     "choices": [{
                         "index": 0,
                         "delta": {"content": "fallback alias"},
-                        "finish_reason": null
+                        "finish_reason": "stop"
                     }],
                     "usage": null
                 })])),
@@ -8214,6 +8730,7 @@ async fn exposed_fallback_model_alias_is_listed_and_routes_to_declaring_fallback
         upstream_model: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstream_request_log_path: None,
+        responses_capabilities: None,
         fallback_upstreams: vec![FallbackUpstreamConfig {
             name: "fallback".to_string(),
             upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
@@ -8222,6 +8739,7 @@ async fn exposed_fallback_model_alias_is_listed_and_routes_to_declaring_fallback
             exposed_model: Some("GLM-5.1".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
         }],
     }];
 
@@ -8331,7 +8849,7 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
                             "delta": {
                                 "content": "fallback ok"
                             },
-                            "finish_reason": null
+                            "finish_reason": "stop"
                         }
                     ],
                     "usage": null
@@ -8366,6 +8884,7 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
             ),
         ]),
         upstream_request_log_path: None,
+        responses_capabilities: None,
     }];
     config.upstream_failure_cooldown_secs = 3600;
     config.model_profiles = std::collections::BTreeMap::from([(
@@ -8603,10 +9122,16 @@ async fn chat_completions_preserves_multimodal_content_parts() {
         .await
         .expect("response");
 
-    assert_eq!(response.status().as_u16(), 200);
-    let _ = axum::body::to_bytes(response.into_body(), 4096)
+    let status = response.status();
+    let response_body = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .expect("read body");
+    assert_eq!(
+        status.as_u16(),
+        200,
+        "unexpected response: {}",
+        String::from_utf8_lossy(&response_body)
+    );
 
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
@@ -8859,10 +9384,13 @@ async fn chat_completions_client_tool_call_surfaces_tool_calls() {
 }
 
 #[tokio::test]
-async fn chat_completions_developer_messages_become_system_messages() {
+async fn chat_completions_developer_messages_remain_developer_messages() {
     let upstream = MockUpstream::default();
     upstream
-        .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
+        .push_response(vec![
+            Ok(content_chunk("chat-1", "ok")),
+            Ok(finish_chunk("chat-1", "stop")),
+        ])
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
     let app = llmconduit::build_app_from_gateway(gateway);
@@ -8903,7 +9431,10 @@ async fn chat_completions_developer_messages_become_system_messages() {
         .iter()
         .map(|message| message.role.as_str())
         .collect();
-    assert_eq!(roles, vec!["system", "user", "assistant", "system", "user"]);
+    assert_eq!(
+        roles,
+        vec!["developer", "user", "assistant", "developer", "user"]
+    );
     assert_eq!(
         requests[0].messages[0]
             .content
@@ -9533,7 +10064,13 @@ async fn anthropic_messages_streams_tool_use_response() {
         })
         .map(|event| event["delta"]["partial_json"].as_str().unwrap())
         .collect();
-    assert_eq!(json_deltas, vec![r#"{"loc"#, r#"ation":"Seattle"}"#]);
+    assert!(!json_deltas.is_empty(), "missing tool-input JSON delta");
+    let accumulated_json = json_deltas.concat();
+    assert_eq!(accumulated_json, r#"{"location":"Seattle"}"#);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&accumulated_json).expect("valid tool input"),
+        json!({ "location": "Seattle" })
+    );
 
     // T5: full harness proof, real gateway/HTTP output, ClientToolUse surface
     // (deliberately not web_search -- see `conformance::Surface::ClientToolUse`).
@@ -9860,6 +10397,7 @@ async fn anthropic_messages_returns_non_streaming_json() {
 #[tokio::test]
 async fn responses_returns_non_streaming_json_while_streaming_upstream() {
     let upstream = MockUpstream::default();
+    upstream.set_supported_models(["glm-5.1"]).await;
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
         .await;
@@ -9936,6 +10474,7 @@ async fn responses_returns_non_streaming_json_while_streaming_upstream() {
 #[tokio::test]
 async fn responses_streaming_response_created_omits_internal_estimate_hint() {
     let upstream = MockUpstream::default();
+    upstream.set_supported_models(["glm-5.1"]).await;
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "Hello"))])
         .await;
@@ -10005,10 +10544,11 @@ async fn responses_streaming_response_created_omits_internal_estimate_hint() {
 #[tokio::test]
 async fn responses_preserves_multimodal_input_parts() {
     let upstream = MockUpstream::default();
+    upstream.set_supported_models(["glm-5.1"]).await;
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "ok"))])
         .await;
-    // E2b: this test proves canonical `input_image`/`input_file`/`input_audio`
+    // E2b: this test proves canonical `input_image`/`input_file`
     // parts survive lowering to the upstream chat payload unchanged, which is
     // only true on a native-vision backend -- a non-native backend now
     // degrades the image part to a text placeholder (the whole point of E2b;
@@ -10022,6 +10562,10 @@ async fn responses_preserves_multimodal_input_parts() {
             ..Default::default()
         },
     )]);
+    config.responses_capabilities.input_image =
+        Some(llmconduit::responses_capabilities::InputImageCapability::Native);
+    config.responses_capabilities.input_file =
+        Some(llmconduit::responses_capabilities::InputFileCapability::Native);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
@@ -10043,13 +10587,6 @@ async fn responses_preserves_multimodal_input_parts() {
                         "type": "input_file",
                         "file_id": "file_doc",
                         "filename": "brief.pdf"
-                    },
-                    {
-                        "type": "input_audio",
-                        "input_audio": {
-                            "data": "UklGRg==",
-                            "format": "wav"
-                        }
                     }
                 ]
             }
@@ -10068,10 +10605,16 @@ async fn responses_preserves_multimodal_input_parts() {
         .await
         .expect("response");
 
-    assert_eq!(response.status().as_u16(), 200);
-    let _ = axum::body::to_bytes(response.into_body(), 4096)
+    let status = response.status();
+    let response_body = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .expect("read body");
+    assert_eq!(
+        status.as_u16(),
+        200,
+        "unexpected response: {}",
+        String::from_utf8_lossy(&response_body)
+    );
 
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
@@ -10090,13 +10633,6 @@ async fn responses_preserves_multimodal_input_parts() {
                 "type": "input_file",
                 "file_id": "file_doc",
                 "filename": "brief.pdf"
-            },
-            {
-                "type": "input_audio",
-                "input_audio": {
-                    "data": "UklGRg==",
-                    "format": "wav"
-                }
             }
         ]))
     );
@@ -10527,11 +11063,14 @@ async fn cancels_mid_stream_when_client_disconnects() {
         system_prompt_prefix: None,
         upstream_request_log_path: None,
         turn_capture_dir: None,
+        api_log_body_mode: Default::default(),
+        upstream_request_log_body_mode: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
+        responses_capabilities: Default::default(),
         model_routes: Vec::new(),
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
@@ -10542,6 +11081,8 @@ async fn cancels_mid_stream_when_client_disconnects() {
         max_web_search_rounds: 5,
         flatten_content: true,
         max_replay_entries: 1000,
+        response_store: Default::default(),
+        replay: Default::default(),
         debug_log_max_age_hours: None,
         min_completion_tokens: 4096,
         max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -10671,8 +11212,8 @@ async fn wait_for_only_artifact(dir: &std::path::Path) -> serde_json::Value {
     panic!("no turn-capture artifact appeared in {}", dir.display());
 }
 
-/// AC-7: a PRE-SPAWN validation failure (`previous_response_id`, rejected at
-/// canonical lowering — `engine.rs` pre-spawn seam) writes a `status:"failed"`
+/// AC-7: a PRE-SPAWN state-resolution failure (`previous_response_id`, missing
+/// from the response store — `engine.rs` pre-spawn seam) writes a `status:"failed"`
 /// artifact with the terminal reason and the served error body, with the upstream
 /// sections ABSENT (backend never contacted) — and it does NOT hang.
 #[tokio::test]
@@ -10687,8 +11228,8 @@ async fn f1c_ac7_pre_spawn_failure_writes_failed_served_present_upstream_absent(
     let gateway = gateway_with_capture_dir(Arc::new(upstream.clone()), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
-    // `previous_response_id` is unsupported and rejected at lowering, BEFORE the
-    // engine spawns any upstream work.
+    // The parent response is missing and rejected during state resolution, BEFORE
+    // the engine spawns any upstream work.
     let body = json!({
         "model": "glm-5.1",
         "input": "hi",
@@ -10765,6 +11306,10 @@ async fn f1c_ac8_completed_streaming_turn_writes_completed_with_sections() {
         ])
         .await;
     let mut config = test_config();
+    // This test verifies exact raw-response capture. A configured backend/tool
+    // credential intentionally suppresses raw response sections, so use the
+    // credential-free capture mode exercised by this mock-only test.
+    config.brave_api_key = None;
     config.turn_capture_dir = Some(capture_dir.clone());
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
@@ -11098,6 +11643,10 @@ async fn f1e_ac12_upstream_response_is_exact_raw_sse_bytes() {
         .await;
 
     let mut config = test_config();
+    // The wiremock backend is unauthenticated; keeping the unrelated Brave test
+    // key would intentionally replace raw response captures with a redaction
+    // marker and defeat this byte-exact capture test.
+    config.brave_api_key = None;
     config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
     config.turn_capture_dir = Some(capture_dir.clone());
     let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
@@ -11177,6 +11726,8 @@ async fn f1e_ac13_final_non_2xx_body_captured_status_failed() {
         .await;
 
     let mut config = test_config();
+    // Exercise verbatim diagnostic capture only in a credential-free setup.
+    config.brave_api_key = None;
     config.upstream_base_url = format!("{}/v1/", server.uri()).parse().expect("url");
     config.turn_capture_dir = Some(capture_dir.clone());
     let (app, _gateway) = llmconduit::build_app_with_gateway_and_options(
@@ -11561,6 +12112,7 @@ async fn root_endpoint_returns_ok() {
 #[tokio::test]
 async fn sse_responses_include_connection_keep_alive() {
     let upstream = MockUpstream::default();
+    upstream.set_supported_models(["glm-5.1"]).await;
     upstream
         .push_response(vec![Ok(content_chunk("chat-1", "hello"))])
         .await;
@@ -11568,11 +12120,11 @@ async fn sse_responses_include_connection_keep_alive() {
 
     let request = ResponsesRequest {
         model: "glm-5.1".to_string(),
-        instructions: String::new(),
+        instructions: String::new().into(),
         input: vec![user_message("hi")],
         tools: Vec::new(),
         tool_choice: json!("auto"),
-        parallel_tool_calls: Some(true),
+        parallel_tool_calls: Some(false),
         reasoning: None,
         thinking: None,
         store: false,
@@ -11580,9 +12132,10 @@ async fn sse_responses_include_connection_keep_alive() {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_retention: None,
         text: None,
-        client_metadata: None,
         previous_response_id: None,
+        llmconduit_replay: None,
         temperature: None,
         top_p: None,
         max_output_tokens: None,
@@ -11631,6 +12184,7 @@ fn e1_tool_chunk(
     finish: bool,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
+        service_tier: None,
         id: id.to_string(),
         choices: vec![ChatChunkChoice {
             index: 0,
@@ -11813,7 +12367,7 @@ async fn e1_repair_note_honors_role_mapping_and_keeps_single_leading_system() {
         },
         user_message("search the code"),
     ]);
-    request.instructions = "You are a helpful assistant.".to_string();
+    request.instructions = "You are a helpful assistant.".into();
 
     let events = collect_stream(
         gateway
@@ -12563,12 +13117,14 @@ async fn e2a_request_intrinsic_4xx_structured_terminal_chat_stream() {
         .filter_map(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
         .find(|value| value.get("error").is_some())
         .expect("a request-intrinsic 4xx must emit a structured chat SSE error frame");
+    assert_eq!(
+        error_frame["error"]["message"].as_str(),
+        Some("the upstream request failed"),
+        "chat error frame must use the sanitized public upstream error: {text}"
+    );
     assert!(
-        error_frame["error"]["message"]
-            .as_str()
-            .expect("error message")
-            .contains("400"),
-        "chat error frame should surface the upstream status in the message: {text}"
+        !text.contains("model is not multimodal"),
+        "the raw upstream error body must not reach the client: {text}"
     );
     assert!(
         text.contains("[DONE]"),
@@ -12611,9 +13167,15 @@ async fn e2a_request_intrinsic_4xx_structured_terminal_responses_stream() {
     let message = failed["response"]["error"]["message"]
         .as_str()
         .expect("error message");
+    assert_eq!(
+        message, "the upstream request failed",
+        "response.failed must carry the sanitized public upstream error"
+    );
     assert!(
-        message.contains("400"),
-        "response.failed should surface the upstream status: {message}"
+        !serde_json::to_string(failed)
+            .expect("serialize response.failed")
+            .contains("model is not multimodal"),
+        "the raw upstream error body must not reach response.failed"
     );
     assert!(
         !names.iter().any(|name| name.contains("output_text")),
@@ -12790,7 +13352,12 @@ async fn build_app_with_gateway_wires_disabled_turn_capture_by_default() {
 /// `dir`, but the dashboard FlowStore DISABLED — i.e. `--with-debug-ui` OFF. Proves
 /// turn capture's own gate fires independent of the debug UI (spec Design #1).
 fn test_gateway_with_turn_capture(upstream: MockUpstream, dir: std::path::PathBuf) -> Arc<Gateway> {
-    let config = test_config();
+    let mut config = test_config();
+    // These F1b tests validate exact served bytes against an in-process mock.
+    // Raw response capture is deliberately suppressed whenever any backend/tool
+    // credential is configured, including the otherwise unrelated Brave key in
+    // the general gateway fixture.
+    config.brave_api_key = None;
     upstream.set_finalization_policies(
         llmconduit::upstream::BackendFinalizationPolicies::from_config(&config),
     );

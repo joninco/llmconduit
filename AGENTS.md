@@ -57,6 +57,11 @@ The production unit is `/etc/systemd/system/llmconduit.service`, the installed b
 rewrite either file. Build with the dashboard embedded because production launches with
 `--with-debug-ui`:
 
+**Deployment prerequisite:** production binds a non-loopback address, so its environment must set
+`LLMCONDUIT_API_TOKEN` (preferred) or the explicit development override
+`LLMCONDUIT_ALLOW_UNAUTHENTICATED_API=1` before restart. Do not add either variable or change the
+live environment without separate deployment authorization.
+
 ```bash
 cd ~/git/local-inference-lab/llmconduit
 
@@ -149,11 +154,13 @@ These are intentional and load-bearing. Do not change without strong reason + ma
 - **`web_search` tool stripped from request when `brave_api_key` is unset.** Engine also relaxes `tool_choice` to `"auto"` when the only tool was stripped (`engine.rs:1536-1558`).
 - **Provider-side `web_search` is single-purpose.** Runtime execution supports search/query actions only; `open_page`, `find_in_page`, and unknown actions are rejected. Failed/timed-out Brave calls are injected as model-visible text so the turn can complete.
 - **Mixed provider-side and client-side tool calls are rejected.** A turn cannot hand off client tools and run Brave search in the same upstream tool-call batch (`engine.rs:1290-1357`).
-- **`response.web_search_results`** is a non-standard additive SSE event consumed only by the Anthropic converter. OpenAI clients ignore unknown events, so this stays compatible. See `engine.rs:1480-1485`.
-- **`previous_response_id` is unsupported** and must continue to return 400 from canonical lowering. Replay is internal SHA256-prefix state, not OpenAI hosted response retrieval.
-- **Image generation tools are stripped before upstream.** They remain accepted in Responses wire types but are not sent as chat tools.
+- **`response.web_search_results` is internal-only.** The Anthropic converter consumes this non-standard event; the raw Responses public projection strips it. See the engine emission path and Responses egress projection in `http.rs`.
+- **Responses state and private replay are independent.** `store:true` makes a completed/incomplete Responses turn referenceable by `previous_response_id`; `store:false` never does. Private SHA256-prefix replay is configured separately under `replay`, defaults off, and honors the consumed `llmconduit_replay:false` bypass extension.
+- **Persist state before advertising completion.** An eligible response-store write completes before the terminal SSE event. Failed/cancelled responses are never referenceable, and persistence failure must not emit a falsely successful stored resource.
+- **Capability checks happen after primary routing.** The selected primary must support every requested Responses feature. Incapable nested fallbacks are pruned for that request without cooldown/health penalty; do not jump to another routing provider to acquire a capability.
+- **Image generation tools are rejected on raw Responses ingress unless implemented.** The downstream strip remains defense in depth for converted/internal surfaces; hosted OpenAI image generation is not implemented.
 - **Request-intrinsic 4xx `{400,413,415,422}` never cools/fails over a provider.** The leaf tags these `FailoverDisposition::Terminal` (`upstream.rs` `dispatch_chat_stream`); `401/403/404/408/429`/5xx/connect/timeout keep failover + cooldown unchanged. Limitation: a request-intrinsic 400 is therefore NOT retried on a differently-capable provider — acceptable because E2b removes images before dispatch, and a non-image request-intrinsic 400 would reject identically elsewhere.
-- **No raw image reaches a non-native-vision backend.** A role-agnostic residual-image pass (`engine.rs`, after `activate_image_agent`, gated on `!backend_is_native_vision`) sweeps every `ResponseItem` (not just `role=="user"`) for `ContentItem::InputImage` (`image_url` or `file_id`) the active G4 agent left behind and either degrades it to a text placeholder (`unsupported_image_policy: placeholder`, default) or rejects the turn pre-dispatch with a 4xx (`reject`) — never forwarded raw. A degraded turn forces `request.store = false` to bypass the replay cache both ways (lookup + store), since two different images collapse to byte-identical placeholder text at the same position.
+- **No raw image reaches a non-native-vision backend.** A role-agnostic residual-image pass (`engine.rs`, after `activate_image_agent`, gated on `!backend_is_native_vision`) sweeps every `ResponseItem` (not just `role=="user"`) for `ContentItem::InputImage` (`image_url` or `file_id`) the active G4 agent left behind and either degrades it to a text placeholder (`unsupported_image_policy: placeholder`, default) or rejects the turn pre-dispatch with a 4xx (`reject`) — never forwarded raw. A degraded turn sets `llmconduit_replay=false` to bypass private replay while preserving the caller's independent Responses `store` semantics.
 
 ## Config resolution order
 
@@ -161,7 +168,7 @@ Global → matched model profile templates (`extends:` in order) → matched mod
 
 Profiles are considered against the resolved catalog model, the configured upstream-model remap target, and the original request model, de-duplicated in that order. For kwargs, later matches override earlier matches, so request-model profile settings beat backend-model profile settings on conflict. For `system_prompt_prefix`, global prefix is prepended and the most specific matched profile prefix is appended before request `instructions`.
 
-`upstreams: [...]` switches the app to model-routing mode. `/v1/models` exposes the ordered union of primary upstream model catalogs plus fallback `exposed_model` aliases. Exact model id wins; normalized alias routing uses `canonical_model_key` and only succeeds when it maps to one unique id. Blank/missing/unavailable/ambiguous models default to the first model in the first non-empty provider catalog.
+`upstreams: [...]` switches the app to model-routing mode. `/v1/models` exposes the ordered union of primary upstream model catalogs plus fallback `exposed_model` aliases. Exact model id wins; normalized alias routing uses `canonical_model_key` and only succeeds when it maps to one unique id. Chat and Anthropic ingress retain default-model behavior for blank/missing/unavailable/ambiguous models. Raw Responses ingress requires a model (400 when missing) and returns 404 for an explicit unknown model.
 
 ## Testing
 
@@ -176,6 +183,8 @@ Profiles are considered against the resolved catalog model, the configured upstr
 - Don't add direct converter between two non-canonical shapes — go through Responses.
 - Don't add a typed field for a provider-specific knob if `extra_body` works.
 - Don't bypass `redact_payload_secrets` in `http.rs` when adding new logged surfaces.
+- Don't log API/upstream payload bodies by default. `api_log_body_mode` and `upstream_request_log_body_mode` default to `metadata`; `redacted_payload` remains an explicit opt-in and must use the shared secret + image-URI redactors.
+- Don't forward client credentials to upstreams. Raw proxy/header forwarding uses a narrow allowlist; inbound `authorization`, `x-api-key`, `api-key`, cookies, proxy credentials, and dashboard/session headers stay at the gateway.
 - Don't introduce blocking IO on the tokio runtime. Upstream request log uses `spawn_blocking` for a reason.
 - Don't silence cancellation. Every long-running task in `run_turn` selects on `tx.closed()` so client hang-up cancels upstream work — preserve that pattern.
 - Don't lower the hard ceilings listed above.
@@ -190,7 +199,9 @@ Profiles are considered against the resolved catalog model, the configured upstr
 
 - `flatten_content` defaults to `true` — multimodal text-only content gets flattened to bare string before going upstream. Some providers expect arrays; the option is configurable.
 - `OPENAI_API_KEY` is a fallback upstream key when `upstream_api_key` is unset.
-- Chat and Anthropic ingress set canonical `store=false`; raw Responses defaults to `store=true`, enabling replay unless the caller disables it.
+- Chat and Anthropic ingress set canonical `store=false`; raw Responses defaults to `store=true`, which controls only Responses state persistence. Private replay defaults off and is configured separately.
+- `response_store` defaults to a bounded TTL-aware memory LRU (`1000` entries, `720` hours). SQLite mode requires `path`, uses a versioned transactional database plus bounded memory front cache, and performs database work off the async runtime.
+- All `/v1/*` routes require `LLMCONDUIT_API_TOKEN` when it is configured (Bearer or `x-api-key`, constant-time digest comparison). Loopback may run without a token; non-loopback startup requires the token or explicit `LLMCONDUIT_ALLOW_UNAUTHENTICATED_API=1`. `/` and `/health` remain public; dashboard auth is separate.
 - `/v1/messages` has HEAD/OPTIONS probe routes returning `204` with `Allow: POST, HEAD, OPTIONS`.
 - `/v1/models` is reshaped to Anthropic-style pagination when `anthropic-version` or `anthropic-beta` is present; OpenAI-style responses can preserve upstream `ETag`, Anthropic-shaped responses do not.
 - `/health` returns `{"status":"healthy"}` and `/` returns `{"status":"ok"}`. There is no `/healthz` route.

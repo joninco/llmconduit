@@ -403,11 +403,14 @@ mod integration {
             system_prompt_prefix: None,
             upstream_request_log_path: None,
             turn_capture_dir: None,
+            api_log_body_mode: Default::default(),
+            upstream_request_log_body_mode: Default::default(),
             upstream_chat_kwargs: serde_json::Map::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
+            responses_capabilities: Default::default(),
             model_routes: Vec::new(),
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
@@ -418,6 +421,8 @@ mod integration {
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: Default::default(),
+            replay: Default::default(),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -439,7 +444,7 @@ mod integration {
             "choices": [{
                 "index": 0,
                 "delta": {"role": "assistant", "content": "hello after retry"},
-                "finish_reason": null
+                "finish_reason": "stop"
             }],
             "usage": null
         });
@@ -721,6 +726,7 @@ mod integration {
             exposed_model: None,
             upstream_chat_kwargs: serde_json::Map::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
         }];
         config.upstream_failure_cooldown_secs = 3600;
 
@@ -755,8 +761,8 @@ mod integration {
         let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("prompt is too long") && message.contains("reduce the prompt"),
-            "error must tell the caller to reduce the prompt, got: {message}"
+            message.contains("prompt is too long") && message.contains("reduce the input"),
+            "error must tell the caller to reduce its request, got: {message}"
         );
 
         let primary_posts = chat_post_bodies(&primary).await.len();
@@ -828,6 +834,7 @@ mod integration {
             exposed_model: None,
             upstream_chat_kwargs: serde_json::Map::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
         }];
         config.upstream_failure_cooldown_secs = 3600;
 
@@ -925,6 +932,7 @@ mod integration {
             exposed_model: None,
             upstream_chat_kwargs: serde_json::Map::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
         }];
         config.upstream_failure_cooldown_secs = 3600;
 
@@ -959,11 +967,16 @@ mod integration {
             .await
             .expect("read body");
         let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
+        assert_eq!(
+            body["error"]["message"].as_str(),
+            Some("prompt is too long for the selected model; reduce the input or output limit"),
+            "the public error must stay actionable without exposing the upstream body"
+        );
         assert!(
-            body["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("persisted after shrink-and-retry")),
-            "error should describe the persistent overflow, got: {body}"
+            !body
+                .to_string()
+                .contains("persisted after shrink-and-retry"),
+            "operator-only retry diagnostics must not reach the client: {body}"
         );
 
         // Primary saw the original POST plus exactly one retry: the unchanged
@@ -1061,11 +1074,16 @@ mod integration {
             .await
             .expect("read body");
         let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
+        assert_eq!(
+            body["error"]["message"].as_str(),
+            Some("prompt is too long for the selected model; reduce the input or output limit"),
+            "cap exhaustion must use the sanitized prompt-too-long error"
+        );
         assert!(
-            body["error"]["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("persisted after shrink-and-retry")),
-            "cap exhaustion should surface the persisted-overflow terminal, got: {body}"
+            !body
+                .to_string()
+                .contains("persisted after shrink-and-retry"),
+            "operator-only retry diagnostics must not reach the client: {body}"
         );
 
         let chat_requests = chat_post_bodies(&server).await;
@@ -1235,6 +1253,7 @@ mod integration {
         ));
         let mut config = config_for(&server.uri());
         config.upstream_request_log_path = Some(log_path.clone());
+        config.upstream_request_log_body_mode = llmconduit::config::LogBodyMode::RedactedPayload;
 
         let app = llmconduit::build_app(config);
         let response = app
@@ -1262,7 +1281,22 @@ mod integration {
             .await
             .expect("read body");
 
-        let logged = std::fs::read_to_string(&log_path).expect("read request log");
+        let logged = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(logged) = std::fs::read_to_string(&log_path)
+                    && logged
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .count()
+                        >= 2
+                {
+                    break logged;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("request-log writer drained its bounded queue");
         let lines: Vec<&str> = logged.lines().filter(|l| !l.trim().is_empty()).collect();
         assert_eq!(
             lines.len(),
@@ -1648,8 +1682,12 @@ mod integration {
         let body: Value = serde_json::from_slice(&body_bytes).expect("json body");
         let message = body["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("prompt is too long") && message.contains("exact"),
-            "terminal must cite the exact tokenizer count, got: {message}"
+            message.contains("prompt is too long") && message.contains("reduce the input"),
+            "terminal must remain actionable without exposing upstream diagnostics: {message}"
+        );
+        assert!(
+            !message.contains("exact") && !message.contains("tokenizer"),
+            "provider diagnostic details must remain operator-only: {message}"
         );
 
         assert_eq!(

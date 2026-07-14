@@ -51,6 +51,9 @@ The HTTP leaf. One instance per upstream `base_url` + `api_key`. Owns the `reqwe
 - The leaf is the single point that sees the FINAL provider-model after routing/failover/exposed-alias remap — so it applies `finalization_policies` keyed by `request.model` at line 1511.
 - G1 shrink-and-retry (lines 1382–1466) happens INSIDE `dispatch_chat_stream` BEFORE any SSE chunk is parsed — the routing/failover layers never see a context-limit error as a provider failure.
 - D2 bare-leaf marker (`tag_primary_provider` at line 538) prevents a leaf nested inside failover/routing from clobbering the real provider name.
+- Request-intrinsic 400/413/415/422 failures are terminal for that selected primary: they neither cool the provider nor try a fallback. Retryable connect/header timeout, 408, 429, and 5xx failures retain pre-first-chunk failover.
+- Raw proxy forwarding uses an allowlist. Client `authorization`, `x-api-key`, `api-key`, cookie, proxy-credential, and dashboard/session headers are never forwarded; each upstream uses only its configured credential.
+- Responses capability filtering is scoped to the already-selected primary chain. An incapable primary rejects the request, while incapable nested fallbacks are removed without cooldown; routing does not jump to another primary for capability acquisition.
 
 ---
 

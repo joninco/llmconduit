@@ -26,7 +26,7 @@ pub fn convert_request(request: ChatCompletionRequest) -> AppResult<ResponsesReq
     let extra_body = request.extra_body.clone();
     Ok(ResponsesRequest {
         model: request.model,
-        instructions: String::new(),
+        instructions: String::new().into(),
         input,
         tools,
         tool_choice: request
@@ -44,9 +44,10 @@ pub fn convert_request(request: ChatCompletionRequest) -> AppResult<ResponsesReq
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_retention: None,
         text: convert_response_format(request.response_format.as_ref()),
-        client_metadata: None,
         previous_response_id: None,
+        llmconduit_replay: None,
         temperature: request.temperature,
         top_p: request.top_p,
         max_output_tokens: request.max_output_tokens,
@@ -79,7 +80,7 @@ fn convert_message(message: &ChatMessage, items: &mut Vec<ResponseItem>) -> AppR
                 })?;
             items.push(ResponseItem::FunctionCallOutput {
                 call_id,
-                output: tool_output_value(message.content.as_ref()),
+                output: tool_output_value(message.content.as_ref()).into(),
             });
         }
         "assistant" => {
@@ -347,6 +348,10 @@ fn convert_response_format(format: Option<&Value>) -> Option<TextControls> {
                 .and_then(Value::as_str)
                 .unwrap_or("response")
                 .to_string(),
+            description: schema
+                .get("description")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
         }),
     })
 }
@@ -1009,6 +1014,7 @@ struct ChatCompletionTokensDetails {
 #[cfg(test)]
 mod tests {
     use super::convert_request;
+    use super::convert_response_format;
     use crate::models::chat::ChatCompletionRequest;
     use crate::models::chat::ChatMessage;
     use serde_json::Value;
@@ -1054,6 +1060,27 @@ mod tests {
         let converted = convert_request(request).expect("convert request");
 
         assert_eq!(converted.extra_body, extra_body);
+    }
+
+    #[test]
+    fn convert_response_format_preserves_json_schema_description() {
+        let converted = convert_response_format(Some(&json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "description": "A structured answer.",
+                "schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                },
+                "strict": true
+            }
+        })))
+        .expect("JSON Schema response format");
+        let format = converted.format.expect("text format");
+        assert_eq!(format.description.as_deref(), Some("A structured answer."));
     }
 
     // --- G2 Finding 2: forced-but-unrequested reasoning suppression (Chat) ---

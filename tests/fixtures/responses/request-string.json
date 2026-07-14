@@ -1,0 +1,6 @@
+{
+  "model": "model-a",
+  "input": "Hello",
+  "stream": false,
+  "store": false
+}

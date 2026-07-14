@@ -35,6 +35,19 @@ upstream_base_url: "http://127.0.0.1:8000/v1"
 upstream_model: "Qwen3.5"
 ```
 
+Loopback listeners may run without client authentication. For any wildcard or
+other non-loopback bind, startup requires an environment-only API token unless
+you explicitly opt into insecure development serving:
+
+```bash
+export LLMCONDUIT_API_TOKEN='replace-with-a-dedicated-gateway-token'
+```
+
+Clients may present it as `Authorization: Bearer …` or `x-api-key`. The token
+protects every `/v1/*` route and is never a YAML field. `/` and `/health` stay
+public; dashboard authentication is separate. The development-only escape
+hatch is `LLMCONDUIT_ALLOW_UNAUTHENTICATED_API=1`.
+
 Multi-upstream model routing:
 
 ```yaml
@@ -47,9 +60,10 @@ upstreams:
 ```
 
 When `upstreams` is configured, llmconduit exposes the ordered union of the
-primary upstream model catalogs. If a request omits `model`, passes a blank
-model, or requests a model that is not currently available, llmconduit uses the
-first model from the first upstream with a catalog entry. Requested model names
+primary upstream model catalogs. Chat Completions and Anthropic Messages keep
+the existing default-model behavior for a missing, blank, or unavailable model.
+Raw Responses requests require `model` (400 when missing and 404 when explicitly
+unknown). Requested model names
 are normalized against the catalogs, so aliases such as different case or
 punctuation route to the exact model id exposed by the backend. If multiple
 upstreams expose the same model id, the first upstream wins.
@@ -203,6 +217,39 @@ model_profiles:
   A matched profile without a `capabilities` block gets no fill-in from the `*`
   profile. Caps resolve per upstream id: an id-keyed profile, else the first alias
   whose `upstream_model` targets the id, else the reserved `*` profile.
+
+### Responses capabilities
+
+Responses-only feature support is declared separately and resolved by provider
+plus served model. Global declarations are overlaid by the selected provider
+and then the matching model profile:
+
+```yaml
+responses_capabilities:
+  parallel_tool_calls: false
+  structured_outputs: [text, json_object, json_schema]
+  reasoning_summary: upstream
+  encrypted_reasoning: unsupported
+  input_image: placeholder
+  input_file: unsupported
+  truncation_auto: unsupported
+  text_verbosity: unsupported
+  service_tiers: []
+  prompt_cache_key: gateway_hash
+  prompt_cache_retention: []
+```
+
+An advanced feature omitted from the resolved declaration is unsupported, apart
+from the existing safe placeholder policy for non-native image input. A request
+that needs an unsupported primary capability receives an OpenAI-shaped
+400 naming the parameter. An incapable nested fallback is removed only for that
+request, without cooldown or health penalty; routing never jumps to a different
+primary merely to gain a capability. Hosted OpenAI Files, Conversations, Code
+Interpreter, and Computer Use remain outside llmconduit's implemented surface.
+
+`prompt_cache_key: gateway_hash` hashes the opaque key before local use and
+does not forward the original; `upstream` forwards it. Raw images still never
+reach a non-native backend.
 
 ### Reasoning effort
 
@@ -402,6 +449,32 @@ forwarded raw:
 unsupported_image_policy: placeholder
 ```
 
+### Responses state and replay
+
+Responses `store` and `previous_response_id` use a bounded state store. Memory
+is the default; SQLite adds continuity across restarts:
+
+```yaml
+response_store:
+  backend: memory       # memory | sqlite
+  path: null            # required for sqlite
+  max_entries: 1000
+  retention_hours: 720
+
+replay:
+  enabled: false
+  max_entries: 100
+```
+
+`store:true` persists completed/incomplete canonical history;
+`store:false` never does. Failed and cancelled responses are not referenceable.
+Responses `instructions` accepts either the standard string form or a normalized
+Response input-item array (including easy messages). Current instructions replace,
+rather than inherit, previous instructions.
+Private visible-history replay is a separate optimization, defaults off, and
+can be bypassed per request with the consumed `llmconduit_replay:false`
+extension when the server feature is enabled.
+
 ## Run
 
 ```bash
@@ -419,21 +492,10 @@ The gateway listens on `http://127.0.0.1:4000` by default.
 
 ## Codex
 
-```toml
-[model_providers.llmconduit]
-name = "llmconduit"
-base_url = "http://127.0.0.1:4000/v1"
-wire_api = "responses"
-requires_openai_auth = false
-
-[profiles.llmconduit]
-model_provider = "llmconduit"
-model = "Qwen3.5"
-```
-
-```bash
-codex -p llmconduit "what files are in this directory?"
-```
+Use the standard Responses base URL plus the checked Codex model catalog; do
+not change `/v1/models` to Codex's private catalog shape. See
+[docs/codex.md](docs/codex.md) for the complete provider configuration and
+version-specific catalog guidance.
 
 ## Docker
 
@@ -445,8 +507,12 @@ docker build -t llmconduit .
 docker run --rm -p 4000:4000 \
   --add-host=host.docker.internal:host-gateway \
   -e LLMCONDUIT_UPSTREAM_BASE_URL=http://host.docker.internal:8000/v1 \
+  -e LLMCONDUIT_API_TOKEN="$LLMCONDUIT_API_TOKEN" \
   llmconduit
 ```
+
+The image binds `0.0.0.0:4000`, so `LLMCONDUIT_API_TOKEN` is a required
+deployment input unless the explicit insecure API override is supplied.
 
 To expose `/debug` and `/dashboard`, replace the final line with
 `llmconduit start --with-debug-ui`.
@@ -464,7 +530,7 @@ startup logs a prominent warning because `/debug` and `/dashboard` will be open.
 | `POST /v1/messages` | Anthropic Messages API |
 | `GET /v1/models` | Proxied model list |
 | `GET /metrics` | Raw Prometheus passthrough from the first configured primary upstream |
-| `GET /healthz` | Health check |
+| `GET /health` | Health check (public) |
 | `GET /debug` | Debug UI when started with `--with-debug-ui` |
 
 `/metrics` preserves the primary backend's status, body, and eligible end-to-end
@@ -483,6 +549,8 @@ LLMCONDUIT_UPSTREAM_API_KEY
 LLMCONDUIT_UPSTREAM_MODEL
 LLMCONDUIT_SYSTEM_PROMPT_PREFIX
 LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON
+LLMCONDUIT_API_LOG_BODY_MODE
+LLMCONDUIT_UPSTREAM_REQUEST_LOG_BODY_MODE
 LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS
 LLMCONDUIT_BRAVE_MAX_RESULTS
 LLMCONDUIT_REQUEST_TIMEOUT_SECS
@@ -492,6 +560,8 @@ LLMCONDUIT_MAX_REPLAY_ENTRIES
 LLMCONDUIT_FLATTEN_CONTENT
 LLMCONDUIT_TURN_CAPTURE_DIR
 LLMCONDUIT_BACKEND_METRICS
+LLMCONDUIT_API_TOKEN
+LLMCONDUIT_ALLOW_UNAUTHENTICATED_API
 BRAVE_SEARCH_API_KEY
 OPENAI_API_KEY
 ```
@@ -510,7 +580,13 @@ Set this in config to write upstream chat requests as JSONL:
 
 ```yaml
 upstream_request_log_path: "/tmp/llmconduit-upstream.jsonl"
+upstream_request_log_body_mode: metadata
 ```
+
+API and upstream request-body logging default to `metadata`. Set the relevant
+mode to `redacted_payload` only for deliberate diagnostics; payload mode still
+uses shared secret and image-URI redaction. Malformed JSON is logged only as a
+bounded hash/length marker. Turn capture remains separately opt-in.
 
 Then inspect prefix stability:
 

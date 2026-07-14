@@ -17,12 +17,19 @@
 # LISTEN ADDRESS
 # ---------------------------------------------------------------------------
 # bind_addr: "127.0.0.1:4000"                    # default
+# Public API authentication is environment-only: set LLMCONDUIT_API_TOKEN for
+# Bearer/x-api-key authentication. Loopback may run unauthenticated; wildcard
+# or other non-loopback binds require that token or the explicit development
+# override LLMCONDUIT_ALLOW_UNAUTHENTICATED_API=1. Never persist the token here.
 
 # ---------------------------------------------------------------------------
 # SINGLE-UPSTREAM MODE (no `upstreams:` list, no `model_routes:`)
 # ---------------------------------------------------------------------------
 # When `upstreams:` and `model_routes:` are both absent (or empty), the config
 # acts as a simple single-backend proxy. These fields configure that backend:
+# Service URLs (`upstream_base_url`, every routing/fallback URL,
+# `brave_base_url`, and `vision_url`) must not contain URL userinfo, query
+# strings, or fragments. Put credentials in the dedicated key fields/env vars.
 #
 # upstream_base_url: "http://127.0.0.1:8000/v1"   # default
 # upstream_api_key: "sk-..."                      # or set OPENAI_API_KEY env
@@ -59,6 +66,14 @@ upstreams:
     # Client-provided values override these (client-wins merge).
     # upstream_chat_kwargs:
     #   temperature: 0.7
+
+    # Optional Responses feature declaration for this provider. Missing
+    # advanced capabilities are treated conservatively as unsupported, apart
+    # from the existing safe image-placeholder policy.
+    # responses_capabilities:
+    #   parallel_tool_calls: false
+    #   structured_outputs: [text, json_object]
+    #   reasoning_summary: upstream
 
   - name: "openai"
     upstream_base_url: "https://api.openai.com/v1"
@@ -98,6 +113,25 @@ model_routes:
 upstream_failure_cooldown_secs: 30             # default
 
 # ---------------------------------------------------------------------------
+# OPENAI RESPONSES CAPABILITIES
+# ---------------------------------------------------------------------------
+# Global declaration; provider and resolved model-profile declarations overlay
+# this field-by-field. The selected primary must support a requested feature.
+# Incapable nested fallbacks are pruned for that request without cooldown.
+# responses_capabilities:
+#   parallel_tool_calls: false
+#   structured_outputs: [text, json_object, json_schema]
+#   reasoning_summary: upstream       # upstream | unsupported
+#   encrypted_reasoning: unsupported  # passthrough | unsupported
+#   input_image: placeholder          # native | agent | placeholder | reject
+#   input_file: unsupported           # native | unsupported
+#   truncation_auto: unsupported      # upstream | unsupported
+#   text_verbosity: unsupported       # upstream | unsupported
+#   service_tiers: []
+#   prompt_cache_key: gateway_hash    # gateway_hash | upstream | unsupported
+#   prompt_cache_retention: []
+
+# ---------------------------------------------------------------------------
 # PER-MODEL PROFILES
 # ---------------------------------------------------------------------------
 # Profiles attach sampling defaults, role-routing rules, template-family
@@ -116,6 +150,8 @@ model_profiles:
   # DeepSeek's template expects `developer` messages and rejects unknown roles.
   deepseek-chat:
     template_family: deepseek
+    # responses_capabilities:
+    #   structured_outputs: [text, json_object]
     upstream_chat_kwargs:
       temperature: 1.0
       top_p: 1.0
@@ -267,6 +303,10 @@ model_profile_templates:
 # path -- the top-level path is then only used by route paths.
 #
 # upstream_request_log_path: "/var/log/llmconduit/requests.jsonl"
+# Request bodies are not logged by default. `redacted_payload` is an explicit
+# diagnostic opt-in and still applies shared secret and image-URI redaction.
+api_log_body_mode: metadata                    # metadata | redacted_payload
+upstream_request_log_body_mode: metadata       # metadata | redacted_payload
 # debug_log_max_age_hours: 24                 # auto-rotate log files older than N hours
 
 # ---------------------------------------------------------------------------
@@ -313,7 +353,20 @@ connect_timeout_secs: 10                         # default (TCP connect timeout)
 # TOKEN / MEMORY / SECURITY LIMITS
 # ---------------------------------------------------------------------------
 # min_completion_tokens: 4096                    # floor for shrink-and-retry (default)
-# max_replay_entries: 1000                       # max conversation replay entries (default)
+
+# Public Responses state (`store` / `previous_response_id`). Memory is a
+# bounded TTL-aware LRU. SQLite persists across restarts and requires `path`.
+# response_store:
+#   backend: memory                              # memory | sqlite
+#   path: null                                   # required for sqlite
+#   max_entries: 1000
+#   retention_hours: 720
+
+# Private visible-history replay is independent from Responses `store` and is
+# disabled by default. `max_replay_entries` is a deprecated size alias.
+# replay:
+#   enabled: false
+#   max_entries: 100
 
 # SSE frame byte ceiling (G6 DoS guard). An oversized/never-terminated upstream
 # SSE frame is rejected beyond this point before unbounded buffer growth.
@@ -363,6 +416,8 @@ connect_timeout_secs: 10                         # default (TCP connect timeout)
 # LLMCONDUIT_TEMPLATE_FAMILY               template_family (global)
 # LLMCONDUIT_SYSTEM_PROMPT_PREFIX          system_prompt_prefix
 # LLMCONDUIT_UPSTREAM_REQUEST_LOG_PATH     upstream_request_log_path
+# LLMCONDUIT_API_LOG_BODY_MODE             api_log_body_mode
+# LLMCONDUIT_UPSTREAM_REQUEST_LOG_BODY_MODE upstream_request_log_body_mode
 # LLMCONDUIT_TURN_CAPTURE_DIR              turn_capture_dir
 # LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON     upstream_chat_kwargs (JSON map, wholesale replace)
 # LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS  upstream_failure_cooldown_secs
@@ -386,3 +441,5 @@ connect_timeout_secs: 10                         # default (TCP connect timeout)
 # LLMCONDUIT_PRICE_TABLE_JSON              price_table (JSON map, wholesale replace)
 # BRAVE_SEARCH_API_KEY                     brave_api_key
 # OPENAI_API_KEY                           upstream_api_key (fallback when no YAML/env-first set)
+# LLMCONDUIT_API_TOKEN                     /v1/* auth token (environment-only)
+# LLMCONDUIT_ALLOW_UNAUTHENTICATED_API     explicit non-loopback development override

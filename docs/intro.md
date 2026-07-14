@@ -23,6 +23,8 @@ Client protocol
 | Routes | `src/http.rs` | [routes.md](routes.md) |
 | Adapters | `src/adapters/` | [adapters.md](adapters.md) |
 | Engine | `src/engine.rs` | [engine.md](engine.md) |
+| Responses state/capabilities | `src/response_store.rs`, `src/responses_capabilities.rs` | [config.md](config.md) |
+| Public API authentication | `src/api_auth.rs`, `src/http.rs` | [routes.md](routes.md) |
 | Config | `src/config.rs` + `config.yaml` | [config.md](config.md) |
 | Upstream | `src/upstream.rs` | [upstream.md](upstream.md) |
 | Server-side tools | `src/search.rs`, `src/vision/` | [tools.md](tools.md) |

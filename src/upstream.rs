@@ -1,11 +1,10 @@
+use crate::config::LogBodyMode;
 use crate::config::merge_json_maps;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::error::FailoverDisposition;
 use crate::models::chat::ChatCompletionChunk;
 use crate::models::chat::ChatCompletionRequest;
-use crate::proxy_headers::header_name_eq;
-use crate::proxy_headers::is_hop_by_hop_header;
 use crate::sse_guard::bounded_sse_byte_stream;
 use crate::sse_guard::default_max_sse_frame_bytes;
 use crate::turn_capture::TurnCaptureState;
@@ -22,6 +21,7 @@ use reqwest::StatusCode;
 use serde::Serialize;
 use serde_json::Map as JsonMap;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -46,6 +46,81 @@ use url::Url;
 /// times in a row AND is still inside its cooldown window is shown as hard-down
 /// in the topology map; a single transient failure stays `Cooling`.
 const DOWN_THRESHOLD: u32 = 3;
+const UPSTREAM_ERROR_CAPTURE_BODY_CAP: usize = 128 * 1024;
+const UPSTREAM_ERROR_CAPTURE_SCALAR_CAP: usize = 4 * 1024;
+/// Hard ceiling for a non-success upstream HTTP body. These responses are
+/// diagnostics, not model output; retaining an unbounded `.text()` body lets a
+/// hostile provider exhaust gateway memory before the capture/log redactors
+/// ever see it. Keep this equal to the durable-capture ceiling so every caller
+/// has one bounded representation to classify and (when safe) persist.
+const UPSTREAM_ERROR_BODY_READ_CAP: usize = UPSTREAM_ERROR_CAPTURE_BODY_CAP;
+/// Successful model catalogs are expected to be small, but some providers add
+/// rich per-model metadata. Keep enough headroom for those catalogs while
+/// preventing an upstream from forcing an unbounded JSON allocation.
+const UPSTREAM_MODELS_BODY_READ_CAP: usize = 4 * 1024 * 1024;
+/// `/tokenize` returns a scalar count (plus, on some servers, a short token-id
+/// array). A 64 KiB ceiling is deliberately generous for that control-plane
+/// response while keeping the fallback path bounded.
+const UPSTREAM_TOKENIZE_BODY_READ_CAP: usize = 64 * 1024;
+const DEFAULT_RESPONSE_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const CREDENTIALLED_UPSTREAM_ERROR_MARKER: &str = r#"{"error":"[redacted: upstream error body omitted because backend credentials are configured]"}"#;
+
+#[derive(Debug)]
+struct BoundedUpstreamErrorBody {
+    text: String,
+    truncated: bool,
+}
+
+impl BoundedUpstreamErrorBody {
+    /// Preserve the existing capture API's length-based `truncated` signal. The
+    /// retained prefix is exactly the capture cap; appending a fixed marker makes
+    /// the downstream capped serializer report that the source was incomplete
+    /// without retaining any additional provider-controlled bytes.
+    fn capture_text(&self) -> String {
+        if self.truncated {
+            format!("{}\n[llmconduit: upstream error body truncated]", self.text)
+        } else {
+            self.text.clone()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundedBodyReadError {
+    IdleTimeout,
+    Transport,
+}
+
+/// Read a small, non-streaming upstream response with a retained-byte ceiling
+/// and an IDLE deadline. The deadline is restarted for every body chunk rather
+/// than wrapping the whole response, so a healthy slow transfer can take longer
+/// than `idle_timeout` while a provider that stops making progress is bounded.
+async fn read_body_capped_with_idle_timeout(
+    response: reqwest::Response,
+    limit: usize,
+    idle_timeout: Duration,
+) -> Result<(Vec<u8>, bool), BoundedBodyReadError> {
+    let limit = limit.max(1);
+    let idle_timeout = idle_timeout.max(Duration::from_millis(1));
+    let mut body = Vec::with_capacity(limit.min(16 * 1024));
+    let mut stream = response.bytes_stream();
+
+    loop {
+        let next = tokio::time::timeout(idle_timeout, stream.next())
+            .await
+            .map_err(|_| BoundedBodyReadError::IdleTimeout)?;
+        let Some(chunk) = next else {
+            return Ok((body, false));
+        };
+        let chunk = chunk.map_err(|_| BoundedBodyReadError::Transport)?;
+        let remaining = limit.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            return Ok((body, true));
+        }
+        body.extend_from_slice(&chunk);
+    }
+}
 
 /// Wall-clock epoch-ms, for the serializable [`ProviderHealth`] timestamps. The
 /// upstream cooldown bookkeeping uses a monotonic [`Instant`] (immune to clock
@@ -96,17 +171,12 @@ fn stamp_header_byte(serving: Option<&Arc<ServingToken>>) {
 /// Round-1 review (F2): classification is driven by STRUCTURED metadata and FIXED
 /// gateway-emitted prefixes only — never by a `contains()` substring scan of the full
 /// `Display` text, which can include the redacted-but-attacker-influenced upstream
-/// response body interpolated into `"upstream chat failed with {status}: {body}"`. A raw
-/// body containing the literal text `"timed out"` / `"request failed"` must NOT be able to
-/// flip the bounded code. So:
+/// response body. Raw body text such as `"timed out"` / `"request failed"` must NOT be
+/// able to flip the bounded code. So:
 ///   - We match the gateway's OWN fixed leaf-error PREFIXES with `starts_with`
-///     against the part of the message BEFORE any `{body}` is interpolated. Each
-///     body-bearing gateway error is `"<fixed prefix> {status}: <body>"` or
-///     `"<fixed prefix>: <reqwest err>"`, so a `starts_with` on the fixed prefix is
-///     immune to body content (the body is strictly after the prefix). Body-free fixed
-///     markers (timeout / stream-ended) match in full. First-chunk read/parse failures
-///     from `stream_success_response` (`"failed to parse upstream chat chunk: …"` /
-///     `"failed to read upstream SSE: …"`) match their fixed prefix → `Stream`.
+///     against gateway-owned messages. HTTP-status and stream-parse errors contain
+///     no provider body; transport errors retain only reqwest transport detail.
+///     Body-free fixed markers (timeout / stream-ended) match in full.
 ///   - Only once NONE of those fixed prefixes match do we fall back to `Terminal`
 ///     disposition (E2a: this is now checked LAST, not first — see below) and finally
 ///     `Other`.
@@ -145,17 +215,13 @@ fn classify_attempt_error(err: &AppError) -> crate::dashboard_flow::AttemptError
     }
     // Timeout / stream-ended-before-first-chunk: BODY-FREE fixed markers from
     // `prefetch_first_chunk` / `stream_after_prefetch` — exact, no interpolation.
-    if message == "upstream stream timed out" {
+    if message == "upstream stream timed out" || message == "upstream response headers timed out" {
         return AttemptErrorClass::Timeout;
     }
     if message == "upstream stream ended before the first chunk" {
         return AttemptErrorClass::Stream;
     }
-    // Non-2xx HTTP status: `"upstream chat failed with {status}: {body}"`. The `{body}`
-    // is interpolated strictly AFTER this fixed prefix, so `starts_with` cannot be
-    // influenced by body text (a body that itself contains "timed out" / "request failed"
-    // is already excluded above because those branches require the message to START with /
-    // EQUAL their own markers, which this variant never does). E2a: this ALSO catches a
+    // Non-2xx HTTP status: `"upstream chat failed with {status}"`. E2a: this ALSO catches a
     // request-intrinsic 4xx tagged `Terminal` — same message shape, same bounded code,
     // regardless of disposition (see the function doc comment).
     if message.starts_with("upstream chat failed with ") {
@@ -223,7 +289,8 @@ pub struct ProviderHealth {
     pub status: ProviderStatus,
     /// Epoch-ms instant the cooldown window ends, when cooling (else `None`).
     pub cooling_until_ms: Option<u64>,
-    /// The most recent failure message recorded for this provider (else `None`).
+    /// The most recent bounded failure classification recorded for this provider
+    /// (else `None`). Never contains upstream response text.
     pub last_error: Option<String>,
     /// Cumulative count of flows this provider served (produced a first chunk).
     pub served_count: u64,
@@ -423,7 +490,9 @@ pub trait UpstreamClient: Send + Sync {
         request: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
-        let stream = self.stream_chat_completion(request).await?;
+        let stream = tokio::time::timeout(request_timeout, self.stream_chat_completion(request))
+            .await
+            .map_err(|_| upstream_response_headers_timeout())??;
         Ok(timeout_upstream_stream(stream, request_timeout))
     }
     async fn list_models(&self) -> AppResult<reqwest::Response>;
@@ -456,6 +525,13 @@ pub trait UpstreamClient: Send + Sync {
     async fn count_tokens(&self, _request: &BackendChatRequest) -> AppResult<Option<u64>> {
         Ok(None)
     }
+    /// Idle deadline used while consuming bounded, non-streaming response
+    /// bodies such as `/v1/models`. Concrete HTTP clients override this with
+    /// the configured request timeout; mock/in-process clients keep the safe
+    /// historical default.
+    fn response_body_idle_timeout(&self) -> Duration {
+        DEFAULT_RESPONSE_BODY_IDLE_TIMEOUT
+    }
     /// The upstream model catalog (ids + per-model context length) from a single
     /// `/v1/models` snapshot. The default impl fetches `list_models()` once and
     /// parses both the id list and the context-window length per entry, so model
@@ -465,7 +541,7 @@ pub trait UpstreamClient: Send + Sync {
     /// `context_limit: None` (budgeting no-ops for them).
     async fn supported_model_catalog(&self) -> AppResult<Vec<UpstreamModelEntry>> {
         let response = self.list_models().await?;
-        collect_supported_model_catalog(response).await
+        collect_supported_model_catalog(response, self.response_body_idle_timeout()).await
     }
 
     /// Every backend model `requested_model` could ACTUALLY be served by
@@ -508,6 +584,23 @@ pub trait UpstreamClient: Send + Sync {
         }
     }
 
+    /// Responses capability candidates for the already-selected route. The
+    /// first entry is the primary; later entries are pre-first-chunk fallbacks.
+    async fn responses_capability_plan(
+        &self,
+        requested_model: &str,
+    ) -> crate::responses_capabilities::CapabilityPlan {
+        crate::responses_capabilities::CapabilityPlan {
+            candidates: vec![crate::responses_capabilities::CapabilityCandidate {
+                target: crate::responses_capabilities::CapabilityTarget {
+                    provider: "primary".to_string(),
+                    model: requested_model.to_string(),
+                },
+                capabilities: crate::responses_capabilities::ResponsesCapabilities::default(),
+            }],
+        }
+    }
+
     /// Per-upstream health + cumulative counters for the dashboard topology map
     /// (D4). A NON-async, dyn-safe default (mirrors `supported_model_catalog`'s
     /// default so `Arc<dyn UpstreamClient>` stays object-safe): the bare leaf and
@@ -522,11 +615,16 @@ pub trait UpstreamClient: Send + Sync {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ReqwestUpstreamClient {
     client: reqwest::Client,
     base_url: Url,
     api_key: Option<String>,
+    /// Maximum wait for an upstream to return response headers and maximum idle
+    /// gap while consuming raw proxy bodies. This deliberately is not installed
+    /// as a reqwest total-request deadline: healthy long-lived generation streams
+    /// may run for substantially longer than one idle interval.
+    request_timeout: Duration,
     request_logger: Option<UpstreamRequestLogger>,
     flatten_content: bool,
     /// Floor for the shrink-and-retry completion budget on a context-window
@@ -545,6 +643,9 @@ pub struct ReqwestUpstreamClient {
     /// model after routing/failover/exposed-alias remap (T1). Shared (cheap
     /// clone) across all providers; empty when no profile defines any.
     finalization_policies: BackendFinalizationPolicies,
+    /// Provider-layer Responses capability overrides. These are merged over
+    /// global declarations and under the final served-model profile.
+    responses_capabilities: crate::responses_capabilities::ResponsesCapabilitiesConfig,
     /// D2 capture seam: the dashboard FlowStore handle (a cheap `Clone` sharing the
     /// inner `Arc<Mutex<_>>`). The leaf is the SINGLE point that sees the TRUE
     /// on-wire chat-completions body — POST `finalize_request_for_backend` +
@@ -561,6 +662,21 @@ pub struct ReqwestUpstreamClient {
     /// on first-chunk success (the leaf runs BEFORE that success, so a
     /// first-writer-wins tag here would otherwise win over the true provider).
     tag_primary_provider: bool,
+}
+
+impl std::fmt::Debug for ReqwestUpstreamClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReqwestUpstreamClient")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("request_timeout", &self.request_timeout)
+            .field("request_logger", &self.request_logger)
+            .field("flatten_content", &self.flatten_content)
+            .field("min_completion_tokens", &self.min_completion_tokens)
+            .field("max_sse_frame_bytes", &self.max_sse_frame_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -735,9 +851,14 @@ pub struct RoutingUpstreamClient {
     route_providers: Vec<RouteUpstreamProvider>,
     routes: Vec<ModelRouteSpec>,
     catalog: Arc<AsyncMutex<Option<CachedRoutingModelCatalog>>>,
+    /// Serializes refreshes without holding the catalog value lock while network
+    /// I/O is pending. Readers of a still-fresh snapshot take only the short
+    /// `catalog` lock; the first stale reader refreshes and later readers
+    /// double-check after acquiring this gate.
+    catalog_refresh: Arc<AsyncMutex<()>>,
     /// D4 catalog metadata `(fetched_ms, size)` published for the topology map.
     /// Swapped as a SINGLE immutable `Arc<CatalogMeta>` inside `refresh_catalog`
-    /// (under the `catalog` `AsyncMutex` hold) so a lock-free `provider_health()`
+    /// (under the refresh gate) so a lock-free `provider_health()`
     /// reader can never observe a torn `(fetched_ms, size)` pair — the two fields
     /// always move together. Default `Arc<CatalogMeta>` (both `None`) until the
     /// first refresh.
@@ -832,15 +953,8 @@ struct RoutingFallbackExposedModel {
 #[derive(Debug, Clone, Default)]
 struct ProviderCooldownState {
     cooling_until: Option<Instant>,
+    // Bounded `AttemptErrorClass` name only; never retain an AppError/body here.
     last_error: Option<String>,
-}
-
-/// Cheap case-insensitive scan for a potential image-URI marker (`data:` /
-/// `http`) in serialized request bytes, so the log fast-path only pays the
-/// redaction round-trip when an image URL might be present (G4 round-4 #3).
-fn bytes_contain_image_uri(bytes: &[u8]) -> bool {
-    bytes.windows(5).any(|w| w.eq_ignore_ascii_case(b"data:"))
-        || bytes.windows(4).any(|w| w.eq_ignore_ascii_case(b"http"))
 }
 
 /// F1d: the redacted bytes for the turn-capture `upstream_request` section — the
@@ -848,8 +962,8 @@ fn bytes_contain_image_uri(bytes: &[u8]) -> bool {
 /// sanitize), redacted through the SAME primitives `UpstreamRequestLogger`/the
 /// HTTP inbound-trace capture use: secret keys via
 /// [`crate::redaction::redact_payload_secrets_in_value`] (AGENTS.md line 137 — a
-/// NEW logged surface must not bypass secret redaction; `UpstreamRequestLogger`
-/// only redacts image URIs, so this is a STRICTER pass, not a mirror of it),
+/// NEW logged surface must not bypass secret redaction; payload-mode upstream
+/// logging uses this same recursive secret-redaction contract),
 /// image/data URIs via [`crate::redaction::redact_image_uris_in_value`].
 /// Serializes into a fresh owned `Vec<u8>` — never retains a slice of any larger
 /// buffer (AGENTS.md line 144); `request` is already an owned, parsed typed
@@ -925,45 +1039,165 @@ async fn offload_redacted_upstream_request_bytes(
 #[derive(Debug, Clone)]
 struct UpstreamRequestLogger {
     path: PathBuf,
-    write_lock: Arc<Mutex<()>>,
+    sender: tokio::sync::mpsc::Sender<UpstreamRequestLogJob>,
+    dropped_entries: Arc<AtomicU64>,
+    body_mode: LogBodyMode,
 }
+
+#[derive(Debug)]
+struct UpstreamRequestLogJob {
+    request: ChatCompletionRequest,
+    body_mode: LogBodyMode,
+    completion: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+}
+
+/// A slow or wedged filesystem must not create an unbounded number of blocking
+/// tasks (or retain an unbounded number of full request bodies). One dedicated
+/// writer owns a small queue per configured log path; overflow drops only the
+/// observability record and never delays model serving.
+const UPSTREAM_REQUEST_LOG_QUEUE_CAPACITY: usize = 16;
+static UPSTREAM_REQUEST_LOG_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 impl UpstreamRequestLogger {
     fn new(path: PathBuf) -> Self {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<UpstreamRequestLogJob>(
+            UPSTREAM_REQUEST_LOG_QUEUE_CAPACITY,
+        );
+        let worker_path = path.clone();
+        let _ = std::thread::Builder::new()
+            .name("llmconduit-request-log".to_string())
+            .spawn(move || {
+                let mut write_failures = 0_u64;
+                while let Some(job) = receiver.blocking_recv() {
+                    let result =
+                        write_upstream_request_log_entry(&worker_path, &job.request, job.body_mode);
+                    if let Some(completion) = job.completion {
+                        let _ = completion.send(result);
+                    } else if let Err(error) = result {
+                        write_failures = write_failures.saturating_add(1);
+                        if write_failures.is_power_of_two() {
+                            tracing::warn!(
+                                path = %worker_path.display(),
+                                failures = write_failures,
+                                %error,
+                                "failed to append upstream request log"
+                            );
+                        }
+                    }
+                }
+            });
         Self {
             path,
-            write_lock: Arc::new(Mutex::new(())),
+            sender,
+            dropped_entries: Arc::new(AtomicU64::new(0)),
+            body_mode: LogBodyMode::Metadata,
         }
     }
 
-    async fn log(&self, request: &ChatCompletionRequest) -> std::io::Result<()> {
-        // G4 round-4 #3: the JSONL request log is written to DISK and would
-        // otherwise serialize raw `data:` image bytes / signed `image_url`s for
-        // native-vision-passthrough / disabled-agent / missing-url /
-        // tool_choice:"none" image requests (any path that does NOT strip). The
-        // common no-image request serializes directly (format unchanged); only
-        // when the serialized bytes contain an image-URI marker do we re-redact
-        // via a CLONED JSON value through the shared redactor, so the on-disk log
-        // never carries request image content.
-        let mut payload = serde_json::to_vec(request).map_err(std::io::Error::other)?;
-        if bytes_contain_image_uri(&payload) {
-            let mut value = serde_json::to_value(request).map_err(std::io::Error::other)?;
-            crate::redaction::redact_image_uris_in_value(&mut value);
-            payload = serde_json::to_vec(&value).map_err(std::io::Error::other)?;
-        }
-        payload.push(b'\n');
-        let path = self.path.clone();
-        let write_lock = self.write_lock.clone();
-        tokio::task::spawn_blocking(move || {
-            let _guard = write_lock.lock().map_err(|err| {
-                std::io::Error::other(format!("request log lock poisoned: {err}"))
-            })?;
-            let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-            file.write_all(&payload)
-        })
-        .await
-        .map_err(|err| std::io::Error::other(format!("spawn_blocking failed: {err}")))?
+    fn with_body_mode(mut self, body_mode: LogBodyMode) -> Self {
+        self.body_mode = body_mode;
+        self
     }
+
+    #[cfg(test)]
+    fn enqueue(
+        &self,
+        request: &ChatCompletionRequest,
+    ) -> std::io::Result<tokio::sync::oneshot::Receiver<std::io::Result<()>>> {
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        self.enqueue_job(request, Some(completion))?;
+        Ok(completed)
+    }
+
+    fn log_detached(&self, request: &ChatCompletionRequest) -> std::io::Result<()> {
+        self.enqueue_job(request, None)
+    }
+
+    fn enqueue_job(
+        &self,
+        request: &ChatCompletionRequest,
+        completion: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+    ) -> std::io::Result<()> {
+        // Reserve before cloning the potentially large request. A full queue
+        // therefore has constant failure cost and cannot transiently double an
+        // attacker-controlled request body merely to discover overflow.
+        let permit = self.sender.try_reserve().map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "upstream request log queue is full; entry dropped",
+            ),
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "upstream request log worker is unavailable",
+            ),
+        })?;
+        permit.send(UpstreamRequestLogJob {
+            request: request.clone(),
+            body_mode: self.body_mode,
+            completion,
+        });
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn log(&self, request: &ChatCompletionRequest) -> std::io::Result<()> {
+        self.enqueue(request)?
+            .await
+            .map_err(|_| std::io::Error::other("upstream request log worker stopped"))?
+    }
+}
+
+fn write_upstream_request_log_entry(
+    path: &PathBuf,
+    request: &ChatCompletionRequest,
+    body_mode: LogBodyMode,
+) -> std::io::Result<()> {
+    let serialized = serde_json::to_vec(request).map_err(std::io::Error::other)?;
+    let value = match body_mode {
+        LogBodyMode::Metadata => {
+            let model = request.model.chars().take(256).collect::<String>();
+            serde_json::json!({
+                "type": "request_metadata",
+                "model": model,
+                "stream": request.stream,
+                "message_count": request.messages.len(),
+                "tool_count": request.tools.as_ref().map_or(0, Vec::len),
+                "body_bytes": serialized.len(),
+                "body_sha256": hex::encode(Sha256::digest(&serialized)),
+            })
+        }
+        LogBodyMode::RedactedPayload => {
+            // Payload mode is still a durable on-disk surface. Apply the
+            // same recursive secret and image-URI redactors used by turn
+            // capture before serializing it.
+            let mut value = serde_json::from_slice(&serialized).map_err(std::io::Error::other)?;
+            crate::redaction::redact_payload_secrets_in_value(&mut value);
+            crate::redaction::redact_image_uris_in_value(&mut value);
+            value
+        }
+    };
+    let mut payload = serde_json::to_vec(&value).map_err(std::io::Error::other)?;
+    payload.push(b'\n');
+    // Configured providers may intentionally share one JSONL path. Serialize
+    // the final append across their independent bounded workers so a large
+    // `write_all` cannot interleave two JSON records.
+    let _guard = UPSTREAM_REQUEST_LOG_WRITE_LOCK
+        .lock()
+        .map_err(|error| std::io::Error::other(format!("request log lock poisoned: {error}")))?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(&payload)
 }
 
 impl ReqwestUpstreamClient {
@@ -1003,11 +1237,14 @@ impl ReqwestUpstreamClient {
             client,
             base_url,
             api_key,
+            request_timeout: Duration::from_secs(60),
             request_logger: request_log_path.map(UpstreamRequestLogger::new),
             flatten_content,
             min_completion_tokens: min_completion_tokens.max(1),
             max_sse_frame_bytes: max_sse_frame_bytes.max(1024),
             finalization_policies: BackendFinalizationPolicies::default(),
+            responses_capabilities:
+                crate::responses_capabilities::ResponsesCapabilitiesConfig::default(),
             // Default to the no-op store (D2); the DI root threads the live one in
             // via `with_flow_store` only when the debug UI is enabled.
             flow_store: crate::dashboard_flow::DashboardFlowStore::disabled(),
@@ -1026,6 +1263,32 @@ impl ReqwestUpstreamClient {
         policies: BackendFinalizationPolicies,
     ) -> Self {
         self.finalization_policies = policies;
+        self
+    }
+
+    pub(crate) fn with_responses_capabilities(
+        mut self,
+        capabilities: crate::responses_capabilities::ResponsesCapabilitiesConfig,
+    ) -> Self {
+        self.responses_capabilities = capabilities;
+        self
+    }
+
+    /// Select the durable upstream JSONL body policy. Metadata-only is the
+    /// constructor default, including for direct embedders and tests.
+    pub fn with_request_log_body_mode(mut self, body_mode: LogBodyMode) -> Self {
+        self.request_logger = self
+            .request_logger
+            .take()
+            .map(|logger| logger.with_body_mode(body_mode));
+        self
+    }
+
+    /// Configure response-header and idle-body deadlines for non-generation
+    /// upstream surfaces. Generation receives the same resolved duration from
+    /// the gateway through `stream_chat_completion_with_timeout`.
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout.max(Duration::from_millis(1));
         self
     }
 
@@ -1059,11 +1322,40 @@ impl ReqwestUpstreamClient {
         self.base_url.to_string()
     }
 
+    fn effective_responses_capabilities(
+        &self,
+        model: &str,
+    ) -> crate::responses_capabilities::ResponsesCapabilities {
+        self.finalization_policies
+            .resolve_responses_capabilities(model, &self.responses_capabilities)
+    }
+
     fn with_auth(&self, request: RequestBuilder) -> RequestBuilder {
         match &self.api_key {
             Some(api_key) => request.bearer_auth(api_key),
             None => request,
         }
+    }
+
+    /// Await only request dispatch and response headers. A `RequestBuilder::timeout`
+    /// would remain attached to the response body and become a total deadline,
+    /// which is incorrect for healthy long streams; the surrounding Tokio timeout
+    /// ends as soon as reqwest yields the `Response` instead.
+    async fn send_for_headers(
+        &self,
+        request: RequestBuilder,
+        operation: &'static str,
+        client_message: &'static str,
+    ) -> AppResult<reqwest::Response> {
+        tokio::time::timeout(self.request_timeout, request.send())
+            .await
+            .map_err(|_| upstream_response_headers_timeout())?
+            .map_err(|err| {
+                let mut error = AppError::upstream(format!("{operation}: {err}"));
+                error.client_message = client_message.to_string();
+                error.code = Some("upstream_connection_error".to_string());
+                error
+            })
     }
 
     fn endpoint_url(&self, path: &str) -> AppResult<Url> {
@@ -1132,7 +1424,12 @@ impl ReqwestUpstreamClient {
             .json(request)
             .send()
             .await
-            .map_err(|err| AppError::upstream(format!("upstream chat request failed: {err}")))
+            .map_err(|err| {
+                let mut error = AppError::upstream(format!("upstream chat request failed: {err}"));
+                error.client_message = "could not connect to the upstream provider".to_string();
+                error.code = Some("upstream_connection_error".to_string());
+                error
+            })
     }
 
     /// Append `request` to the JSONL request log (when configured), capture the
@@ -1166,13 +1463,27 @@ impl ReqwestUpstreamClient {
         capture: Option<&Arc<TurnCaptureState>>,
     ) -> AppResult<reqwest::Response> {
         if let Some(ref logger) = self.request_logger
-            && let Err(err) = logger.log(request).await
+            && let Err(err) = logger.log_detached(request)
         {
-            tracing::warn!(
-                path = %logger.path.display(),
-                error = %err,
-                "failed to append upstream request log"
-            );
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                let dropped = logger.dropped_entries.fetch_add(1, Ordering::Relaxed) + 1;
+                // Power-of-two sampling keeps a sustained log-filesystem stall
+                // observable without turning queue overflow into its own disk
+                // amplification vector.
+                if dropped.is_power_of_two() {
+                    tracing::warn!(
+                        path = %logger.path.display(),
+                        dropped,
+                        "upstream request log queue is full; entries are being dropped"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    path = %logger.path.display(),
+                    error = %err,
+                    "failed to append upstream request log"
+                );
+            }
         }
         self.capture_upstream_body(response_id, request);
         // Finding 1: redact the `upstream_request` section OFF the tokio worker for
@@ -1223,6 +1534,36 @@ impl ReqwestUpstreamClient {
         );
     }
 
+    /// Read one non-success response body with both an idle deadline and a hard
+    /// retained-byte ceiling. A body read failure is represented by a fixed
+    /// marker: transport details can contain provider URLs, and are unnecessary
+    /// for request classification or client errors.
+    async fn read_upstream_error_body(
+        &self,
+        response: reqwest::Response,
+    ) -> BoundedUpstreamErrorBody {
+        match read_body_capped_with_idle_timeout(
+            response,
+            UPSTREAM_ERROR_BODY_READ_CAP,
+            self.request_timeout,
+        )
+        .await
+        {
+            Ok((body, truncated)) => BoundedUpstreamErrorBody {
+                text: String::from_utf8_lossy(&body).into_owned(),
+                truncated,
+            },
+            Err(BoundedBodyReadError::Transport) => BoundedUpstreamErrorBody {
+                text: r#"{"error":"[redacted: failed to read upstream error body]"}"#.to_string(),
+                truncated: false,
+            },
+            Err(BoundedBodyReadError::IdleTimeout) => BoundedUpstreamErrorBody {
+                text: r#"{"error":"[redacted: upstream error body read timed out]"}"#.to_string(),
+                truncated: false,
+            },
+        }
+    }
+
     /// Gap 05 capture: STAGE the upstream RESPONSE/ERROR `body` of a FAILED attempt as the
     /// turn's pending body on the shared `ServingToken`, copied through the capped +
     /// redacting + truncation-flagging serializer. No-op when the SEPARATE upstream-response
@@ -1251,15 +1592,31 @@ impl ReqwestUpstreamClient {
         capture: Option<&Arc<TurnCaptureState>>,
         body: &str,
     ) {
+        // A backend that received our configured Authorization value can echo it
+        // under an ordinary field such as `error.message`, where key-based JSON
+        // redaction cannot identify it. Do not retain any such body. This mirrors
+        // the raw-stream suppression at the HTTP turn-capture seam and also
+        // protects the separately-gated dashboard response capture.
+        let body = if self.api_key.is_some() {
+            CREDENTIALLED_UPSTREAM_ERROR_MARKER
+        } else {
+            body
+        };
         // F1e: STAGE the failed HTTP body on the turn-capture handle -- gated ONLY
         // on capture being enabled (independent of the dashboard response-capture
-        // flag, so durable capture works without the debug UI). Image-URI redaction
-        // only (responses carry no header secrets; keep it cheap + consistent, and
-        // it handles non-JSON error bodies). Last-writer-wins within an attempt; the
-        // per-attempt clear at dispatch start + the streamed-success discriminator
-        // make the committed body the FINAL attempt's (gap-05 semantics).
+        // flag, so durable capture works without the debug UI). Use the same
+        // structured secret-key + image-URI redactor as every other capture
+        // surface: providers can echo request JSON (including credentials) in an
+        // error body. Malformed bodies become a fixed marker. Last-writer-wins
+        // within an attempt; the per-attempt clear at dispatch start + the
+        // streamed-success discriminator make the committed body the FINAL
+        // attempt's (gap-05 semantics).
         if let Some(capture) = capture {
-            let redacted = crate::redaction::redact_image_uris(body).into_bytes();
+            let redacted = crate::redaction::capture_capped_redacted(
+                body.as_bytes(),
+                UPSTREAM_ERROR_CAPTURE_BODY_CAP,
+                UPSTREAM_ERROR_CAPTURE_SCALAR_CAP,
+            );
             capture.stage_upstream_response_body(&redacted);
         }
         // gap-05 dashboard staging (separately gated on the response-capture flag).
@@ -1414,10 +1771,15 @@ impl ReqwestUpstreamClient {
                 chat_template_kwargs.clone(),
             );
         }
-        let response = match self
+        let request = self
             .with_auth(self.client.post(self.tokenize_url()))
-            .json(&Value::Object(body))
-            .send()
+            .json(&Value::Object(body));
+        let response = match self
+            .send_for_headers(
+                request,
+                "upstream tokenize request failed",
+                "could not query the upstream tokenizer",
+            )
             .await
         {
             Ok(response) => response,
@@ -1430,10 +1792,31 @@ impl ReqwestUpstreamClient {
             tracing::debug!(status = %response.status(), "upstream /tokenize returned non-success status");
             return None;
         }
-        let value: Value = match response.json().await {
+        let body = match read_body_capped_with_idle_timeout(
+            response,
+            UPSTREAM_TOKENIZE_BODY_READ_CAP,
+            self.request_timeout,
+        )
+        .await
+        {
+            Ok((_, true)) => {
+                tracing::debug!("upstream /tokenize response exceeded the body limit");
+                return None;
+            }
+            Ok((body, false)) => body,
+            Err(BoundedBodyReadError::IdleTimeout) => {
+                tracing::debug!("upstream /tokenize response body timed out");
+                return None;
+            }
+            Err(BoundedBodyReadError::Transport) => {
+                tracing::debug!("failed to read upstream /tokenize response body");
+                return None;
+            }
+        };
+        let value: Value = match serde_json::from_slice(&body) {
             Ok(value) => value,
-            Err(err) => {
-                tracing::debug!(error = %err, "upstream /tokenize response was not JSON");
+            Err(_) => {
+                tracing::debug!("upstream /tokenize response was not JSON");
                 return None;
             }
         };
@@ -1450,6 +1833,7 @@ impl ReqwestUpstreamClient {
         &self,
         url: &Url,
         mut request: ChatCompletionRequest,
+        allow_context_rebudget: bool,
         response_id: Option<&str>,
         serving: Option<&Arc<ServingToken>>,
         capture: Option<&Arc<TurnCaptureState>>,
@@ -1516,9 +1900,17 @@ impl ReqwestUpstreamClient {
                 .await;
             }
 
-            let body = response.text().await.unwrap_or_default();
+            let body = self.read_upstream_error_body(response).await;
+            let capture_body = body.capture_text();
             let overflow =
-                classify_context_overflow(&body, Some(estimate_leaf_input_tokens(&request)));
+                classify_context_overflow(&body.text, Some(estimate_leaf_input_tokens(&request)));
+            if overflow.is_some() && !allow_context_rebudget {
+                self.capture_upstream_response_body(serving, capture, &capture_body);
+                return Err(AppError::prompt_too_long(
+                    "upstream rejected the requested Responses context/output budget",
+                )
+                .with_param("max_output_tokens"));
+            }
             let Some(overflow) = overflow else {
                 // Not an overflow — either the first attempt failed outright, or a shrink
                 // fixed the size but the request is unacceptable for another reason (E2a).
@@ -1530,19 +1922,67 @@ impl ReqwestUpstreamClient {
                 // backend; e.g. an image reaching a text-only upstream).
                 // 401/403/404/408/429/5xx keep the default `Failover` disposition,
                 // unchanged.
-                self.capture_upstream_response_body(serving, capture, &body);
+                self.capture_upstream_response_body(serving, capture, &capture_body);
                 let disposition = if status_is_request_intrinsic_4xx(status) {
-                    FailoverDisposition::FailoverNoCooldown
+                    FailoverDisposition::Terminal
                 } else {
                     FailoverDisposition::Failover
                 };
-                return Err(AppError::upstream_with_disposition(
-                    format!(
-                        "upstream chat failed with {status}: {}",
-                        redact_and_truncate_error_body(&body, 500)
-                    ),
+                let mut error = AppError::upstream_with_disposition(
+                    format!("upstream chat failed with {status}"),
                     disposition,
-                ));
+                );
+                // Preserve the full redacted diagnostic only for operators.
+                // Public errors never echo an upstream response body or turn a
+                // backend credential failure into a client-authentication error.
+                match status.as_u16() {
+                    400 => {
+                        error.status = status;
+                        error.client_message =
+                            format!("the upstream rejected this request ({status})");
+                        error.code = Some("invalid_request_error".to_string());
+                    }
+                    413 => {
+                        error.status = status;
+                        error.client_message =
+                            format!("the upstream rejected this request ({status})");
+                        error.code = Some("request_too_large".to_string());
+                    }
+                    415 => {
+                        error.status = status;
+                        error.client_message =
+                            format!("the upstream rejected this request ({status})");
+                        error.code = Some("unsupported_media_type".to_string());
+                    }
+                    422 => {
+                        error.status = status;
+                        error.client_message =
+                            format!("the upstream rejected this request ({status})");
+                        error.code = Some("unprocessable_entity".to_string());
+                    }
+                    408 | 504 => {
+                        error.status = StatusCode::GATEWAY_TIMEOUT;
+                        error.client_message = "the upstream response timed out".to_string();
+                        error.code = Some("upstream_timeout".to_string());
+                    }
+                    429 => {
+                        error.status = StatusCode::TOO_MANY_REQUESTS;
+                        error.client_message = "the upstream rate limit was exceeded".to_string();
+                        error.code = Some("rate_limit_exceeded".to_string());
+                    }
+                    401 | 403 => {
+                        error.status = StatusCode::BAD_GATEWAY;
+                        error.client_message =
+                            "the upstream provider rejected gateway credentials".to_string();
+                        error.code = Some("upstream_authentication_error".to_string());
+                    }
+                    _ => {
+                        error.status = StatusCode::BAD_GATEWAY;
+                        error.client_message = format!("the upstream request failed ({status})");
+                        error.code = Some("upstream_error".to_string());
+                    }
+                }
+                return Err(error);
             };
 
             let mut available = overflow.available_completion_tokens;
@@ -1575,14 +2015,12 @@ impl ReqwestUpstreamClient {
                 if available < self.min_completion_tokens {
                     // Authoritative count: the prompt genuinely cannot fit beside
                     // the minimum completion budget.
-                    self.capture_upstream_response_body(serving, capture, &body);
+                    self.capture_upstream_response_body(serving, capture, &capture_body);
                     return Err(AppError::prompt_too_long(format!(
                         "prompt is too long: {exact} input tokens (exact, via the backend \
                          tokenizer) exceed the {}-token context window minus the minimum \
-                         completion budget ({}); reduce the prompt. Upstream said {status}: {}",
-                        overflow.ctx_limit,
-                        self.min_completion_tokens,
-                        redact_and_truncate_error_body(&body, 500)
+                         completion budget ({}); reduce the prompt (upstream status {status})",
+                        overflow.ctx_limit, self.min_completion_tokens
                     )));
                 }
             } else if overflow.reason == "completion_limit" {
@@ -1613,15 +2051,14 @@ impl ReqwestUpstreamClient {
                 // re-sending the same oversized prompt to another provider would
                 // overflow identically — and served as a 400 "prompt is too long" so
                 // clients treat it as their own input to fix, not a transient 502.
-                self.capture_upstream_response_body(serving, capture, &body);
+                self.capture_upstream_response_body(serving, capture, &capture_body);
                 return Err(AppError::prompt_too_long(format!(
                     "prompt is too long: at least {} input tokens exceed the {}-token \
                      context window minus the minimum completion budget ({}); reduce the \
-                     prompt. Upstream said {status}: {}",
+                     prompt (upstream status {status})",
                     overflow.input_tokens.unwrap_or(0),
                     overflow.ctx_limit,
-                    self.min_completion_tokens,
-                    redact_and_truncate_error_body(&body, 500)
+                    self.min_completion_tokens
                 )));
             }
 
@@ -1633,11 +2070,10 @@ impl ReqwestUpstreamClient {
             // same oversized prompt on another provider.
             let no_progress = last_sent_budget.is_some_and(|sent| available >= sent);
             if no_progress || attempt >= CONTEXT_OVERFLOW_MAX_ATTEMPTS {
-                self.capture_upstream_response_body(serving, capture, &body);
+                self.capture_upstream_response_body(serving, capture, &capture_body);
                 return Err(AppError::prompt_too_long(format!(
                     "prompt is too long: upstream context-window overflow persisted after \
-                     shrink-and-retry; failed with {status}: {}",
-                    redact_and_truncate_error_body(&body, 500)
+                     shrink-and-retry; failed with {status}"
                 )));
             }
 
@@ -1706,6 +2142,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         // shrink-retry send below can write the SANITIZED on-wire request into the
         // SAME turn's `upstream_request` section (last-writer-wins).
         let capture = backend.capture.clone();
+        let allow_context_rebudget = backend.allow_context_rebudget;
         let request = sanitize_chat_request(backend.request, self.flatten_content);
         // D5 R4 (MEDIUM): finalize the ACTUAL on-wire model onto the shared serving
         // token, overwriting the engine's PRE-routing guess (and any earlier
@@ -1749,6 +2186,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
                 .dispatch_chat_stream(
                     &url,
                     request,
+                    allow_context_rebudget,
                     response_id.as_deref(),
                     serving.as_ref(),
                     capture.as_ref(),
@@ -1799,6 +2237,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
         self.dispatch_chat_stream(
             &url,
             request,
+            allow_context_rebudget,
             response_id.as_deref(),
             serving.as_ref(),
             capture.as_ref(),
@@ -1813,29 +2252,52 @@ impl UpstreamClient for ReqwestUpstreamClient {
         Ok(self.tokenize_sanitized_count(&request).await)
     }
 
+    fn response_body_idle_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
     async fn list_models(&self) -> AppResult<reqwest::Response> {
         let url = self.endpoint_url("models")?;
         let response = self
-            .with_auth(self.client.get(url))
-            .send()
-            .await
-            .map_err(|err| AppError::upstream(format!("upstream models request failed: {err}")))?;
+            .send_for_headers(
+                self.with_auth(self.client.get(url)),
+                "upstream models request failed",
+                "could not query the upstream model catalog",
+            )
+            .await?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(AppError::upstream(format!(
-                "upstream /models failed with {status}: {}",
-                redact_and_truncate_error_body(&body, 500)
-            )));
+            let _body = self.read_upstream_error_body(response).await;
+            let mut error = AppError::upstream(format!("upstream /models failed with {status}"));
+            error.client_message = format!("the upstream model catalog request failed ({status})");
+            error.code = Some("upstream_error".to_string());
+            return Err(error);
         }
         Ok(response)
     }
 
+    async fn responses_capability_plan(
+        &self,
+        requested_model: &str,
+    ) -> crate::responses_capabilities::CapabilityPlan {
+        crate::responses_capabilities::CapabilityPlan {
+            candidates: vec![crate::responses_capabilities::CapabilityCandidate {
+                target: crate::responses_capabilities::CapabilityTarget {
+                    provider: "primary".to_string(),
+                    model: requested_model.to_string(),
+                },
+                capabilities: self.effective_responses_capabilities(requested_model),
+            }],
+        }
+    }
+
     async fn proxy_metrics(&self) -> AppResult<reqwest::Response> {
-        self.with_auth(self.client.get(self.metrics_url()))
-            .send()
-            .await
-            .map_err(|err| AppError::upstream(format!("upstream metrics request failed: {err}")))
+        self.send_for_headers(
+            self.with_auth(self.client.get(self.metrics_url())),
+            "upstream metrics request failed",
+            "could not query the upstream metrics endpoint",
+        )
+        .await
     }
 
     fn backend_metrics_targets(&self) -> Vec<crate::backend_metrics::BackendMetricsTarget> {
@@ -1869,9 +2331,26 @@ impl UpstreamClient for ReqwestUpstreamClient {
     ) -> AppResult<reqwest::Response> {
         let url = self.endpoint_url("completions")?;
         let request = copy_proxy_request_headers(self.client.post(url), &headers).body(body);
-        self.with_auth(request).send().await.map_err(|err| {
-            AppError::upstream(format!("upstream completions request failed: {err}"))
-        })
+        let response = self
+            .send_for_headers(
+                self.with_auth(request),
+                "upstream completions request failed",
+                "could not connect to the upstream provider",
+            )
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(response);
+        }
+
+        // `/v1/completions` is otherwise a byte-for-byte success proxy, but an
+        // upstream error body is not part of that public contract. Providers
+        // routinely include credentials, prompts, and implementation details in
+        // those bodies. Drain it through the existing bounded/idle-limited reader
+        // for connection reuse, then discard it and surface only a gateway-owned
+        // OpenAI error below.
+        let _discarded = self.read_upstream_error_body(response).await;
+        Err(completions_status_error(status))
     }
 }
 
@@ -1894,6 +2373,25 @@ impl FailoverUpstreamClient {
             .and_then(|provider| provider.upstream_model.clone())
     }
 
+    fn responses_capability_candidate(
+        &self,
+        index: usize,
+        requested_model: &str,
+    ) -> Option<crate::responses_capabilities::CapabilityCandidate> {
+        let provider = self.providers.get(index)?;
+        let model = provider
+            .upstream_model
+            .clone()
+            .unwrap_or_else(|| requested_model.to_string());
+        Some(crate::responses_capabilities::CapabilityCandidate {
+            target: crate::responses_capabilities::CapabilityTarget {
+                provider: provider.name.clone(),
+                model: model.clone(),
+            },
+            capabilities: provider.client.effective_responses_capabilities(&model),
+        })
+    }
+
     fn available_provider_indices(&self) -> Vec<usize> {
         let now = Instant::now();
         let states = self
@@ -1911,6 +2409,27 @@ impl FailoverUpstreamClient {
                 (!cooling).then_some(index)
             })
             .collect()
+    }
+
+    fn available_provider_indices_for_request(&self, backend: &BackendChatRequest) -> Vec<usize> {
+        self.available_provider_indices()
+            .into_iter()
+            .filter(|index| self.provider_is_capability_compatible(*index, backend))
+            .collect()
+    }
+
+    fn provider_is_capability_compatible(
+        &self,
+        provider_index: usize,
+        backend: &BackendChatRequest,
+    ) -> bool {
+        self.providers.get(provider_index).is_some_and(|provider| {
+            let model = provider
+                .upstream_model
+                .as_deref()
+                .unwrap_or(&backend.request.model);
+            backend.capability_allowlist.permits(&provider.name, model)
+        })
     }
 
     fn provider_is_available(&self, provider_index: usize) -> bool {
@@ -2043,6 +2562,8 @@ impl FailoverUpstreamClient {
             // F1d (AC-11): carry the turn-capture handle forward too -- a captured
             // turn keeps capturing across a failover provider rebuild.
             capture: backend.capture.clone(),
+            capability_allowlist: backend.capability_allowlist.clone(),
+            allow_context_rebudget: backend.allow_context_rebudget,
         }
     }
 
@@ -2056,7 +2577,7 @@ impl FailoverUpstreamClient {
             Ok(None) => Err(AppError::upstream(
                 "upstream stream ended before the first chunk",
             )),
-            Err(_) => Err(AppError::upstream("upstream stream timed out".to_string())),
+            Err(_) => Err(AppError::gateway_timeout("upstream stream timed out")),
         }
     }
 
@@ -2086,21 +2607,21 @@ impl FailoverUpstreamClient {
                             provider_index,
                             &provider_name,
                             cooldown,
-                            err.to_string(),
+                            classify_attempt_error(&err),
                         );
                         yield Err(err);
                         break;
                     }
                     Ok(None) => break,
                     Err(_) => {
-                        let err = AppError::upstream("upstream stream timed out".to_string());
+                        let err = AppError::gateway_timeout("upstream stream timed out");
                         Self::mark_provider_failure(
                             &states,
                             &metrics,
                             provider_index,
                             &provider_name,
                             cooldown,
-                            err.to_string(),
+                            classify_attempt_error(&err),
                         );
                         yield Err(err);
                         break;
@@ -2134,8 +2655,9 @@ impl FailoverUpstreamClient {
         provider_index: usize,
         provider_name: &str,
         cooldown: Duration,
-        error: String,
+        error_class: crate::dashboard_flow::AttemptErrorClass,
     ) {
+        let error_class = attempt_error_class_name(error_class);
         let cooling_until = (cooldown > Duration::ZERO).then(|| Instant::now() + cooldown);
         {
             let mut states = states
@@ -2143,7 +2665,7 @@ impl FailoverUpstreamClient {
                 .expect("upstream provider cooldown state lock poisoned");
             if let Some(state) = states.get_mut(provider_index) {
                 state.cooling_until = cooling_until;
-                state.last_error = Some(error.clone());
+                state.last_error = Some(error_class.to_string());
             }
             // D4: bump the cumulative failover counter + the consecutive-failure
             // streak (the streak crosses `DOWN_THRESHOLD` → `Down` while cooling)
@@ -2158,13 +2680,13 @@ impl FailoverUpstreamClient {
             tracing::warn!(
                 provider = provider_name,
                 cooldown_secs = cooldown.as_secs(),
-                error = %error,
+                error_class,
                 "upstream provider failed; entering cooldown"
             );
         } else {
             tracing::warn!(
                 provider = provider_name,
-                error = %error,
+                error_class,
                 "upstream provider failed"
             );
         }
@@ -2177,7 +2699,7 @@ impl FailoverUpstreamClient {
             provider_index,
             &self.providers[provider_index].name,
             self.cooldown,
-            error.to_string(),
+            classify_attempt_error(error),
         );
     }
 
@@ -2194,6 +2716,12 @@ impl FailoverUpstreamClient {
         }
         if !self.provider_is_available(provider_index) {
             return Err(self.cooldown_error());
+        }
+        if !self.provider_is_capability_compatible(provider_index, backend) {
+            return Err(AppError::bad_request(
+                "the selected fallback does not support the requested Responses capabilities",
+            )
+            .with_code("unsupported_parameter"));
         }
         self.stream_chat_completion_with_provider_indices(
             vec![provider_index],
@@ -2246,11 +2774,14 @@ impl FailoverUpstreamClient {
                 // record commits `None`. Idempotent + gated (no-op when capture is off).
                 serving.clear_pending_response_body();
             }
-            let stream = match provider
-                .client
-                .stream_chat_completion(&provider_request)
-                .await
-            {
+            let dispatch = tokio::time::timeout(
+                request_timeout,
+                provider.client.stream_chat_completion(&provider_request),
+            )
+            .await
+            .map_err(|_| upstream_response_headers_timeout())
+            .and_then(|result| result);
+            let stream = match dispatch {
                 Ok(stream) => stream,
                 Err(err) if err.failover_disposition() == FailoverDisposition::Terminal => {
                     // Terminal same-provider error (e.g. a context overflow that
@@ -2532,18 +3063,13 @@ impl FailoverUpstreamClient {
                 .proxy_completions(headers.clone(), provider_body)
                 .await
             {
-                Ok(response) => {
-                    let status = response.status();
-                    if !status_is_failover_eligible(status) {
-                        return Ok(response);
-                    }
-                    let body = response.text().await.unwrap_or_default();
-                    let err = AppError::upstream(format!(
-                        "upstream completions failed with {status}: {}",
-                        redact_and_truncate_error_body(&body, 500)
-                    ));
-                    self.mark_failure(provider_index, &err);
-                    last_error = Some(err);
+                Ok(response) => return Ok(response),
+                Err(err) if err.failover_disposition() == FailoverDisposition::Terminal => {
+                    // Intrinsic request failures (400/413/415/422) cannot be
+                    // repaired by trying an equivalent fallback. Surface them
+                    // without cooling a healthy provider, matching the canonical
+                    // chat path's retry-safety rule.
+                    return Err(err);
                 }
                 Err(err) => {
                     self.mark_failure(provider_index, &err);
@@ -2575,6 +3101,7 @@ impl RoutingUpstreamClient {
             route_providers,
             routes,
             catalog: Arc::new(AsyncMutex::new(None)),
+            catalog_refresh: Arc::new(AsyncMutex::new(())),
             catalog_meta: Arc::new(Mutex::new(Arc::new(CatalogMeta::default()))),
         }
     }
@@ -2614,22 +3141,39 @@ impl RoutingUpstreamClient {
             // F1d: carry the turn-capture handle forward too (same reasoning as the
             // failover rebuild above, `request_for_provider`).
             capture: backend.capture.clone(),
+            capability_allowlist: backend.capability_allowlist.clone(),
+            allow_context_rebudget: backend.allow_context_rebudget,
         }
     }
 
     async fn load_catalog(&self) -> AppResult<RoutingModelCatalog> {
-        let mut cache = self.catalog.lock().await;
-        if let Some(cached) = cache.as_ref()
-            && cached.fetched_at.elapsed().as_secs() < ROUTING_MODEL_CATALOG_TTL_SECS
-        {
-            return Ok(cached.catalog.clone());
+        if let Some(catalog) = self.fresh_cached_catalog().await {
+            return Ok(catalog);
         }
+
+        let _refresh = self.catalog_refresh.lock().await;
+        if let Some(catalog) = self.fresh_cached_catalog().await {
+            return Ok(catalog);
+        }
+
+        // No catalog mutex is held across provider network requests. A stalled
+        // provider is bounded by the leaf's response-header deadline and cannot
+        // block readers from cloning an already-published snapshot.
         let catalog = self.refresh_catalog().await?;
+        let mut cache = self.catalog.lock().await;
         *cache = Some(CachedRoutingModelCatalog {
             fetched_at: Instant::now(),
             catalog: catalog.clone(),
         });
         Ok(catalog)
+    }
+
+    async fn fresh_cached_catalog(&self) -> Option<RoutingModelCatalog> {
+        let cache = self.catalog.lock().await;
+        cache
+            .as_ref()
+            .filter(|cached| cached.fetched_at.elapsed().as_secs() < ROUTING_MODEL_CATALOG_TTL_SECS)
+            .map(|cached| cached.catalog.clone())
     }
 
     async fn refresh_catalog(&self) -> AppResult<RoutingModelCatalog> {
@@ -2708,9 +3252,8 @@ impl RoutingUpstreamClient {
         }
 
         // D4: publish the catalog metadata as a SINGLE immutable `Arc<CatalogMeta>`
-        // swap. We still hold the `catalog` `AsyncMutex` (the caller `load_catalog`
-        // owns it for this whole refresh), so the swap is serialized with the
-        // catalog write — a lock-free `provider_health()` reader sees the
+        // swap. The refresh gate serializes this with the subsequent catalog
+        // write — a lock-free `provider_health()` reader sees the
         // `(fetched_ms, size)` pair move together, never torn. `fetched_ms` is the
         // refresh wall-clock; `size` is the union model count.
         let meta = Arc::new(CatalogMeta {
@@ -2879,13 +3422,15 @@ async fn primary_provider_model_entries(
 ) -> AppResult<Vec<Value>> {
     let Some(model) = provider.primary_upstream_model.as_deref() else {
         let response = provider.primary_client.list_models().await?;
-        let (_, body, _) = collect_models_response(response).await?;
+        let (_, body, _) =
+            collect_models_response(response, provider.primary_client.request_timeout).await?;
         return Ok(model_entries_from_body(&body));
     };
 
     match provider.primary_client.list_models().await {
         Ok(response) => {
-            let (_, body, _) = collect_models_response(response).await?;
+            let (_, body, _) =
+                collect_models_response(response, provider.primary_client.request_timeout).await?;
             Ok(filter_model_entries(&model_entries_from_body(&body), model))
         }
         Err(err) => {
@@ -2978,9 +3523,11 @@ impl UpstreamClient for FailoverUpstreamClient {
         backend: &BackendChatRequest,
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
-        let provider_indices = self.available_provider_indices();
+        let provider_indices = self.available_provider_indices_for_request(backend);
         if provider_indices.is_empty() {
-            return Err(self.cooldown_error());
+            return Err(AppError::upstream(
+                "no capability-compatible upstream provider is currently available",
+            ));
         }
         self.stream_chat_completion_with_provider_indices(
             provider_indices,
@@ -2991,12 +3538,20 @@ impl UpstreamClient for FailoverUpstreamClient {
     }
 
     async fn count_tokens(&self, backend: &BackendChatRequest) -> AppResult<Option<u64>> {
-        let provider_indices = self.available_provider_indices();
+        let provider_indices = self.available_provider_indices_for_request(backend);
         if provider_indices.is_empty() {
             return Ok(None);
         }
         self.count_tokens_with_provider_indices(provider_indices, backend)
             .await
+    }
+
+    fn response_body_idle_timeout(&self) -> Duration {
+        self.providers
+            .iter()
+            .map(|provider| provider.client.request_timeout)
+            .min()
+            .unwrap_or(DEFAULT_RESPONSE_BODY_IDLE_TIMEOUT)
     }
 
     async fn list_models(&self) -> AppResult<reqwest::Response> {
@@ -3010,7 +3565,12 @@ impl UpstreamClient for FailoverUpstreamClient {
             match provider.client.list_models().await {
                 Ok(response) => {
                     if let Some(model) = &provider.upstream_model {
-                        return filter_models_response(response, model).await;
+                        return filter_models_response(
+                            response,
+                            model,
+                            provider.client.request_timeout,
+                        )
+                        .await;
                     }
                     return Ok(response);
                 }
@@ -3075,6 +3635,31 @@ impl UpstreamClient for FailoverUpstreamClient {
             })
             .collect();
         BackendCandidatePlan { candidates }
+    }
+
+    async fn responses_capability_plan(
+        &self,
+        requested_model: &str,
+    ) -> crate::responses_capabilities::CapabilityPlan {
+        crate::responses_capabilities::CapabilityPlan {
+            candidates: self
+                .providers
+                .iter()
+                .map(|provider| {
+                    let model = provider
+                        .upstream_model
+                        .clone()
+                        .unwrap_or_else(|| requested_model.to_string());
+                    crate::responses_capabilities::CapabilityCandidate {
+                        target: crate::responses_capabilities::CapabilityTarget {
+                            provider: provider.name.clone(),
+                            model: model.clone(),
+                        },
+                        capabilities: provider.client.effective_responses_capabilities(&model),
+                    }
+                })
+                .collect(),
+        }
     }
 
     /// D4: a bare failover chain (no routing wrapper) reports each provider with
@@ -3188,6 +3773,58 @@ impl UpstreamClient for RoutingUpstreamClient {
             }
         };
         BackendCandidatePlan { candidates }
+    }
+
+    async fn responses_capability_plan(
+        &self,
+        requested_model: &str,
+    ) -> crate::responses_capabilities::CapabilityPlan {
+        let Ok(catalog) = self.load_catalog().await else {
+            return crate::responses_capabilities::CapabilityPlan::default();
+        };
+        let Some((resolution, _)) = catalog.resolve(requested_model) else {
+            return crate::responses_capabilities::CapabilityPlan::default();
+        };
+        let candidates = match resolution {
+            RoutingResolution::Route {
+                route_provider_index,
+                model_id,
+            } => self
+                .route_providers
+                .get(route_provider_index)
+                .and_then(|provider| provider.client.responses_capability_candidate(0, &model_id))
+                .into_iter()
+                .collect(),
+            RoutingResolution::Catalog(candidate) => {
+                let Some(provider) = self.providers.get(candidate.provider_index) else {
+                    return crate::responses_capabilities::CapabilityPlan::default();
+                };
+                match candidate.target {
+                    RoutingModelTarget::Primary => provider
+                        .client
+                        .providers
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, _)| {
+                            provider
+                                .client
+                                .responses_capability_candidate(index, &candidate.model_id)
+                        })
+                        .collect(),
+                    RoutingModelTarget::Fallback {
+                        failover_provider_index,
+                    } => provider
+                        .client
+                        .responses_capability_candidate(
+                            failover_provider_index,
+                            &candidate.model_id,
+                        )
+                        .into_iter()
+                        .collect(),
+                }
+            }
+        };
+        crate::responses_capabilities::CapabilityPlan { candidates }
     }
 
     /// D4: aggregate per-provider health across every routing provider's nested
@@ -3454,7 +4091,7 @@ fn timeout_upstream_stream(
                 Ok(Some(chunk)) => yield chunk,
                 Ok(None) => break,
                 Err(_) => {
-                    yield Err(AppError::upstream("upstream stream timed out".to_string()));
+                    yield Err(AppError::gateway_timeout("upstream stream timed out"));
                     break;
                 }
             }
@@ -3462,18 +4099,85 @@ fn timeout_upstream_stream(
     })
 }
 
+/// A request timeout must cover the wait for response headers as well as idle gaps in
+/// the response body. Keeping this as a fixed, body-free marker makes timeout taxonomy
+/// bounded and lets failover treat it exactly like another pre-first-chunk provider
+/// failure without exposing transport details.
+fn upstream_response_headers_timeout() -> AppError {
+    AppError::gateway_timeout("upstream response headers timed out")
+}
+
 /// A provider-failure-shaped status: a server error, or a request-timeout/rate-limit
-/// another provider might succeed on. Used by the raw `/v1/completions` proxy failover
-/// (`proxy_completions_with_provider_indices`) and cross-referenced by
-/// [`status_is_request_intrinsic_4xx`]'s disjointness check below, so the two "which
-/// statuses trigger which behavior" predicates stay auditable side by side. Formerly
-/// `should_failover_proxy_status`; renamed because it is no longer proxy-path-only in
-/// spirit (still the only literal call site outside this module's tests, but the E2a
-/// leaf now reasons about the same status space via its sibling predicate).
+/// another provider might succeed on. Cross-referenced by
+/// [`status_is_request_intrinsic_4xx`]'s disjointness check and pinned in tests so the
+/// retryable and terminal status sets cannot silently overlap. Raw Completions now
+/// carries the actual retry decision on the sanitized [`AppError`] disposition rather
+/// than passing the provider response into the failover layer.
 fn status_is_failover_eligible(status: StatusCode) -> bool {
     status.is_server_error()
         || status == StatusCode::REQUEST_TIMEOUT
         || status == StatusCode::TOO_MANY_REQUESTS
+}
+
+/// Convert every non-success raw Completions response into a body-free,
+/// gateway-owned OpenAI error. This happens at the leaf before routing/failover
+/// sees the result, so no path can accidentally proxy a provider's error body.
+/// The disposition is part of the retry contract: request-intrinsic failures
+/// stop immediately without cooldown; provider-shaped failures remain eligible
+/// for pre-response failover.
+fn completions_status_error(status: StatusCode) -> AppError {
+    let disposition = if status_is_request_intrinsic_4xx(status) {
+        FailoverDisposition::Terminal
+    } else {
+        FailoverDisposition::Failover
+    };
+    let mut error = AppError::upstream_with_disposition(
+        format!("upstream completions failed with {status}"),
+        disposition,
+    );
+    match status.as_u16() {
+        400 => {
+            error.status = status;
+            error.client_message = format!("the upstream rejected this request ({status})");
+            error.code = Some("invalid_request_error".to_string());
+        }
+        413 => {
+            error.status = status;
+            error.client_message = format!("the upstream rejected this request ({status})");
+            error.code = Some("request_too_large".to_string());
+        }
+        415 => {
+            error.status = status;
+            error.client_message = format!("the upstream rejected this request ({status})");
+            error.code = Some("unsupported_media_type".to_string());
+        }
+        422 => {
+            error.status = status;
+            error.client_message = format!("the upstream rejected this request ({status})");
+            error.code = Some("unprocessable_entity".to_string());
+        }
+        408 | 504 => {
+            error.status = StatusCode::GATEWAY_TIMEOUT;
+            error.client_message = "the upstream response timed out".to_string();
+            error.code = Some("upstream_timeout".to_string());
+        }
+        429 => {
+            error.status = StatusCode::TOO_MANY_REQUESTS;
+            error.client_message = "the upstream rate limit was exceeded".to_string();
+            error.code = Some("rate_limit_exceeded".to_string());
+        }
+        401 | 403 => {
+            error.status = StatusCode::BAD_GATEWAY;
+            error.client_message = "the upstream provider rejected gateway credentials".to_string();
+            error.code = Some("upstream_authentication_error".to_string());
+        }
+        _ => {
+            error.status = StatusCode::BAD_GATEWAY;
+            error.client_message = format!("the upstream request failed ({status})");
+            error.code = Some("upstream_error".to_string());
+        }
+    }
+    error
 }
 
 /// E2a: statuses where the REQUEST ITSELF (not the provider) is unacceptable to ANY
@@ -3517,6 +4221,15 @@ pub struct BackendFinalizationPolicies {
     /// GLOBAL `upstream_chat_kwargs` (base layer), merged under the per-model
     /// policy at the leaf.
     pub global_upstream_chat_kwargs: Arc<JsonMap<String, Value>>,
+    /// Per-final-served-model Responses capability overrides.
+    pub responses_capabilities: Arc<
+        std::collections::BTreeMap<
+            String,
+            crate::responses_capabilities::ResponsesCapabilitiesConfig,
+        >,
+    >,
+    /// Global conservative Responses capability declaration.
+    pub global_responses_capabilities: crate::responses_capabilities::ResponsesCapabilitiesConfig,
 }
 
 impl BackendFinalizationPolicies {
@@ -3532,6 +4245,19 @@ impl BackendFinalizationPolicies {
             global_template_family: config.global_template_family(),
             upstream_chat_kwargs: Arc::new(config.upstream_chat_kwargs_policies()),
             global_upstream_chat_kwargs: Arc::new(config.global_upstream_chat_kwargs().clone()),
+            responses_capabilities: Arc::new(
+                config
+                    .model_profiles
+                    .iter()
+                    .filter_map(|(model, profile)| {
+                        profile
+                            .responses_capabilities
+                            .clone()
+                            .map(|capabilities| (model.clone(), capabilities))
+                    })
+                    .collect(),
+            ),
+            global_responses_capabilities: config.responses_capabilities.clone(),
         }
     }
 
@@ -3554,6 +4280,19 @@ impl BackendFinalizationPolicies {
             merge_json_maps(&mut merged, per_model);
         }
         merged
+    }
+
+    fn resolve_responses_capabilities(
+        &self,
+        model: &str,
+        provider: &crate::responses_capabilities::ResponsesCapabilitiesConfig,
+    ) -> crate::responses_capabilities::ResponsesCapabilities {
+        let mut merged = self.global_responses_capabilities.clone();
+        merged.overlay(provider);
+        if let Some(per_model) = policy_for_model(&self.responses_capabilities, model) {
+            merged.overlay(per_model);
+        }
+        merged.resolve()
     }
 }
 /// Look up a per-model policy in `map` for the FINAL provider `model` with the
@@ -3924,6 +4663,14 @@ pub struct BackendChatRequest {
     /// (spec Design #3) precisely because the carrier is here, not on
     /// `ServingToken`.
     pub capture: Option<Arc<TurnCaptureState>>,
+    /// Per-request capability-compatible provider/model targets. The engine
+    /// validates the selected primary and supplies only compatible fallbacks;
+    /// routing/failover consult this before dispatch without changing health.
+    pub capability_allowlist: crate::responses_capabilities::CapabilityAllowlist,
+    /// Whether the leaf may silently reduce a completion budget after a
+    /// context-overflow response. Raw Responses disables this to preserve the
+    /// caller's explicit `max_output_tokens`; legacy ingresses retain it.
+    pub allow_context_rebudget: bool,
 }
 
 impl BackendChatRequest {
@@ -3949,6 +4696,9 @@ impl BackendChatRequest {
             response_id,
             serving,
             capture: None,
+            capability_allowlist: crate::responses_capabilities::CapabilityAllowlist::unrestricted(
+            ),
+            allow_context_rebudget: true,
         }
     }
 
@@ -3963,6 +4713,19 @@ impl BackendChatRequest {
 
     pub fn with_thinking_override(mut self, thinking: Option<bool>) -> Self {
         self.thinking_override = thinking;
+        self
+    }
+
+    pub fn with_capability_allowlist(
+        mut self,
+        allowlist: crate::responses_capabilities::CapabilityAllowlist,
+    ) -> Self {
+        self.capability_allowlist = allowlist;
+        self
+    }
+
+    pub fn with_context_rebudget(mut self, allow: bool) -> Self {
+        self.allow_context_rebudget = allow;
         self
     }
 }
@@ -4483,10 +5246,10 @@ fn copy_proxy_request_headers(mut request: RequestBuilder, headers: &HeaderMap) 
 }
 
 fn should_proxy_request_header(name: &HeaderName) -> bool {
-    !is_hop_by_hop_header(name)
-        && !header_name_eq(name, "authorization")
-        && !header_name_eq(name, "host")
-        && !header_name_eq(name, "content-length")
+    matches!(
+        name.as_str(),
+        "accept" | "content-type" | "traceparent" | "tracestate" | "x-request-id" | "x-trace-id"
+    )
 }
 
 /// Small fixed reserve subtracted from the context window when recomputing the
@@ -4806,20 +5569,27 @@ async fn stream_success_response(
     let stream = bounded.eventsource().filter_map(|result| async move {
         match result {
             Ok(event) if event.data == "[DONE]" => None,
-            Ok(event) => Some(parse_chat_completion_chunk(&event.data).map_err(|err| {
-                AppError::upstream(format!(
-                    "failed to parse upstream chat chunk: {err}; payload={}",
-                    redact_and_truncate_error_body(&event.data, 500)
-                ))
+            Ok(event) => Some(parse_chat_completion_chunk(&event.data).map_err(|_| {
+                // The event payload is provider-controlled and can echo a
+                // configured Authorization value under an ordinary JSON field.
+                // Keep terminal diagnostics taxonomy-only; raw bytes, when
+                // capture is safe, remain available through the opt-in capture.
+                let mut error = AppError::upstream("failed to parse upstream chat chunk");
+                error.client_message = "the upstream returned a malformed event stream".to_string();
+                error.code = Some("malformed_upstream_response".to_string());
+                error
             })),
             // The bounded adapter surfaces the frame-cap rejection through the
             // transport-error channel as an already-formed `AppError` (its
             // `Display` carries the cap message); other transport errors are
             // wrapped here. Either way the model output is never silently
             // truncated — the stream ends in an error item.
-            Err(err) => Some(Err(AppError::upstream(format!(
-                "failed to read upstream SSE: {err}"
-            )))),
+            Err(_) => Some(Err({
+                let mut error = AppError::upstream("failed to read upstream SSE");
+                error.client_message = "the upstream event stream ended unexpectedly".to_string();
+                error.code = Some("malformed_upstream_response".to_string());
+                error
+            })),
         }
     });
     Ok(Box::pin(stream))
@@ -4981,6 +5751,7 @@ fn normalize_sparse_tool_call_types(value: &mut Value) -> bool {
 
 pub async fn collect_models_response(
     response: reqwest::Response,
+    idle_timeout: Duration,
 ) -> AppResult<(StatusCode, Value, Option<String>)> {
     let status = response.status();
     let etag = response
@@ -4988,29 +5759,58 @@ pub async fn collect_models_response(
         .get(http::header::ETAG)
         .and_then(|value| value.to_str().ok())
         .map(ToString::to_string);
-    let body = response
-        .json::<Value>()
-        .await
-        .map_err(|err| AppError::upstream(format!("invalid upstream /models JSON: {err}")))?;
+    let body = match read_body_capped_with_idle_timeout(
+        response,
+        UPSTREAM_MODELS_BODY_READ_CAP,
+        idle_timeout,
+    )
+    .await
+    {
+        Ok((_, true)) => {
+            let mut error =
+                AppError::upstream("upstream model catalog response exceeded the body limit");
+            error.client_message = "the upstream model catalog response was too large".to_string();
+            error.code = Some("upstream_response_too_large".to_string());
+            return Err(error);
+        }
+        Ok((body, false)) => body,
+        Err(BoundedBodyReadError::IdleTimeout) => {
+            return Err(AppError::gateway_timeout(
+                "upstream model catalog response body timed out",
+            ));
+        }
+        Err(BoundedBodyReadError::Transport) => {
+            let mut error =
+                AppError::upstream("failed to read upstream model catalog response body");
+            error.client_message = "could not read the upstream model catalog".to_string();
+            error.code = Some("invalid_upstream_response".to_string());
+            return Err(error);
+        }
+    };
+    let body = serde_json::from_slice::<Value>(&body).map_err(|_| {
+        let mut error = AppError::upstream("upstream model catalog returned invalid JSON");
+        error.client_message = "the upstream model catalog returned invalid JSON".to_string();
+        error.code = Some("invalid_upstream_response".to_string());
+        error
+    })?;
     Ok((status, body, etag))
 }
 
 pub async fn collect_supported_model_catalog(
     response: reqwest::Response,
+    idle_timeout: Duration,
 ) -> AppResult<Vec<UpstreamModelEntry>> {
-    let (_, body, _) = collect_models_response(response).await?;
+    let (_, body, _) = collect_models_response(response, idle_timeout).await?;
     Ok(extract_supported_model_catalog(&body))
 }
 
 async fn filter_models_response(
     response: reqwest::Response,
     model: &str,
+    idle_timeout: Duration,
 ) -> AppResult<reqwest::Response> {
     let status = response.status();
-    let body = response
-        .json::<Value>()
-        .await
-        .map_err(|err| AppError::upstream(format!("invalid upstream /models JSON: {err}")))?;
+    let (_, body, _) = collect_models_response(response, idle_timeout).await?;
     let body = filter_models_body(body, model);
     let body = serde_json::to_string(&body).map_err(|err| {
         AppError::internal(format!("failed to serialize /models response: {err}"))
@@ -5210,6 +6010,7 @@ fn flatten_content_parts(parts: &[Value]) -> String {
     text_parts.join("\n")
 }
 
+#[cfg(test)]
 fn truncate_for_error(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -5220,15 +6021,25 @@ fn truncate_for_error(s: &str, max: usize) -> String {
     }
 }
 
-/// Redact image `data:`/signed URLs from an upstream RESPONSE error body, then
-/// truncate it for an `AppError`/log message (G4 round-9 #2). A provider that
-/// echoes a native-vision-passthrough / disabled-agent image request can mirror
-/// the submitted `data:` bytes or a signed image URL back in its 4xx/5xx body;
-/// without this they would leak through `response.failed` and failover logs
-/// (AGENTS.md redact rule). Redaction runs BEFORE truncation so a split image
-/// URI cannot survive at the truncation boundary.
+/// Apply the shared structured body redactor to an upstream RESPONSE error before
+/// it enters an `AppError` or log. Providers may echo request credentials as well
+/// as image payloads; malformed bodies therefore become a fixed marker instead of
+/// preserving an unstructured prefix.
+#[cfg(test)]
 fn redact_and_truncate_error_body(body: &str, max: usize) -> String {
-    truncate_for_error(&crate::redaction::redact_image_uris(body), max)
+    crate::redaction::sanitize_untrusted_body_for_diagnostics(body.as_bytes(), max)
+}
+
+fn attempt_error_class_name(error_class: crate::dashboard_flow::AttemptErrorClass) -> &'static str {
+    use crate::dashboard_flow::AttemptErrorClass;
+    match error_class {
+        AttemptErrorClass::Connect => "connect",
+        AttemptErrorClass::HttpStatus => "http_status",
+        AttemptErrorClass::Timeout => "timeout",
+        AttemptErrorClass::Stream => "stream",
+        AttemptErrorClass::Terminal => "terminal",
+        AttemptErrorClass::Other => "other",
+    }
 }
 
 fn stringify_json_value(value: Value) -> Value {
@@ -5238,12 +6049,14 @@ fn stringify_json_value(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::ReqwestUpstreamClient;
+    use super::UPSTREAM_REQUEST_LOG_QUEUE_CAPACITY;
     use super::UpstreamModelEntry;
     use super::UpstreamRequestLogger;
     use super::classify_attempt_error;
     use super::extract_supported_model_catalog;
     use super::sanitize_chat_request;
     use super::should_proxy_request_header;
+    use crate::config::LogBodyMode;
     use crate::error::AppError;
     use crate::error::FailoverDisposition;
     use crate::models::chat::ChatCompletionRequest;
@@ -5252,6 +6065,7 @@ mod tests {
     use reqwest::StatusCode;
     use serde_json::Value;
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
     /// The full RFC 7230 §6.1 hop-by-hop set; must match the canonical list and
     /// the response-direction parity test in `http.rs`.
@@ -5292,6 +6106,31 @@ mod tests {
     fn request_direction_passes_representative_passthrough_header() {
         let name = HeaderName::from_static("content-type");
         assert!(should_proxy_request_header(&name));
+    }
+
+    #[test]
+    fn request_direction_uses_fixed_allowlist() {
+        for header in [
+            "accept",
+            "content-type",
+            "traceparent",
+            "tracestate",
+            "x-request-id",
+            "x-trace-id",
+        ] {
+            let name = HeaderName::from_bytes(header.as_bytes()).unwrap();
+            assert!(
+                should_proxy_request_header(&name),
+                "request proxy must pass allowlisted header {header}",
+            );
+        }
+        for header in ["cookie", "x-api-key", "x-client-secret", "x-forwarded-for"] {
+            let name = HeaderName::from_bytes(header.as_bytes()).unwrap();
+            assert!(
+                !should_proxy_request_header(&name),
+                "request proxy must drop non-allowlisted header {header}",
+            );
+        }
     }
 
     #[test]
@@ -6348,13 +7187,129 @@ mod tests {
         logger.log(&request).await.expect("write request log");
 
         let contents = std::fs::read_to_string(&path).expect("read request log");
-        assert_eq!(
-            contents,
-            format!(
-                "{}\n",
-                serde_json::to_string(&request).expect("serialize request")
-            )
-        );
+        let value: Value = serde_json::from_str(contents.trim()).expect("metadata json");
+        assert_eq!(value["type"], "request_metadata");
+        assert_eq!(value["model"], "grok-4");
+        assert_eq!(value["message_count"], 1);
+        assert_eq!(value["tool_count"], 0);
+        assert!(value["body_bytes"].as_u64().is_some_and(|bytes| bytes > 0));
+        assert_eq!(value["body_sha256"].as_str().map(str::len), Some(64));
+        assert!(!contents.contains("hello"));
+        assert!(!contents.contains("world"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+            logger.log(&request).await.expect("rewrite request log");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "an existing request log is tightened before append"
+            );
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn upstream_request_logger_queue_is_strictly_bounded() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-upstream-bounded-log-{}.jsonl",
+            uuid::Uuid::new_v4().simple()
+        ));
+        // Keep the receiver alive without a worker so reservations remain
+        // occupied deterministically. This exercises the exact enqueue seam
+        // used by production without relying on filesystem timing.
+        let (sender, _receiver) = tokio::sync::mpsc::channel(UPSTREAM_REQUEST_LOG_QUEUE_CAPACITY);
+        let logger = UpstreamRequestLogger {
+            path,
+            sender,
+            dropped_entries: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            body_mode: LogBodyMode::Metadata,
+        };
+        let request = ChatCompletionRequest {
+            model: "bounded-log-model".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(serde_json::json!("small request")),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                thinking: None,
+                tool_calls: None,
+            }],
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning_effort: None,
+            response_format: None,
+            stream_options: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            extra_body: BTreeMap::new(),
+        };
+
+        let pending = (0..UPSTREAM_REQUEST_LOG_QUEUE_CAPACITY)
+            .map(|_| logger.enqueue(&request).expect("queue slot"))
+            .collect::<Vec<_>>();
+        assert_eq!(pending.len(), UPSTREAM_REQUEST_LOG_QUEUE_CAPACITY);
+        let overflow = logger.enqueue(&request).expect_err("queue must be full");
+        assert_eq!(overflow.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test]
+    async fn upstream_request_logger_redacted_payload_mode_never_writes_secrets() {
+        let path = std::env::temp_dir().join(format!(
+            "llmconduit-upstream-payload-log-{}.jsonl",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let logger =
+            UpstreamRequestLogger::new(path.clone()).with_body_mode(LogBodyMode::RedactedPayload);
+        let request = ChatCompletionRequest {
+            model: "grok-4".to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(serde_json::json!({
+                    "api_key": "sentinel-secret",
+                    "text": "visible prompt"
+                })),
+                tool_call_id: None,
+                name: None,
+                reasoning_content: None,
+                thinking: None,
+                tool_calls: None,
+            }],
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: Some(false),
+            reasoning_effort: None,
+            response_format: None,
+            stream_options: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            extra_body: BTreeMap::new(),
+        };
+
+        logger.log(&request).await.expect("write request log");
+        let contents = std::fs::read_to_string(&path).expect("read request log");
+        assert!(!contents.contains("sentinel-secret"));
+        assert!(contents.contains("[redacted]"));
+        assert!(contents.contains("visible prompt"));
 
         let _ = std::fs::remove_file(path);
     }
@@ -6388,6 +7343,68 @@ mod tests {
     fn test_truncate_exact_boundary() {
         let exact = "a".repeat(500);
         assert_eq!(super::truncate_for_error(&exact, 500), exact);
+    }
+
+    #[test]
+    fn upstream_error_diagnostics_use_shared_structured_redaction() {
+        let body = r#"{"error":{"message":"denied","api_key":"sk-UPSTREAM-LEAK"},"image":"data:image/png;base64,LEAK"}"#;
+        let diagnostic = super::redact_and_truncate_error_body(body, 500);
+        assert!(diagnostic.contains("denied"));
+        assert!(diagnostic.contains("[redacted]"));
+        assert!(diagnostic.contains("<redacted uri>"));
+        assert!(!diagnostic.contains("sk-UPSTREAM-LEAK"));
+        assert!(!diagnostic.contains("base64,LEAK"));
+
+        let malformed = "api_key=sk-MALFORMED-UPSTREAM-LEAK";
+        let diagnostic = super::redact_and_truncate_error_body(malformed, 500);
+        assert_eq!(
+            diagnostic,
+            format!("[redacted: unparseable body {} bytes]", malformed.len())
+        );
+        assert!(!diagnostic.contains("sk-MALFORMED-UPSTREAM-LEAK"));
+    }
+
+    #[tokio::test]
+    async fn turn_capture_redacts_secrets_in_structured_upstream_error_body() {
+        let root = std::env::temp_dir().join(format!(
+            "llmconduit-upstream-error-capture-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let turn_capture = crate::turn_capture::TurnCapture::enabled(root.clone());
+        let state = turn_capture
+            .start("api_error_redaction", Some("model".to_string()), 1)
+            .expect("capture state");
+        state.write_inbound_request(br#"{"model":"model"}"#);
+
+        let client = ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            url::Url::parse("https://example.invalid/v1").unwrap(),
+            None,
+            None,
+            true,
+            4096,
+        );
+        client.capture_upstream_response_body(
+            None,
+            Some(&state),
+            r#"{"error":{"message":"denied","api_key":"sk-CAPTURE-LEAK"}}"#,
+        );
+        state.write_served_response(b"failed");
+        state.served_done(false);
+        state.engine_done("failed", Some("upstream_error"));
+
+        let artifact_path = root.join("api_error_redaction.json");
+        for _ in 0..200 {
+            if artifact_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let artifact = std::fs::read_to_string(&artifact_path).expect("capture artifact");
+        assert!(!artifact.contains("sk-CAPTURE-LEAK"));
+        assert!(artifact.contains("[redacted]"));
+        assert!(artifact.contains("denied"));
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6758,6 +7775,176 @@ mod tests {
     use wiremock::matchers::path as wm_path;
 
     #[tokio::test]
+    async fn oversized_non_success_body_is_read_and_captured_with_a_hard_cap() {
+        let server = MockServer::start().await;
+        let oversized = format!(
+            r#"{{"error":{{"message":"{}"}}}}"#,
+            "oversized-provider-body-"
+                .repeat(super::UPSTREAM_ERROR_BODY_READ_CAP / "oversized-provider-body-".len() * 2)
+        );
+        assert!(oversized.len() > super::UPSTREAM_ERROR_BODY_READ_CAP);
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(oversized))
+            .mount(&server)
+            .await;
+
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+        let leaf = ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        )
+        .into_bare_primary()
+        .with_flow_store(store.clone());
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some(response_id),
+            Some(Arc::clone(&token)),
+        );
+
+        let error = leaf
+            .stream_chat_completion(&backend)
+            .await
+            .err()
+            .expect("500 must fail");
+        assert_eq!(
+            error.to_string(),
+            "upstream chat failed with 500 Internal Server Error"
+        );
+        assert!(!error.to_string().contains("oversized-provider-body"));
+        let captured = token
+            .take_pending_response_body()
+            .expect("bounded error body staged");
+        store.set_upstream_response(&api_call_id, Some(captured));
+        let captured = store
+            .detail(&api_call_id)
+            .and_then(|record| record.upstream_response.clone())
+            .expect("bounded error body committed");
+        assert!(
+            captured.truncated,
+            "the upstream read cap is reported honestly"
+        );
+        assert!(
+            captured.bytes.len() <= super::UPSTREAM_ERROR_CAPTURE_BODY_CAP,
+            "only a bounded capture is retained"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_upstream_credential_cannot_echo_into_errors_or_capture() {
+        const SECRET: &str = "configured-upstream-secret-must-not-survive";
+        let server = MockServer::start().await;
+        let body = format!(
+            r#"{{"error":{{"message":"credential echoed in free-form text: {SECRET}"}},"padding":"{}"}}"#,
+            "x".repeat(super::UPSTREAM_ERROR_BODY_READ_CAP * 2)
+        );
+        for (method, path) in [
+            ("POST", "/v1/chat/completions"),
+            ("GET", "/v1/models"),
+            ("POST", "/v1/completions"),
+        ] {
+            Mock::given(wm_method(method))
+                .and(wm_path(path))
+                .respond_with(ResponseTemplate::new(500).set_body_string(body.clone()))
+                .mount(&server)
+                .await;
+        }
+
+        let store = DashboardFlowStore::new_with_response_capture(true);
+        let (api_call_id, response_id) = d2_open_linked_flow(&store);
+        let leaf = ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{}/v1/", server.uri()).parse().expect("url"),
+            Some(SECRET.to_string()),
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        )
+        .into_bare_primary()
+        .with_flow_store(store.clone());
+
+        let dir = turn_capture_test_dir("credential-error-redaction");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture
+            .start("api_credential_error", Some("m".to_string()), 1)
+            .expect("capture state");
+        state.write_inbound_request(br#"{"model":"m"}"#);
+        let token = Arc::new(super::ServingToken::default());
+        let backend = BackendChatRequest::new(
+            family_request("m"),
+            None,
+            Some(response_id),
+            Some(Arc::clone(&token)),
+        )
+        .with_capture(Some(Arc::clone(&state)));
+
+        let chat_error = leaf
+            .stream_chat_completion(&backend)
+            .await
+            .err()
+            .expect("chat 500 must fail");
+        assert!(!chat_error.to_string().contains(SECRET));
+        assert!(!chat_error.client_message.contains(SECRET));
+        let captured = token
+            .take_pending_response_body()
+            .expect("credential-safe marker staged");
+        store.set_upstream_response(&api_call_id, Some(captured));
+        let captured = store
+            .detail(&api_call_id)
+            .and_then(|record| record.upstream_response.clone())
+            .expect("credential-safe marker committed");
+        let captured_text = String::from_utf8_lossy(&captured.bytes);
+        assert!(!captured_text.contains(SECRET));
+        assert!(captured_text.contains("omitted because backend credentials are configured"));
+
+        state.write_served_response(chat_error.client_message.as_bytes());
+        state.served_done(false);
+        state.engine_done("failed", Some(&chat_error.to_string()));
+        let artifact = wait_for_turn_capture_artifact(&dir, "api_credential_error").await;
+        let artifact_text = artifact.to_string();
+        assert!(
+            !artifact_text.contains(SECRET),
+            "credential leaked: {artifact_text}"
+        );
+        assert!(artifact_text.contains("omitted because backend credentials are configured"));
+
+        let models_error = leaf.list_models().await.expect_err("models 500 must fail");
+        assert!(!models_error.to_string().contains(SECRET));
+        assert!(!models_error.client_message.contains(SECRET));
+
+        let failover = FailoverUpstreamClient::new(
+            vec![FailoverUpstreamProvider::new(
+                "primary",
+                leaf,
+                None,
+                None,
+                JsonMap::new(),
+            )],
+            Duration::ZERO,
+        );
+        let completions_error = failover
+            .proxy_completions(
+                http::HeaderMap::new(),
+                axum::body::Bytes::from_static(br#"{"model":"m","prompt":"hi"}"#),
+            )
+            .await
+            .expect_err("completions 500 must fail");
+        assert!(!completions_error.to_string().contains(SECRET));
+        assert!(!completions_error.client_message.contains(SECRET));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn count_tokens_posts_finalized_payload_to_server_root_tokenize() {
         use super::UpstreamClient as _;
 
@@ -7094,6 +8281,41 @@ mod tests {
             json!(64000),
             "first attempt carried the oversized budget"
         );
+    }
+
+    #[tokio::test]
+    async fn raw_responses_context_overflow_preserves_budget_and_never_retries() {
+        let server = MockServer::start().await;
+        let overflow = "This model's maximum context length is 202752 tokens. \
+            However, you requested 64000 output tokens and your prompt contains 139000 input tokens.";
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(overflow))
+            .mount(&server)
+            .await;
+
+        let client = d2_capturing_client(&server.uri(), DashboardFlowStore::new());
+        let mut request = family_request("served-model");
+        request.max_output_tokens = Some(64000);
+        let backend =
+            BackendChatRequest::new(request, None, None, None).with_context_rebudget(false);
+        let error = match client.stream_chat_completion(&backend).await {
+            Ok(_) => panic!("raw Responses overflow must be terminal"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.param.as_deref(), Some("max_output_tokens"));
+
+        let requests: Vec<_> = server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .into_iter()
+            .filter(|request| request.url.path() == "/v1/chat/completions")
+            .collect();
+        assert_eq!(requests.len(), 1, "raw Responses must not shrink and retry");
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["max_tokens"], 64000);
     }
 
     use crate::turn_capture::TurnCapture;
@@ -7640,6 +8862,12 @@ mod tests {
         use crate::dashboard_flow::AttemptErrorClass;
         assert_eq!(
             classify_attempt_error(&AppError::upstream("upstream stream timed out".to_string())),
+            AttemptErrorClass::Timeout
+        );
+        assert_eq!(
+            classify_attempt_error(&AppError::upstream(
+                "upstream response headers timed out".to_string()
+            )),
             AttemptErrorClass::Timeout
         );
         assert_eq!(
@@ -8637,8 +9865,8 @@ mod tests {
         );
         assert_eq!(
             attempts[0].failover_reason,
-            Some(AttemptFailoverReason::RequestRejected),
-            "the trace must distinguish request rejection from provider failure"
+            Some(AttemptFailoverReason::TerminalNoFailover),
+            "the trace must show that an intrinsic request rejection was terminal"
         );
 
         // The provider must NOT be cooling: no deadline, no failure counted.
@@ -9038,7 +10266,7 @@ mod d4_provider_health_tests {
         assert_eq!(health[0].failover_count, 3);
         assert_eq!(health[0].status, ProviderStatus::Down);
         assert!(health[0].cooling_until_ms.is_some());
-        assert!(health[0].last_error.is_some());
+        assert_eq!(health[0].last_error.as_deref(), Some("other"));
 
         // One success clears the streak + cooldown → Healthy, served bumped.
         client.mark_provider_success(0);
@@ -9049,6 +10277,23 @@ mod d4_provider_health_tests {
         assert_eq!(health[0].status, ProviderStatus::Healthy);
         assert_eq!(health[0].cooling_until_ms, None);
         assert_eq!(health[0].last_error, None);
+    }
+
+    #[test]
+    fn cooldown_state_retains_only_bounded_error_classification() {
+        let client = FailoverUpstreamClient::new(
+            vec![provider("p", "https://a.invalid/v1")],
+            Duration::from_secs(3600),
+        );
+        let err = AppError::upstream(
+            "upstream chat failed with 500 Internal Server Error: {\"api_key\":\"sk-COOLDOWN-LEAK\"}",
+        );
+        client.mark_failure(0, &err);
+        let health = client.provider_health();
+        assert_eq!(health[0].last_error.as_deref(), Some("http_status"));
+        let serialized = serde_json::to_string(&health).unwrap();
+        assert!(!serialized.contains("sk-COOLDOWN-LEAK"));
+        assert!(!serialized.contains("api_key"));
     }
 
     /// `Down` requires BOTH cooling AND `>= DOWN_THRESHOLD` consecutive failures:

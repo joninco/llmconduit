@@ -246,6 +246,7 @@ async fn image_agent_handles_multiple_image_ids() {
 
 #[tokio::test]
 async fn image_agent_vision_error_becomes_model_visible_text() {
+    const ERROR_SENTINEL: &str = "vision-client-error-secret-must-not-reach-tool-output";
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(tool_call_chunk(
@@ -260,9 +261,9 @@ async fn image_agent_vision_error_becomes_model_visible_text() {
         .await;
     let vision = MockVisionClient::default();
     vision
-        .push_outcome(Err(llmconduit::error::AppError::upstream(
-            "backend exploded",
-        )))
+        .push_outcome(Err(llmconduit::error::AppError::upstream(format!(
+            "backend exploded {ERROR_SENTINEL} {TEST_IMAGE_DATA_URL}"
+        ))))
         .await;
     let gateway = test_gateway_with_vision(upstream.clone(), vision, image_agent_config());
 
@@ -283,6 +284,9 @@ async fn image_agent_vision_error_becomes_model_visible_text() {
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     assert!(tool_msg.contains("Vision analysis failed"));
+    assert!(tool_msg.contains("backend_error"));
+    assert!(!tool_msg.contains(ERROR_SENTINEL));
+    assert!(!tool_msg.contains(TEST_IMAGE_DATA_URL));
 }
 
 #[tokio::test]
@@ -713,6 +717,7 @@ async fn image_agent_rejects_mixed_client_and_analyze_image() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(ChatCompletionChunk {
+            service_tier: None,
             id: "chat-1".to_string(),
             choices: vec![ChatChunkChoice {
                 index: 0,
@@ -777,6 +782,7 @@ async fn image_agent_runs_analyze_and_web_search_sequentially() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![Ok(ChatCompletionChunk {
+            service_tier: None,
             id: "chat-1".to_string(),
             choices: vec![ChatChunkChoice {
                 index: 0,
@@ -894,6 +900,7 @@ async fn image_agent_hides_analyze_deltas_when_args_precede_name_chat() {
         .push_response(vec![
             // Chunk 1: arguments only, no name, no id.
             Ok(ChatCompletionChunk {
+                service_tier: None,
                 id: "chat-1".to_string(),
                 choices: vec![ChatChunkChoice {
                     index: 0,
@@ -922,6 +929,7 @@ async fn image_agent_hides_analyze_deltas_when_args_precede_name_chat() {
             }),
             // Chunk 2: name (+ id) arrives with the rest of the arguments.
             Ok(ChatCompletionChunk {
+                service_tier: None,
                 id: "chat-1".to_string(),
                 choices: vec![ChatChunkChoice {
                     index: 0,
@@ -981,6 +989,7 @@ async fn image_agent_hides_analyze_deltas_when_args_precede_name_anthropic() {
     upstream
         .push_response(vec![
             Ok(ChatCompletionChunk {
+                service_tier: None,
                 id: "chat-1".to_string(),
                 choices: vec![ChatChunkChoice {
                     index: 0,
@@ -1008,6 +1017,7 @@ async fn image_agent_hides_analyze_deltas_when_args_precede_name_anthropic() {
                 usage: None,
             }),
             Ok(ChatCompletionChunk {
+                service_tier: None,
                 id: "chat-1".to_string(),
                 choices: vec![ChatChunkChoice {
                     index: 0,
@@ -1120,6 +1130,8 @@ async fn image_agent_resolved_alias_to_kimi_passes_images_through() {
 
     let base = format!("{}/v1", server.uri());
     let mut config = image_agent_config();
+    config.responses_capabilities.input_image =
+        Some(llmconduit::responses_capabilities::InputImageCapability::Native);
     config.upstreams = vec![UpstreamConfig {
         name: "primary".to_string(),
         upstream_base_url: base.parse().expect("url"),
@@ -1127,6 +1139,7 @@ async fn image_agent_resolved_alias_to_kimi_passes_images_through() {
         upstream_model: None,
         upstream_chat_kwargs: JsonMap::new(),
         upstream_request_log_path: None,
+        responses_capabilities: None,
         fallback_upstreams: vec![FallbackUpstreamConfig {
             name: "kimi-fallback".to_string(),
             upstream_base_url: base.parse().expect("url"),
@@ -1135,6 +1148,7 @@ async fn image_agent_resolved_alias_to_kimi_passes_images_through() {
             exposed_model: Some("vision-alias".to_string()),
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
+            responses_capabilities: None,
         }],
     }];
     let app = llmconduit::build_app(config);
@@ -1252,6 +1266,7 @@ async fn image_agent_oversized_unresolved_tool_buffer_fails_cleanly() {
     let mut chunks = Vec::new();
     for i in 0..192 {
         chunks.push(Ok(ChatCompletionChunk {
+            service_tier: None,
             id: "chat-1".to_string(),
             choices: vec![ChatChunkChoice {
                 index: 0,
@@ -1305,6 +1320,7 @@ async fn image_agent_client_tool_args_before_name_still_emits_all_deltas() {
         .push_response(vec![
             // Chunk 1: client tool args only, no name, no id.
             Ok(ChatCompletionChunk {
+                service_tier: None,
                 id: "chat-1".to_string(),
                 choices: vec![ChatChunkChoice {
                     index: 0,
@@ -1334,6 +1350,7 @@ async fn image_agent_client_tool_args_before_name_still_emits_all_deltas() {
             // Chunk 2: NAME-ONLY (+ id) — no arguments, so no delta is produced
             // by the resolution path; the post-stream flush must emit chunk 1.
             Ok(ChatCompletionChunk {
+                service_tier: None,
                 id: "chat-1".to_string(),
                 choices: vec![ChatChunkChoice {
                     index: 0,
@@ -1360,6 +1377,7 @@ async fn image_agent_client_tool_args_before_name_still_emits_all_deltas() {
             }),
             // Chunk 3: remaining client args (resolved → emitted live).
             Ok(ChatCompletionChunk {
+                service_tier: None,
                 id: "chat-1".to_string(),
                 choices: vec![ChatChunkChoice {
                     index: 0,
@@ -1637,6 +1655,9 @@ async fn upstream_request_log_redacts_image_data_when_agent_disabled() {
     )]);
     config.upstream_base_url = format!("{}/v1", server.uri()).parse().expect("url");
     config.upstream_request_log_path = Some(log_path.clone());
+    config.upstream_request_log_body_mode = llmconduit::config::LogBodyMode::RedactedPayload;
+    config.responses_capabilities.input_image =
+        Some(llmconduit::responses_capabilities::InputImageCapability::Native);
     let app = llmconduit::build_app(config);
 
     let body = json!({
@@ -2268,10 +2289,10 @@ async fn gating_table_request_override_not_displaced_by_remap_target_profile() {
 }
 
 #[tokio::test]
-async fn upstream_chat_error_body_with_image_url_is_redacted_in_failed() {
-    // Round-9 #2: an upstream 4xx whose error body echoes a data:/signed image
-    // URL must surface a REDACTED response.failed message (and redacted logs) —
-    // the raw image bytes / signed URL must not leak through the error path.
+async fn upstream_chat_error_body_with_image_url_is_not_exposed_in_failed() {
+    // An upstream 4xx whose body echoes a data:/signed image URL must surface a
+    // sanitized response.failed message. Public errors never expose upstream
+    // response bodies, even after redaction.
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -2314,8 +2335,8 @@ async fn upstream_chat_error_body_with_image_url_is_redacted_in_failed() {
         .as_str()
         .unwrap_or_default();
     assert!(
-        message.contains("upstream chat failed with 400"),
-        "surfaces the upstream error"
+        message.starts_with("the upstream rejected this request (400"),
+        "sanitized upstream status: {message}"
     );
     assert!(
         !message.contains("ERRBODYLEAK"),
@@ -2326,8 +2347,8 @@ async fn upstream_chat_error_body_with_image_url_is_redacted_in_failed() {
         "signed-url token redacted from response.failed"
     );
     assert!(
-        message.contains("<redacted uri>"),
-        "image uris redacted in error body"
+        !message.contains("<redacted uri>"),
+        "body is omitted entirely"
     );
 }
 
@@ -2657,7 +2678,8 @@ async fn e2b_degraded_turn_does_not_read_from_replay_cache() {
     replay_store
         .insert(ReplayRecord {
             model: request.model.clone(),
-            instructions: request.instructions.clone(),
+            instructions: request.instructions.replay_key().into_owned(),
+            cache_affinity: None,
             visible_history: would_be_degraded,
             internal_messages: vec![ChatMessage {
                 role: "system".to_string(),
@@ -2889,8 +2911,11 @@ async fn e2b_reject_policy_chat_returns_4xx_not_502_and_skips_provider() {
 #[tokio::test]
 async fn e2b_reject_policy_responses_returns_4xx_not_502_and_skips_provider() {
     let upstream = MockUpstream::default();
+    upstream.set_supported_models(["glm-5.1"]).await;
     let mut config = test_config();
     config.unsupported_image_policy = UnsupportedImagePolicy::Reject;
+    config.responses_capabilities.input_image =
+        Some(llmconduit::responses_capabilities::InputImageCapability::Reject);
     let gateway = test_gateway_with_config(upstream.clone(), MockSearch::default(), config);
     let app = llmconduit::build_app_from_gateway(gateway);
 
@@ -2927,12 +2952,13 @@ async fn e2b_reject_policy_responses_returns_4xx_not_502_and_skips_provider() {
         status, 400,
         "Reject must fail pre-dispatch with a 4xx, never 502"
     );
-    assert!(
-        parsed["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("text-only"),
-        "structured error body: {parsed}"
+    assert_eq!(
+        parsed["error"]["code"], "unsupported_parameter",
+        "Responses rejects the capability with a standard OpenAI error: {parsed}"
+    );
+    assert_eq!(
+        parsed["error"]["param"], "input[0].content[1]",
+        "the error identifies the exact unsupported image item: {parsed}"
     );
     assert!(
         upstream.requests().await.is_empty(),
@@ -2980,6 +3006,9 @@ async fn e2b_ac9_no_image_bytes_in_upstream_jsonl_log_for_degraded_turn() {
     config.brave_api_key = None;
     config.upstream_base_url = format!("{}/v1", server.uri()).parse().expect("url");
     config.upstream_request_log_path = Some(log_path.clone());
+    config.upstream_request_log_body_mode = llmconduit::config::LogBodyMode::RedactedPayload;
+    config.responses_capabilities.input_image =
+        Some(llmconduit::responses_capabilities::InputImageCapability::Placeholder);
     let app = llmconduit::build_app(config);
 
     let body = json!({

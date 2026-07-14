@@ -77,6 +77,25 @@ pub fn redact_image_uris(text: &str) -> String {
     out
 }
 
+/// Remove exact secret values from untrusted text, regardless of the JSON key
+/// or prose label the peer used to return them. Key-based redaction is not
+/// sufficient for backend responses: a malicious or merely verbose service can
+/// echo an Authorization value in a neutral `message`, `title`, or `content`
+/// field. Empty literals are ignored because replacing `""` would expand every
+/// character boundary.
+pub(crate) fn redact_sensitive_literals<'a>(
+    text: &str,
+    literals: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut redacted = text.to_string();
+    for literal in literals {
+        if !literal.is_empty() && redacted.contains(literal) {
+            redacted = redacted.replace(literal, "<redacted secret>");
+        }
+    }
+    redacted
+}
+
 /// Recursively redact image URIs in every string within a JSON value (G4
 /// round-4 consolidation). Used by the request-logging surfaces (inbound trace
 /// `redact_payload_secrets`, upstream JSONL) so a `data:`/signed `image_url`
@@ -154,6 +173,29 @@ pub fn redact_vision_text(text: &str) -> String {
     }
 }
 
+/// Vision text additionally knows the exact image locations submitted to the
+/// backend. Remove those literals before the generic URI pass so non-HTTP image
+/// schemes (for example `s3:` or a provider-specific opaque locator) cannot be
+/// echoed through an otherwise innocuous `content` field.
+pub(crate) fn redact_vision_text_with_literals<'a>(
+    text: &str,
+    literals: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let mut redacted = text.to_string();
+    for literal in literals {
+        if literal.is_empty() {
+            continue;
+        }
+        let encoded = url::form_urlencoded::byte_serialize(literal.as_bytes()).collect::<String>();
+        let encoded_lower = encoded.to_ascii_lowercase();
+        redacted = redact_sensitive_literals(
+            &redacted,
+            [literal, encoded.as_str(), encoded_lower.as_str()],
+        );
+    }
+    redact_vision_text(&redacted)
+}
+
 // ===========================================================================
 // Secret-key authority + the capped, redacting STREAMING capture primitive.
 //
@@ -185,6 +227,20 @@ pub(crate) fn is_sensitive_payload_key(key: &str) -> bool {
             | "refreshtoken"
             | "authtoken"
             | "bearertoken"
+            | "cookie"
+            | "setcookie"
+            | "proxyauthorization"
+            | "proxyauthenticate"
+            | "xauthtoken"
+            | "xsubscriptiontoken"
+            | "sessiontoken"
+            | "xsessiontoken"
+            | "csrftoken"
+            | "xcsrftoken"
+            // Responses prompt-cache affinity keys are opaque caller secrets.
+            // Gateway-hash mode consumes them before dispatch, but inbound
+            // payload logging/capture happens earlier and must redact them too.
+            | "promptcachekey"
             // `openai-beta` carries feature-gating tokens; redact its value in
             // captured headers (D1 R1 #2). Also covers a JSON `openai_beta` field.
             | "openaibeta"
@@ -217,6 +273,55 @@ pub(crate) fn capture_capped_redacted(raw: &[u8], body_cap: usize, scalar_cap: u
     // bounded FIXED marker that contains NONE of the original bytes — guaranteeing
     // no secret survives — while still recording that a body existed and its size.
     format!("[redacted: unparseable body {} bytes]", raw.len()).into_bytes()
+}
+
+/// Sanitize an untrusted upstream error body for diagnostics and client-safe
+/// internal error plumbing. Structured JSON uses the same recursive secret-key
+/// and image-URI redaction as every capture surface; malformed/non-UTF8 content
+/// becomes a fixed length-only marker. The returned text is bounded by `cap`
+/// (apart from the short fixed marker itself) and contains no original malformed
+/// bytes.
+#[cfg(test)]
+pub(crate) fn sanitize_untrusted_body_for_diagnostics(raw: &[u8], cap: usize) -> String {
+    let redacted = capture_capped_redacted(raw, cap.max(1), cap.clamp(1, 4 * 1024));
+    // Both the JSON writer and the fallback marker emit UTF-8. Keep the fallback
+    // defensive so this helper remains total if that implementation changes.
+    String::from_utf8(redacted).unwrap_or_else(|error| {
+        format!(
+            "[redacted: unparseable body {} bytes]",
+            error.as_bytes().len()
+        )
+    })
+}
+
+/// Read an HTTP body with a hard retained-byte ceiling. The stream is stopped
+/// once `limit + 1` bytes have been observed, so an error endpoint cannot force
+/// an unbounded `.text()`/`.json()` allocation. The boolean reports truncation.
+pub(crate) async fn read_reqwest_body_capped(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<(Vec<u8>, bool), reqwest::Error> {
+    use futures::StreamExt;
+
+    let limit = limit.max(1);
+    let mut body = Vec::with_capacity(limit.min(16 * 1024));
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = limit.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            body.extend_from_slice(&chunk[..remaining]);
+            return Ok((body, true));
+        }
+        body.extend_from_slice(&chunk);
+        if body.len() == limit {
+            if stream.next().await.transpose()?.is_some() {
+                return Ok((body, true));
+            }
+            break;
+        }
+    }
+    Ok((body, false))
 }
 
 /// Capped + redacting capture of a `Serialize` value WITHOUT a full O(body)
@@ -911,6 +1016,14 @@ mod tests {
             "openai_beta",
             "client_secret",
             "refresh_token",
+            "prompt_cache_key",
+            "cookie",
+            "set-cookie",
+            "proxy-authorization",
+            "x-auth-token",
+            "x-subscription-token",
+            "x-session-token",
+            "x-csrf-token",
         ] {
             assert!(is_sensitive_payload_key(key), "{key} must be sensitive");
         }
@@ -982,6 +1095,25 @@ mod tests {
             String::from_utf8_lossy(&out2).starts_with("[redacted: unparseable body"),
             "non-utf8 body → fixed marker"
         );
+    }
+
+    #[test]
+    fn diagnostic_body_sanitizer_redacts_structured_secrets_and_hides_malformed_bytes() {
+        let structured = br#"{"error":{"message":"denied","api_key":"sk-LEAK"},"image":"data:image/png;base64,LEAK"}"#;
+        let sanitized = sanitize_untrusted_body_for_diagnostics(structured, 1024);
+        assert!(sanitized.contains("denied"));
+        assert!(sanitized.contains("[redacted]"));
+        assert!(sanitized.contains("<redacted uri>"));
+        assert!(!sanitized.contains("sk-LEAK"));
+        assert!(!sanitized.contains("base64,LEAK"));
+
+        let malformed = b"api_key=sk-MALFORMED-LEAK";
+        let sanitized = sanitize_untrusted_body_for_diagnostics(malformed, 1024);
+        assert_eq!(
+            sanitized,
+            format!("[redacted: unparseable body {} bytes]", malformed.len())
+        );
+        assert!(!sanitized.contains("sk-MALFORMED-LEAK"));
     }
 
     #[test]
@@ -1122,6 +1254,18 @@ mod tests {
             HeaderValue::from_static("tok=BETALEAK"),
         );
         headers.insert(
+            HeaderName::from_static("cookie"),
+            HeaderValue::from_static("dashboard_session=COOKIELEAK"),
+        );
+        headers.insert(
+            HeaderName::from_static("proxy-authorization"),
+            HeaderValue::from_static("Basic PROXYLEAK"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-subscription-token"),
+            HeaderValue::from_static("SUBSCRIPTIONLEAK"),
+        );
+        headers.insert(
             HeaderName::from_static("x-cb"),
             HeaderValue::from_static("https://x/y?sig=URLLEAK"),
         );
@@ -1129,6 +1273,15 @@ mod tests {
         let dumped = format!("{out:?}");
         assert!(!dumped.contains("HDRLEAK"));
         assert!(!dumped.contains("BETALEAK"), "openai-beta value redacted");
+        assert!(!dumped.contains("COOKIELEAK"), "cookies are redacted");
+        assert!(
+            !dumped.contains("PROXYLEAK"),
+            "proxy credentials are redacted"
+        );
+        assert!(
+            !dumped.contains("SUBSCRIPTIONLEAK"),
+            "subscription tokens are redacted"
+        );
         assert!(
             !dumped.contains("URLLEAK"),
             "uri-bearing header value redacted"

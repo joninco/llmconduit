@@ -27,12 +27,23 @@ pub trait SearchClient: Send + Sync {
     async fn search(&self, query: &str) -> AppResult<SearchOutcome>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BraveSearchClient {
     client: reqwest::Client,
     base_url: Url,
     api_key: Option<String>,
     max_results: usize,
+}
+
+impl std::fmt::Debug for BraveSearchClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BraveSearchClient")
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("max_results", &self.max_results)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BraveSearchClient {
@@ -75,23 +86,83 @@ impl SearchClient for BraveSearchClient {
             ])
             .send()
             .await
-            .map_err(|err| AppError::upstream(format!("Brave search request failed: {err}")))?;
+            .map_err(|_| AppError::upstream("Brave search request failed"))?;
         if !response.status().is_success() {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            // The body is provider-controlled and the request carried the
+            // configured Brave credential. Never echo response bytes into an
+            // AppError: the engine deliberately turns this error into a
+            // model-visible tool result, and a backend can return the header
+            // value under an innocuous field such as `message`.
             return Err(AppError::upstream(format!(
-                "Brave search failed with {status}: {body}"
+                "Brave search backend returned HTTP {}",
+                status.as_u16()
             )));
         }
-        let payload: BraveSearchResponse = response
-            .json()
-            .await
-            .map_err(|err| AppError::upstream(format!("invalid Brave search JSON: {err}")))?;
+        let (body, truncated) =
+            crate::redaction::read_reqwest_body_capped(response, 4 * 1024 * 1024)
+                .await
+                .map_err(|_| AppError::upstream("failed to read Brave search response"))?;
+        if truncated {
+            return Err(AppError::upstream("Brave search response was too large"));
+        }
+        let mut payload: BraveSearchResponse = serde_json::from_slice(&body)
+            .map_err(|_| AppError::upstream("invalid Brave search JSON"))?;
+        redact_brave_response_credentials(&mut payload, api_key);
         Ok(SearchOutcome {
             formatted: format_search_results(&payload),
             sources: collect_sources(&payload),
         })
     }
+}
+
+/// Scrub the configured credential from every provider-controlled text field
+/// before it can become model-visible or enter a structured source event. The
+/// JSON field name is irrelevant: exact and URL-encoded echoes are removed even
+/// from neutral `title`, `description`, and `url` fields.
+fn redact_brave_response_credentials(payload: &mut BraveSearchResponse, api_key: &str) {
+    let encoded = url::form_urlencoded::byte_serialize(api_key.as_bytes()).collect::<String>();
+    let encoded_lower = encoded.to_ascii_lowercase();
+    let literals = [api_key, encoded.as_str(), encoded_lower.as_str()];
+    let Some(web) = payload.web.as_mut() else {
+        return;
+    };
+    for result in &mut web.results {
+        result.title = crate::redaction::redact_sensitive_literals(&result.title, literals);
+        result.description =
+            crate::redaction::redact_sensitive_literals(&result.description, literals);
+        if literals
+            .iter()
+            .any(|literal| !literal.is_empty() && result.url.contains(literal))
+        {
+            // Replacing a token inside a URL creates an invalid citation and
+            // can leave surrounding signed parameters meaningful. Omit the URL
+            // altogether; `collect_sources` then drops this source.
+            result.url.clear();
+        }
+    }
+}
+
+/// Defense-in-depth for alternate `SearchClient` implementations. Production's
+/// Brave client sanitizes fields before formatting, but the engine calls this
+/// on every outcome so an injected client cannot echo the configured key.
+pub(crate) fn redact_search_outcome_credentials(
+    outcome: &mut SearchOutcome,
+    api_key: Option<&str>,
+) {
+    let Some(api_key) = api_key.filter(|key| !key.is_empty()) else {
+        return;
+    };
+    let encoded = url::form_urlencoded::byte_serialize(api_key.as_bytes()).collect::<String>();
+    let encoded_lower = encoded.to_ascii_lowercase();
+    let literals = [api_key, encoded.as_str(), encoded_lower.as_str()];
+    outcome.formatted = crate::redaction::redact_sensitive_literals(&outcome.formatted, literals);
+    outcome.sources.retain_mut(|source| {
+        source.title = crate::redaction::redact_sensitive_literals(&source.title, literals);
+        !literals
+            .iter()
+            .any(|literal| !literal.is_empty() && source.url.contains(literal))
+    });
 }
 
 fn collect_sources(payload: &BraveSearchResponse) -> Vec<SearchSource> {
@@ -166,9 +237,15 @@ mod tests {
     use super::BraveSearchResponse;
     use super::BraveWebResult;
     use super::BraveWebResults;
+    use super::SearchClient;
     use super::SearchSource;
     use super::collect_sources;
     use super::format_search_results;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
 
     #[test]
     fn format_search_results_empty() {
@@ -249,11 +326,14 @@ mod tests {
                 system_prompt_prefix: None,
                 upstream_request_log_path: None,
                 turn_capture_dir: None,
+                api_log_body_mode: Default::default(),
+                upstream_request_log_body_mode: Default::default(),
                 upstream_chat_kwargs: serde_json::Map::new(),
                 upstreams: Vec::new(),
                 fallback_upstreams: Vec::new(),
                 upstream_failure_cooldown_secs: 30,
                 model_profiles: std::collections::BTreeMap::new(),
+                responses_capabilities: Default::default(),
                 model_routes: Vec::new(),
                 template_family: None,
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1")
@@ -265,6 +345,8 @@ mod tests {
                 max_web_search_rounds: 5,
                 flatten_content: true,
                 max_replay_entries: 1000,
+                response_store: Default::default(),
+                replay: Default::default(),
                 debug_log_max_age_hours: None,
                 min_completion_tokens: 4096,
                 max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -300,11 +382,14 @@ mod tests {
                 system_prompt_prefix: None,
                 upstream_request_log_path: None,
                 turn_capture_dir: None,
+                api_log_body_mode: Default::default(),
+                upstream_request_log_body_mode: Default::default(),
                 upstream_chat_kwargs: serde_json::Map::new(),
                 upstreams: Vec::new(),
                 fallback_upstreams: Vec::new(),
                 upstream_failure_cooldown_secs: 30,
                 model_profiles: std::collections::BTreeMap::new(),
+                responses_capabilities: Default::default(),
                 model_routes: Vec::new(),
                 template_family: None,
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1/")
@@ -316,6 +401,8 @@ mod tests {
                 max_web_search_rounds: 5,
                 flatten_content: true,
                 max_replay_entries: 1000,
+                response_store: Default::default(),
+                replay: Default::default(),
                 debug_log_max_age_hours: None,
                 min_completion_tokens: 4096,
                 max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -337,5 +424,75 @@ mod tests {
                 .as_str(),
             "https://api.search.brave.com/res/v1/web/search"
         );
+    }
+
+    #[tokio::test]
+    async fn brave_backend_never_echoes_key_from_neutral_error_or_result_fields() {
+        const SENTINEL: &str = "brave-key-sentinel-7f291";
+
+        let failed = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/res/v1/web/search"))
+            .respond_with(ResponseTemplate::new(502).set_body_json(serde_json::json!({
+                "message": format!("backend reflected {SENTINEL}"),
+            })))
+            .mount(&failed)
+            .await;
+        let failed_config = Config::from_persisted(&crate::config::PersistedConfig {
+            brave_base_url: format!("{}/res/v1", failed.uri()),
+            brave_api_key: Some(SENTINEL.to_string()),
+            ..crate::config::PersistedConfig::default()
+        })
+        .expect("failed-backend config");
+        let error = BraveSearchClient::new(reqwest::Client::new(), failed_config)
+            .search("safe query")
+            .await
+            .expect_err("non-success response must fail");
+        assert_eq!(error.message, "Brave search backend returned HTTP 502");
+        assert!(!error.to_string().contains(SENTINEL));
+        assert!(!error.client_message.contains(SENTINEL));
+
+        let succeeded = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/res/v1/web/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "web": {"results": [
+                    {
+                        "title": format!("reflected title {SENTINEL}"),
+                        "url": format!("https://result.test/path?token={SENTINEL}"),
+                        "description": format!("reflected description {SENTINEL}")
+                    },
+                    {
+                        "title": format!("safe URL but reflected {SENTINEL}"),
+                        "url": "https://safe-result.test/path",
+                        "description": "ordinary description"
+                    }
+                ]}
+            })))
+            .mount(&succeeded)
+            .await;
+        let success_config = Config::from_persisted(&crate::config::PersistedConfig {
+            brave_base_url: format!("{}/res/v1", succeeded.uri()),
+            brave_api_key: Some(SENTINEL.to_string()),
+            ..crate::config::PersistedConfig::default()
+        })
+        .expect("success-backend config");
+        let outcome = BraveSearchClient::new(reqwest::Client::new(), success_config)
+            .search("safe query")
+            .await
+            .expect("search outcome");
+        assert!(!outcome.formatted.contains(SENTINEL));
+        assert!(
+            outcome
+                .sources
+                .iter()
+                .all(|source| !source.title.contains(SENTINEL) && !source.url.contains(SENTINEL))
+        );
+        assert_eq!(
+            outcome.sources.len(),
+            1,
+            "credential-bearing URL is omitted"
+        );
+        assert_eq!(outcome.sources[0].url, "https://safe-result.test/path");
     }
 }

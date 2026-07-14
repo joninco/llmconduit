@@ -549,7 +549,72 @@ pub enum UnsupportedImagePolicy {
     Reject,
 }
 
-#[derive(Debug, Clone)]
+/// Controls whether API/request logs contain only bounded metadata or a
+/// recursively redacted JSON payload. Metadata-only is deliberately the safe
+/// default; durable turn capture remains a separate opt-in surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogBodyMode {
+    #[default]
+    Metadata,
+    RedactedPayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseStoreBackend {
+    #[default]
+    Memory,
+    Sqlite,
+}
+
+/// OpenAI Responses state persistence (`store` / `previous_response_id`).
+/// This is intentionally independent from llmconduit's private replay cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseStoreConfig {
+    #[serde(default)]
+    pub backend: ResponseStoreBackend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    #[serde(default = "default_response_store_max_entries")]
+    pub max_entries: usize,
+    #[serde(default = "default_response_store_retention_hours")]
+    pub retention_hours: u64,
+}
+
+impl Default for ResponseStoreConfig {
+    fn default() -> Self {
+        Self {
+            backend: ResponseStoreBackend::Memory,
+            path: None,
+            max_entries: default_response_store_max_entries(),
+            retention_hours: default_response_store_retention_hours(),
+        }
+    }
+}
+
+/// Private prefix replay cache. Disabled by default and independent from the
+/// public Responses `store` flag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_replay_max_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for ReplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_entries: default_replay_max_entries(),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub upstream_base_url: Url,
@@ -557,6 +622,8 @@ pub struct Config {
     pub upstream_model: Option<String>,
     pub system_prompt_prefix: Option<String>,
     pub upstream_request_log_path: Option<PathBuf>,
+    pub api_log_body_mode: LogBodyMode,
+    pub upstream_request_log_body_mode: LogBodyMode,
     /// F1 (Topic F): opt-in durable per-turn capture directory. When set,
     /// every instrumented inference turn writes `<dir>/<api_call_id>.json`
     /// with the full inbound request, on-wire upstream request, raw upstream
@@ -568,6 +635,9 @@ pub struct Config {
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
     pub upstream_failure_cooldown_secs: u64,
     pub model_profiles: BTreeMap<String, ModelProfile>,
+    /// Global OpenAI Responses capability declaration. Provider and final
+    /// served-model profile layers overlay this conservatively.
+    pub responses_capabilities: crate::responses_capabilities::ResponsesCapabilitiesConfig,
     /// Ad-hoc model routes (G7). Each route maps a request-model *name* (which
     /// may be a glob pattern such as `claude-opus-*`) to a synthetic upstream
     /// (base URL + optional upstream model). Routes turn the gateway into
@@ -589,6 +659,8 @@ pub struct Config {
     pub max_web_search_rounds: usize,
     pub flatten_content: bool,
     pub max_replay_entries: usize,
+    pub response_store: ResponseStoreConfig,
+    pub replay: ReplayConfig,
     pub debug_log_max_age_hours: Option<u64>,
     /// Floor for the reduced completion budget when retrying a context-window
     /// overflow (G1). A shrink-and-retry never pushes `max_completion_tokens`
@@ -634,6 +706,54 @@ pub struct Config {
     /// default — an absent model simply has no price (cost stays `None`/0), which
     /// is contract-valid (the frontend only requires finite rates when present).
     pub price_table: HashMap<String, ModelPrice>,
+}
+
+impl Config {
+    /// Whether any configured backend/server tool can receive a credential.
+    /// Turn capture uses this conservative signal to avoid retaining raw output
+    /// from a peer that could echo its Authorization value.
+    pub fn has_backend_credentials(&self) -> bool {
+        self.upstream_api_key.is_some()
+            || self.brave_api_key.is_some()
+            || self
+                .fallback_upstreams
+                .iter()
+                .any(|upstream| upstream.upstream_api_key.is_some())
+            || self.upstreams.iter().any(|upstream| {
+                upstream.upstream_api_key.is_some()
+                    || upstream
+                        .fallback_upstreams
+                        .iter()
+                        .any(|fallback| fallback.upstream_api_key.is_some())
+            })
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Config")
+            .field("bind_addr", &self.bind_addr)
+            .field("upstream_base_url", &self.upstream_base_url)
+            .field(
+                "upstream_api_key",
+                &self.upstream_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("upstream_model", &self.upstream_model)
+            .field("upstream_count", &self.upstreams.len())
+            .field("fallback_upstream_count", &self.fallback_upstreams.len())
+            .field("model_profile_count", &self.model_profiles.len())
+            .field("brave_base_url", &self.brave_base_url)
+            .field(
+                "brave_api_key",
+                &self.brave_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("request_timeout", &self.request_timeout)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("response_store", &self.response_store)
+            .field("replay", &self.replay)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One model's billing rates (T13/D13), per 1k tokens. Field names mirror the
@@ -784,7 +904,7 @@ fn retain_finite_prices(table: &mut HashMap<String, ModelPrice>) {
     });
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UpstreamConfig {
     pub name: String,
     pub upstream_base_url: Url,
@@ -792,7 +912,24 @@ pub struct UpstreamConfig {
     pub upstream_model: Option<String>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstream_request_log_path: Option<PathBuf>,
+    pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
+}
+
+impl std::fmt::Debug for UpstreamConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpstreamConfig")
+            .field("name", &self.name)
+            .field("upstream_base_url", &self.upstream_base_url)
+            .field(
+                "upstream_api_key",
+                &self.upstream_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("upstream_model", &self.upstream_model)
+            .field("fallback_count", &self.fallback_upstreams.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// A resolved ad-hoc model route (G7): request-model name → synthetic upstream.
@@ -1023,6 +1160,8 @@ pub struct PersistedModelProfile {
     pub reasoning_effort_default: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<CapabilitiesConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
     /// Upstream-compatible shorthand for effort remapping and thinking-kwarg
     /// control. Mutually exclusive with the fragment-based effort fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1057,6 +1196,9 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             #[serde(default)]
             capabilities: Option<CapabilitiesConfig>,
             #[serde(default)]
+            responses_capabilities:
+                Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
+            #[serde(default)]
             reasoning_effort: Option<ReasoningConfig>,
             #[serde(default, flatten)]
             shorthand_upstream_chat_kwargs: JsonMap<String, JsonValue>,
@@ -1074,6 +1216,7 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
         upstream_chat_kwargs.remove("reasoning_effort");
         upstream_chat_kwargs.remove("roles");
         upstream_chat_kwargs.remove("capabilities");
+        upstream_chat_kwargs.remove("responses_capabilities");
         merge_json_maps(&mut upstream_chat_kwargs, &raw.upstream_chat_kwargs);
         Ok(Self {
             extends: raw.extends,
@@ -1086,6 +1229,7 @@ impl<'de> Deserialize<'de> for PersistedModelProfile {
             reasoning_effort_map: raw.reasoning_effort_map,
             reasoning_effort_default: raw.reasoning_effort_default,
             capabilities: raw.capabilities,
+            responses_capabilities: raw.responses_capabilities,
             reasoning_effort: raw.reasoning_effort,
         })
     }
@@ -1104,6 +1248,7 @@ pub struct ModelProfile {
     pub reasoning_effort_map: BTreeMap<String, JsonValue>,
     pub reasoning_effort_default: Option<String>,
     pub capabilities: Option<CapabilitiesConfig>,
+    pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
     pub reasoning_effort: Option<ReasoningConfig>,
 }
 
@@ -1119,7 +1264,7 @@ pub struct ReasoningEffortPolicy {
     pub upstream_reasoning: Option<ReasoningConfig>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FallbackUpstreamConfig {
     pub name: String,
     pub upstream_base_url: Url,
@@ -1128,9 +1273,26 @@ pub struct FallbackUpstreamConfig {
     pub exposed_model: Option<String>,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstream_request_log_path: Option<PathBuf>,
+    pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+impl std::fmt::Debug for FallbackUpstreamConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FallbackUpstreamConfig")
+            .field("name", &self.name)
+            .field("upstream_base_url", &self.upstream_base_url)
+            .field(
+                "upstream_api_key",
+                &self.upstream_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("upstream_model", &self.upstream_model)
+            .field("exposed_model", &self.exposed_model)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PersistedFallbackUpstream {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -1145,9 +1307,27 @@ pub struct PersistedFallbackUpstream {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+impl std::fmt::Debug for PersistedFallbackUpstream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistedFallbackUpstream")
+            .field("name", &self.name)
+            .field("upstream_base_url", &self.upstream_base_url)
+            .field(
+                "upstream_api_key",
+                &self.upstream_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("upstream_model", &self.upstream_model)
+            .field("exposed_model", &self.exposed_model)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct PersistedUpstream {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -1160,11 +1340,29 @@ pub struct PersistedUpstream {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_log_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_upstreams: Vec<PersistedFallbackUpstream>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+impl std::fmt::Debug for PersistedUpstream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistedUpstream")
+            .field("name", &self.name)
+            .field("upstream_base_url", &self.upstream_base_url)
+            .field(
+                "upstream_api_key",
+                &self.upstream_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("upstream_model", &self.upstream_model)
+            .field("fallback_upstreams", &self.fallback_upstreams)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct PersistedConfig {
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
@@ -1178,6 +1376,10 @@ pub struct PersistedConfig {
     pub system_prompt_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_request_log_path: Option<String>,
+    #[serde(default)]
+    pub api_log_body_mode: LogBodyMode,
+    #[serde(default)]
+    pub upstream_request_log_body_mode: LogBodyMode,
     /// F1: opt-in durable per-turn capture directory (see
     /// `Config::turn_capture_dir`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1194,6 +1396,8 @@ pub struct PersistedConfig {
     pub model_profile_templates: BTreeMap<String, PersistedModelProfile>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_profiles: BTreeMap<String, PersistedModelProfile>,
+    #[serde(default, skip_serializing_if = "is_default_responses_capabilities")]
+    pub responses_capabilities: crate::responses_capabilities::ResponsesCapabilitiesConfig,
     /// Ad-hoc model routes (G7): request-model name (possibly a glob) →
     /// synthetic upstream, in DECLARATION order (see `OrderedModelRoutes`). CLI
     /// `--model-route` specs are merged in after these.
@@ -1217,8 +1421,18 @@ pub struct PersistedConfig {
     pub max_web_search_rounds: usize,
     #[serde(default = "default_flatten_content")]
     pub flatten_content: bool,
-    #[serde(default = "default_max_replay_entries")]
+    #[serde(
+        default = "default_max_replay_entries",
+        skip_serializing_if = "is_default_max_replay_entries"
+    )]
     pub max_replay_entries: usize,
+    #[serde(default)]
+    pub response_store: ResponseStoreConfig,
+    /// `None` distinguishes an older configuration that only supplied the
+    /// deprecated `max_replay_entries` alias. Newly generated configurations
+    /// always write this section.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay: Option<ReplayConfig>,
     /// Opt-in age-based cleanup of debug/request-log dump files. `None` (the
     /// default) disables rotation entirely so behavior is opt-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1263,6 +1477,29 @@ pub struct PersistedConfig {
     pub price_table: HashMap<String, ModelPrice>,
 }
 
+impl std::fmt::Debug for PersistedConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PersistedConfig")
+            .field("bind_addr", &self.bind_addr)
+            .field("upstream_base_url", &self.upstream_base_url)
+            .field(
+                "upstream_api_key",
+                &self.upstream_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("upstream_model", &self.upstream_model)
+            .field("upstreams", &self.upstreams)
+            .field("fallback_upstreams", &self.fallback_upstreams)
+            .field(
+                "brave_api_key",
+                &self.brave_api_key.as_ref().map(|_| "[redacted]"),
+            )
+            .field("response_store", &self.response_store)
+            .field("replay", &self.replay)
+            .finish_non_exhaustive()
+    }
+}
+
 fn default_bind_addr() -> String {
     "127.0.0.1:4000".to_string()
 }
@@ -1296,7 +1533,32 @@ fn default_flatten_content() -> bool {
 }
 
 fn default_max_replay_entries() -> usize {
+    // Deprecated flat alias. Keep its deserialize default aligned with the
+    // nested replay contract so an older sparse config still gets the new,
+    // bounded disabled-by-default behavior.
+    100
+}
+
+fn is_default_max_replay_entries(value: &usize) -> bool {
+    *value == default_max_replay_entries()
+}
+
+fn is_default_responses_capabilities(
+    value: &crate::responses_capabilities::ResponsesCapabilitiesConfig,
+) -> bool {
+    value == &crate::responses_capabilities::ResponsesCapabilitiesConfig::default()
+}
+
+fn default_response_store_max_entries() -> usize {
     1000
+}
+
+fn default_response_store_retention_hours() -> u64 {
+    720
+}
+
+fn default_replay_max_entries() -> usize {
+    100
 }
 
 fn default_upstream_failure_cooldown_secs() -> u64 {
@@ -1352,6 +1614,8 @@ impl Default for PersistedConfig {
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            api_log_body_mode: LogBodyMode::Metadata,
+            upstream_request_log_body_mode: LogBodyMode::Metadata,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
@@ -1359,6 +1623,8 @@ impl Default for PersistedConfig {
             upstream_failure_cooldown_secs: default_upstream_failure_cooldown_secs(),
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::new(),
+            responses_capabilities:
+                crate::responses_capabilities::ResponsesCapabilitiesConfig::default(),
             model_routes: OrderedModelRoutes::default(),
             template_family: None,
             brave_base_url: default_brave_base_url(),
@@ -1368,7 +1634,9 @@ impl Default for PersistedConfig {
             connect_timeout_secs: 10,
             max_web_search_rounds: 5,
             flatten_content: true,
-            max_replay_entries: 1000,
+            max_replay_entries: default_max_replay_entries(),
+            response_store: ResponseStoreConfig::default(),
+            replay: Some(ReplayConfig::default()),
             debug_log_max_age_hours: None,
             min_completion_tokens: default_min_completion_tokens(),
             max_sse_frame_bytes: default_max_sse_frame_bytes(),
@@ -1500,10 +1768,8 @@ impl Config {
             .bind_addr
             .parse()
             .map_err(|err| format!("invalid bind_addr: {err}"))?;
-        let upstream_base_url = Url::parse(&config.upstream_base_url)
-            .map_err(|err| format!("invalid upstream_base_url: {err}"))?;
-        let brave_base_url = Url::parse(&config.brave_base_url)
-            .map_err(|err| format!("invalid brave_base_url: {err}"))?;
+        let upstream_base_url = parse_service_url(&config.upstream_base_url, "upstream_base_url")?;
+        let brave_base_url = parse_service_url(&config.brave_base_url, "brave_base_url")?;
         let fallback_upstreams = config
             .fallback_upstreams
             .iter()
@@ -1520,11 +1786,44 @@ impl Config {
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
         let model_routes = resolve_model_routes(&config.model_routes)?;
         let vision_url = match trim_nonempty(config.vision_url.as_deref()) {
-            Some(url) => {
-                Some(Url::parse(&url).map_err(|err| format!("invalid vision_url: {err}"))?)
-            }
+            Some(url) => Some(parse_service_url(&url, "vision_url")?),
             None => None,
         };
+        let mut response_store = config.response_store.clone();
+        if response_store.max_entries == 0 {
+            return Err("response_store.max_entries must be at least 1".to_string());
+        }
+        if response_store.retention_hours == 0 {
+            return Err("response_store.retention_hours must be at least 1".to_string());
+        }
+        response_store.path = response_store.path.and_then(|path| {
+            let trimmed = path.to_string_lossy().trim().to_string();
+            (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+        });
+        match response_store.backend {
+            ResponseStoreBackend::Memory => {
+                if response_store.path.is_some() {
+                    return Err(
+                        "response_store.path is only valid when response_store.backend is sqlite"
+                            .to_string(),
+                    );
+                }
+            }
+            ResponseStoreBackend::Sqlite if response_store.path.is_none() => {
+                return Err(
+                    "response_store.path is required when response_store.backend is sqlite"
+                        .to_string(),
+                );
+            }
+            ResponseStoreBackend::Sqlite => {}
+        }
+        let replay = config.replay.clone().unwrap_or(ReplayConfig {
+            enabled: false,
+            max_entries: config.max_replay_entries,
+        });
+        if replay.max_entries == 0 {
+            return Err("replay.max_entries must be at least 1".to_string());
+        }
         Ok(Self {
             bind_addr,
             upstream_base_url,
@@ -1549,6 +1848,8 @@ impl Config {
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .map(PathBuf::from),
+            api_log_body_mode: config.api_log_body_mode,
+            upstream_request_log_body_mode: config.upstream_request_log_body_mode,
             turn_capture_dir: config
                 .turn_capture_dir
                 .as_ref()
@@ -1560,6 +1861,7 @@ impl Config {
             fallback_upstreams,
             upstream_failure_cooldown_secs: config.upstream_failure_cooldown_secs,
             model_profiles,
+            responses_capabilities: config.responses_capabilities.clone(),
             model_routes,
             template_family: normalize_template_family(config.template_family.as_deref()),
             brave_base_url,
@@ -1573,7 +1875,9 @@ impl Config {
             connect_timeout_secs: config.connect_timeout_secs,
             max_web_search_rounds: config.max_web_search_rounds,
             flatten_content: config.flatten_content,
-            max_replay_entries: config.max_replay_entries,
+            max_replay_entries: replay.max_entries,
+            response_store,
+            replay,
             debug_log_max_age_hours: config.debug_log_max_age_hours,
             min_completion_tokens: config.min_completion_tokens.max(1),
             // Floor at 1 KiB so a misconfigured tiny/zero cap cannot reject every
@@ -1606,6 +1910,15 @@ impl Config {
             .and_then(|profile| profile.upstream_model.clone())
             .or_else(|| self.upstream_model.clone())
             .unwrap_or_else(|| request_model.to_string())
+    }
+
+    /// Return only an explicitly named request-model alias target. Unlike
+    /// `resolve_upstream_model`, this deliberately ignores the global
+    /// `upstream_model` fallback: a blanket backend rewrite must not make every
+    /// arbitrary Responses model name appear to be a configured public alias.
+    pub fn explicit_response_model_alias(&self, request_model: &str) -> Option<String> {
+        self.model_profile(request_model)
+            .and_then(|profile| profile.upstream_model.clone())
     }
 
     /// The configured [`ModelPrice`] for `model` (T13/D13). Exact key match first,
@@ -1885,6 +2198,7 @@ struct ResolvedModelProfile {
     reasoning_effort_map: BTreeMap<String, JsonValue>,
     reasoning_effort_default: Option<String>,
     capabilities: Option<CapabilitiesConfig>,
+    responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
     reasoning_effort: Option<ReasoningConfig>,
 }
 
@@ -1900,6 +2214,7 @@ impl ResolvedModelProfile {
             reasoning_effort_map: self.reasoning_effort_map,
             reasoning_effort_default: self.reasoning_effort_default,
             capabilities: self.capabilities,
+            responses_capabilities: self.responses_capabilities,
             reasoning_effort: self.reasoning_effort,
         }
     }
@@ -1973,8 +2288,10 @@ fn resolve_model_routes(routes: &OrderedModelRoutes) -> Result<Vec<ModelRoute>, 
         }
         let base_url = trim_nonempty(route.upstream_base_url.as_deref())
             .ok_or_else(|| format!("model_routes[{name}]: missing upstream_base_url"))?;
-        let upstream_base_url = Url::parse(&base_url)
-            .map_err(|err| format!("model_routes[{name}]: invalid upstream_base_url: {err}"))?;
+        let upstream_base_url = parse_service_url(
+            &base_url,
+            &format!("model_routes[{name}].upstream_base_url"),
+        )?;
         let glob = if is_glob_pattern(name) {
             Some(glob_to_regex(name).map_err(|err| format!("model_routes[{name}]: {err}"))?)
         } else {
@@ -2010,7 +2327,9 @@ pub fn parse_model_route_spec(spec: &str) -> Result<(String, PersistedModelRoute
     }
     // Validate the URL eagerly so a malformed spec is rejected here rather than
     // surfacing later from `from_persisted`.
-    Url::parse(url).map_err(|err| format!("--model-route {spec:?}: invalid URL: {err}"))?;
+    // Do not echo the raw CLI spec in a validation error: a rejected URL may
+    // itself contain the credential/query value this validation protects.
+    parse_service_url(url, "--model-route URL")?;
     Ok((
         name.to_string(),
         PersistedModelRoute {
@@ -2104,6 +2423,13 @@ fn merge_resolved_model_profile(
     if source.capabilities.is_some() {
         destination.capabilities = source.capabilities;
     }
+    if let Some(source_capabilities) = source.responses_capabilities {
+        if let Some(destination_capabilities) = &mut destination.responses_capabilities {
+            destination_capabilities.overlay(&source_capabilities);
+        } else {
+            destination.responses_capabilities = Some(source_capabilities);
+        }
+    }
     if source.reasoning_effort.is_some() {
         destination.reasoning_effort = source.reasoning_effort;
         destination.reasoning_effort_map.clear();
@@ -2146,6 +2472,13 @@ fn merge_persisted_model_profile(
     }
     if source.capabilities.is_some() {
         destination.capabilities.clone_from(&source.capabilities);
+    }
+    if let Some(source_capabilities) = &source.responses_capabilities {
+        if let Some(destination_capabilities) = &mut destination.responses_capabilities {
+            destination_capabilities.overlay(source_capabilities);
+        } else {
+            destination.responses_capabilities = Some(source_capabilities.clone());
+        }
     }
     if source.reasoning_effort.is_some() {
         destination
@@ -2193,8 +2526,10 @@ fn join_prompt_prefixes(prefixes: impl IntoIterator<Item = String>) -> Option<St
 fn parse_upstream(
     (index, provider): (usize, &PersistedUpstream),
 ) -> Result<UpstreamConfig, String> {
-    let upstream_base_url = Url::parse(provider.upstream_base_url.trim())
-        .map_err(|err| format!("invalid upstreams[{index}].upstream_base_url: {err}"))?;
+    let upstream_base_url = parse_service_url(
+        provider.upstream_base_url.trim(),
+        &format!("upstreams[{index}].upstream_base_url"),
+    )?;
     let fallback_upstreams = provider
         .fallback_upstreams
         .iter()
@@ -2220,6 +2555,7 @@ fn parse_upstream(
         upstream_chat_kwargs: provider.upstream_chat_kwargs.clone(),
         upstream_request_log_path: trim_nonempty(provider.upstream_request_log_path.as_deref())
             .map(PathBuf::from),
+        responses_capabilities: provider.responses_capabilities.clone(),
         fallback_upstreams,
     })
 }
@@ -2229,8 +2565,10 @@ fn parse_fallback_upstream(
     index: usize,
     path: &str,
 ) -> Result<FallbackUpstreamConfig, String> {
-    let upstream_base_url = Url::parse(provider.upstream_base_url.trim())
-        .map_err(|err| format!("invalid {path}[{index}].upstream_base_url: {err}"))?;
+    let upstream_base_url = parse_service_url(
+        provider.upstream_base_url.trim(),
+        &format!("{path}[{index}].upstream_base_url"),
+    )?;
     Ok(FallbackUpstreamConfig {
         name: provider
             .name
@@ -2245,6 +2583,7 @@ fn parse_fallback_upstream(
         upstream_chat_kwargs: provider.upstream_chat_kwargs.clone(),
         upstream_request_log_path: trim_nonempty(provider.upstream_request_log_path.as_deref())
             .map(PathBuf::from),
+        responses_capabilities: provider.responses_capabilities.clone(),
     })
 }
 
@@ -2253,6 +2592,25 @@ fn trim_nonempty(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+/// Parse a configured HTTP-service URL without permitting hidden credential
+/// carriers. These URLs are projected into diagnostics/topology and are joined
+/// with fixed API paths, so userinfo, query strings, and fragments have no
+/// legitimate configuration role. Rejecting them at startup is safer than
+/// attempting to sanitize every future projection independently.
+fn parse_service_url(raw: &str, path: &str) -> Result<Url, String> {
+    let url = Url::parse(raw.trim()).map_err(|err| format!("invalid {path}: {err}"))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(format!(
+            "invalid {path}: service URLs must not contain userinfo, query strings, or fragments"
+        ));
+    }
+    Ok(url)
 }
 
 /// Canonicalize a configured `template_family` override to the lowercase forms
@@ -2326,11 +2684,16 @@ pub fn write_persisted_config(path: &Path, config: &PersistedConfig) -> Result<(
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true).mode(0o600);
         let mut file = opts
             .open(path)
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+        // `OpenOptionsExt::mode` applies only when creating a file. Tighten an
+        // existing operator config before writing new secret-bearing content.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|err| format!("failed to secure {}: {err}", path.display()))?;
         file.write_all(yaml.as_bytes())
             .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
     }
@@ -2382,6 +2745,16 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
         && !value.trim().is_empty()
     {
         config.upstream_request_log_path = Some(value);
+    }
+    if let Ok(value) = env::var("LLMCONDUIT_API_LOG_BODY_MODE")
+        && let Some(mode) = parse_log_body_mode(&value)
+    {
+        config.api_log_body_mode = mode;
+    }
+    if let Ok(value) = env::var("LLMCONDUIT_UPSTREAM_REQUEST_LOG_BODY_MODE")
+        && let Some(mode) = parse_log_body_mode(&value)
+    {
+        config.upstream_request_log_body_mode = mode;
     }
     if let Ok(value) = env::var("LLMCONDUIT_TURN_CAPTURE_DIR")
         && !value.trim().is_empty()
@@ -2438,6 +2811,21 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
         && let Ok(parsed) = value.parse()
     {
         config.max_replay_entries = parsed;
+        if let Some(replay) = config.replay.as_mut() {
+            replay.max_entries = parsed;
+        }
+    }
+    if let Ok(value) = env::var("LLMCONDUIT_REPLAY_ENABLED")
+        && let Ok(parsed) = value.parse()
+    {
+        let legacy_max_entries = config.max_replay_entries;
+        config
+            .replay
+            .get_or_insert(ReplayConfig {
+                enabled: false,
+                max_entries: legacy_max_entries,
+            })
+            .enabled = parsed;
     }
     if let Ok(value) = env::var("LLMCONDUIT_DEBUG_LOG_MAX_AGE_HOURS")
         && let Ok(parsed) = value.trim().parse()
@@ -2512,6 +2900,14 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
     }
 }
 
+fn parse_log_body_mode(value: &str) -> Option<LogBodyMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "metadata" => Some(LogBodyMode::Metadata),
+        "redacted_payload" | "redacted" | "payload" => Some(LogBodyMode::RedactedPayload),
+        _ => None,
+    }
+}
+
 pub fn merge_json_maps(
     destination: &mut JsonMap<String, JsonValue>,
     source: &JsonMap<String, JsonValue>,
@@ -2533,12 +2929,16 @@ mod tests {
     use super::Config;
     use super::JsonMap;
     use super::JsonValue;
+    use super::LogBodyMode;
     use super::ModelPrice;
     use super::OrderedModelRoutes;
     use super::PersistedConfig;
     use super::PersistedFallbackUpstream;
     use super::PersistedModelProfile;
     use super::PersistedUpstream;
+    use super::ReplayConfig;
+    use super::ResponseStoreBackend;
+    use super::ResponseStoreConfig;
     use super::RolesConfig;
     use super::UnsupportedImagePolicy;
     use super::apply_env_overrides;
@@ -2904,6 +3304,7 @@ model_profiles:
                         }),
                     )]),
                     upstream_request_log_path: Some(" /tmp/llmconduit-fallback.jsonl ".to_string()),
+                    responses_capabilities: None,
                 },
                 PersistedFallbackUpstream {
                     name: Some("   ".to_string()),
@@ -2913,6 +3314,7 @@ model_profiles:
                     exposed_model: None,
                     upstream_chat_kwargs: JsonMap::new(),
                     upstream_request_log_path: None,
+                    responses_capabilities: None,
                 },
             ],
             upstream_failure_cooldown_secs: 12,
@@ -2972,6 +3374,7 @@ model_profiles:
                     json!({"thinking": true}),
                 )]),
                 upstream_request_log_path: Some(" /tmp/llmconduit-local.jsonl ".to_string()),
+                responses_capabilities: None,
                 fallback_upstreams: vec![PersistedFallbackUpstream {
                     name: Some(" backup ".to_string()),
                     upstream_base_url: " https://openrouter.ai/api/v1 ".to_string(),
@@ -2983,6 +3386,7 @@ model_profiles:
                         json!({"order": ["openai"]}),
                     )]),
                     upstream_request_log_path: Some(" /tmp/llmconduit-backup.jsonl ".to_string()),
+                    responses_capabilities: None,
                 }],
             }],
             ..PersistedConfig::default()
@@ -3035,12 +3439,143 @@ model_profiles:
     }
 
     #[test]
+    fn configured_service_urls_reject_hidden_secret_components() {
+        const SENTINEL: &str = "url-secret-must-not-appear";
+        let cases = [
+            (
+                format!("upstream_base_url: http://{SENTINEL}@example.test/v1\n"),
+                "upstream_base_url",
+            ),
+            (
+                format!("brave_base_url: https://user:{SENTINEL}@api.search.test/res/v1\n"),
+                "brave_base_url",
+            ),
+            (
+                format!("vision_url: http://vision.test/v1/chat/completions?token={SENTINEL}\n"),
+                "vision_url",
+            ),
+            (
+                format!("upstreams:\n  - upstream_base_url: http://provider.test/v1#{SENTINEL}\n"),
+                "upstreams[0].upstream_base_url",
+            ),
+            (
+                format!(
+                    "fallback_upstreams:\n  - upstream_base_url: http://fallback.test/v1?key={SENTINEL}\n"
+                ),
+                "fallback_upstreams[0].upstream_base_url",
+            ),
+            (
+                format!(
+                    "upstreams:\n  - upstream_base_url: http://primary.test/v1\n    fallback_upstreams:\n      - upstream_base_url: http://user:{SENTINEL}@nested.test/v1\n"
+                ),
+                "upstreams[0].fallback_upstreams[0].upstream_base_url",
+            ),
+            (
+                format!("model_routes:\n  routed-model: http://route.test/v1?token={SENTINEL}\n"),
+                "model_routes[routed-model].upstream_base_url",
+            ),
+        ];
+
+        for (yaml, expected_path) in cases {
+            let persisted: PersistedConfig = serde_yaml::from_str(&yaml).expect("config yaml");
+            let error = Config::from_persisted(&persisted)
+                .expect_err("secret-bearing service URL must be rejected");
+            assert!(
+                error.contains(expected_path),
+                "{expected_path}: unexpected error: {error}"
+            );
+            assert!(
+                !error.contains(SENTINEL),
+                "{expected_path}: validation error leaked the rejected URL secret"
+            );
+        }
+    }
+
+    #[test]
     fn load_persisted_config_missing_file_returns_default() {
         let result = load_persisted_config(std::path::Path::new(
             "/tmp/nonexistent-llmconduit-config-test.yaml",
         ));
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), PersistedConfig::default());
+    }
+
+    #[test]
+    fn responses_state_and_logging_defaults_are_safe() {
+        let persisted: PersistedConfig = serde_yaml::from_str("{}").expect("minimal yaml");
+        let config = Config::from_persisted(&persisted).expect("config");
+
+        assert_eq!(config.api_log_body_mode, LogBodyMode::Metadata);
+        assert_eq!(config.upstream_request_log_body_mode, LogBodyMode::Metadata);
+        assert_eq!(config.response_store, ResponseStoreConfig::default());
+        assert!(!config.replay.enabled);
+        assert_eq!(config.replay.max_entries, 100);
+    }
+
+    #[test]
+    fn legacy_flat_replay_limit_migrates_disabled() {
+        let persisted: PersistedConfig =
+            serde_yaml::from_str("max_replay_entries: 17\n").expect("legacy yaml");
+        let config = Config::from_persisted(&persisted).expect("config");
+
+        assert!(!config.replay.enabled);
+        assert_eq!(config.replay.max_entries, 17);
+        assert_eq!(config.max_replay_entries, 17);
+    }
+
+    #[test]
+    fn responses_state_and_logging_yaml_round_trip() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+api_log_body_mode: redacted_payload
+upstream_request_log_body_mode: redacted_payload
+response_store:
+  backend: sqlite
+  path: /tmp/llmconduit-state/responses.sqlite3
+  max_entries: 37
+  retention_hours: 48
+replay:
+  enabled: true
+  max_entries: 12
+"#,
+        )
+        .expect("yaml");
+        let config = Config::from_persisted(&persisted).expect("config");
+
+        assert_eq!(config.api_log_body_mode, LogBodyMode::RedactedPayload);
+        assert_eq!(
+            config.upstream_request_log_body_mode,
+            LogBodyMode::RedactedPayload
+        );
+        assert_eq!(config.response_store.backend, ResponseStoreBackend::Sqlite);
+        assert_eq!(
+            config.response_store.path.as_deref(),
+            Some(std::path::Path::new(
+                "/tmp/llmconduit-state/responses.sqlite3"
+            ))
+        );
+        assert_eq!(config.response_store.max_entries, 37);
+        assert_eq!(config.response_store.retention_hours, 48);
+        assert!(config.replay.enabled);
+        assert_eq!(config.replay.max_entries, 12);
+
+        let serialized = serde_yaml::to_string(&persisted).expect("serialize");
+        let reparsed: PersistedConfig = serde_yaml::from_str(&serialized).expect("reparse");
+        assert_eq!(reparsed, persisted);
+    }
+
+    #[test]
+    fn sqlite_response_store_requires_a_path() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+response_store:
+  backend: sqlite
+"#,
+        )
+        .expect("yaml");
+
+        let error = Config::from_persisted(&persisted).expect_err("missing sqlite path");
+        assert!(error.contains("response_store.path is required"));
     }
 
     #[test]
@@ -3259,6 +3794,8 @@ model_profiles:
             upstream_model: Some("grok-4".to_string()),
             system_prompt_prefix: Some("Global prefix.".to_string()),
             upstream_request_log_path: Some("/tmp/llmconduit-upstream.jsonl".to_string()),
+            api_log_body_mode: LogBodyMode::Metadata,
+            upstream_request_log_body_mode: LogBodyMode::Metadata,
             turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
             upstream_chat_kwargs: JsonMap::from_iter([(
                 "clear_thinking".to_string(),
@@ -3300,6 +3837,7 @@ model_profiles:
                     ..Default::default()
                 },
             )]),
+            responses_capabilities: Default::default(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: Some("secret".to_string()),
             brave_max_results: 7,
@@ -3308,6 +3846,8 @@ model_profiles:
             max_web_search_rounds: 10,
             flatten_content: false,
             max_replay_entries: 1000,
+            response_store: ResponseStoreConfig::default(),
+            replay: Some(ReplayConfig::default()),
             debug_log_max_age_hours: Some(48),
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -3337,6 +3877,8 @@ model_profiles:
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            api_log_body_mode: LogBodyMode::Metadata,
+            upstream_request_log_body_mode: LogBodyMode::Metadata,
             turn_capture_dir: None,
             // Non-empty GLOBAL base: a global-only sibling key plus a nested key
             // (`thinking`) that CONFLICTS with the per-model policy below, so the
@@ -3371,6 +3913,7 @@ model_profiles:
                     ..Default::default()
                 },
             )]),
+            responses_capabilities: Default::default(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
@@ -3379,6 +3922,8 @@ model_profiles:
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: ResponseStoreConfig::default(),
+            replay: Some(ReplayConfig::default()),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -3523,6 +4068,8 @@ model_profiles:
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            api_log_body_mode: LogBodyMode::Metadata,
+            upstream_request_log_body_mode: LogBodyMode::Metadata,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
@@ -3550,6 +4097,7 @@ model_profiles:
                     ..Default::default()
                 },
             )]),
+            responses_capabilities: Default::default(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
@@ -3558,6 +4106,8 @@ model_profiles:
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: ResponseStoreConfig::default(),
+            replay: Some(ReplayConfig::default()),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -3602,6 +4152,8 @@ model_profiles:
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            api_log_body_mode: LogBodyMode::Metadata,
+            upstream_request_log_body_mode: LogBodyMode::Metadata,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
@@ -3625,6 +4177,7 @@ model_profiles:
                     ..Default::default()
                 },
             )]),
+            responses_capabilities: Default::default(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
@@ -3633,6 +4186,8 @@ model_profiles:
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: ResponseStoreConfig::default(),
+            replay: Some(ReplayConfig::default()),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -3687,6 +4242,8 @@ model_profiles:
             upstream_model: Some("xiaomi/mimo-v2.5-pro".to_string()),
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            api_log_body_mode: LogBodyMode::Metadata,
+            upstream_request_log_body_mode: LogBodyMode::Metadata,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
@@ -3730,6 +4287,7 @@ model_profiles:
                     },
                 ),
             ]),
+            responses_capabilities: Default::default(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
@@ -3738,6 +4296,8 @@ model_profiles:
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: ResponseStoreConfig::default(),
+            replay: Some(ReplayConfig::default()),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -3797,6 +4357,8 @@ model_profiles:
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            api_log_body_mode: LogBodyMode::Metadata,
+            upstream_request_log_body_mode: LogBodyMode::Metadata,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
@@ -3835,6 +4397,7 @@ model_profiles:
                     },
                 ),
             ]),
+            responses_capabilities: Default::default(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
@@ -3843,6 +4406,8 @@ model_profiles:
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: ResponseStoreConfig::default(),
+            replay: Some(ReplayConfig::default()),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -4212,6 +4777,19 @@ model_profiles:
         let metadata = std::fs::metadata(&path).expect("metadata");
         let mode = metadata.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "config file should have 0600 permissions");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("loosen existing config for regression setup");
+        write_persisted_config(&path, &config).expect("rewrite existing config");
+        let rewritten_mode = std::fs::metadata(&path)
+            .expect("rewritten metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            rewritten_mode, 0o600,
+            "rewriting an existing config must also tighten permissions"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -4224,6 +4802,8 @@ model_profiles:
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            api_log_body_mode: LogBodyMode::Metadata,
+            upstream_request_log_body_mode: LogBodyMode::Metadata,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
@@ -4231,6 +4811,7 @@ model_profiles:
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::new(),
+            responses_capabilities: Default::default(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
@@ -4239,6 +4820,8 @@ model_profiles:
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: ResponseStoreConfig::default(),
+            replay: Some(ReplayConfig::default()),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -4274,6 +4857,8 @@ model_profiles:
             upstream_model: None,
             system_prompt_prefix: None,
             upstream_request_log_path: None,
+            api_log_body_mode: LogBodyMode::Metadata,
+            upstream_request_log_body_mode: LogBodyMode::Metadata,
             turn_capture_dir: None,
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
@@ -4292,6 +4877,7 @@ model_profiles:
                     ..Default::default()
                 },
             )]),
+            responses_capabilities: Default::default(),
             brave_base_url: "https://api.search.brave.com/res/v1".to_string(),
             brave_api_key: None,
             brave_max_results: 5,
@@ -4300,6 +4886,8 @@ model_profiles:
             max_web_search_rounds: 5,
             flatten_content: true,
             max_replay_entries: 1000,
+            response_store: ResponseStoreConfig::default(),
+            replay: Some(ReplayConfig::default()),
             debug_log_max_age_hours: None,
             min_completion_tokens: 4096,
             max_sse_frame_bytes: 8 * 1024 * 1024,
@@ -4411,6 +4999,8 @@ model_profiles:
     fn debug_log_dirs_includes_turn_capture_dir() {
         let config = Config::from_persisted(&PersistedConfig {
             upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
+            api_log_body_mode: LogBodyMode::Metadata,
+            upstream_request_log_body_mode: LogBodyMode::Metadata,
             turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
             ..PersistedConfig::default()
         })
@@ -4456,6 +5046,8 @@ model_profiles:
     fn debug_log_dirs_dedups_turn_capture_dir_against_request_log_dir() {
         let config = Config::from_persisted(&PersistedConfig {
             upstream_request_log_path: Some("/tmp/llmconduit-shared/requests.jsonl".to_string()),
+            api_log_body_mode: LogBodyMode::Metadata,
+            upstream_request_log_body_mode: LogBodyMode::Metadata,
             turn_capture_dir: Some("/tmp/llmconduit-shared".to_string()),
             ..PersistedConfig::default()
         })
@@ -4741,5 +5333,79 @@ model_profiles:
             "an explicit flag wins even with cached_per_1k omitted"
         );
         assert_eq!(flag_only.cached_per_1k, 0.0);
+    }
+
+    #[test]
+    fn responses_capabilities_parse_at_global_provider_and_profile_layers() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+responses_capabilities:
+  parallel_tool_calls: false
+  structured_outputs: [text, json_object]
+  prompt_cache_key: gateway_hash
+upstreams:
+  - name: primary
+    upstream_base_url: http://127.0.0.1:8000/v1
+    responses_capabilities:
+      service_tiers: [default]
+model_profiles:
+  served-model:
+    responses_capabilities:
+      structured_outputs: [text, json_object, json_schema]
+      reasoning_summary: upstream
+"#,
+        )
+        .expect("capability config");
+
+        assert_eq!(
+            persisted.responses_capabilities.prompt_cache_key,
+            Some(crate::responses_capabilities::PromptCacheKeyCapability::GatewayHash)
+        );
+        assert_eq!(
+            persisted.upstreams[0]
+                .responses_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.service_tiers.as_ref()),
+            Some(&vec!["default".to_string()])
+        );
+
+        let config = Config::from_persisted(&persisted).expect("resolved config");
+        assert_eq!(
+            config
+                .model_profiles
+                .get("served-model")
+                .and_then(|profile| profile.responses_capabilities.as_ref())
+                .and_then(|capabilities| capabilities.reasoning_summary),
+            Some(crate::responses_capabilities::ReasoningSummaryCapability::Upstream)
+        );
+    }
+
+    #[test]
+    fn configuration_debug_output_redacts_all_api_keys() {
+        const SENTINEL: &str = "debug-secret-must-not-appear";
+        let persisted = PersistedConfig {
+            upstream_api_key: Some(SENTINEL.to_string()),
+            brave_api_key: Some(SENTINEL.to_string()),
+            upstreams: vec![PersistedUpstream {
+                name: Some("provider".to_string()),
+                upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
+                upstream_api_key: Some(SENTINEL.to_string()),
+                fallback_upstreams: vec![PersistedFallbackUpstream {
+                    upstream_base_url: "http://127.0.0.1:8001/v1".to_string(),
+                    upstream_api_key: Some(SENTINEL.to_string()),
+                    ..PersistedFallbackUpstream::default()
+                }],
+                ..PersistedUpstream::default()
+            }],
+            ..PersistedConfig::default()
+        };
+        let persisted_debug = format!("{persisted:?}");
+        assert!(!persisted_debug.contains(SENTINEL));
+        assert!(persisted_debug.contains("[redacted]"));
+
+        let resolved = Config::from_persisted(&persisted).expect("resolved config");
+        let resolved_debug = format!("{resolved:?}");
+        assert!(!resolved_debug.contains(SENTINEL));
+        assert!(resolved_debug.contains("[redacted]"));
     }
 }

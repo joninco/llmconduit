@@ -80,6 +80,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::sync::PollSender;
 
+const SENSITIVE_RESPONSE_CAPTURE_MARKER: &[u8] =
+    b"[redacted: response capture suppressed because request contained sensitive fields]";
+
 /// Handle to the turn-capture sink. Cheap to `Clone` (the enabled variant
 /// clones an inner `Arc`); threads through DI (`lib.rs`) into the `Gateway`
 /// (`Gateway::turn_capture`) and, in later tasks, the upstream client
@@ -338,6 +341,11 @@ pub struct TurnCaptureState {
     pending_upstream_body: Mutex<Option<Vec<u8>>>,
     /// The exact bytes served to the client, teed off the response `Body` (F1b).
     served_response: Section,
+    /// Set when the already-redacted inbound section proves that the request
+    /// contained a sensitive-key value. Raw upstream/served output can echo such
+    /// a value under an innocuous key, so those diagnostic sections become a
+    /// fixed marker for this turn rather than retaining model output verbatim.
+    suppress_response_capture: AtomicBool,
     /// Set synchronously by [`CaptureGuard::new`] the instant the engine takes
     /// ownership of the turn (before it returns the stream). The
     /// [`MiddlewareCaptureGuard`] backstop reads it at `Drop`: an UNCLAIMED turn
@@ -409,6 +417,7 @@ impl TurnCaptureState {
             upstream_response_present: AtomicBool::new(false),
             pending_upstream_body: Mutex::new(None),
             served_response,
+            suppress_response_capture: AtomicBool::new(false),
             engine_claimed: AtomicBool::new(false),
             served_tee_installed: AtomicBool::new(false),
             barrier: Mutex::new(AssemblyBarrier::default()),
@@ -535,9 +544,25 @@ impl TurnCaptureState {
     /// BEFORE calling; `bytes` is a redacted COPY, never a slice of the 256 MiB
     /// middleware buffer (AGENTS.md). Written once per turn.
     pub fn write_inbound_request(&self, bytes: &[u8]) {
+        if bytes
+            .windows(b"\"[redacted]\"".len())
+            .any(|window| window == b"\"[redacted]\"")
+        {
+            self.suppress_response_capture
+                .store(true, Ordering::Release);
+        }
         self.inbound_request.append(bytes);
         // The whole (redacted) body is in hand, so the section is complete.
         self.inbound_request.close(false);
+    }
+
+    /// Disable raw response capture for this turn. Callers arm this whenever a
+    /// backend credential was used: a malicious or misconfigured upstream can
+    /// echo its Authorization value in otherwise ordinary output, where
+    /// structural JSON key redaction cannot identify it safely.
+    pub fn suppress_raw_response_capture(&self) {
+        self.suppress_response_capture
+            .store(true, Ordering::Release);
     }
 
     /// Persist the canonical request that the engine has settled on. The shared capped redacting
@@ -620,7 +645,7 @@ impl TurnCaptureState {
         self.upstream_response
             .lock()
             .expect("turn-capture upstream-response lock")
-            .append(bytes);
+            .append(self.response_capture_bytes(bytes));
     }
 
     /// F1e: a bounded, back-pressured [`ServedSink`] over the `upstream_response`
@@ -636,7 +661,12 @@ impl TurnCaptureState {
             .lock()
             .expect("turn-capture upstream-response lock")
             .poll_sender()
-            .map(ServedSink::new)
+            .map(|sender| {
+                ServedSink::new(
+                    sender,
+                    self.suppress_response_capture.load(Ordering::Acquire),
+                )
+            })
     }
 
     /// F1e: mark that a 2xx success stream was tapped into the CURRENT
@@ -770,7 +800,8 @@ impl TurnCaptureState {
         *self
             .pending_upstream_body
             .lock()
-            .expect("turn-capture pending-upstream-body lock") = Some(bytes.to_vec());
+            .expect("turn-capture pending-upstream-body lock") =
+            Some(self.response_capture_bytes(bytes).to_vec());
     }
 
     /// F1e: discard any staged failed HTTP body at the START of a dispatch attempt,
@@ -789,7 +820,8 @@ impl TurnCaptureState {
     /// `Body` tee, once per DATA frame). Each call COPIES the frame to disk; no
     /// slice of the frame's backing allocation is retained.
     pub fn write_served_response(&self, bytes: &[u8]) {
-        self.served_response.append(bytes);
+        self.served_response
+            .append(self.response_capture_bytes(bytes));
     }
 
     /// F1b: mark the `served_response` section closed. `partial` is `true` when
@@ -858,7 +890,20 @@ impl TurnCaptureState {
     ///
     /// [`write_served_response`]: TurnCaptureState::write_served_response
     pub fn served_sink(&self) -> Option<ServedSink> {
-        self.served_response.poll_sender().map(ServedSink::new)
+        self.served_response.poll_sender().map(|sender| {
+            ServedSink::new(
+                sender,
+                self.suppress_response_capture.load(Ordering::Acquire),
+            )
+        })
+    }
+
+    fn response_capture_bytes<'a>(&self, bytes: &'a [u8]) -> &'a [u8] {
+        if self.suppress_response_capture.load(Ordering::Acquire) {
+            SENSITIVE_RESPONSE_CAPTURE_MARKER
+        } else {
+            bytes
+        }
     }
 
     /// F1c: stamp the served/backend model onto the outcome metadata. The engine
@@ -1299,6 +1344,8 @@ impl TurnCaptureState {
 #[derive(Debug)]
 pub struct ServedSink {
     inner: PollSender<SectionChunk>,
+    suppress: bool,
+    marker_sent: bool,
 }
 
 /// The served-section writer is gone -- its bounded channel closed (typically
@@ -1309,8 +1356,12 @@ pub struct ServedSink {
 pub struct SinkClosed;
 
 impl ServedSink {
-    fn new(inner: PollSender<SectionChunk>) -> Self {
-        Self { inner }
+    fn new(inner: PollSender<SectionChunk>, suppress: bool) -> Self {
+        Self {
+            inner,
+            suppress,
+            marker_sent: false,
+        }
     }
 
     /// Reserve one slot for the next served frame. `Poll::Ready(Ok(()))` once a
@@ -1330,6 +1381,16 @@ impl ServedSink {
     ///
     /// [`poll_reserve`]: ServedSink::poll_reserve
     pub fn send(&mut self, bytes: Vec<u8>) -> Result<(), SinkClosed> {
+        let bytes = if self.suppress {
+            if self.marker_sent {
+                Vec::new()
+            } else {
+                self.marker_sent = true;
+                SENSITIVE_RESPONSE_CAPTURE_MARKER.to_vec()
+            }
+        } else {
+            bytes
+        };
         self.inner
             .send_item(SectionChunk::Append(bytes))
             .map_err(|_| SinkClosed)
@@ -1685,8 +1746,41 @@ fn create_section_file(meta: &SectionMeta) -> Option<tokio::fs::File> {
         );
         meta.partial.store(true, Ordering::Release);
     }
-    match std::fs::File::create(&meta.path) {
-        Ok(file) => Some(tokio::fs::File::from_std(file)),
+    #[cfg(unix)]
+    if let Some(parent) = meta.path.parent() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::symlink_metadata(parent).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            tracing::warn!(path = %parent.display(), "turn-capture: refusing symlink work dir");
+            meta.partial.store(true, Ordering::Release);
+            return None;
+        }
+        if let Err(err) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
+            tracing::warn!(path = %parent.display(), error = %err, "turn-capture: failed to secure section work dir");
+            meta.partial.store(true, Ordering::Release);
+            return None;
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(&meta.path) {
+        Ok(file) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) = file.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!(path = %meta.path.display(), error = %err, "turn-capture: failed to secure section file");
+                    meta.partial.store(true, Ordering::Release);
+                    return None;
+                }
+            }
+            Some(tokio::fs::File::from_std(file))
+        }
         Err(err) => {
             tracing::warn!(
                 path = %meta.path.display(),
@@ -2202,7 +2296,7 @@ fn stream_file_base64<W: std::io::Write>(path: &Path, w: &mut W) -> std::io::Res
 
 #[cfg(test)]
 mod tests {
-    use super::TurnCapture;
+    use super::{SENSITIVE_RESPONSE_CAPTURE_MARKER, TurnCapture};
     use std::sync::Arc;
     use tokio_util::sync::CancellationToken;
 
@@ -3196,6 +3290,42 @@ mod tests {
         assert_eq!(decoded, raw, "base64 round-trips the exact bytes");
     }
 
+    #[tokio::test]
+    async fn prompt_cache_key_inbound_suppresses_raw_response_capture() {
+        const SENTINEL: &str = "opaque-prompt-cache-sentinel-must-not-survive";
+        let dir = temp_dir_path("prompt-cache-response-suppression");
+        let capture = TurnCapture::enabled(dir.clone());
+        let state = capture.start("api_sensitive_echo", None, 0).expect("state");
+        // The HTTP layer supplies this already-redacted body. Seeing the shared
+        // marker arms response suppression before any upstream dispatch begins.
+        state.write_inbound_request(br#"{"prompt_cache_key":"[redacted]"}"#);
+        state.write_upstream_response(
+            format!("data: {{\"content\":\"{SENTINEL}\"}}\n\n").as_bytes(),
+        );
+        state.upstream_response_done(false);
+        state.write_served_response(
+            format!("event: response.output_text.delta\ndata: {SENTINEL}\n\n").as_bytes(),
+        );
+        state.served_done(false);
+        state.engine_done("completed", Some("response.completed"));
+
+        let artifact = wait_for_artifact(&dir.join("api_sensitive_echo.json")).await;
+        let serialized = artifact.to_string();
+        assert!(
+            !serialized.contains(SENTINEL),
+            "sentinel leaked: {serialized}"
+        );
+        let marker = String::from_utf8_lossy(SENSITIVE_RESPONSE_CAPTURE_MARKER);
+        assert_eq!(
+            artifact["sections"]["upstream_response"]["content"],
+            marker.as_ref()
+        );
+        assert_eq!(
+            artifact["sections"]["served_response"]["content"],
+            marker.as_ref()
+        );
+    }
+
     /// The middleware backstop resolves the barrier for a turn that NEVER reached the
     /// engine (unclaimed → `failed`/`unhandled`), and is INERT for a claimed turn (the
     /// engine's status wins). This is the "served side is the only latch" case that
@@ -3693,6 +3823,28 @@ mod tests {
             state.inbound_request_path().exists(),
             "the inbound_request section file is created eagerly"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(state.work_dir())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "live work directories contain request data and must be private"
+            );
+            assert_eq!(
+                std::fs::metadata(state.inbound_request_path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "live section files must be private before final assembly"
+            );
+        }
         // A dispatch attempt's reset mints a fresh upstream_response.<gen> section --
         // its file must exist the moment reset returns (no await in between).
         state.reset_upstream_response();

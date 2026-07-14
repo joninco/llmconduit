@@ -174,6 +174,8 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         system_prompt_prefix: existing.system_prompt_prefix.clone(),
         upstream_request_log_path: (!upstream_request_log_path.trim().is_empty())
             .then_some(upstream_request_log_path),
+        api_log_body_mode: existing.api_log_body_mode,
+        upstream_request_log_body_mode: existing.upstream_request_log_body_mode,
         // F1: not interactively prompted (an advanced, opt-in knob, like
         // `debug_log_max_age_hours` below) -- just carried through unchanged.
         turn_capture_dir: existing.turn_capture_dir.clone(),
@@ -185,6 +187,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         model_profiles: existing.model_profiles.clone(),
         model_routes: existing.model_routes.clone(),
         template_family: existing.template_family.clone(),
+        responses_capabilities: existing.responses_capabilities.clone(),
         brave_base_url,
         brave_api_key: (!brave_api_key.trim().is_empty()).then_some(brave_api_key),
         brave_max_results,
@@ -193,6 +196,16 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         max_web_search_rounds: existing.max_web_search_rounds,
         flatten_content: existing.flatten_content,
         max_replay_entries: existing.max_replay_entries,
+        response_store: existing.response_store.clone(),
+        replay: Some(
+            existing
+                .replay
+                .clone()
+                .unwrap_or(crate::config::ReplayConfig {
+                    enabled: false,
+                    max_entries: existing.max_replay_entries,
+                }),
+        ),
         debug_log_max_age_hours: existing.debug_log_max_age_hours,
         min_completion_tokens: existing.min_completion_tokens,
         max_sse_frame_bytes: existing.max_sse_frame_bytes,

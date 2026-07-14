@@ -11,6 +11,10 @@ use tokio::sync::RwLock;
 pub struct ReplayRecord {
     pub model: String,
     pub instructions: String,
+    /// SHA-256 digest of an opaque Responses `prompt_cache_key`.  The raw key
+    /// is never retained or logged; the digest only partitions private replay
+    /// entries so callers that request different cache affinity cannot collide.
+    pub cache_affinity: Option<String>,
     pub visible_history: Vec<ResponseItem>,
     pub internal_messages: Vec<ChatMessage>,
 }
@@ -39,8 +43,12 @@ impl ReplayStore {
     }
 
     pub async fn insert(&self, record: ReplayRecord) {
-        let key =
-            hash_visible_history(&record.model, &record.instructions, &record.visible_history);
+        let key = hash_visible_history_with_affinity(
+            &record.model,
+            &record.instructions,
+            record.cache_affinity.as_deref(),
+            &record.visible_history,
+        );
         let mut guard = self.inner.write().await;
         if let std::collections::hash_map::Entry::Occupied(mut entry) = guard.map.entry(key.clone())
         {
@@ -63,9 +71,25 @@ impl ReplayStore {
         instructions: &str,
         input: &[ResponseItem],
     ) -> Option<ReplayRecord> {
+        self.longest_prefix_match_with_affinity(model, instructions, None, input)
+            .await
+    }
+
+    pub async fn longest_prefix_match_with_affinity(
+        &self,
+        model: &str,
+        instructions: &str,
+        cache_affinity: Option<&str>,
+        input: &[ResponseItem],
+    ) -> Option<ReplayRecord> {
         let guard = self.inner.read().await;
         for len in (0..=input.len()).rev() {
-            let key = hash_visible_history(model, instructions, &input[..len]);
+            let key = hash_visible_history_with_affinity(
+                model,
+                instructions,
+                cache_affinity,
+                &input[..len],
+            );
             if let Some(record) = guard.map.get(&key) {
                 return Some(record.clone());
             }
@@ -99,6 +123,29 @@ pub fn hash_visible_history(model: &str, instructions: &str, items: &[ResponseIt
     hex::encode(hasher.finalize())
 }
 
+fn hash_visible_history_with_affinity(
+    model: &str,
+    instructions: &str,
+    cache_affinity: Option<&str>,
+    items: &[ResponseItem],
+) -> String {
+    // Preserve the historic `(model, instructions, items)` hash exactly when
+    // no Responses cache-affinity key is present.
+    if cache_affinity.is_none() {
+        return hash_visible_history(model, instructions, items);
+    }
+    let payload = serde_json::json!({
+        "model": model,
+        "instructions": instructions,
+        "cache_affinity": cache_affinity,
+        "items": items,
+    });
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +169,7 @@ mod tests {
             .map(|i| ReplayRecord {
                 model: "m".to_string(),
                 instructions: "i".to_string(),
+                cache_affinity: None,
                 visible_history: vec![user_msg(&format!("msg-{i}"))],
                 internal_messages: vec![],
             })
@@ -148,6 +196,7 @@ mod tests {
                 .insert(ReplayRecord {
                     model: "m".to_string(),
                     instructions: "i".to_string(),
+                    cache_affinity: None,
                     visible_history: vec![user_msg(&format!("cap-{i}"))],
                     internal_messages: vec![],
                 })
@@ -167,6 +216,7 @@ mod tests {
         let record = ReplayRecord {
             model: "m".to_string(),
             instructions: "i".to_string(),
+            cache_affinity: None,
             visible_history: vec![user_msg("dup")],
             internal_messages: vec![],
         };
@@ -189,6 +239,7 @@ mod tests {
             .insert(ReplayRecord {
                 model: "m".to_string(),
                 instructions: "i".to_string(),
+                cache_affinity: None,
                 visible_history: history.clone(),
                 internal_messages: vec![],
             })
@@ -199,6 +250,40 @@ mod tests {
         let result = store.longest_prefix_match("m", "i", &query).await;
         assert!(result.is_some());
         assert_eq!(result.unwrap().visible_history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn prompt_cache_affinity_partitions_replay_without_storing_raw_key() {
+        let store = ReplayStore::new(10);
+        let history = vec![user_msg("same visible history")];
+        store
+            .insert(ReplayRecord {
+                model: "m".to_string(),
+                instructions: "i".to_string(),
+                cache_affinity: Some("sha256-a".to_string()),
+                visible_history: history.clone(),
+                internal_messages: vec![],
+            })
+            .await;
+
+        assert!(
+            store
+                .longest_prefix_match_with_affinity("m", "i", Some("sha256-a"), &history)
+                .await
+                .is_some()
+        );
+        assert!(
+            store
+                .longest_prefix_match_with_affinity("m", "i", Some("sha256-b"), &history)
+                .await
+                .is_none()
+        );
+        assert!(
+            store
+                .longest_prefix_match("m", "i", &history)
+                .await
+                .is_none()
+        );
     }
 
     #[test]

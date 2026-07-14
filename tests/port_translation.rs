@@ -146,6 +146,8 @@ fn policies_with_global_kwargs(
         global_template_family: None,
         upstream_chat_kwargs: Arc::new(std::collections::BTreeMap::new()),
         global_upstream_chat_kwargs: Arc::new(kwargs),
+        responses_capabilities: Arc::new(std::collections::BTreeMap::new()),
+        global_responses_capabilities: Default::default(),
     }
 }
 

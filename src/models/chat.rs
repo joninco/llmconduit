@@ -187,6 +187,14 @@ pub struct ChatFunctionCall {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionChunk {
     pub id: String,
+    /// The service tier the provider actually used for this completion.
+    ///
+    /// This is response metadata, not an echo of the requested tier. Some
+    /// OpenAI-compatible providers include it on every chunk while others only
+    /// include it on the terminal or usage chunk, so the engine retains the
+    /// latest reported value for the terminal Responses resource.
+    #[serde(default)]
+    pub service_tier: Option<String>,
     pub choices: Vec<ChatChunkChoice>,
     #[serde(default)]
     pub usage: Option<ChunkUsage>,
@@ -242,6 +250,9 @@ pub struct ChatDelta {
 }
 
 impl ChatDelta {
+    /// Provider-private reasoning/thinking text. This is suitable for internal
+    /// protocol conversion (for example Anthropic thinking blocks), but it is
+    /// never by itself an OpenAI Responses reasoning *summary*.
     pub fn reasoning_delta(&self) -> Option<&str> {
         // Treat empty reasoning_content as absent so we fall through to alternate
         // fields when an upstream emits an empty placeholder alongside the real text.
@@ -256,7 +267,6 @@ impl ChatDelta {
             "reasoning",
             "reasoning_text",
             "reasoning_delta",
-            "reasoning_summary",
             "thinking",
             "thinking_content",
         ] {
@@ -279,6 +289,26 @@ impl ChatDelta {
             }
         }
         None
+    }
+
+    /// An explicit provider-declared safe reasoning summary channel.
+    ///
+    /// Generic `reasoning_content`/`thinking` is intentionally excluded: those
+    /// fields commonly contain hidden chain-of-thought and must not be promoted
+    /// to the public Responses summary lifecycle.
+    pub fn reasoning_summary_delta(&self) -> Option<&str> {
+        let value = self.extra.get("reasoning_summary")?;
+        if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
+            return Some(text);
+        }
+        value
+            .as_object()
+            .and_then(|object| {
+                ["text", "delta", "content", "summary"]
+                    .into_iter()
+                    .find_map(|key| object.get(key).and_then(Value::as_str))
+            })
+            .filter(|text| !text.is_empty())
     }
 
     pub fn reasoning_signature_delta(&self) -> Option<&str> {
