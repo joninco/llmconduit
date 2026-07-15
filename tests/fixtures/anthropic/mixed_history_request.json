@@ -1,0 +1,139 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 2048,
+  "stream": false,
+  "system": "Keep the synthetic history in order.",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Read the synthetic resource."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "A short synthetic rationale.",
+          "signature": "synthetic-provider-signature"
+        },
+        {
+          "type": "text",
+          "text": "I will read it."
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_read_1",
+          "name": "read_resource",
+          "input": {
+            "path": "/synthetic/input.txt"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_read_1",
+          "content": "synthetic contents"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "redacted_thinking",
+          "data": "opaque-synthetic-data"
+        },
+        {
+          "type": "tool_use",
+          "id": "toolu_write_1",
+          "name": "write_resource",
+          "input": {
+            "path": "/synthetic/output.txt",
+            "text": "synthetic output"
+          }
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "toolu_write_1",
+          "content": [
+            {
+              "type": "text",
+              "text": "write failed"
+            },
+            {
+              "type": "text",
+              "text": "synthetic permission error"
+            }
+          ],
+          "is_error": true,
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    },
+    {
+      "role": "system",
+      "content": "A synthetic inline system note."
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Continue without writing."
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "read_resource",
+      "description": "Read a synthetic resource.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "write_resource",
+      "description": "Write a synthetic resource.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": ["path", "text"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "auto"
+  },
+  "thinking": {
+    "type": "disabled"
+  }
+}

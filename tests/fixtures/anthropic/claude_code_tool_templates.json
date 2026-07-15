@@ -1,0 +1,206 @@
+{
+  "templates": [
+    {
+      "slug": "shell",
+      "description": "Run a synthetic command.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 120000
+          },
+          "environment": {
+            "type": "object",
+            "propertyNames": {
+              "pattern": "^[A-Z_][A-Z0-9_]*$"
+            },
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "slug": "read",
+      "description": "Read a synthetic resource.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": {
+          "location": {
+            "type": "string",
+            "pattern": "^/"
+          }
+        },
+        "type": "object",
+        "properties": {
+          "path": {
+            "$ref": "#/$defs/location"
+          },
+          "range": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 0
+              },
+              {
+                "type": "string",
+                "const": "all"
+              }
+            ]
+          }
+        },
+        "required": ["path"],
+        "additionalProperties": false,
+        "deprecated": false,
+        "readOnly": false,
+        "x-google-enum-descriptions": ["synthetic annotation"]
+      }
+    },
+    {
+      "slug": "edit",
+      "description": "Apply a synthetic edit.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "oneOf": [
+          {
+            "required": ["replacement"]
+          },
+          {
+            "required": ["patch"]
+          }
+        ],
+        "properties": {
+          "replacement": {
+            "type": "string"
+          },
+          "patch": {
+            "type": "string"
+          },
+          "mode": {
+            "enum": ["first", "all"],
+            "default": "first"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "slug": "search",
+      "description": "Search synthetic content.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "format": "regex",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "options": {
+            "type": "object",
+            "patternProperties": {
+              "^x-": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": true
+          },
+          "provider_boolean_schema": true,
+          "external_reference": {
+            "$ref": "https://example.invalid/synthetic-tool-schema.json"
+          },
+          "ecma_pattern": {
+            "type": "string",
+            "pattern": "^(?=synthetic)"
+          }
+        },
+        "required": ["query"],
+        "dependentSchemas": {
+          "options": {
+            "properties": {
+              "query": {
+                "minLength": 2
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "slug": "batch",
+      "description": "Process a synthetic batch.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "prefixItems": [
+              {
+                "type": "string"
+              }
+            ],
+            "contains": {
+              "type": "string",
+              "minLength": 1
+            },
+            "minItems": 1,
+            "maxItems": 100
+          }
+        },
+        "required": ["items"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "slug": "task",
+      "description": "Describe a synthetic task.",
+      "input_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "kind": {
+            "enum": ["short", "long"]
+          },
+          "budget": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        },
+        "if": {
+          "properties": {
+            "kind": {
+              "const": "long"
+            }
+          }
+        },
+        "then": {
+          "required": ["budget"]
+        },
+        "else": {
+          "properties": {
+            "budget": {
+              "maximum": 10
+            }
+          }
+        },
+        "unevaluatedProperties": false
+      }
+    }
+  ]
+}

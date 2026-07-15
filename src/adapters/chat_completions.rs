@@ -11,6 +11,7 @@ use crate::models::responses::ReasoningContentItem;
 use crate::models::responses::ReasoningRequest;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponsesRequest;
+use crate::models::responses::StrictSchemaDialect;
 use crate::models::responses::TextControls;
 use crate::models::responses::TextFormat;
 use crate::models::responses::ToolSpec;
@@ -39,6 +40,7 @@ pub fn convert_request(request: ChatCompletionRequest) -> AppResult<ResponsesReq
         }),
         // Chat Completions clients control the upstream thinking kwarg directly via extra_body.
         thinking: None,
+        strict_schema_dialect: StrictSchemaDialect::OpenAi,
         store: false,
         stream: true,
         include: Vec::new(),

@@ -31,6 +31,7 @@ use llmconduit::models::responses::ContentItem;
 use llmconduit::models::responses::ReasoningRequest;
 use llmconduit::models::responses::ResponseItem;
 use llmconduit::models::responses::ResponsesRequest;
+use llmconduit::models::responses::StrictSchemaDialect;
 use llmconduit::monitor::MonitorHub;
 use llmconduit::replay::ReplayStore;
 use llmconduit::search::SearchClient;
@@ -77,6 +78,7 @@ pub struct MockUpstream {
     finalization_policies: Arc<std::sync::Mutex<llmconduit::upstream::BackendFinalizationPolicies>>,
     responses_capabilities:
         Arc<std::sync::Mutex<llmconduit::responses_capabilities::ResponsesCapabilities>>,
+    token_count: Arc<Mutex<Option<u64>>>,
 }
 
 impl MockUpstream {
@@ -88,6 +90,10 @@ impl MockUpstream {
     /// Queue a deliberately unterminated stream for malformed-upstream tests.
     pub async fn push_unterminated_response(&self, chunks: ChunkBatch) {
         self.responses.lock().await.push_back(chunks);
+    }
+
+    pub async fn set_token_count(&self, count: Option<u64>) {
+        *self.token_count.lock().await = count;
     }
 
     /// Set the finalization policies built from the test config, so the mock's
@@ -212,6 +218,21 @@ impl UpstreamClient for MockUpstream {
 
     async fn list_models(&self) -> Result<reqwest::Response, AppError> {
         Err(AppError::internal("unused in this test"))
+    }
+
+    async fn count_tokens(
+        &self,
+        backend: &llmconduit::upstream::BackendChatRequest,
+    ) -> Result<Option<u64>, AppError> {
+        let mut backend = backend.clone();
+        let policies = self
+            .finalization_policies
+            .lock()
+            .expect("policies lock")
+            .clone();
+        llmconduit::upstream::finalize_request_for_backend(&mut backend, &policies);
+        self.requests.lock().await.push(backend.request);
+        Ok(*self.token_count.lock().await)
     }
 
     async fn supported_model_catalog(&self) -> Result<Vec<UpstreamModelEntry>, AppError> {
@@ -622,6 +643,7 @@ pub fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
             summary: None,
         }),
         thinking: None,
+        strict_schema_dialect: StrictSchemaDialect::OpenAi,
         store: false,
         stream: true,
         include: Vec::new(),

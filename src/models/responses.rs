@@ -375,6 +375,12 @@ pub struct ResponsesRequest {
     /// control backend-specific thinking kwargs through their normal fields.
     #[serde(skip)]
     pub thinking: Option<bool>,
+    /// Strict JSON Schema rules differ slightly by ingress surface. OpenAI
+    /// requires every object property to appear in `required`, while Anthropic
+    /// strict tools and structured outputs permit optional properties. This is
+    /// internal gateway state and is never accepted from or emitted onto a wire.
+    #[serde(skip)]
+    pub strict_schema_dialect: StrictSchemaDialect,
     #[serde(default = "default_store_true")]
     pub store: bool,
     #[serde(default)]
@@ -420,6 +426,13 @@ pub struct ResponsesRequest {
     pub extra_body: BTreeMap<String, Value>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StrictSchemaDialect {
+    #[default]
+    OpenAi,
+    Anthropic,
+}
+
 impl ResponsesRequest {
     /// Typed request keys are owned by their fields even if internal callers
     /// programmatically place a colliding key in `extra_body`.
@@ -433,6 +446,7 @@ impl ResponsesRequest {
                 | "tool_choice"
                 | "parallel_tool_calls"
                 | "reasoning"
+                | "strict_schema_dialect"
                 | "store"
                 | "stream"
                 | "include"

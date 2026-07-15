@@ -242,10 +242,10 @@ fn anthropic_max_tokens_maps_to_max_output_tokens() {
     assert_eq!(result.max_output_tokens, Some(256));
 }
 
-/// Hard rule: parallel_tool_calls is forced false regardless of caller input
-/// (AGENTS.md engine.rs:707-726). Anthropic conversion sets it false up front.
+/// Ordinary Anthropic client tools retain provider-default parallelism unless
+/// tool_choice.disable_parallel_tool_use explicitly selects a policy.
 #[test]
-fn anthropic_forces_parallel_tool_calls_false() {
+fn anthropic_parallel_tool_calls_defaults_unset() {
     let result = anthropic_to_responses::convert_request(anthropic(json!({
         "model": "claude-3",
         "max_tokens": 64,

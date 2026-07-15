@@ -255,6 +255,9 @@ fn request_serialization_filters_extra_body_typed_key_collisions() {
     request
         .extra_body
         .insert("prompt_cache_retention".to_string(), json!("shadow"));
+    request
+        .extra_body
+        .insert("strict_schema_dialect".to_string(), json!("anthropic"));
     request.prompt_cache_retention = Some("24h".to_string());
 
     let wire = serde_json::to_string(&request).expect("serialize collision-safe request");
@@ -270,6 +273,7 @@ fn request_serialization_filters_extra_body_typed_key_collisions() {
     assert_eq!(serialized["model"], "typed-model");
     assert_eq!(serialized["temperature"], 0.25);
     assert_eq!(serialized["prompt_cache_retention"], "24h");
+    assert!(serialized.get("strict_schema_dialect").is_none());
     assert_eq!(serialized["vendor_knob"], json!({ "enabled": true }));
     assert_eq!(message_text(&request.input[0]), ("user", "hello"));
 }
@@ -713,6 +717,33 @@ fn strict_schema_validation_is_recursive_and_validates_numeric_constraints() {
 }
 
 #[test]
+fn responses_strict_schema_still_requires_every_property() {
+    let request = parse_request(json!({
+        "model": "test-model",
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "lookup",
+            "strict": true,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": { "type": "string" },
+                    "unit": { "type": "string" }
+                },
+                "required": ["location"],
+                "additionalProperties": false
+            }
+        }]
+    }));
+
+    let error = lower_request(&request, Vec::new())
+        .expect_err("OpenAI strict schemas must keep the required-all contract");
+    assert_eq!(error.code.as_deref(), Some("invalid_json_schema"));
+    assert_eq!(error.param.as_deref(), Some("tools[0].parameters.required"));
+}
+
+#[test]
 fn strict_schema_supports_defs_refs_any_of_nullable_types_and_constraints() {
     let request = parse_request(json!({
         "model": "test-model",
@@ -782,7 +813,7 @@ fn strict_schema_supports_defs_refs_any_of_nullable_types_and_constraints() {
 }
 
 #[test]
-fn non_strict_function_schemas_validate_syntax_and_supported_vocabulary() {
+fn non_strict_function_schemas_validate_known_syntax_and_preserve_extra_vocabulary() {
     let valid = parse_request(json!({
         "model": "test-model",
         "input": "hello",
@@ -791,24 +822,53 @@ fn non_strict_function_schemas_validate_syntax_and_supported_vocabulary() {
             "name": "configure",
             "strict": false,
             "parameters": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "oneOf": [
+                    { "required": ["env"] }
+                ],
                 "properties": {
                     "env": {
                         "type": "object",
+                        "propertyNames": { "pattern": "^[A-Z_][A-Z0-9_]*$" },
                         "additionalProperties": { "type": "string" }
+                    },
+                    "matcher": {
+                        "type": "string",
+                        "format": "regex"
+                    },
+                    "boolean_schema": true,
+                    "external_reference": {
+                        "$ref": "https://example.invalid/synthetic-schema.json"
+                    },
+                    "ecma_pattern": {
+                        "type": "string",
+                        "pattern": "^(?=synthetic)"
                     }
                 },
                 "required": ["env"]
             }
         }]
     }));
-    lower_request(&valid, Vec::new())
+    let lowered = lower_request(&valid, Vec::new())
         .expect("valid permissive non-strict schemas must remain supported");
+    let ToolSpec::Function { parameters, .. } = &valid.tools[0] else {
+        panic!("expected function tool");
+    };
+    assert_eq!(
+        lowered.tools[0].function.parameters.as_ref(),
+        Some(parameters),
+        "additional non-strict vocabulary must reach the provider unchanged"
+    );
 
     for (schema, expected_param) in [
         (json!({ "type": 42 }), "tools[0].parameters.type"),
         (
             json!({ "type": "object", "properties": [] }),
             "tools[0].parameters.properties",
+        ),
+        (
+            json!({ "type": "object", "required": "env" }),
+            "tools[0].parameters.required",
         ),
         (
             json!({
@@ -818,8 +878,16 @@ fn non_strict_function_schemas_validate_syntax_and_supported_vocabulary() {
             "tools[0].parameters.properties.count.minimum",
         ),
         (
-            json!({ "type": "object", "oneOf": [{ "type": "object" }] }),
+            json!({ "type": "object", "$schema": 42 }),
+            "tools[0].parameters.$schema",
+        ),
+        (
+            json!({ "type": "object", "oneOf": { "type": "object" } }),
             "tools[0].parameters.oneOf",
+        ),
+        (
+            json!({ "type": "object", "propertyNames": [] }),
+            "tools[0].parameters.propertyNames",
         ),
     ] {
         let mut invalid = valid.clone();
@@ -828,10 +896,103 @@ fn non_strict_function_schemas_validate_syntax_and_supported_vocabulary() {
         };
         *parameters = schema;
         let error = lower_request(&invalid, Vec::new())
-            .expect_err("malformed or unsupported non-strict schema must fail locally");
+            .expect_err("malformed known JSON Schema syntax must fail locally");
         assert_eq!(error.code.as_deref(), Some("invalid_json_schema"));
         assert_eq!(error.param.as_deref(), Some(expected_param));
     }
+
+    let mut array_root_type = valid.clone();
+    let ToolSpec::Function { parameters, .. } = &mut array_root_type.tools[0] else {
+        panic!("expected function tool");
+    };
+    parameters["type"] = json!(["object"]);
+    lower_request(&array_root_type, Vec::new())
+        .expect("the standard single-element object type array is valid");
+
+    let mut non_object_ref = valid.clone();
+    let ToolSpec::Function { parameters, .. } = &mut non_object_ref.tools[0] else {
+        panic!("expected function tool");
+    };
+    *parameters = json!({
+        "$defs": { "root": { "type": "string" } },
+        "$ref": "#/$defs/root"
+    });
+    let error = lower_request(&non_object_ref, Vec::new())
+        .expect_err("a locally resolvable non-object root schema must fail");
+    assert_eq!(error.code.as_deref(), Some("invalid_json_schema"));
+    assert_eq!(error.param.as_deref(), Some("tools[0].parameters.$ref"));
+
+    let mut local_to_external_ref = valid.clone();
+    let ToolSpec::Function { parameters, .. } = &mut local_to_external_ref.tools[0] else {
+        panic!("expected function tool");
+    };
+    *parameters = json!({
+        "$defs": {
+            "root": { "$ref": "https://example.invalid/synthetic-root-schema.json" }
+        },
+        "$ref": "#/$defs/root"
+    });
+    lower_request(&local_to_external_ref, Vec::new())
+        .expect("an externally defined root type remains provider-owned");
+
+    for (keyword, value) in [
+        (
+            "$schema",
+            json!("https://json-schema.org/draft/2020-12/schema"),
+        ),
+        ("oneOf", json!([{ "type": "object" }])),
+        ("propertyNames", json!({ "pattern": "^[a-z]+$" })),
+    ] {
+        let mut strict = valid.clone();
+        let ToolSpec::Function {
+            strict: is_strict,
+            parameters,
+            ..
+        } = &mut strict.tools[0]
+        else {
+            panic!("expected function tool");
+        };
+        *is_strict = true;
+        *parameters = json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false,
+            keyword: value
+        });
+        let error = lower_request(&strict, Vec::new())
+            .expect_err("strict schemas must stay within the enforced vocabulary");
+        assert_eq!(error.code.as_deref(), Some("invalid_json_schema"));
+        assert_eq!(
+            error.param.as_deref(),
+            Some(format!("tools[0].parameters.{keyword}").as_str())
+        );
+    }
+
+    let strict_format = parse_request(json!({
+        "model": "test-model",
+        "input": "hello",
+        "tools": [{
+            "type": "function",
+            "name": "configure",
+            "strict": true,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "matcher": { "type": "string", "format": "regex" }
+                },
+                "required": ["matcher"],
+                "additionalProperties": false
+            }
+        }]
+    }));
+    let error = lower_request(&strict_format, Vec::new())
+        .expect_err("strict schemas must still reject unenforced format values");
+    assert_eq!(error.code.as_deref(), Some("invalid_json_schema"));
+    assert_eq!(
+        error.param.as_deref(),
+        Some("tools[0].parameters.properties.matcher.format")
+    );
 }
 
 #[test]

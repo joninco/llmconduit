@@ -176,7 +176,10 @@ async fn require_api_auth(
     if auth.authenticate(request.headers()) {
         return next.run(request).await;
     }
-    AppError::unauthorized("invalid or missing API key").into_response()
+    surface_error_response(
+        request.uri().path(),
+        AppError::unauthorized("invalid or missing API key"),
+    )
 }
 
 /// The D7-gated `/debug` + `/dashboard` sub-router (state `Arc<Gateway>`, merged
@@ -434,9 +437,24 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
         .ok()
 }
 
+fn is_anthropic_messages_path(path: &str) -> bool {
+    matches!(path, "/v1/messages" | "/v1/messages/count_tokens")
+}
+
+/// Render errors that arise before route extraction using the destination
+/// surface's wire contract. The exact-path check avoids treating unrelated
+/// `/v1/messages-*` extensions as Anthropic endpoints.
+fn surface_error_response(path: &str, error: AppError) -> Response {
+    if is_anthropic_messages_path(path) {
+        anthropic_error_response(error)
+    } else {
+        error.into_response()
+    }
+}
+
 /// 413 response for an inbound body that exceeds `limit_bytes`.
-fn payload_too_large(limit_bytes: usize) -> Response {
-    AppError::payload_too_large(limit_bytes).into_response()
+fn payload_too_large(path: &str, limit_bytes: usize) -> Response {
+    surface_error_response(path, AppError::payload_too_large(limit_bytes))
 }
 
 /// True when an `axum::body::to_bytes` error is an over-cap length-limit
@@ -499,7 +517,7 @@ async fn log_api_call(
             limit_bytes = max_request_body_bytes,
             "rejected oversized inbound API request: Content-Length over limit"
         );
-        return payload_too_large(max_request_body_bytes);
+        return payload_too_large(uri.path(), max_request_body_bytes);
     }
 
     let (mut parts, body) = request.into_parts();
@@ -520,7 +538,7 @@ async fn log_api_call(
                     error = %err,
                     "rejected inbound API request: body exceeded limit"
                 );
-                return payload_too_large(max_request_body_bytes);
+                return payload_too_large(uri.path(), max_request_body_bytes);
             }
             tracing::warn!(
                 api_call_id = %api_call_id,
@@ -529,9 +547,11 @@ async fn log_api_call(
                 error = %err,
                 "failed to read inbound API request body"
             );
-            return AppError::bad_request("failed to read request body")
-                .with_code("invalid_request_body")
-                .into_response();
+            return surface_error_response(
+                uri.path(),
+                AppError::bad_request("failed to read request body")
+                    .with_code("invalid_request_body"),
+            );
         }
     };
 
@@ -1650,6 +1670,7 @@ fn known_unsupported_responses_variant(value: &Value) -> Option<String> {
         "response_format",
         "seed",
         "stream_options",
+        "strict_schema_dialect",
         "user",
         crate::responses_capabilities::ENFORCE_EXTENSION,
         crate::responses_capabilities::FORWARD_PROMPT_CACHE_KEY_EXTENSION,
@@ -1744,8 +1765,13 @@ fn content_type_is_json(headers: &HeaderMap) -> bool {
 async fn post_messages(
     State(gateway): State<Arc<Gateway>>,
     api_call_id: Option<axum::Extension<crate::dashboard_flow::ApiCallId>>,
-    Json(request): Json<AnthropicRequest>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
+    let request = match parse_anthropic_request(&headers, &body) {
+        Ok(request) => request,
+        Err(error) => return anthropic_error_response(error),
+    };
     let api_call_id = api_call_id.map(|extension| extension.0.0);
     match handle_post_messages(gateway, request, api_call_id).await {
         Ok(response) => response,
@@ -1753,18 +1779,28 @@ async fn post_messages(
     }
 }
 
-async fn post_count_tokens(State(gateway): State<Arc<Gateway>>, body: Bytes) -> Response {
-    let request: AnthropicRequest = match serde_json::from_slice(&body) {
+async fn post_count_tokens(
+    State(gateway): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request = match parse_anthropic_request(&headers, &body) {
         Ok(request) => request,
-        Err(err) => {
-            tracing::debug!(error = %err, "invalid Anthropic count_tokens request body");
-            return anthropic_error_response(AppError::bad_request("invalid request body"));
-        }
+        Err(error) => return anthropic_error_response(error),
     };
     match handle_count_tokens(gateway, request).await {
         Ok(response) => response,
         Err(err) => anthropic_error_response(err),
     }
+}
+
+fn parse_anthropic_request(headers: &HeaderMap, body: &[u8]) -> AppResult<AnthropicRequest> {
+    if !content_type_is_json(headers) {
+        return Err(AppError::unsupported_media_type(
+            "content-type must be application/json",
+        ));
+    }
+    serde_json::from_slice(body).map_err(|_| AppError::bad_request("invalid request body"))
 }
 
 async fn handle_count_tokens(
@@ -1778,7 +1814,10 @@ async fn handle_count_tokens(
     }
 
     let original_model = request.model.clone();
-    let responses_request = anthropic_to_responses::convert_request(request)?;
+    let mut responses_request = anthropic_to_responses::convert_request(request)?;
+    // Counting input tokens never reserves or generates output, so the
+    // generation budget must not participate in lowering validation.
+    responses_request.max_output_tokens = None;
     let resolved_model = gateway.resolve_request_model(&original_model).await.0;
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
     let roles = gateway
@@ -1901,6 +1940,18 @@ async fn handle_post_messages(
     request: AnthropicRequest,
     api_call_id: Option<String>,
 ) -> AppResult<Response> {
+    if request.max_tokens == Some(0) {
+        // Anthropic defines zero as a cache-only prewarm. OpenAI Chat
+        // upstreams have no equivalent operation: promoting it to one would
+        // generate and then hide a token, while tokenization alone does not
+        // populate the model's KV cache. Reject the unsupported capability
+        // explicitly rather than leaking the canonical max_output_tokens rule.
+        return Err(AppError::bad_request(
+            "max_tokens: 0 prompt-cache prewarming is not supported by this gateway",
+        )
+        .with_code("unsupported_parameter")
+        .with_param("max_tokens"));
+    }
     let requested = request.model.clone();
     let model = gateway.resolve_request_model(&request.model).await.0;
     let wants_stream = request.stream;
@@ -2830,12 +2881,7 @@ async fn collect_anthropic_response(
 
 fn anthropic_error_response(err: AppError) -> Response {
     let status = err.status_code();
-    let error_type = match err.status_code() {
-        axum::http::StatusCode::BAD_REQUEST => "invalid_request_error",
-        axum::http::StatusCode::CONFLICT => "invalid_request_error",
-        axum::http::StatusCode::NOT_FOUND => "not_found_error",
-        _ => "api_error",
-    };
+    let error_type = anthropic_error_type(status);
     let body = serde_json::json!({
         "type": "error",
         "error": {
@@ -2844,6 +2890,23 @@ fn anthropic_error_response(err: AppError) -> Response {
         }
     });
     (status, Json(body)).into_response()
+}
+
+fn anthropic_error_type(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        402 => "billing_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        409 => "conflict_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        504 => "timeout_error",
+        529 => "overloaded_error",
+        _ if status.is_client_error() => "invalid_request_error",
+        _ => "api_error",
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3168,6 +3231,7 @@ fn model_id_from_value(model: &Value) -> Option<String> {
 mod tests {
     use super::CaptureSurface;
     use super::anthropic_error_response;
+    use super::anthropic_error_type;
     use super::body_log_fields;
     use super::parse_responses_request;
     use super::payload_logging_enabled;
@@ -3196,6 +3260,31 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).expect("Anthropic error is UTF-8 JSON");
         assert!(body.contains("the upstream request failed"));
         assert!(!body.contains("SENTINEL-UPSTREAM-SECRET"));
+    }
+
+    #[test]
+    fn anthropic_error_types_follow_the_documented_status_taxonomy() {
+        for (status, expected) in [
+            (400, "invalid_request_error"),
+            (401, "authentication_error"),
+            (402, "billing_error"),
+            (403, "permission_error"),
+            (404, "not_found_error"),
+            (409, "conflict_error"),
+            (413, "request_too_large"),
+            (415, "invalid_request_error"),
+            (422, "invalid_request_error"),
+            (429, "rate_limit_error"),
+            (500, "api_error"),
+            (504, "timeout_error"),
+            (529, "overloaded_error"),
+        ] {
+            assert_eq!(
+                anthropic_error_type(StatusCode::from_u16(status).expect("valid status")),
+                expected,
+                "status {status}",
+            );
+        }
     }
 
     #[test]

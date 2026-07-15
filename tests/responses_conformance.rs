@@ -1852,6 +1852,15 @@ async fn responses_wrong_types_and_hosted_variants_use_parameter_errors() {
         (
             json!({
                 "model": "glm-5.1",
+                "input": "hi",
+                "strict_schema_dialect": "anthropic"
+            }),
+            "unsupported_parameter",
+            "strict_schema_dialect",
+        ),
+        (
+            json!({
+                "model": "glm-5.1",
                 "instructions": [{ "type": "code_interpreter_call", "id": "ci_1" }],
                 "input": "hi"
             }),

@@ -13,6 +13,7 @@ use crate::models::responses::ReasoningContentItem;
 use crate::models::responses::ReasoningRequest;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponsesRequest;
+use crate::models::responses::StrictSchemaDialect;
 use crate::models::responses::TextControls;
 use crate::models::responses::TextFormat;
 use crate::models::responses::ToolSpec;
@@ -40,7 +41,7 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
     // Chat path so OPENAI_MAX_STOP_SEQUENCES=4 → 400 (and empty-drop) apply here too.
     // Assign to the typed field instead of smuggling raw into extra_body["stop"].
     let stop = crate::models::chat::normalize_stop(request.stop_sequences)?;
-    let tool_choice = convert_tool_choice(request.tool_choice);
+    let (tool_choice, parallel_tool_calls) = convert_tool_choice(request.tool_choice);
     let metadata = convert_metadata(request.metadata)?;
     let reasoning =
         apply_output_config_effort(reasoning, &request.thinking, &request.output_config);
@@ -56,9 +57,10 @@ pub fn convert_request(request: AnthropicRequest) -> AppResult<ResponsesRequest>
         input,
         tools,
         tool_choice,
-        parallel_tool_calls: None,
+        parallel_tool_calls,
         reasoning,
         thinking: Some(thinking_on),
+        strict_schema_dialect: StrictSchemaDialect::Anthropic,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -398,20 +400,39 @@ fn push_function_call(
 
 fn convert_tool_choice(
     tool_choice: Option<crate::models::anthropic::AnthropicToolChoice>,
-) -> Value {
+) -> (Value, Option<bool>) {
+    let parallel_tool_calls = tool_choice.as_ref().and_then(|choice| {
+        let disabled = match choice {
+            crate::models::anthropic::AnthropicToolChoice::Auto {
+                disable_parallel_tool_use,
+            }
+            | crate::models::anthropic::AnthropicToolChoice::Any {
+                disable_parallel_tool_use,
+            }
+            | crate::models::anthropic::AnthropicToolChoice::None {
+                disable_parallel_tool_use,
+            }
+            | crate::models::anthropic::AnthropicToolChoice::Tool {
+                disable_parallel_tool_use,
+                ..
+            } => *disable_parallel_tool_use,
+        };
+        disabled.map(|disabled| !disabled)
+    });
     match tool_choice {
-        Some(crate::models::anthropic::AnthropicToolChoice::Auto) | None => {
-            Value::String("auto".to_string())
+        Some(crate::models::anthropic::AnthropicToolChoice::Auto { .. }) | None => {
+            (Value::String("auto".to_string()), parallel_tool_calls)
         }
-        Some(crate::models::anthropic::AnthropicToolChoice::Any) => {
-            Value::String("required".to_string())
+        Some(crate::models::anthropic::AnthropicToolChoice::Any { .. }) => {
+            (Value::String("required".to_string()), parallel_tool_calls)
         }
-        Some(crate::models::anthropic::AnthropicToolChoice::None) => {
-            Value::String("none".to_string())
+        Some(crate::models::anthropic::AnthropicToolChoice::None { .. }) => {
+            (Value::String("none".to_string()), parallel_tool_calls)
         }
-        Some(crate::models::anthropic::AnthropicToolChoice::Tool { name }) => {
-            json!({"type": "function", "function": {"name": name}})
-        }
+        Some(crate::models::anthropic::AnthropicToolChoice::Tool { name, .. }) => (
+            json!({"type": "function", "function": {"name": name}}),
+            parallel_tool_calls,
+        ),
     }
 }
 
@@ -597,7 +618,7 @@ fn convert_tools(tools: &Option<Vec<AnthropicTool>>) -> Vec<ToolSpec> {
                     _ => ToolSpec::Function {
                         name: tool.name,
                         description: tool.description.unwrap_or_default(),
-                        strict: false,
+                        strict: tool.strict,
                         parameters: tool.input_schema,
                     },
                 })
@@ -1096,6 +1117,7 @@ mod tests {
                     name: "zulu".to_string(),
                     description: Some("Z".to_string()),
                     input_schema: json!({"type": "object"}),
+                    strict: false,
                 },
                 AnthropicTool {
                     name: "alpha".to_string(),
@@ -1105,6 +1127,7 @@ mod tests {
                         "properties": { "location": { "type": "string" } },
                         "required": ["location"]
                     }),
+                    strict: true,
                 },
             ]),
             tool_choice: None,
@@ -1120,7 +1143,14 @@ mod tests {
 
         let result = convert_request(request).expect("convert");
         assert_eq!(result.tools.len(), 2);
-        assert!(matches!(&result.tools[0], ToolSpec::Function { name, .. } if name == "alpha"));
+        assert!(matches!(
+            &result.tools[0],
+            ToolSpec::Function {
+                name,
+                strict: true,
+                ..
+            } if name == "alpha"
+        ));
     }
 
     #[test]
@@ -1367,9 +1397,11 @@ mod tests {
                 name: "echo".to_string(),
                 description: Some("Echo".to_string()),
                 input_schema: json!({"type": "object"}),
+                strict: false,
             }]),
             tool_choice: Some(AnthropicToolChoice::Tool {
                 name: "echo".to_string(),
+                disable_parallel_tool_use: Some(true),
             }),
             stream: true,
             temperature: None,
@@ -1386,14 +1418,19 @@ mod tests {
             tool_specific.tool_choice,
             json!({"type": "function", "function": {"name": "echo"}})
         );
+        assert_eq!(tool_specific.parallel_tool_calls, Some(false));
 
         assert_eq!(
-            convert_tool_choice(Some(AnthropicToolChoice::Any)),
-            Value::String("required".to_string())
+            convert_tool_choice(Some(AnthropicToolChoice::Any {
+                disable_parallel_tool_use: Some(false),
+            })),
+            (Value::String("required".to_string()), Some(true))
         );
         assert_eq!(
-            convert_tool_choice(Some(AnthropicToolChoice::None)),
-            Value::String("none".to_string())
+            convert_tool_choice(Some(AnthropicToolChoice::None {
+                disable_parallel_tool_use: None,
+            })),
+            (Value::String("none".to_string()), None)
         );
     }
 

@@ -1,0 +1,61 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 8192,
+  "stream": false,
+  "metadata": {
+    "user_id": "synthetic-conformance-client"
+  },
+  "system": [
+    {
+      "type": "text",
+      "text": "Follow the synthetic conformance request.",
+      "cache_control": {
+        "type": "ephemeral",
+        "ttl": "1h"
+      }
+    },
+    {
+      "type": "text",
+      "text": "Never use real credentials in fixtures.",
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Return a short synthetic answer.",
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    }
+  ],
+  "tools": [],
+  "tool_choice": {
+    "type": "auto",
+    "disable_parallel_tool_use": true
+  },
+  "thinking": {
+    "type": "adaptive"
+  },
+  "output_config": {
+    "effort": "high"
+  },
+  "context_management": {
+    "edits": [
+      {
+        "type": "clear_thinking_20251015",
+        "keep": "all"
+      }
+    ]
+  },
+  "temperature": 0.25,
+  "top_p": 0.9,
+  "stop_sequences": ["<synthetic-stop>"]
+}

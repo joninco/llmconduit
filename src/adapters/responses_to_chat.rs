@@ -14,6 +14,7 @@ use crate::models::responses::LocalShellAction;
 use crate::models::responses::NamespaceToolSpec;
 use crate::models::responses::ResponseItem;
 use crate::models::responses::ResponsesRequest;
+use crate::models::responses::StrictSchemaDialect;
 use crate::models::responses::ToolSpec;
 use serde_json::Map;
 use serde_json::Value;
@@ -180,7 +181,7 @@ pub fn lower_request_with_image_agent_and_roles(
             tool_calls: None,
         });
     }
-    let tools = lower_tools(&request.tools)?;
+    let tools = lower_tools(&request.tools, request.strict_schema_dialect)?;
     let registry = build_tool_registry(&request.tools, image_agent_active)?;
     let mut pending_reasoning: Option<PendingReasoning> = None;
     let instruction_items = if messages.is_empty() {
@@ -745,9 +746,10 @@ fn validate_request(request: &ResponsesRequest) -> AppResult<()> {
             &format.schema,
             "text.format.name",
             "text.format.schema",
+            request.strict_schema_dialect,
         )?;
     }
-    validate_tool_schemas(&request.tools)?;
+    validate_tool_schemas(&request.tools, request.strict_schema_dialect)?;
     if let Some(metadata) = &request.metadata {
         if metadata.len() > 16 {
             return Err(
@@ -1016,7 +1018,10 @@ fn validate_multimodal_content(content: &[ContentItem], base: &str) -> AppResult
     Ok(())
 }
 
-fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
+fn lower_tools(
+    specs: &[ToolSpec],
+    strict_schema_dialect: StrictSchemaDialect,
+) -> AppResult<Vec<ChatTool>> {
     let mut tools = Vec::new();
     for spec in specs {
         let lowered_tools = match spec {
@@ -1026,7 +1031,7 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
                 strict,
                 parameters,
             } => {
-                validate_function_schema(name, *strict, parameters)?;
+                validate_function_schema(name, *strict, parameters, strict_schema_dialect)?;
                 vec![ChatTool {
                     kind: "function".to_string(),
                     function: ChatToolDefinition {
@@ -1050,7 +1055,12 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
                             strict,
                             parameters,
                         } => {
-                            validate_function_schema(name, *strict, parameters)?;
+                            validate_function_schema(
+                                name,
+                                *strict,
+                                parameters,
+                                strict_schema_dialect,
+                            )?;
                             ChatTool {
                                 kind: "function".to_string(),
                                 function: ChatToolDefinition {
@@ -1162,11 +1172,26 @@ fn lower_tools(specs: &[ToolSpec]) -> AppResult<Vec<ChatTool>> {
     Ok(tools)
 }
 
-fn validate_function_schema(name: &str, strict: bool, parameters: &Value) -> AppResult<()> {
-    validate_function_schema_at(name, strict, parameters, "tools", "tools")
+fn validate_function_schema(
+    name: &str,
+    strict: bool,
+    parameters: &Value,
+    strict_schema_dialect: StrictSchemaDialect,
+) -> AppResult<()> {
+    validate_function_schema_at(
+        name,
+        strict,
+        parameters,
+        "tools",
+        "tools",
+        strict_schema_dialect,
+    )
 }
 
-fn validate_tool_schemas(specs: &[ToolSpec]) -> AppResult<()> {
+fn validate_tool_schemas(
+    specs: &[ToolSpec],
+    strict_schema_dialect: StrictSchemaDialect,
+) -> AppResult<()> {
     for (tool_index, spec) in specs.iter().enumerate() {
         match spec {
             ToolSpec::Function {
@@ -1180,6 +1205,7 @@ fn validate_tool_schemas(specs: &[ToolSpec]) -> AppResult<()> {
                 parameters,
                 &format!("tools[{tool_index}].name"),
                 &format!("tools[{tool_index}].parameters"),
+                strict_schema_dialect,
             )?,
             ToolSpec::Namespace { tools, .. } => {
                 for (nested_index, tool) in tools.iter().enumerate() {
@@ -1196,6 +1222,7 @@ fn validate_tool_schemas(specs: &[ToolSpec]) -> AppResult<()> {
                         parameters,
                         &format!("{prefix}.name"),
                         &format!("{prefix}.parameters"),
+                        strict_schema_dialect,
                     )?;
                 }
             }
@@ -1230,6 +1257,7 @@ fn validate_function_schema_at(
     parameters: &Value,
     name_path: &str,
     schema_path: &str,
+    strict_schema_dialect: StrictSchemaDialect,
 ) -> AppResult<()> {
     validate_tool_name(name, name_path)?;
 
@@ -1241,11 +1269,48 @@ fn validate_function_schema_at(
         );
     }
 
-    // Validate the supported JSON Schema vocabulary for every function, not
-    // only `strict:true` functions. Passing malformed/unsupported non-strict
-    // schemas through to different providers produces provider-dependent 4xxs
-    // and makes capability behavior nondeterministic.
-    validate_schema_node(parameters, schema_path, 0, strict)?;
+    // Non-strict schemas are interpreted by the selected provider, but known
+    // JSON Schema syntax is still validated locally. The permissive validator
+    // accepts standard dialect constructs, boolean subschemas, external refs,
+    // ECMA-262 patterns, and unknown vendor annotations without narrowing what
+    // reaches the provider.
+    if !strict {
+        validate_schema_node(parameters, schema_path, 0, false, strict_schema_dialect)?;
+        let declared_types = declared_schema_types(
+            parameters
+                .as_object()
+                .expect("parameters checked as object"),
+            schema_path,
+        )?;
+        let effective_types = if declared_types.is_none()
+            && parameters
+                .get("$ref")
+                .and_then(Value::as_str)
+                .is_some_and(|reference| reference.starts_with('#'))
+        {
+            determinable_non_strict_root_types(parameters, parameters, schema_path, 0)?
+        } else {
+            declared_types.map(|types| types.into_iter().map(str::to_string).collect())
+        };
+        if effective_types
+            .as_ref()
+            .is_some_and(|types| types.as_slice() != ["object"])
+        {
+            let param = if parameters.get("type").is_some() {
+                format!("{schema_path}.type")
+            } else {
+                format!("{schema_path}.$ref")
+            };
+            return Err(AppError::bad_request(
+                "function parameters must declare a top-level object schema",
+            )
+            .with_code("invalid_json_schema")
+            .with_param(param));
+        }
+        return Ok(());
+    }
+
+    validate_schema_node(parameters, schema_path, 0, true, strict_schema_dialect)?;
 
     // Function arguments are always JSON objects. Keep `{}` as the permissive
     // non-strict shorthand used by existing clients, but reject an explicit
@@ -1254,7 +1319,7 @@ fn validate_function_schema_at(
     if root_types
         .as_ref()
         .is_some_and(|types| types.as_slice() != ["object"])
-        || strict && root_types.is_none()
+        || root_types.is_none()
     {
         return Err(AppError::bad_request(
             "function parameters must declare a top-level object schema",
@@ -1281,8 +1346,14 @@ fn validate_tool_name(name: &str, name_path: &str) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_schema_node(schema: &Value, path: &str, depth: usize, strict: bool) -> AppResult<()> {
-    validate_schema_node_with_root(schema, schema, path, depth, strict)
+fn validate_schema_node(
+    schema: &Value,
+    path: &str,
+    depth: usize,
+    strict: bool,
+    strict_schema_dialect: StrictSchemaDialect,
+) -> AppResult<()> {
+    validate_schema_node_with_root(schema, schema, path, depth, strict, strict_schema_dialect)
 }
 
 fn validate_schema_node_with_root(
@@ -1291,6 +1362,7 @@ fn validate_schema_node_with_root(
     path: &str,
     depth: usize,
     strict: bool,
+    strict_schema_dialect: StrictSchemaDialect,
 ) -> AppResult<()> {
     if depth > 64 {
         return Err(invalid_schema(
@@ -1298,13 +1370,23 @@ fn validate_schema_node_with_root(
             path,
         ));
     }
-    let object = schema
-        .as_object()
-        .ok_or_else(|| invalid_schema("schema nodes must be JSON objects", path))?;
+    if schema.is_boolean() && !strict {
+        return Ok(());
+    }
+    let object = schema.as_object().ok_or_else(|| {
+        invalid_schema(
+            if strict {
+                "strict schema nodes must be JSON objects"
+            } else {
+                "schema nodes must be JSON objects or booleans"
+            },
+            path,
+        )
+    })?;
 
-    // Every assertion keyword accepted here is also enforced by
-    // `validate_json_schema_value`. Keeping the two sides in lock-step avoids
-    // accepting a schema locally and then advertising an unchecked result.
+    // Every assertion keyword accepted for a strict schema is also enforced by
+    // `validate_json_schema_value`. Non-strict schemas preserve unknown
+    // vocabulary for the provider while still validating the keywords below.
     const SUPPORTED_KEYWORDS: &[&str] = &[
         "$defs",
         "$ref",
@@ -1336,7 +1418,7 @@ fn validate_schema_node_with_root(
         "examples",
     ];
     for keyword in object.keys() {
-        if !SUPPORTED_KEYWORDS.contains(&keyword.as_str()) {
+        if strict && !SUPPORTED_KEYWORDS.contains(&keyword.as_str()) {
             return Err(invalid_schema(
                 format!("unsupported JSON Schema keyword: {keyword}"),
                 format!("{path}.{keyword}"),
@@ -1355,19 +1437,21 @@ fn validate_schema_node_with_root(
         let reference = reference
             .as_str()
             .ok_or_else(|| invalid_schema("$ref must be a string", format!("{path}.$ref")))?;
-        let target = resolve_local_ref(root, reference)
-            .map_err(|message| invalid_schema(message, format!("{path}.$ref")))?;
-        if !target.is_object() {
-            return Err(invalid_schema(
-                "$ref must resolve to a schema object",
-                format!("{path}.$ref"),
-            ));
-        }
-        if std::ptr::eq(target, schema) {
-            return Err(invalid_schema(
-                "$ref forms a reference cycle without a constraining schema",
-                format!("{path}.$ref"),
-            ));
+        if strict {
+            let target = resolve_local_ref(root, reference)
+                .map_err(|message| invalid_schema(message, format!("{path}.$ref")))?;
+            if !target.is_object() {
+                return Err(invalid_schema(
+                    "$ref must resolve to a schema object",
+                    format!("{path}.$ref"),
+                ));
+            }
+            if std::ptr::eq(target, schema) {
+                return Err(invalid_schema(
+                    "$ref forms a reference cycle without a constraining schema",
+                    format!("{path}.$ref"),
+                ));
+            }
         }
     }
 
@@ -1382,6 +1466,7 @@ fn validate_schema_node_with_root(
                 &format!("{path}.$defs.{name}"),
                 depth + 1,
                 strict,
+                strict_schema_dialect,
             )?;
         }
     }
@@ -1403,8 +1488,13 @@ fn validate_schema_node_with_root(
                 &format!("{path}.anyOf[{index}]"),
                 depth + 1,
                 strict,
+                strict_schema_dialect,
             )?;
         }
+    }
+
+    if !strict {
+        validate_non_strict_schema_extensions(root, object, path, depth, strict_schema_dialect)?;
     }
 
     for annotation in ["description", "title"] {
@@ -1485,30 +1575,34 @@ fn validate_schema_node_with_root(
         let pattern = pattern
             .as_str()
             .ok_or_else(|| invalid_schema("pattern must be a string", format!("{path}.pattern")))?;
-        regex::Regex::new(pattern).map_err(|error| {
-            invalid_schema(
-                format!("pattern is not a valid regular expression: {error}"),
-                format!("{path}.pattern"),
-            )
-        })?;
+        if strict {
+            regex::Regex::new(pattern).map_err(|error| {
+                invalid_schema(
+                    format!("pattern is not a valid regular expression: {error}"),
+                    format!("{path}.pattern"),
+                )
+            })?;
+        }
     }
     if let Some(format) = object.get("format") {
         let format = format
             .as_str()
             .ok_or_else(|| invalid_schema("format must be a string", format!("{path}.format")))?;
-        if !matches!(
-            format,
-            "date-time"
-                | "date"
-                | "time"
-                | "duration"
-                | "email"
-                | "hostname"
-                | "ipv4"
-                | "ipv6"
-                | "uuid"
-                | "uri"
-        ) {
+        if strict
+            && !matches!(
+                format,
+                "date-time"
+                    | "date"
+                    | "time"
+                    | "duration"
+                    | "email"
+                    | "hostname"
+                    | "ipv4"
+                    | "ipv6"
+                    | "uuid"
+                    | "uri"
+            )
+        {
             return Err(invalid_schema(
                 format!("unsupported JSON Schema format: {format}"),
                 format!("{path}.format"),
@@ -1615,6 +1709,7 @@ fn validate_schema_node_with_root(
                 &format!("{path}.properties.{name}"),
                 depth + 1,
                 strict,
+                strict_schema_dialect,
             )?;
         }
     }
@@ -1662,6 +1757,7 @@ fn validate_schema_node_with_root(
                 &format!("{path}.additionalProperties"),
                 depth + 1,
                 false,
+                strict_schema_dialect,
             )?;
             Some(value)
         }
@@ -1695,25 +1791,49 @@ fn validate_schema_node_with_root(
                 format!("{path}.additionalProperties"),
             ));
         }
-        let required_names = required.as_ref().ok_or_else(|| {
-            invalid_schema(
-                "strict object schemas must list every property in required",
-                format!("{path}.required"),
-            )
-        })?;
-        if required_names.len() != properties.len()
-            || !properties
-                .keys()
-                .all(|key| required_names.contains(key.as_str()))
+        if let Some(required_names) = required.as_ref()
+            && required_names
+                .iter()
+                .any(|name| !properties.contains_key(*name))
         {
             return Err(invalid_schema(
-                "strict object schemas must list every property exactly once in required",
+                "required entries must name declared properties",
                 format!("{path}.required"),
             ));
+        }
+        if strict_schema_dialect == StrictSchemaDialect::OpenAi {
+            let required_names = required.as_ref().ok_or_else(|| {
+                invalid_schema(
+                    "strict object schemas must list every property in required",
+                    format!("{path}.required"),
+                )
+            })?;
+            if required_names.len() != properties.len()
+                || !properties
+                    .keys()
+                    .all(|key| required_names.contains(key.as_str()))
+            {
+                return Err(invalid_schema(
+                    "strict object schemas must list every property exactly once in required",
+                    format!("{path}.required"),
+                ));
+            }
         }
     }
 
     match object.get("items") {
+        Some(Value::Array(items)) if !strict && allows_type("array") => {
+            for (index, item) in items.iter().enumerate() {
+                validate_schema_node_with_root(
+                    root,
+                    item,
+                    &format!("{path}.items[{index}]"),
+                    depth + 1,
+                    false,
+                    strict_schema_dialect,
+                )?;
+            }
+        }
         Some(items) if allows_type("array") && (schema_types.is_some() || !strict) => {
             validate_schema_node_with_root(
                 root,
@@ -1721,6 +1841,7 @@ fn validate_schema_node_with_root(
                 &format!("{path}.items"),
                 depth + 1,
                 strict,
+                strict_schema_dialect,
             )?;
         }
         Some(_) => {
@@ -1738,6 +1859,196 @@ fn validate_schema_node_with_root(
         None => {}
     }
 
+    Ok(())
+}
+
+/// Validate the structural shape of standard JSON Schema keywords that are
+/// outside llmconduit's strict subset. Unknown keywords remain provider-owned;
+/// known keywords must still have valid JSON types so malformed client schemas
+/// fail consistently before dispatch.
+fn validate_non_strict_schema_extensions(
+    root: &Value,
+    object: &Map<String, Value>,
+    path: &str,
+    depth: usize,
+    strict_schema_dialect: StrictSchemaDialect,
+) -> AppResult<()> {
+    for keyword in [
+        "$schema",
+        "$id",
+        "$anchor",
+        "$dynamicAnchor",
+        "$dynamicRef",
+        "$comment",
+        "contentEncoding",
+        "contentMediaType",
+    ] {
+        if object.get(keyword).is_some_and(|value| !value.is_string()) {
+            return Err(invalid_schema(
+                format!("{keyword} must be a string"),
+                format!("{path}.{keyword}"),
+            ));
+        }
+    }
+
+    for keyword in ["allOf", "oneOf", "prefixItems"] {
+        let Some(value) = object.get(keyword) else {
+            continue;
+        };
+        let schemas = value.as_array().ok_or_else(|| {
+            invalid_schema(
+                format!("{keyword} must be an array"),
+                format!("{path}.{keyword}"),
+            )
+        })?;
+        if keyword != "prefixItems" && schemas.is_empty() {
+            return Err(invalid_schema(
+                format!("{keyword} must contain at least one schema"),
+                format!("{path}.{keyword}"),
+            ));
+        }
+        for (index, schema) in schemas.iter().enumerate() {
+            validate_schema_node_with_root(
+                root,
+                schema,
+                &format!("{path}.{keyword}[{index}]"),
+                depth + 1,
+                false,
+                strict_schema_dialect,
+            )?;
+        }
+    }
+
+    for keyword in [
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "contains",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contentSchema",
+    ] {
+        if let Some(schema) = object.get(keyword) {
+            validate_schema_node_with_root(
+                root,
+                schema,
+                &format!("{path}.{keyword}"),
+                depth + 1,
+                false,
+                strict_schema_dialect,
+            )?;
+        }
+    }
+
+    for keyword in ["patternProperties", "dependentSchemas"] {
+        let Some(value) = object.get(keyword) else {
+            continue;
+        };
+        let schemas = value.as_object().ok_or_else(|| {
+            invalid_schema(
+                format!("{keyword} must be an object"),
+                format!("{path}.{keyword}"),
+            )
+        })?;
+        for (name, schema) in schemas {
+            validate_schema_node_with_root(
+                root,
+                schema,
+                &format!("{path}.{keyword}.{name}"),
+                depth + 1,
+                false,
+                strict_schema_dialect,
+            )?;
+        }
+    }
+
+    if let Some(value) = object.get("dependentRequired") {
+        let dependencies = value.as_object().ok_or_else(|| {
+            invalid_schema(
+                "dependentRequired must be an object",
+                format!("{path}.dependentRequired"),
+            )
+        })?;
+        for (name, required) in dependencies {
+            validate_unique_string_array(required, &format!("{path}.dependentRequired.{name}"))?;
+        }
+    }
+
+    if let Some(value) = object.get("dependencies") {
+        let dependencies = value.as_object().ok_or_else(|| {
+            invalid_schema(
+                "dependencies must be an object",
+                format!("{path}.dependencies"),
+            )
+        })?;
+        for (name, dependency) in dependencies {
+            if dependency.is_array() {
+                validate_unique_string_array(dependency, &format!("{path}.dependencies.{name}"))?;
+            } else {
+                validate_schema_node_with_root(
+                    root,
+                    dependency,
+                    &format!("{path}.dependencies.{name}"),
+                    depth + 1,
+                    false,
+                    strict_schema_dialect,
+                )?;
+            }
+        }
+    }
+
+    for keyword in ["minContains", "maxContains"] {
+        if object
+            .get(keyword)
+            .is_some_and(|value| value.as_u64().is_none())
+        {
+            return Err(invalid_schema(
+                format!("{keyword} must be a non-negative integer"),
+                format!("{path}.{keyword}"),
+            ));
+        }
+    }
+    if let (Some(minimum), Some(maximum)) = (
+        object.get("minContains").and_then(Value::as_u64),
+        object.get("maxContains").and_then(Value::as_u64),
+    ) && minimum > maximum
+    {
+        return Err(invalid_schema(
+            "minContains must not exceed maxContains",
+            format!("{path}.maxContains"),
+        ));
+    }
+
+    for keyword in ["readOnly", "writeOnly", "deprecated"] {
+        if object.get(keyword).is_some_and(|value| !value.is_boolean()) {
+            return Err(invalid_schema(
+                format!("{keyword} must be a boolean"),
+                format!("{path}.{keyword}"),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_unique_string_array(value: &Value, path: &str) -> AppResult<()> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| invalid_schema("value must be an array of strings", path))?;
+    let mut unique = std::collections::HashSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let value = value.as_str().ok_or_else(|| {
+            invalid_schema("array entries must be strings", format!("{path}[{index}]"))
+        })?;
+        if !unique.insert(value) {
+            return Err(invalid_schema(
+                "array entries must be unique",
+                format!("{path}[{index}]"),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1826,6 +2137,41 @@ fn effective_schema_types(
         ));
     }
     effective_schema_types(root, target, path, depth + 1)
+}
+
+fn determinable_non_strict_root_types(
+    root: &Value,
+    schema: &Value,
+    path: &str,
+    depth: usize,
+) -> AppResult<Option<Vec<String>>> {
+    if depth > 64 {
+        return Err(invalid_schema(
+            "JSON Schema reference chain exceeds the supported nesting depth",
+            format!("{path}.$ref"),
+        ));
+    }
+    let Some(object) = schema.as_object() else {
+        return Ok(None);
+    };
+    if let Some(types) = declared_schema_types(object, path)? {
+        return Ok(Some(types.into_iter().map(str::to_string).collect()));
+    }
+    let Some(reference) = object.get("$ref").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if !reference.starts_with('#') {
+        return Ok(None);
+    }
+    let target = resolve_local_ref(root, reference)
+        .map_err(|message| invalid_schema(message, format!("{path}.$ref")))?;
+    if std::ptr::eq(target, schema) {
+        return Err(invalid_schema(
+            "$ref forms a reference cycle without declaring a root type",
+            format!("{path}.$ref"),
+        ));
+    }
+    determinable_non_strict_root_types(root, target, path, depth + 1)
 }
 
 fn resolve_local_ref<'a>(root: &'a Value, reference: &str) -> Result<&'a Value, String> {
@@ -2579,6 +2925,7 @@ mod tests {
             parallel_tool_calls: Some(false),
             reasoning: None,
             thinking: None,
+            strict_schema_dialect: StrictSchemaDialect::OpenAi,
             store: false,
             stream: true,
             include: vec![],
@@ -2657,7 +3004,10 @@ mod tests {
             strict: true,
             parameters: json!({
                 "type": "object",
-                "properties": { "value": { "type": "string" } },
+                "properties": {
+                    "value": { "type": "string" },
+                    "unit": { "type": "string", "enum": ["short", "long"] }
+                },
                 "required": ["value"],
                 "additionalProperties": false
             }),
@@ -2671,6 +3021,10 @@ mod tests {
         let error = registry
             .validate_function_arguments("echo", &json!({ "value": 1 }))
             .expect_err("integer must fail the string schema");
+        assert_eq!(error.code.as_deref(), Some("invalid_tool_call"));
+        let error = registry
+            .validate_function_arguments("echo", &json!({ "value": "ok", "unit": "unsupported" }))
+            .expect_err("a present optional property must still satisfy its schema");
         assert_eq!(error.code.as_deref(), Some("invalid_tool_call"));
     }
 

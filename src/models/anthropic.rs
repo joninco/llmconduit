@@ -154,15 +154,30 @@ pub struct AnthropicTool {
     pub description: Option<String>,
     #[serde(default = "default_input_schema")]
     pub input_schema: Value,
+    #[serde(default)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicToolChoice {
-    Auto,
-    Any,
-    None,
-    Tool { name: String },
+    Auto {
+        #[serde(default)]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    Any {
+        #[serde(default)]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    None {
+        #[serde(default)]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    Tool {
+        name: String,
+        #[serde(default)]
+        disable_parallel_tool_use: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -538,6 +553,7 @@ mod tests {
         let tool: AnthropicTool = serde_json::from_value(value).unwrap();
         assert_eq!(tool.name, "web_search");
         assert_eq!(tool.input_schema, serde_json::json!({"type": "object"}));
+        assert!(!tool.strict);
     }
 
     #[test]
@@ -546,9 +562,10 @@ mod tests {
             "type": "object",
             "properties": { "query": { "type": "string" } }
         });
-        let value = serde_json::json!({"name": "search", "input_schema": schema});
+        let value = serde_json::json!({"name": "search", "input_schema": schema, "strict": true});
         let tool: AnthropicTool = serde_json::from_value(value).unwrap();
         assert_eq!(tool.name, "search");
         assert_eq!(tool.input_schema, schema);
+        assert!(tool.strict);
     }
 }

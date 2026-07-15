@@ -23,6 +23,7 @@ use llmconduit::models::responses::ReasoningSummaryItem;
 use llmconduit::models::responses::ResponseInstructions;
 use llmconduit::models::responses::ResponseItem;
 use llmconduit::models::responses::ResponsesRequest;
+use llmconduit::models::responses::StrictSchemaDialect;
 use llmconduit::models::responses::ToolSpec;
 use llmconduit::monitor::MonitorHub;
 use llmconduit::raw::RawOutput;
@@ -506,6 +507,7 @@ async fn streams_function_call_turn() {
         parallel_tool_calls: Some(true),
         reasoning: None,
         thinking: None,
+        strict_schema_dialect: StrictSchemaDialect::OpenAi,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -801,6 +803,7 @@ async fn flattens_namespace_tools_for_upstream_and_preserves_namespace_in_output
         parallel_tool_calls: Some(true),
         reasoning: None,
         thinking: None,
+        strict_schema_dialect: StrictSchemaDialect::OpenAi,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -4951,6 +4954,7 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
         parallel_tool_calls: Some(true),
         reasoning: None,
         thinking: None,
+        strict_schema_dialect: StrictSchemaDialect::OpenAi,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -5065,6 +5069,7 @@ async fn merges_multiple_tool_calls_into_single_upstream_assistant_message() {
         parallel_tool_calls: Some(true),
         reasoning: None,
         thinking: None,
+        strict_schema_dialect: StrictSchemaDialect::OpenAi,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -7840,6 +7845,7 @@ fn base_request(input: Vec<ResponseItem>) -> ResponsesRequest {
             summary: None,
         }),
         thinking: None,
+        strict_schema_dialect: StrictSchemaDialect::OpenAi,
         store: false,
         stream: true,
         include: Vec::new(),
@@ -9960,7 +9966,7 @@ async fn anthropic_messages_forwards_output_config_as_response_format() {
 }
 
 #[tokio::test]
-async fn anthropic_messages_streams_tool_use_response() {
+async fn anthropic_messages_preserves_non_strict_schema_vocabulary_through_tool_use() {
     let upstream = MockUpstream::default();
     upstream
         .push_response(vec![
@@ -9980,6 +9986,19 @@ async fn anthropic_messages_streams_tool_use_response() {
         .await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
     let app = llmconduit::build_app_from_gateway(gateway);
+    let tool_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "location": { "type": "string" },
+            "labels": {
+                "type": "object",
+                "propertyNames": { "pattern": "^[a-z_]+$" },
+                "additionalProperties": { "type": "string" }
+            }
+        },
+        "required": ["location"]
+    });
 
     let body = serde_json::json!({
         "model": "claude-3-5-sonnet-20241022",
@@ -9992,11 +10011,7 @@ async fn anthropic_messages_streams_tool_use_response() {
             {
                 "name": "get_weather",
                 "description": "Get the weather",
-                "input_schema": {
-                    "type": "object",
-                    "properties": { "location": { "type": "string" } },
-                    "required": ["location"]
-                }
+                "input_schema": tool_schema.clone()
             }
         ]
     });
@@ -10077,6 +10092,13 @@ async fn anthropic_messages_streams_tool_use_response() {
     use llmconduit::adapters::responses_to_anthropic::conformance::Surface;
     use llmconduit::adapters::responses_to_anthropic::conformance::assert_sse_conformant;
     assert_sse_conformant(&anthropic_events, Surface::ClientToolUse);
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let tools = requests[0].tools.as_ref().expect("forwarded tools");
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].function.parameters.as_ref(), Some(&tool_schema));
+    assert!(!tools[0].function.strict);
 }
 
 #[tokio::test]
@@ -10283,11 +10305,27 @@ async fn anthropic_count_tokens_lowers_and_returns_anthropic_shape() {
     upstream.set_token_count(Some(321)).await;
     let gateway = test_gateway(upstream.clone(), MockSearch::default());
     let app = llmconduit::build_app_from_gateway(gateway);
+    let tool_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "env": {
+                "type": "object",
+                "propertyNames": { "pattern": "^[A-Z_]+$" },
+                "additionalProperties": { "type": "string" }
+            }
+        }
+    });
     let body = json!({
         "model": "test-model",
         "max_tokens": 128,
         "system": "Be concise.",
-        "messages": [{"role": "user", "content": "Hello"}]
+        "messages": [{"role": "user", "content": "Hello"}],
+        "tools": [{
+            "name": "configure",
+            "description": "Configure environment values",
+            "input_schema": tool_schema.clone()
+        }]
     });
 
     let response = app
@@ -10315,6 +10353,9 @@ async fn anthropic_count_tokens_lowers_and_returns_anthropic_shape() {
     let requests = upstream.requests().await;
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].model, "test-model");
+    let tools = requests[0].tools.as_ref().expect("forwarded tools");
+    assert_eq!(tools[0].function.parameters.as_ref(), Some(&tool_schema));
+    assert!(!tools[0].function.strict);
     assert_eq!(
         requests[0]
             .messages
@@ -12127,6 +12168,7 @@ async fn sse_responses_include_connection_keep_alive() {
         parallel_tool_calls: Some(false),
         reasoning: None,
         thinking: None,
+        strict_schema_dialect: StrictSchemaDialect::OpenAi,
         store: false,
         stream: true,
         include: Vec::new(),
