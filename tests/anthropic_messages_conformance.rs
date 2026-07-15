@@ -537,6 +537,7 @@ async fn anthropic_strict_tools_preserve_strict_schema_enforcement() {
             "description": "Look up a synthetic record.",
             "strict": true,
             "input_schema": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
                 "properties": {
                     "location": {"type": "string"},
@@ -547,21 +548,28 @@ async fn anthropic_strict_tools_preserve_strict_schema_enforcement() {
             }
         }]
     });
-    let harness = Harness::generation(test_config()).await;
-    let response = post_json(&harness.app, "/v1/messages", &request).await;
-    assert_eq!(response.status, StatusCode::OK, "{}", response.text());
-    let recorded = harness.upstream.requests().await;
-    let tool = &recorded[0].tools.as_ref().expect("forwarded tool")[0];
-    assert!(tool.function.strict);
-    assert_eq!(
-        tool.function.parameters.as_ref(),
-        Some(&request["tools"][0]["input_schema"])
-    );
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let harness = if path.ends_with("count_tokens") {
+            Harness::tokenizer(test_config(), 123).await
+        } else {
+            Harness::generation(test_config()).await
+        };
+        let response = post_json(&harness.app, path, &request).await;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text());
+        let recorded = harness.upstream.requests().await;
+        let tool = &recorded[0].tools.as_ref().expect("forwarded tool")[0];
+        assert!(tool.function.strict);
+        assert_eq!(
+            tool.function.parameters.as_ref(),
+            Some(&request["tools"][0]["input_schema"])
+        );
+    }
 }
 
 #[tokio::test]
 async fn anthropic_structured_output_and_controls_lower_end_to_end() {
     let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {
             "answer": {"type": "string"},
@@ -831,6 +839,19 @@ fn semantic_error_cases() -> Vec<(&'static str, Value)> {
     let mut request = basic_request();
     request["tools"] = json!([{"name": "lookup", "input_schema": {"type": 42}}]);
     cases.push(("malformed known schema keyword", request));
+
+    let mut request = basic_request();
+    request["tools"] = json!([{
+        "name": "lookup",
+        "strict": true,
+        "input_schema": {
+            "$schema": 42,
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }
+    }]);
+    cases.push(("malformed strict schema declaration", request));
 
     let mut request = basic_request();
     request["tools"] = json!([

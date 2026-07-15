@@ -1418,12 +1418,26 @@ fn validate_schema_node_with_root(
         "examples",
     ];
     for keyword in object.keys() {
-        if strict && !SUPPORTED_KEYWORDS.contains(&keyword.as_str()) {
+        let is_anthropic_schema_declaration =
+            strict_schema_dialect == StrictSchemaDialect::Anthropic && keyword == "$schema";
+        if strict
+            && !SUPPORTED_KEYWORDS.contains(&keyword.as_str())
+            && !is_anthropic_schema_declaration
+        {
             return Err(invalid_schema(
                 format!("unsupported JSON Schema keyword: {keyword}"),
                 format!("{path}.{keyword}"),
             ));
         }
+    }
+    if object
+        .get("$schema")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err(invalid_schema(
+            "$schema must be a string",
+            format!("{path}.$schema"),
+        ));
     }
 
     let schema_types = declared_schema_types(object, path)?;
@@ -1874,7 +1888,6 @@ fn validate_non_strict_schema_extensions(
     strict_schema_dialect: StrictSchemaDialect,
 ) -> AppResult<()> {
     for keyword in [
-        "$schema",
         "$id",
         "$anchor",
         "$dynamicAnchor",
