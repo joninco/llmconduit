@@ -6,9 +6,11 @@
 
 use crate::error::{AppError, AppResult};
 use crate::models::responses::{
-    ContentItem, FunctionCallOutputContent, ResponseItem, ResponsesRequest, ToolSpec,
+    AgentMessageInputContent, ContentItem, FunctionCallOutputContent, ResponseItem,
+    ResponsesRequest, ToolSpec,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -20,6 +22,11 @@ pub const FORWARD_PROMPT_CACHE_KEY_EXTENSION: &str = "llmconduit_forward_prompt_
 /// Internal SHA-256 cache-affinity namespace. This is consumed before upstream
 /// serialization and never contains the caller's opaque key.
 pub const PROMPT_CACHE_AFFINITY_EXTENSION: &str = "llmconduit_prompt_cache_affinity_sha256";
+/// Internal, consumed-before-dispatch marker permitting the selected local
+/// Chat backend to interpret Codex v2 agent-message encrypted content as the
+/// plaintext tool payload that Codex placed in that channel.
+pub const AGENT_MESSAGE_PLAINTEXT_COMPAT_EXTENSION: &str =
+    "llmconduit_agent_message_plaintext_compat";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,6 +48,14 @@ pub enum ReasoningSummaryCapability {
 #[serde(rename_all = "snake_case")]
 pub enum EncryptedReasoningCapability {
     Passthrough,
+    #[default]
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessageEncryptedContentCapability {
+    PlaintextCompat,
     #[default]
     Unsupported,
 }
@@ -102,6 +117,8 @@ pub struct ResponsesCapabilitiesConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_reasoning: Option<EncryptedReasoningCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_message_encrypted_content: Option<AgentMessageEncryptedContentCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_image: Option<InputImageCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_file: Option<InputFileCapability>,
@@ -131,6 +148,7 @@ impl ResponsesCapabilitiesConfig {
         overlay!(structured_outputs);
         overlay!(reasoning_summary);
         overlay!(encrypted_reasoning);
+        overlay!(agent_message_encrypted_content);
         overlay!(input_image);
         overlay!(input_file);
         overlay!(truncation_auto);
@@ -154,6 +172,9 @@ impl ResponsesCapabilitiesConfig {
                 .unwrap_or_else(|| vec![StructuredOutputCapability::Text]),
             reasoning_summary: self.reasoning_summary.unwrap_or_default(),
             encrypted_reasoning: self.encrypted_reasoning.unwrap_or_default(),
+            agent_message_encrypted_content: self
+                .agent_message_encrypted_content
+                .unwrap_or_default(),
             // Raw Responses capability metadata is conservative by default.
             // Chat/Anthropic ingress is not gated here and retains the gateway's
             // established placeholder/agent behavior.
@@ -174,6 +195,7 @@ pub struct ResponsesCapabilities {
     pub structured_outputs: Vec<StructuredOutputCapability>,
     pub reasoning_summary: ReasoningSummaryCapability,
     pub encrypted_reasoning: EncryptedReasoningCapability,
+    pub agent_message_encrypted_content: AgentMessageEncryptedContentCapability,
     pub input_image: InputImageCapability,
     pub input_file: InputFileCapability,
     pub truncation_auto: TruncationAutoCapability,
@@ -451,6 +473,16 @@ fn unsupported_items_parameter(
                     return Some(param);
                 }
             }
+            ResponseItem::AgentMessage { content, .. } => {
+                if capabilities.agent_message_encrypted_content
+                    != AgentMessageEncryptedContentCapability::PlaintextCompat
+                    && let Some(content_index) = content.iter().position(|part| {
+                        matches!(part, AgentMessageInputContent::EncryptedContent { .. })
+                    })
+                {
+                    return Some(format!("{base}[{item_index}].content[{content_index}]"));
+                }
+            }
             ResponseItem::FunctionCallOutput {
                 output: FunctionCallOutputContent::Content(content),
                 ..
@@ -611,6 +643,18 @@ fn prepare_capability_fields(request: &mut ResponsesRequest, capabilities: &Resp
     if request.parallel_tool_calls.is_none() {
         request.parallel_tool_calls = Some(capabilities.parallel_tool_calls);
     }
+    if capabilities.agent_message_encrypted_content
+        == AgentMessageEncryptedContentCapability::PlaintextCompat
+    {
+        request.extra_body.insert(
+            AGENT_MESSAGE_PLAINTEXT_COMPAT_EXTENSION.to_string(),
+            Value::Bool(true),
+        );
+    } else {
+        request
+            .extra_body
+            .remove(AGENT_MESSAGE_PLAINTEXT_COMPAT_EXTENSION);
+    }
     if let Some(key) = request.prompt_cache_key.as_ref() {
         let hash = format!("{:x}", Sha256::digest(key.as_bytes()));
         request.extra_body.insert(
@@ -646,7 +690,8 @@ mod tests {
         .unwrap();
         let child: ResponsesCapabilitiesConfig = serde_json::from_value(serde_json::json!({
             "parallel_tool_calls": false,
-            "prompt_cache_key": "gateway_hash"
+            "prompt_cache_key": "gateway_hash",
+            "agent_message_encrypted_content": "plaintext_compat"
         }))
         .unwrap();
         let resolved = base.overlaid(&child).resolve();
@@ -655,6 +700,10 @@ mod tests {
         assert_eq!(
             resolved.prompt_cache_key,
             PromptCacheKeyCapability::GatewayHash
+        );
+        assert_eq!(
+            resolved.agent_message_encrypted_content,
+            AgentMessageEncryptedContentCapability::PlaintextCompat
         );
     }
 

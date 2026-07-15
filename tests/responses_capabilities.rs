@@ -4,8 +4,9 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use llmconduit::config::{FallbackUpstreamConfig, ModelProfile, UpstreamConfig};
 use llmconduit::responses_capabilities::{
-    EncryptedReasoningCapability, InputImageCapability, PromptCacheKeyCapability,
-    ResponsesCapabilitiesConfig, StructuredOutputCapability, TruncationAutoCapability,
+    AgentMessageEncryptedContentCapability, EncryptedReasoningCapability, InputImageCapability,
+    PromptCacheKeyCapability, ResponsesCapabilitiesConfig, StructuredOutputCapability,
+    TruncationAutoCapability,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -168,6 +169,78 @@ async fn responses_primary_capability_failure_is_pre_dispatch_400() {
             .unwrap()
             .iter()
             .all(|request| request.url.path() != "/v1/chat/completions")
+    );
+}
+
+#[tokio::test]
+async fn responses_agent_message_encrypted_content_requires_plaintext_compat() {
+    let request = || {
+        json!({
+            "model": "model-a",
+            "input": [{
+                "type": "agent_message",
+                "id": "amsg_worker",
+                "author": "/root/worker",
+                "recipient": "/root",
+                "content": [
+                    {"type": "input_text", "text": "Payload:\n"},
+                    {"type": "encrypted_content", "encrypted_content": "worker result"}
+                ]
+            }]
+        })
+    };
+
+    let unsupported_upstream = MockServer::start().await;
+    mount_models(&unsupported_upstream, "model-a").await;
+    let mut unsupported = common::test_config();
+    unsupported.upstream_base_url = format!("{}/v1", unsupported_upstream.uri())
+        .parse()
+        .unwrap();
+    let rejected = post_responses(llmconduit::build_app(unsupported), request()).await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(rejected.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "input[0].content[1]");
+    assert!(
+        unsupported_upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() != "/v1/chat/completions")
+    );
+
+    let supported_upstream = MockServer::start().await;
+    mount_models(&supported_upstream, "model-a").await;
+    mount_success(&supported_upstream, "model-a").await;
+    let mut supported = common::test_config();
+    supported.upstream_base_url = format!("{}/v1", supported_upstream.uri()).parse().unwrap();
+    supported
+        .responses_capabilities
+        .agent_message_encrypted_content =
+        Some(AgentMessageEncryptedContentCapability::PlaintextCompat);
+    let accepted = post_responses(llmconduit::build_app(supported), request()).await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    let requests = supported_upstream.received_requests().await.unwrap();
+    let chat = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/chat/completions")
+        .expect("chat request");
+    let upstream_body: serde_json::Value = serde_json::from_slice(&chat.body).unwrap();
+    assert_eq!(upstream_body["messages"][0]["role"], "user");
+    assert_eq!(
+        upstream_body["messages"][0]["content"],
+        format!(
+            "Inter-agent delivery: {}\nPayload:\n\nworker result",
+            json!({"author": "/root/worker", "recipient": "/root"})
+        )
+    );
+    assert!(
+        upstream_body
+            .get("llmconduit_agent_message_plaintext_compat")
+            .is_none()
     );
 }
 

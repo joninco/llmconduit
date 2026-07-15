@@ -7,6 +7,7 @@ use crate::models::chat::ChatThinking;
 use crate::models::chat::ChatTool;
 use crate::models::chat::ChatToolCall;
 use crate::models::chat::ChatToolDefinition;
+use crate::models::responses::AgentMessageInputContent;
 use crate::models::responses::ContentItem;
 use crate::models::responses::CustomToolFormat;
 use crate::models::responses::FunctionCallOutputContent;
@@ -134,6 +135,25 @@ impl PendingReasoning {
     }
 }
 
+fn flush_pending_reasoning_message(
+    messages: &mut Vec<ChatMessage>,
+    pending_reasoning: &mut Option<PendingReasoning>,
+) {
+    let Some(reasoning) = pending_reasoning.take() else {
+        return;
+    };
+    let (reasoning_content, thinking) = reasoning.into_chat_parts();
+    messages.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: None,
+        tool_call_id: None,
+        name: None,
+        reasoning_content,
+        thinking,
+        tool_calls: None,
+    });
+}
+
 pub fn lower_request(
     request: &ResponsesRequest,
     baseline_messages: Vec<ChatMessage>,
@@ -202,6 +222,12 @@ pub fn lower_request_with_image_agent_and_roles(
                 // through canonical lowering; a model profile may still opt
                 // into an explicit role rewrite through `roles` below.
                 let normalized_role = role.to_string();
+                // A Codex inter-agent delivery is normalized to a user message.
+                // Keep any immediately preceding model reasoning before that
+                // new turn boundary instead of moving it to the end of history.
+                if normalized_role != "assistant" {
+                    flush_pending_reasoning_message(&mut messages, &mut pending_reasoning);
+                }
                 let (reasoning_content, thinking) = if normalized_role == "assistant" {
                     pending_reasoning
                         .take()
@@ -217,6 +243,58 @@ pub fn lower_request_with_image_agent_and_roles(
                     name: None,
                     reasoning_content,
                     thinking,
+                    tool_calls: None,
+                });
+            }
+            ResponseItem::AgentMessage {
+                author,
+                recipient,
+                content,
+                ..
+            } => {
+                // Codex treats an inter-agent delivery as a user-turn boundary.
+                // Chat has no equivalent typed item, so preserve routing
+                // provenance in an escaped envelope and lower only here, after
+                // Responses state/replay retained the canonical item.
+                flush_pending_reasoning_message(&mut messages, &mut pending_reasoning);
+                let routing = serde_json::to_string(&json!({
+                    "author": author,
+                    "recipient": recipient,
+                }))
+                .map_err(|error| {
+                    AppError::internal(format!(
+                        "failed to serialize agent_message routing metadata: {error}"
+                    ))
+                })?;
+                let mut parts = Vec::with_capacity(content.len());
+                for part in content {
+                    match part {
+                        AgentMessageInputContent::InputText { text } => parts.push(text.as_str()),
+                        AgentMessageInputContent::EncryptedContent { encrypted_content } => {
+                            if !request
+                                .extra_body
+                                .get(crate::responses_capabilities::AGENT_MESSAGE_PLAINTEXT_COMPAT_EXTENSION)
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                            {
+                                return Err(AppError::internal(
+                                    "unsupported agent_message encrypted_content reached Chat lowering",
+                                ));
+                            }
+                            parts.push(encrypted_content.as_str());
+                        }
+                    }
+                }
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(Value::String(format!(
+                        "Inter-agent delivery: {routing}\n{}",
+                        parts.join("\n")
+                    ))),
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                    thinking: None,
                     tool_calls: None,
                 });
             }
@@ -376,18 +454,7 @@ pub fn lower_request_with_image_agent_and_roles(
             ResponseItem::ImageGenerationCall { .. } => {}
         }
     }
-    if let Some(reasoning) = pending_reasoning.take() {
-        let (reasoning_content, thinking) = reasoning.into_chat_parts();
-        messages.push(ChatMessage {
-            role: "assistant".to_string(),
-            content: None,
-            tool_call_id: None,
-            name: None,
-            reasoning_content,
-            thinking,
-            tool_calls: None,
-        });
-    }
+    flush_pending_reasoning_message(&mut messages, &mut pending_reasoning);
     if roles.is_some() {
         let mut new_messages = messages.split_off(baseline_len);
         apply_role_rules(&mut new_messages, roles)?;
@@ -925,6 +992,29 @@ fn validate_response_items(items: &[ResponseItem], base: &str) -> AppResult<()> 
                         .with_param(format!("{base}[{item_index}].role")));
                 }
                 validate_multimodal_content(content, &format!("{base}[{item_index}].content"))?;
+            }
+            ResponseItem::AgentMessage {
+                author,
+                recipient,
+                content,
+                ..
+            } => {
+                for (field, value) in [("author", author), ("recipient", recipient)] {
+                    if value.trim().is_empty() {
+                        return Err(AppError::bad_request(format!(
+                            "agent_message {field} must not be empty"
+                        ))
+                        .with_code("invalid_value")
+                        .with_param(format!("{base}[{item_index}].{field}")));
+                    }
+                }
+                if content.is_empty() {
+                    return Err(AppError::bad_request(
+                        "agent_message content must contain at least one part",
+                    )
+                    .with_code("invalid_value")
+                    .with_param(format!("{base}[{item_index}].content")));
+                }
             }
             ResponseItem::FunctionCallOutput { call_id, output } => {
                 if call_id.is_empty() {

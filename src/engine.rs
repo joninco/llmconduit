@@ -723,6 +723,7 @@ fn build_upstream_extra_body(
     // Local cache-affinity is a gateway-only SHA-256 namespace. It must never
     // become an arbitrary vendor kwarg on the Chat Completions request.
     extra_body.remove(crate::responses_capabilities::PROMPT_CACHE_AFFINITY_EXTENSION);
+    extra_body.remove(crate::responses_capabilities::AGENT_MESSAGE_PLAINTEXT_COMPAT_EXTENSION);
     if forward_prompt_cache_key && let Some(key) = &request.prompt_cache_key {
         extra_body.insert("prompt_cache_key".to_string(), Value::String(key.clone()));
     }
@@ -2668,6 +2669,7 @@ impl Gateway {
                                 ..
                             } if role == "user"
                         )
+                            || matches!(item, ResponseItem::AgentMessage { .. })
                     })
                     .count(),
                 user_messages: request
@@ -2798,6 +2800,17 @@ impl Gateway {
                                 }
                             })
                             .sum::<usize>(),
+                        ResponseItem::AgentMessage { content, .. } => content
+                            .iter()
+                            .map(|part| match part {
+                                crate::models::responses::AgentMessageInputContent::InputText {
+                                    text,
+                                } => text.chars().count(),
+                                crate::models::responses::AgentMessageInputContent::EncryptedContent {
+                                    encrypted_content,
+                                } => encrypted_content.chars().count(),
+                            })
+                            .sum(),
                         ResponseItem::Reasoning { content, .. } => content
                             .as_ref()
                             .map(|items| {
@@ -4865,6 +4878,7 @@ fn public_tool_call_identity(item: &ResponseItem) -> Option<&str> {
         ResponseItem::WebSearchCall { id, .. } => id.as_deref(),
         ResponseItem::ItemReference { .. }
         | ResponseItem::Message { .. }
+        | ResponseItem::AgentMessage { .. }
         | ResponseItem::Reasoning { .. }
         | ResponseItem::FunctionCallOutput { .. }
         | ResponseItem::CustomToolCallOutput { .. }
@@ -5127,6 +5141,17 @@ fn summarize_response_item(item: &ResponseItem) -> String {
         ResponseItem::Message { role, content, .. } => {
             format!("{role}: {}", summarize_content(content))
         }
+        ResponseItem::AgentMessage {
+            author,
+            recipient,
+            content,
+            ..
+        } => format!(
+            "agent_message {} -> {} ({} parts)",
+            preview_text(author),
+            preview_text(recipient),
+            content.len()
+        ),
         ResponseItem::Reasoning { content, .. } => content
             .as_ref()
             .and_then(|items| items.first())
@@ -6133,6 +6158,7 @@ fn response_item_event_id(item: &ResponseItem) -> Option<String> {
     match item {
         ResponseItem::ItemReference { id } => Some(id.clone()),
         ResponseItem::Message { id, .. } => id.clone(),
+        ResponseItem::AgentMessage { id, .. } => id.clone(),
         ResponseItem::Reasoning { id, .. } => Some(id.clone()),
         ResponseItem::FunctionCall { id, call_id, .. } => {
             id.clone().or_else(|| Some(call_id.clone()))

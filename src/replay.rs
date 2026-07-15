@@ -149,7 +149,7 @@ fn hash_visible_history_with_affinity(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::responses::{ContentItem, ResponseItem};
+    use crate::models::responses::{AgentMessageInputContent, ContentItem, ResponseItem};
 
     fn user_msg(text: &str) -> ResponseItem {
         ResponseItem::Message {
@@ -160,6 +160,34 @@ mod tests {
             }],
             phase: None,
         }
+    }
+
+    fn agent_msg(author: &str, part: AgentMessageInputContent) -> ResponseItem {
+        ResponseItem::AgentMessage {
+            id: Some("amsg_1".to_string()),
+            author: author.to_string(),
+            recipient: "/root".to_string(),
+            content: vec![part],
+        }
+    }
+
+    #[test]
+    fn agent_message_replay_hash_preserves_routing_and_part_type() {
+        let text = AgentMessageInputContent::InputText {
+            text: "same bytes".to_string(),
+        };
+        let encrypted = AgentMessageInputContent::EncryptedContent {
+            encrypted_content: "same bytes".to_string(),
+        };
+        let baseline = hash_visible_history("m", "i", &[agent_msg("/root/a", text.clone())]);
+        assert_ne!(
+            baseline,
+            hash_visible_history("m", "i", &[agent_msg("/root/b", text)])
+        );
+        assert_ne!(
+            baseline,
+            hash_visible_history("m", "i", &[agent_msg("/root/a", encrypted)])
+        );
     }
 
     #[tokio::test]

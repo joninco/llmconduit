@@ -22,7 +22,9 @@ use llmconduit::models::responses::ResponseItem;
 use llmconduit::response_store::{
     ResponseStore, ResponseStoreError, ResponseStoreHandle, StoredResponse,
 };
-use llmconduit::responses_capabilities::{ReasoningSummaryCapability, ResponsesCapabilitiesConfig};
+use llmconduit::responses_capabilities::{
+    AgentMessageEncryptedContentCapability, ReasoningSummaryCapability, ResponsesCapabilitiesConfig,
+};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -368,9 +370,6 @@ async fn responses_text_sse_lifecycle_is_ordered() {
             assert!(resource.get("estimated_input_tokens").is_none(), "{event}");
             assert!(resource.get("terminal_reason").is_none(), "{event}");
             assert!(resource.get("stop_sequence").is_none(), "{event}");
-        }
-        if let Some(item) = event.get("item") {
-            assert!(item.get("namespace").is_none(), "{event}");
         }
     }
 }
@@ -805,6 +804,350 @@ async fn responses_function_argument_events_use_stable_public_item_identity() {
     assert_eq!(arguments_done["name"], "echo");
     assert_eq!(item_done["item"]["call_id"], "call_upstream_1");
     assert_eq!(terminal_events(&events).len(), 1);
+}
+
+#[tokio::test]
+async fn responses_namespace_function_call_preserves_namespace_stream_and_nonstream() {
+    let upstream = MockUpstream::default();
+    upstream.set_supported_models(["glm-5.1"]).await;
+    let chunks = || {
+        vec![Ok(tool_call_chunk(
+            "chat-namespace",
+            "call_spawn_1",
+            "spawn_agent",
+            r#"{"message":"inspect the bounded task","task_name":"inspect"}"#,
+        ))]
+    };
+    upstream.push_response(chunks()).await;
+    upstream.push_response(chunks()).await;
+    let app =
+        llmconduit::build_app_from_gateway(test_gateway(upstream.clone(), MockSearch::default()));
+    let request = |stream| {
+        json!({
+            "model": "glm-5.1",
+            "stream": stream,
+            "store": false,
+            "input": "delegate the bounded task",
+            "tools": [{
+                "type": "namespace",
+                "name": "collaboration",
+                "description": "Tools for spawning and managing sub-agents.",
+                "tools": [{
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "description": "Spawn a sub-agent.",
+                    "strict": false,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message": { "type": "string" },
+                            "task_name": { "type": "string" }
+                        },
+                        "required": ["message", "task_name"],
+                        "additionalProperties": false
+                    }
+                }]
+            }]
+        })
+    };
+
+    let streaming = post_json(app.clone(), &request(true)).await;
+    assert_eq!(streaming.status(), StatusCode::OK);
+    let events = parse_responses_sse_events(&response_text(streaming).await);
+    for event_type in ["response.output_item.added", "response.output_item.done"] {
+        let event = events
+            .iter()
+            .find(|event| event["type"] == event_type)
+            .unwrap_or_else(|| panic!("missing {event_type}: {events:?}"));
+        assert_eq!(event["item"]["type"], "function_call");
+        assert_eq!(event["item"]["name"], "spawn_agent");
+        assert_eq!(event["item"]["namespace"], "collaboration");
+    }
+    let terminal = &terminal_events(&events)[0]["response"];
+    assert_eq!(terminal["output"][0]["namespace"], "collaboration");
+
+    let nonstreaming = post_json(app, &request(false)).await;
+    assert_eq!(nonstreaming.status(), StatusCode::OK);
+    let body = response_json(nonstreaming).await;
+    assert_eq!(body["output"][0]["type"], "function_call");
+    assert_eq!(body["output"][0]["name"], "spawn_agent");
+    assert_eq!(body["output"][0]["namespace"], "collaboration");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(request.tools.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            request
+                .tools
+                .as_ref()
+                .and_then(|tools| tools.first())
+                .map(|tool| tool.function.name.as_str()),
+            Some("spawn_agent")
+        );
+    }
+}
+
+#[tokio::test]
+async fn responses_namespace_function_call_output_continuation_lowers_matching_chat_history() {
+    let upstream = MockUpstream::default();
+    queue_text_turn(
+        &upstream,
+        "chat-namespace-continuation",
+        "delegation complete",
+    )
+    .await;
+    let app =
+        llmconduit::build_app_from_gateway(test_gateway(upstream.clone(), MockSearch::default()));
+    let response = post_json(
+        app,
+        &json!({
+            "model": "glm-5.1",
+            "stream": false,
+            "store": false,
+            "input": [
+                { "role": "user", "content": "delegate the bounded task" },
+                {
+                    "type": "function_call",
+                    "id": "fc_spawn_1",
+                    "namespace": "collaboration",
+                    "name": "spawn_agent",
+                    "arguments": "{\"message\":\"inspect\",\"task_name\":\"inspect\"}",
+                    "call_id": "call_spawn_1"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_spawn_1",
+                    "output": "agent spawned"
+                }
+            ],
+            "tools": [{
+                "type": "namespace",
+                "name": "collaboration",
+                "description": "Tools for spawning and managing sub-agents.",
+                "tools": [{
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "description": "Spawn a sub-agent.",
+                    "strict": false,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message": { "type": "string" },
+                            "task_name": { "type": "string" }
+                        },
+                        "required": ["message", "task_name"],
+                        "additionalProperties": false
+                    }
+                }]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert_eq!(body["status"], "completed");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>(),
+        vec!["user", "assistant", "tool"]
+    );
+    let prior_call = request.messages[1]
+        .tool_calls
+        .as_ref()
+        .and_then(|calls| calls.first())
+        .expect("namespaced assistant function call");
+    assert_eq!(prior_call.id.as_deref(), Some("call_spawn_1"));
+    assert_eq!(prior_call.function.name.as_deref(), Some("spawn_agent"));
+    assert_eq!(
+        prior_call.function.arguments,
+        Some(json!({"message": "inspect", "task_name": "inspect"}))
+    );
+    assert_eq!(
+        request.messages[2].tool_call_id.as_deref(),
+        Some("call_spawn_1")
+    );
+    assert_eq!(request.messages[2].content, Some(json!("agent spawned")));
+    assert_eq!(request.tools.as_ref().map(Vec::len), Some(1));
+    assert_eq!(
+        request
+            .tools
+            .as_ref()
+            .and_then(|tools| tools.first())
+            .map(|tool| tool.function.name.as_str()),
+        Some("spawn_agent")
+    );
+}
+
+#[tokio::test]
+async fn responses_codex_agent_message_continuation_becomes_user_turn() {
+    let upstream = MockUpstream::default();
+    queue_text_turn(&upstream, "chat-agent-message", "parent continued").await;
+    let mut config = test_config();
+    config
+        .responses_capabilities
+        .agent_message_encrypted_content =
+        Some(AgentMessageEncryptedContentCapability::PlaintextCompat);
+    let app = llmconduit::build_app_from_gateway(test_gateway_with_config(
+        upstream.clone(),
+        MockSearch::default(),
+        config,
+    ));
+    let response = post_json(
+        app,
+        &json!({
+            "model": "glm-5.1",
+            "stream": false,
+            "store": false,
+            "input": [
+                { "role": "user", "content": "delegate the bounded task" },
+                {
+                    "type": "function_call",
+                    "id": "fc_spawn_1",
+                    "namespace": "collaboration",
+                    "name": "spawn_agent",
+                    "arguments": "{\"message\":\"inspect\",\"task_name\":\"inspect\"}",
+                    "call_id": "call_spawn_1"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_spawn_1",
+                    "output": "agent spawned"
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_waiting",
+                    "summary": [{"type": "summary_text", "text": "waiting for worker"}],
+                    "encrypted_content": null
+                },
+                {
+                    "type": "agent_message",
+                    "id": "amsg_worker_1",
+                    "author": "/root/inspect",
+                    "recipient": "/root",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Message Type: MESSAGE\nTask name: /root\nSender: /root/inspect\nPayload:\n"
+                        },
+                        {
+                            "type": "encrypted_content",
+                            "encrypted_content": "bounded result"
+                        }
+                    ]
+                }
+            ],
+            "tools": [{
+                "type": "namespace",
+                "name": "collaboration",
+                "description": "Tools for spawning and managing sub-agents.",
+                "tools": [{
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "description": "Spawn a sub-agent.",
+                    "strict": false,
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message": { "type": "string" },
+                            "task_name": { "type": "string" }
+                        },
+                        "required": ["message", "task_name"],
+                        "additionalProperties": false
+                    }
+                }]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["status"], "completed");
+
+    let requests = upstream.requests().await;
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(
+        request
+            .messages
+            .iter()
+            .map(|message| message.role.as_str())
+            .collect::<Vec<_>>(),
+        vec!["user", "assistant", "tool", "assistant", "user"]
+    );
+    assert_eq!(
+        request.messages[3].reasoning_content.as_deref(),
+        Some("waiting for worker")
+    );
+    assert_eq!(
+        request.messages[4].content,
+        Some(json!(format!(
+            "Inter-agent delivery: {}\nMessage Type: MESSAGE\nTask name: /root\nSender: /root/inspect\nPayload:\n\nbounded result",
+            json!({"author": "/root/inspect", "recipient": "/root"})
+        )))
+    );
+}
+
+#[tokio::test]
+async fn responses_agent_message_validation_names_exact_paths() {
+    let cases = [
+        (
+            json!({
+                "type": "agent_message",
+                "author": "",
+                "recipient": "/root",
+                "content": [{"type": "input_text", "text": "done"}]
+            }),
+            "input[0].author",
+        ),
+        (
+            json!({
+                "type": "agent_message",
+                "author": "/root/worker",
+                "recipient": "",
+                "content": [{"type": "input_text", "text": "done"}]
+            }),
+            "input[0].recipient",
+        ),
+        (
+            json!({
+                "type": "agent_message",
+                "author": "/root/worker",
+                "recipient": "/root",
+                "content": []
+            }),
+            "input[0].content",
+        ),
+    ];
+
+    for (item, expected_param) in cases {
+        let upstream = MockUpstream::default();
+        upstream.set_supported_models(["glm-5.1"]).await;
+        let app = llmconduit::build_app_from_gateway(test_gateway(
+            upstream.clone(),
+            MockSearch::default(),
+        ));
+        let response = post_json(
+            app,
+            &json!({
+                "model": "glm-5.1",
+                "stream": false,
+                "store": false,
+                "input": [item]
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response_json(response).await;
+        assert_eq!(body["error"]["param"], expected_param);
+        assert!(upstream.requests().await.is_empty());
+    }
 }
 
 #[tokio::test]

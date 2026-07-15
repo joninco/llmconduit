@@ -17,6 +17,18 @@ Bearer authorization or `x-api-key`. Loopback serving may be left unauthenticate
 dedicated provider token prevents Codex from forwarding a global OpenAI credential by mistake.
 Never point `env_key` at `OPENAI_API_KEY` or reuse a ChatGPT/OpenAI token for this local provider.
 
+Codex 0.144.4 may reuse its stored global OpenAI/ChatGPT bearer when a custom provider has neither
+`env_key` nor another provider-scoped bearer, even with `requires_openai_auth = false`. For an
+intentionally unauthenticated local profile, use a clearly non-secret sentinel instead:
+
+```toml
+experimental_bearer_token = "llmconduit-local-unauthenticated"
+```
+
+This only selects provider-scoped request auth in Codex; it does not enable authentication in
+llmconduit. Prefer `env_key = "LLMCONDUIT_API_TOKEN"` whenever the gateway has a real token, and do
+not configure both fields.
+
 ## Declare the matching llmconduit capabilities
 
 The Codex catalog is client-side metadata; it does not enable gateway features. Merge the following
@@ -31,6 +43,7 @@ model_profiles:
       structured_outputs: [text, json_object, json_schema]
       reasoning_summary: upstream
       encrypted_reasoning: passthrough
+      agent_message_encrypted_content: plaintext_compat
       input_image: placeholder
       input_file: unsupported
       truncation_auto: unsupported
@@ -44,7 +57,12 @@ This declaration matches the checked catalog: Codex sends sequential text/tool t
 explicit upstream reasoning summary, includes `reasoning.encrypted_content` whenever reasoning is
 enabled, and attaches an opaque prompt-cache key that llmconduit hashes locally instead of
 forwarding. `encrypted_reasoning: passthrough` authorizes only opaque state actually supplied by the
-provider; llmconduit does not synthesize it from reasoning text. Images remain absent from the Codex
+provider; llmconduit does not synthesize it from reasoning text.
+`agent_message_encrypted_content: plaintext_compat` is a separate Codex-v2 compatibility policy:
+Codex places the local model's plain-text collaboration payload in an `encrypted_content` part, and
+llmconduit makes that part visible to the selected Chat backend while retaining its canonical type
+in Responses state. Do not enable this policy for a backend that supplies genuinely opaque
+ciphertext. Images remain absent from the Codex
 catalog even though the gateway's non-native-image fallback is `placeholder`. Do not declare a
 service tier, verbosity, file input, or automatic truncation until that behavior is supported and
 tested by the selected upstream. If the upstream does not provide an explicit safe reasoning
@@ -55,7 +73,7 @@ The snippet is documentation only: it does not edit the live configuration or re
 Applying it to a running installation is a separate operational change.
 
 Codex 0.134.0 and later load named profiles from separate files. Put the following in
-`~/.codex/llmconduit.config.toml`:
+`~/.codex/responses.config.toml`:
 
 ```toml
 model = "GLM-5.2-NVFP4"
@@ -67,6 +85,19 @@ web_search = "disabled"
 # These match the active llmconduit model profile.
 model_reasoning_effort = "max"
 model_reasoning_summary = "auto"
+
+[features]
+# Keep the verified local-agent tools enabled even if Codex defaults change.
+apps = true
+goals = true
+multi_agent = true
+plugins = true
+shell_tool = true
+tool_suggest = true
+unified_exec = true
+
+[tools.experimental_request_user_input]
+enabled = true
 
 [model_providers.llmconduit]
 name = "Local llmconduit"
@@ -101,8 +132,8 @@ rejects that unsupported hosted-search control instead of silently discarding it
 Start Codex with the profile:
 
 ```bash
-codex --profile llmconduit
-codex exec --profile llmconduit --ephemeral "Reply with exactly: ok"
+codex --profile responses
+codex exec --profile responses --ephemeral "Reply with exactly: ok"
 ```
 
 ## Why the local catalog is required
@@ -117,8 +148,11 @@ OpenAI-compatible route. It advertises:
 
 - a 524,288-token context window with a 95% effective-input percentage;
 - text input only;
-- sequential tool calls (`supports_parallel_tool_calls = false`);
-- no verbosity control, image-original mode, search tool, or service tiers;
+- sequential model-emitted tool calls (`supports_parallel_tool_calls = false`);
+- freeform `apply_patch` and the v2 collaboration tool family;
+- client-side dynamic-tool search metadata (the catalog's `supports_search_tool` gate exposes
+  `tool_search` even though the old feature flag was removed), but no hosted web search;
+- no verbosity control, image-original mode, or service tiers;
 - reasoning summaries and the reasoning efforts mapped by the active llmconduit model profile; and
 - the `shell_command` tool shape used by Codex.
 
@@ -126,6 +160,21 @@ The catalog deliberately embeds Codex 0.144.4's fallback base instructions. Thos
 Codex's tool schemas account for substantial input tokens even on a trivial prompt; retaining them
 preserves agent behavior. Replacing them with a short prompt may reduce token accounting, but it is
 a behavioral change rather than a compatibility fix.
+
+Codex v2 collaboration depends on two Responses extensions in addition to advertising the tools:
+llmconduit preserves `namespace` on returned function calls so Codex dispatches them through the
+`collaboration` runtime, and it accepts Codex `agent_message` continuations. Because the configured
+upstream speaks Chat Completions, `agent_message` is normalized to a user-turn boundary while its
+ordered `input_text` and `encrypted_content` payload remains model-visible. Request logging stays
+metadata-only by default, so that collaboration payload is not added to normal logs.
+
+The profile explicitly enables `request_user_input`; Codex makes it callable in Plan mode. That
+tool and tools discovered through `tool_search` work in the interactive TUI, but Codex 0.144.4
+deliberately rejects their frontend interactions in `codex exec`; use the TUI to exercise those
+continuations.
+`view_image` remains visible as a generic workspace utility, but Codex rejects it before dispatch
+for this intentionally text-only catalog. Do not advertise image input merely to silence that
+guard.
 
 ## Upgrade checklist
 
@@ -135,9 +184,9 @@ Treat the catalog as Codex-version-specific. After upgrading Codex:
 2. Refresh `base_instructions` from the new version's fallback model instructions if they changed.
 3. Reconfirm the model's context size, input modalities, reasoning mappings, tool parallelism, and
    service-tier support against the active llmconduit configuration.
-4. Parse the catalog with the new CLI before running inference. A non-networking check such as
-   `codex --profile llmconduit features list` is sufficient to exercise startup config and catalog
-   deserialization. (`--strict-config` is not accepted by the `features` subcommand in 0.144.4.)
+4. Parse the catalog with the new CLI before regular use. Run a bounded
+   `codex exec --profile responses --strict-config --ephemeral "Reply with exactly: ok"` smoke;
+   Codex 0.144.4 does not apply profiles to the `features list` subcommand.
 
 Do not replace llmconduit's standard `/v1/models` response with Codex's private catalog schema; use
 the static catalog for Codex and retain the standard route for OpenAI-compatible clients.

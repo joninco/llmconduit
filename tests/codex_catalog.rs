@@ -42,6 +42,16 @@ fn codex_catalog_example_decodes_with_current_schema() {
     let codex_home = TestDirectory::new();
     let catalog = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("docs/examples/codex-model-catalog.glm-5.2-nvfp4.json");
+    let catalog_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&catalog).expect("read checked Codex model catalog"))
+            .expect("parse checked Codex model catalog");
+    let model = &catalog_json["models"][0];
+    assert_eq!(model["apply_patch_tool_type"], "freeform");
+    assert_eq!(model["experimental_supported_tools"], serde_json::json!([]));
+    assert_eq!(model["supports_search_tool"], true);
+    assert_eq!(model["multi_agent_version"], "v2");
+    assert_eq!(model["supports_parallel_tool_calls"], false);
+
     let catalog_value = serde_json::to_string(catalog.to_string_lossy().as_ref())
         .expect("serialize catalog path as TOML-compatible string");
 

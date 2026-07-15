@@ -960,6 +960,13 @@ pub enum ReasoningContentItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentMessageInputContent {
+    InputText { text: String },
+    EncryptedContent { encrypted_content: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseItem {
     ItemReference {
         id: String,
@@ -971,6 +978,13 @@ pub enum ResponseItem {
         content: Vec<ContentItem>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         phase: Option<String>,
+    },
+    AgentMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        author: String,
+        recipient: String,
+        content: Vec<AgentMessageInputContent>,
     },
     Reasoning {
         #[serde(default = "default_reasoning_id")]
@@ -1650,6 +1664,71 @@ mod tests {
             }
             other => panic!("expected Message, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn codex_agent_message_round_trips_canonical_shape() {
+        let json = r#"{
+            "model":"gpt-4",
+            "input":[{
+                "type":"agent_message",
+                "id":"amsg_1",
+                "author":"/root/worker",
+                "recipient":"/root",
+                "content":[
+                    {"type":"input_text","text":"Message Type: MESSAGE\nPayload:\n"},
+                    {"type":"encrypted_content","encrypted_content":"worker result"}
+                ]
+            }]
+        }"#;
+        let req: ResponsesRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.input.len(), 1);
+        match &req.input[0] {
+            ResponseItem::AgentMessage {
+                id,
+                author,
+                recipient,
+                content,
+            } => {
+                assert_eq!(id.as_deref(), Some("amsg_1"));
+                assert_eq!(author, "/root/worker");
+                assert_eq!(recipient, "/root");
+                assert_eq!(
+                    content,
+                    &[
+                        AgentMessageInputContent::InputText {
+                            text: "Message Type: MESSAGE\nPayload:\n".to_string(),
+                        },
+                        AgentMessageInputContent::EncryptedContent {
+                            encrypted_content: "worker result".to_string(),
+                        }
+                    ]
+                );
+            }
+            other => panic!("expected AgentMessage, got {other:?}"),
+        }
+        let serialized = serde_json::to_value(&req).expect("serialize request");
+        assert_eq!(serialized["input"][0]["type"], "agent_message");
+        assert_eq!(serialized["input"][0]["author"], "/root/worker");
+        assert_eq!(
+            serialized["input"][0]["content"][1]["type"],
+            "encrypted_content"
+        );
+    }
+
+    #[test]
+    fn codex_agent_message_rejects_unknown_content_parts() {
+        let json = r#"{
+            "model":"gpt-4",
+            "input":[{
+                "type":"agent_message",
+                "author":"/root/worker",
+                "recipient":"/root",
+                "content":[{"type":"input_image","image_url":"https://example.test/a.png"}]
+            }]
+        }"#;
+        let error = serde_json::from_str::<ResponsesRequest>(json).unwrap_err();
+        assert!(error.to_string().contains("unknown variant `input_image`"));
     }
 
     #[test]

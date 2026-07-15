@@ -879,6 +879,7 @@ fn response_item_id(item: &ResponseItem) -> Option<&str> {
         | ResponseItem::Reasoning { id, .. }
         | ResponseItem::ImageGenerationCall { id, .. } => Some(id),
         ResponseItem::Message { id, .. }
+        | ResponseItem::AgentMessage { id, .. }
         | ResponseItem::FunctionCall { id, .. }
         | ResponseItem::CustomToolCall { id, .. }
         | ResponseItem::ToolSearchCall { id, .. }
@@ -991,7 +992,7 @@ fn restrict_file(_path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::responses::{ContentItem, ResponseItem};
+    use crate::models::responses::{AgentMessageInputContent, ContentItem, ResponseItem};
 
     fn history(text: &str) -> Vec<ResponseItem> {
         vec![ResponseItem::Message {
@@ -1033,6 +1034,30 @@ mod tests {
         assert!(store.get("resp_0").await.unwrap().is_none());
         assert!(store.get("resp_2").await.unwrap().is_some());
         assert_eq!(store.memory_len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn memory_store_indexes_canonical_agent_message_id() {
+        let store = ResponseStoreHandle::memory(2, 720);
+        let item = ResponseItem::AgentMessage {
+            id: Some("amsg_worker".to_string()),
+            author: "/root/worker".to_string(),
+            recipient: "/root".to_string(),
+            content: vec![AgentMessageInputContent::InputText {
+                text: "done".to_string(),
+            }],
+        };
+        store
+            .insert(
+                "resp_agent".to_string(),
+                "requested".to_string(),
+                "served".to_string(),
+                vec![item.clone()],
+                now_epoch(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.find_item("amsg_worker").await.unwrap(), Some(item));
     }
 
     #[tokio::test]

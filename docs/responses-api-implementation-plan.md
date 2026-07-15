@@ -105,6 +105,7 @@ responses_capabilities:
   structured_outputs: [text, json_object, json_schema]
   reasoning_summary: upstream       # upstream | unsupported
   encrypted_reasoning: unsupported  # passthrough | unsupported
+  agent_message_encrypted_content: unsupported # plaintext_compat | unsupported
   input_image: placeholder          # native | agent | placeholder | reject
   input_file: unsupported           # native | unsupported
   truncation_auto: unsupported      # upstream | unsupported
@@ -295,6 +296,7 @@ Do not change `/v1/models` to silence Codex’s private-schema warning. The cata
 - `client_tools_honor_parallel_tool_calls`
 - `responses_reasoning_summary_lifecycle_is_complete`
 - `responses_encrypted_reasoning_requires_include_and_capability`
+- `responses_agent_message_encrypted_content_requires_plaintext_compat`
 - `responses_reasoning_usage_is_not_inferred`
 
 ### Stateful and advanced behavior

@@ -1333,7 +1333,7 @@ fn accumulate_responses_content(content: &Value, text_chars: &mut usize) {
         }
         Value::Array(parts) => {
             for part in parts {
-                for key in ["text", "input_text", "output_text"] {
+                for key in ["text", "input_text", "output_text", "encrypted_content"] {
                     if let Some(text) = part.get(key).and_then(Value::as_str) {
                         *text_chars += text.chars().count();
                     }
@@ -1675,6 +1675,7 @@ fn known_unsupported_responses_variant(value: &Value) -> Option<String> {
         crate::responses_capabilities::ENFORCE_EXTENSION,
         crate::responses_capabilities::FORWARD_PROMPT_CACHE_KEY_EXTENSION,
         crate::responses_capabilities::PROMPT_CACHE_AFFINITY_EXTENSION,
+        crate::responses_capabilities::AGENT_MESSAGE_PLAINTEXT_COMPAT_EXTENSION,
     ];
     const HOSTED_TOOLS: &[&str] = &[
         "code_interpreter",
@@ -2682,7 +2683,10 @@ fn normalize_response_item_for_wire(
     // `custom_tool_call` has no public `status` member in the Responses
     // resource schema. The permissive canonical model retains the legacy field
     // for ingress compatibility, but raw Responses egress must omit it.
-    if object.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+    if matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("custom_tool_call" | "agent_message")
+    ) {
         object.remove("status");
     } else {
         object.insert("status".to_string(), Value::String(status.to_string()));
@@ -2694,7 +2698,9 @@ fn normalize_response_item_for_wire(
             .entry("env".to_string())
             .or_insert_with(|| Value::Object(Default::default()));
     }
-    object.remove("namespace");
+    // Namespace tools are part of the current Responses function-call shape.
+    // Codex uses this field to route a returned child call back to the handler
+    // registered under the parent namespace (for example, collaboration).
     // Opaque provider reasoning state is internal unless the caller explicitly
     // requested the include and the selected provider declared passthrough.
     // The current public projector is conservative; capability-aware opt-in is
