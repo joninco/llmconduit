@@ -2549,6 +2549,8 @@ fn responses_wire_event_data_inner(
         item_status = object
             .remove("llmconduit_item_status")
             .and_then(|value| value.as_str().map(ToString::to_string));
+        object.remove("llmconduit_error_status");
+        object.remove("llmconduit_error_param");
         if let Some(sequence_number) = sequence_number {
             object.insert(
                 "sequence_number".to_string(),
@@ -2820,7 +2822,16 @@ async fn collect_responses_response(
                 let code = error
                     .and_then(|error| error.get("code"))
                     .and_then(Value::as_str);
-                return Err(AppError::from_terminal_event(message, code));
+                let status = event
+                    .data
+                    .get("llmconduit_error_status")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u16::try_from(value).ok());
+                let param = event
+                    .data
+                    .get("llmconduit_error_param")
+                    .and_then(Value::as_str);
+                return Err(AppError::from_terminal_event(message, code, status, param));
             }
             _ => {}
         }
@@ -2875,13 +2886,13 @@ async fn collect_anthropic_response(
         // converter chose; `invalid_request_error` (context overflow — the
         // client's input to fix) restores the 400 shape, everything else stays
         // the historical 502.
-        Err(err) => Ok(anthropic_error_response(
-            if err.kind == "invalid_request_error" {
-                AppError::bad_request(err.message)
-            } else {
-                AppError::upstream(err.message)
-            },
-        )),
+        Err(err) => Ok(anthropic_error_response(AppError::from_terminal_event(
+            &err.message,
+            err.llmconduit_error_code.as_deref(),
+            err.llmconduit_error_status
+                .or_else(|| (err.kind == "invalid_request_error").then_some(400)),
+            err.llmconduit_error_param.as_deref(),
+        ))),
     }
 }
 
@@ -2899,20 +2910,7 @@ fn anthropic_error_response(err: AppError) -> Response {
 }
 
 fn anthropic_error_type(status: StatusCode) -> &'static str {
-    match status.as_u16() {
-        400 => "invalid_request_error",
-        401 => "authentication_error",
-        402 => "billing_error",
-        403 => "permission_error",
-        404 => "not_found_error",
-        409 => "conflict_error",
-        413 => "request_too_large",
-        429 => "rate_limit_error",
-        504 => "timeout_error",
-        529 => "overloaded_error",
-        _ if status.is_client_error() => "invalid_request_error",
-        _ => "api_error",
-    }
+    crate::adapters::responses_to_anthropic::anthropic_error_type_for_status(status.as_u16())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3663,6 +3661,23 @@ mod tests {
             data: serde_json::json!({ "type": "response.created" }),
         };
         assert_eq!(responses_wire_event_data(&event), event.data.to_string());
+    }
+
+    #[test]
+    fn responses_wire_strips_internal_error_status_and_parameter() {
+        let event = crate::engine::SseEvent {
+            event: "response.failed".to_string(),
+            data: serde_json::json!({
+                "type":"response.failed",
+                "response":{"id":"resp_1","status":"failed"},
+                "llmconduit_error_status":409,
+                "llmconduit_error_param":"input"
+            }),
+        };
+        let projected: serde_json::Value =
+            serde_json::from_str(&responses_wire_event_data(&event)).unwrap();
+        assert!(projected.get("llmconduit_error_status").is_none());
+        assert!(projected.get("llmconduit_error_param").is_none());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::adapters::canonical_error_metadata;
 use crate::engine::SseEvent;
 use crate::models::anthropic::AnthropicContentBlockStart;
 use crate::models::anthropic::AnthropicDelta;
@@ -30,6 +31,23 @@ pub use collector::AnthropicStreamCollector;
 use reasoning::ReasoningEgressState;
 
 const ESTIMATED_OUTPUT_TOKEN_BYTES: usize = 4;
+
+pub(crate) fn anthropic_error_type_for_status(status: u16) -> &'static str {
+    match status {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        402 => "billing_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        409 => "conflict_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        504 => "timeout_error",
+        529 => "overloaded_error",
+        status if (400..500).contains(&status) => "invalid_request_error",
+        _ => "api_error",
+    }
+}
 
 /// Name of the server-side web-search tool. Brave runs server-side, so the
 /// model's own `web_search` call is NOT surfaced to the Anthropic client as a
@@ -598,6 +616,7 @@ impl AnthropicStreamConverter {
     // end WITH the `error` event), which this now satisfies for real.
     fn handle_failed(&mut self, data: &Value, output: &mut Vec<AnthropicStreamEvent>) {
         let error = data.get("response").and_then(|r| r.get("error"));
+        let metadata = canonical_error_metadata(data);
         let message = error
             .and_then(|e| e.get("message"))
             .and_then(Value::as_str)
@@ -607,14 +626,20 @@ impl AnthropicStreamConverter {
         // as Anthropic's `invalid_request_error` (the type the real API's
         // "prompt is too long" 400 carries) so clients engage their own trim/
         // compaction handling instead of retrying an `api_error` as transient.
-        let kind = match error.and_then(|e| e.get("code")).and_then(Value::as_str) {
-            Some(crate::error::CONTEXT_LENGTH_EXCEEDED_CODE) => "invalid_request_error",
-            _ => "api_error",
-        };
+        let kind = metadata
+            .status
+            .map(anthropic_error_type_for_status)
+            .unwrap_or_else(|| match metadata.code.as_deref() {
+                Some(crate::error::CONTEXT_LENGTH_EXCEEDED_CODE) => "invalid_request_error",
+                _ => "api_error",
+            });
         output.push(AnthropicStreamEvent::Error {
             error: AnthropicErrorBody {
                 kind: kind.to_string(),
                 message,
+                llmconduit_error_status: metadata.status,
+                llmconduit_error_param: metadata.param,
+                llmconduit_error_code: metadata.code,
             },
         });
         self.completed = true;

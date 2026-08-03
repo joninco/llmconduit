@@ -795,6 +795,9 @@ mod tests {
                 error: AnthropicErrorBody {
                     kind: "api_error".to_string(),
                     message: "boom".to_string(),
+                    llmconduit_error_status: None,
+                    llmconduit_error_param: None,
+                    llmconduit_error_code: None,
                 },
             },
         ];

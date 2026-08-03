@@ -470,6 +470,18 @@ pub struct AnthropicErrorBody {
     #[serde(rename = "type")]
     pub kind: String,
     pub message: String,
+    /// Gateway-only canonical terminal metadata. These fields survive the
+    /// streaming-to-nonstream collector boundary but are never serialized on
+    /// Anthropic's public error wire.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub llmconduit_error_status: Option<u16>,
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub llmconduit_error_param: Option<String>,
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub llmconduit_error_code: Option<String>,
 }
 
 impl AnthropicStreamEvent {

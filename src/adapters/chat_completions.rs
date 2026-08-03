@@ -1,3 +1,5 @@
+use crate::adapters::CanonicalErrorMetadata;
+use crate::adapters::canonical_error_metadata;
 use crate::engine::SseEvent;
 use crate::error::AppError;
 use crate::error::AppResult;
@@ -584,10 +586,10 @@ impl ChatCompletionStreamConverter {
 pub struct ChatCompletionCollector {
     model: String,
     final_response: Option<Value>,
-    /// Terminal failure as `(message, structured code)`. The code decides the
-    /// restored HTTP shape (a context-overflow terminal resurfaces as its 400
-    /// "prompt is too long", not the generic 502).
-    error: Option<(String, String)>,
+    /// Terminal failure as `(message, structured code, gateway-only metadata)`.
+    /// The metadata restores provider-specific HTTP status/parameter semantics
+    /// without placing those internal fields on a public Responses resource.
+    error: Option<(String, String, CanonicalErrorMetadata)>,
     /// See `ChatCompletionStreamConverter::suppress_reasoning` (G2, Finding 2):
     /// drop forced-but-unrequested `reasoning_content` from the assembled
     /// non-streaming Chat response.
@@ -617,6 +619,7 @@ impl ChatCompletionCollector {
                 self.error = Some((
                     response_error_message(&event.data),
                     response_error_code(&event.data),
+                    canonical_error_metadata(&event.data),
                 ));
             }
             _ => {}
@@ -624,8 +627,13 @@ impl ChatCompletionCollector {
     }
 
     pub fn into_response(self) -> AppResult<Value> {
-        if let Some((message, code)) = self.error {
-            return Err(AppError::from_terminal_event(&message, Some(&code)));
+        if let Some((message, code, metadata)) = self.error {
+            return Err(AppError::from_terminal_event(
+                &message,
+                Some(&code),
+                metadata.status,
+                metadata.param.as_deref(),
+            ));
         }
         let response = self.final_response.ok_or_else(|| {
             AppError::upstream("stream ended before a final response resource was emitted")
@@ -1178,5 +1186,23 @@ mod tests {
     #[test]
     fn collected_keeps_reasoning_when_not_suppressed() {
         assert_eq!(collected_reasoning(false), Some("hidden".to_string()));
+    }
+
+    #[test]
+    fn collector_preserves_canonical_failure_status_and_parameter() {
+        let mut collector = ChatCompletionCollector::new("gpt-5.6-sol".to_string());
+        collector.process(&SseEvent {
+            event: "response.failed".to_string(),
+            data: json!({
+                "type":"response.failed",
+                "response":{"error":{"code":"turn_state_conflict","message":"turn conflict"}},
+                "llmconduit_error_status":409,
+                "llmconduit_error_param":"input[2]"
+            }),
+        });
+
+        let error = collector.into_response().expect_err("terminal failure");
+        assert_eq!(error.status_code(), http::StatusCode::CONFLICT);
+        assert_eq!(error.param.as_deref(), Some("input[2]"));
     }
 }

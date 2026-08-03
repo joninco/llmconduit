@@ -167,6 +167,20 @@ fn failed_event(message: &str) -> SseEvent {
     }
 }
 
+fn failed_event_with_metadata(message: &str, status: u16, param: &str) -> SseEvent {
+    SseEvent {
+        event: "response.failed".to_string(),
+        data: json!({
+            "type": "response.failed",
+            "response": {
+                "error": { "code": "turn_state_conflict", "message": message }
+            },
+            "llmconduit_error_status": status,
+            "llmconduit_error_param": param
+        }),
+    }
+}
+
 fn event_types(events: &[AnthropicStreamEvent]) -> Vec<&str> {
     events.iter().map(|e| e.sse_event_type()).collect()
 }
@@ -770,6 +784,32 @@ fn converts_failure_event() {
 }
 
 #[test]
+fn converts_failure_status_to_anthropic_type_without_serializing_internal_metadata() {
+    let mut converter = AnthropicStreamConverter::new("claude-3".to_string());
+    let events = converter.convert(&failed_event_with_metadata(
+        "turn conflict",
+        409,
+        "input[2]",
+    ));
+
+    let AnthropicStreamEvent::Error { error } = &events[0] else {
+        panic!("expected error event")
+    };
+    assert_eq!(error.kind, "conflict_error");
+    assert_eq!(error.llmconduit_error_status, Some(409));
+    assert_eq!(error.llmconduit_error_param.as_deref(), Some("input[2]"));
+    assert_eq!(
+        error.llmconduit_error_code.as_deref(),
+        Some("turn_state_conflict")
+    );
+    let wire: Value = serde_json::from_str(&events[0].to_json()).expect("wire JSON");
+    assert_eq!(wire["error"]["type"], "conflict_error");
+    assert!(wire["error"].get("llmconduit_error_status").is_none());
+    assert!(wire["error"].get("llmconduit_error_param").is_none());
+    assert!(wire["error"].get("llmconduit_error_code").is_none());
+}
+
+#[test]
 fn emits_usage_from_completed_response() {
     // C3: `response.created` carries the engine's early estimate (20) --
     // `message_start.usage.input_tokens` must reflect it instead of the old
@@ -951,6 +991,21 @@ fn collector_returns_final_usage() {
     let response = collector.into_response().expect("response");
     assert_eq!(response.usage.input_tokens, 12);
     assert_eq!(response.usage.output_tokens, 5);
+}
+
+#[test]
+fn collector_preserves_failure_status_and_parameter() {
+    let mut collector = AnthropicStreamCollector::new("claude-3".to_string());
+    collector.process(&failed_event_with_metadata("rate limited", 429, "model"));
+
+    let error = collector.into_response().expect_err("terminal failure");
+    assert_eq!(error.kind, "rate_limit_error");
+    assert_eq!(error.llmconduit_error_status, Some(429));
+    assert_eq!(error.llmconduit_error_param.as_deref(), Some("model"));
+    assert_eq!(
+        error.llmconduit_error_code.as_deref(),
+        Some("turn_state_conflict")
+    );
 }
 
 #[test]

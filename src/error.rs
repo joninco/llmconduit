@@ -232,8 +232,13 @@ impl AppError {
     /// "temporary, try again" that clients hammer. The context-overflow code
     /// restores the 400 `prompt is too long` shape; everything else keeps the
     /// 502 upstream default.
-    pub(crate) fn from_terminal_event(message: &str, code: Option<&str>) -> Self {
-        match code {
+    pub(crate) fn from_terminal_event(
+        message: &str,
+        code: Option<&str>,
+        status: Option<u16>,
+        param: Option<&str>,
+    ) -> Self {
+        let mut error = match code {
             Some(CONTEXT_LENGTH_EXCEEDED_CODE) => Self::prompt_too_long(message),
             Some("internal_error") => Self::internal(message),
             Some("upstream_timeout") => Self::gateway_timeout(message),
@@ -267,7 +272,13 @@ impl AppError {
             }
             Some(code) => Self::upstream(message).with_code(code),
             None => Self::upstream(message),
+        };
+        if let Some(status) = status.and_then(|status| StatusCode::from_u16(status).ok()) {
+            error.status = status;
+            error.failover = FailoverDisposition::Terminal;
         }
+        error.param = param.map(str::to_string);
+        error
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
@@ -445,7 +456,7 @@ mod tests {
                 "the upstream request failed",
             ),
         ] {
-            let error = AppError::from_terminal_event("sanitized", Some(code));
+            let error = AppError::from_terminal_event("sanitized", Some(code), None, None);
             assert_eq!(error.status, expected, "code={code}");
             assert_eq!(error.client_message, expected_message);
             assert_eq!(error.code.as_deref(), Some(code));
