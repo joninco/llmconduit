@@ -10,6 +10,7 @@ use crate::adapters::responses_to_chat::{
 };
 use crate::config::Config;
 use crate::config::UnsupportedImagePolicy;
+use crate::config::UpstreamWireApi;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::models::chat::ChatCompletionChunk;
@@ -56,8 +57,10 @@ use crate::vision::VisionRequest;
 use futures::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
+use sha2::Digest as _;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
@@ -67,13 +70,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 const UPSTREAM_MODEL_CATALOG_TTL_SECS: u64 = 300;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TokenizeCapability {
-    Unknown,
-    Supported,
-    Unsupported,
-}
 
 /// E1: absolute ceiling on in-gateway repair rounds for hallucinated (unoffered)
 /// tool calls — mirrors `WEB_SEARCH_ROUNDS_HARD_CEILING`. Default 1 (one
@@ -198,6 +194,284 @@ impl FunctionCallIdentitySnapshot {
     }
 }
 
+const NATIVE_TURN_TRACKER_MAX_CALLS: usize = 4096;
+const NATIVE_TURN_TRACKER_MAX_HISTORIES: usize = 1024;
+// Two distinct live identities are sufficient to preserve the only states the
+// resolver needs: unique or ambiguous. Retaining every colliding identity would
+// let one repeated call ID/history digest grow an unbounded Vec while bypassing
+// the map-key ceilings above.
+const NATIVE_TURN_TRACKER_MAX_IDENTITIES_PER_KEY: usize = 2;
+const NATIVE_TURN_TRACKER_TTL: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NativeTurnIdentity {
+    conversation_id: String,
+    turn_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct NativeTurnEntry {
+    identity: NativeTurnIdentity,
+    touched_at: std::time::Instant,
+}
+
+#[derive(Debug, Default)]
+struct NativeTurnTracker {
+    // A private turn can only be resumed by a model-issued call ID for the
+    // same served model. Keep collisions instead of overwriting them so an
+    // ambiguous ID fails closed rather than attaching one caller's output to
+    // another private turn.
+    by_call_id: HashMap<(String, String), Vec<NativeTurnEntry>>,
+    // Completed visible histories retain the stable conversation identity for
+    // an ordinary next human turn. The digest includes model, instructions,
+    // item boundaries, and every canonical item; only the digest is retained.
+    by_history: HashMap<[u8; 32], Vec<NativeTurnEntry>>,
+}
+
+impl NativeTurnTracker {
+    fn begin(
+        &mut self,
+        model: &str,
+        instructions: &crate::models::responses::ResponseInstructions,
+        input: &[ResponseItem],
+    ) -> AppResult<(NativeTurnIdentity, bool)> {
+        self.prune();
+        // The current user suffix may contain text adjacent to tool results.
+        // Anthropic, for example, converts `[tool_result, text]` into a function
+        // output followed by a user message. Stop at the latest non-user item so
+        // outputs from older completed turns remain ordinary visible history.
+        let output_ids = native_current_user_function_output_ids(input);
+        let mut matched: Option<NativeTurnIdentity> = None;
+        let mut consumed = Vec::new();
+        for call_id in &output_ids {
+            let key = (model.to_string(), (*call_id).to_string());
+            let Some(entries) = self.by_call_id.get(&key) else {
+                return Err(AppError::conflict(
+                    "function output cannot be matched to an active native Responses turn",
+                )
+                .with_code("turn_state_lost")
+                .with_param("input"));
+            };
+            let entry = entries
+                .first()
+                .filter(|_| entries.len() == 1)
+                .ok_or_else(|| {
+                    AppError::conflict(
+                        "function output matches more than one active native Responses turn",
+                    )
+                    .with_code("turn_state_conflict")
+                    .with_param("input")
+                })?;
+            if matched
+                .as_ref()
+                .is_some_and(|identity| identity != &entry.identity)
+            {
+                return Err(AppError::bad_request(
+                    "function outputs refer to more than one active upstream turn",
+                )
+                .with_code("turn_state_conflict")
+                .with_param("input"));
+            }
+            matched = Some(entry.identity.clone());
+            consumed.push(key);
+        }
+        if let Some(identity) = matched {
+            // A call output is single-use. Removing it before dispatch makes a
+            // caller retry fail closed instead of potentially billing the same
+            // private turn twice after an ambiguous transport failure.
+            for key in consumed {
+                self.by_call_id.remove(&key);
+            }
+            return Ok((identity, true));
+        }
+        debug_assert!(output_ids.is_empty());
+
+        // The current request resends visible history. Match the longest
+        // completed prefix and rotate only the private turn ID. Equal-length
+        // ambiguous matches intentionally start a fresh conversation.
+        let mut conversation_id = None;
+        for digest in native_history_prefix_digests(model, instructions, input) {
+            if let Some(entries) = self.by_history.get(&digest)
+                && entries.len() == 1
+            {
+                conversation_id = Some(entries[0].identity.conversation_id.clone());
+            } else if self
+                .by_history
+                .get(&digest)
+                .is_some_and(|entries| entries.len() > 1)
+            {
+                conversation_id = None;
+            }
+        }
+        Ok((
+            NativeTurnIdentity {
+                conversation_id: conversation_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+                turn_id: Uuid::new_v4().to_string(),
+            },
+            false,
+        ))
+    }
+
+    fn complete(
+        &mut self,
+        model: &str,
+        instructions: &crate::models::responses::ResponseInstructions,
+        identity: &NativeTurnIdentity,
+        history: &[ResponseItem],
+        output: &[ResponseItem],
+    ) {
+        self.prune();
+        let now = std::time::Instant::now();
+        for call_id in output.iter().filter_map(|item| match item {
+            ResponseItem::FunctionCall { call_id, .. }
+            | ResponseItem::CustomToolCall { call_id, .. } => Some(call_id),
+            _ => None,
+        }) {
+            let key = (model.to_string(), call_id.clone());
+            if self.by_call_id.len() >= NATIVE_TURN_TRACKER_MAX_CALLS
+                && !self.by_call_id.contains_key(&key)
+                && let Some(oldest) = self
+                    .by_call_id
+                    .iter()
+                    .min_by_key(|(_, entries)| {
+                        entries
+                            .iter()
+                            .map(|entry| entry.touched_at)
+                            .min()
+                            .unwrap_or(now)
+                    })
+                    .map(|(key, _)| key.clone())
+            {
+                self.by_call_id.remove(&oldest);
+            }
+            Self::remember_identity(self.by_call_id.entry(key).or_default(), identity, now);
+        }
+
+        if let Some(digest) = native_history_prefix_digests(model, instructions, history)
+            .last()
+            .copied()
+        {
+            if self.by_history.len() >= NATIVE_TURN_TRACKER_MAX_HISTORIES
+                && !self.by_history.contains_key(&digest)
+                && let Some(oldest) = self
+                    .by_history
+                    .iter()
+                    .min_by_key(|(_, entries)| {
+                        entries
+                            .iter()
+                            .map(|entry| entry.touched_at)
+                            .min()
+                            .unwrap_or(now)
+                    })
+                    .map(|(digest, _)| *digest)
+            {
+                self.by_history.remove(&oldest);
+            }
+            Self::remember_identity(self.by_history.entry(digest).or_default(), identity, now);
+        }
+    }
+
+    fn remember_identity(
+        entries: &mut Vec<NativeTurnEntry>,
+        identity: &NativeTurnIdentity,
+        now: std::time::Instant,
+    ) {
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.identity == *identity) {
+            entry.touched_at = now;
+            return;
+        }
+        let new_entry = NativeTurnEntry {
+            identity: identity.clone(),
+            touched_at: now,
+        };
+        if entries.len() < NATIVE_TURN_TRACKER_MAX_IDENTITIES_PER_KEY {
+            entries.push(new_entry);
+            return;
+        }
+
+        // Once a key is ambiguous, only two recent, distinct representatives
+        // are needed to keep it fail-closed. Replacing the oldest representative
+        // also preserves TTL semantics: old collisions age out, while a newly
+        // observed distinct identity keeps ambiguity live for a full TTL.
+        let oldest = entries
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.touched_at)
+            .map(|(index, _)| index)
+            .expect("the per-key identity cap is non-zero");
+        entries[oldest] = new_entry;
+    }
+
+    fn prune(&mut self) {
+        let now = std::time::Instant::now();
+        self.by_call_id.retain(|_, entries| {
+            entries.retain(|entry| now.duration_since(entry.touched_at) <= NATIVE_TURN_TRACKER_TTL);
+            !entries.is_empty()
+        });
+        self.by_history.retain(|_, entries| {
+            entries.retain(|entry| now.duration_since(entry.touched_at) <= NATIVE_TURN_TRACKER_TTL);
+            !entries.is_empty()
+        });
+    }
+}
+
+fn native_history_prefix_digests(
+    model: &str,
+    instructions: &crate::models::responses::ResponseInstructions,
+    input: &[ResponseItem],
+) -> Vec<[u8; 32]> {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"llmconduit-native-history-v1\0");
+    hasher.update(model.as_bytes());
+    hasher.update(b"\0");
+    if serde_json::to_writer(&mut DigestWriter(&mut hasher), instructions).is_err() {
+        return Vec::new();
+    }
+    hasher.update(b"\0");
+    let mut digests = Vec::with_capacity(input.len());
+    for item in input {
+        if write_native_history_item(&mut hasher, item).is_err() {
+            return Vec::new();
+        }
+        hasher.update(b"\0");
+        digests.push(hasher.clone().finalize().into());
+    }
+    digests
+}
+
+fn write_native_history_item(
+    hasher: &mut sha2::Sha256,
+    item: &ResponseItem,
+) -> Result<(), serde_json::Error> {
+    // Public output item IDs are transport identities and are not preserved
+    // when Claude Code resends an assistant message as Anthropic history. They
+    // must not break semantic prefix matching. Model-issued call IDs and opaque
+    // encrypted reasoning remain part of the digest.
+    let mut normalized = item.clone();
+    match &mut normalized {
+        ResponseItem::Message { id, .. }
+        | ResponseItem::AgentMessage { id, .. }
+        | ResponseItem::FunctionCall { id, .. }
+        | ResponseItem::CustomToolCall { id, .. } => *id = None,
+        ResponseItem::Reasoning { id, .. } => id.clear(),
+        _ => {}
+    }
+    serde_json::to_writer(&mut DigestWriter(hasher), &normalized)
+}
+
+struct DigestWriter<'a>(&'a mut sha2::Sha256);
+
+impl std::io::Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct Gateway {
     config: Config,
@@ -286,10 +560,10 @@ pub struct Gateway {
     function_call_identity_counts: Arc<
         std::sync::Mutex<BTreeMap<FunctionCallIdentityCounterKey, FunctionCallIdentitySnapshot>>,
     >,
-    /// Process-wide negative capability cache for the optional backend
-    /// `/tokenize` endpoint. The routing implementation probes all eligible
-    /// candidates before returning unsupported.
-    tokenize_capability: Arc<std::sync::Mutex<TokenizeCapability>>,
+    /// Private Codex turn-state affinity keyed only by model-issued call IDs.
+    /// Tokens from the subscription backend never enter this process: the
+    /// sidecar owns them and llmconduit carries opaque local UUIDs only.
+    native_turn_tracker: Arc<StdMutex<NativeTurnTracker>>,
 }
 
 #[derive(Debug, Clone)]
@@ -578,6 +852,26 @@ fn estimate_input_tokens(
     let bytes = serde_json::to_vec(&request).map(|v| v.len()).unwrap_or(0);
     // ceil(bytes / 4): ~4 bytes per token is the standard coarse approximation.
     bytes.div_ceil(4) as i64
+}
+
+/// Count deterministic JSON bytes without allocating a second copy of a large
+/// request body. Native Responses uses this only for the early Anthropic usage
+/// estimate; provider-reported terminal usage remains authoritative.
+pub(crate) fn serialized_json_size<T: Serialize>(value: &T) -> Result<usize, serde_json::Error> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
 }
 
 /// Cap an explicitly-requested output-token budget down to what the model's
@@ -911,7 +1205,7 @@ impl Gateway {
             model_fallback_warned: Arc::new(std::sync::Mutex::new(HashMap::new())),
             unknown_tool_call_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             function_call_identity_counts: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            tokenize_capability: Arc::new(std::sync::Mutex::new(TokenizeCapability::Unknown)),
+            native_turn_tracker: Arc::new(StdMutex::new(NativeTurnTracker::default())),
         }
     }
 
@@ -1236,20 +1530,6 @@ impl Gateway {
 
     pub fn upstream_client(&self) -> Arc<dyn UpstreamClient> {
         Arc::clone(&self.upstream)
-    }
-
-    pub fn tokenize_capability(&self) -> TokenizeCapability {
-        *self
-            .tokenize_capability
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    pub fn set_tokenize_capability(&self, capability: TokenizeCapability) {
-        *self
-            .tokenize_capability
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = capability;
     }
 
     /// D4: the current per-upstream health + counters (lock-free read through
@@ -1745,6 +2025,29 @@ impl Gateway {
                 return Err(err);
             }
         };
+        let upstream_wire_api = match self.upstream.wire_api_for_model(&resolved_model).await {
+            Ok(wire_api) => wire_api,
+            Err(err) => {
+                let (err, durable) = finalize_pre_spawn_err(err);
+                if let Some((summary, record_seq)) = durable
+                    && let Err(error) = self
+                        .dashboard_history()
+                        .persist_flow_summary(
+                            summary,
+                            crate::dashboard_flow::FlowMutationPhase::Terminal,
+                            record_seq,
+                        )
+                        .await
+                    && self.dashboard_history().is_required()
+                {
+                    tracing::error!(%error, "failed to persist upstream wire-resolution failure");
+                    return Err(AppError::internal(
+                        "dashboard durability commit failed before error response",
+                    ));
+                }
+                return Err(err);
+            }
+        };
 
         // Raw Responses image handling is selected by the primary provider's
         // declared capability. Converted Chat/Anthropic requests carry no raw
@@ -1915,27 +2218,36 @@ impl Gateway {
             }
         }
 
-        let (baseline_record, prefix_len) = match self.find_replay_baseline(&request).await {
-            Ok(value) => value,
-            Err(err) => {
-                let (err, durable) = finalize_pre_spawn_err(err);
-                if let Some((summary, record_seq)) = durable
-                    && let Err(error) = self
-                        .dashboard_history()
-                        .persist_flow_summary(
-                            summary,
-                            crate::dashboard_flow::FlowMutationPhase::Terminal,
-                            record_seq,
-                        )
-                        .await
-                    && self.dashboard_history().is_required()
-                {
-                    tracing::error!(%error, "failed to persist replay-baseline failure");
-                    return Err(AppError::internal(
-                        "dashboard durability commit failed before error response",
-                    ));
+        let (baseline_record, prefix_len) = if upstream_wire_api == UpstreamWireApi::CodexResponses
+        {
+            // Native Responses already carries canonical visible history and
+            // private Codex turn affinity. Prefix replay is a Chat-lowering
+            // optimization and cannot safely be mixed with the sidecar's
+            // single-use continuation contract.
+            (None, 0)
+        } else {
+            match self.find_replay_baseline(&request).await {
+                Ok(value) => value,
+                Err(err) => {
+                    let (err, durable) = finalize_pre_spawn_err(err);
+                    if let Some((summary, record_seq)) = durable
+                        && let Err(error) = self
+                            .dashboard_history()
+                            .persist_flow_summary(
+                                summary,
+                                crate::dashboard_flow::FlowMutationPhase::Terminal,
+                                record_seq,
+                            )
+                            .await
+                        && self.dashboard_history().is_required()
+                    {
+                        tracing::error!(%error, "failed to persist replay-baseline failure");
+                        return Err(AppError::internal(
+                            "dashboard durability commit failed before error response",
+                        ));
+                    }
+                    return Err(err);
                 }
-                return Err(err);
             }
         };
         let mut tail_request = request.clone();
@@ -1957,6 +2269,9 @@ impl Gateway {
                     tail_request.tools.is_empty(),
                 );
             }
+        }
+        if upstream_wire_api == UpstreamWireApi::CodexResponses {
+            request.tools.clone_from(&tail_request.tools);
         }
         // D2 (D13 R1 HIGH): capture the NORMALIZED canonical body — the
         // `ResponsesRequest` the engine operates on AFTER the inbound→canonical
@@ -1980,6 +2295,134 @@ impl Gateway {
             && let Some(capture) = self.turn_capture().state(api_call_id)
         {
             capture.write_normalized_request(&request);
+        }
+        if upstream_wire_api == UpstreamWireApi::CodexResponses {
+            if let Some(param) = unsupported_native_responses_parameter(&request) {
+                let (err, durable) = finalize_pre_spawn_err(
+                    AppError::bad_request(format!(
+                        "{param} is not supported by this native Responses provider"
+                    ))
+                    .with_code("unsupported_parameter")
+                    .with_param(param),
+                );
+                if let Some((summary, record_seq)) = durable {
+                    self.dashboard_history()
+                        .persist_flow_summary(
+                            summary,
+                            crate::dashboard_flow::FlowMutationPhase::Terminal,
+                            record_seq,
+                        )
+                        .await
+                        .map_err(|error| {
+                            tracing::error!(%error, "failed to persist native-parameter validation failure");
+                            AppError::internal(
+                                "dashboard durability commit failed before error response",
+                            )
+                        })?;
+                }
+                return Err(err);
+            }
+            if request
+                .tools
+                .iter()
+                .any(|tool| !matches!(tool, crate::models::responses::ToolSpec::Function { .. }))
+            {
+                let (err, durable) = finalize_pre_spawn_err(
+                    AppError::bad_request(
+                        "this native Responses provider supports client function tools only",
+                    )
+                    .with_code("unsupported_parameter")
+                    .with_param("tools"),
+                );
+                if let Some((summary, record_seq)) = durable {
+                    self.dashboard_history()
+                        .persist_flow_summary(
+                            summary,
+                            crate::dashboard_flow::FlowMutationPhase::Terminal,
+                            record_seq,
+                        )
+                        .await
+                        .map_err(|error| {
+                            tracing::error!(%error, "failed to persist native-tool validation failure");
+                            AppError::internal(
+                                "dashboard durability commit failed before error response",
+                            )
+                        })?;
+                }
+                return Err(err);
+            }
+            let native_tool_registry =
+                match crate::adapters::responses_to_chat::validate_and_build_native_tool_registry(
+                    &request.tools,
+                    request.strict_schema_dialect,
+                ) {
+                    Ok(registry) => registry,
+                    Err(err) => {
+                        let (err, durable) = finalize_pre_spawn_err(err);
+                        if let Some((summary, record_seq)) = durable {
+                            self.dashboard_history()
+                            .persist_flow_summary(
+                                summary,
+                                crate::dashboard_flow::FlowMutationPhase::Terminal,
+                                record_seq,
+                            )
+                            .await
+                            .map_err(|error| {
+                                tracing::error!(%error, "failed to persist native-tool schema validation failure");
+                                AppError::internal(
+                                    "dashboard durability commit failed before error response",
+                                )
+                            })?;
+                        }
+                        return Err(err);
+                    }
+                };
+            let turn_result = {
+                let mut tracker = self
+                    .native_turn_tracker
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                tracker.begin(&resolved_model, &request.instructions, &request.input)
+            };
+            let (identity, continuation) = match turn_result {
+                Ok(turn) => turn,
+                Err(err) => {
+                    let (err, durable) = finalize_pre_spawn_err(err);
+                    if let Some((summary, record_seq)) = durable {
+                        self.dashboard_history()
+                            .persist_flow_summary(
+                                summary,
+                                crate::dashboard_flow::FlowMutationPhase::Terminal,
+                                record_seq,
+                            )
+                            .await
+                            .map_err(|error| {
+                                tracing::error!(%error, "failed to persist native-turn validation failure");
+                                AppError::internal(
+                                    "dashboard durability commit failed before error response",
+                                )
+                            })?;
+                    }
+                    return Err(err);
+                }
+            };
+            return self
+                .start_native_responses_turn(
+                    request,
+                    resolved_model,
+                    response_id,
+                    caller_instructions,
+                    capability_allowlist,
+                    native_tool_registry,
+                    identity,
+                    continuation,
+                    api_call_id,
+                    serving_token,
+                    telemetry_guard,
+                    capture_guard,
+                    abort_token,
+                )
+                .await;
         }
         // Lower the canonical request to the upstream chat payload BEFORE
         // budgeting. The `?` surfaces any lowering/validation error (invalid
@@ -2377,6 +2820,588 @@ impl Gateway {
             }
         });
         Ok(ReceiverStream::new(rx))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_native_responses_turn(
+        self: Arc<Self>,
+        request: ResponsesRequest,
+        resolved_model: String,
+        response_id: String,
+        caller_instructions: crate::models::responses::ResponseInstructions,
+        capability_allowlist: crate::responses_capabilities::CapabilityAllowlist,
+        native_tool_registry: crate::adapters::responses_to_chat::ToolRegistry,
+        identity: NativeTurnIdentity,
+        continuation: bool,
+        api_call_id: Option<String>,
+        serving_token: Arc<crate::upstream::ServingToken>,
+        telemetry_guard: Option<crate::dashboard_flow::TelemetryGuard>,
+        capture_guard: Option<crate::turn_capture::CaptureGuard>,
+        abort_token: tokio_util::sync::CancellationToken,
+    ) -> AppResult<ReceiverStream<SseEvent>> {
+        let body = native_responses_request_body(&request, &resolved_model)?;
+        if let Some(api_call_id) = api_call_id.as_deref() {
+            self.flow_store().stamp_routing_decision(api_call_id);
+        }
+        let mut response_template =
+            response_resource_template(response_id.clone(), &request, resolved_model.clone());
+        response_template.instructions =
+            (!caller_instructions.is_empty()).then_some(caller_instructions);
+        let failure_snapshot = FailureSnapshot::new(response_template.clone());
+        let (tx, rx) = mpsc::channel(128);
+        let gateway = Arc::clone(&self);
+        tokio::spawn(async move {
+            let backend = crate::upstream::BackendResponsesRequest {
+                body,
+                model: resolved_model,
+                conversation_id: identity.conversation_id.clone(),
+                turn_id: identity.turn_id.clone(),
+                request_id: Uuid::new_v4().to_string(),
+                continuation,
+                response_id: Some(response_id.clone()),
+                serving: Some(Arc::clone(&serving_token)),
+                capture: api_call_id
+                    .as_deref()
+                    .and_then(|id| gateway.turn_capture().state(id)),
+                capability_allowlist,
+            };
+            let mut result = gateway
+                .run_native_responses_turn(
+                    response_id.clone(),
+                    request,
+                    response_template,
+                    failure_snapshot.clone(),
+                    backend,
+                    native_tool_registry,
+                    identity,
+                    api_call_id.clone(),
+                    Arc::clone(&serving_token),
+                    tx.clone(),
+                    abort_token.clone(),
+                )
+                .await;
+            if result.is_ok()
+                && let Some(api_call_id) = &api_call_id
+            {
+                gateway.flow_store().stamp_stream_end(api_call_id);
+            }
+            let (status, reason) = match &result {
+                Ok(_) => (
+                    crate::dashboard_flow::FlowStatus::Completed,
+                    "response.completed".to_string(),
+                ),
+                Err(error) if error.is_cancelled() => (
+                    crate::dashboard_flow::FlowStatus::Cancelled,
+                    "client_disconnected".to_string(),
+                ),
+                Err(error) => (crate::dashboard_flow::FlowStatus::Failed, error.to_string()),
+            };
+            if let Some(guard) = &telemetry_guard {
+                gateway.prepare_terminal_pricing(guard);
+                let durable = guard.finalize(status, Some(reason.clone()));
+                gateway.record_terminal_metrics(guard, status, guard.elapsed().as_millis());
+                if let Some((summary, record_seq)) = durable
+                    && let Err(error) = gateway
+                        .dashboard_history()
+                        .persist_flow_summary(
+                            summary,
+                            crate::dashboard_flow::FlowMutationPhase::Terminal,
+                            record_seq,
+                        )
+                        .await
+                {
+                    tracing::error!(api_call_id = %guard.api_call_id(), %error, "failed to persist native Responses terminal flow");
+                    if gateway.dashboard_history().is_required() && result.is_ok() {
+                        result = Err(AppError::internal(
+                            "dashboard durability commit failed before terminal response",
+                        ));
+                    }
+                }
+            }
+            if let Some(guard) = &capture_guard {
+                let (capture_status, capture_reason) = match &result {
+                    Ok(turn) if turn.is_incomplete() => ("incomplete", "response.incomplete"),
+                    _ => (flow_status_artifact_str(status), reason.as_str()),
+                };
+                guard.finalize(capture_status, Some(capture_reason));
+            }
+            if let Ok(turn) = &result {
+                if gateway
+                    .send_event(&tx, turn.terminal_event().clone(), &abort_token)
+                    .await
+                    .is_err()
+                {
+                    discard_response_state(
+                        Arc::clone(&gateway.response_store),
+                        response_id.clone(),
+                    )
+                    .await;
+                    return;
+                }
+                gateway
+                    .monitor
+                    .emit(response_id.clone(), MonitorEventKind::Completed);
+            }
+            if let Err(error) = &result {
+                discard_response_state(Arc::clone(&gateway.response_store), response_id.clone())
+                    .await;
+                if tx.is_closed() {
+                    return;
+                }
+                gateway
+                    .monitor
+                    .emit_with(response_id.as_str(), || MonitorEventKind::Failed {
+                        message: error.to_string(),
+                    });
+                let _ = gateway
+                    .send_event(
+                        &tx,
+                        failure_event(error, failure_snapshot.resource()),
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
+            }
+        });
+        Ok(ReceiverStream::new(rx))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_native_responses_turn(
+        &self,
+        response_id: String,
+        request: ResponsesRequest,
+        mut response_template: ResponseResource,
+        failure_snapshot: FailureSnapshot,
+        backend: crate::upstream::BackendResponsesRequest,
+        native_tool_registry: crate::adapters::responses_to_chat::ToolRegistry,
+        identity: NativeTurnIdentity,
+        api_call_id: Option<String>,
+        serving_token: Arc<crate::upstream::ServingToken>,
+        tx: mpsc::Sender<SseEvent>,
+        abort_token: tokio_util::sync::CancellationToken,
+    ) -> AppResult<TurnCompletion> {
+        serving_token.set_model_served(backend.model.clone());
+        if let Some(api_call_id) = &api_call_id {
+            self.flow_store()
+                .link(response_id.clone(), api_call_id.clone());
+        }
+        self.monitor.emit_with(response_id.as_str(), || {
+            let role_count = |wanted: &str| {
+                request
+                    .input
+                    .iter()
+                    .filter(
+                        |item| matches!(item, ResponseItem::Message { role, .. } if role == wanted),
+                    )
+                    .count()
+            };
+            let function_calls = request
+                .input
+                .iter()
+                .filter(|item| matches!(item, ResponseItem::FunctionCall { .. }))
+                .count();
+            let function_outputs = request
+                .input
+                .iter()
+                .filter(|item| matches!(item, ResponseItem::FunctionCallOutput { .. }))
+                .count();
+            MonitorEventKind::RequestStarted {
+                model: request.model.clone(),
+                input_items: request.input.len(),
+                tool_count: request.tools.len(),
+                turn_count: request
+                    .input
+                    .iter()
+                    .filter(|item| matches!(item, ResponseItem::Message { .. }))
+                    .count(),
+                user_messages: role_count("user"),
+                assistant_messages: role_count("assistant"),
+                system_messages: role_count("system"),
+                developer_messages: role_count("developer"),
+                reasoning_items: request
+                    .input
+                    .iter()
+                    .filter(|item| matches!(item, ResponseItem::Reasoning { .. }))
+                    .count(),
+                function_calls,
+                function_outputs,
+                tool_items: function_calls.saturating_add(function_outputs),
+                input_chars: serialized_json_size(&request.input).unwrap_or(0),
+                instructions_chars: request.instructions.character_count(),
+            }
+        });
+        let estimated_input_tokens = serialized_json_size(&backend.body)
+            .unwrap_or(0)
+            .div_ceil(4)
+            .try_into()
+            .unwrap_or(i64::MAX);
+        self.send_event(
+            &tx,
+            created_event(response_template.clone(), estimated_input_tokens),
+            &abort_token,
+        )
+        .await?;
+        self.send_event(
+            &tx,
+            in_progress_event(response_template.clone()),
+            &abort_token,
+        )
+        .await?;
+
+        let mut stream = tokio::select! {
+            biased;
+            _ = tx.closed() => return Err(AppError::cancelled()),
+            _ = abort_token.cancelled() => return Err(AppError::cancelled()),
+            result = self.upstream.stream_responses_native_with_timeout(
+                &backend,
+                self.config.request_timeout,
+            ) => result?,
+        };
+        let mut collected_output: BTreeMap<usize, ResponseItem> = BTreeMap::new();
+        let mut native_call_ids = HashSet::new();
+        let mut projector =
+            crate::adapters::codex_private_responses::CodexPrivateResponsesProjector::default();
+        let mut terminal: Option<SseEvent> = None;
+        loop {
+            let next = tokio::select! {
+                biased;
+                _ = tx.closed() => return Err(AppError::cancelled()),
+                _ = abort_token.cancelled() => return Err(AppError::cancelled()),
+                next = stream.next() => next,
+            };
+            let Some(event) = next else { break };
+            let mut event = event?;
+            if !native_responses_event_is_supported(&event.event) {
+                return Err(AppError::upstream(format!(
+                    "native Responses provider emitted unsupported event {}",
+                    event.event
+                ))
+                .with_code("malformed_upstream_response"));
+            }
+            if event.event == "response.metadata" {
+                // Private Codex transport metadata is consumed at the sidecar
+                // boundary. It is neither an OpenAI Responses event nor safe
+                // public model output.
+                continue;
+            }
+            if matches!(
+                event.event.as_str(),
+                "response.reasoning_text.delta" | "response.reasoning_text.done"
+            ) {
+                // This is the provider's hidden reasoning channel, not the
+                // explicit safe summary channel. Never feed it to public or
+                // Anthropic converters.
+                continue;
+            }
+            normalize_native_response_id(&mut event.data, &response_id);
+            if matches!(
+                event.event.as_str(),
+                "response.created" | "response.in_progress"
+            ) {
+                continue;
+            }
+            if matches!(
+                event.event.as_str(),
+                "response.completed" | "response.incomplete" | "response.failed"
+            ) {
+                terminal = Some(event);
+                break;
+            }
+            let projection = projector.project(event.event, event.data)?;
+            let (projected_events, completed_items) =
+                prepare_native_projection(projection, &native_tool_registry, &mut native_call_ids)?;
+            for projected_event in projected_events {
+                self.send_event(&tx, projected_event, &abort_token).await?;
+            }
+            for completed in completed_items {
+                if collected_output
+                    .insert(completed.output_index, completed.item)
+                    .is_some()
+                {
+                    return Err(AppError::upstream(
+                        "native Responses stream completed the same output index twice",
+                    )
+                    .with_code("malformed_upstream_response"));
+                }
+            }
+            failure_snapshot.update_output(collected_output.values().cloned().collect());
+        }
+        let terminal = terminal.ok_or_else(|| {
+            AppError::upstream("native Responses stream ended before a terminal event")
+        })?;
+        if terminal.event == "response.failed" {
+            let code = terminal
+                .data
+                .pointer("/response/error/code")
+                .and_then(Value::as_str)
+                .unwrap_or("upstream_error");
+            return Err(
+                AppError::upstream("native Responses provider reported failure").with_code(code),
+            );
+        }
+        let provider_response = terminal
+            .data
+            .get("response")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                AppError::upstream("native Responses terminal event omitted its response resource")
+            })?;
+        let terminal_output = provider_response
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !terminal_output.is_empty() {
+            for (output_index, terminal_item) in terminal_output.iter().enumerate() {
+                if let Some(streamed_item) = collected_output.get(&output_index) {
+                    let terminal_item: ResponseItem = serde_json::from_value(terminal_item.clone())
+                        .map_err(|_| {
+                            AppError::upstream("native Responses terminal output was malformed")
+                                .with_code("malformed_upstream_response")
+                        })?;
+                    if !native_output_items_equivalent(streamed_item, &terminal_item) {
+                        return Err(AppError::upstream(
+                            "native Responses terminal output disagreed with streamed output",
+                        )
+                        .with_code("malformed_upstream_response"));
+                    }
+                    continue;
+                }
+
+                // Some private responses put complete items only on the
+                // terminal resource. Project them through the exact same
+                // lifecycle and executable-tool quarantine before accepting
+                // the terminal snapshot.
+                let projection = projector.project(
+                    "response.output_item.done",
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": terminal_item,
+                    }),
+                )?;
+                let (projected_events, completed_items) = prepare_native_projection(
+                    projection,
+                    &native_tool_registry,
+                    &mut native_call_ids,
+                )?;
+                for projected_event in projected_events {
+                    self.send_event(&tx, projected_event, &abort_token).await?;
+                }
+                for completed in completed_items {
+                    if collected_output
+                        .insert(completed.output_index, completed.item)
+                        .is_some()
+                    {
+                        return Err(AppError::upstream(
+                            "native Responses terminal output reused an output index",
+                        )
+                        .with_code("malformed_upstream_response"));
+                    }
+                }
+            }
+            if collected_output.len() != terminal_output.len() {
+                return Err(AppError::upstream(
+                    "native Responses terminal output omitted streamed items",
+                )
+                .with_code("malformed_upstream_response"));
+            }
+        }
+        projector.finish()?;
+        let output = collected_output.into_values().collect::<Vec<_>>();
+        let usage = match provider_response.get("usage") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(native_response_usage(value)?),
+        };
+        if let Some(usage) = usage.clone() {
+            failure_snapshot.update_usage(usage.clone());
+            let flow_usage = crate::dashboard_flow::FlowUsage {
+                prompt: usage.input_tokens,
+                completion: usage.output_tokens,
+                total: usage.total_tokens,
+                cached: usage
+                    .input_tokens_details
+                    .as_ref()
+                    .map(|details| details.cached_tokens),
+                reasoning: usage
+                    .output_tokens_details
+                    .as_ref()
+                    .map(|details| details.reasoning_tokens),
+            };
+            serving_token.set_usage(flow_usage);
+            if let Some(api_call_id) = api_call_id.as_deref() {
+                self.flow_store().record_usage(api_call_id, flow_usage);
+            }
+        }
+        let is_incomplete = terminal.event == "response.incomplete";
+        if !is_incomplete
+            && !output
+                .iter()
+                .any(|item| matches!(item, ResponseItem::FunctionCall { .. }))
+        {
+            validate_structured_output(request.text.as_ref(), &output)?;
+        }
+        let mut history = request.input.clone();
+        history.extend(output.clone());
+        let tracker_history = history.clone();
+        if request.store {
+            let served_model = serving_token
+                .metrics_snapshot()
+                .0
+                .unwrap_or_else(|| backend.model.clone());
+            let store = Arc::clone(&self.response_store);
+            let response_id_for_prepare = response_id.clone();
+            let requested_model = request.model.clone();
+            let created_at = response_template.created_at;
+            let mut prepare_task = tokio::spawn(async move {
+                store
+                    .prepare(
+                        response_id_for_prepare,
+                        requested_model,
+                        served_model,
+                        history,
+                        created_at,
+                    )
+                    .await
+            });
+            let prepared = tokio::select! {
+                biased;
+                _ = tx.closed() => None,
+                _ = abort_token.cancelled() => None,
+                result = &mut prepare_task => Some(result),
+            };
+            let Some(prepared) = prepared else {
+                let store = Arc::clone(&self.response_store);
+                let cancelled_id = response_id.clone();
+                tokio::spawn(async move {
+                    let _ = prepare_task.await;
+                    discard_response_state(store, cancelled_id).await;
+                });
+                return Err(AppError::cancelled());
+            };
+            prepared
+                .map_err(|error| {
+                    AppError::internal(format!("response-store worker failed: {error}"))
+                })?
+                .map_err(|error| {
+                    AppError::internal(format!("failed to persist response state: {error}"))
+                })?;
+            if tx.is_closed() || abort_token.is_cancelled() {
+                discard_response_state(Arc::clone(&self.response_store), response_id.clone()).await;
+                return Err(AppError::cancelled());
+            }
+            let store = Arc::clone(&self.response_store);
+            let publish_response_id = response_id.clone();
+            let mut publish_task =
+                tokio::spawn(async move { store.publish(&publish_response_id).await });
+            let published = tokio::select! {
+                biased;
+                _ = tx.closed() => None,
+                _ = abort_token.cancelled() => None,
+                result = &mut publish_task => Some(result),
+            };
+            let Some(published) = published else {
+                publish_task.abort();
+                let store = Arc::clone(&self.response_store);
+                let cancelled_id = response_id.clone();
+                tokio::spawn(async move {
+                    let _ = publish_task.await;
+                    discard_response_state(store, cancelled_id).await;
+                });
+                return Err(AppError::cancelled());
+            };
+            published
+                .map_err(|error| {
+                    AppError::internal(format!("response-store worker failed: {error}"))
+                })?
+                .map_err(|error| {
+                    AppError::internal(format!("failed to publish response state: {error}"))
+                })?;
+            if tx.is_closed() || abort_token.is_cancelled() {
+                discard_response_state(Arc::clone(&self.response_store), response_id.clone()).await;
+                return Err(AppError::cancelled());
+            }
+        }
+        {
+            let mut tracker = self
+                .native_turn_tracker
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tracker.complete(
+                &backend.model,
+                &request.instructions,
+                &identity,
+                &tracker_history,
+                &output,
+            );
+        }
+        response_template.completed_at = (!is_incomplete).then(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        });
+        response_template.status = if is_incomplete {
+            "incomplete".to_string()
+        } else {
+            "completed".to_string()
+        };
+        response_template.output = output;
+        response_template.usage = usage;
+        response_template.service_tier = provider_response
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        response_template.incomplete_details = if is_incomplete {
+            Some(crate::models::responses::IncompleteDetails {
+                reason: provider_response
+                    .get("incomplete_details")
+                    .and_then(Value::as_object)
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("max_output_tokens")
+                    .to_string(),
+            })
+        } else {
+            None
+        };
+        let incomplete_reason = response_template
+            .incomplete_details
+            .as_ref()
+            .map(|details| details.reason.as_str());
+        response_template.terminal_reason = Some(
+            if response_template
+                .output
+                .iter()
+                .any(|item| matches!(item, ResponseItem::FunctionCall { .. }))
+            {
+                crate::models::responses::TerminalReason::ToolCall
+            } else if is_incomplete {
+                match incomplete_reason {
+                    Some("content_filter") => {
+                        crate::models::responses::TerminalReason::ContentFilter
+                    }
+                    Some("max_output_tokens" | "length") => {
+                        crate::models::responses::TerminalReason::Length
+                    }
+                    _ => crate::models::responses::TerminalReason::Other,
+                }
+            } else {
+                crate::models::responses::TerminalReason::Stop
+            },
+        );
+        failure_snapshot.update_output(response_template.output.clone());
+        Ok(if is_incomplete {
+            TurnCompletion::Incomplete {
+                event: incomplete_event(response_template),
+                replay_record: None,
+            }
+        } else {
+            TurnCompletion::Completed {
+                event: completed_event(response_template),
+                replay_record: None,
+            }
+        })
     }
 
     pub(crate) fn apply_system_prompt_prefix(
@@ -5256,6 +6281,34 @@ fn trailing_tool_output_items(input: &[ResponseItem]) -> Vec<&ResponseItem> {
     items
 }
 
+/// Function outputs in the maximal current-user suffix.
+///
+/// User messages may precede or follow a tool result in one Anthropic message,
+/// while any assistant/model item starts an older history region. Native Codex
+/// continuation lookup must therefore skip adjacent user text without scanning
+/// across a completed assistant turn.
+fn native_current_user_function_output_ids(input: &[ResponseItem]) -> Vec<&str> {
+    let suffix_start = input
+        .iter()
+        .rposition(|item| match item {
+            ResponseItem::Message { role, .. } => role != "user",
+            ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
+                false
+            }
+            _ => true,
+        })
+        .map_or(0, |index| index + 1);
+
+    input[suffix_start..]
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::FunctionCallOutput { call_id, .. }
+            | ResponseItem::CustomToolCallOutput { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn is_tool_output_item(item: &ResponseItem) -> bool {
     matches!(
         item,
@@ -5281,12 +6334,18 @@ fn preview_text(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::NATIVE_TURN_TRACKER_MAX_IDENTITIES_PER_KEY;
+    use super::NATIVE_TURN_TRACKER_TTL;
+    use super::NativeTurnIdentity;
+    use super::NativeTurnTracker;
     use super::extract_data_image;
+    use super::native_current_user_function_output_ids;
     use super::preview_json;
     use super::preview_json_limited_with_images;
     use super::preview_text;
     use super::response_resource_template;
     use super::trailing_tool_output_items;
+    use crate::models::responses::ResponseInstructions;
     use crate::models::responses::ResponseItem;
     use crate::models::responses::ResponsesRequest;
     use pretty_assertions::assert_eq;
@@ -5444,6 +6503,143 @@ mod tests {
                 ..
             } if call_id == "search"
         ));
+    }
+
+    #[test]
+    fn native_current_user_suffix_allows_text_and_fences_historical_outputs() {
+        let current = vec![
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "lookup".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: "call_live".to_string(),
+            },
+            ResponseItem::FunctionCallOutput {
+                call_id: "call_live".to_string(),
+                output: json!("42").into(),
+            },
+            ResponseItem::CustomToolCallOutput {
+                call_id: "call_custom".to_string(),
+                name: Some("custom".to_string()),
+                output: json!("ok").into(),
+            },
+            ResponseItem::message_text("user", "Use that result."),
+        ];
+        assert_eq!(
+            native_current_user_function_output_ids(&current),
+            ["call_live", "call_custom"]
+        );
+
+        let historical = vec![
+            ResponseItem::FunctionCallOutput {
+                call_id: "call_old".to_string(),
+                output: json!("42").into(),
+            },
+            ResponseItem::message_text("user", "Use that result."),
+            ResponseItem::message_text("assistant", "Done."),
+            ResponseItem::message_text("user", "Start a new turn."),
+        ];
+        assert!(native_current_user_function_output_ids(&historical).is_empty());
+    }
+
+    #[test]
+    fn native_turn_tracker_bounds_colliding_identities_and_preserves_ttl_resolution() {
+        let mut tracker = NativeTurnTracker::default();
+        let instructions = ResponseInstructions::default();
+        let call = ResponseItem::FunctionCall {
+            id: Some("fc_repeat".to_string()),
+            name: "repeat".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "call_repeat".to_string(),
+        };
+        let history = vec![
+            ResponseItem::message_text("user", "same prompt"),
+            call.clone(),
+        ];
+        let output = vec![call];
+
+        for index in 0..10_000 {
+            tracker.complete(
+                "model",
+                &instructions,
+                &NativeTurnIdentity {
+                    conversation_id: format!("conversation-{index}"),
+                    turn_id: format!("turn-{index}"),
+                },
+                &history,
+                &output,
+            );
+        }
+
+        assert_eq!(tracker.by_call_id.len(), 1);
+        assert_eq!(tracker.by_history.len(), 1);
+        assert!(
+            tracker
+                .by_call_id
+                .values()
+                .all(|entries| entries.len() <= NATIVE_TURN_TRACKER_MAX_IDENTITIES_PER_KEY)
+        );
+        assert!(
+            tracker
+                .by_history
+                .values()
+                .all(|entries| entries.len() <= NATIVE_TURN_TRACKER_MAX_IDENTITIES_PER_KEY)
+        );
+
+        let conflict = tracker
+            .begin(
+                "model",
+                &instructions,
+                &[ResponseItem::FunctionCallOutput {
+                    call_id: "call_repeat".to_string(),
+                    output: json!("done").into(),
+                }],
+            )
+            .expect_err("two recent identities remain ambiguous");
+        assert_eq!(conflict.status, http::StatusCode::CONFLICT);
+        assert_eq!(conflict.code.as_deref(), Some("turn_state_conflict"));
+
+        let expired_at = std::time::Instant::now()
+            .checked_sub(NATIVE_TURN_TRACKER_TTL + std::time::Duration::from_secs(1))
+            .unwrap();
+        for entries in tracker
+            .by_call_id
+            .values_mut()
+            .chain(tracker.by_history.values_mut())
+        {
+            entries[0].touched_at = expired_at;
+        }
+        tracker.prune();
+        assert!(
+            tracker
+                .by_call_id
+                .values()
+                .all(|entries| entries.len() == 1)
+        );
+        assert!(
+            tracker
+                .by_history
+                .values()
+                .all(|entries| entries.len() == 1)
+        );
+
+        let survivor = tracker.by_call_id.values().next().unwrap()[0]
+            .identity
+            .clone();
+        let (resolved, continuation) = tracker
+            .begin(
+                "model",
+                &instructions,
+                &[ResponseItem::FunctionCallOutput {
+                    call_id: "call_repeat".to_string(),
+                    output: json!("done").into(),
+                }],
+            )
+            .expect("the sole unexpired identity resolves again");
+        assert!(continuation);
+        assert_eq!(resolved, survivor);
     }
 
     use super::AccumulatedUsage;
@@ -6454,6 +7650,392 @@ fn response_resource_template(
     }
 }
 
+pub(crate) fn native_responses_request_body(
+    request: &ResponsesRequest,
+    served_model: &str,
+) -> AppResult<Value> {
+    if request.tool_choice != Value::String("auto".to_string()) {
+        return Err(AppError::bad_request(
+            "the native Codex subscription provider currently supports tool_choice=auto only",
+        )
+        .with_code("unsupported_parameter")
+        .with_param("tool_choice"));
+    }
+    let mut input = request.input.clone();
+    let instructions = match &request.instructions {
+        crate::models::responses::ResponseInstructions::Text(text) => text.clone(),
+        crate::models::responses::ResponseInstructions::Items(items) => {
+            let mut prefixed = items.clone();
+            prefixed.extend(input);
+            input = prefixed;
+            String::new()
+        }
+    };
+    let mut body = serde_json::Map::new();
+    body.insert("model".to_string(), Value::String(served_model.to_string()));
+    body.insert("instructions".to_string(), Value::String(instructions));
+    body.insert(
+        "input".to_string(),
+        serde_json::to_value(input).map_err(|error| {
+            AppError::internal(format!("failed to serialize Responses input: {error}"))
+        })?,
+    );
+    body.insert(
+        "tools".to_string(),
+        serde_json::to_value(&request.tools).map_err(|error| {
+            AppError::internal(format!("failed to serialize Responses tools: {error}"))
+        })?,
+    );
+    body.insert("tool_choice".to_string(), Value::String("auto".to_string()));
+    body.insert(
+        "parallel_tool_calls".to_string(),
+        // gpt-5.6-sol is currently served through Codex Responses-Lite,
+        // whose own client forces this false even when model metadata says
+        // parallel calls are generally available.
+        Value::Bool(false),
+    );
+    if let Some(reasoning) = &request.reasoning {
+        body.insert(
+            "reasoning".to_string(),
+            serde_json::to_value(reasoning).map_err(|error| {
+                AppError::internal(format!("failed to serialize Responses reasoning: {error}"))
+            })?,
+        );
+    }
+    body.insert("store".to_string(), Value::Bool(false));
+    body.insert("stream".to_string(), Value::Bool(true));
+    body.insert(
+        "include".to_string(),
+        Value::Array(vec![Value::String(
+            "reasoning.encrypted_content".to_string(),
+        )]),
+    );
+    if let Some(service_tier) = &request.service_tier {
+        body.insert(
+            "service_tier".to_string(),
+            Value::String(service_tier.clone()),
+        );
+    }
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        body.insert(
+            "max_output_tokens".to_string(),
+            Value::Number(max_output_tokens.into()),
+        );
+    }
+    if let Some(text) = &request.text {
+        body.insert(
+            "text".to_string(),
+            serde_json::to_value(text).map_err(|error| {
+                AppError::internal(format!(
+                    "failed to serialize Responses text controls: {error}"
+                ))
+            })?,
+        );
+    }
+    Ok(Value::Object(body))
+}
+
+fn unsupported_native_responses_parameter(request: &ResponsesRequest) -> Option<String> {
+    if request.temperature.is_some() {
+        return Some("temperature".to_string());
+    }
+    if request.top_p.is_some() {
+        return Some("top_p".to_string());
+    }
+    if request.frequency_penalty.is_some() {
+        return Some("frequency_penalty".to_string());
+    }
+    if request.presence_penalty.is_some() {
+        return Some("presence_penalty".to_string());
+    }
+    if request.stop.is_some() {
+        return Some("stop".to_string());
+    }
+    if request.truncation.as_ref().is_some_and(
+        |truncation| !matches!(truncation, Value::String(value) if value == "disabled"),
+    ) {
+        return Some("truncation".to_string());
+    }
+    request
+        .extra_body
+        .keys()
+        .find(|key| {
+            !matches!(
+                key.as_str(),
+                crate::responses_capabilities::PROMPT_CACHE_AFFINITY_EXTENSION
+                    | crate::responses_capabilities::FORWARD_PROMPT_CACHE_KEY_EXTENSION
+            )
+        })
+        .cloned()
+}
+
+fn normalize_native_response_id(data: &mut Value, response_id: &str) {
+    if let Some(object) = data.as_object_mut() {
+        if object.contains_key("response_id") {
+            object.insert(
+                "response_id".to_string(),
+                Value::String(response_id.to_string()),
+            );
+        }
+        if let Some(response) = object.get_mut("response").and_then(Value::as_object_mut) {
+            response.insert("id".to_string(), Value::String(response_id.to_string()));
+        }
+    }
+}
+
+fn native_responses_event_is_supported(event: &str) -> bool {
+    matches!(
+        event,
+        "response.created"
+            | "response.metadata"
+            | "response.in_progress"
+            | "response.completed"
+            | "response.incomplete"
+            | "response.failed"
+            | "response.output_item.added"
+            | "response.output_item.done"
+            | "response.content_part.added"
+            | "response.content_part.done"
+            | "response.output_text.delta"
+            | "response.output_text.done"
+            | "response.refusal.delta"
+            | "response.refusal.done"
+            | "response.reasoning_text.delta"
+            | "response.reasoning_text.done"
+            | "response.reasoning_summary_part.added"
+            | "response.reasoning_summary_part.done"
+            | "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary_text.done"
+            | "response.function_call_arguments.delta"
+            | "response.function_call_arguments.done"
+    )
+}
+
+fn validate_native_function_item(
+    registry: &crate::adapters::responses_to_chat::ToolRegistry,
+    item: &ResponseItem,
+) -> AppResult<()> {
+    let ResponseItem::FunctionCall {
+        id,
+        name,
+        arguments,
+        call_id,
+        ..
+    } = item
+    else {
+        return Err(AppError::internal(
+            "native function validator received a non-function item",
+        ));
+    };
+    id.as_ref().ok_or_else(|| {
+        AppError::upstream("native Responses function call omitted its item id")
+            .with_code("invalid_tool_call")
+    })?;
+    if call_id.is_empty() {
+        return Err(
+            AppError::upstream("native Responses function call omitted its call_id")
+                .with_code("invalid_tool_call"),
+        );
+    }
+    match registry.get(&name.to_ascii_lowercase()) {
+        Some(ToolKind::Function { public_name, .. }) if public_name == name => {}
+        Some(ToolKind::Function { .. }) => {
+            return Err(AppError::upstream(
+                "native Responses function name did not match the offered name",
+            )
+            .with_code("invalid_tool_call"));
+        }
+        _ => {
+            return Err(AppError::upstream(format!(
+                "native Responses provider called unoffered function {name}"
+            ))
+            .with_code("invalid_tool_call"));
+        }
+    }
+    let argument_value: Value = serde_json::from_str(arguments).map_err(|_| {
+        AppError::upstream(format!(
+            "native Responses provider returned malformed arguments for function {name}"
+        ))
+        .with_code("invalid_tool_call")
+    })?;
+    registry.validate_function_arguments(name, &argument_value)?;
+    Ok(())
+}
+
+fn prepare_native_projection(
+    projection: crate::adapters::codex_private_responses::Projection,
+    registry: &crate::adapters::responses_to_chat::ToolRegistry,
+    call_ids: &mut HashSet<String>,
+) -> AppResult<(
+    Vec<SseEvent>,
+    Vec<crate::adapters::codex_private_responses::CompletedOutputItem>,
+)> {
+    let mut reasoning_signatures = HashMap::new();
+    for completed in &projection.completed_items {
+        match &completed.item {
+            ResponseItem::FunctionCall { call_id, .. } => {
+                validate_native_function_item(registry, &completed.item)?;
+                if !call_ids.insert(call_id.clone()) {
+                    return Err(AppError::upstream(
+                        "native Responses stream reused a function call_id",
+                    )
+                    .with_code("invalid_tool_call"));
+                }
+            }
+            ResponseItem::Reasoning {
+                id,
+                encrypted_content: Some(signature),
+                ..
+            } => {
+                reasoning_signatures.insert(
+                    completed.output_index,
+                    reasoning_signature_delta_event(
+                        id.clone(),
+                        completed.output_index,
+                        signature.clone(),
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut events = Vec::with_capacity(
+        projection
+            .events
+            .len()
+            .saturating_add(reasoning_signatures.len()),
+    );
+    for event in projection.events {
+        if event.event == "response.output_item.done"
+            && let Some(output_index) = event
+                .data
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+            && let Some(signature) = reasoning_signatures.remove(&output_index)
+        {
+            events.push(signature);
+        }
+        events.push(SseEvent {
+            event: event.event,
+            data: event.data,
+        });
+    }
+    if !reasoning_signatures.is_empty() {
+        return Err(AppError::internal(
+            "native reasoning signature had no completed output item event",
+        ));
+    }
+    Ok((events, projection.completed_items))
+}
+
+fn native_output_items_equivalent(streamed: &ResponseItem, terminal: &ResponseItem) -> bool {
+    match (streamed, terminal) {
+        (
+            ResponseItem::Message {
+                role: left_role,
+                content: left_content,
+                phase: left_phase,
+                ..
+            },
+            ResponseItem::Message {
+                role: right_role,
+                content: right_content,
+                phase: right_phase,
+                ..
+            },
+        ) => left_role == right_role && left_content == right_content && left_phase == right_phase,
+        (
+            ResponseItem::Reasoning {
+                summary: left_summary,
+                content: left_content,
+                encrypted_content: left_encrypted,
+                ..
+            },
+            ResponseItem::Reasoning {
+                summary: right_summary,
+                content: right_content,
+                encrypted_content: right_encrypted,
+                ..
+            },
+        ) => {
+            left_summary == right_summary
+                && left_content == right_content
+                && left_encrypted == right_encrypted
+        }
+        (
+            ResponseItem::FunctionCall {
+                name: left_name,
+                namespace: left_namespace,
+                arguments: left_arguments,
+                call_id: left_call_id,
+                ..
+            },
+            ResponseItem::FunctionCall {
+                name: right_name,
+                namespace: right_namespace,
+                arguments: right_arguments,
+                call_id: right_call_id,
+                ..
+            },
+        ) => {
+            left_name == right_name
+                && left_namespace == right_namespace
+                && left_call_id == right_call_id
+                && serde_json::from_str::<Value>(left_arguments).ok()
+                    == serde_json::from_str::<Value>(right_arguments).ok()
+        }
+        _ => streamed == terminal,
+    }
+}
+
+fn native_response_usage(value: &Value) -> AppResult<ResponseUsage> {
+    let malformed = || {
+        AppError::upstream("native Responses terminal usage was malformed")
+            .with_code("malformed_upstream_response")
+    };
+    let usage = value.as_object().ok_or_else(malformed)?;
+    let input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or_else(malformed)?;
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or_else(malformed)?;
+    // Provider totals are authoritative accounting data. Never manufacture a
+    // total from input + output when the private backend omitted it.
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .ok_or_else(malformed)?;
+    let input_tokens_details = usage
+        .get("input_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .map(|cached_tokens| ResponseInputTokensDetails { cached_tokens });
+    let output_tokens_details = usage
+        .get("output_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+        .map(|reasoning_tokens| ResponseOutputTokensDetails { reasoning_tokens });
+    Ok(ResponseUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        input_tokens_details,
+        output_tokens_details,
+    })
+}
+
 fn failure_event(error: &AppError, mut response: ResponseResource) -> SseEvent {
     response.status = "failed".to_string();
     response.completed_at = None;
@@ -6464,13 +8046,26 @@ fn failure_event(error: &AppError, mut response: ResponseResource) -> SseEvent {
             .unwrap_or_else(|| "gateway_error".to_string()),
         message: error.client_message.clone(),
     });
-    json_event(
+    let mut event = json_event(
         "response.failed",
         ResponsesEnvelope {
             kind: "response.failed".to_string(),
             payload: FailedPayload { response },
         },
-    )
+    );
+    if let Some(object) = event.data.as_object_mut() {
+        object.insert(
+            "llmconduit_error_status".to_string(),
+            Value::from(error.status.as_u16()),
+        );
+        if let Some(param) = &error.param {
+            object.insert(
+                "llmconduit_error_param".to_string(),
+                Value::String(param.clone()),
+            );
+        }
+    }
+    event
 }
 
 fn in_progress_event(mut response: ResponseResource) -> SseEvent {

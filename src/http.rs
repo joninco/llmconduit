@@ -5,6 +5,7 @@ use crate::adapters::chat_completions::ChatCompletionStreamConverter;
 use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
 use crate::adapters::responses_to_chat;
+use crate::config::UpstreamWireApi;
 use crate::dashboard_api::dashboard_catalog;
 use crate::dashboard_api::dashboard_durability;
 use crate::dashboard_api::dashboard_flow_detail;
@@ -1808,12 +1809,6 @@ async fn handle_count_tokens(
     gateway: Arc<Gateway>,
     request: AnthropicRequest,
 ) -> AppResult<Response> {
-    use crate::engine::TokenizeCapability;
-
-    if gateway.tokenize_capability() == TokenizeCapability::Unsupported {
-        return Err(AppError::not_found("upstream does not support /tokenize"));
-    }
-
     let original_model = request.model.clone();
     let mut responses_request = anthropic_to_responses::convert_request(request)?;
     // Counting input tokens never reserves or generates output, so the
@@ -1821,6 +1816,15 @@ async fn handle_count_tokens(
     responses_request.max_output_tokens = None;
     let resolved_model = gateway.resolve_request_model(&original_model).await.0;
     let responses_request = gateway.apply_system_prompt_prefix(responses_request, &resolved_model);
+    if gateway
+        .upstream_client()
+        .wire_api_for_model(&resolved_model)
+        .await?
+        == UpstreamWireApi::CodexResponses
+    {
+        let count = estimate_native_responses_input_tokens(&responses_request, &resolved_model)?;
+        return Ok(token_count_response(count, "estimated"));
+    }
     let roles = gateway
         .config()
         .resolve_roles_config_for_resolved_model(&original_model, &resolved_model);
@@ -1862,19 +1866,59 @@ async fn handle_count_tokens(
     .with_thinking_override(thinking_override);
 
     match gateway.upstream_client().count_tokens(&backend).await {
-        Ok(Some(count)) => {
-            gateway.set_tokenize_capability(TokenizeCapability::Supported);
-            Ok((
-                StatusCode::OK,
-                Json(serde_json::json!({ "input_tokens": count })),
-            )
-                .into_response())
-        }
-        Ok(None) | Err(_) => {
-            gateway.set_tokenize_capability(TokenizeCapability::Unsupported);
-            Err(AppError::not_found("upstream does not support /tokenize"))
-        }
+        Ok(Some(count)) => Ok(token_count_response(count, "exact")),
+        Ok(None) | Err(_) => Err(AppError::not_found("upstream does not support /tokenize")),
     }
+}
+
+/// Native Codex subscription providers expose no token-count endpoint. Return
+/// a deliberately approximate, locally computed count instead of performing a
+/// model generation merely to learn usage. The projection is the exact native
+/// Responses body sent by the gateway; three serialized UTF-8 bytes per token
+/// is more conservative than the gateway's ordinary four-byte streaming hint,
+/// and a fixed allowance covers the sidecar's developer/tool envelope.
+///
+/// This is not claimed to be a tokenizer upper bound. The additive response
+/// header makes the quality explicit to callers while preserving Anthropic's
+/// required `{input_tokens}` body shape.
+fn estimate_native_responses_input_tokens(
+    request: &ResponsesRequest,
+    resolved_model: &str,
+) -> AppResult<u64> {
+    let body = crate::engine::native_responses_request_body(request, resolved_model)?;
+    let serialized_bytes = crate::engine::serialized_json_size(&body).map_err(|error| {
+        AppError::internal(format!(
+            "failed to size native Responses token-count estimate: {error}"
+        ))
+    })?;
+    Ok(native_token_estimate_from_serialized_bytes(
+        serialized_bytes,
+    ))
+}
+
+fn native_token_estimate_from_serialized_bytes(serialized_bytes: usize) -> u64 {
+    const ESTIMATE_BYTES_PER_TOKEN: u64 = 3;
+    const SIDECAR_ENVELOPE_TOKENS: u64 = 64;
+
+    u64::try_from(serialized_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(ESTIMATE_BYTES_PER_TOKEN - 1)
+        .checked_div(ESTIMATE_BYTES_PER_TOKEN)
+        .unwrap_or(u64::MAX)
+        .saturating_add(SIDECAR_ENVELOPE_TOKENS)
+}
+
+fn token_count_response(count: u64, quality: &'static str) -> Response {
+    let mut response = (
+        StatusCode::OK,
+        Json(serde_json::json!({ "input_tokens": count })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("x-llmconduit-token-count-quality"),
+        HeaderValue::from_static(quality),
+    );
+    response
 }
 
 async fn post_chat_completions(
@@ -2657,6 +2701,33 @@ fn normalize_response_resource_for_wire(
     object
         .entry("metadata".to_string())
         .or_insert_with(|| Value::Object(Default::default()));
+    // The public Responses schema requires both usage detail objects whenever
+    // usage is present. Keep the internal `Option` values untouched so
+    // observability can distinguish an unreported class from a measured zero;
+    // only the public projection supplies the schema-required zero default.
+    if let Some(usage) = object.get_mut("usage").and_then(Value::as_object_mut) {
+        let input_details = usage
+            .entry("input_tokens_details".to_string())
+            .or_insert_with(|| serde_json::json!({ "cached_tokens": 0 }));
+        if input_details.is_null() {
+            *input_details = serde_json::json!({ "cached_tokens": 0 });
+        } else if let Some(details) = input_details.as_object_mut() {
+            details
+                .entry("cached_tokens".to_string())
+                .or_insert_with(|| Value::from(0));
+        }
+
+        let output_details = usage
+            .entry("output_tokens_details".to_string())
+            .or_insert_with(|| serde_json::json!({ "reasoning_tokens": 0 }));
+        if output_details.is_null() {
+            *output_details = serde_json::json!({ "reasoning_tokens": 0 });
+        } else if let Some(details) = output_details.as_object_mut() {
+            details
+                .entry("reasoning_tokens".to_string())
+                .or_insert_with(|| Value::from(0));
+        }
+    }
     let output_status = match object.get("status").and_then(Value::as_str) {
         Some("failed" | "incomplete") => "incomplete",
         _ => "completed",
@@ -2743,6 +2814,7 @@ fn is_public_responses_event(
 ) -> bool {
     match event.event.as_str() {
         "response.reasoning_text.delta"
+        | "response.reasoning_text.done"
         | "response.reasoning_summary_text.signature_delta"
         | "response.web_search_results" => false,
         "response.reasoning_summary_part.added"
@@ -3237,17 +3309,111 @@ mod tests {
     use super::anthropic_error_response;
     use super::anthropic_error_type;
     use super::body_log_fields;
+    use super::estimate_native_responses_input_tokens;
+    use super::is_public_responses_event;
+    use super::native_token_estimate_from_serialized_bytes;
     use super::parse_responses_request;
     use super::payload_logging_enabled;
     use super::responses_wire_event_data;
     use super::responses_wire_event_data_inner;
     use super::should_proxy_response_header;
+    use crate::models::responses::ResponsesRequest;
     use axum::body::Bytes;
     use axum::http::{HeaderName, StatusCode};
     use axum::response::IntoResponse as _;
     use http_body_util::BodyExt as _;
     use sha2::Digest as _;
     use std::time::Duration;
+
+    #[test]
+    fn private_reasoning_text_delta_and_done_never_reach_responses_wire() {
+        for event_name in [
+            "response.reasoning_text.delta",
+            "response.reasoning_text.done",
+        ] {
+            let event = crate::engine::SseEvent {
+                event: event_name.to_string(),
+                data: serde_json::json!({
+                    "type": event_name,
+                    "text": "sentinel-hidden-reasoning"
+                }),
+            };
+            assert!(!is_public_responses_event(&event, true));
+        }
+    }
+
+    fn native_count_request(input: &str, tools: serde_json::Value) -> ResponsesRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "gpt-5.6-sol",
+            "input": input,
+            "tools": tools,
+            "tool_choice": "auto",
+            "store": false
+        }))
+        .expect("valid native count request")
+    }
+
+    #[test]
+    fn native_token_estimate_accounts_for_unicode_bytes_and_sidecar_envelope() {
+        let ascii = native_count_request(&"a".repeat(32), serde_json::json!([]));
+        let unicode = native_count_request(&"🦀".repeat(32), serde_json::json!([]));
+        let ascii_count =
+            estimate_native_responses_input_tokens(&ascii, "gpt-5.6-sol").expect("estimate");
+        let unicode_count =
+            estimate_native_responses_input_tokens(&unicode, "gpt-5.6-sol").expect("estimate");
+
+        assert!(
+            ascii_count >= 64,
+            "the sidecar envelope is always represented"
+        );
+        assert!(
+            unicode_count > ascii_count,
+            "the estimate must count serialized UTF-8 bytes, not Unicode scalar values"
+        );
+    }
+
+    #[test]
+    fn native_token_estimate_includes_tool_schema_and_saturates() {
+        let without_tools = native_count_request("hello", serde_json::json!([]));
+        let with_tools = native_count_request(
+            "hello",
+            serde_json::json!([{
+                "type": "function",
+                "name": "configure_environment",
+                "description": "Configure environment variables",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "variables": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"}
+                        }
+                    },
+                    "required": ["variables"],
+                    "additionalProperties": false
+                }
+            }]),
+        );
+        let without = estimate_native_responses_input_tokens(&without_tools, "gpt-5.6-sol")
+            .expect("estimate");
+        let with =
+            estimate_native_responses_input_tokens(&with_tools, "gpt-5.6-sol").expect("estimate");
+
+        assert!(
+            with > without,
+            "tool schemas are part of native prompt input"
+        );
+        assert_eq!(
+            native_token_estimate_from_serialized_bytes(usize::MAX),
+            u64::try_from(usize::MAX)
+                .unwrap_or(u64::MAX)
+                .saturating_add(2)
+                .checked_div(3)
+                .unwrap_or(u64::MAX)
+                .saturating_add(64)
+        );
+    }
 
     #[tokio::test]
     async fn anthropic_error_response_never_exposes_operator_diagnostics() {
@@ -3678,6 +3844,33 @@ mod tests {
             serde_json::from_str(&responses_wire_event_data(&event)).unwrap();
         assert!(projected.get("llmconduit_error_status").is_none());
         assert!(projected.get("llmconduit_error_param").is_none());
+    }
+
+    #[test]
+    fn responses_wire_supplies_required_zero_usage_details_when_unreported() {
+        let event = crate::engine::SseEvent {
+            event: "response.completed".to_string(),
+            data: serde_json::json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"resp_1",
+                    "status":"completed",
+                    "usage":{
+                        "input_tokens":11,
+                        "output_tokens":3,
+                        "total_tokens":14
+                    }
+                }
+            }),
+        };
+        let projected: serde_json::Value =
+            serde_json::from_str(&responses_wire_event_data(&event)).unwrap();
+        let usage = &projected["response"]["usage"];
+        assert_eq!(usage["input_tokens"], 11);
+        assert_eq!(usage["output_tokens"], 3);
+        assert_eq!(usage["total_tokens"], 14);
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 0);
     }
 
     #[test]

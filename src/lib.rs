@@ -194,7 +194,10 @@ pub fn build_app_with_gateway_and_options(
     let request_timeout = config.request_timeout;
     let upstream_request_log_body_mode = config.upstream_request_log_body_mode;
     let make_upstream_client =
-        |base_url: url::Url, api_key: Option<String>, log_path: Option<std::path::PathBuf>| {
+        |base_url: url::Url,
+         api_key: Option<String>,
+         log_path: Option<std::path::PathBuf>,
+         wire_api: crate::config::UpstreamWireApi| {
             ReqwestUpstreamClient::with_options(
                 http_client.clone(),
                 base_url,
@@ -204,6 +207,7 @@ pub fn build_app_with_gateway_and_options(
                 min_completion_tokens,
                 max_sse_frame_bytes,
             )
+            .with_wire_api(wire_api)
             .with_finalization_policies(finalization_policies.clone())
             .with_request_timeout(request_timeout)
             .with_request_log_body_mode(upstream_request_log_body_mode)
@@ -221,6 +225,7 @@ pub fn build_app_with_gateway_and_options(
                     provider.upstream_base_url.clone(),
                     provider.upstream_api_key.clone(),
                     provider.upstream_request_log_path.clone(),
+                    provider.wire_api,
                 )
                 .with_responses_capabilities(
                     provider.responses_capabilities.clone().unwrap_or_default(),
@@ -235,6 +240,7 @@ pub fn build_app_with_gateway_and_options(
                                 fallback.upstream_base_url.clone(),
                                 fallback.upstream_api_key.clone(),
                                 fallback.upstream_request_log_path.clone(),
+                                fallback.wire_api,
                             )
                             .with_responses_capabilities(
                                 fallback.responses_capabilities.clone().unwrap_or_default(),
@@ -266,6 +272,7 @@ pub fn build_app_with_gateway_and_options(
                 route.upstream_base_url.clone(),
                 config.upstream_api_key.clone(),
                 config.upstream_request_log_path.clone(),
+                crate::config::UpstreamWireApi::ChatCompletions,
             );
             route_providers.push(RouteUpstreamProvider::new(
                 format!("route-{}", route.name),
@@ -289,6 +296,7 @@ pub fn build_app_with_gateway_and_options(
             config.upstream_base_url.clone(),
             config.upstream_api_key.clone(),
             config.upstream_request_log_path.clone(),
+            crate::config::UpstreamWireApi::ChatCompletions,
         );
         if config.fallback_upstreams.is_empty() {
             // D2: the BARE leaf is the engine's upstream directly — no routing/
@@ -310,6 +318,7 @@ pub fn build_app_with_gateway_and_options(
                         provider.upstream_base_url.clone(),
                         provider.upstream_api_key.clone(),
                         provider.upstream_request_log_path.clone(),
+                        provider.wire_api,
                     )
                     .with_responses_capabilities(
                         provider.responses_capabilities.clone().unwrap_or_default(),

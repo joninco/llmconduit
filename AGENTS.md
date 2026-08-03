@@ -116,6 +116,12 @@ and HTTP 200 from `/v1/models`.
 | `src/models/` | `responses.rs`, `chat.rs`, `anthropic.rs` wire types |
 | `tests/gateway.rs` | Integration tests with `MockUpstream`, `MockSearch`, `PendingChunkUpstream` + wiremock |
 
+The experimental ChatGPT-subscription path uses the sibling
+`../codex-subscription-proxy` process and provider `wire_api: codex_responses` (legacy ingress alias:
+`responses`). It is a pinned Codex Responses-Lite transport, not a generic OpenAI Responses
+upstream. Private sparse SSE is normalized by `adapters/codex_private_responses.rs`; do not bypass
+that projector or forward the private event dialect directly.
+
 ## Canonical protocol
 
 OpenAI Responses is the **single canonical internal protocol**. All inbound shapes convert in via adapters; all outbound shapes convert out via streaming converters. Do not add direct adapters between non-canonical shapes — go through Responses.
@@ -150,6 +156,8 @@ These are intentional and load-bearing. Do not change without strong reason + ma
 - **`OPENAI_MAX_STOP_SEQUENCES = 4`** in `chat.rs:81`. Returns 400 — do not silently truncate.
 - **`API_LOG_BODY_LIMIT_BYTES` / `API_LOG_PAYLOAD_DUMP_LIMIT_BYTES`** in `http.rs:51-52`. Don't bypass.
 - **Failover only pre-first-chunk** (`upstream.rs:407-419`). Mid-stream provider failure surfaces as error — never retry, never duplicate tokens.
+- **A failover chain cannot mix Chat Completions and Codex Responses-Lite wire protocols.** Native
+  private-turn conflicts are terminal and never fail over or cool a provider.
 - **Routing providers are not failure fallbacks.** With explicit `upstreams`, only the selected upstream's nested `fallback_upstreams` are failover candidates. Never fail over to the next routing upstream just because the selected provider failed.
 - **`web_search` tool stripped from request when `brave_api_key` is unset.** Engine also relaxes `tool_choice` to `"auto"` when the only tool was stripped (`engine.rs:1536-1558`).
 - **Provider-side `web_search` is single-purpose.** Runtime execution supports search/query actions only; `open_page`, `find_in_page`, and unknown actions are rejected. Failed/timed-out Brave calls are injected as model-visible text so the turn can complete.

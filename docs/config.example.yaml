@@ -47,6 +47,9 @@
 upstreams:
   - name: "local-vllm"
     upstream_base_url: "http://localhost:8000/v1"
+    # Generation wire protocol: chat_completions (default) or responses.
+    # A failover chain must use one protocol throughout.
+    # wire_api: chat_completions
 
     # Log all requests/responses sent to this upstream (JSONL, append-only).
     upstream_request_log_path: "/var/log/llmconduit/local-vllm.jsonl"
@@ -81,6 +84,20 @@ upstreams:
     # upstream_model: "gpt-4o"                # override request model id
     # upstream_request_log_path: "/var/log/llmconduit/openai.jsonl"
     # fallback_upstreams: []                  # optional nested fallbacks
+
+  # Codex Responses-Lite sidecar example. This path preserves item IDs,
+  # encrypted reasoning, usage, and function-call events without translating
+  # through Chat Completions.
+  # - name: "codex-subscription"
+  #   upstream_base_url: "http://127.0.0.1:5033/v1"
+  #   upstream_api_key: "<dedicated loopback sidecar token>"
+  #   wire_api: codex_responses
+  #   responses_capabilities:
+  #     parallel_tool_calls: false
+  #     structured_outputs: [text, json_schema]
+  #     reasoning_summary: upstream
+  #     encrypted_reasoning: passthrough
+  #     input_image: reject
 
 # ---------------------------------------------------------------------------
 # AD-HOC MODEL ROUTES (G7)

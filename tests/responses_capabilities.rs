@@ -895,6 +895,7 @@ async fn responses_capability_pruning_removes_only_incapable_fallbacks() {
         upstream_base_url: format!("{}/v1", primary.uri()).parse().unwrap(),
         upstream_api_key: None,
         upstream_model: None,
+        wire_api: Default::default(),
         upstream_chat_kwargs: Default::default(),
         upstream_request_log_path: None,
         responses_capabilities: Some(ResponsesCapabilitiesConfig {
@@ -907,6 +908,7 @@ async fn responses_capability_pruning_removes_only_incapable_fallbacks() {
             upstream_api_key: None,
             upstream_model: None,
             exposed_model: None,
+            wire_api: Default::default(),
             upstream_chat_kwargs: Default::default(),
             upstream_request_log_path: None,
             responses_capabilities: Some(ResponsesCapabilitiesConfig {

@@ -1775,7 +1775,13 @@ fn validate_schema_node_with_root(
         ("minProperties", &["object"][..]),
         ("maxProperties", &["object"][..]),
     ] {
+        // `format` is OpenAPI/protobuf metadata (int32, int64, byte, ...) that
+        // legitimately applies to non-string types. Only enforce the
+        // keyword-type compatibility table for `format` under strict schemas,
+        // where the IETF-format whitelist above already bounds legal values.
+        let enforce_type_compatibility = strict || keyword != "format";
         if object.contains_key(keyword)
+            && enforce_type_compatibility
             && (schema_types
                 .as_ref()
                 .is_some_and(|types| !types.iter().any(|kind| allowed.contains(kind)))
@@ -2383,6 +2389,18 @@ fn build_tool_registry(specs: &[ToolSpec], image_agent_active: bool) -> AppResul
         by_name,
         strict_function_schemas,
     })
+}
+
+/// Validate the complete public function-tool contract and build the same
+/// registry used by Chat lowering, without lowering the request itself. Native
+/// Responses backends use this to quarantine provider tool events until names,
+/// argument JSON, and strict schemas have all passed the canonical checks.
+pub(crate) fn validate_and_build_native_tool_registry(
+    specs: &[ToolSpec],
+    strict_schema_dialect: StrictSchemaDialect,
+) -> AppResult<ToolRegistry> {
+    validate_tool_schemas(specs, strict_schema_dialect)?;
+    build_tool_registry(specs, false)
 }
 
 pub(crate) fn validate_json_schema_value(
@@ -3168,6 +3186,119 @@ mod tests {
             output_format: None,
         }];
         assert!(validate_request(&req).is_ok());
+    }
+
+    /// Regression: OpenAPI/protobuf `format` values (`int32`, `int64`, `byte`,
+    /// `float`, `double`) legitimately apply to non-string types. A non-strict
+    /// tool schema must NOT be rejected as "format is incompatible with the
+    /// declared schema type" merely because `format` annotates an integer or
+    /// number. claude.ai Gmail/Calendar/Drive MCP connectors ship
+    /// `format:"int32"` integer properties; rejecting them broke every Claude
+    /// Code turn that loaded those connectors.
+    #[test]
+    fn non_strict_format_annotations_on_non_string_types_are_accepted() {
+        let mut req = base_test_request();
+        req.tools = vec![ToolSpec::Function {
+            name: "search".to_string(),
+            description: String::new(),
+            strict: false,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "page_size": { "type": "integer", "format": "int32" },
+                    "ratio": { "type": "number", "format": "double" },
+                    "blob": { "type": "string", "format": "byte" },
+                    "link": { "type": "string", "format": "uri" }
+                },
+                "required": ["page_size"]
+            }),
+        }];
+        assert!(validate_request(&req).is_ok());
+    }
+
+    /// Under strict mode the IETF `format` whitelist still rejects non-standard
+    /// formats like `int32`, so strict schemas continue to fail fast with the
+    /// dedicated "unsupported JSON Schema format" message rather than the
+    /// type-compatibility message.
+    #[test]
+    fn strict_format_int32_rejected_by_whitelist_not_type_compatibility() {
+        let mut req = base_test_request();
+        req.tools = vec![ToolSpec::Function {
+            name: "search".to_string(),
+            description: String::new(),
+            strict: true,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "page_size": { "type": "integer", "format": "int32" }
+                },
+                "required": ["page_size"],
+                "additionalProperties": false
+            }),
+        }];
+        let error = validate_request(&req).expect_err("strict int32 format must be rejected");
+        assert!(
+            error
+                .message
+                .contains("unsupported JSON Schema format: int32"),
+            "expected whitelist rejection, got: {}",
+            error.message
+        );
+    }
+
+    /// A whitelisted `format` on an incompatible type under strict mode still
+    /// produces the type-compatibility error — the `format` keyword is NOT
+    /// exempted from the compatibility table when `strict` is true.
+    #[test]
+    fn strict_whitelisted_format_on_incompatible_type_still_rejected() {
+        let mut req = base_test_request();
+        req.tools = vec![ToolSpec::Function {
+            name: "search".to_string(),
+            description: String::new(),
+            strict: true,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "link": { "type": "integer", "format": "uri" }
+                },
+                "required": ["link"],
+                "additionalProperties": false
+            }),
+        }];
+        let error = validate_request(&req).expect_err("uri on integer must be rejected");
+        assert!(
+            error
+                .message
+                .contains("format is incompatible with the declared schema type"),
+            "expected type-compatibility rejection, got: {}",
+            error.message
+        );
+    }
+
+    /// The `format` exemption must NOT relax the other keyword-type rules.
+    /// `pattern` on a non-string type still fails.
+    #[test]
+    fn non_strict_pattern_on_integer_still_rejected() {
+        let mut req = base_test_request();
+        req.tools = vec![ToolSpec::Function {
+            name: "search".to_string(),
+            description: String::new(),
+            strict: false,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "count": { "type": "integer", "pattern": "^[0-9]+$" }
+                }
+            }),
+        }];
+        let error = validate_request(&req).expect_err("pattern on integer must be rejected");
+        assert!(
+            error
+                .message
+                .contains("pattern is incompatible with the declared schema type"),
+            "expected pattern type-compatibility rejection, got: {}",
+            error.message
+        );
     }
 
     #[test]

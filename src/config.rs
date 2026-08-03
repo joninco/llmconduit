@@ -568,6 +568,21 @@ pub enum ResponseStoreBackend {
     Sqlite,
 }
 
+/// Wire protocol used by an upstream generation endpoint.
+///
+/// Chat Completions remains the compatibility default. `codex_responses` is
+/// the deliberately narrow Codex Responses-Lite sidecar contract, not a claim
+/// that arbitrary public Responses providers share its private headers/event
+/// dialect. The legacy spelling `responses` remains an ingress-only alias.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamWireApi {
+    #[default]
+    ChatCompletions,
+    #[serde(rename = "codex_responses", alias = "responses")]
+    CodexResponses,
+}
+
 /// OpenAI Responses state persistence (`store` / `previous_response_id`).
 /// This is intentionally independent from llmconduit's private replay cache.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -910,6 +925,7 @@ pub struct UpstreamConfig {
     pub upstream_base_url: Url,
     pub upstream_api_key: Option<String>,
     pub upstream_model: Option<String>,
+    pub wire_api: UpstreamWireApi,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstream_request_log_path: Option<PathBuf>,
     pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
@@ -927,6 +943,7 @@ impl std::fmt::Debug for UpstreamConfig {
                 &self.upstream_api_key.as_ref().map(|_| "[redacted]"),
             )
             .field("upstream_model", &self.upstream_model)
+            .field("wire_api", &self.wire_api)
             .field("fallback_count", &self.fallback_upstreams.len())
             .finish_non_exhaustive()
     }
@@ -1271,6 +1288,7 @@ pub struct FallbackUpstreamConfig {
     pub upstream_api_key: Option<String>,
     pub upstream_model: Option<String>,
     pub exposed_model: Option<String>,
+    pub wire_api: UpstreamWireApi,
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstream_request_log_path: Option<PathBuf>,
     pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
@@ -1288,6 +1306,7 @@ impl std::fmt::Debug for FallbackUpstreamConfig {
             )
             .field("upstream_model", &self.upstream_model)
             .field("exposed_model", &self.exposed_model)
+            .field("wire_api", &self.wire_api)
             .finish_non_exhaustive()
     }
 }
@@ -1303,6 +1322,8 @@ pub struct PersistedFallbackUpstream {
     pub upstream_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposed_model: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_upstream_wire_api")]
+    pub wire_api: UpstreamWireApi,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1336,6 +1357,8 @@ pub struct PersistedUpstream {
     pub upstream_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_upstream_wire_api")]
+    pub wire_api: UpstreamWireApi,
     #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1547,6 +1570,10 @@ fn is_default_responses_capabilities(
     value: &crate::responses_capabilities::ResponsesCapabilitiesConfig,
 ) -> bool {
     value == &crate::responses_capabilities::ResponsesCapabilitiesConfig::default()
+}
+
+fn is_default_upstream_wire_api(value: &UpstreamWireApi) -> bool {
+    *value == UpstreamWireApi::ChatCompletions
 }
 
 fn default_response_store_max_entries() -> usize {
@@ -1776,6 +1803,15 @@ impl Config {
             .enumerate()
             .map(|(index, provider)| parse_fallback_upstream(provider, index, "fallback_upstreams"))
             .collect::<Result<Vec<_>, String>>()?;
+        if let Some((index, _)) = fallback_upstreams
+            .iter()
+            .enumerate()
+            .find(|(_, fallback)| fallback.wire_api != UpstreamWireApi::ChatCompletions)
+        {
+            return Err(format!(
+                "fallback_upstreams[{index}].wire_api must be chat_completions; use upstreams for a Responses-native routing provider"
+            ));
+        }
         let upstreams = config
             .upstreams
             .iter()
@@ -2542,6 +2578,16 @@ fn parse_upstream(
             )
         })
         .collect::<Result<Vec<_>, String>>()?;
+    if let Some((fallback_index, fallback)) = fallback_upstreams
+        .iter()
+        .enumerate()
+        .find(|(_, fallback)| fallback.wire_api != provider.wire_api)
+    {
+        return Err(format!(
+            "upstreams[{index}].fallback_upstreams[{fallback_index}].wire_api ({:?}) must match the primary wire_api ({:?})",
+            fallback.wire_api, provider.wire_api
+        ));
+    }
     Ok(UpstreamConfig {
         name: provider
             .name
@@ -2552,6 +2598,7 @@ fn parse_upstream(
         upstream_base_url,
         upstream_api_key: trim_nonempty(provider.upstream_api_key.as_deref()),
         upstream_model: trim_nonempty(provider.upstream_model.as_deref()),
+        wire_api: provider.wire_api,
         upstream_chat_kwargs: provider.upstream_chat_kwargs.clone(),
         upstream_request_log_path: trim_nonempty(provider.upstream_request_log_path.as_deref())
             .map(PathBuf::from),
@@ -2580,6 +2627,7 @@ fn parse_fallback_upstream(
         upstream_api_key: trim_nonempty(provider.upstream_api_key.as_deref()),
         upstream_model: trim_nonempty(provider.upstream_model.as_deref()),
         exposed_model: trim_nonempty(provider.exposed_model.as_deref()),
+        wire_api: provider.wire_api,
         upstream_chat_kwargs: provider.upstream_chat_kwargs.clone(),
         upstream_request_log_path: trim_nonempty(provider.upstream_request_log_path.as_deref())
             .map(PathBuf::from),
@@ -2941,6 +2989,7 @@ mod tests {
     use super::ResponseStoreConfig;
     use super::RolesConfig;
     use super::UnsupportedImagePolicy;
+    use super::UpstreamWireApi;
     use super::apply_env_overrides;
     use super::default_config_path;
     use super::load_persisted_config;
@@ -3296,6 +3345,7 @@ model_profiles:
                     upstream_api_key: Some(" backup-secret ".to_string()),
                     upstream_model: Some(" fallback-model ".to_string()),
                     exposed_model: Some(" fallback-alias ".to_string()),
+                    wire_api: UpstreamWireApi::ChatCompletions,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "provider".to_string(),
                         json!({
@@ -3312,6 +3362,7 @@ model_profiles:
                     upstream_api_key: Some("   ".to_string()),
                     upstream_model: None,
                     exposed_model: None,
+                    wire_api: UpstreamWireApi::ChatCompletions,
                     upstream_chat_kwargs: JsonMap::new(),
                     upstream_request_log_path: None,
                     responses_capabilities: None,
@@ -3369,6 +3420,7 @@ model_profiles:
                 upstream_base_url: " http://127.0.0.1:8000/v1 ".to_string(),
                 upstream_api_key: Some(" local-secret ".to_string()),
                 upstream_model: Some(" local-model ".to_string()),
+                wire_api: UpstreamWireApi::ChatCompletions,
                 upstream_chat_kwargs: JsonMap::from_iter([(
                     "chat_template_kwargs".to_string(),
                     json!({"thinking": true}),
@@ -3381,6 +3433,7 @@ model_profiles:
                     upstream_api_key: Some(" backup-secret ".to_string()),
                     upstream_model: Some(" backup-model ".to_string()),
                     exposed_model: Some(" backup-alias ".to_string()),
+                    wire_api: UpstreamWireApi::ChatCompletions,
                     upstream_chat_kwargs: JsonMap::from_iter([(
                         "provider".to_string(),
                         json!({"order": ["openai"]}),
@@ -5407,5 +5460,71 @@ model_profiles:
         let resolved_debug = format!("{resolved:?}");
         assert!(!resolved_debug.contains(SENTINEL));
         assert!(resolved_debug.contains("[redacted]"));
+    }
+
+    #[test]
+    fn upstream_wire_api_defaults_to_chat_and_round_trips_codex_responses() {
+        let defaulted: PersistedConfig = serde_yaml::from_str(
+            r#"
+upstreams:
+  - name: chat
+    upstream_base_url: http://127.0.0.1:8000/v1
+"#,
+        )
+        .expect("default wire config");
+        assert_eq!(
+            defaulted.upstreams[0].wire_api,
+            UpstreamWireApi::ChatCompletions
+        );
+
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+upstreams:
+  - name: codex-subscription
+    upstream_base_url: http://127.0.0.1:5033/v1
+    wire_api: codex_responses
+"#,
+        )
+        .expect("Responses wire config");
+        let resolved = Config::from_persisted(&persisted).expect("resolved Responses config");
+        assert_eq!(
+            resolved.upstreams[0].wire_api,
+            UpstreamWireApi::CodexResponses
+        );
+        let encoded = serde_yaml::to_string(&persisted).expect("wire config serialization");
+        assert!(encoded.contains("wire_api: codex_responses"));
+
+        let legacy: PersistedConfig = serde_yaml::from_str(
+            r#"
+upstreams:
+  - name: legacy-spelling
+    upstream_base_url: http://127.0.0.1:5033/v1
+    wire_api: responses
+"#,
+        )
+        .expect("legacy Responses spelling remains accepted at ingress");
+        assert_eq!(
+            legacy.upstreams[0].wire_api,
+            UpstreamWireApi::CodexResponses
+        );
+    }
+
+    #[test]
+    fn mixed_wire_protocol_failover_chain_is_rejected() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+upstreams:
+  - name: native
+    upstream_base_url: http://127.0.0.1:5033/v1
+    wire_api: codex_responses
+    fallback_upstreams:
+      - name: chat-fallback
+        upstream_base_url: http://127.0.0.1:8000/v1
+"#,
+        )
+        .expect("mixed wire syntax");
+        let error = Config::from_persisted(&persisted).expect_err("mixed wire chain must fail");
+        assert!(error.contains("wire_api"));
+        assert!(error.contains("must match"));
     }
 }

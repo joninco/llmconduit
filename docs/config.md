@@ -93,6 +93,7 @@ struct PersistedUpstream {  // line 1148
     upstream_base_url: String,
     upstream_api_key: Option<String>,
     upstream_model: Option<String>,
+    wire_api: UpstreamWireApi,                 // chat_completions (default) | codex_responses
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
     upstream_request_log_path: Option<String>,
     responses_capabilities: Option<ResponsesCapabilitiesConfig>,
@@ -111,6 +112,7 @@ struct PersistedFallbackUpstream {  // line 1130
     upstream_api_key: Option<String>,
     upstream_model: Option<String>,
     exposed_model: Option<String>,            // model id advertised to the client
+    wire_api: UpstreamWireApi,                // must match its primary
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
     upstream_request_log_path: Option<String>,
     responses_capabilities: Option<ResponsesCapabilitiesConfig>,

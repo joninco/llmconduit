@@ -384,6 +384,7 @@ async fn malformed_sse_failover_does_not_duplicate_responses_items_or_function_c
         upstream_api_key: None,
         upstream_model: None,
         exposed_model: None,
+        wire_api: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstream_request_log_path: None,
         responses_capabilities: None,

@@ -3186,6 +3186,7 @@ async fn fallback_models_endpoint_filters_to_provider_model_override() {
         upstream_api_key: None,
         upstream_model: Some("fallback-model".to_string()),
         exposed_model: None,
+        wire_api: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstream_request_log_path: None,
         responses_capabilities: None,
@@ -3262,6 +3263,7 @@ async fn fallback_models_endpoint_without_provider_model_override_passes_list_th
         upstream_api_key: None,
         upstream_model: None,
         exposed_model: None,
+        wire_api: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstream_request_log_path: None,
         responses_capabilities: None,
@@ -3861,6 +3863,7 @@ async fn metrics_passthrough_does_not_substitute_a_fallback_provider() {
         upstream_api_key: None,
         upstream_model: None,
         exposed_model: None,
+        wire_api: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstream_request_log_path: None,
         responses_capabilities: None,
@@ -8286,6 +8289,7 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
+            wire_api: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
             responses_capabilities: None,
@@ -8295,6 +8299,7 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
                 upstream_api_key: None,
                 upstream_model: Some("fallback-only".to_string()),
                 exposed_model: None,
+                wire_api: Default::default(),
                 upstream_chat_kwargs: JsonMap::new(),
                 upstream_request_log_path: None,
                 responses_capabilities: None,
@@ -8305,6 +8310,7 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
+            wire_api: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
             responses_capabilities: None,
@@ -8383,6 +8389,7 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
+            wire_api: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
             responses_capabilities: None,
@@ -8393,6 +8400,7 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
+            wire_api: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
             responses_capabilities: None,
@@ -8488,6 +8496,7 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
+            wire_api: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
             responses_capabilities: None,
@@ -8498,6 +8507,7 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
+            wire_api: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
             responses_capabilities: None,
@@ -8612,6 +8622,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
+            wire_api: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
             responses_capabilities: None,
@@ -8621,6 +8632,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
                 upstream_api_key: None,
                 upstream_model: Some("fallback-model".to_string()),
                 exposed_model: None,
+                wire_api: Default::default(),
                 upstream_chat_kwargs: JsonMap::new(),
                 upstream_request_log_path: None,
                 responses_capabilities: None,
@@ -8631,6 +8643,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
             upstream_model: None,
+            wire_api: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
             responses_capabilities: None,
@@ -8734,6 +8747,7 @@ async fn exposed_fallback_model_alias_is_listed_and_routes_to_declaring_fallback
         upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
         upstream_api_key: None,
         upstream_model: None,
+        wire_api: Default::default(),
         upstream_chat_kwargs: JsonMap::new(),
         upstream_request_log_path: None,
         responses_capabilities: None,
@@ -8743,6 +8757,7 @@ async fn exposed_fallback_model_alias_is_listed_and_routes_to_declaring_fallback
             upstream_api_key: None,
             upstream_model: Some("z-ai/glm-5.1".to_string()),
             exposed_model: Some("GLM-5.1".to_string()),
+            wire_api: Default::default(),
             upstream_chat_kwargs: JsonMap::new(),
             upstream_request_log_path: None,
             responses_capabilities: None,
@@ -8873,6 +8888,7 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
         upstream_api_key: None,
         upstream_model: Some("fallback-model".to_string()),
         exposed_model: None,
+        wire_api: Default::default(),
         upstream_chat_kwargs: JsonMap::from_iter([
             (
                 "provider".to_string(),
@@ -10367,7 +10383,7 @@ async fn anthropic_count_tokens_lowers_and_returns_anthropic_shape() {
 }
 
 #[tokio::test]
-async fn anthropic_count_tokens_caches_unsupported_as_not_found() {
+async fn anthropic_count_tokens_returns_not_found_when_selected_provider_has_no_tokenizer() {
     let upstream = MockUpstream::default();
     let gateway = test_gateway(upstream, MockSearch::default());
     let app = llmconduit::build_app_from_gateway(gateway);
