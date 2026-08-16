@@ -563,9 +563,11 @@ mod integration {
     /// lower bound DERIVED from the request (`ctx − max_tokens + 1`), so the
     /// bound TIGHTENS on the retry and a budget computed from the FIRST error
     /// re-overflows. Round 1 carries the derived fingerprint
-    /// (input + output == ctx + 1) → escalating backoff (−512); round 2 reports
-    /// a REAL tightened bound (no fingerprint) → arithmetic re-budget. The turn
-    /// converges within the attempt cap with strictly decreasing budgets.
+    /// (input + output == ctx + 1) → min(rejected − backoff, ctx − 4096 −
+    /// derived input) = min(63488, 59903) = 59903 (the margin clamp
+    /// dominates); round 2 reports a REAL tightened bound (no fingerprint) →
+    /// arithmetic re-budget 524288 − 8 − 464800 = 59480. The turn converges
+    /// within the attempt cap with strictly decreasing budgets.
     #[tokio::test]
     async fn derived_lower_bound_overflow_converges_after_two_shrinks() {
         let server = MockServer::start().await;
@@ -579,8 +581,9 @@ mod integration {
             .await;
 
         // POST 1 -> derived bound (460289 + 64000 == 524289 == ctx + 1): the
-        // fingerprint carries no true prompt size, so the loop backs off
-        // 64000 - 512 = 63488 instead of chasing the arithmetic bound.
+        // fingerprint carries no true prompt size, so the loop takes
+        // min(64000 - 512, 524288 - 4096 - 460289) = min(63488, 59903) = 59903
+        // — the derived-bound margin clamp dominates the backoff slice.
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
@@ -593,14 +596,14 @@ mod integration {
             .mount(&server)
             .await;
 
-        // POST 2 -> a REAL tightened bound (461314 + 63488 != ctx + 1, so no
-        // derived fingerprint): arithmetic re-budget = 524288 - 8 - 461314 = 62966.
+        // POST 2 -> a REAL tightened bound (464800 + 59903 != ctx + 1, so no
+        // derived fingerprint): arithmetic re-budget = 524288 - 8 - 464800 = 59480.
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
                 "This model's maximum context length is 524288 tokens. However, you requested \
-                 63488 output tokens and your prompt contains at least 461314 input tokens, \
-                 for a total of at least 524802 tokens. (parameter=input_tokens, value=461314)",
+                 59903 output tokens and your prompt contains at least 464800 input tokens, \
+                 for a total of at least 524703 tokens. (parameter=input_tokens, value=464800)",
             ))
             .up_to_n_times(1)
             .with_priority(2)
@@ -667,15 +670,16 @@ mod integration {
             .collect();
         assert_eq!(
             budgets,
-            vec![64000, 63488, 62966],
-            "derived round backs off 512; the real tightened bound re-budgets arithmetically"
+            vec![64000, 59903, 59480],
+            "derived round clamps to ctx - 4096 - derived input; the real \
+             tightened bound re-budgets arithmetically"
         );
         assert!(
             budgets.windows(2).all(|pair| pair[1] < pair[0]),
             "forwarded budgets must be strictly decreasing"
         );
         // The final budget fits beside the tightest reported bound.
-        assert!(461314 + budgets[2] <= 524288);
+        assert!(464800 + budgets[2] <= 524288);
     }
 
     /// A backend-REPORTED input that leaves less than the configured minimum
@@ -1334,12 +1338,14 @@ mod integration {
 
     /// A backend whose bound is PURELY derived (every error reports exactly
     /// `ctx − sent + 1`, tracking whatever we send — the live 2026-07-09
-    /// failure) gives the arithmetic re-budget only SAFETY+1 tokens per round.
-    /// The fingerprint must route every such round through the ESCALATING
-    /// backoff instead: −512, then −1024 off the budget the backend just
-    /// rejected.
+    /// failure) gives the plain arithmetic re-budget only SAFETY+1 tokens per
+    /// round. The fingerprint routes every such round through
+    /// min(rejected − backoff, ctx − 4096 − derived input); for a
+    /// self-consistent derived chain the margin term equals
+    /// `rejected − 4097`, so it dominates the 512/1024/2048 backoff slices in
+    /// every round and each retry concedes a full 4097-token slice.
     #[tokio::test]
-    async fn derived_bound_backoff_escalates_512_then_1024() {
+    async fn derived_bound_retry_clamps_to_margin_each_round() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -1350,8 +1356,8 @@ mod integration {
             .mount(&server)
             .await;
 
-        // Round 1: derived for sent=64000 (460289 + 64000 == 524289) -> backoff
-        // 64000 - 512 = 63488.
+        // Round 1: derived for sent=64000 (460289 + 64000 == 524289) ->
+        // min(64000 - 512, 524288 - 4096 - 460289) = min(63488, 59903) = 59903.
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
@@ -1364,14 +1370,15 @@ mod integration {
             .mount(&server)
             .await;
 
-        // Round 2: the bound TRACKED the shrink — derived again for sent=63488
-        // (460801 + 63488 == 524289) -> backoff escalates: 63488 - 1024 = 62464.
+        // Round 2: the bound TRACKED the shrink — derived again for sent=59903
+        // (464386 + 59903 == 524289) ->
+        // min(59903 - 1024, 524288 - 4096 - 464386) = min(58879, 55806) = 55806.
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .respond_with(ResponseTemplate::new(400).set_body_string(
                 "This model's maximum context length is 524288 tokens. However, you requested \
-                 63488 output tokens and your prompt contains at least 460801 input tokens, \
-                 for a total of at least 524289 tokens. (parameter=input_tokens, value=460801)",
+                 59903 output tokens and your prompt contains at least 464386 input tokens, \
+                 for a total of at least 524289 tokens. (parameter=input_tokens, value=464386)",
             ))
             .up_to_n_times(1)
             .with_priority(2)
@@ -1414,7 +1421,7 @@ mod integration {
         assert_eq!(
             response.status().as_u16(),
             200,
-            "escalating backoff must land a purely derived-bound backend"
+            "the margin-clamped retry must land a purely derived-bound backend"
         );
 
         let chat_requests = chat_post_bodies(&server).await;
@@ -1424,8 +1431,9 @@ mod integration {
             .collect();
         assert_eq!(
             budgets,
-            vec![64000, 63488, 62464],
-            "each derived round concedes an escalating slice (512, then 1024)"
+            vec![64000, 59903, 55806],
+            "each derived round clamps to ctx - 4096 - derived input (the \
+             margin term dominates the 512/1024 backoff slices)"
         );
     }
 
