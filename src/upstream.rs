@@ -479,6 +479,11 @@ pub struct UpstreamModelEntry {
 }
 
 const ROUTING_MODEL_CATALOG_TTL_SECS: u64 = 300;
+/// TTL for a catalog whose refresh had to serve last-known-good entries for at
+/// least one provider (stale-on-error). Shorter than the clean TTL so a failed
+/// provider is retried promptly once it recovers, while still bounding how
+/// often a persistently-down provider is probed.
+const ROUTING_MODEL_CATALOG_DEGRADED_TTL_SECS: u64 = 30;
 
 /// One pre-first-chunk serving backend: its FINAL model id (after any
 /// routing/route/exposed-alias + per-provider `upstream_model` rewrite — no
@@ -943,6 +948,18 @@ struct RoutingModelCatalog {
     /// by request-model name, independent of the live catalog, so routes still
     /// resolve when an upstream `/v1/models` fetch is unavailable.
     routes: Vec<ModelRouteSpec>,
+    /// Stale-on-error: the last-known-good raw `/v1/models` entries per
+    /// provider, indexed by provider index (matching `providers`). `None` when
+    /// that provider has never fetched successfully. `refresh_catalog` serves a
+    /// provider's stored entries when its live fetch fails, so a momentary
+    /// upstream outage (e.g. vLLM reloading) does not drop that provider's
+    /// models from the union for the whole TTL.
+    provider_entries: Vec<Option<Vec<Value>>>,
+    /// Names of providers whose live fetch failed in the most recent refresh,
+    /// so their catalog rows came from `provider_entries` (stale-on-error).
+    /// Non-empty ⇒ the catalog is degraded and `fresh_cached_catalog` trusts
+    /// it only for `ROUTING_MODEL_CATALOG_DEGRADED_TTL_SECS`.
+    stale_providers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3599,7 +3616,18 @@ impl RoutingUpstreamClient {
         let cache = self.catalog.lock().await;
         cache
             .as_ref()
-            .filter(|cached| cached.fetched_at.elapsed().as_secs() < ROUTING_MODEL_CATALOG_TTL_SECS)
+            .filter(|cached| {
+                // A degraded catalog (a provider's rows were served
+                // stale-on-error) is only trusted briefly, so the failed
+                // provider is retried soon after it recovers; a clean catalog
+                // keeps the full TTL.
+                let ttl = if cached.catalog.stale_providers.is_empty() {
+                    ROUTING_MODEL_CATALOG_TTL_SECS
+                } else {
+                    ROUTING_MODEL_CATALOG_DEGRADED_TTL_SECS
+                };
+                cached.fetched_at.elapsed().as_secs() < ttl
+            })
             .map(|cached| cached.catalog.clone())
     }
 
@@ -3611,20 +3639,60 @@ impl RoutingUpstreamClient {
         let mut ids_by_key: HashMap<String, Vec<RoutingModelCandidate>> = HashMap::new();
         let mut seen_union_ids = HashSet::new();
         let mut last_error = None;
+        let mut provider_entries: Vec<Option<Vec<Value>>> = Vec::with_capacity(self.providers.len());
+        let mut stale_providers: Vec<String> = Vec::new();
+
+        // Stale-on-error: snapshot the previously published catalog's
+        // per-provider entries so a provider whose live fetch fails this refresh
+        // can still contribute its last-known-good rows. The value lock is held
+        // only long enough to clone the snapshot — never across the per-provider
+        // network requests below.
+        let previous_entries = self
+            .catalog
+            .lock()
+            .await
+            .as_ref()
+            .map(|cached| cached.catalog.provider_entries.clone())
+            .unwrap_or_default();
 
         for (provider_index, provider) in self.providers.iter().enumerate() {
-            let entries = match primary_provider_model_entries(provider).await {
-                Ok(entries) => entries,
+            let (entries, fetch_failed) = match primary_provider_model_entries(provider).await {
+                Ok(entries) => (entries, false),
                 Err(err) => {
-                    tracing::warn!(
-                        provider = %provider.name,
-                        error = %err,
-                        "failed to load upstream model catalog"
-                    );
+                    // A failed fetch must not drop this provider's models from the
+                    // union for the whole TTL: serve the previous refresh's entries
+                    // (stale-on-error). An empty snapshot (the provider has never
+                    // fetched successfully, or its last fetch was itself empty)
+                    // degrades to the previous drop-to-empty behavior.
+                    let stale_entries = previous_entries
+                        .get(provider_index)
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .unwrap_or_default();
+                    if stale_entries.is_empty() {
+                        tracing::warn!(
+                            provider = %provider.name,
+                            error = %err,
+                            "failed to load upstream model catalog"
+                        );
+                    } else {
+                        tracing::warn!(
+                            provider = %provider.name,
+                            error = %err,
+                            models = stale_entries.len(),
+                            "failed to load upstream model catalog; serving last-known-good entries"
+                        );
+                    }
                     last_error = Some(err);
-                    Vec::new()
+                    (stale_entries, true)
                 }
             };
+            // Retry the failed provider on the degraded (short) TTL whether or
+            // not we had stale rows to serve for it.
+            if fetch_failed {
+                stale_providers.push(provider.name.clone());
+            }
+            let stored_entries = entries.clone();
 
             let mut provider_candidates = Vec::new();
             let mut provider_context_limits: HashMap<String, i64> = HashMap::new();
@@ -3667,6 +3735,14 @@ impl RoutingUpstreamClient {
                 candidates: provider_candidates,
                 context_limit_by_id: provider_context_limits,
             });
+            // Record this provider's entries for the NEXT refresh: fresh entries
+            // on success; the previous snapshot carried forward on failure, so
+            // consecutive failures keep serving the same last-known-good rows.
+            provider_entries.push(if fetch_failed {
+                previous_entries.get(provider_index).cloned().flatten()
+            } else {
+                Some(stored_entries)
+            });
         }
 
         // With ad-hoc routes (G7), an empty union is still a usable catalog:
@@ -3699,6 +3775,8 @@ impl RoutingUpstreamClient {
             union_context_limit_by_id,
             ids_by_key,
             routes: self.routes.clone(),
+            provider_entries,
+            stale_providers,
         })
     }
 }
@@ -10884,6 +10962,8 @@ mod resolve_match_kind_tests {
             union_context_limit_by_id: HashMap::new(),
             ids_by_key,
             routes: Vec::new(),
+            provider_entries: Vec::new(),
+            stale_providers: Vec::new(),
         }
     }
 
@@ -10935,6 +11015,8 @@ mod resolve_match_kind_tests {
             union_context_limit_by_id: HashMap::new(),
             ids_by_key: HashMap::new(),
             routes: Vec::new(),
+            provider_entries: Vec::new(),
+            stale_providers: Vec::new(),
         };
         assert!(empty.resolve("anything").is_none());
     }
@@ -11258,6 +11340,233 @@ mod d4_provider_health_tests {
         assert_eq!(first.version, 1);
         assert!(first.providers.is_empty());
         assert_eq!(second.providers.len(), 1);
+    }
+}
+
+/// Stale-on-error: a provider whose live `/v1/models` fetch fails must not drop
+/// its models from the union for the whole TTL — the last-known-good entries are
+/// served, the failure is flagged for the short degraded TTL, and only a provider
+/// that never fetched successfully contributes nothing. These tests drive the
+/// real [`RoutingUpstreamClient::load_catalog`] refresh path against wiremock
+/// upstreams.
+#[cfg(test)]
+mod routing_catalog_stale_on_error_tests {
+    use super::*;
+    use serde_json::Map as JsonMap;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    fn leaf(base: &str) -> ReqwestUpstreamClient {
+        ReqwestUpstreamClient::new(
+            reqwest::Client::new(),
+            base.parse().expect("url"),
+            None,
+            None,
+            true,
+            4096,
+        )
+    }
+
+    fn routing_provider(name: &str, base: &str) -> RoutingUpstreamProvider {
+        RoutingUpstreamProvider::new(
+            name,
+            leaf(&format!("{base}/v1/")),
+            None,
+            JsonMap::new(),
+            Vec::new(),
+            Duration::from_secs(30),
+        )
+    }
+
+    async fn mount_models(server: &MockServer, data: Value) {
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "object": "list",
+                    "data": data,
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// Rewind the cached catalog's `fetched_at` past the clean TTL so the next
+    /// `load_catalog` refreshes instead of serving the cache.
+    async fn force_refresh(client: &RoutingUpstreamClient) {
+        let mut cache = client.catalog.lock().await;
+        if let Some(cached) = cache.as_mut() {
+            cached.fetched_at =
+                Instant::now() - Duration::from_secs(ROUTING_MODEL_CATALOG_TTL_SECS + 1);
+        }
+    }
+
+    fn union_model_ids(catalog: &RoutingModelCatalog) -> Vec<String> {
+        catalog.union_ids.clone()
+    }
+
+    #[tokio::test]
+    async fn failed_provider_serves_last_known_good_entries() {
+        let server_a = MockServer::start().await;
+        mount_models(&server_a, serde_json::json!([{"id": "model-a", "max_model_len": 1000}])).await;
+        let server_b = MockServer::start().await;
+        mount_models(&server_b, serde_json::json!([{"id": "model-b", "max_model_len": 2000}])).await;
+
+        let client = RoutingUpstreamClient::new(vec![
+            routing_provider("provider-a", &server_a.uri()),
+            routing_provider("provider-b", &server_b.uri()),
+        ]);
+
+        // Clean refresh: both providers' models are in the union, nothing stale,
+        // and both providers' raw entries are snapshotted for stale-on-error.
+        let clean = client.load_catalog().await.expect("clean refresh");
+        assert!(clean.stale_providers.is_empty());
+        assert_eq!(
+            union_model_ids(&clean),
+            vec!["model-a".to_string(), "model-b".to_string()]
+        );
+        assert_eq!(clean.provider_entries.len(), 2);
+        assert!(clean.provider_entries[0]
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| e.get("id").and_then(Value::as_str) == Some("model-a")));
+        assert!(clean.provider_entries[1]
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|e| e.get("id").and_then(Value::as_str) == Some("model-b")));
+
+        // Kill provider-b's catalog: reset() unmounts every mock, so from here
+        // on GET /v1/models falls through to wiremock's default 404 with an
+        // empty body and the catalog fetch fails (invalid JSON). Fully
+        // deterministic — dropping a MockServer handle would not stop a pooled
+        // server, so it is not a usable kill switch here.
+        server_b.reset().await;
+        force_refresh(&client).await;
+
+        // The failed provider's last-known-good rows stay in the union.
+        let stale = client
+            .load_catalog()
+            .await
+            .expect("degraded refresh still succeeds");
+        assert_eq!(stale.stale_providers, vec!["provider-b".to_string()]);
+        assert_eq!(
+            union_model_ids(&stale),
+            vec!["model-a".to_string(), "model-b".to_string()]
+        );
+        let body = stale.union_body();
+        assert!(body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["id"] == "model-b"));
+
+        // Consecutive failures keep serving the same last-known-good rows.
+        force_refresh(&client).await;
+        let stale_again = client
+            .load_catalog()
+            .await
+            .expect("second degraded refresh");
+        assert_eq!(stale_again.stale_providers, vec!["provider-b".to_string()]);
+        assert_eq!(
+            union_model_ids(&stale_again),
+            vec!["model-a".to_string(), "model-b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn degraded_catalog_uses_short_ttl() {
+        let server_a = MockServer::start().await;
+        mount_models(&server_a, serde_json::json!([{"id": "model-a"}])).await;
+        let client =
+            RoutingUpstreamClient::new(vec![routing_provider("provider-a", &server_a.uri())]);
+        client.load_catalog().await.expect("clean refresh");
+
+        // A clean catalog is fresh up to the full TTL...
+        {
+            let mut cache = client.catalog.lock().await;
+            cache.as_mut().unwrap().fetched_at =
+                Instant::now() - Duration::from_secs(ROUTING_MODEL_CATALOG_TTL_SECS - 1);
+        }
+        assert!(client.fresh_cached_catalog().await.is_some());
+        // ...and expired just past it.
+        {
+            let mut cache = client.catalog.lock().await;
+            cache.as_mut().unwrap().fetched_at =
+                Instant::now() - Duration::from_secs(ROUTING_MODEL_CATALOG_TTL_SECS + 1);
+        }
+        assert!(client.fresh_cached_catalog().await.is_none());
+
+        // A degraded catalog (stale providers recorded) is fresh up to the SHORT
+        // TTL and expired just past it — the failed provider gets retried soon.
+        {
+            let mut cache = client.catalog.lock().await;
+            cache.as_mut().unwrap().catalog.stale_providers = vec!["provider-a".to_string()];
+            cache.as_mut().unwrap().fetched_at =
+                Instant::now() - Duration::from_secs(ROUTING_MODEL_CATALOG_DEGRADED_TTL_SECS - 1);
+        }
+        assert!(client.fresh_cached_catalog().await.is_some());
+        {
+            let mut cache = client.catalog.lock().await;
+            cache.as_mut().unwrap().fetched_at =
+                Instant::now() - Duration::from_secs(ROUTING_MODEL_CATALOG_DEGRADED_TTL_SECS + 1);
+        }
+        assert!(client.fresh_cached_catalog().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn never_fetched_failed_provider_contributes_nothing() {
+        // A port that was bound and released: connections to it are refused.
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let dead_port = dead.local_addr().expect("addr").port();
+        drop(dead);
+
+        let server_a = MockServer::start().await;
+        mount_models(&server_a, serde_json::json!([{"id": "model-a"}])).await;
+
+        let client = RoutingUpstreamClient::new(vec![
+            routing_provider("provider-a", &server_a.uri()),
+            routing_provider(
+                "provider-b",
+                &format!("http://127.0.0.1:{dead_port}"),
+            ),
+        ]);
+
+        // The healthy provider's models are served; the never-fetched provider
+        // contributes no phantom rows and is flagged for the short-TTL retry.
+        let catalog = client
+            .load_catalog()
+            .await
+            .expect("serves the healthy provider");
+        assert_eq!(catalog.stale_providers, vec!["provider-b".to_string()]);
+        assert_eq!(union_model_ids(&catalog), vec!["model-a".to_string()]);
+        assert_eq!(catalog.provider_entries[1], None);
+
+        // Same on the next refresh: still no phantom rows.
+        force_refresh(&client).await;
+        let again = client.load_catalog().await.expect("second refresh");
+        assert_eq!(again.provider_entries[1], None);
+        assert_eq!(union_model_ids(&again), vec!["model-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn all_providers_failed_with_no_prior_catalog_errors() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let dead_port = dead.local_addr().expect("addr").port();
+        drop(dead);
+
+        let client = RoutingUpstreamClient::new(vec![routing_provider(
+            "provider-a",
+            &format!("http://127.0.0.1:{dead_port}"),
+        )]);
+
+        // No prior catalog to serve stale: a total first-refresh outage still
+        // errors, as before.
+        assert!(client.load_catalog().await.is_err());
     }
 }
 
