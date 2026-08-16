@@ -2103,6 +2103,14 @@ impl ReqwestUpstreamClient {
                         recomputed_budget = available,
                         "exact prompt size from upstream /tokenize; retrying once with a precise budget"
                     );
+                } else {
+                    // The precision pass is the designed fast path out of an
+                    // overflow; when it degrades to the error-driven heuristics
+                    // that must be visible at WARN, not buried at DEBUG.
+                    tracing::warn!(
+                        ctx_limit = overflow.ctx_limit,
+                        "upstream /tokenize recount unavailable; falling back to error-driven shrink heuristics"
+                    );
                 }
             }
             if let Some(exact) = exact_input {
@@ -2137,7 +2145,18 @@ impl ReqwestUpstreamClient {
                     .or(overflow.requested_output_tokens)
                     .unwrap_or(available);
                 let backoff = DERIVED_BOUND_BACKOFF_INITIAL << (attempt - 1);
-                available = (rejected - backoff).max(self.min_completion_tokens);
+                // The backoff alone covers only ~3.5K tokens of true-prompt
+                // understatement across the attempt cap (live 2026-08-16
+                // failure: a ~4K-understated transcript exhausted all rounds
+                // and went terminal). Clamp each round to the derived bound
+                // minus a real margin as well, so the cap covers ~12K.
+                let margin_budget = overflow
+                    .input_tokens
+                    .map(|input| overflow.ctx_limit - DERIVED_BOUND_MARGIN_TOKENS - input)
+                    .unwrap_or(i64::MAX);
+                available = (rejected - backoff)
+                    .min(margin_budget)
+                    .max(self.min_completion_tokens);
             } else if available < self.min_completion_tokens {
                 // The backend-reported input alone (a lower bound at worst — the true
                 // prompt is only bigger) leaves less than the configured minimum
@@ -5824,6 +5843,17 @@ const CONTEXT_OVERFLOW_MAX_ATTEMPTS: usize = 4;
 /// as much completion budget as possible while covering several thousand
 /// tokens of true-prompt understatement within the attempt cap.
 const DERIVED_BOUND_BACKOFF_INITIAL: i64 = 512;
+
+/// Per-round clamp applied against a DERIVED input bound: each retry's budget
+/// is at most `ctx − margin − derived_input`, i.e. the loop assumes the true
+/// prompt exceeds the back-computed minimum by up to this much per round.
+/// Because the derived bound tightens by exactly the amount shrunk, every
+/// round gains `margin + 1` tokens of coverage — the attempt cap then covers
+/// ~3× this margin of understatement, versus the ~3.5K the escalating backoff
+/// manages alone (which a live 2026-08-16 transcript exceeded, exhausting all
+/// rounds and failing five requests that a single 4K-margin round would have
+/// fit).
+const DERIVED_BOUND_MARGIN_TOKENS: i64 = 4096;
 
 /// A parsed context/completion token-limit overflow, carrying the recomputed
 /// completion budget for the next shrink attempt.

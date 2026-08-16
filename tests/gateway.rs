@@ -4984,11 +4984,13 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
     assert_eq!(requests.len(), 1);
     let messages = &requests[0].messages;
 
-    // M4: assistant with content does NOT merge with tool call — separate messages
-    let content_msg = messages
-        .iter()
-        .find(|m| m.role == "assistant" && m.content.is_some())
-        .expect("assistant message with content");
+    // Prose and the tool call from the same turn travel as ONE assistant
+    // message (content + tool_calls together): a split pair renders as two
+    // assistant turns under chat templates and teaches agentic models to end
+    // turns after prose without acting.
+    let merged: Vec<_> = messages.iter().filter(|m| m.role == "assistant").collect();
+    assert_eq!(merged.len(), 1);
+    let content_msg = merged[0];
     assert_eq!(
         content_msg.content,
         Some(serde_json::Value::String(
@@ -4996,14 +4998,9 @@ async fn merges_assistant_message_and_tool_call_into_single_upstream_message() {
         ))
     );
     assert!(content_msg.reasoning_content.is_some());
-    assert!(content_msg.tool_calls.is_none());
-
-    let tool_msg = messages
-        .iter()
-        .find(|m| m.role == "assistant" && m.tool_calls.is_some())
-        .expect("assistant message with tool_calls");
-    assert!(tool_msg.content.is_none());
-    assert_eq!(tool_msg.tool_calls.as_ref().unwrap().len(), 1);
+    let calls = content_msg.tool_calls.as_ref().expect("merged tool_calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name.as_deref(), Some("exec_command"));
 }
 
 #[tokio::test]

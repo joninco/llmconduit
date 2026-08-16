@@ -2740,9 +2740,18 @@ fn append_tool_call(
     arguments: Value,
     pending_reasoning: Option<PendingReasoning>,
 ) {
+    // A tool call folds into the immediately preceding assistant message even
+    // when that message carries prose: a split prose/tool_calls pair renders as
+    // two assistant turns under chat templates, and transcripts full of such
+    // pairs teach agentic models that a turn may end after prose without
+    // acting (premature end_turn instead of a tool call). The pair stays split
+    // only when both sides carry reasoning payloads that would conflict.
     if let Some(last) = messages.last_mut()
         && last.role == "assistant"
-        && (last.tool_calls.is_some() || last.content.is_none())
+        && (last.tool_calls.is_some()
+            || last.content.is_none()
+            || pending_reasoning.is_none()
+            || (last.reasoning_content.is_none() && last.thinking.is_none()))
     {
         let index = last.tool_calls.as_ref().map(|v| v.len()).unwrap_or(0);
         let tool_call = ChatToolCall {
@@ -3961,7 +3970,7 @@ mod tests {
     }
 
     #[test]
-    fn test_append_tool_call_no_merge_into_content_message() {
+    fn test_append_tool_call_merges_into_content_message() {
         let mut messages = vec![ChatMessage {
             role: "assistant".to_string(),
             content: Some(Value::String("some text".to_string())),
@@ -3978,14 +3987,62 @@ mod tests {
             json!({}),
             None,
         );
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0].content,
             Some(Value::String("some text".to_string()))
         );
+        let calls = messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls[0].index, Some(0));
+        assert_eq!(calls[0].function.name.as_deref(), Some("fn_1"));
+    }
+
+    #[test]
+    fn test_append_tool_call_merges_pending_reasoning_into_content_message() {
+        let mut messages = vec![ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(Value::String("some text".to_string())),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: None,
+            thinking: None,
+            tool_calls: None,
+        }];
+        append_tool_call(
+            &mut messages,
+            "call_1".to_string(),
+            "fn_1".to_string(),
+            json!({}),
+            Some(PendingReasoning::from_parts("thought".to_string(), None)),
+        );
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].tool_calls.is_some());
+        assert_eq!(messages[0].reasoning_content.as_deref(), Some("thought"));
+    }
+
+    #[test]
+    fn test_append_tool_call_keeps_split_on_conflicting_reasoning() {
+        let mut messages = vec![ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(Value::String("some text".to_string())),
+            tool_call_id: None,
+            name: None,
+            reasoning_content: Some("earlier thought".to_string()),
+            thinking: None,
+            tool_calls: None,
+        }];
+        append_tool_call(
+            &mut messages,
+            "call_1".to_string(),
+            "fn_1".to_string(),
+            json!({}),
+            Some(PendingReasoning::from_parts("later thought".to_string(), None)),
+        );
+        assert_eq!(messages.len(), 2);
         assert!(messages[0].tool_calls.is_none());
+        assert_eq!(messages[0].reasoning_content.as_deref(), Some("earlier thought"));
+        assert_eq!(messages[1].reasoning_content.as_deref(), Some("later thought"));
         assert!(messages[1].tool_calls.is_some());
-        assert_eq!(messages[1].tool_calls.as_ref().unwrap()[0].index, Some(0));
     }
 
     // --- M2 test ---
