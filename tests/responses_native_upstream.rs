@@ -87,6 +87,10 @@ impl Respond for NativeResponder {
 }
 
 async fn app(server: &MockServer) -> axum::Router {
+    app_with_retry(server, true).await
+}
+
+async fn app_with_retry(server: &MockServer, retry_enabled: bool) -> axum::Router {
     Mock::given(method("GET"))
         .and(path("/v1/models"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -96,7 +100,10 @@ async fn app(server: &MockServer) -> axum::Router {
         .mount(server)
         .await;
     let mut config = common::test_config();
+    let mut resilience = llmconduit::config::UpstreamResilienceConfig::default();
+    resilience.retry.enabled = retry_enabled;
     config.upstreams = vec![UpstreamConfig {
+        resilience,
         name: "codex-subscription".to_string(),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: Some("local-sidecar-token".to_string()),
@@ -138,6 +145,7 @@ async fn mixed_app(native: &MockServer, chat: &MockServer, native_first: bool) -
         .await;
 
     let native_provider = UpstreamConfig {
+        resilience: Default::default(),
         name: "codex-subscription".to_string(),
         upstream_base_url: format!("{}/v1/", native.uri()).parse().expect("url"),
         upstream_api_key: Some("local-sidecar-token".to_string()),
@@ -149,6 +157,7 @@ async fn mixed_app(native: &MockServer, chat: &MockServer, native_first: bool) -
         fallback_upstreams: Vec::new(),
     };
     let chat_provider = UpstreamConfig {
+        resilience: Default::default(),
         name: "local-chat".to_string(),
         upstream_base_url: format!("{}/v1/", chat.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -735,6 +744,7 @@ async fn native_turn_conflict_is_terminal_and_never_calls_fallback() {
 
     let mut config = common::test_config();
     config.upstreams = vec![UpstreamConfig {
+        resilience: Default::default(),
         name: "codex-primary".into(),
         upstream_base_url: format!("{}/v1/", primary.uri()).parse().unwrap(),
         upstream_api_key: Some("primary-token".into()),
@@ -744,6 +754,7 @@ async fn native_turn_conflict_is_terminal_and_never_calls_fallback() {
         upstream_request_log_path: None,
         responses_capabilities: None,
         fallback_upstreams: vec![FallbackUpstreamConfig {
+            resilience: Default::default(),
             name: "codex-fallback".into(),
             upstream_base_url: format!("{}/v1/", fallback.uri()).parse().unwrap(),
             upstream_api_key: Some("fallback-token".into()),
@@ -820,7 +831,7 @@ async fn native_sidecar_statuses_preserve_anthropic_nonstream_and_stream_error_t
                 .expect(1)
                 .mount(&server)
                 .await;
-            let response = app(&server)
+            let response = app_with_retry(&server, false)
                 .await
                 .oneshot(
                     Request::builder()

@@ -633,6 +633,11 @@ impl ChatCompletionCollector {
                 Some(&code),
                 metadata.status,
                 metadata.param.as_deref(),
+            )
+            .with_retry_after(
+                metadata
+                    .retry_after_secs
+                    .map(std::time::Duration::from_secs),
             ));
         }
         let response = self.final_response.ok_or_else(|| {

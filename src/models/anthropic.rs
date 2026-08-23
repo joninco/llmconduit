@@ -482,6 +482,9 @@ pub struct AnthropicErrorBody {
     #[doc(hidden)]
     #[serde(skip)]
     pub llmconduit_error_code: Option<String>,
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub llmconduit_retry_after_secs: Option<u64>,
 }
 
 impl AnthropicStreamEvent {

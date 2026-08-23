@@ -798,6 +798,7 @@ mod tests {
                     llmconduit_error_status: None,
                     llmconduit_error_param: None,
                     llmconduit_error_code: None,
+                    llmconduit_retry_after_secs: None,
                 },
             },
         ];

@@ -592,6 +592,9 @@ pub fn test_config() -> Config {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        upstream_retry: Default::default(),
+        upstream_circuit_breaker: Default::default(),
+        upstream_bulkhead: Default::default(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: BTreeMap::new(),
         responses_capabilities:

@@ -875,6 +875,9 @@ async fn uses_configured_upstream_model_override() {
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             responses_capabilities: Default::default(),
@@ -972,6 +975,9 @@ async fn single_supported_backend_model_overrides_configured_model_alias() {
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             responses_capabilities: Default::default(),
@@ -1362,6 +1368,9 @@ async fn forwards_configured_upstream_chat_kwargs() {
             )]),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             responses_capabilities: Default::default(),
@@ -1429,6 +1438,9 @@ async fn forwards_profile_specific_upstream_chat_kwargs_for_backend_model() {
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::from([(
                 "Kimi-K2.6".to_string(),
@@ -3181,6 +3193,7 @@ async fn fallback_models_endpoint_filters_to_provider_model_override() {
     let mut config = test_config();
     config.upstream_base_url = format!("{}/v1/", primary.uri()).parse().expect("url");
     config.fallback_upstreams = vec![FallbackUpstreamConfig {
+        resilience: Default::default(),
         name: "fallback".to_string(),
         upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -3258,6 +3271,7 @@ async fn fallback_models_endpoint_without_provider_model_override_passes_list_th
     let mut config = test_config();
     config.upstream_base_url = format!("{}/v1/", primary.uri()).parse().expect("url");
     config.fallback_upstreams = vec![FallbackUpstreamConfig {
+        resilience: Default::default(),
         name: "fallback".to_string(),
         upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -3345,6 +3359,9 @@ async fn proxies_models_endpoint_with_etag() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        upstream_retry: Default::default(),
+        upstream_circuit_breaker: Default::default(),
+        upstream_bulkhead: Default::default(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         responses_capabilities: Default::default(),
@@ -3437,6 +3454,9 @@ async fn proxies_models_endpoint_with_upstream_api_key() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        upstream_retry: Default::default(),
+        upstream_circuit_breaker: Default::default(),
+        upstream_bulkhead: Default::default(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         responses_capabilities: Default::default(),
@@ -3526,6 +3546,9 @@ async fn transforms_models_endpoint_for_anthropic_clients() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        upstream_retry: Default::default(),
+        upstream_circuit_breaker: Default::default(),
+        upstream_bulkhead: Default::default(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         responses_capabilities: Default::default(),
@@ -3618,6 +3641,9 @@ async fn paginates_anthropic_models_transform_with_cursors() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        upstream_retry: Default::default(),
+        upstream_circuit_breaker: Default::default(),
+        upstream_bulkhead: Default::default(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         responses_capabilities: Default::default(),
@@ -3716,6 +3742,9 @@ async fn proxies_completions_endpoint_passthrough() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        upstream_retry: Default::default(),
+        upstream_circuit_breaker: Default::default(),
+        upstream_bulkhead: Default::default(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         responses_capabilities: Default::default(),
@@ -3858,6 +3887,7 @@ async fn metrics_passthrough_does_not_substitute_a_fallback_provider() {
     let mut config = test_config();
     config.upstream_base_url = format!("{}/v1/", primary.uri()).parse().expect("url");
     config.fallback_upstreams = vec![FallbackUpstreamConfig {
+        resilience: Default::default(),
         name: "fallback".to_string(),
         upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -7803,6 +7833,9 @@ fn test_config() -> Config {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        upstream_retry: Default::default(),
+        upstream_circuit_breaker: Default::default(),
+        upstream_bulkhead: Default::default(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         responses_capabilities: Default::default(),
@@ -8282,6 +8315,7 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
     let mut config = test_config();
     config.upstreams = vec![
         UpstreamConfig {
+            resilience: Default::default(),
             name: "first".to_string(),
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8291,6 +8325,7 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
             upstream_request_log_path: None,
             responses_capabilities: None,
             fallback_upstreams: vec![FallbackUpstreamConfig {
+                resilience: Default::default(),
                 name: "fallback".to_string(),
                 upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
                 upstream_api_key: None,
@@ -8303,6 +8338,7 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
             }],
         },
         UpstreamConfig {
+            resilience: Default::default(),
             name: "second".to_string(),
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8314,7 +8350,6 @@ async fn explicit_upstreams_models_endpoint_returns_primary_union_and_hides_fall
             fallback_upstreams: Vec::new(),
         },
     ];
-
     let app = llmconduit::build_app(config);
     let response = app
         .oneshot(
@@ -8382,6 +8417,7 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
     let mut config = test_config();
     config.upstreams = vec![
         UpstreamConfig {
+            resilience: Default::default(),
             name: "first".to_string(),
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8393,6 +8429,7 @@ async fn chat_completions_routes_normalized_model_to_first_matching_upstream() {
             fallback_upstreams: Vec::new(),
         },
         UpstreamConfig {
+            resilience: Default::default(),
             name: "second".to_string(),
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8489,6 +8526,7 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
     let mut config = test_config();
     config.upstreams = vec![
         UpstreamConfig {
+            resilience: Default::default(),
             name: "first".to_string(),
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8500,6 +8538,7 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
             fallback_upstreams: Vec::new(),
         },
         UpstreamConfig {
+            resilience: Default::default(),
             name: "second".to_string(),
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8567,10 +8606,12 @@ async fn chat_completions_defaults_missing_and_unavailable_models_to_first_upstr
 }
 
 #[tokio::test]
-async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstream() {
+async fn routing_provider_is_not_used_as_failure_fallback() {
     let first = MockServer::start().await;
     let fallback = MockServer::start().await;
     let second = MockServer::start().await;
+    let mut no_retry_resilience = llmconduit::config::UpstreamResilienceConfig::default();
+    no_retry_resilience.retry.enabled = false;
 
     Mock::given(method("GET"))
         .and(path("/v1/models"))
@@ -8615,6 +8656,10 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
     config.upstream_failure_cooldown_secs = 3600;
     config.upstreams = vec![
         UpstreamConfig {
+            // This regression isolates the routing boundary. Same-provider
+            // retry is covered separately; one failure must use only the
+            // selected provider's nested fallback.
+            resilience: no_retry_resilience,
             name: "first".to_string(),
             upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8624,6 +8669,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
             upstream_request_log_path: None,
             responses_capabilities: None,
             fallback_upstreams: vec![FallbackUpstreamConfig {
+                resilience: Default::default(),
                 name: "fallback".to_string(),
                 upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
                 upstream_api_key: None,
@@ -8636,6 +8682,7 @@ async fn selected_upstream_failure_uses_nested_fallback_not_next_routing_upstrea
             }],
         },
         UpstreamConfig {
+            resilience: Default::default(),
             name: "second".to_string(),
             upstream_base_url: format!("{}/v1/", second.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8740,6 +8787,7 @@ async fn exposed_fallback_model_alias_is_listed_and_routes_to_declaring_fallback
     let mut config = test_config();
     config.upstream_failure_cooldown_secs = 3600;
     config.upstreams = vec![UpstreamConfig {
+        resilience: Default::default(),
         name: "first".to_string(),
         upstream_base_url: format!("{}/v1/", first.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -8749,6 +8797,7 @@ async fn exposed_fallback_model_alias_is_listed_and_routes_to_declaring_fallback
         upstream_request_log_path: None,
         responses_capabilities: None,
         fallback_upstreams: vec![FallbackUpstreamConfig {
+            resilience: Default::default(),
             name: "fallback".to_string(),
             upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -8880,6 +8929,7 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
     config.upstream_base_url = format!("{}/v1/", primary.uri()).parse().expect("url");
     config.upstream_model = Some("primary-model".to_string());
     config.fallback_upstreams = vec![FallbackUpstreamConfig {
+        resilience: Default::default(),
         name: "fallback".to_string(),
         upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -8968,7 +9018,11 @@ async fn chat_completions_fails_over_and_skips_primary_during_cooldown() {
             request.method.as_str() == "POST" && request.url.path() == "/v1/chat/completions"
         })
         .collect::<Vec<_>>();
-    assert_eq!(primary_chat_requests.len(), 1);
+    assert_eq!(
+        primary_chat_requests.len(),
+        3,
+        "the first turn exhausts the default same-provider attempts; the second skips the open circuit"
+    );
 
     let fallback_chat_requests = fallback
         .received_requests()
@@ -11122,6 +11176,9 @@ async fn cancels_mid_stream_when_client_disconnects() {
         upstream_chat_kwargs: JsonMap::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        upstream_retry: Default::default(),
+        upstream_circuit_breaker: Default::default(),
+        upstream_bulkhead: Default::default(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         responses_capabilities: Default::default(),

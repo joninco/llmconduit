@@ -4036,12 +4036,21 @@ mod tests {
             "call_1".to_string(),
             "fn_1".to_string(),
             json!({}),
-            Some(PendingReasoning::from_parts("later thought".to_string(), None)),
+            Some(PendingReasoning::from_parts(
+                "later thought".to_string(),
+                None,
+            )),
         );
         assert_eq!(messages.len(), 2);
         assert!(messages[0].tool_calls.is_none());
-        assert_eq!(messages[0].reasoning_content.as_deref(), Some("earlier thought"));
-        assert_eq!(messages[1].reasoning_content.as_deref(), Some("later thought"));
+        assert_eq!(
+            messages[0].reasoning_content.as_deref(),
+            Some("earlier thought")
+        );
+        assert_eq!(
+            messages[1].reasoning_content.as_deref(),
+            Some("later thought")
+        );
         assert!(messages[1].tool_calls.is_some());
     }
 

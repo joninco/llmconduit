@@ -195,15 +195,13 @@ async fn gateway_upstream_health_delegates_and_bare_is_empty() {
     assert_eq!(health[1].id, "backup");
 }
 
-/// THE idle-flip acceptance test: a provider is driven into cooldown by a real
-/// failing upstream POST, then — with ZERO further traffic — the Gateway's
-/// publication task flips it Cooling→Healthy at the cooldown deadline via the
-/// deadline-wake path (not a per-request republish). A SHORT real cooldown
-/// exercises the sub-second deadline wake. (The cooldown clock is a monotonic
-/// `std::time::Instant`, which a tokio paused clock cannot advance, so this uses
-/// real time on a multi-thread runtime — the faithful end-to-end proof.)
+/// A provider whose open interval expires becomes eligible for one half-open
+/// probe, but it must not be advertised as Healthy before that probe succeeds.
+/// The publisher still wakes at the deadline and removes the future cooldown
+/// timestamp with zero traffic, leaving the status Cooling until a caller owns
+/// and completes the probe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn idle_cooling_provider_flips_to_healthy_via_deadline_wake() {
+async fn idle_open_provider_becomes_probe_eligible_without_claiming_healthy() {
     let server = MockServer::start().await;
     // The upstream 503s, so the first (and only) request fails over off this
     // single provider and marks it cooling.
@@ -245,19 +243,20 @@ async fn idle_cooling_provider_flips_to_healthy_via_deadline_wake() {
     assert!(cooling[0].cooling_until_ms.is_some());
 
     // Start the publication task. From here we make NO further requests — the
-    // flip must come purely from the cooldown-deadline wake.
+    // deadline update must come purely from the circuit-deadline wake.
     let handle = gateway.spawn_provider_health_publisher();
     let publisher = gateway.provider_health_publisher();
 
-    // Poll the PUBLISHED snapshot (not a fresh on-demand read) until it reports
-    // Healthy, proving the task republished the idle transition. Bound the wait
-    // generously; the deadline is ~120 ms out.
+    // Poll the PUBLISHED snapshot until its deadline clears while it remains
+    // Cooling. Claiming Healthy here would let an unprobed provider bypass the
+    // half-open state machine.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut flipped = None;
     while Instant::now() < deadline {
         let snapshot = publisher.latest();
         if let Some(provider) = snapshot.providers.first()
-            && provider.status == ProviderStatus::Healthy
+            && provider.status == ProviderStatus::Cooling
+            && provider.cooling_until_ms.is_none()
         {
             flipped = Some(snapshot.version);
             break;
@@ -266,20 +265,24 @@ async fn idle_cooling_provider_flips_to_healthy_via_deadline_wake() {
     }
     handle.abort();
 
-    let version = flipped.expect("publisher flips the idle provider to Healthy with no traffic");
+    let version = flipped.expect("publisher marks the idle provider probe-eligible");
     assert!(
         version >= 1,
         "the flip was published as a versioned snapshot"
     );
-    // The published Healthy entry has no cooldown deadline.
+    // The provider is ready for exactly one probe but remains non-Healthy until
+    // that probe accepts upstream output.
     let final_snapshot = publisher.latest();
     let provider = &final_snapshot.providers[0];
-    assert_eq!(provider.status, ProviderStatus::Healthy);
+    assert_eq!(provider.status, ProviderStatus::Cooling);
     assert_eq!(provider.cooling_until_ms, None);
     assert_eq!(
         provider.served_count, 0,
-        "the flip required NO served traffic — purely the deadline wake"
+        "probe eligibility required no served traffic"
     );
-    // A failure WAS recorded (cumulative), proving the entry is the same provider.
-    assert!(provider.failover_count >= 1);
+    assert_eq!(provider.consecutive_failures, 1);
+    assert_eq!(
+        provider.failover_count, 0,
+        "a single-provider failure did not actually fail over"
+    );
 }

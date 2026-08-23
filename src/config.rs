@@ -639,6 +639,373 @@ impl Default for ReplayConfig {
     }
 }
 
+/// Bounded, pre-output same-provider retry policy. Retries are deliberately
+/// limited to explicit transient HTTP statuses; transport and stream failures
+/// remain eligible for nested fallback but are never repeated on the same
+/// provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamRetryConfig {
+    #[serde(default = "default_upstream_retry_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_upstream_retry_max_attempts")]
+    pub max_attempts: usize,
+    #[serde(default = "default_upstream_retry_initial_backoff_ms")]
+    pub initial_backoff_ms: u64,
+    #[serde(default = "default_upstream_retry_max_backoff_ms")]
+    pub max_backoff_ms: u64,
+    #[serde(default = "default_upstream_retry_total_budget_ms")]
+    pub total_budget_ms: u64,
+    #[serde(default = "default_upstream_retry_honor_retry_after")]
+    pub honor_retry_after: bool,
+    #[serde(default = "default_upstream_retry_max_retry_after_secs")]
+    pub max_retry_after_secs: u64,
+}
+
+impl Default for UpstreamRetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_upstream_retry_enabled(),
+            max_attempts: default_upstream_retry_max_attempts(),
+            initial_backoff_ms: default_upstream_retry_initial_backoff_ms(),
+            max_backoff_ms: default_upstream_retry_max_backoff_ms(),
+            total_budget_ms: default_upstream_retry_total_budget_ms(),
+            honor_retry_after: default_upstream_retry_honor_retry_after(),
+            max_retry_after_secs: default_upstream_retry_max_retry_after_secs(),
+        }
+    }
+}
+
+impl UpstreamRetryConfig {
+    /// Compatibility policy for direct construction of an upstream client in
+    /// tests/embedded users. Application configuration always supplies the new
+    /// enabled-by-default policy explicitly.
+    pub(crate) fn legacy_disabled() -> Self {
+        Self {
+            enabled: false,
+            max_attempts: 1,
+            ..Self::default()
+        }
+    }
+
+    fn apply_override(&self, overlay: Option<&UpstreamRetryOverride>) -> Self {
+        let Some(overlay) = overlay else {
+            return self.clone();
+        };
+        Self {
+            enabled: overlay.enabled.unwrap_or(self.enabled),
+            max_attempts: overlay.max_attempts.unwrap_or(self.max_attempts),
+            initial_backoff_ms: overlay
+                .initial_backoff_ms
+                .unwrap_or(self.initial_backoff_ms),
+            max_backoff_ms: overlay.max_backoff_ms.unwrap_or(self.max_backoff_ms),
+            total_budget_ms: overlay.total_budget_ms.unwrap_or(self.total_budget_ms),
+            honor_retry_after: overlay.honor_retry_after.unwrap_or(self.honor_retry_after),
+            max_retry_after_secs: overlay
+                .max_retry_after_secs
+                .unwrap_or(self.max_retry_after_secs),
+        }
+    }
+
+    fn validate(&self, path: &str) -> Result<(), String> {
+        if !(1..=10).contains(&self.max_attempts) {
+            return Err(format!("{path}.max_attempts must be between 1 and 10"));
+        }
+        if self.initial_backoff_ms == 0 {
+            return Err(format!("{path}.initial_backoff_ms must be at least 1"));
+        }
+        if self.max_backoff_ms < self.initial_backoff_ms {
+            return Err(format!(
+                "{path}.max_backoff_ms must be greater than or equal to initial_backoff_ms"
+            ));
+        }
+        if self.total_budget_ms == 0 || self.total_budget_ms > 60_000 {
+            return Err(format!(
+                "{path}.total_budget_ms must be between 1 and 60000"
+            ));
+        }
+        if self.max_retry_after_secs > 60 {
+            return Err(format!("{path}.max_retry_after_secs must not exceed 60"));
+        }
+        Ok(())
+    }
+}
+
+/// Sparse per-provider overlay for [`UpstreamRetryConfig`]. Missing fields
+/// inherit the global policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamRetryOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_backoff_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_backoff_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_budget_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub honor_retry_after: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retry_after_secs: Option<u64>,
+}
+
+/// Adaptive provider circuit policy. `max_open_ms == 0` is the compatibility
+/// spelling for a disabled legacy cooldown and remains meaningful.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamCircuitBreakerConfig {
+    #[serde(default = "default_upstream_circuit_initial_open_ms")]
+    pub initial_open_ms: u64,
+    #[serde(default = "default_upstream_circuit_max_open_ms")]
+    pub max_open_ms: u64,
+    #[serde(default = "default_upstream_circuit_half_open_max_probes")]
+    pub half_open_max_probes: usize,
+}
+
+impl Default for UpstreamCircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            initial_open_ms: default_upstream_circuit_initial_open_ms(),
+            max_open_ms: default_upstream_circuit_max_open_ms(),
+            half_open_max_probes: default_upstream_circuit_half_open_max_probes(),
+        }
+    }
+}
+
+impl UpstreamCircuitBreakerConfig {
+    fn from_legacy_cooldown_secs(seconds: u64) -> Result<Self, String> {
+        let max_open_ms = seconds.checked_mul(1_000).ok_or_else(|| {
+            "upstream_failure_cooldown_secs is too large to convert to milliseconds".to_string()
+        })?;
+        Ok(Self {
+            initial_open_ms: default_upstream_circuit_initial_open_ms().min(max_open_ms),
+            max_open_ms,
+            half_open_max_probes: 1,
+        })
+    }
+
+    fn apply_override(&self, overlay: Option<&UpstreamCircuitBreakerOverride>) -> Self {
+        let Some(overlay) = overlay else {
+            return self.clone();
+        };
+        Self {
+            initial_open_ms: overlay.initial_open_ms.unwrap_or(self.initial_open_ms),
+            max_open_ms: overlay.max_open_ms.unwrap_or(self.max_open_ms),
+            half_open_max_probes: overlay
+                .half_open_max_probes
+                .unwrap_or(self.half_open_max_probes),
+        }
+    }
+
+    fn validate(&self, path: &str) -> Result<(), String> {
+        if self.max_open_ms > 300_000 {
+            return Err(format!("{path}.max_open_ms must not exceed 300000"));
+        }
+        if self.max_open_ms > 0 {
+            if self.initial_open_ms == 0 {
+                return Err(format!("{path}.initial_open_ms must be at least 1"));
+            }
+            if self.initial_open_ms > self.max_open_ms {
+                return Err(format!(
+                    "{path}.initial_open_ms must not exceed max_open_ms"
+                ));
+            }
+        }
+        if self.half_open_max_probes != 1 {
+            return Err(format!(
+                "{path}.half_open_max_probes must be 1 to preserve single-probe semantics"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Sparse per-provider overlay for [`UpstreamCircuitBreakerConfig`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamCircuitBreakerOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_open_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_open_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub half_open_max_probes: Option<usize>,
+}
+
+/// Optional provider bulkhead. `max_in_flight: null` preserves existing
+/// concurrency. With a limit enabled, `max_queue: null` means a zero-length
+/// queue (immediate bounded rejection), never an unbounded waiter list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamBulkheadConfig {
+    #[serde(default)]
+    pub max_in_flight: Option<usize>,
+    #[serde(default)]
+    pub max_queue: Option<usize>,
+    #[serde(default = "default_upstream_bulkhead_queue_timeout_ms")]
+    pub queue_timeout_ms: u64,
+}
+
+impl Default for UpstreamBulkheadConfig {
+    fn default() -> Self {
+        Self {
+            max_in_flight: None,
+            max_queue: None,
+            queue_timeout_ms: default_upstream_bulkhead_queue_timeout_ms(),
+        }
+    }
+}
+
+impl UpstreamBulkheadConfig {
+    fn apply_override(&self, overlay: Option<&UpstreamBulkheadOverride>) -> Self {
+        let Some(overlay) = overlay else {
+            return self.clone();
+        };
+        Self {
+            max_in_flight: overlay.max_in_flight.unwrap_or(self.max_in_flight),
+            max_queue: overlay.max_queue.unwrap_or(self.max_queue),
+            queue_timeout_ms: overlay.queue_timeout_ms.unwrap_or(self.queue_timeout_ms),
+        }
+    }
+
+    fn validate(&self, path: &str) -> Result<(), String> {
+        if self.max_in_flight == Some(0) {
+            return Err(format!("{path}.max_in_flight must be at least 1"));
+        }
+        if self.max_in_flight.is_some_and(|limit| limit > 100_000) {
+            return Err(format!("{path}.max_in_flight must not exceed 100000"));
+        }
+        if self.max_queue.is_some() && self.max_in_flight.is_none() {
+            return Err(format!(
+                "{path}.max_queue requires max_in_flight to be configured"
+            ));
+        }
+        if self.max_in_flight.is_some() && self.max_queue.unwrap_or(0) > 0 {
+            if self.queue_timeout_ms == 0 {
+                return Err(format!("{path}.queue_timeout_ms must be at least 1"));
+            }
+            if self.queue_timeout_ms > 60_000 {
+                return Err(format!("{path}.queue_timeout_ms must not exceed 60000"));
+            }
+            if self.max_queue.unwrap_or(0) > 100_000 {
+                return Err(format!("{path}.max_queue must not exceed 100000"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Sparse per-provider overlay for [`UpstreamBulkheadConfig`]. The nested
+/// options distinguish an omitted field (inherit) from an explicit YAML `null`
+/// (clear a global limit for this provider).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamBulkheadOverride {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_in_flight: Option<Option<usize>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_queue: Option<Option<usize>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_timeout_ms: Option<u64>,
+}
+
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpstreamResilienceConfig {
+    pub retry: UpstreamRetryConfig,
+    pub circuit_breaker: UpstreamCircuitBreakerConfig,
+    pub bulkhead: UpstreamBulkheadConfig,
+}
+
+impl UpstreamResilienceConfig {
+    fn apply_overrides(
+        &self,
+        retry: Option<&UpstreamRetryOverride>,
+        circuit: Option<&UpstreamCircuitBreakerOverride>,
+        bulkhead: Option<&UpstreamBulkheadOverride>,
+        path: &str,
+    ) -> Result<Self, String> {
+        let resolved = Self {
+            retry: self.retry.apply_override(retry),
+            circuit_breaker: self.circuit_breaker.apply_override(circuit),
+            bulkhead: self.bulkhead.apply_override(bulkhead),
+        };
+        resolved.validate(path)?;
+        Ok(resolved)
+    }
+
+    fn validate(&self, path: &str) -> Result<(), String> {
+        self.retry.validate(&format!("{path}.upstream_retry"))?;
+        self.circuit_breaker
+            .validate(&format!("{path}.upstream_circuit_breaker"))?;
+        self.bulkhead
+            .validate(&format!("{path}.upstream_bulkhead"))?;
+        Ok(())
+    }
+}
+
+fn default_upstream_retry_enabled() -> bool {
+    true
+}
+
+fn default_upstream_retry_max_attempts() -> usize {
+    3
+}
+
+fn default_upstream_retry_initial_backoff_ms() -> u64 {
+    500
+}
+
+fn default_upstream_retry_max_backoff_ms() -> u64 {
+    4_000
+}
+
+fn default_upstream_retry_total_budget_ms() -> u64 {
+    10_000
+}
+
+fn default_upstream_retry_honor_retry_after() -> bool {
+    true
+}
+
+fn default_upstream_retry_max_retry_after_secs() -> u64 {
+    15
+}
+
+fn default_upstream_circuit_initial_open_ms() -> u64 {
+    2_000
+}
+
+fn default_upstream_circuit_max_open_ms() -> u64 {
+    30_000
+}
+
+fn default_upstream_circuit_half_open_max_probes() -> usize {
+    1
+}
+
+fn default_upstream_bulkhead_queue_timeout_ms() -> u64 {
+    5_000
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -658,6 +1025,12 @@ pub struct Config {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstreams: Vec<UpstreamConfig>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
+    pub upstream_retry: UpstreamRetryConfig,
+    pub upstream_circuit_breaker: UpstreamCircuitBreakerConfig,
+    pub upstream_bulkhead: UpstreamBulkheadConfig,
+    /// Deprecated compatibility input. Runtime dispatch uses
+    /// `upstream_circuit_breaker`; retain the resolved legacy value so existing
+    /// callers and diagnostics do not break.
     pub upstream_failure_cooldown_secs: u64,
     pub model_profiles: BTreeMap<String, ModelProfile>,
     /// Global OpenAI Responses capability declaration. Provider and final
@@ -940,6 +1313,7 @@ pub struct UpstreamConfig {
     pub upstream_request_log_path: Option<PathBuf>,
     pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
     pub fallback_upstreams: Vec<FallbackUpstreamConfig>,
+    pub resilience: UpstreamResilienceConfig,
 }
 
 impl std::fmt::Debug for UpstreamConfig {
@@ -1302,6 +1676,7 @@ pub struct FallbackUpstreamConfig {
     pub upstream_chat_kwargs: JsonMap<String, JsonValue>,
     pub upstream_request_log_path: Option<PathBuf>,
     pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
+    pub resilience: UpstreamResilienceConfig,
 }
 
 impl std::fmt::Debug for FallbackUpstreamConfig {
@@ -1342,6 +1717,12 @@ pub struct PersistedFallbackUpstream {
     pub upstream_request_log_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_retry: Option<UpstreamRetryOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_circuit_breaker: Option<UpstreamCircuitBreakerOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_bulkhead: Option<UpstreamBulkheadOverride>,
 }
 
 impl std::fmt::Debug for PersistedFallbackUpstream {
@@ -1380,6 +1761,12 @@ pub struct PersistedUpstream {
     pub upstream_request_log_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responses_capabilities: Option<crate::responses_capabilities::ResponsesCapabilitiesConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_retry: Option<UpstreamRetryOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_circuit_breaker: Option<UpstreamCircuitBreakerOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_bulkhead: Option<UpstreamBulkheadOverride>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_upstreams: Vec<PersistedFallbackUpstream>,
 }
@@ -1429,6 +1816,14 @@ pub struct PersistedConfig {
     pub upstreams: Vec<PersistedUpstream>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback_upstreams: Vec<PersistedFallbackUpstream>,
+    #[serde(default)]
+    pub upstream_retry: UpstreamRetryConfig,
+    /// `None` means migrate the legacy cooldown into the adaptive circuit's
+    /// maximum interval. An explicitly configured block takes precedence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_circuit_breaker: Option<UpstreamCircuitBreakerConfig>,
+    #[serde(default)]
+    pub upstream_bulkhead: UpstreamBulkheadConfig,
     #[serde(default = "default_upstream_failure_cooldown_secs")]
     pub upstream_failure_cooldown_secs: u64,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1663,6 +2058,9 @@ impl Default for PersistedConfig {
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: UpstreamRetryConfig::default(),
+            upstream_circuit_breaker: None,
+            upstream_bulkhead: UpstreamBulkheadConfig::default(),
             upstream_failure_cooldown_secs: default_upstream_failure_cooldown_secs(),
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::new(),
@@ -1813,11 +2211,29 @@ impl Config {
             .map_err(|err| format!("invalid bind_addr: {err}"))?;
         let upstream_base_url = parse_service_url(&config.upstream_base_url, "upstream_base_url")?;
         let brave_base_url = parse_service_url(&config.brave_base_url, "brave_base_url")?;
+        // Validate the legacy value even when the explicit policy wins. This
+        // keeps the still-supported environment override bounded instead of
+        // silently accepting a seconds-to-milliseconds overflow.
+        let legacy_circuit_breaker = UpstreamCircuitBreakerConfig::from_legacy_cooldown_secs(
+            config.upstream_failure_cooldown_secs,
+        )?;
+        let upstream_circuit_breaker = config
+            .upstream_circuit_breaker
+            .clone()
+            .unwrap_or(legacy_circuit_breaker);
+        let global_resilience = UpstreamResilienceConfig {
+            retry: config.upstream_retry.clone(),
+            circuit_breaker: upstream_circuit_breaker.clone(),
+            bulkhead: config.upstream_bulkhead.clone(),
+        };
+        global_resilience.validate("config")?;
         let fallback_upstreams = config
             .fallback_upstreams
             .iter()
             .enumerate()
-            .map(|(index, provider)| parse_fallback_upstream(provider, index, "fallback_upstreams"))
+            .map(|(index, provider)| {
+                parse_fallback_upstream(provider, index, "fallback_upstreams", &global_resilience)
+            })
             .collect::<Result<Vec<_>, String>>()?;
         if let Some((index, _)) = fallback_upstreams
             .iter()
@@ -1832,7 +2248,7 @@ impl Config {
             .upstreams
             .iter()
             .enumerate()
-            .map(parse_upstream)
+            .map(|indexed| parse_upstream(indexed, &global_resilience))
             .collect::<Result<Vec<_>, String>>()?;
         let model_profiles =
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
@@ -1911,6 +2327,9 @@ impl Config {
             upstream_chat_kwargs: config.upstream_chat_kwargs.clone(),
             upstreams,
             fallback_upstreams,
+            upstream_retry: global_resilience.retry,
+            upstream_circuit_breaker,
+            upstream_bulkhead: global_resilience.bulkhead,
             upstream_failure_cooldown_secs: config.upstream_failure_cooldown_secs,
             model_profiles,
             responses_capabilities: config.responses_capabilities.clone(),
@@ -2577,6 +2996,7 @@ fn join_prompt_prefixes(prefixes: impl IntoIterator<Item = String>) -> Option<St
 
 fn parse_upstream(
     (index, provider): (usize, &PersistedUpstream),
+    global_resilience: &UpstreamResilienceConfig,
 ) -> Result<UpstreamConfig, String> {
     let upstream_base_url = parse_service_url(
         provider.upstream_base_url.trim(),
@@ -2591,6 +3011,7 @@ fn parse_upstream(
                 fallback,
                 fallback_index,
                 &format!("upstreams[{index}].fallback_upstreams"),
+                global_resilience,
             )
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -2604,6 +3025,13 @@ fn parse_upstream(
             fallback.wire_api, provider.wire_api
         ));
     }
+    let path = format!("upstreams[{index}]");
+    let resilience = global_resilience.apply_overrides(
+        provider.upstream_retry.as_ref(),
+        provider.upstream_circuit_breaker.as_ref(),
+        provider.upstream_bulkhead.as_ref(),
+        &path,
+    )?;
     Ok(UpstreamConfig {
         name: provider
             .name
@@ -2624,6 +3052,7 @@ fn parse_upstream(
             .map(PathBuf::from),
         responses_capabilities: provider.responses_capabilities.clone(),
         fallback_upstreams,
+        resilience,
     })
 }
 
@@ -2631,10 +3060,18 @@ fn parse_fallback_upstream(
     provider: &PersistedFallbackUpstream,
     index: usize,
     path: &str,
+    global_resilience: &UpstreamResilienceConfig,
 ) -> Result<FallbackUpstreamConfig, String> {
     let upstream_base_url = parse_service_url(
         provider.upstream_base_url.trim(),
         &format!("{path}[{index}].upstream_base_url"),
+    )?;
+    let provider_path = format!("{path}[{index}]");
+    let resilience = global_resilience.apply_overrides(
+        provider.upstream_retry.as_ref(),
+        provider.upstream_circuit_breaker.as_ref(),
+        provider.upstream_bulkhead.as_ref(),
+        &provider_path,
     )?;
     Ok(FallbackUpstreamConfig {
         name: provider
@@ -2656,6 +3093,7 @@ fn parse_fallback_upstream(
         upstream_request_log_path: trim_nonempty(provider.upstream_request_log_path.as_deref())
             .map(PathBuf::from),
         responses_capabilities: provider.responses_capabilities.clone(),
+        resilience,
     })
 }
 
@@ -2693,9 +3131,7 @@ fn resolve_upstream_api_key(
     }
     match std::env::var(&env_name) {
         Ok(value) => trim_nonempty(Some(&value)).map(Some).ok_or_else(|| {
-            format!(
-                "{path}.upstream_api_key_env references {env_name}, but that variable is empty"
-            )
+            format!("{path}.upstream_api_key_env references {env_name}, but that variable is empty")
         }),
         Err(std::env::VarError::NotPresent) => Err(format!(
             "{path}.upstream_api_key_env references {env_name}, but that variable is not set"
@@ -2883,6 +3319,20 @@ fn apply_env_overrides(config: &mut PersistedConfig) {
         && let Ok(parsed) = value.parse()
     {
         config.upstream_failure_cooldown_secs = parsed;
+        // An explicit legacy environment override remains authoritative even
+        // when the file uses the new circuit block. This preserves the env
+        // knob's established deployment semantics while treating it as the
+        // adaptive circuit's maximum open interval.
+        if let Some(circuit) = &mut config.upstream_circuit_breaker
+            && let Some(milliseconds) = parsed.checked_mul(1_000)
+        {
+            circuit.max_open_ms = milliseconds;
+            if milliseconds == 0 {
+                circuit.initial_open_ms = 0;
+            } else {
+                circuit.initial_open_ms = circuit.initial_open_ms.min(milliseconds);
+            }
+        }
     }
     if let Ok(value) = env::var("LLMCONDUIT_BRAVE_BASE_URL")
         && !value.trim().is_empty()
@@ -3053,6 +3503,9 @@ mod tests {
     use super::ResponseStoreConfig;
     use super::RolesConfig;
     use super::UnsupportedImagePolicy;
+    use super::UpstreamBulkheadConfig;
+    use super::UpstreamCircuitBreakerConfig;
+    use super::UpstreamRetryConfig;
     use super::UpstreamWireApi;
     use super::apply_env_overrides;
     use super::default_config_path;
@@ -3519,6 +3972,9 @@ upstreams:
         let config = PersistedConfig {
             fallback_upstreams: vec![
                 PersistedFallbackUpstream {
+                    upstream_retry: None,
+                    upstream_circuit_breaker: None,
+                    upstream_bulkhead: None,
                     name: Some(" backup ".to_string()),
                     upstream_base_url: "  http://127.0.0.1:8001/v1  ".to_string(),
                     upstream_api_key: Some(" backup-secret ".to_string()),
@@ -3537,6 +3993,9 @@ upstreams:
                     responses_capabilities: None,
                 },
                 PersistedFallbackUpstream {
+                    upstream_retry: None,
+                    upstream_circuit_breaker: None,
+                    upstream_bulkhead: None,
                     name: Some("   ".to_string()),
                     upstream_base_url: "http://127.0.0.1:8002/v1".to_string(),
                     upstream_api_key: Some("   ".to_string()),
@@ -3549,6 +4008,9 @@ upstreams:
                     responses_capabilities: None,
                 },
             ],
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 12,
             ..PersistedConfig::default()
         };
@@ -3597,6 +4059,9 @@ upstreams:
     fn from_persisted_parses_explicit_upstreams_with_nested_fallbacks() {
         let config = PersistedConfig {
             upstreams: vec![PersistedUpstream {
+                upstream_retry: None,
+                upstream_circuit_breaker: None,
+                upstream_bulkhead: None,
                 name: Some(" local ".to_string()),
                 upstream_base_url: " http://127.0.0.1:8000/v1 ".to_string(),
                 upstream_api_key: Some(" local-secret ".to_string()),
@@ -3610,6 +4075,9 @@ upstreams:
                 upstream_request_log_path: Some(" /tmp/llmconduit-local.jsonl ".to_string()),
                 responses_capabilities: None,
                 fallback_upstreams: vec![PersistedFallbackUpstream {
+                    upstream_retry: None,
+                    upstream_circuit_breaker: None,
+                    upstream_bulkhead: None,
                     name: Some(" backup ".to_string()),
                     upstream_base_url: " https://openrouter.ai/api/v1 ".to_string(),
                     upstream_api_key: Some(" backup-secret ".to_string()),
@@ -3663,6 +4131,9 @@ upstreams:
     fn from_persisted_rejects_invalid_fallback_upstream_url() {
         let config = PersistedConfig {
             fallback_upstreams: vec![PersistedFallbackUpstream {
+                upstream_retry: None,
+                upstream_circuit_breaker: None,
+                upstream_bulkhead: None,
                 upstream_base_url: "not a url".to_string(),
                 ..PersistedFallbackUpstream::default()
             }],
@@ -4009,9 +4480,25 @@ response_store:
         unsafe {
             std::env::set_var("LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS", "7");
         }
-        let mut config = PersistedConfig::default();
+        let mut config = PersistedConfig {
+            upstream_circuit_breaker: Some(UpstreamCircuitBreakerConfig {
+                initial_open_ms: 2_000,
+                max_open_ms: 5_000,
+                half_open_max_probes: 1,
+            }),
+            ..PersistedConfig::default()
+        };
         apply_env_overrides(&mut config);
         assert_eq!(config.upstream_failure_cooldown_secs, 7);
+        assert_eq!(
+            config
+                .upstream_circuit_breaker
+                .as_ref()
+                .expect("explicit circuit policy")
+                .max_open_ms,
+            7_000,
+            "the supported legacy env knob remains authoritative"
+        );
         unsafe {
             std::env::remove_var("LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS");
         };
@@ -4039,6 +4526,9 @@ response_store:
             )]),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::from_iter([(
                 "streaming-reasoning".to_string(),
@@ -4129,6 +4619,9 @@ response_store:
             )]),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([(
@@ -4310,6 +4803,9 @@ response_store:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([(
@@ -4394,6 +4890,9 @@ response_store:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([(
@@ -4484,6 +4983,9 @@ response_store:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([
@@ -4599,6 +5101,9 @@ response_store:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([
@@ -5044,6 +5549,9 @@ model_profiles:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::new(),
@@ -5099,6 +5607,9 @@ model_profiles:
             upstream_chat_kwargs: JsonMap::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profile_templates: BTreeMap::new(),
             model_profiles: BTreeMap::from_iter([(
@@ -5154,6 +5665,9 @@ model_profiles:
         let config = Config::from_persisted(&PersistedConfig {
             upstream_request_log_path: Some("/tmp/llmconduit-top/primary.jsonl".to_string()),
             fallback_upstreams: vec![PersistedFallbackUpstream {
+                upstream_retry: None,
+                upstream_circuit_breaker: None,
+                upstream_bulkhead: None,
                 upstream_base_url: "http://127.0.0.1:8001/v1".to_string(),
                 upstream_request_log_path: Some("/tmp/llmconduit-global/backup.jsonl".to_string()),
                 ..PersistedFallbackUpstream::default()
@@ -5184,6 +5698,9 @@ model_profiles:
                 "/tmp/llmconduit-inactive-top/primary.jsonl".to_string(),
             ),
             fallback_upstreams: vec![PersistedFallbackUpstream {
+                upstream_retry: None,
+                upstream_circuit_breaker: None,
+                upstream_bulkhead: None,
                 upstream_base_url: "http://127.0.0.1:9001/v1".to_string(),
                 upstream_request_log_path: Some(
                     "/tmp/llmconduit-inactive-global/backup.jsonl".to_string(),
@@ -5191,11 +5708,17 @@ model_profiles:
                 ..PersistedFallbackUpstream::default()
             }],
             upstreams: vec![PersistedUpstream {
+                upstream_retry: None,
+                upstream_circuit_breaker: None,
+                upstream_bulkhead: None,
                 upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
                 upstream_request_log_path: Some(
                     "/tmp/llmconduit-routing/primary.jsonl".to_string(),
                 ),
                 fallback_upstreams: vec![PersistedFallbackUpstream {
+                    upstream_retry: None,
+                    upstream_circuit_breaker: None,
+                    upstream_bulkhead: None,
                     upstream_base_url: "https://openrouter.ai/api/v1".to_string(),
                     upstream_request_log_path: Some(
                         "/tmp/llmconduit-routing-fallback/backup.jsonl".to_string(),
@@ -5261,6 +5784,9 @@ model_profiles:
         let config = Config::from_persisted(&PersistedConfig {
             turn_capture_dir: Some("/tmp/llmconduit-turns".to_string()),
             upstreams: vec![PersistedUpstream {
+                upstream_retry: None,
+                upstream_circuit_breaker: None,
+                upstream_bulkhead: None,
                 upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
                 ..PersistedUpstream::default()
             }],
@@ -5623,10 +6149,16 @@ model_profiles:
             upstream_api_key: Some(SENTINEL.to_string()),
             brave_api_key: Some(SENTINEL.to_string()),
             upstreams: vec![PersistedUpstream {
+                upstream_retry: None,
+                upstream_circuit_breaker: None,
+                upstream_bulkhead: None,
                 name: Some("provider".to_string()),
                 upstream_base_url: "http://127.0.0.1:8000/v1".to_string(),
                 upstream_api_key: Some(SENTINEL.to_string()),
                 fallback_upstreams: vec![PersistedFallbackUpstream {
+                    upstream_retry: None,
+                    upstream_circuit_breaker: None,
+                    upstream_bulkhead: None,
                     upstream_base_url: "http://127.0.0.1:8001/v1".to_string(),
                     upstream_api_key: Some(SENTINEL.to_string()),
                     ..PersistedFallbackUpstream::default()
@@ -5709,5 +6241,167 @@ upstreams:
         let error = Config::from_persisted(&persisted).expect_err("mixed wire chain must fail");
         assert!(error.contains("wire_api"));
         assert!(error.contains("must match"));
+    }
+
+    #[test]
+    fn configuration_defaults_and_per_provider_overrides_round_trip() {
+        let defaults: PersistedConfig = serde_yaml::from_str("{}").expect("default config");
+        assert_eq!(defaults.upstream_retry, UpstreamRetryConfig::default());
+        assert_eq!(
+            defaults.upstream_bulkhead,
+            UpstreamBulkheadConfig::default()
+        );
+        let resolved_defaults = Config::from_persisted(&defaults).expect("resolve defaults");
+        assert!(resolved_defaults.upstream_retry.enabled);
+        assert_eq!(resolved_defaults.upstream_retry.max_attempts, 3);
+        assert_eq!(resolved_defaults.upstream_retry.initial_backoff_ms, 500);
+        assert_eq!(resolved_defaults.upstream_retry.max_backoff_ms, 4_000);
+        assert_eq!(resolved_defaults.upstream_retry.total_budget_ms, 10_000);
+        assert!(resolved_defaults.upstream_retry.honor_retry_after);
+        assert_eq!(resolved_defaults.upstream_retry.max_retry_after_secs, 15);
+        assert_eq!(
+            resolved_defaults.upstream_circuit_breaker,
+            UpstreamCircuitBreakerConfig::default()
+        );
+        assert_eq!(resolved_defaults.upstream_bulkhead.max_in_flight, None);
+
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+upstream_retry:
+  enabled: true
+  max_attempts: 4
+  initial_backoff_ms: 250
+  max_backoff_ms: 2000
+  total_budget_ms: 9000
+  honor_retry_after: false
+  max_retry_after_secs: 9
+upstream_circuit_breaker:
+  initial_open_ms: 1500
+  max_open_ms: 12000
+  half_open_max_probes: 1
+upstream_bulkhead:
+  max_in_flight: 8
+  max_queue: 16
+  queue_timeout_ms: 3000
+upstreams:
+  - name: primary
+    upstream_base_url: http://127.0.0.1:8100/v1
+    upstream_retry:
+      max_attempts: 2
+      honor_retry_after: true
+    upstream_circuit_breaker:
+      initial_open_ms: 1000
+    upstream_bulkhead:
+      max_in_flight: 4
+      max_queue: 2
+    fallback_upstreams:
+      - name: nested
+        upstream_base_url: http://127.0.0.1:8200/v1
+        upstream_retry:
+          enabled: false
+        upstream_circuit_breaker:
+          max_open_ms: 6000
+        upstream_bulkhead:
+          max_in_flight: null
+          max_queue: null
+"#,
+        )
+        .expect("parse resilience config");
+        let encoded = serde_yaml::to_string(&persisted).expect("serialize resilience config");
+        let reparsed: PersistedConfig =
+            serde_yaml::from_str(&encoded).expect("reparse resilience config");
+        assert_eq!(reparsed, persisted);
+
+        let resolved = Config::from_persisted(&persisted).expect("resolve resilience config");
+        let primary = &resolved.upstreams[0].resilience;
+        assert_eq!(primary.retry.max_attempts, 2);
+        assert!(primary.retry.honor_retry_after);
+        assert_eq!(primary.retry.initial_backoff_ms, 250);
+        assert_eq!(primary.circuit_breaker.initial_open_ms, 1_000);
+        assert_eq!(primary.circuit_breaker.max_open_ms, 12_000);
+        assert_eq!(primary.bulkhead.max_in_flight, Some(4));
+        assert_eq!(primary.bulkhead.max_queue, Some(2));
+
+        let nested = &resolved.upstreams[0].fallback_upstreams[0].resilience;
+        assert!(!nested.retry.enabled);
+        assert_eq!(nested.retry.max_attempts, 4);
+        assert_eq!(nested.circuit_breaker.initial_open_ms, 1_500);
+        assert_eq!(nested.circuit_breaker.max_open_ms, 6_000);
+        assert_eq!(nested.bulkhead.max_in_flight, None);
+        assert_eq!(nested.bulkhead.max_queue, None);
+        assert_eq!(nested.bulkhead.queue_timeout_ms, 3_000);
+    }
+
+    #[test]
+    fn legacy_cooldown_configuration_remains_supported() {
+        let legacy: PersistedConfig =
+            serde_yaml::from_str("upstream_failure_cooldown_secs: 7\n").expect("legacy config");
+        let resolved = Config::from_persisted(&legacy).expect("resolve legacy config");
+        assert_eq!(resolved.upstream_circuit_breaker.initial_open_ms, 2_000);
+        assert_eq!(resolved.upstream_circuit_breaker.max_open_ms, 7_000);
+
+        let disabled: PersistedConfig = serde_yaml::from_str("upstream_failure_cooldown_secs: 0\n")
+            .expect("zero legacy config");
+        let resolved = Config::from_persisted(&disabled).expect("resolve zero legacy config");
+        assert_eq!(resolved.upstream_circuit_breaker.initial_open_ms, 0);
+        assert_eq!(resolved.upstream_circuit_breaker.max_open_ms, 0);
+
+        let explicit: PersistedConfig = serde_yaml::from_str(
+            r#"
+upstream_failure_cooldown_secs: 7
+upstream_circuit_breaker:
+  initial_open_ms: 900
+  max_open_ms: 5000
+  half_open_max_probes: 1
+"#,
+        )
+        .expect("explicit circuit config");
+        let resolved = Config::from_persisted(&explicit).expect("resolve explicit circuit");
+        assert_eq!(resolved.upstream_circuit_breaker.initial_open_ms, 900);
+        assert_eq!(resolved.upstream_circuit_breaker.max_open_ms, 5_000);
+    }
+
+    #[test]
+    fn invalid_retry_and_circuit_configuration_is_rejected() {
+        for (yaml, expected) in [
+            (
+                "upstream_retry:\n  max_attempts: 0\n",
+                "max_attempts must be between 1 and 10",
+            ),
+            (
+                "upstream_retry:\n  initial_backoff_ms: 5000\n  max_backoff_ms: 1000\n",
+                "max_backoff_ms must be greater than or equal",
+            ),
+            (
+                "upstream_circuit_breaker:\n  initial_open_ms: 2000\n  max_open_ms: 30000\n  half_open_max_probes: 2\n",
+                "half_open_max_probes must be 1",
+            ),
+            (
+                "upstream_bulkhead:\n  max_queue: 1\n",
+                "max_queue requires max_in_flight",
+            ),
+            (
+                "upstream_bulkhead:\n  max_in_flight: 100001\n",
+                "max_in_flight must not exceed 100000",
+            ),
+            (
+                "upstream_bulkhead:\n  max_in_flight: 1\n  max_queue: 1\n  queue_timeout_ms: 60001\n",
+                "queue_timeout_ms must not exceed 60000",
+            ),
+        ] {
+            let persisted: PersistedConfig = serde_yaml::from_str(yaml).expect("syntax is valid");
+            let error = Config::from_persisted(&persisted).expect_err("config must be rejected");
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in validation error: {error}"
+            );
+        }
+
+        let overflow = PersistedConfig {
+            upstream_failure_cooldown_secs: u64::MAX,
+            ..PersistedConfig::default()
+        };
+        let error = Config::from_persisted(&overflow).expect_err("legacy overflow must fail");
+        assert!(error.contains("too large to convert"));
     }
 }

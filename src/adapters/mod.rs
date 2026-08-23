@@ -17,6 +17,7 @@ pub(crate) struct CanonicalErrorMetadata {
     pub status: Option<u16>,
     pub param: Option<String>,
     pub code: Option<String>,
+    pub retry_after_secs: Option<u64>,
 }
 
 pub(crate) fn canonical_error_metadata(data: &Value) -> CanonicalErrorMetadata {
@@ -50,10 +51,15 @@ pub(crate) fn canonical_error_metadata(data: &Value) -> CanonicalErrorMetadata {
                 .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
         })
         .map(str::to_string);
+    let retry_after_secs = data
+        .get("llmconduit_retry_after_secs")
+        .and_then(Value::as_u64)
+        .filter(|seconds| (1..=300).contains(seconds));
     CanonicalErrorMetadata {
         status,
         param,
         code,
+        retry_after_secs,
     }
 }
 
@@ -75,6 +81,7 @@ mod error_metadata_tests {
                 status: Some(409),
                 param: Some("input[2].content".to_string()),
                 code: Some("turn_state_conflict".to_string()),
+                retry_after_secs: None,
             }
         );
         assert_eq!(

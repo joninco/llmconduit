@@ -640,6 +640,7 @@ impl AnthropicStreamConverter {
                 llmconduit_error_status: metadata.status,
                 llmconduit_error_param: metadata.param,
                 llmconduit_error_code: metadata.code,
+                llmconduit_retry_after_secs: metadata.retry_after_secs,
             },
         });
         self.completed = true;

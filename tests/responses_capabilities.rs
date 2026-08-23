@@ -879,7 +879,7 @@ async fn responses_capability_pruning_removes_only_incapable_fallbacks() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(500).set_body_string("primary failed"))
-        .expect(1)
+        .expect(3)
         .mount(&primary)
         .await;
     Mock::given(method("POST"))
@@ -891,6 +891,7 @@ async fn responses_capability_pruning_removes_only_incapable_fallbacks() {
 
     let mut config = common::test_config();
     config.upstreams = vec![UpstreamConfig {
+        resilience: Default::default(),
         name: "route-a".to_string(),
         upstream_base_url: format!("{}/v1", primary.uri()).parse().unwrap(),
         upstream_api_key: None,
@@ -903,6 +904,7 @@ async fn responses_capability_pruning_removes_only_incapable_fallbacks() {
             ..Default::default()
         }),
         fallback_upstreams: vec![FallbackUpstreamConfig {
+            resilience: Default::default(),
             name: "fallback-a".to_string(),
             upstream_base_url: format!("{}/v1", fallback.uri()).parse().unwrap(),
             upstream_api_key: None,

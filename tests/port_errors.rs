@@ -408,6 +408,9 @@ mod integration {
             upstream_chat_kwargs: serde_json::Map::new(),
             upstreams: Vec::new(),
             fallback_upstreams: Vec::new(),
+            upstream_retry: Default::default(),
+            upstream_circuit_breaker: Default::default(),
+            upstream_bulkhead: Default::default(),
             upstream_failure_cooldown_secs: 30,
             model_profiles: std::collections::BTreeMap::new(),
             responses_capabilities: Default::default(),
@@ -723,6 +726,7 @@ mod integration {
         let mut config = config_for(&primary.uri());
         config.upstream_model = Some("primary-model".to_string());
         config.fallback_upstreams = vec![FallbackUpstreamConfig {
+            resilience: Default::default(),
             name: "fallback".to_string(),
             upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -830,8 +834,15 @@ mod integration {
             .await;
 
         let mut config = config_for(&primary.uri());
+        // This regression isolates the leaf's context-rebudget loop. The new
+        // outer transient-status retry is covered separately; disable it here
+        // so the assertion remains exactly "overflow send + rebudgeted send",
+        // followed by nested fallback.
+        config.upstream_retry.enabled = false;
+        config.upstream_retry.max_attempts = 1;
         config.upstream_model = Some("primary-model".to_string());
         config.fallback_upstreams = vec![FallbackUpstreamConfig {
+            resilience: Default::default(),
             name: "fallback".to_string(),
             upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
             upstream_api_key: None,
@@ -931,6 +942,7 @@ mod integration {
         let mut config = config_for(&primary.uri());
         config.upstream_model = Some("primary-model".to_string());
         config.fallback_upstreams = vec![FallbackUpstreamConfig {
+            resilience: Default::default(),
             name: "fallback".to_string(),
             upstream_base_url: format!("{}/v1/", fallback.uri()).parse().expect("url"),
             upstream_api_key: None,

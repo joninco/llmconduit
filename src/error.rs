@@ -1,9 +1,13 @@
 use axum::Json;
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
+use axum::http::header;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use serde::Serialize;
 use std::fmt;
+use std::num::NonZeroU64;
+use std::time::Duration;
 
 pub type AppResult<T> = Result<T, AppError>;
 
@@ -19,9 +23,11 @@ pub(crate) const CONTEXT_LENGTH_EXCEEDED_CODE: &str = "context_length_exceeded";
 /// not a generic error policy: only the leaf upstream client decides it, and
 /// only the failover loop reads it.
 ///
-/// `Failover` (the default) retries and cools a provider. `FailoverNoCooldown`
-/// retries elsewhere without penalizing a healthy provider for a request it
-/// rejected. `Terminal` surfaces the error without retrying or cooling.
+/// `Failover` (the default) permits nested fallback and a provider-health
+/// penalty. Same-provider retry is governed separately by structured failure
+/// metadata. `FailoverNoCooldown` advances elsewhere without penalizing a
+/// healthy provider for a request it rejected. `Terminal` surfaces the error
+/// without retrying, failing over, or cooling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum FailoverDisposition {
     /// Provider-failure-shaped: failover may retry on the next provider.
@@ -32,6 +38,77 @@ pub(crate) enum FailoverDisposition {
     FailoverNoCooldown,
     /// Same-provider terminal: surface as-is, do not fail over.
     Terminal,
+}
+
+/// Bounded machine classification for one upstream failure. This metadata is
+/// internal-only: retry/circuit policy consumes it without parsing an error
+/// message, while public errors retain the existing sanitized shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UpstreamRetryClass {
+    RetryableHttpStatus,
+    RequestIntrinsic,
+    Authentication,
+    NotFound,
+    Transport,
+    Timeout,
+    MalformedStream,
+    Stream,
+    TurnStateConflict,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UpstreamFailureMetadata {
+    pub original_status: Option<u16>,
+    pub retry_class: UpstreamRetryClass,
+    pub retry_after: Option<Duration>,
+    pub response_headers_received: bool,
+    pub upstream_chunk_accepted: bool,
+    pub safe_same_provider_retry: bool,
+}
+
+impl UpstreamFailureMetadata {
+    pub(crate) fn http(status: StatusCode, retry_after: Option<Duration>) -> Self {
+        let retryable = matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504);
+        let retry_class = match status.as_u16() {
+            400 | 413 | 415 | 422 => UpstreamRetryClass::RequestIntrinsic,
+            401 | 403 => UpstreamRetryClass::Authentication,
+            404 => UpstreamRetryClass::NotFound,
+            409 => UpstreamRetryClass::TurnStateConflict,
+            408 | 429 | 500 | 502 | 503 | 504 => UpstreamRetryClass::RetryableHttpStatus,
+            _ => UpstreamRetryClass::Other,
+        };
+        Self {
+            original_status: Some(status.as_u16()),
+            retry_class,
+            retry_after,
+            response_headers_received: true,
+            upstream_chunk_accepted: false,
+            safe_same_provider_retry: retryable,
+        }
+    }
+
+    pub(crate) fn transport(retry_class: UpstreamRetryClass) -> Self {
+        Self {
+            original_status: None,
+            retry_class,
+            retry_after: None,
+            response_headers_received: false,
+            upstream_chunk_accepted: false,
+            safe_same_provider_retry: false,
+        }
+    }
+
+    pub(crate) fn stream(retry_class: UpstreamRetryClass, headers_received: bool) -> Self {
+        Self {
+            original_status: None,
+            retry_class,
+            retry_after: None,
+            response_headers_received: headers_received,
+            upstream_chunk_accepted: false,
+            safe_same_provider_retry: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -55,6 +132,13 @@ pub struct AppError {
     /// error. Generic errors carry the default (`Failover`); only the leaf
     /// upstream client promotes an error to `Terminal`.
     failover: FailoverDisposition,
+    /// Structured upstream-attempt facts used only by retry/circuit policy.
+    /// Never serialized or reflected to clients.
+    upstream_failure: Option<Box<UpstreamFailureMetadata>>,
+    /// Sanitized whole-second delay for a local temporary-unavailability
+    /// response. This is emitted as `Retry-After` only when HTTP headers are
+    /// still writable.
+    retry_after: Option<NonZeroU64>,
 }
 
 impl AppError {
@@ -67,6 +151,8 @@ impl AppError {
             code: None,
             param: None,
             failover: FailoverDisposition::default(),
+            upstream_failure: None,
+            retry_after: None,
         }
     }
 
@@ -79,6 +165,8 @@ impl AppError {
             code: None,
             param: None,
             failover: FailoverDisposition::default(),
+            upstream_failure: None,
+            retry_after: None,
         }
     }
 
@@ -91,6 +179,8 @@ impl AppError {
             code: Some("invalid_api_key".to_string()),
             param: None,
             failover: FailoverDisposition::Terminal,
+            upstream_failure: None,
+            retry_after: None,
         }
     }
 
@@ -103,6 +193,8 @@ impl AppError {
             code: Some("unsupported_media_type".to_string()),
             param: None,
             failover: FailoverDisposition::Terminal,
+            upstream_failure: None,
+            retry_after: None,
         }
     }
 
@@ -115,6 +207,8 @@ impl AppError {
             code: Some("request_too_large".to_string()),
             param: None,
             failover: FailoverDisposition::Terminal,
+            upstream_failure: None,
+            retry_after: None,
         }
     }
 
@@ -127,6 +221,8 @@ impl AppError {
             code: None,
             param: None,
             failover: FailoverDisposition::default(),
+            upstream_failure: None,
+            retry_after: None,
         }
     }
 
@@ -139,6 +235,8 @@ impl AppError {
             code: None,
             param: None,
             failover: FailoverDisposition::default(),
+            upstream_failure: None,
+            retry_after: None,
         }
     }
 
@@ -151,6 +249,8 @@ impl AppError {
             code: Some("upstream_timeout".to_string()),
             param: None,
             failover: FailoverDisposition::default(),
+            upstream_failure: None,
+            retry_after: None,
         }
     }
 
@@ -222,6 +322,8 @@ impl AppError {
             code: Some(CONTEXT_LENGTH_EXCEEDED_CODE.to_string()),
             param: None,
             failover: FailoverDisposition::Terminal,
+            upstream_failure: None,
+            retry_after: None,
         }
     }
 
@@ -249,6 +351,8 @@ impl AppError {
                 code: Some("rate_limit_exceeded".to_string()),
                 param: None,
                 failover: FailoverDisposition::Terminal,
+                upstream_failure: None,
+                retry_after: None,
             },
             Some("request_too_large") => Self {
                 status: StatusCode::PAYLOAD_TOO_LARGE,
@@ -257,6 +361,8 @@ impl AppError {
                 code: Some("request_too_large".to_string()),
                 param: None,
                 failover: FailoverDisposition::Terminal,
+                upstream_failure: None,
+                retry_after: None,
             },
             Some("unsupported_media_type") => Self::unsupported_media_type(message.to_string()),
             Some("unprocessable_entity") => Self {
@@ -266,10 +372,22 @@ impl AppError {
                 code: Some("unprocessable_entity".to_string()),
                 param: None,
                 failover: FailoverDisposition::Terminal,
+                upstream_failure: None,
+                retry_after: None,
             },
             Some("invalid_request_error") => {
                 Self::bad_request(message.to_string()).with_code("invalid_request_error")
             }
+            Some("provider_temporarily_unavailable") => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                client_message: message.to_string(),
+                message: message.to_string(),
+                code: Some("provider_temporarily_unavailable".to_string()),
+                param: None,
+                failover: FailoverDisposition::Terminal,
+                upstream_failure: None,
+                retry_after: None,
+            },
             Some(code) => Self::upstream(message).with_code(code),
             None => Self::upstream(message),
         };
@@ -289,6 +407,8 @@ impl AppError {
             code: Some("internal_error".to_string()),
             param: None,
             failover: FailoverDisposition::default(),
+            upstream_failure: None,
+            retry_after: None,
         }
     }
 
@@ -300,6 +420,8 @@ impl AppError {
             code: None,
             param: None,
             failover: FailoverDisposition::default(),
+            upstream_failure: None,
+            retry_after: None,
         }
     }
 
@@ -317,6 +439,62 @@ impl AppError {
     pub(crate) fn failover_disposition(&self) -> FailoverDisposition {
         self.failover
     }
+
+    pub(crate) fn with_upstream_failure(mut self, metadata: UpstreamFailureMetadata) -> Self {
+        self.upstream_failure = Some(Box::new(metadata));
+        self
+    }
+
+    pub(crate) fn upstream_failure(&self) -> Option<UpstreamFailureMetadata> {
+        self.upstream_failure.as_deref().copied()
+    }
+
+    pub(crate) fn mark_upstream_chunk_accepted(&mut self) {
+        let metadata = self.upstream_failure.get_or_insert_with(|| {
+            Box::new(UpstreamFailureMetadata::stream(
+                UpstreamRetryClass::Stream,
+                true,
+            ))
+        });
+        metadata.upstream_chunk_accepted = true;
+        metadata.safe_same_provider_retry = false;
+    }
+
+    pub(crate) fn provider_temporarily_unavailable(retry_after: Duration) -> Self {
+        let seconds = bounded_retry_after_secs(retry_after);
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "compatible upstream providers are temporarily unavailable; retry in {seconds}s"
+            ),
+            client_message: format!(
+                "the upstream provider is temporarily unavailable; retry after {seconds} seconds"
+            ),
+            code: Some("provider_temporarily_unavailable".to_string()),
+            param: None,
+            failover: FailoverDisposition::Terminal,
+            upstream_failure: None,
+            retry_after: NonZeroU64::new(seconds),
+        }
+    }
+
+    pub(crate) fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after
+            .map(bounded_retry_after_secs)
+            .and_then(NonZeroU64::new);
+        self
+    }
+
+    pub(crate) fn retry_after_secs(&self) -> Option<u64> {
+        self.retry_after.map(NonZeroU64::get)
+    }
+}
+
+fn bounded_retry_after_secs(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0))
+        .clamp(1, 300)
 }
 
 impl fmt::Display for AppError {
@@ -358,7 +536,13 @@ impl IntoResponse for AppError {
                 code: self.code.as_deref(),
             },
         };
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if let Some(seconds) = self.retry_after_secs()
+            && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        response
     }
 }
 

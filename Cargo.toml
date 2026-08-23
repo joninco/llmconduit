@@ -22,6 +22,7 @@ base64 = "0.22"
 hmac = "0.12"
 subtle = "2"
 http = "1"
+httpdate = "1"
 # `LengthLimitError` (re-exported by axum's `to_bytes`) so `http.rs` can tell an
 # over-cap inbound body (413) from a truncated/broken stream (400). Already in
 # the graph via axum; a normal (not dev) dep because it is used in `src/`.

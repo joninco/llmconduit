@@ -2595,6 +2595,7 @@ fn responses_wire_event_data_inner(
             .and_then(|value| value.as_str().map(ToString::to_string));
         object.remove("llmconduit_error_status");
         object.remove("llmconduit_error_param");
+        object.remove("llmconduit_retry_after_secs");
         if let Some(sequence_number) = sequence_number {
             object.insert(
                 "sequence_number".to_string(),
@@ -2903,7 +2904,14 @@ async fn collect_responses_response(
                     .data
                     .get("llmconduit_error_param")
                     .and_then(Value::as_str);
-                return Err(AppError::from_terminal_event(message, code, status, param));
+                let retry_after = event
+                    .data
+                    .get("llmconduit_retry_after_secs")
+                    .and_then(Value::as_u64)
+                    .filter(|seconds| (1..=300).contains(seconds))
+                    .map(std::time::Duration::from_secs);
+                return Err(AppError::from_terminal_event(message, code, status, param)
+                    .with_retry_after(retry_after));
             }
             _ => {}
         }
@@ -2958,18 +2966,25 @@ async fn collect_anthropic_response(
         // converter chose; `invalid_request_error` (context overflow — the
         // client's input to fix) restores the 400 shape, everything else stays
         // the historical 502.
-        Err(err) => Ok(anthropic_error_response(AppError::from_terminal_event(
-            &err.message,
-            err.llmconduit_error_code.as_deref(),
-            err.llmconduit_error_status
-                .or_else(|| (err.kind == "invalid_request_error").then_some(400)),
-            err.llmconduit_error_param.as_deref(),
-        ))),
+        Err(err) => Ok(anthropic_error_response(
+            AppError::from_terminal_event(
+                &err.message,
+                err.llmconduit_error_code.as_deref(),
+                err.llmconduit_error_status
+                    .or_else(|| (err.kind == "invalid_request_error").then_some(400)),
+                err.llmconduit_error_param.as_deref(),
+            )
+            .with_retry_after(
+                err.llmconduit_retry_after_secs
+                    .map(std::time::Duration::from_secs),
+            ),
+        )),
     }
 }
 
 fn anthropic_error_response(err: AppError) -> Response {
     let status = err.status_code();
+    let retry_after = err.retry_after_secs();
     let error_type = anthropic_error_type(status);
     let body = serde_json::json!({
         "type": "error",
@@ -2978,7 +2993,13 @@ fn anthropic_error_response(err: AppError) -> Response {
             "message": err.client_message,
         }
     });
-    (status, Json(body)).into_response()
+    let mut response = (status, Json(body)).into_response();
+    if let Some(seconds) = retry_after
+        && let Ok(value) = HeaderValue::from_str(&seconds.to_string())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
 }
 
 fn anthropic_error_type(status: StatusCode) -> &'static str {

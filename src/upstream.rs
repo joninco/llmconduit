@@ -1,9 +1,15 @@
 use crate::config::LogBodyMode;
+use crate::config::UpstreamBulkheadConfig;
+use crate::config::UpstreamCircuitBreakerConfig;
+use crate::config::UpstreamResilienceConfig;
+use crate::config::UpstreamRetryConfig;
 use crate::config::UpstreamWireApi;
 use crate::config::merge_json_maps;
 use crate::error::AppError;
 use crate::error::AppResult;
 use crate::error::FailoverDisposition;
+use crate::error::UpstreamFailureMetadata;
+use crate::error::UpstreamRetryClass;
 use crate::models::chat::ChatCompletionChunk;
 use crate::models::chat::ChatCompletionRequest;
 use crate::sse_guard::bounded_sse_byte_stream;
@@ -34,12 +40,16 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
+use tokio::time::Instant as TokioInstant;
 use url::Url;
 
 /// Consecutive-failure count at or above which a cooling provider is reported
@@ -142,9 +152,9 @@ fn now_epoch_ms() -> u64 {
 /// for serialization, by measuring how far in the future it is from `now` and
 /// adding that to the current epoch-ms. A deadline already in the past yields the
 /// current epoch-ms (the cooldown is effectively over). `None` ⇒ no cooldown.
-fn instant_deadline_to_epoch_ms(deadline: Option<Instant>) -> Option<u64> {
+fn instant_deadline_to_epoch_ms(deadline: Option<TokioInstant>) -> Option<u64> {
     let deadline = deadline?;
-    let now = Instant::now();
+    let now = TokioInstant::now();
     let remaining = deadline.saturating_duration_since(now);
     Some(now_epoch_ms().saturating_add(remaining.as_millis() as u64))
 }
@@ -300,8 +310,8 @@ pub struct ProviderHealth {
     pub last_error: Option<String>,
     /// Cumulative count of flows this provider served (produced a first chunk).
     pub served_count: u64,
-    /// Cumulative count of times this provider was failed over FROM (a recorded
-    /// `mark_failure`).
+    /// Cumulative count of times dispatch actually advanced from this provider
+    /// to another nested provider.
     pub failover_count: u64,
     /// Consecutive failures since the last success (reset to 0 on success).
     pub consecutive_failures: u32,
@@ -316,13 +326,16 @@ pub struct ProviderHealth {
 /// Cumulative per-provider serving counters held behind an `Arc` so the owning
 /// upstream struct keeps its derived `Clone` (a bare atomic field would not be
 /// `Clone`). `served_count` / `failover_count` are monotonic totals;
-/// `consecutive_failures` is reset to 0 at `mark_provider_success` and bumped at
-/// `mark_failure`. All three are plain atomics (lock-free reads for the snapshot).
+/// `consecutive_failures` is reset to 0 at provider success and bumped when a
+/// provider attempt is exhausted. The counters are plain atomics (lock-free
+/// reads for the snapshot).
 #[derive(Debug, Default)]
 pub struct ProviderMetrics {
     served_count: AtomicU64,
     failover_count: AtomicU64,
     consecutive_failures: AtomicU32,
+    retry_attempt_count: AtomicU64,
+    retry_exhausted_count: AtomicU64,
 }
 
 impl ProviderMetrics {
@@ -338,10 +351,23 @@ impl ProviderMetrics {
         self.consecutive_failures.store(0, Ordering::Relaxed);
     }
 
-    /// Record a failover-away and bump the consecutive-failure streak.
-    fn record_failure(&self) {
-        self.failover_count.fetch_add(1, Ordering::Relaxed);
+    /// Record a provider failure independently from whether a nested fallback
+    /// was actually attempted. The failover counter is advanced only at the
+    /// later dispatch seam that truly moves to another provider.
+    fn record_health_failure(&self) {
         self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_failover(&self) {
+        self.failover_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_retry_attempt(&self) {
+        self.retry_attempt_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_retry_exhausted(&self) {
+        self.retry_exhausted_count.fetch_add(1, Ordering::Relaxed);
     }
 
     fn served_count(&self) -> u64 {
@@ -354,6 +380,16 @@ impl ProviderMetrics {
 
     fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn retry_attempt_count(&self) -> u64 {
+        self.retry_attempt_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn retry_exhausted_count(&self) -> u64 {
+        self.retry_exhausted_count.load(Ordering::Relaxed)
     }
 }
 
@@ -753,6 +789,10 @@ pub struct FailoverUpstreamProvider {
     /// same counters survive the routing/failover REBUILD that clones the
     /// provider (the rebuild clones the `Arc`, not the counters).
     metrics: Arc<ProviderMetrics>,
+    /// `None` preserves the historical direct-constructor behavior. The DI
+    /// root resolves and installs the configured policy for every real
+    /// provider, including routing primaries and nested fallbacks.
+    resilience: Option<UpstreamResilienceConfig>,
 }
 
 impl FailoverUpstreamProvider {
@@ -770,15 +810,22 @@ impl FailoverUpstreamProvider {
             exposed_model,
             upstream_chat_kwargs,
             metrics: ProviderMetrics::new(),
+            resilience: None,
         }
+    }
+
+    pub fn with_resilience(mut self, resilience: UpstreamResilienceConfig) -> Self {
+        self.resilience = Some(resilience);
+        self
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct FailoverUpstreamClient {
     providers: Vec<FailoverUpstreamProvider>,
-    cooldown: Duration,
-    states: Arc<Mutex<Vec<ProviderCooldownState>>>,
+    states: Arc<Mutex<Vec<ProviderCircuitRuntime>>>,
+    bulkheads: Arc<Vec<ProviderBulkhead>>,
+    jitter: Arc<dyn JitterSource>,
 }
 
 #[derive(Debug, Clone)]
@@ -799,14 +846,58 @@ impl RoutingUpstreamProvider {
         fallback_providers: Vec<FailoverUpstreamProvider>,
         cooldown: Duration,
     ) -> Self {
+        Self::new_with_optional_resilience(
+            name,
+            primary_client,
+            primary_upstream_model,
+            primary_upstream_chat_kwargs,
+            fallback_providers,
+            cooldown,
+            None,
+        )
+    }
+
+    pub fn new_with_resilience(
+        name: impl Into<String>,
+        primary_client: ReqwestUpstreamClient,
+        primary_upstream_model: Option<String>,
+        primary_upstream_chat_kwargs: JsonMap<String, Value>,
+        fallback_providers: Vec<FailoverUpstreamProvider>,
+        primary_resilience: UpstreamResilienceConfig,
+    ) -> Self {
+        Self::new_with_optional_resilience(
+            name,
+            primary_client,
+            primary_upstream_model,
+            primary_upstream_chat_kwargs,
+            fallback_providers,
+            Duration::ZERO,
+            Some(primary_resilience),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_optional_resilience(
+        name: impl Into<String>,
+        primary_client: ReqwestUpstreamClient,
+        primary_upstream_model: Option<String>,
+        primary_upstream_chat_kwargs: JsonMap<String, Value>,
+        fallback_providers: Vec<FailoverUpstreamProvider>,
+        cooldown: Duration,
+        primary_resilience: Option<UpstreamResilienceConfig>,
+    ) -> Self {
         let name = name.into();
-        let mut providers = vec![FailoverUpstreamProvider::new(
+        let mut primary = FailoverUpstreamProvider::new(
             name.clone(),
             primary_client.clone(),
             primary_upstream_model.clone(),
             None,
             primary_upstream_chat_kwargs,
-        )];
+        );
+        if let Some(resilience) = primary_resilience {
+            primary = primary.with_resilience(resilience);
+        }
+        let mut providers = vec![primary];
         let fallback_exposed_models = fallback_providers
             .iter()
             .enumerate()
@@ -853,19 +944,32 @@ pub struct RouteUpstreamProvider {
 
 impl RouteUpstreamProvider {
     pub fn new(name: impl Into<String>, client: ReqwestUpstreamClient, cooldown: Duration) -> Self {
+        Self::new_with_optional_resilience(name, client, cooldown, None)
+    }
+
+    pub fn new_with_resilience(
+        name: impl Into<String>,
+        client: ReqwestUpstreamClient,
+        resilience: UpstreamResilienceConfig,
+    ) -> Self {
+        Self::new_with_optional_resilience(name, client, Duration::ZERO, Some(resilience))
+    }
+
+    fn new_with_optional_resilience(
+        name: impl Into<String>,
+        client: ReqwestUpstreamClient,
+        cooldown: Duration,
+        resilience: Option<UpstreamResilienceConfig>,
+    ) -> Self {
         let name = name.into();
+        let mut provider =
+            FailoverUpstreamProvider::new(name.clone(), client, None, None, JsonMap::new());
+        if let Some(resilience) = resilience {
+            provider = provider.with_resilience(resilience);
+        }
         Self {
             name: name.clone(),
-            client: FailoverUpstreamClient::new(
-                vec![FailoverUpstreamProvider::new(
-                    name,
-                    client,
-                    None,
-                    None,
-                    JsonMap::new(),
-                )],
-                cooldown,
-            ),
+            client: FailoverUpstreamClient::new(vec![provider], cooldown),
         }
     }
 }
@@ -1024,11 +1128,206 @@ struct RoutingFallbackExposedModel {
     failover_provider_index: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ProviderCircuitState {
+    #[default]
+    Closed,
+    Open {
+        until: TokioInstant,
+        backoff_level: u32,
+    },
+    HalfOpen {
+        probe_in_flight: bool,
+    },
+}
+
 #[derive(Debug, Clone, Default)]
-struct ProviderCooldownState {
-    cooling_until: Option<Instant>,
+struct ProviderCircuitRuntime {
+    state: ProviderCircuitState,
+    /// The level is copied out of `Open` while the state is `HalfOpen`, whose
+    /// public state shape intentionally carries only probe ownership.
+    half_open_backoff_level: u32,
     // Bounded `AttemptErrorClass` name only; never retain an AppError/body here.
     last_error: Option<String>,
+}
+
+trait JitterSource: Send + Sync + std::fmt::Debug {
+    fn full_jitter(&self, upper: Duration) -> Duration;
+}
+
+#[derive(Debug)]
+struct SystemJitter {
+    state: AtomicU64,
+}
+
+impl Default for SystemJitter {
+    fn default() -> Self {
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0)
+            ^ 0x9e37_79b9_7f4a_7c15;
+        Self {
+            state: AtomicU64::new(seed.max(1)),
+        }
+    }
+}
+
+impl JitterSource for SystemJitter {
+    fn full_jitter(&self, upper: Duration) -> Duration {
+        let mut current = self.state.load(Ordering::Relaxed).max(1);
+        let next = loop {
+            let mut value = current;
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            value = value.max(1);
+            match self.state.compare_exchange_weak(
+                current,
+                value,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break value,
+                Err(observed) => current = observed.max(1),
+            }
+        };
+        let upper_nanos = u64::try_from(upper.as_nanos()).unwrap_or(u64::MAX);
+        let nanos = if upper_nanos == u64::MAX {
+            next
+        } else {
+            next % (upper_nanos + 1)
+        };
+        Duration::from_nanos(nanos)
+    }
+}
+
+#[derive(Debug)]
+struct ProviderBulkhead {
+    semaphore: Option<Arc<Semaphore>>,
+    max_queue: usize,
+    queued: Arc<AtomicUsize>,
+    queue_timeout: Duration,
+}
+
+impl ProviderBulkhead {
+    fn new(policy: &UpstreamBulkheadConfig) -> Self {
+        Self {
+            semaphore: policy
+                .max_in_flight
+                .map(|limit| Arc::new(Semaphore::new(limit))),
+            max_queue: policy.max_queue.unwrap_or(0),
+            queued: Arc::new(AtomicUsize::new(0)),
+            queue_timeout: Duration::from_millis(policy.queue_timeout_ms),
+        }
+    }
+
+    async fn acquire(&self) -> Result<Option<OwnedSemaphorePermit>, BulkheadUnavailable> {
+        let Some(semaphore) = &self.semaphore else {
+            return Ok(None);
+        };
+        if let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() {
+            return Ok(Some(permit));
+        }
+        if self.max_queue == 0 {
+            return Err(BulkheadUnavailable {
+                retry_after: Duration::from_secs(1),
+            });
+        }
+        let reserved = self
+            .queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued < self.max_queue).then_some(queued + 1)
+            })
+            .is_ok();
+        if !reserved {
+            return Err(BulkheadUnavailable {
+                retry_after: Duration::from_secs(1),
+            });
+        }
+        let _queue_slot = QueueSlot(Arc::clone(&self.queued));
+        match tokio::time::timeout(self.queue_timeout, Arc::clone(semaphore).acquire_owned()).await
+        {
+            Ok(Ok(permit)) => Ok(Some(permit)),
+            Ok(Err(_)) | Err(_) => Err(BulkheadUnavailable {
+                retry_after: self.queue_timeout.max(Duration::from_secs(1)),
+            }),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QueueSlot(Arc<AtomicUsize>);
+
+impl Drop for QueueSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BulkheadUnavailable {
+    retry_after: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitPermitKind {
+    Closed,
+    HalfOpen { backoff_level: u32 },
+}
+
+#[derive(Debug)]
+struct CircuitPermit {
+    states: Arc<Mutex<Vec<ProviderCircuitRuntime>>>,
+    provider_index: usize,
+    kind: CircuitPermitKind,
+    completed: bool,
+}
+
+impl CircuitPermit {
+    fn is_half_open(&self) -> bool {
+        matches!(self.kind, CircuitPermitKind::HalfOpen { .. })
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for CircuitPermit {
+    fn drop(&mut self) {
+        if self.completed || !self.is_half_open() {
+            return;
+        }
+        let mut states = self
+            .states
+            .lock()
+            .expect("upstream provider circuit state lock poisoned");
+        if let Some(runtime) = states.get_mut(self.provider_index)
+            && matches!(
+                runtime.state,
+                ProviderCircuitState::HalfOpen {
+                    probe_in_flight: true
+                }
+            )
+        {
+            runtime.state = ProviderCircuitState::HalfOpen {
+                probe_in_flight: false,
+            };
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitUnavailableKind {
+    Open,
+    HalfOpenProbeInFlight,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CircuitUnavailable {
+    kind: CircuitUnavailableKind,
+    retry_after: Duration,
 }
 
 /// F1d: the redacted bytes for the turn-capture `upstream_request` section — the
@@ -1386,11 +1685,11 @@ impl ReqwestUpstreamClient {
         self
     }
 
-    /// Mark this leaf the BARE/direct engine upstream (D2): the DI root calls this
-    /// ONLY for the single-upstream `Arc::new(primary_upstream)` path, where no
-    /// routing/failover layer owns the `provider` serving field. Then the leaf
-    /// synthesizes `provider = "primary"`. Leaves nested inside a failover/routing
-    /// client never call this, so they don't clobber the real provider name.
+    /// Mark this leaf as a bare/direct engine upstream for embedded and test
+    /// construction. Production now wraps even one provider in the shared
+    /// resilience layer, but retaining this seam preserves the direct-client
+    /// telemetry contract for callers that intentionally bypass that layer.
+    #[allow(dead_code)]
     pub(crate) fn into_bare_primary(mut self) -> Self {
         self.tag_primary_provider = true;
         self
@@ -1435,7 +1734,9 @@ impl ReqwestUpstreamClient {
                 let mut error = AppError::upstream(format!("{operation}: {err}"));
                 error.client_message = client_message.to_string();
                 error.code = Some("upstream_connection_error".to_string());
-                error
+                error.with_upstream_failure(UpstreamFailureMetadata::transport(
+                    UpstreamRetryClass::Transport,
+                ))
             })
     }
 
@@ -1509,7 +1810,9 @@ impl ReqwestUpstreamClient {
                 let mut error = AppError::upstream(format!("upstream chat request failed: {err}"));
                 error.client_message = "could not connect to the upstream provider".to_string();
                 error.code = Some("upstream_connection_error".to_string());
-                error
+                error.with_upstream_failure(UpstreamFailureMetadata::transport(
+                    UpstreamRetryClass::Transport,
+                ))
             })
     }
 
@@ -2011,6 +2314,7 @@ impl ReqwestUpstreamClient {
                 .await;
             }
 
+            let retry_after = parse_retry_after(response.headers());
             let body = self.read_upstream_error_body(response).await;
             let capture_body = body.capture_text();
             let overflow =
@@ -2093,7 +2397,9 @@ impl ReqwestUpstreamClient {
                         error.code = Some("upstream_error".to_string());
                     }
                 }
-                return Err(error);
+                return Err(
+                    error.with_upstream_failure(UpstreamFailureMetadata::http(status, retry_after))
+                );
             };
 
             let mut available = overflow.available_completion_tokens;
@@ -2289,18 +2595,21 @@ impl ReqwestUpstreamClient {
                     AppError::upstream(format!("upstream Responses request failed: {error}"));
                 app_error.client_message = "could not connect to the upstream provider".into();
                 app_error.code = Some("upstream_connection_error".into());
-                app_error
+                app_error.with_upstream_failure(UpstreamFailureMetadata::transport(
+                    UpstreamRetryClass::Transport,
+                ))
             })?;
         stamp_header_byte(backend.serving.as_ref());
         if !response.status().is_success() {
             let status = response.status();
+            let retry_after = parse_retry_after(response.headers());
             let body = self.read_upstream_error_body(response).await;
             self.capture_upstream_response_body(
                 backend.serving.as_ref(),
                 backend.capture.as_ref(),
                 &body.capture_text(),
             );
-            return Err(responses_status_error(status, &body.text));
+            return Err(responses_status_error(status, &body.text, retry_after));
         }
         if response
             .headers()
@@ -2310,7 +2619,11 @@ impl ReqwestUpstreamClient {
         {
             return Err(malformed_responses_stream_error(
                 "upstream Responses endpoint returned the wrong content type",
-            ));
+            )
+            .with_upstream_failure(UpstreamFailureMetadata::stream(
+                UpstreamRetryClass::MalformedStream,
+                true,
+            )));
         }
         stream_success_responses_response(
             response,
@@ -2593,13 +2906,58 @@ impl UpstreamClient for ReqwestUpstreamClient {
 }
 
 impl FailoverUpstreamClient {
-    pub fn new(providers: Vec<FailoverUpstreamProvider>, cooldown: Duration) -> Self {
-        let states = vec![ProviderCooldownState::default(); providers.len()];
+    pub fn new(mut providers: Vec<FailoverUpstreamProvider>, cooldown: Duration) -> Self {
+        let legacy = Self::legacy_resilience(cooldown);
+        for provider in &mut providers {
+            if provider.resilience.is_none() {
+                provider.resilience = Some(legacy.clone());
+            }
+        }
+        let states = vec![ProviderCircuitRuntime::default(); providers.len()];
+        let bulkheads = providers
+            .iter()
+            .map(|provider| {
+                ProviderBulkhead::new(
+                    &provider
+                        .resilience
+                        .as_ref()
+                        .expect("provider resilience resolved")
+                        .bulkhead,
+                )
+            })
+            .collect();
         Self {
             providers,
-            cooldown,
             states: Arc::new(Mutex::new(states)),
+            bulkheads: Arc::new(bulkheads),
+            jitter: Arc::new(SystemJitter::default()),
         }
+    }
+
+    fn legacy_resilience(cooldown: Duration) -> UpstreamResilienceConfig {
+        let open_ms = u64::try_from(cooldown.as_millis()).unwrap_or(u64::MAX);
+        UpstreamResilienceConfig {
+            retry: UpstreamRetryConfig::legacy_disabled(),
+            circuit_breaker: UpstreamCircuitBreakerConfig {
+                initial_open_ms: open_ms,
+                max_open_ms: open_ms,
+                half_open_max_probes: 1,
+            },
+            bulkhead: UpstreamBulkheadConfig::default(),
+        }
+    }
+
+    fn provider_resilience(&self, provider_index: usize) -> &UpstreamResilienceConfig {
+        self.providers[provider_index]
+            .resilience
+            .as_ref()
+            .expect("provider resilience resolved")
+    }
+
+    #[cfg(test)]
+    fn with_jitter_source(mut self, jitter: Arc<dyn JitterSource>) -> Self {
+        self.jitter = jitter;
+        self
     }
 
     /// The configured `upstream_model` rewrite of provider `index`, if any.
@@ -2631,27 +2989,30 @@ impl FailoverUpstreamClient {
     }
 
     fn available_provider_indices(&self) -> Vec<usize> {
-        let now = Instant::now();
+        let now = TokioInstant::now();
         let states = self
             .states
             .lock()
-            .expect("upstream provider cooldown state lock poisoned");
+            .expect("upstream provider circuit state lock poisoned");
         self.providers
             .iter()
             .enumerate()
             .filter_map(|(index, _)| {
-                let cooling = states
-                    .get(index)
-                    .and_then(|state| state.cooling_until)
-                    .is_some_and(|until| until > now);
-                (!cooling).then_some(index)
+                let available = states.get(index).is_none_or(|runtime| match runtime.state {
+                    ProviderCircuitState::Closed => true,
+                    ProviderCircuitState::Open { until, .. } => until <= now,
+                    ProviderCircuitState::HalfOpen { probe_in_flight } => !probe_in_flight,
+                });
+                available.then_some(index)
             })
             .collect()
     }
 
     fn available_provider_indices_for_request(&self, backend: &BackendChatRequest) -> Vec<usize> {
-        self.available_provider_indices()
-            .into_iter()
+        self.providers
+            .iter()
+            .enumerate()
+            .map(|(index, _)| index)
             .filter(|index| self.provider_is_capability_compatible(*index, backend))
             .collect()
     }
@@ -2660,8 +3021,10 @@ impl FailoverUpstreamClient {
         &self,
         backend: &BackendResponsesRequest,
     ) -> Vec<usize> {
-        self.available_provider_indices()
-            .into_iter()
+        self.providers
+            .iter()
+            .enumerate()
+            .map(|(index, _)| index)
             .filter(|index| self.provider_is_responses_compatible(*index, backend))
             .collect()
     }
@@ -2693,15 +3056,18 @@ impl FailoverUpstreamClient {
     }
 
     fn provider_is_available(&self, provider_index: usize) -> bool {
-        let now = Instant::now();
+        let now = TokioInstant::now();
         let states = self
             .states
             .lock()
-            .expect("upstream provider cooldown state lock poisoned");
+            .expect("upstream provider circuit state lock poisoned");
         states
             .get(provider_index)
-            .and_then(|state| state.cooling_until)
-            .is_none_or(|until| until <= now)
+            .is_none_or(|runtime| match runtime.state {
+                ProviderCircuitState::Closed => true,
+                ProviderCircuitState::Open { until, .. } => until <= now,
+                ProviderCircuitState::HalfOpen { probe_in_flight } => !probe_in_flight,
+            })
     }
 
     /// Build the D4 `ProviderHealth` vector for this failover chain. `route` is
@@ -2720,30 +3086,30 @@ impl FailoverUpstreamClient {
         route: Option<&str>,
         catalog_meta: CatalogMeta,
     ) -> Vec<ProviderHealth> {
-        // Snapshot cooldown state under one short lock hold, then drop it.
-        let states: Vec<(Option<Instant>, Option<String>)> = {
+        // Snapshot circuit state under one short lock hold, then drop it.
+        let states: Vec<(ProviderCircuitState, Option<String>)> = {
             let guard = self
                 .states
                 .lock()
-                .expect("upstream provider cooldown state lock poisoned");
+                .expect("upstream provider circuit state lock poisoned");
             self.providers
                 .iter()
                 .enumerate()
                 .map(|(index, _)| {
                     guard
                         .get(index)
-                        .map(|state| (state.cooling_until, state.last_error.clone()))
-                        .unwrap_or((None, None))
+                        .map(|runtime| (runtime.state, runtime.last_error.clone()))
+                        .unwrap_or((ProviderCircuitState::Closed, None))
                 })
                 .collect()
         };
-        let now = Instant::now();
+        let now = TokioInstant::now();
         self.providers
             .iter()
             .zip(states)
-            .map(|(provider, (cooling_until, last_error))| {
+            .map(|(provider, (circuit, last_error))| {
                 let consecutive_failures = provider.metrics.consecutive_failures();
-                let cooling = cooling_until.is_some_and(|until| until > now);
+                let cooling = !matches!(circuit, ProviderCircuitState::Closed);
                 let status = if cooling {
                     if consecutive_failures >= DOWN_THRESHOLD {
                         ProviderStatus::Down
@@ -2756,10 +3122,11 @@ impl FailoverUpstreamClient {
                 // Surface the cooldown deadline only while actually cooling — a
                 // stale past deadline (cleared logically by the `now` compare)
                 // would otherwise serialize a misleading future-looking value.
-                let cooling_until_ms = if cooling {
-                    instant_deadline_to_epoch_ms(cooling_until)
-                } else {
-                    None
+                let cooling_until_ms = match circuit {
+                    ProviderCircuitState::Open { until, .. } if until > now => {
+                        instant_deadline_to_epoch_ms(Some(until))
+                    }
+                    _ => None,
                 };
                 ProviderHealth {
                     id: provider.name.clone(),
@@ -2780,26 +3147,304 @@ impl FailoverUpstreamClient {
     }
 
     fn cooldown_error(&self) -> AppError {
-        let now = Instant::now();
+        let now = TokioInstant::now();
         let states = self
             .states
             .lock()
-            .expect("upstream provider cooldown state lock poisoned");
-        let next_retry_secs = states
+            .expect("upstream provider circuit state lock poisoned");
+        let next_retry = states
             .iter()
-            .filter_map(|state| state.cooling_until)
-            .filter(|until| *until > now)
-            .map(|until| until.duration_since(now).as_secs().max(1))
+            .filter_map(|runtime| match runtime.state {
+                ProviderCircuitState::Open { until, .. } if until > now => {
+                    Some(until.duration_since(now))
+                }
+                ProviderCircuitState::HalfOpen {
+                    probe_in_flight: true,
+                } => Some(Duration::from_secs(1)),
+                _ => None,
+            })
             .min()
-            .unwrap_or(0);
-        let last_error = states
-            .iter()
-            .rev()
-            .find_map(|state| state.last_error.as_deref())
-            .unwrap_or("no provider is currently available");
-        AppError::upstream(format!(
-            "all upstream providers are in cooldown; next retry in {next_retry_secs}s; last error: {last_error}"
-        ))
+            .unwrap_or(Duration::from_secs(1));
+        AppError::provider_temporarily_unavailable(next_retry)
+    }
+
+    fn temporary_unavailability_error(
+        unavailable: &[CircuitUnavailable],
+        bulkhead_retry_after: Option<Duration>,
+    ) -> AppError {
+        let circuit_delay = unavailable.iter().map(|item| item.retry_after).min();
+        let delay = circuit_delay
+            .into_iter()
+            .chain(bulkhead_retry_after)
+            .min()
+            .unwrap_or(Duration::from_secs(1));
+        AppError::provider_temporarily_unavailable(delay)
+    }
+
+    fn acquire_circuit(&self, provider_index: usize) -> Result<CircuitPermit, CircuitUnavailable> {
+        let policy = &self.provider_resilience(provider_index).circuit_breaker;
+        if policy.max_open_ms == 0 {
+            return Ok(CircuitPermit {
+                states: Arc::clone(&self.states),
+                provider_index,
+                kind: CircuitPermitKind::Closed,
+                completed: false,
+            });
+        }
+        let now = TokioInstant::now();
+        let mut states = self
+            .states
+            .lock()
+            .expect("upstream provider circuit state lock poisoned");
+        let runtime = states
+            .get_mut(provider_index)
+            .expect("provider circuit state index");
+        let kind = match runtime.state {
+            ProviderCircuitState::Closed => CircuitPermitKind::Closed,
+            ProviderCircuitState::Open {
+                until,
+                backoff_level,
+            } if until <= now => {
+                runtime.half_open_backoff_level = backoff_level;
+                runtime.state = ProviderCircuitState::HalfOpen {
+                    probe_in_flight: true,
+                };
+                tracing::info!(
+                    provider = %self.providers[provider_index].name,
+                    circuit_transition = "open_to_half_open",
+                    backoff_level,
+                    "upstream circuit entered half-open"
+                );
+                CircuitPermitKind::HalfOpen { backoff_level }
+            }
+            ProviderCircuitState::Open { until, .. } => {
+                return Err(CircuitUnavailable {
+                    kind: CircuitUnavailableKind::Open,
+                    retry_after: until.duration_since(now).max(Duration::from_millis(1)),
+                });
+            }
+            ProviderCircuitState::HalfOpen {
+                probe_in_flight: false,
+            } => {
+                runtime.state = ProviderCircuitState::HalfOpen {
+                    probe_in_flight: true,
+                };
+                CircuitPermitKind::HalfOpen {
+                    backoff_level: runtime.half_open_backoff_level,
+                }
+            }
+            ProviderCircuitState::HalfOpen {
+                probe_in_flight: true,
+            } => {
+                return Err(CircuitUnavailable {
+                    kind: CircuitUnavailableKind::HalfOpenProbeInFlight,
+                    retry_after: Duration::from_secs(1),
+                });
+            }
+        };
+        drop(states);
+        Ok(CircuitPermit {
+            states: Arc::clone(&self.states),
+            provider_index,
+            kind,
+            completed: false,
+        })
+    }
+
+    fn circuit_open_interval(policy: &UpstreamCircuitBreakerConfig, level: u32) -> Duration {
+        if policy.max_open_ms == 0 {
+            return Duration::ZERO;
+        }
+        let multiplier = 1_u64.checked_shl(level.min(63)).unwrap_or(u64::MAX);
+        let milliseconds = policy
+            .initial_open_ms
+            .saturating_mul(multiplier)
+            .min(policy.max_open_ms);
+        Duration::from_millis(milliseconds)
+    }
+
+    fn mark_provider_success_with_permit(&self, provider_index: usize, permit: &mut CircuitPermit) {
+        let was_half_open = permit.is_half_open();
+        {
+            let mut states = self
+                .states
+                .lock()
+                .expect("upstream provider circuit state lock poisoned");
+            if let Some(runtime) = states.get_mut(provider_index) {
+                runtime.state = ProviderCircuitState::Closed;
+                runtime.half_open_backoff_level = 0;
+                runtime.last_error = None;
+            }
+            self.providers[provider_index].metrics.record_success();
+        }
+        permit.complete();
+        if was_half_open {
+            tracing::info!(
+                provider = %self.providers[provider_index].name,
+                circuit_transition = "half_open_to_closed",
+                half_open_probe_outcome = "success",
+                "upstream half-open probe succeeded"
+            );
+        }
+    }
+
+    fn close_circuit_without_served_turn(&self, provider_index: usize, permit: &mut CircuitPermit) {
+        let was_half_open = permit.is_half_open();
+        let mut states = self
+            .states
+            .lock()
+            .expect("upstream provider circuit state lock poisoned");
+        if let Some(runtime) = states.get_mut(provider_index) {
+            runtime.state = ProviderCircuitState::Closed;
+            runtime.half_open_backoff_level = 0;
+            runtime.last_error = None;
+        }
+        permit.complete();
+        drop(states);
+        if was_half_open {
+            tracing::info!(
+                provider = %self.providers[provider_index].name,
+                circuit_transition = "half_open_to_closed",
+                half_open_probe_outcome = "success",
+                "upstream control-plane probe succeeded"
+            );
+        }
+    }
+
+    fn mark_failure_with_permit(
+        &self,
+        provider_index: usize,
+        error: &AppError,
+        permit: &mut CircuitPermit,
+        retry_exhausted: bool,
+    ) {
+        let policy = &self.provider_resilience(provider_index).circuit_breaker;
+        let error_class = attempt_error_class_name(classify_attempt_error(error));
+        let (level, half_open) = match permit.kind {
+            CircuitPermitKind::Closed => (0, false),
+            CircuitPermitKind::HalfOpen { backoff_level } => {
+                (backoff_level.saturating_add(1), true)
+            }
+        };
+        let interval = Self::circuit_open_interval(policy, level);
+        let mut transitioned = false;
+        {
+            let mut states = self
+                .states
+                .lock()
+                .expect("upstream provider circuit state lock poisoned");
+            let runtime = states
+                .get_mut(provider_index)
+                .expect("provider circuit state index");
+            let owns_transition =
+                half_open || matches!(runtime.state, ProviderCircuitState::Closed);
+            if owns_transition {
+                runtime.state = if interval.is_zero() {
+                    ProviderCircuitState::Closed
+                } else {
+                    ProviderCircuitState::Open {
+                        until: TokioInstant::now() + interval,
+                        backoff_level: level,
+                    }
+                };
+                runtime.half_open_backoff_level = level;
+                transitioned = !interval.is_zero();
+            }
+            runtime.last_error = Some(error_class.to_string());
+            self.providers[provider_index]
+                .metrics
+                .record_health_failure();
+            if retry_exhausted {
+                self.providers[provider_index]
+                    .metrics
+                    .record_retry_exhausted();
+            }
+        }
+        permit.complete();
+        tracing::warn!(
+            provider = %self.providers[provider_index].name,
+            error_class,
+            retry_exhausted,
+            circuit_transition = if transitioned { "to_open" } else { "unchanged" },
+            open_ms = interval.as_millis(),
+            backoff_level = level,
+            half_open_probe_outcome = if half_open { "failure" } else { "not_probe" },
+            "upstream provider attempt exhausted"
+        );
+    }
+
+    #[cfg(test)]
+    fn mark_failure(&self, provider_index: usize, error: &AppError) {
+        let mut permit = CircuitPermit {
+            states: Arc::clone(&self.states),
+            provider_index,
+            kind: CircuitPermitKind::Closed,
+            completed: false,
+        };
+        self.mark_failure_with_permit(provider_index, error, &mut permit, false);
+    }
+
+    #[cfg(test)]
+    fn mark_provider_success(&self, provider_index: usize) {
+        let mut permit = CircuitPermit {
+            states: Arc::clone(&self.states),
+            provider_index,
+            kind: CircuitPermitKind::Closed,
+            completed: false,
+        };
+        self.mark_provider_success_with_permit(provider_index, &mut permit);
+    }
+
+    fn next_retry_delay(
+        &self,
+        provider_index: usize,
+        error: &AppError,
+        completed_attempts: usize,
+        accumulated_delay: Duration,
+    ) -> Option<Duration> {
+        let policy = &self.provider_resilience(provider_index).retry;
+        let metadata = error.upstream_failure()?;
+        if !policy.enabled
+            || completed_attempts >= policy.max_attempts
+            || error.failover_disposition() == FailoverDisposition::Terminal
+            || !metadata.safe_same_provider_retry
+            || metadata.upstream_chunk_accepted
+        {
+            return None;
+        }
+        let total_budget = Duration::from_millis(policy.total_budget_ms);
+        let remaining = total_budget.checked_sub(accumulated_delay)?;
+        if remaining.is_zero() {
+            return None;
+        }
+        let exponent = u32::try_from(completed_attempts.saturating_sub(1)).unwrap_or(u32::MAX);
+        let multiplier = 1_u64.checked_shl(exponent.min(63)).unwrap_or(u64::MAX);
+        let cap = Duration::from_millis(
+            policy
+                .initial_backoff_ms
+                .saturating_mul(multiplier)
+                .min(policy.max_backoff_ms),
+        );
+        let jitter = self.jitter.full_jitter(cap);
+        let retry_after = policy
+            .honor_retry_after
+            .then_some(metadata.retry_after)
+            .flatten()
+            .map(|duration| duration.min(Duration::from_secs(policy.max_retry_after_secs)))
+            .unwrap_or(Duration::ZERO);
+        Some(jitter.max(retry_after).min(remaining))
+    }
+
+    fn retry_status_class(error: &AppError) -> &'static str {
+        match error
+            .upstream_failure()
+            .and_then(|metadata| metadata.original_status)
+        {
+            Some(408) => "http_408",
+            Some(429) => "http_429",
+            Some(500 | 502 | 503 | 504) => "http_5xx",
+            _ => "other",
+        }
     }
 
     fn request_for_provider(
@@ -2859,11 +3504,28 @@ impl FailoverUpstreamClient {
     ) -> AppResult<(ChatCompletionChunk, UpstreamStream)> {
         match tokio::time::timeout(request_timeout, stream.next()).await {
             Ok(Some(Ok(chunk))) => Ok((chunk, stream)),
-            Ok(Some(Err(err))) => Err(err),
-            Ok(None) => Err(AppError::upstream(
-                "upstream stream ended before the first chunk",
-            )),
-            Err(_) => Err(AppError::gateway_timeout("upstream stream timed out")),
+            Ok(Some(Err(err))) => {
+                if err.upstream_failure().is_some() {
+                    Err(err)
+                } else {
+                    Err(err.with_upstream_failure(UpstreamFailureMetadata::stream(
+                        UpstreamRetryClass::Stream,
+                        true,
+                    )))
+                }
+            }
+            Ok(None) => Err(
+                AppError::upstream("upstream stream ended before the first chunk")
+                    .with_upstream_failure(UpstreamFailureMetadata::stream(
+                        UpstreamRetryClass::Stream,
+                        true,
+                    )),
+            ),
+            Err(_) => Err(AppError::gateway_timeout("upstream stream timed out")
+                .with_upstream_failure(UpstreamFailureMetadata::stream(
+                    UpstreamRetryClass::Timeout,
+                    true,
+                ))),
         }
     }
 
@@ -2873,26 +3535,32 @@ impl FailoverUpstreamClient {
         first_chunk: ChatCompletionChunk,
         mut stream: UpstreamStream,
         request_timeout: Duration,
+        bulkhead_permit: Option<OwnedSemaphorePermit>,
     ) -> UpstreamStream {
         let states = Arc::clone(&self.states);
-        let cooldown = self.cooldown;
+        let circuit_policy = self
+            .provider_resilience(provider_index)
+            .circuit_breaker
+            .clone();
         let provider_name = self.providers[provider_index].name.clone();
         // D4: capture this provider's `Arc<ProviderMetrics>` so a mid-stream
         // failure (which runs in the spawned stream, not through `&self`) still
         // records the failover/consecutive-failure counters.
         let metrics = Arc::clone(&self.providers[provider_index].metrics);
         Box::pin(async_stream::stream! {
+            let _bulkhead_permit = bulkhead_permit;
             yield Ok(first_chunk);
             loop {
                 match tokio::time::timeout(request_timeout, stream.next()).await {
                     Ok(Some(Ok(chunk))) => yield Ok(chunk),
-                    Ok(Some(Err(err))) => {
-                        Self::mark_provider_failure(
+                    Ok(Some(Err(mut err))) => {
+                        err.mark_upstream_chunk_accepted();
+                        Self::mark_midstream_failure(
                             &states,
                             &metrics,
                             provider_index,
                             &provider_name,
-                            cooldown,
+                            &circuit_policy,
                             classify_attempt_error(&err),
                         );
                         yield Err(err);
@@ -2900,13 +3568,18 @@ impl FailoverUpstreamClient {
                     }
                     Ok(None) => break,
                     Err(_) => {
-                        let err = AppError::gateway_timeout("upstream stream timed out");
-                        Self::mark_provider_failure(
+                        let mut err = AppError::gateway_timeout("upstream stream timed out")
+                            .with_upstream_failure(UpstreamFailureMetadata::stream(
+                                UpstreamRetryClass::Timeout,
+                                true,
+                            ));
+                        err.mark_upstream_chunk_accepted();
+                        Self::mark_midstream_failure(
                             &states,
                             &metrics,
                             provider_index,
                             &provider_name,
-                            cooldown,
+                            &circuit_policy,
                             classify_attempt_error(&err),
                         );
                         yield Err(err);
@@ -2917,75 +3590,43 @@ impl FailoverUpstreamClient {
         })
     }
 
-    fn mark_provider_success(&self, provider_index: usize) {
-        let mut states = self
-            .states
-            .lock()
-            .expect("upstream provider cooldown state lock poisoned");
-        if let Some(state) = states.get_mut(provider_index) {
-            state.cooling_until = None;
-            state.last_error = None;
-        }
-        // D4: a served flow clears the consecutive-failure streak (mirrors the
-        // cooldown clear above) and bumps the cumulative served counter, under
-        // the same `states` lock so the cleared deadline + reset streak are
-        // observed together (a reader snapshots the deadline under this lock).
-        if let Some(provider) = self.providers.get(provider_index) {
-            provider.metrics.record_success();
-        }
-    }
-
-    fn mark_provider_failure(
-        states: &Arc<Mutex<Vec<ProviderCooldownState>>>,
+    fn mark_midstream_failure(
+        states: &Arc<Mutex<Vec<ProviderCircuitRuntime>>>,
         metrics: &Arc<ProviderMetrics>,
         provider_index: usize,
         provider_name: &str,
-        cooldown: Duration,
+        circuit_policy: &UpstreamCircuitBreakerConfig,
         error_class: crate::dashboard_flow::AttemptErrorClass,
     ) {
         let error_class = attempt_error_class_name(error_class);
-        let cooling_until = (cooldown > Duration::ZERO).then(|| Instant::now() + cooldown);
+        let interval = Self::circuit_open_interval(circuit_policy, 0);
+        let mut transitioned = false;
         {
             let mut states = states
                 .lock()
-                .expect("upstream provider cooldown state lock poisoned");
-            if let Some(state) = states.get_mut(provider_index) {
-                state.cooling_until = cooling_until;
-                state.last_error = Some(error_class.to_string());
+                .expect("upstream provider circuit state lock poisoned");
+            if let Some(runtime) = states.get_mut(provider_index) {
+                if matches!(runtime.state, ProviderCircuitState::Closed) && !interval.is_zero() {
+                    runtime.state = ProviderCircuitState::Open {
+                        until: TokioInstant::now() + interval,
+                        backoff_level: 0,
+                    };
+                    transitioned = true;
+                }
+                runtime.last_error = Some(error_class.to_string());
             }
-            // D4: bump the cumulative failover counter + the consecutive-failure
-            // streak (the streak crosses `DOWN_THRESHOLD` → `Down` while cooling)
-            // WHILE the `states` lock is held, so the deadline write and the
-            // failure-count bump land in one critical section — a reader that
-            // snapshots the cooldown deadline under this same lock observes the
-            // pair consistently (it reads `consecutive_failures` right after, so
-            // a Cooling→Down step is never split across the deadline write).
-            metrics.record_failure();
+            metrics.record_health_failure();
         }
-        if cooldown > Duration::ZERO {
-            tracing::warn!(
-                provider = provider_name,
-                cooldown_secs = cooldown.as_secs(),
-                error_class,
-                "upstream provider failed; entering cooldown"
-            );
-        } else {
-            tracing::warn!(
-                provider = provider_name,
-                error_class,
-                "upstream provider failed"
-            );
-        }
-    }
-
-    fn mark_failure(&self, provider_index: usize, error: &AppError) {
-        Self::mark_provider_failure(
-            &self.states,
-            &self.providers[provider_index].metrics,
-            provider_index,
-            &self.providers[provider_index].name,
-            self.cooldown,
-            classify_attempt_error(error),
+        tracing::warn!(
+            provider = provider_name,
+            error_class,
+            circuit_transition = if transitioned {
+                "closed_to_open"
+            } else {
+                "unchanged"
+            },
+            open_ms = interval.as_millis(),
+            "upstream failed after output began"
         );
     }
 
@@ -3000,14 +3641,14 @@ impl FailoverUpstreamClient {
                 "resolved fallback provider index was out of range",
             ));
         }
-        if !self.provider_is_available(provider_index) {
-            return Err(self.cooldown_error());
-        }
         if !self.provider_is_responses_compatible(provider_index, backend) {
             return Err(AppError::bad_request(
                 "the selected fallback cannot serve this native Responses request",
             )
             .with_code("unsupported_parameter"));
+        }
+        if !self.provider_is_available(provider_index) {
+            return Err(self.cooldown_error());
         }
         self.stream_responses_with_provider_indices(vec![provider_index], backend, request_timeout)
             .await
@@ -3020,57 +3661,138 @@ impl FailoverUpstreamClient {
         request_timeout: Duration,
     ) -> AppResult<UpstreamResponsesStream> {
         let mut last_error = None;
+        let mut unavailable = Vec::new();
+        let mut bulkhead_retry_after = None;
+        let mut pending_failed_provider: Option<usize> = None;
         for provider_index in provider_indices {
             let provider = &self.providers[provider_index];
             let provider_request = Self::responses_request_for_provider(provider, backend);
-            if let Some(serving) = &backend.serving {
-                serving.arm_attempt_header_byte();
-                serving.clear_pending_response_body();
+            let mut circuit_permit = match self.acquire_circuit(provider_index) {
+                Ok(permit) => permit,
+                Err(reason) => {
+                    tracing::debug!(
+                        provider = %provider.name,
+                        circuit_state = ?reason.kind,
+                        retry_after_ms = reason.retry_after.as_millis(),
+                        "native Responses provider is temporarily unavailable"
+                    );
+                    unavailable.push(reason);
+                    continue;
+                }
+            };
+            let bulkhead_permit = match self.bulkheads[provider_index].acquire().await {
+                Ok(permit) => permit,
+                Err(reason) => {
+                    bulkhead_retry_after = Some(
+                        bulkhead_retry_after.map_or(reason.retry_after, |current: Duration| {
+                            current.min(reason.retry_after)
+                        }),
+                    );
+                    continue;
+                }
+            };
+            if let Some(failed_provider) = pending_failed_provider.take() {
+                self.providers[failed_provider].metrics.record_failover();
             }
-            let dispatch = provider
-                .client
-                .stream_responses_native_with_timeout(&provider_request, request_timeout)
-                .await;
-            let mut stream = match dispatch {
-                Ok(stream) => stream,
+
+            let mut completed_attempts = 0_usize;
+            let mut accumulated_delay = Duration::ZERO;
+            let final_result = loop {
+                completed_attempts += 1;
+                if let Some(serving) = &backend.serving {
+                    serving.arm_attempt_header_byte();
+                    serving.clear_pending_response_body();
+                }
+                let dispatch = provider
+                    .client
+                    .stream_responses_native_with_timeout(&provider_request, request_timeout)
+                    .await;
+                match dispatch {
+                    Ok(mut stream) => {
+                        let prefetched = match tokio::time::timeout(request_timeout, stream.next())
+                            .await
+                        {
+                            Ok(Some(Ok(event))) => Ok((event, stream)),
+                            Ok(Some(Err(error))) => Err(error),
+                            Ok(None) => Err(malformed_responses_stream_error(
+                                "upstream Responses stream ended before its first event",
+                            )),
+                            Err(_) => Err(AppError::gateway_timeout(
+                                "upstream Responses stream timed out",
+                            )
+                            .with_upstream_failure(
+                                UpstreamFailureMetadata::stream(UpstreamRetryClass::Timeout, true),
+                            )),
+                        };
+                        break prefetched;
+                    }
+                    Err(error) => {
+                        if let Some(delay) = self.next_retry_delay(
+                            provider_index,
+                            &error,
+                            completed_attempts,
+                            accumulated_delay,
+                        ) {
+                            provider.metrics.record_retry_attempt();
+                            tracing::warn!(
+                                provider = %provider.name,
+                                retry_ordinal = completed_attempts,
+                                retry_status_class = Self::retry_status_class(&error),
+                                retry_delay_ms = delay.as_millis(),
+                                accumulated_retry_delay_ms = accumulated_delay
+                                    .saturating_add(delay)
+                                    .as_millis(),
+                                "retrying native Responses request on the same provider"
+                            );
+                            tokio::time::sleep(delay).await;
+                            accumulated_delay += delay;
+                            continue;
+                        }
+                        break Err(error);
+                    }
+                }
+            };
+            let (first, mut stream) = match final_result {
+                Ok(success) => success,
                 Err(error) if error.failover_disposition() == FailoverDisposition::Terminal => {
+                    self.close_circuit_without_served_turn(provider_index, &mut circuit_permit);
                     return Err(error);
                 }
                 Err(error)
                     if error.failover_disposition() == FailoverDisposition::FailoverNoCooldown =>
                 {
+                    self.close_circuit_without_served_turn(provider_index, &mut circuit_permit);
+                    pending_failed_provider = Some(provider_index);
                     last_error = Some(error);
                     continue;
                 }
                 Err(error) => {
-                    self.mark_failure(provider_index, &error);
-                    last_error = Some(error);
-                    continue;
-                }
-            };
-            let first = match tokio::time::timeout(request_timeout, stream.next()).await {
-                Ok(Some(Ok(event))) => event,
-                Ok(Some(Err(error))) => {
-                    self.mark_failure(provider_index, &error);
-                    last_error = Some(error);
-                    continue;
-                }
-                Ok(None) => {
-                    let error = malformed_responses_stream_error(
-                        "upstream Responses stream ended before its first event",
+                    let retry_exhausted = error
+                        .upstream_failure()
+                        .is_some_and(|metadata| metadata.safe_same_provider_retry)
+                        && self.provider_resilience(provider_index).retry.enabled;
+                    if retry_exhausted {
+                        tracing::warn!(
+                            provider = %provider.name,
+                            retry_status_class = Self::retry_status_class(&error),
+                            retry_attempts = completed_attempts,
+                            accumulated_retry_delay_ms = accumulated_delay.as_millis(),
+                            retry_exhaustion = true,
+                            "same-provider native Responses retry exhausted"
+                        );
+                    }
+                    self.mark_failure_with_permit(
+                        provider_index,
+                        &error,
+                        &mut circuit_permit,
+                        retry_exhausted,
                     );
-                    self.mark_failure(provider_index, &error);
-                    last_error = Some(error);
-                    continue;
-                }
-                Err(_) => {
-                    let error = AppError::gateway_timeout("upstream Responses stream timed out");
-                    self.mark_failure(provider_index, &error);
+                    pending_failed_provider = Some(provider_index);
                     last_error = Some(error);
                     continue;
                 }
             };
-            self.mark_provider_success(provider_index);
+            self.mark_provider_success_with_permit(provider_index, &mut circuit_permit);
             if let Some(serving) = &backend.serving {
                 serving.set_provider(provider.name.clone());
                 serving.clear_pending_response_body();
@@ -3078,19 +3800,24 @@ impl FailoverUpstreamClient {
             let states = Arc::clone(&self.states);
             let metrics = Arc::clone(&provider.metrics);
             let provider_name = provider.name.clone();
-            let cooldown = self.cooldown;
+            let circuit_policy = self
+                .provider_resilience(provider_index)
+                .circuit_breaker
+                .clone();
             return Ok(Box::pin(async_stream::stream! {
+                let _bulkhead_permit = bulkhead_permit;
                 yield Ok(first);
                 loop {
                     match tokio::time::timeout(request_timeout, stream.next()).await {
                         Ok(Some(Ok(event))) => yield Ok(event),
-                        Ok(Some(Err(error))) => {
-                            Self::mark_provider_failure(
+                        Ok(Some(Err(mut error))) => {
+                            error.mark_upstream_chunk_accepted();
+                            Self::mark_midstream_failure(
                                 &states,
                                 &metrics,
                                 provider_index,
                                 &provider_name,
-                                cooldown,
+                                &circuit_policy,
                                 classify_attempt_error(&error),
                             );
                             yield Err(error);
@@ -3098,13 +3825,18 @@ impl FailoverUpstreamClient {
                         }
                         Ok(None) => return,
                         Err(_) => {
-                            let error = AppError::gateway_timeout("upstream Responses stream timed out");
-                            Self::mark_provider_failure(
+                            let mut error = AppError::gateway_timeout("upstream Responses stream timed out")
+                                .with_upstream_failure(UpstreamFailureMetadata::stream(
+                                    UpstreamRetryClass::Timeout,
+                                    true,
+                                ));
+                            error.mark_upstream_chunk_accepted();
+                            Self::mark_midstream_failure(
                                 &states,
                                 &metrics,
                                 provider_index,
                                 &provider_name,
-                                cooldown,
+                                &circuit_policy,
                                 classify_attempt_error(&error),
                             );
                             yield Err(error);
@@ -3114,9 +3846,14 @@ impl FailoverUpstreamClient {
                 }
             }));
         }
-        Err(last_error.unwrap_or_else(|| {
-            AppError::upstream("all native Responses providers failed before output")
-        }))
+        if let Some(error) = last_error {
+            Err(error)
+        } else {
+            Err(Self::temporary_unavailability_error(
+                &unavailable,
+                bulkhead_retry_after,
+            ))
+        }
     }
 
     async fn stream_chat_completion_with_timeout_from_provider(
@@ -3130,14 +3867,14 @@ impl FailoverUpstreamClient {
                 "resolved fallback provider index was out of range",
             ));
         }
-        if !self.provider_is_available(provider_index) {
-            return Err(self.cooldown_error());
-        }
         if !self.provider_is_capability_compatible(provider_index, backend) {
             return Err(AppError::bad_request(
                 "the selected fallback does not support the requested Responses capabilities",
             )
             .with_code("unsupported_parameter"));
+        }
+        if !self.provider_is_available(provider_index) {
+            return Err(self.cooldown_error());
         }
         self.stream_chat_completion_with_provider_indices(
             vec![provider_index],
@@ -3154,9 +3891,39 @@ impl FailoverUpstreamClient {
         request_timeout: Duration,
     ) -> AppResult<UpstreamStream> {
         let mut last_error = None;
+        let mut unavailable = Vec::new();
+        let mut bulkhead_retry_after = None;
+        let mut pending_failed_provider: Option<usize> = None;
         for provider_index in provider_indices {
             let provider = &self.providers[provider_index];
             let provider_request = Self::request_for_provider(provider, backend);
+            let mut circuit_permit = match self.acquire_circuit(provider_index) {
+                Ok(permit) => permit,
+                Err(reason) => {
+                    tracing::debug!(
+                        provider = %provider.name,
+                        circuit_state = ?reason.kind,
+                        retry_after_ms = reason.retry_after.as_millis(),
+                        "upstream provider is temporarily unavailable"
+                    );
+                    unavailable.push(reason);
+                    continue;
+                }
+            };
+            let bulkhead_permit = match self.bulkheads[provider_index].acquire().await {
+                Ok(permit) => permit,
+                Err(reason) => {
+                    bulkhead_retry_after = Some(
+                        bulkhead_retry_after.map_or(reason.retry_after, |current: Duration| {
+                            current.min(reason.retry_after)
+                        }),
+                    );
+                    continue;
+                }
+            };
+            if let Some(failed_provider) = pending_failed_provider.take() {
+                self.providers[failed_provider].metrics.record_failover();
+            }
             // Gap 03: per-attempt provenance. `start_ms` is the wall-clock the dispatch
             // is issued; the provider's on-wire model is `provider_request.request.model`
             // (post `request_for_provider` remap). The attempt's outcome (served / failed)
@@ -3168,101 +3935,66 @@ impl FailoverUpstreamClient {
             let attempt_started_at = Instant::now();
             let attempt_start_ms = now_epoch_ms_u128();
             let attempt_model = provider_request.request.model.clone();
-            // Gap 03 round-1 review (F1): arm the per-attempt wire-byte slot on the SHARED
-            // token (the nested leaf stamps it the instant `send().await` returns response
-            // headers, for both a 2xx and a non-2xx). Read it after the dispatch resolves:
-            // `Some` once headers arrived (served OR HTTP-status failure), `None` for a
-            // connect/timeout-before-response. This is the TRUE wire TTFB the prior code
-            // missed (it stamped a served attempt only at first-chunk yield and recorded
-            // `None` for an HTTP-status failure despite headers having arrived).
-            if let Some(serving) = &backend.serving {
-                serving.arm_attempt_header_byte();
-                // Gap 05 review round 2 (HIGH): CLEAR any upstream ERROR body staged by an
-                // EARLIER provider before THIS attempt dispatches, so the FINAL attempt's
-                // outcome — not a stale earlier one — decides the committed body. Without
-                // this, `A=500(body) → B=connect/timeout/prefetch-stream-error(no body)`
-                // would commit A's stale body even though the turn's final failure carried
-                // none: B's body-less failure never re-stages, and the served-path clear
-                // (below) is reached only on a SERVE, not on a body-less failure. Mirrors
-                // `arm_attempt_header_byte`'s per-attempt reset of scratch state — an
-                // HTTP-status failure re-stages its own body, a served attempt clears (as
-                // it already does), and a body-less final failure leaves it cleared ⇒ the
-                // record commits `None`. Idempotent + gated (no-op when capture is off).
-                serving.clear_pending_response_body();
-            }
-            let dispatch = tokio::time::timeout(
-                request_timeout,
-                provider.client.stream_chat_completion(&provider_request),
-            )
-            .await
-            .map_err(|_| upstream_response_headers_timeout())
-            .and_then(|result| result);
-            let stream = match dispatch {
-                Ok(stream) => stream,
-                Err(err) if err.failover_disposition() == FailoverDisposition::Terminal => {
-                    // Terminal same-provider error (e.g. a context overflow that
-                    // survived the leaf shrink-and-retry). Trying the next
-                    // provider would just overflow again, so surface it as-is and
-                    // do NOT mark this provider failed (it is not at fault). A context
-                    // overflow IS an HTTP-status response, so its headers arrived — the
-                    // slot carries the wire byte time for the trace.
-                    let header_byte_ms = Self::take_attempt_header_byte(backend);
-                    Self::record_attempt(
-                        backend,
-                        provider,
-                        attempt_start_ms,
-                        attempt_started_at,
-                        attempt_model,
-                        header_byte_ms,
-                        Self::take_attempt_header_byte_offset(backend),
-                        Some(&err),
-                    );
-                    return Err(err);
+            let mut completed_attempts = 0_usize;
+            let mut accumulated_delay = Duration::ZERO;
+            let final_result = loop {
+                completed_attempts += 1;
+                // Retry attempts reuse the exact same finalized provider request.
+                // Scratch capture/header state is reset per on-wire attempt so
+                // only the final attempt remains authoritative.
+                if let Some(serving) = &backend.serving {
+                    serving.arm_attempt_header_byte();
+                    serving.clear_pending_response_body();
                 }
-                Err(err)
-                    if err.failover_disposition() == FailoverDisposition::FailoverNoCooldown =>
-                {
-                    let header_byte_ms = Self::take_attempt_header_byte(backend);
-                    Self::record_attempt(
-                        backend,
-                        provider,
-                        attempt_start_ms,
-                        attempt_started_at,
-                        attempt_model,
-                        header_byte_ms,
-                        Self::take_attempt_header_byte_offset(backend),
-                        Some(&err),
-                    );
-                    last_error = Some(err);
-                    continue;
-                }
-                Err(err) => {
-                    self.mark_failure(provider_index, &err);
-                    // `Some` for an HTTP-status failure (headers arrived), `None` for a
-                    // connect/timeout-before-response (the leaf never reached the stamp).
-                    let header_byte_ms = Self::take_attempt_header_byte(backend);
-                    Self::record_attempt(
-                        backend,
-                        provider,
-                        attempt_start_ms,
-                        attempt_started_at,
-                        attempt_model,
-                        header_byte_ms,
-                        Self::take_attempt_header_byte_offset(backend),
-                        Some(&err),
-                    );
-                    last_error = Some(err);
-                    continue;
+                let dispatch = tokio::time::timeout(
+                    request_timeout,
+                    provider.client.stream_chat_completion(&provider_request),
+                )
+                .await
+                .map_err(|_| upstream_response_headers_timeout())
+                .and_then(|result| result);
+                match dispatch {
+                    Ok(stream) => {
+                        let header_byte_ms = Self::take_attempt_header_byte(backend);
+                        let header_byte_offset_ms = Self::take_attempt_header_byte_offset(backend);
+                        break match Self::prefetch_first_chunk(stream, request_timeout).await {
+                            Ok((first_chunk, stream)) => {
+                                Ok((first_chunk, stream, header_byte_ms, header_byte_offset_ms))
+                            }
+                            Err(error) => Err((error, header_byte_ms, header_byte_offset_ms)),
+                        };
+                    }
+                    Err(error) => {
+                        let header_byte_ms = Self::take_attempt_header_byte(backend);
+                        let header_byte_offset_ms = Self::take_attempt_header_byte_offset(backend);
+                        if let Some(delay) = self.next_retry_delay(
+                            provider_index,
+                            &error,
+                            completed_attempts,
+                            accumulated_delay,
+                        ) {
+                            provider.metrics.record_retry_attempt();
+                            tracing::warn!(
+                                provider = %provider.name,
+                                retry_ordinal = completed_attempts,
+                                retry_status_class = Self::retry_status_class(&error),
+                                retry_delay_ms = delay.as_millis(),
+                                accumulated_retry_delay_ms = accumulated_delay
+                                    .saturating_add(delay)
+                                    .as_millis(),
+                                "retrying chat request on the same provider"
+                            );
+                            tokio::time::sleep(delay).await;
+                            accumulated_delay += delay;
+                            continue;
+                        }
+                        break Err((error, header_byte_ms, header_byte_offset_ms));
+                    }
                 }
             };
-            // Headers arrived (the dispatch returned `Ok`), so the slot holds the wire byte
-            // time for THIS served/prefetch-failed attempt. Read it ONCE here, before
-            // `prefetch_first_chunk` may take a while waiting for the first chunk — the
-            // measured byte is the header time, not the prefetch-completion time.
-            let header_byte_ms = Self::take_attempt_header_byte(backend);
-            match Self::prefetch_first_chunk(stream, request_timeout).await {
-                Ok((first_chunk, stream)) => {
-                    self.mark_provider_success(provider_index);
+            match final_result {
+                Ok((first_chunk, stream, header_byte_ms, header_byte_offset_ms)) => {
+                    self.mark_provider_success_with_permit(provider_index, &mut circuit_permit);
                     // D2: this provider produced the first chunk, so it is the ACTUAL
                     // serving provider (not a fallback that was tried and skipped —
                     // AGENTS.md steering). The failover layer owns the `provider`
@@ -3290,7 +4022,7 @@ impl FailoverUpstreamClient {
                         attempt_started_at,
                         attempt_model,
                         header_byte_ms,
-                        Self::take_attempt_header_byte_offset(backend),
+                        header_byte_offset_ms,
                         None,
                     );
                     if provider_index > 0 {
@@ -3304,10 +4036,37 @@ impl FailoverUpstreamClient {
                         first_chunk,
                         stream,
                         request_timeout,
+                        bulkhead_permit,
                     ));
                 }
-                Err(err) => {
-                    self.mark_failure(provider_index, &err);
+                Err((err, header_byte_ms, header_byte_offset_ms)) => {
+                    let retry_exhausted = err
+                        .upstream_failure()
+                        .is_some_and(|metadata| metadata.safe_same_provider_retry)
+                        && self.provider_resilience(provider_index).retry.enabled;
+                    if retry_exhausted {
+                        tracing::warn!(
+                            provider = %provider.name,
+                            retry_status_class = Self::retry_status_class(&err),
+                            retry_attempts = completed_attempts,
+                            accumulated_retry_delay_ms = accumulated_delay.as_millis(),
+                            retry_exhaustion = true,
+                            "same-provider chat retry exhausted"
+                        );
+                    }
+                    if err.failover_disposition() == FailoverDisposition::Failover {
+                        self.mark_failure_with_permit(
+                            provider_index,
+                            &err,
+                            &mut circuit_permit,
+                            retry_exhausted,
+                        );
+                    } else {
+                        // A request-shaped rejection proves the half-open
+                        // provider is reachable. Do not strand the circuit in
+                        // HalfOpen or keep unrelated callers cooling.
+                        self.close_circuit_without_served_turn(provider_index, &mut circuit_permit);
+                    }
                     // Gap 03 (F1): the response HEADERS arrived but no first chunk did (a
                     // stream-ended / timeout-AFTER-headers). Headers were received, so the
                     // wire byte time IS measured (`header_byte_ms` is `Some`) — only the
@@ -3320,16 +4079,31 @@ impl FailoverUpstreamClient {
                         attempt_started_at,
                         attempt_model,
                         header_byte_ms,
-                        Self::take_attempt_header_byte_offset(backend),
+                        header_byte_offset_ms,
                         Some(&err),
                     );
-                    last_error = Some(err);
+                    match err.failover_disposition() {
+                        FailoverDisposition::Terminal => return Err(err),
+                        FailoverDisposition::FailoverNoCooldown => {
+                            pending_failed_provider = Some(provider_index);
+                            last_error = Some(err);
+                        }
+                        FailoverDisposition::Failover => {
+                            pending_failed_provider = Some(provider_index);
+                            last_error = Some(err);
+                        }
+                    }
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| {
-            AppError::upstream("all upstream providers failed before producing a response")
-        }))
+        if let Some(error) = last_error {
+            Err(error)
+        } else {
+            Err(Self::temporary_unavailability_error(
+                &unavailable,
+                bulkhead_retry_after,
+            ))
+        }
     }
 
     /// Gap 03 round-1 review (F1): read the current attempt's wire-header-byte time off the
@@ -3471,24 +4245,44 @@ impl FailoverUpstreamClient {
         body: Bytes,
     ) -> AppResult<reqwest::Response> {
         let mut last_error = None;
+        let mut pending_failed_provider: Option<usize> = None;
         for provider_index in provider_indices {
             let provider = &self.providers[provider_index];
+            let mut circuit_permit = match self.acquire_circuit(provider_index) {
+                Ok(permit) => permit,
+                Err(_) => continue,
+            };
+            if let Some(failed_provider) = pending_failed_provider.take() {
+                self.providers[failed_provider].metrics.record_failover();
+            }
             let provider_body = proxy_body_for_provider(provider, &body);
             match self.providers[provider_index]
                 .client
                 .proxy_completions(headers.clone(), provider_body)
                 .await
             {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    self.close_circuit_without_served_turn(provider_index, &mut circuit_permit);
+                    return Ok(response);
+                }
                 Err(err) if err.failover_disposition() == FailoverDisposition::Terminal => {
                     // Intrinsic request failures (400/413/415/422) cannot be
                     // repaired by trying an equivalent fallback. Surface them
                     // without cooling a healthy provider, matching the canonical
                     // chat path's retry-safety rule.
+                    self.close_circuit_without_served_turn(provider_index, &mut circuit_permit);
                     return Err(err);
                 }
+                Err(err)
+                    if err.failover_disposition() == FailoverDisposition::FailoverNoCooldown =>
+                {
+                    self.close_circuit_without_served_turn(provider_index, &mut circuit_permit);
+                    pending_failed_provider = Some(provider_index);
+                    last_error = Some(err);
+                }
                 Err(err) => {
-                    self.mark_failure(provider_index, &err);
+                    self.mark_failure_with_permit(provider_index, &err, &mut circuit_permit, false);
+                    pending_failed_provider = Some(provider_index);
                     last_error = Some(err);
                 }
             }
@@ -3639,7 +4433,8 @@ impl RoutingUpstreamClient {
         let mut ids_by_key: HashMap<String, Vec<RoutingModelCandidate>> = HashMap::new();
         let mut seen_union_ids = HashSet::new();
         let mut last_error = None;
-        let mut provider_entries: Vec<Option<Vec<Value>>> = Vec::with_capacity(self.providers.len());
+        let mut provider_entries: Vec<Option<Vec<Value>>> =
+            Vec::with_capacity(self.providers.len());
         let mut stale_providers: Vec<String> = Vec::new();
 
         // Stale-on-error: snapshot the previously published catalog's
@@ -4039,9 +4834,16 @@ impl UpstreamClient for FailoverUpstreamClient {
     ) -> AppResult<UpstreamResponsesStream> {
         let provider_indices = self.available_provider_indices_for_responses(backend);
         if provider_indices.is_empty() {
-            return Err(AppError::upstream(
-                "no capability-compatible native Responses provider is currently available",
-            ));
+            if self.providers.is_empty() {
+                return Err(AppError::not_found(
+                    "no upstream provider exists for the requested model",
+                )
+                .with_code("model_not_found"));
+            }
+            return Err(AppError::bad_request(
+                "no upstream provider supports the requested Responses capabilities",
+            )
+            .with_code("unsupported_parameter"));
         }
         self.stream_responses_with_provider_indices(provider_indices, backend, request_timeout)
             .await
@@ -4062,9 +4864,16 @@ impl UpstreamClient for FailoverUpstreamClient {
     ) -> AppResult<UpstreamStream> {
         let provider_indices = self.available_provider_indices_for_request(backend);
         if provider_indices.is_empty() {
-            return Err(AppError::upstream(
-                "no capability-compatible upstream provider is currently available",
-            ));
+            if self.providers.is_empty() {
+                return Err(AppError::not_found(
+                    "no upstream provider exists for the requested model",
+                )
+                .with_code("model_not_found"));
+            }
+            return Err(AppError::bad_request(
+                "no upstream provider supports the requested Responses capabilities",
+            )
+            .with_code("unsupported_parameter"));
         }
         self.stream_chat_completion_with_provider_indices(
             provider_indices,
@@ -4733,7 +5542,11 @@ fn timeout_upstream_stream(
                 Ok(Some(chunk)) => yield chunk,
                 Ok(None) => break,
                 Err(_) => {
-                    yield Err(AppError::gateway_timeout("upstream stream timed out"));
+                    yield Err(AppError::gateway_timeout("upstream stream timed out")
+                        .with_upstream_failure(UpstreamFailureMetadata::stream(
+                            UpstreamRetryClass::Timeout,
+                            true,
+                        )));
                     break;
                 }
             }
@@ -4746,7 +5559,28 @@ fn timeout_upstream_stream(
 /// bounded and lets failover treat it exactly like another pre-first-chunk provider
 /// failure without exposing transport details.
 fn upstream_response_headers_timeout() -> AppError {
-    AppError::gateway_timeout("upstream response headers timed out")
+    AppError::gateway_timeout("upstream response headers timed out").with_upstream_failure(
+        UpstreamFailureMetadata::transport(UpstreamRetryClass::Timeout),
+    )
+}
+
+/// Parse only the two standardized Retry-After representations. The raw header
+/// is never retained or logged; callers receive a duration relative to now.
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    parse_retry_after_at(headers, SystemTime::now())
+}
+
+fn parse_retry_after_at(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    let value = headers
+        .get(http::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let deadline = httpdate::parse_http_date(value).ok()?;
+    Some(deadline.duration_since(now).unwrap_or_default())
 }
 
 /// A provider-failure-shaped status: a server error, or a request-timeout/rate-limit
@@ -6233,7 +7067,10 @@ async fn stream_success_response(
                 let mut error = AppError::upstream("failed to parse upstream chat chunk");
                 error.client_message = "the upstream returned a malformed event stream".to_string();
                 error.code = Some("malformed_upstream_response".to_string());
-                error
+                error.with_upstream_failure(UpstreamFailureMetadata::stream(
+                    UpstreamRetryClass::MalformedStream,
+                    true,
+                ))
             })),
             // The bounded adapter surfaces the frame-cap rejection through the
             // transport-error channel as an already-formed `AppError` (its
@@ -6244,7 +7081,10 @@ async fn stream_success_response(
                 let mut error = AppError::upstream("failed to read upstream SSE");
                 error.client_message = "the upstream event stream ended unexpectedly".to_string();
                 error.code = Some("malformed_upstream_response".to_string());
-                error
+                error.with_upstream_failure(UpstreamFailureMetadata::stream(
+                    UpstreamRetryClass::MalformedStream,
+                    true,
+                ))
             })),
         }
     });
@@ -6257,11 +7097,26 @@ fn malformed_responses_stream_error(internal: impl Into<String>) -> AppError {
     let mut error = AppError::upstream(internal);
     error.client_message = "the upstream returned a malformed Responses event stream".into();
     error.code = Some("malformed_upstream_response".into());
-    error
+    error.with_upstream_failure(UpstreamFailureMetadata::stream(
+        UpstreamRetryClass::MalformedStream,
+        true,
+    ))
 }
 
-fn responses_status_error(status: StatusCode, body: &str) -> AppError {
-    let disposition = if status_is_request_intrinsic_4xx(status) || status == StatusCode::CONFLICT {
+fn responses_status_error(
+    status: StatusCode,
+    body: &str,
+    retry_after: Option<Duration>,
+) -> AppError {
+    let body_error = responses_error_code_and_param(body);
+    let private_turn_conflict = body_error
+        .as_ref()
+        .and_then(|(code, _)| code.as_deref())
+        .is_some_and(|code| matches!(code, "turn_state_conflict" | "turn_state_lost"));
+    let disposition = if status_is_request_intrinsic_4xx(status)
+        || status == StatusCode::CONFLICT
+        || private_turn_conflict
+    {
         FailoverDisposition::Terminal
     } else {
         FailoverDisposition::Failover
@@ -6319,13 +7174,20 @@ fn responses_status_error(status: StatusCode, body: &str) -> AppError {
     // The local sidecar emits the OpenAI four-field error object. Retain only
     // bounded machine-readable code/parameter fields; never reflect its body or
     // message, which remains provider-controlled and may contain private data.
-    if let Some((code, param)) = responses_error_code_and_param(body) {
+    if let Some((code, param)) = body_error {
         if let Some(code) = code {
             error.code = Some(code);
         }
         error.param = param;
     }
-    error
+    let mut metadata = UpstreamFailureMetadata::http(status, retry_after);
+    if private_turn_conflict {
+        error.status = StatusCode::CONFLICT;
+        error.client_message = "the upstream turn state is unavailable or conflicted".into();
+        metadata.retry_class = UpstreamRetryClass::TurnStateConflict;
+        metadata.safe_same_provider_retry = false;
+    }
+    error.with_upstream_failure(metadata)
 }
 
 fn responses_error_code_and_param(body: &str) -> Option<(Option<String>, Option<String>)> {
@@ -11155,7 +12017,10 @@ mod d4_provider_health_tests {
         client.mark_failure(0, &err);
         let health = client.provider_health();
         assert_eq!(health[0].consecutive_failures, 3);
-        assert_eq!(health[0].failover_count, 3);
+        assert_eq!(
+            health[0].failover_count, 0,
+            "provider failures alone are not actual failovers"
+        );
         assert_eq!(health[0].status, ProviderStatus::Down);
         assert!(health[0].cooling_until_ms.is_some());
         assert_eq!(health[0].last_error.as_deref(), Some("other"));
@@ -11164,7 +12029,7 @@ mod d4_provider_health_tests {
         client.mark_provider_success(0);
         let health = client.provider_health();
         assert_eq!(health[0].consecutive_failures, 0);
-        assert_eq!(health[0].failover_count, 3, "failover_count is cumulative");
+        assert_eq!(health[0].failover_count, 0);
         assert_eq!(health[0].served_count, 1);
         assert_eq!(health[0].status, ProviderStatus::Healthy);
         assert_eq!(health[0].cooling_until_ms, None);
@@ -11387,12 +12252,10 @@ mod routing_catalog_stale_on_error_tests {
     async fn mount_models(server: &MockServer, data: Value) {
         Mock::given(method("GET"))
             .and(path("/v1/models"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "object": "list",
-                    "data": data,
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": data,
+            })))
             .mount(server)
             .await;
     }
@@ -11414,9 +12277,17 @@ mod routing_catalog_stale_on_error_tests {
     #[tokio::test]
     async fn failed_provider_serves_last_known_good_entries() {
         let server_a = MockServer::start().await;
-        mount_models(&server_a, serde_json::json!([{"id": "model-a", "max_model_len": 1000}])).await;
+        mount_models(
+            &server_a,
+            serde_json::json!([{"id": "model-a", "max_model_len": 1000}]),
+        )
+        .await;
         let server_b = MockServer::start().await;
-        mount_models(&server_b, serde_json::json!([{"id": "model-b", "max_model_len": 2000}])).await;
+        mount_models(
+            &server_b,
+            serde_json::json!([{"id": "model-b", "max_model_len": 2000}]),
+        )
+        .await;
 
         let client = RoutingUpstreamClient::new(vec![
             routing_provider("provider-a", &server_a.uri()),
@@ -11432,16 +12303,20 @@ mod routing_catalog_stale_on_error_tests {
             vec!["model-a".to_string(), "model-b".to_string()]
         );
         assert_eq!(clean.provider_entries.len(), 2);
-        assert!(clean.provider_entries[0]
-            .as_ref()
-            .unwrap()
-            .iter()
-            .any(|e| e.get("id").and_then(Value::as_str) == Some("model-a")));
-        assert!(clean.provider_entries[1]
-            .as_ref()
-            .unwrap()
-            .iter()
-            .any(|e| e.get("id").and_then(Value::as_str) == Some("model-b")));
+        assert!(
+            clean.provider_entries[0]
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|e| e.get("id").and_then(Value::as_str) == Some("model-a"))
+        );
+        assert!(
+            clean.provider_entries[1]
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|e| e.get("id").and_then(Value::as_str) == Some("model-b"))
+        );
 
         // Kill provider-b's catalog: reset() unmounts every mock, so from here
         // on GET /v1/models falls through to wiremock's default 404 with an
@@ -11462,11 +12337,13 @@ mod routing_catalog_stale_on_error_tests {
             vec!["model-a".to_string(), "model-b".to_string()]
         );
         let body = stale.union_body();
-        assert!(body["data"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["id"] == "model-b"));
+        assert!(
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["id"] == "model-b")
+        );
 
         // Consecutive failures keep serving the same last-known-good rows.
         force_refresh(&client).await;
@@ -11533,10 +12410,7 @@ mod routing_catalog_stale_on_error_tests {
 
         let client = RoutingUpstreamClient::new(vec![
             routing_provider("provider-a", &server_a.uri()),
-            routing_provider(
-                "provider-b",
-                &format!("http://127.0.0.1:{dead_port}"),
-            ),
+            routing_provider("provider-b", &format!("http://127.0.0.1:{dead_port}")),
         ]);
 
         // The healthy provider's models are served; the never-fetched provider
@@ -11712,4 +12586,925 @@ mod f1e_upstream_response_truthful_tests {
             "a byte-then-cancel stays sticky-partial (AC-14): {artifact}"
         );
     }
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use futures::StreamExt;
+    use http::HeaderValue;
+    use serde_json::Map as JsonMap;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use wiremock::Mock;
+    use wiremock::MockServer;
+    use wiremock::ResponseTemplate;
+    use wiremock::matchers::method;
+    use wiremock::matchers::path;
+
+    #[derive(Debug)]
+    struct FixedJitter {
+        values: Mutex<VecDeque<Duration>>,
+        uppers: Mutex<Vec<Duration>>,
+    }
+
+    impl FixedJitter {
+        fn new(values: impl IntoIterator<Item = Duration>) -> Arc<Self> {
+            Arc::new(Self {
+                values: Mutex::new(values.into_iter().collect()),
+                uppers: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn zero() -> Arc<Self> {
+            // An empty deterministic sequence falls back to zero on every
+            // call; avoid collecting an unbounded repeat iterator.
+            Self::new([])
+        }
+
+        fn uppers(&self) -> Vec<Duration> {
+            self.uppers.lock().expect("jitter uppers lock").clone()
+        }
+    }
+
+    impl JitterSource for FixedJitter {
+        fn full_jitter(&self, upper: Duration) -> Duration {
+            self.uppers.lock().expect("jitter uppers lock").push(upper);
+            self.values
+                .lock()
+                .expect("jitter values lock")
+                .pop_front()
+                .unwrap_or(Duration::ZERO)
+        }
+    }
+
+    fn request(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.to_string(),
+            messages: Vec::new(),
+            stream: true,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: Some(false),
+            reasoning_effort: None,
+            response_format: None,
+            stream_options: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            extra_body: BTreeMap::new(),
+        }
+    }
+
+    fn backend() -> BackendChatRequest {
+        BackendChatRequest::new(request("model-a"), None, None, None)
+    }
+
+    fn leaf(server_uri: &str) -> ReqwestUpstreamClient {
+        ReqwestUpstreamClient::with_options(
+            reqwest::Client::new(),
+            format!("{server_uri}/v1/").parse().expect("upstream URL"),
+            None,
+            None,
+            true,
+            4096,
+            1024 * 1024,
+        )
+    }
+
+    fn policy(max_attempts: usize) -> UpstreamResilienceConfig {
+        UpstreamResilienceConfig {
+            retry: UpstreamRetryConfig {
+                max_attempts,
+                ..UpstreamRetryConfig::default()
+            },
+            circuit_breaker: UpstreamCircuitBreakerConfig::default(),
+            bulkhead: UpstreamBulkheadConfig::default(),
+        }
+    }
+
+    fn provider(
+        name: &str,
+        server_uri: &str,
+        resilience: UpstreamResilienceConfig,
+    ) -> FailoverUpstreamProvider {
+        FailoverUpstreamProvider::new(name, leaf(server_uri), None, None, JsonMap::new())
+            .with_resilience(resilience)
+    }
+
+    fn client(
+        providers: Vec<FailoverUpstreamProvider>,
+        jitter: Arc<dyn JitterSource>,
+    ) -> FailoverUpstreamClient {
+        FailoverUpstreamClient::new(providers, Duration::ZERO).with_jitter_source(jitter)
+    }
+
+    fn success_sse() -> String {
+        "data: {\"id\":\"chat-ok\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n\
+         data: [DONE]\n\n"
+            .to_string()
+    }
+
+    fn sse_response(body: impl Into<String>) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_raw(body.into(), "text/event-stream")
+    }
+
+    async fn mount_503_then_success(server: &MockServer, body: String) {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(sse_response(body))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    async fn post_count(server: &MockServer, endpoint: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests")
+            .iter()
+            .filter(|request| request.method.as_str() == "POST" && request.url.path() == endpoint)
+            .count()
+    }
+
+    async fn collect_chat(
+        upstream: &FailoverUpstreamClient,
+    ) -> Result<Vec<ChatCompletionChunk>, AppError> {
+        let mut stream = upstream.stream_chat_completion(&backend()).await?;
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk?);
+        }
+        Ok(chunks)
+    }
+
+    fn retryable_error(status: StatusCode, retry_after: Option<Duration>) -> AppError {
+        AppError::upstream_with_disposition(
+            format!("upstream failed with {status}"),
+            FailoverDisposition::Failover,
+        )
+        .with_upstream_failure(UpstreamFailureMetadata::http(status, retry_after))
+    }
+
+    fn direct_circuit_client() -> FailoverUpstreamClient {
+        client(
+            vec![provider("provider-a", "http://127.0.0.1:1", policy(1))],
+            FixedJitter::zero(),
+        )
+    }
+
+    fn open_direct_circuit(upstream: &FailoverUpstreamClient) {
+        let mut permit = upstream.acquire_circuit(0).expect("closed circuit permit");
+        upstream.mark_failure_with_permit(
+            0,
+            &retryable_error(StatusCode::SERVICE_UNAVAILABLE, None),
+            &mut permit,
+            true,
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_503_then_success_retries_same_provider() {
+        let server = MockServer::start().await;
+        mount_503_then_success(&server, success_sse()).await;
+        let upstream = client(
+            vec![provider("provider-a", &server.uri(), policy(3))],
+            FixedJitter::zero(),
+        );
+
+        let chunks = collect_chat(&upstream).await.expect("retry succeeds");
+        assert_eq!(post_count(&server, "/v1/chat/completions").await, 2);
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests[0].body, requests[1].body);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].choices[0].delta.content.as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn successful_retry_does_not_enter_cooldown() {
+        let server = MockServer::start().await;
+        mount_503_then_success(&server, success_sse()).await;
+        let upstream = client(
+            vec![provider("provider-a", &server.uri(), policy(3))],
+            FixedJitter::zero(),
+        );
+
+        collect_chat(&upstream).await.expect("retry succeeds");
+        let health = upstream.provider_health();
+        assert_eq!(health[0].status, ProviderStatus::Healthy);
+        assert_eq!(health[0].cooling_until_ms, None);
+        assert_eq!(health[0].consecutive_failures, 0);
+    }
+
+    #[tokio::test]
+    async fn successful_retry_does_not_increment_failover_count() {
+        let server = MockServer::start().await;
+        mount_503_then_success(&server, success_sse()).await;
+        let upstream = client(
+            vec![provider("provider-a", &server.uri(), policy(3))],
+            FixedJitter::zero(),
+        );
+
+        collect_chat(&upstream).await.expect("retry succeeds");
+        assert_eq!(upstream.provider_health()[0].failover_count, 0);
+        assert_eq!(upstream.providers[0].metrics.retry_attempt_count(), 1);
+        assert_eq!(upstream.providers[0].metrics.retry_exhausted_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_opens_circuit_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let upstream = client(
+            vec![provider("provider-a", &server.uri(), policy(3))],
+            FixedJitter::zero(),
+        );
+
+        assert!(collect_chat(&upstream).await.is_err());
+        assert_eq!(
+            upstream.provider_health()[0].status,
+            ProviderStatus::Cooling
+        );
+        assert_eq!(upstream.providers[0].metrics.retry_attempt_count(), 2);
+        assert_eq!(upstream.providers[0].metrics.retry_exhausted_count(), 1);
+        assert_eq!(upstream.provider_health()[0].consecutive_failures, 1);
+
+        let second = collect_chat(&upstream)
+            .await
+            .expect_err("open circuit rejects");
+        assert_eq!(
+            second.code.as_deref(),
+            Some("provider_temporarily_unavailable")
+        );
+        assert_eq!(post_count(&server, "/v1/chat/completions").await, 3);
+        assert_eq!(upstream.provider_health()[0].consecutive_failures, 1);
+        assert_eq!(upstream.providers[0].metrics.retry_exhausted_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_then_uses_nested_fallback() {
+        let primary = MockServer::start().await;
+        let fallback = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .expect(3)
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(sse_response(success_sse()))
+            .expect(1)
+            .mount(&fallback)
+            .await;
+        let upstream = client(
+            vec![
+                provider("primary", &primary.uri(), policy(3)),
+                provider("fallback", &fallback.uri(), policy(3)),
+            ],
+            FixedJitter::zero(),
+        );
+
+        collect_chat(&upstream).await.expect("fallback serves");
+        assert_eq!(post_count(&primary, "/v1/chat/completions").await, 3);
+        assert_eq!(post_count(&fallback, "/v1/chat/completions").await, 1);
+        let health = upstream.provider_health();
+        assert_eq!(health[0].failover_count, 1);
+        assert_eq!(health[1].served_count, 1);
+    }
+
+    #[test]
+    fn retry_backoff_uses_full_jitter_with_bounded_budget() {
+        let jitter = FixedJitter::new([
+            Duration::from_millis(123),
+            Duration::from_millis(456),
+            Duration::from_millis(789),
+        ]);
+        let mut resilience = policy(10);
+        resilience.retry.initial_backoff_ms = 500;
+        resilience.retry.max_backoff_ms = 4_000;
+        resilience.retry.total_budget_ms = 1_000;
+        let upstream = client(
+            vec![provider("provider-a", "http://127.0.0.1:1", resilience)],
+            jitter.clone(),
+        );
+        let error = retryable_error(StatusCode::SERVICE_UNAVAILABLE, None);
+
+        let first = upstream
+            .next_retry_delay(0, &error, 1, Duration::ZERO)
+            .expect("first delay");
+        let second = upstream
+            .next_retry_delay(0, &error, 2, first)
+            .expect("second delay");
+        let third = upstream
+            .next_retry_delay(0, &error, 3, first + second)
+            .expect("third delay");
+        assert_eq!(first, Duration::from_millis(123));
+        assert_eq!(second, Duration::from_millis(456));
+        assert_eq!(third, Duration::from_millis(421));
+        assert_eq!(first + second + third, Duration::from_millis(1_000));
+        assert_eq!(
+            jitter.uppers(),
+            vec![
+                Duration::from_millis(500),
+                Duration::from_millis(1_000),
+                Duration::from_millis(2_000)
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_after_seconds_is_honored_and_clamped() {
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::RETRY_AFTER, HeaderValue::from_static("90"));
+        let retry_after = parse_retry_after(&headers).expect("seconds Retry-After");
+        assert_eq!(retry_after, Duration::from_secs(90));
+
+        let mut resilience = policy(3);
+        resilience.retry.total_budget_ms = 20_000;
+        let upstream = client(
+            vec![provider("provider-a", "http://127.0.0.1:1", resilience)],
+            FixedJitter::zero(),
+        );
+        let error = retryable_error(StatusCode::TOO_MANY_REQUESTS, Some(retry_after));
+        assert_eq!(
+            upstream.next_retry_delay(0, &error, 1, Duration::ZERO),
+            Some(Duration::from_secs(15))
+        );
+    }
+
+    #[test]
+    fn retry_after_http_date_is_honored_and_clamped() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let deadline = now + Duration::from_secs(90);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(deadline)).expect("date header"),
+        );
+        let retry_after = parse_retry_after_at(&headers, now).expect("date Retry-After");
+        assert_eq!(retry_after, Duration::from_secs(90));
+
+        let mut resilience = policy(3);
+        resilience.retry.total_budget_ms = 20_000;
+        let upstream = client(
+            vec![provider("provider-a", "http://127.0.0.1:1", resilience)],
+            FixedJitter::zero(),
+        );
+        let error = retryable_error(StatusCode::SERVICE_UNAVAILABLE, Some(retry_after));
+        assert_eq!(
+            upstream.next_retry_delay(0, &error, 1, Duration::ZERO),
+            Some(Duration::from_secs(15))
+        );
+    }
+
+    #[tokio::test]
+    async fn request_intrinsic_4xx_is_never_retried_or_cooled() {
+        for status in [400, 413, 415, 422] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("request rejected"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let upstream = client(
+                vec![provider("provider-a", &server.uri(), policy(3))],
+                FixedJitter::zero(),
+            );
+
+            assert!(collect_chat(&upstream).await.is_err(), "status {status}");
+            assert_eq!(post_count(&server, "/v1/chat/completions").await, 1);
+            let health = upstream.provider_health();
+            assert_eq!(health[0].status, ProviderStatus::Healthy, "status {status}");
+            assert_eq!(health[0].consecutive_failures, 0, "status {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_and_not_found_errors_are_not_same_provider_retried() {
+        for status in [401, 403, 404] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("provider rejected"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let upstream = client(
+                vec![provider("provider-a", &server.uri(), policy(3))],
+                FixedJitter::zero(),
+            );
+
+            assert!(collect_chat(&upstream).await.is_err(), "status {status}");
+            assert_eq!(post_count(&server, "/v1/chat/completions").await, 1);
+            assert_eq!(upstream.providers[0].metrics.retry_attempt_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_sse_is_never_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(sse_response("data: not-json\n\n"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let upstream = client(
+            vec![provider("provider-a", &server.uri(), policy(3))],
+            FixedJitter::zero(),
+        );
+
+        assert!(collect_chat(&upstream).await.is_err());
+        assert_eq!(post_count(&server, "/v1/chat/completions").await, 1);
+        assert_eq!(upstream.providers[0].metrics.retry_attempt_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn failure_after_first_chunk_is_never_retried() {
+        let server = MockServer::start().await;
+        let body = "data: {\"id\":\"chat-partial\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"once\"}}]}\n\n\
+                    data: not-json\n\n";
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(sse_response(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let upstream = client(
+            vec![provider("provider-a", &server.uri(), policy(3))],
+            FixedJitter::zero(),
+        );
+
+        let mut stream = upstream
+            .stream_chat_completion(&backend())
+            .await
+            .expect("first chunk accepted");
+        let first = stream
+            .next()
+            .await
+            .expect("first item")
+            .expect("first chunk");
+        assert_eq!(first.choices[0].delta.content.as_deref(), Some("once"));
+        let error = stream.next().await.expect("terminal stream error");
+        assert!(error.is_err());
+        assert_eq!(post_count(&server, "/v1/chat/completions").await, 1);
+        assert_eq!(upstream.providers[0].metrics.retry_attempt_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_never_duplicates_text_or_usage() {
+        let server = MockServer::start().await;
+        let body = "data: {\"id\":\"chat-once\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"only once\"}}]}\n\n\
+                    data: {\"id\":\"chat-once\",\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n\
+                    data: [DONE]\n\n";
+        mount_503_then_success(&server, body.to_string()).await;
+        let upstream = client(
+            vec![provider("provider-a", &server.uri(), policy(3))],
+            FixedJitter::zero(),
+        );
+
+        let chunks = collect_chat(&upstream).await.expect("retry succeeds");
+        let text: Vec<_> = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.choices)
+            .filter_map(|choice| choice.delta.content.as_deref())
+            .collect();
+        assert_eq!(text, vec!["only once"]);
+        assert_eq!(
+            chunks.iter().filter(|chunk| chunk.usage.is_some()).count(),
+            1
+        );
+        assert_eq!(post_count(&server, "/v1/chat/completions").await, 2);
+    }
+
+    #[tokio::test]
+    async fn retry_never_duplicates_reasoning_or_function_calls() {
+        let server = MockServer::start().await;
+        let body = "data: {\"id\":\"chat-tool\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"think once\"}}]}\n\n\
+                    data: {\"id\":\"chat-tool\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_once\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":1}\"}}]}}]}\n\n\
+                    data: [DONE]\n\n";
+        mount_503_then_success(&server, body.to_string()).await;
+        let upstream = client(
+            vec![provider("provider-a", &server.uri(), policy(3))],
+            FixedJitter::zero(),
+        );
+
+        let chunks = collect_chat(&upstream).await.expect("retry succeeds");
+        let reasoning: Vec<_> = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.choices)
+            .filter_map(|choice| choice.delta.reasoning_content.as_deref())
+            .collect();
+        let call_ids: Vec<_> = chunks
+            .iter()
+            .flat_map(|chunk| &chunk.choices)
+            .flat_map(|choice| choice.delta.tool_calls.iter().flatten())
+            .filter_map(|call| call.id.as_deref())
+            .collect();
+        assert_eq!(reasoning, vec!["think once"]);
+        assert_eq!(call_ids, vec!["call_once"]);
+        assert_eq!(post_count(&server, "/v1/chat/completions").await, 2);
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_during_backoff_cancels_promptly() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+        let mut resilience = policy(3);
+        resilience.retry.initial_backoff_ms = 30_000;
+        resilience.retry.max_backoff_ms = 30_000;
+        resilience.retry.total_budget_ms = 60_000;
+        let upstream = client(
+            vec![provider("provider-a", &server.uri(), resilience)],
+            FixedJitter::new([Duration::from_secs(30)]),
+        );
+        let task = tokio::spawn(async move { upstream.stream_chat_completion(&backend()).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if post_count(&server, "/v1/chat/completions").await == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first attempt reached provider");
+        task.abort();
+        let joined = tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("cancelled retry wait exits promptly");
+        let join_error = match joined {
+            Err(error) => error,
+            Ok(_) => panic!("task was cancelled"),
+        };
+        assert!(join_error.is_cancelled());
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(post_count(&server, "/v1/chat/completions").await, 1);
+    }
+
+    #[tokio::test]
+    async fn circuit_open_reports_temporary_unavailability() {
+        let upstream = direct_circuit_client();
+        open_direct_circuit(&upstream);
+
+        let error = match upstream.stream_chat_completion(&backend()).await {
+            Err(error) => error,
+            Ok(_) => panic!("open circuit must reject"),
+        };
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error.code.as_deref(),
+            Some("provider_temporarily_unavailable")
+        );
+        assert!(!error.client_message.contains("provider-a"));
+    }
+
+    #[tokio::test]
+    async fn circuit_open_reports_retry_after() {
+        let upstream = direct_circuit_client();
+        open_direct_circuit(&upstream);
+        let error = match upstream.stream_chat_completion(&backend()).await {
+            Err(error) => error,
+            Ok(_) => panic!("open circuit must reject"),
+        };
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("2")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn half_open_allows_exactly_one_probe() {
+        let upstream = direct_circuit_client();
+        open_direct_circuit(&upstream);
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        let probe = upstream.acquire_circuit(0).expect("one half-open probe");
+        assert!(probe.is_half_open());
+        let rejected = upstream
+            .acquire_circuit(0)
+            .expect_err("second probe rejected");
+        assert_eq!(rejected.kind, CircuitUnavailableKind::HalfOpenProbeInFlight);
+        drop(probe);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_half_open_callers_do_not_stampede() {
+        let upstream = Arc::new(direct_circuit_client());
+        open_direct_circuit(&upstream);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let probe = upstream
+            .acquire_circuit(0)
+            .expect("one probe owns admission");
+
+        let mut callers = Vec::new();
+        for _ in 0..16 {
+            let upstream = Arc::clone(&upstream);
+            callers.push(tokio::spawn(
+                async move { upstream.acquire_circuit(0).is_err() },
+            ));
+        }
+        for caller in callers {
+            assert!(caller.await.expect("caller task"));
+        }
+        drop(probe);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn half_open_success_closes_and_resets_circuit() {
+        let upstream = direct_circuit_client();
+        open_direct_circuit(&upstream);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let mut probe = upstream.acquire_circuit(0).expect("half-open probe");
+        upstream.mark_provider_success_with_permit(0, &mut probe);
+
+        let state = upstream.states.lock().expect("circuit state")[0].state;
+        assert_eq!(state, ProviderCircuitState::Closed);
+        let health = upstream.provider_health();
+        assert_eq!(health[0].status, ProviderStatus::Healthy);
+        assert_eq!(health[0].consecutive_failures, 0);
+        assert_eq!(health[0].served_count, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn half_open_failure_increases_open_interval() {
+        let upstream = direct_circuit_client();
+        open_direct_circuit(&upstream);
+        let mut expected_current = Duration::from_secs(2);
+
+        for expected_next in [4_u64, 8, 16, 30, 30] {
+            tokio::time::advance(expected_current).await;
+            let mut probe = upstream.acquire_circuit(0).expect("half-open probe");
+            upstream.mark_failure_with_permit(
+                0,
+                &retryable_error(StatusCode::SERVICE_UNAVAILABLE, None),
+                &mut probe,
+                true,
+            );
+            let state = upstream.states.lock().expect("circuit state")[0].state;
+            let ProviderCircuitState::Open { until, .. } = state else {
+                panic!("failed half-open probe must reopen circuit");
+            };
+            let interval = until.duration_since(TokioInstant::now());
+            assert_eq!(interval, Duration::from_secs(expected_next));
+            expected_current = interval;
+        }
+    }
+
+    #[tokio::test]
+    async fn incapable_fallback_is_pruned_without_health_penalty() {
+        let primary = MockServer::start().await;
+        let fallback = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .expect(3)
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(sse_response(success_sse()))
+            .expect(0)
+            .mount(&fallback)
+            .await;
+        let upstream = client(
+            vec![
+                provider("primary", &primary.uri(), policy(3)),
+                provider("incapable", &fallback.uri(), policy(3)),
+            ],
+            FixedJitter::zero(),
+        );
+        let allowlist = crate::responses_capabilities::CapabilityAllowlist::from_targets([
+            crate::responses_capabilities::CapabilityTarget {
+                provider: "primary".to_string(),
+                model: "model-a".to_string(),
+            },
+        ]);
+        let backend = backend().with_capability_allowlist(allowlist);
+
+        assert!(upstream.stream_chat_completion(&backend).await.is_err());
+        assert_eq!(post_count(&fallback, "/v1/chat/completions").await, 0);
+        let health = upstream.provider_health();
+        assert_eq!(health[1].status, ProviderStatus::Healthy);
+        assert_eq!(health[1].consecutive_failures, 0);
+        assert_eq!(health[1].failover_count, 0);
+    }
+
+    #[tokio::test]
+    async fn retry_and_failover_attempt_telemetry_remains_consistent() {
+        let primary = MockServer::start().await;
+        let fallback = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .expect(3)
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(sse_response(success_sse()))
+            .expect(1)
+            .mount(&fallback)
+            .await;
+        let upstream = client(
+            vec![
+                provider("primary", &primary.uri(), policy(3)),
+                provider("fallback", &fallback.uri(), policy(3)),
+            ],
+            FixedJitter::zero(),
+        );
+
+        collect_chat(&upstream).await.expect("fallback serves");
+        let primary_metrics = &upstream.providers[0].metrics;
+        let fallback_metrics = &upstream.providers[1].metrics;
+        assert_eq!(primary_metrics.retry_attempt_count(), 2);
+        assert_eq!(primary_metrics.retry_exhausted_count(), 1);
+        assert_eq!(primary_metrics.failover_count(), 1);
+        assert_eq!(primary_metrics.served_count(), 0);
+        assert_eq!(fallback_metrics.retry_attempt_count(), 0);
+        assert_eq!(fallback_metrics.retry_exhausted_count(), 0);
+        assert_eq!(fallback_metrics.failover_count(), 0);
+        assert_eq!(fallback_metrics.served_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn bulkhead_queue_is_bounded_timeout_aware_and_cancellation_safe() {
+        let bulkhead = Arc::new(ProviderBulkhead::new(&UpstreamBulkheadConfig {
+            max_in_flight: Some(1),
+            max_queue: Some(1),
+            queue_timeout_ms: 25,
+        }));
+        let active = bulkhead.acquire().await.expect("active permit");
+        let waiting_bulkhead = Arc::clone(&bulkhead);
+        let waiting = tokio::spawn(async move { waiting_bulkhead.acquire().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while bulkhead.queued.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one bounded waiter");
+        assert!(
+            bulkhead.acquire().await.is_err(),
+            "queue capacity is bounded"
+        );
+        waiting.abort();
+        assert!(waiting.await.expect_err("waiter cancelled").is_cancelled());
+        assert_eq!(bulkhead.queued.load(Ordering::Acquire), 0);
+        drop(active);
+
+        let active = bulkhead.acquire().await.expect("new active permit");
+        let started = Instant::now();
+        assert!(bulkhead.acquire().await.is_err(), "queued waiter times out");
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        drop(active);
+        assert_eq!(bulkhead.queued.load(Ordering::Acquire), 0);
+    }
+
+    fn native_sse() -> String {
+        [
+            json!({"type":"response.created","response":{"id":"resp_private"}}),
+            json!({"type":"response.output_text.delta","delta":"native once"}),
+            json!({"type":"response.output_item.done","item":{"type":"message","id":"msg_native","role":"assistant","content":[{"type":"output_text","text":"native once"}]}}),
+            json!({"type":"response.completed","response":{"id":"resp_private","usage":{"input_tokens":2,"output_tokens":2,"total_tokens":4}}}),
+        ]
+        .into_iter()
+        .map(|event| {
+            let kind = event["type"].as_str().expect("event type");
+            format!("event: {kind}\ndata: {event}\n\n")
+        })
+        .collect()
+    }
+
+    fn native_backend() -> BackendResponsesRequest {
+        BackendResponsesRequest {
+            body: json!({"model":"model-a","input":"hello","stream":true}),
+            model: "model-a".to_string(),
+            conversation_id: "conversation-id".to_string(),
+            turn_id: "turn-id".to_string(),
+            request_id: "request-id".to_string(),
+            continuation: false,
+            response_id: None,
+            serving: None,
+            capture: None,
+            capability_allowlist: crate::responses_capabilities::CapabilityAllowlist::unrestricted(
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn native_responses_503_then_success_retries_same_provider() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(sse_response(native_sse()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let native_leaf = leaf(&server.uri()).with_wire_api(UpstreamWireApi::CodexResponses);
+        let native_provider =
+            FailoverUpstreamProvider::new("native", native_leaf, None, None, JsonMap::new())
+                .with_resilience(policy(3));
+        let upstream = client(vec![native_provider], FixedJitter::zero());
+
+        let mut stream = upstream
+            .stream_responses_native_with_timeout(&native_backend(), Duration::from_secs(5))
+            .await
+            .expect("native retry succeeds");
+        let mut delta_count = 0;
+        while let Some(event) = stream.next().await {
+            let event = event.expect("native event");
+            if event.event == "response.output_text.delta" {
+                delta_count += 1;
+            }
+        }
+        assert_eq!(delta_count, 1);
+        assert_eq!(post_count(&server, "/v1/responses").await, 2);
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(requests[0].body, requests[1].body);
+        assert_eq!(
+            upstream.provider_health()[0].status,
+            ProviderStatus::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn native_turn_state_conflict_is_never_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                "error": {
+                    "message": "private detail",
+                    "code": "turn_state_lost",
+                    "param": "input"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let native_leaf = leaf(&server.uri()).with_wire_api(UpstreamWireApi::CodexResponses);
+        let native_provider =
+            FailoverUpstreamProvider::new("native", native_leaf, None, None, JsonMap::new())
+                .with_resilience(policy(3));
+        let upstream = client(vec![native_provider], FixedJitter::zero());
+
+        let error = match upstream
+            .stream_responses_native_with_timeout(&native_backend(), Duration::from_secs(5))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("turn state conflict must be terminal"),
+        };
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.code.as_deref(), Some("turn_state_lost"));
+        assert_eq!(post_count(&server, "/v1/responses").await, 1);
+        assert_eq!(
+            upstream.provider_health()[0].status,
+            ProviderStatus::Healthy
+        );
+    }
+
+    // Additional resilience tests are kept in this focused module so they can
+    // inject clock/jitter and inspect circuit telemetry without widening the
+    // production API.
 }

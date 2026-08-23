@@ -193,6 +193,11 @@ pub fn build_app_with_gateway_and_options(
     let max_sse_frame_bytes = config.max_sse_frame_bytes;
     let request_timeout = config.request_timeout;
     let upstream_request_log_body_mode = config.upstream_request_log_body_mode;
+    let global_resilience = crate::config::UpstreamResilienceConfig {
+        retry: config.upstream_retry.clone(),
+        circuit_breaker: config.upstream_circuit_breaker.clone(),
+        bulkhead: config.upstream_bulkhead.clone(),
+    };
     let make_upstream_client =
         |base_url: url::Url,
          api_key: Option<String>,
@@ -249,22 +254,22 @@ pub fn build_app_with_gateway_and_options(
                             fallback.exposed_model.clone(),
                             fallback.upstream_chat_kwargs.clone(),
                         )
+                        .with_resilience(fallback.resilience.clone())
                     })
                     .collect();
-                RoutingUpstreamProvider::new(
+                RoutingUpstreamProvider::new_with_resilience(
                     provider.name.clone(),
                     primary_client,
                     provider.upstream_model.clone(),
                     provider.upstream_chat_kwargs.clone(),
                     fallback_providers,
-                    Duration::from_secs(config.upstream_failure_cooldown_secs),
+                    provider.resilience.clone(),
                 )
             })
             .collect();
         // Build a synthetic provider + spec per ad-hoc route (G7). Each route is
         // a single-upstream client keyed by request-model name/glob; the glob
         // matcher was compiled at config time.
-        let cooldown = Duration::from_secs(config.upstream_failure_cooldown_secs);
         let mut route_providers = Vec::with_capacity(config.model_routes.len());
         let mut route_specs = Vec::with_capacity(config.model_routes.len());
         for (index, route) in config.model_routes.iter().enumerate() {
@@ -274,10 +279,10 @@ pub fn build_app_with_gateway_and_options(
                 config.upstream_request_log_path.clone(),
                 crate::config::UpstreamWireApi::ChatCompletions,
             );
-            route_providers.push(RouteUpstreamProvider::new(
+            route_providers.push(RouteUpstreamProvider::new_with_resilience(
                 format!("route-{}", route.name),
                 client,
-                cooldown,
+                global_resilience.clone(),
             ));
             route_specs.push(ModelRouteSpec::new(
                 route.name.clone(),
@@ -298,41 +303,39 @@ pub fn build_app_with_gateway_and_options(
             config.upstream_request_log_path.clone(),
             crate::config::UpstreamWireApi::ChatCompletions,
         );
-        if config.fallback_upstreams.is_empty() {
-            // D2: the BARE leaf is the engine's upstream directly — no routing/
-            // failover layer owns the `provider` serving field, so mark this leaf to
-            // synthesize `provider = "primary"`.
-            Arc::new(primary_upstream.into_bare_primary())
-        } else {
-            let mut providers = vec![FailoverUpstreamProvider::new(
+        let mut providers = vec![
+            FailoverUpstreamProvider::new(
                 "primary",
                 primary_upstream,
                 None,
                 None,
                 serde_json::Map::new(),
-            )];
-            providers.extend(config.fallback_upstreams.iter().map(|provider| {
-                FailoverUpstreamProvider::new(
-                    provider.name.clone(),
-                    make_upstream_client(
-                        provider.upstream_base_url.clone(),
-                        provider.upstream_api_key.clone(),
-                        provider.upstream_request_log_path.clone(),
-                        provider.wire_api,
-                    )
-                    .with_responses_capabilities(
-                        provider.responses_capabilities.clone().unwrap_or_default(),
-                    ),
-                    provider.upstream_model.clone(),
-                    provider.exposed_model.clone(),
-                    provider.upstream_chat_kwargs.clone(),
+            )
+            .with_resilience(global_resilience.clone()),
+        ];
+        providers.extend(config.fallback_upstreams.iter().map(|provider| {
+            FailoverUpstreamProvider::new(
+                provider.name.clone(),
+                make_upstream_client(
+                    provider.upstream_base_url.clone(),
+                    provider.upstream_api_key.clone(),
+                    provider.upstream_request_log_path.clone(),
+                    provider.wire_api,
                 )
-            }));
-            Arc::new(FailoverUpstreamClient::new(
-                providers,
-                Duration::from_secs(config.upstream_failure_cooldown_secs),
-            ))
-        }
+                .with_responses_capabilities(
+                    provider.responses_capabilities.clone().unwrap_or_default(),
+                ),
+                provider.upstream_model.clone(),
+                provider.exposed_model.clone(),
+                provider.upstream_chat_kwargs.clone(),
+            )
+            .with_resilience(provider.resilience.clone())
+        }));
+        // Even a single configured provider uses the shared pre-output retry,
+        // circuit, and optional bulkhead component. The wrapper remains the
+        // sole provider/attempt telemetry owner, so retries cannot duplicate
+        // dashboard attempts or model output.
+        Arc::new(FailoverUpstreamClient::new(providers, Duration::ZERO))
     };
     let backend_metrics_targets = upstream.backend_metrics_targets();
     let search = Arc::new(BraveSearchClient::new(http_client.clone(), config.clone()));

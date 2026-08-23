@@ -379,6 +379,7 @@ async fn malformed_sse_failover_does_not_duplicate_responses_items_or_function_c
     let mut config = common::test_config();
     config.upstream_base_url = format!("{}/v1/", primary.uri()).parse().expect("URL");
     config.fallback_upstreams = vec![FallbackUpstreamConfig {
+        resilience: Default::default(),
         name: "backup".to_string(),
         upstream_base_url: format!("{}/v1/", backup.uri()).parse().expect("URL"),
         upstream_api_key: None,

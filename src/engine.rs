@@ -8064,6 +8064,12 @@ fn failure_event(error: &AppError, mut response: ResponseResource) -> SseEvent {
                 Value::String(param.clone()),
             );
         }
+        if let Some(seconds) = error.retry_after_secs() {
+            object.insert(
+                "llmconduit_retry_after_secs".to_string(),
+                Value::from(seconds),
+            );
+        }
     }
     event
 }

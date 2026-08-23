@@ -369,6 +369,9 @@ fn config_for(server_uri: &str) -> Config {
         upstream_chat_kwargs: serde_json::Map::new(),
         upstreams: Vec::new(),
         fallback_upstreams: Vec::new(),
+        upstream_retry: Default::default(),
+        upstream_circuit_breaker: Default::default(),
+        upstream_bulkhead: Default::default(),
         upstream_failure_cooldown_secs: 30,
         model_profiles: std::collections::BTreeMap::new(),
         responses_capabilities: Default::default(),
@@ -494,6 +497,7 @@ async fn chat_preflight_routing_caps_against_provider_context_window() {
 
     let mut config = config_for(&server.uri());
     config.upstreams = vec![llmconduit::config::UpstreamConfig {
+        resilience: Default::default(),
         name: "routed".to_string(),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,
@@ -587,6 +591,7 @@ async fn preflight_top_level_failover_no_ops_without_candidate_limit() {
 
     let mut config = config_for(&server.uri());
     config.fallback_upstreams = vec![llmconduit::config::FallbackUpstreamConfig {
+        resilience: Default::default(),
         name: "fallback".to_string(),
         upstream_base_url: format!("{}/v1/", server.uri()).parse().expect("url"),
         upstream_api_key: None,

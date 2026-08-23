@@ -1133,6 +1133,7 @@ async fn image_agent_resolved_alias_to_kimi_passes_images_through() {
     config.responses_capabilities.input_image =
         Some(llmconduit::responses_capabilities::InputImageCapability::Native);
     config.upstreams = vec![UpstreamConfig {
+        resilience: Default::default(),
         name: "primary".to_string(),
         upstream_base_url: base.parse().expect("url"),
         upstream_api_key: None,
@@ -1142,6 +1143,7 @@ async fn image_agent_resolved_alias_to_kimi_passes_images_through() {
         upstream_request_log_path: None,
         responses_capabilities: None,
         fallback_upstreams: vec![FallbackUpstreamConfig {
+            resilience: Default::default(),
             name: "kimi-fallback".to_string(),
             upstream_base_url: base.parse().expect("url"),
             upstream_api_key: None,
