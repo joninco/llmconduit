@@ -326,9 +326,14 @@ async fn cli_model_route_injects_and_routes_request() {
     let target = MockServer::start().await;
     mount_chat_target_for_model(&target, "Qwen2.5", "chat-cli", "from-cli-route").await;
 
-    // No config file; the route comes only from the CLI spec.
+    // Use an explicit nonexistent path so this test cannot accidentally load a
+    // developer's real default config (including env-backed upstream secrets).
+    let config_path = std::env::temp_dir().join(format!(
+        "llmconduit-cli-route-{}.yaml",
+        uuid::Uuid::new_v4().simple()
+    ));
     let config = Config::from_env_file_and_routes(
-        None,
+        Some(&config_path),
         &[format!("claude-haiku={}/v1/,Qwen2.5", target.uri())],
     )
     .expect("config with CLI route");

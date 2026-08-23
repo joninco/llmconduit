@@ -5517,6 +5517,9 @@ fn apply_profile_thinking_kwarg(
     };
     let reasoning_config = policy_for_model(&policies.effort, &backend.request.model)
         .and_then(|policy| policy.upstream_reasoning.as_ref());
+    if reasoning_config.is_some_and(|config| !config.forward_thinking_param) {
+        return;
+    }
     let family_override = policies.resolve_family_override(&backend.request.model);
     let family = detect_model_family(&backend.request.model, family_override.as_deref());
     let (name, value) = if let Some(config) = reasoning_config {

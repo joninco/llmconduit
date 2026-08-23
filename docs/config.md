@@ -92,6 +92,7 @@ struct PersistedUpstream {  // line 1148
     name: Option<String>,
     upstream_base_url: String,
     upstream_api_key: Option<String>,
+    upstream_api_key_env: Option<String>,      // mutually exclusive with upstream_api_key
     upstream_model: Option<String>,
     wire_api: UpstreamWireApi,                 // chat_completions (default) | codex_responses
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
@@ -110,6 +111,7 @@ struct PersistedFallbackUpstream {  // line 1130
     name: Option<String>,
     upstream_base_url: String,
     upstream_api_key: Option<String>,
+    upstream_api_key_env: Option<String>,      // mutually exclusive with upstream_api_key
     upstream_model: Option<String>,
     exposed_model: Option<String>,            // model id advertised to the client
     wire_api: UpstreamWireApi,                // must match its primary
@@ -349,6 +351,7 @@ struct ReasoningConfig {  // line 23
     thinking_param_name: String,                // default "enable_thinking"
     thinking_param_value_on: JsonValue,          // default true
     thinking_param_value_off: JsonValue,         // default false
+    forward_thinking_param: bool,                // default true; false omits dynamic template kwargs
 }
 ```
 

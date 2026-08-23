@@ -80,7 +80,8 @@ upstreams:
 
   - name: "openai"
     upstream_base_url: "https://api.openai.com/v1"
-    upstream_api_key: "sk-..."                # or use OPENAI_API_KEY env
+    upstream_api_key_env: "OPENAI_API_KEY"    # resolved at startup; never persisted
+    # upstream_api_key: "sk-..."              # mutually exclusive inline alternative
     # upstream_model: "gpt-4o"                # override request model id
     # upstream_request_log_path: "/var/log/llmconduit/openai.jsonl"
     # fallback_upstreams: []                  # optional nested fallbacks
@@ -124,6 +125,7 @@ model_routes:
 # fallback_upstreams:
 #   - upstream_base_url: "http://backup:8000/v1"
 #     upstream_api_key: "sk-backup"
+#     upstream_api_key_env: "BACKUP_API_KEY"  # mutually exclusive with inline key
 #     exposed_model: "backup-model"
 
 # Cooldown (seconds) before retrying a failed upstream.
@@ -234,6 +236,7 @@ model_profiles:
   #     thinking_param_name: "enable_thinking"
   #     thinking_param_value_on: true
   #     thinking_param_value_off: false
+  #     forward_thinking_param: true          # false for hosted APIs without template kwargs
 
   # ---- Profile with capability overrides ----
   # Override what /v1/models advertises for this model. Unconfigured keys

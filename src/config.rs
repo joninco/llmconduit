@@ -31,6 +31,8 @@ pub struct ReasoningConfig {
     pub thinking_param_value_on: JsonValue,
     #[serde(skip_serializing_if = "is_default_thinking_param_value_off")]
     pub thinking_param_value_off: JsonValue,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub forward_thinking_param: bool,
 }
 
 const DEFAULT_THINKING_PARAM_NAME: &str = "enable_thinking";
@@ -59,6 +61,10 @@ fn is_default_thinking_param_value_off(value: &JsonValue) -> bool {
     matches!(value, JsonValue::Bool(false))
 }
 
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 impl Default for ReasoningConfig {
     fn default() -> Self {
         Self {
@@ -67,6 +73,7 @@ impl Default for ReasoningConfig {
             thinking_param_name: default_thinking_param_name(),
             thinking_param_value_on: default_thinking_param_value_on(),
             thinking_param_value_off: default_thinking_param_value_off(),
+            forward_thinking_param: true,
         }
     }
 }
@@ -99,6 +106,8 @@ impl<'de> Deserialize<'de> for ReasoningConfig {
             thinking_param_value_on: JsonValue,
             #[serde(default = "default_thinking_param_value_off")]
             thinking_param_value_off: JsonValue,
+            #[serde(default = "default_true")]
+            forward_thinking_param: bool,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -126,6 +135,7 @@ impl<'de> Deserialize<'de> for ReasoningConfig {
             thinking_param_name,
             thinking_param_value_on: raw.thinking_param_value_on,
             thinking_param_value_off: raw.thinking_param_value_off,
+            forward_thinking_param: raw.forward_thinking_param,
         })
     }
 }
@@ -1319,6 +1329,8 @@ pub struct PersistedFallbackUpstream {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_api_key_env: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposed_model: Option<String>,
@@ -1342,6 +1354,7 @@ impl std::fmt::Debug for PersistedFallbackUpstream {
                 "upstream_api_key",
                 &self.upstream_api_key.as_ref().map(|_| "[redacted]"),
             )
+            .field("upstream_api_key_env", &self.upstream_api_key_env)
             .field("upstream_model", &self.upstream_model)
             .field("exposed_model", &self.exposed_model)
             .finish_non_exhaustive()
@@ -1355,6 +1368,8 @@ pub struct PersistedUpstream {
     pub upstream_base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_model: Option<String>,
     #[serde(default, skip_serializing_if = "is_default_upstream_wire_api")]
@@ -1379,6 +1394,7 @@ impl std::fmt::Debug for PersistedUpstream {
                 "upstream_api_key",
                 &self.upstream_api_key.as_ref().map(|_| "[redacted]"),
             )
+            .field("upstream_api_key_env", &self.upstream_api_key_env)
             .field("upstream_model", &self.upstream_model)
             .field("fallback_upstreams", &self.fallback_upstreams)
             .finish_non_exhaustive()
@@ -2596,7 +2612,11 @@ fn parse_upstream(
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| format!("upstream-{}", index + 1)),
         upstream_base_url,
-        upstream_api_key: trim_nonempty(provider.upstream_api_key.as_deref()),
+        upstream_api_key: resolve_upstream_api_key(
+            provider.upstream_api_key.as_deref(),
+            provider.upstream_api_key_env.as_deref(),
+            &format!("upstreams[{index}]"),
+        )?,
         upstream_model: trim_nonempty(provider.upstream_model.as_deref()),
         wire_api: provider.wire_api,
         upstream_chat_kwargs: provider.upstream_chat_kwargs.clone(),
@@ -2624,7 +2644,11 @@ fn parse_fallback_upstream(
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| format!("fallback-{}", index + 1)),
         upstream_base_url,
-        upstream_api_key: trim_nonempty(provider.upstream_api_key.as_deref()),
+        upstream_api_key: resolve_upstream_api_key(
+            provider.upstream_api_key.as_deref(),
+            provider.upstream_api_key_env.as_deref(),
+            &format!("{path}[{index}]"),
+        )?,
         upstream_model: trim_nonempty(provider.upstream_model.as_deref()),
         exposed_model: trim_nonempty(provider.exposed_model.as_deref()),
         wire_api: provider.wire_api,
@@ -2640,6 +2664,46 @@ fn trim_nonempty(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn resolve_upstream_api_key(
+    inline_key: Option<&str>,
+    env_name: Option<&str>,
+    path: &str,
+) -> Result<Option<String>, String> {
+    let inline_key = trim_nonempty(inline_key);
+    let env_name = trim_nonempty(env_name);
+    if inline_key.is_some() && env_name.is_some() {
+        return Err(format!(
+            "{path}.upstream_api_key and {path}.upstream_api_key_env cannot both be set"
+        ));
+    }
+    let Some(env_name) = env_name else {
+        return Ok(inline_key);
+    };
+    let mut chars = env_name.chars();
+    let valid = chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric());
+    if !valid {
+        return Err(format!(
+            "{path}.upstream_api_key_env must name a valid environment variable"
+        ));
+    }
+    match std::env::var(&env_name) {
+        Ok(value) => trim_nonempty(Some(&value)).map(Some).ok_or_else(|| {
+            format!(
+                "{path}.upstream_api_key_env references {env_name}, but that variable is empty"
+            )
+        }),
+        Err(std::env::VarError::NotPresent) => Err(format!(
+            "{path}.upstream_api_key_env references {env_name}, but that variable is not set"
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "{path}.upstream_api_key_env references {env_name}, but that variable is not valid Unicode"
+        )),
+    }
 }
 
 /// Parse a configured HTTP-service URL without permitting hidden credential
@@ -3185,6 +3249,34 @@ model_profiles:
     }
 
     #[test]
+    fn upstream_reasoning_can_omit_dynamic_thinking_template_kwarg() {
+        let persisted: PersistedConfig = serde_yaml::from_str(
+            r#"
+model_profiles:
+  hosted-model:
+    reasoning_effort:
+      map:
+        none: low
+        max: high
+      forward_thinking_param: false
+"#,
+        )
+        .expect("yaml");
+        let config = Config::from_persisted(&persisted).expect("config");
+        let policies = BackendFinalizationPolicies::from_config(&config);
+
+        let mut request = leaf_request("hosted-model");
+        request.reasoning_effort = Some("max".to_string());
+        let mut backend =
+            BackendChatRequest::new(request, None, None, None).with_thinking_override(Some(false));
+        finalize_request_for_backend(&mut backend, &policies);
+        let wire = serde_json::to_value(&backend.request).expect("wire json");
+
+        assert_eq!(wire["reasoning_effort"], json!("high"));
+        assert!(wire.get("chat_template_kwargs").is_none());
+    }
+
+    #[test]
     fn typed_and_fragment_reasoning_syntaxes_are_mutually_exclusive() {
         let persisted: PersistedConfig = serde_yaml::from_str(
             r#"
@@ -3255,6 +3347,93 @@ model_profiles:
         };
         let result2 = Config::from_persisted(&config2).unwrap();
         assert_eq!(result2.upstream_api_key, None);
+    }
+
+    #[test]
+    fn explicit_upstream_api_key_can_resolve_from_environment() {
+        const ENV_NAME: &str = "LLMCONDUIT_TEST_PROVIDER_API_KEY";
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous = std::env::var_os(ENV_NAME);
+        unsafe {
+            std::env::set_var(ENV_NAME, "  provider-secret  ");
+        }
+        let persisted: PersistedConfig = serde_yaml::from_str(&format!(
+            r#"
+upstreams:
+  - name: env-provider
+    upstream_base_url: https://example.com/v1
+    upstream_api_key_env: {ENV_NAME}
+    fallback_upstreams:
+      - name: env-fallback
+        upstream_base_url: https://fallback.example.com/v1
+        upstream_api_key_env: {ENV_NAME}
+"#
+        ))
+        .expect("yaml");
+
+        let config = Config::from_persisted(&persisted).expect("resolved config");
+
+        assert_eq!(
+            config.upstreams[0].upstream_api_key.as_deref(),
+            Some("provider-secret")
+        );
+        assert_eq!(
+            config.upstreams[0].fallback_upstreams[0]
+                .upstream_api_key
+                .as_deref(),
+            Some("provider-secret")
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(ENV_NAME, value),
+                None => std::env::remove_var(ENV_NAME),
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_upstream_api_key_env_rejects_missing_and_ambiguous_sources() {
+        const ENV_NAME: &str = "LLMCONDUIT_TEST_MISSING_PROVIDER_API_KEY";
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let previous = std::env::var_os(ENV_NAME);
+        unsafe {
+            std::env::remove_var(ENV_NAME);
+        }
+        let missing: PersistedConfig = serde_yaml::from_str(&format!(
+            r#"
+upstreams:
+  - upstream_base_url: https://example.com/v1
+    upstream_api_key_env: {ENV_NAME}
+"#
+        ))
+        .expect("yaml");
+        let missing_error = Config::from_persisted(&missing).expect_err("missing env must fail");
+        assert!(missing_error.contains(ENV_NAME));
+        assert!(!missing_error.contains("provider-secret"));
+
+        unsafe {
+            std::env::set_var(ENV_NAME, "provider-secret");
+        }
+        let ambiguous: PersistedConfig = serde_yaml::from_str(&format!(
+            r#"
+upstreams:
+  - upstream_base_url: https://example.com/v1
+    upstream_api_key: inline-secret
+    upstream_api_key_env: {ENV_NAME}
+"#
+        ))
+        .expect("yaml");
+        let ambiguous_error =
+            Config::from_persisted(&ambiguous).expect_err("two key sources must fail");
+        assert!(ambiguous_error.contains("cannot both be set"));
+        assert!(!ambiguous_error.contains("inline-secret"));
+        assert!(!ambiguous_error.contains("provider-secret"));
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(ENV_NAME, value),
+                None => std::env::remove_var(ENV_NAME),
+            }
+        }
     }
 
     /// AC-1 (F1a): `turn_capture_dir` trims like `upstream_request_log_path`
@@ -3343,6 +3522,7 @@ model_profiles:
                     name: Some(" backup ".to_string()),
                     upstream_base_url: "  http://127.0.0.1:8001/v1  ".to_string(),
                     upstream_api_key: Some(" backup-secret ".to_string()),
+                    upstream_api_key_env: None,
                     upstream_model: Some(" fallback-model ".to_string()),
                     exposed_model: Some(" fallback-alias ".to_string()),
                     wire_api: UpstreamWireApi::ChatCompletions,
@@ -3360,6 +3540,7 @@ model_profiles:
                     name: Some("   ".to_string()),
                     upstream_base_url: "http://127.0.0.1:8002/v1".to_string(),
                     upstream_api_key: Some("   ".to_string()),
+                    upstream_api_key_env: None,
                     upstream_model: None,
                     exposed_model: None,
                     wire_api: UpstreamWireApi::ChatCompletions,
@@ -3419,6 +3600,7 @@ model_profiles:
                 name: Some(" local ".to_string()),
                 upstream_base_url: " http://127.0.0.1:8000/v1 ".to_string(),
                 upstream_api_key: Some(" local-secret ".to_string()),
+                upstream_api_key_env: None,
                 upstream_model: Some(" local-model ".to_string()),
                 wire_api: UpstreamWireApi::ChatCompletions,
                 upstream_chat_kwargs: JsonMap::from_iter([(
@@ -3431,6 +3613,7 @@ model_profiles:
                     name: Some(" backup ".to_string()),
                     upstream_base_url: " https://openrouter.ai/api/v1 ".to_string(),
                     upstream_api_key: Some(" backup-secret ".to_string()),
+                    upstream_api_key_env: None,
                     upstream_model: Some(" backup-model ".to_string()),
                     exposed_model: Some(" backup-alias ".to_string()),
                     wire_api: UpstreamWireApi::ChatCompletions,
