@@ -7224,6 +7224,7 @@ async fn stream_success_responses_response(
     let stream = async_stream::stream! {
         futures::pin_mut!(parsed);
         let mut terminal: Option<crate::engine::SseEvent> = None;
+        let mut saw_done = false;
         while let Some(result) = parsed.next().await {
             let event = match result {
                 Ok(event) => event,
@@ -7233,7 +7234,23 @@ async fn stream_success_responses_response(
                 }
             };
             if event.data == "[DONE]" {
-                yield Err(malformed_responses_stream_error("Responses stream used a Chat Completions [DONE] sentinel"));
+                if terminal.is_none() {
+                    yield Err(malformed_responses_stream_error("Responses stream emitted [DONE] before its terminal event"));
+                    return;
+                }
+                if saw_done {
+                    yield Err(malformed_responses_stream_error("Responses stream emitted more than one [DONE] sentinel"));
+                    return;
+                }
+                // Public Responses providers may terminate a valid lifecycle
+                // with the same [DONE] transport marker used by Chat
+                // Completions. It is safe only after the terminal response has
+                // already been validated and only when nothing follows it.
+                saw_done = true;
+                continue;
+            }
+            if saw_done {
+                yield Err(malformed_responses_stream_error("Responses stream emitted data after its [DONE] sentinel"));
                 return;
             }
             let data: Value = match serde_json::from_str(&event.data) {
@@ -13408,6 +13425,10 @@ mod resilience_tests {
         .collect()
     }
 
+    fn native_sse_with_done() -> String {
+        format!("{}data: [DONE]\n\n", native_sse())
+    }
+
     fn native_backend() -> BackendResponsesRequest {
         BackendResponsesRequest {
             body: json!({"model":"model-a","input":"hello","stream":true}),
@@ -13464,6 +13485,30 @@ mod resilience_tests {
         assert_eq!(
             upstream.provider_health()[0].status,
             ProviderStatus::Healthy
+        );
+    }
+
+    #[tokio::test]
+    async fn native_responses_accepts_done_after_terminal_event() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(sse_response(native_sse_with_done()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut stream = leaf(&server.uri())
+            .with_wire_api(UpstreamWireApi::CodexResponses)
+            .stream_responses_native_with_timeout(&native_backend(), Duration::from_secs(5))
+            .await
+            .expect("native Responses stream starts");
+        let mut event_names = Vec::new();
+        while let Some(event) = stream.next().await {
+            event_names.push(event.expect("valid native Responses event").event);
+        }
+        assert_eq!(
+            event_names.last().map(String::as_str),
+            Some("response.completed")
         );
     }
 

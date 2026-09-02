@@ -6340,6 +6340,8 @@ mod tests {
     use super::NativeTurnTracker;
     use super::extract_data_image;
     use super::native_current_user_function_output_ids;
+    use super::native_output_items_equivalent;
+    use super::native_responses_request_body;
     use super::preview_json;
     use super::preview_json_limited_with_images;
     use super::preview_text;
@@ -6833,6 +6835,63 @@ mod tests {
             event.data["response"]["error"]["message"].as_str().unwrap(),
             "internal server error"
         );
+    }
+
+    #[test]
+    fn native_reasoning_items_allow_reencrypted_terminal_content() {
+        let streamed: ResponseItem = serde_json::from_value(json!({
+            "type": "reasoning",
+            "id": "rs_test",
+            "summary": [],
+            "encrypted_content": "stream-ciphertext"
+        }))
+        .expect("streamed reasoning item");
+        let terminal: ResponseItem = serde_json::from_value(json!({
+            "type": "reasoning",
+            "id": "rs_test",
+            "summary": [],
+            "encrypted_content": "terminal-ciphertext"
+        }))
+        .expect("terminal reasoning item");
+        assert!(native_output_items_equivalent(&streamed, &terminal));
+
+        let missing_encrypted: ResponseItem = serde_json::from_value(json!({
+            "type": "reasoning",
+            "id": "rs_test",
+            "summary": []
+        }))
+        .expect("reasoning item without encrypted content");
+        assert!(!native_output_items_equivalent(
+            &streamed,
+            &missing_encrypted
+        ));
+    }
+
+    #[test]
+    fn native_reasoning_replay_omits_synthetic_item_id() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "client-alias",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rsn_generated_by_llmconduit",
+                    "summary": [],
+                    "encrypted_content": "opaque-replay-state"
+                },
+                {
+                    "type": "reasoning",
+                    "id": "rs_provider_identity",
+                    "summary": [],
+                    "encrypted_content": "other-opaque-replay-state"
+                }
+            ]
+        }))
+        .expect("Responses request");
+
+        let body =
+            native_responses_request_body(&request, "served-model").expect("native Responses body");
+        assert!(body["input"][0].get("id").is_none());
+        assert_eq!(body["input"][1]["id"], "rs_provider_identity");
     }
 
     // G2 model-family detection + `chat_template_kwargs` injection now lives in
@@ -7674,12 +7733,33 @@ pub(crate) fn native_responses_request_body(
     let mut body = serde_json::Map::new();
     body.insert("model".to_string(), Value::String(served_model.to_string()));
     body.insert("instructions".to_string(), Value::String(instructions));
-    body.insert(
-        "input".to_string(),
-        serde_json::to_value(input).map_err(|error| {
-            AppError::internal(format!("failed to serialize Responses input: {error}"))
-        })?,
-    );
+    let mut input = serde_json::to_value(input).map_err(|error| {
+        AppError::internal(format!("failed to serialize Responses input: {error}"))
+    })?;
+    if let Some(items) = input.as_array_mut() {
+        for item in items {
+            let Some(item) = item.as_object_mut() else {
+                continue;
+            };
+            let synthetic_reasoning_id = item.get("type").and_then(Value::as_str)
+                == Some("reasoning")
+                && item.get("encrypted_content").is_some()
+                && item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.starts_with("rsn_"));
+            if synthetic_reasoning_id {
+                // Anthropic thinking blocks retain encrypted replay state but
+                // cannot carry a Responses item ID. The ingress adapters use
+                // `rsn_` IDs only to satisfy llmconduit's internal item shape.
+                // Encrypted stateless replay permits the ID to be absent, while
+                // forwarding a locally generated value makes providers treat
+                // it as an invalid or expired upstream identity.
+                item.remove("id");
+            }
+        }
+    }
+    body.insert("input".to_string(), input);
     body.insert(
         "tools".to_string(),
         serde_json::to_value(&request.tools).map_err(|error| {
@@ -7960,9 +8040,12 @@ fn native_output_items_equivalent(streamed: &ResponseItem, terminal: &ResponseIt
                 ..
             },
         ) => {
+            // Encrypted reasoning is an opaque replay token. A provider may
+            // re-encrypt it for the terminal snapshot, so compare presence
+            // while requiring every semantic reasoning field to agree.
             left_summary == right_summary
                 && left_content == right_content
-                && left_encrypted == right_encrypted
+                && left_encrypted.is_some() == right_encrypted.is_some()
         }
         (
             ResponseItem::FunctionCall {
