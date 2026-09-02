@@ -291,7 +291,11 @@ fn convert_message(
                             }
                         } else {
                             let text = normalize_message_text(role, text);
-                            content_items.push(ContentItem::OutputText { text });
+                            if role == "assistant" {
+                                content_items.push(ContentItem::OutputText { text });
+                            } else {
+                                content_items.push(ContentItem::InputText { text });
+                            }
                         }
                     }
                     AnthropicContentBlock::Image { source } => {
@@ -498,12 +502,12 @@ fn text_message_item(role: &str, text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
         role: role.to_string(),
-        content: if role == "user" {
-            vec![ContentItem::InputText {
+        content: if role == "assistant" {
+            vec![ContentItem::OutputText {
                 text: text.to_string(),
             }]
         } else {
-            vec![ContentItem::OutputText {
+            vec![ContentItem::InputText {
                 text: text.to_string(),
             }]
         },
@@ -752,6 +756,12 @@ mod tests {
                     role: "system".to_string(),
                     content: AnthropicContent::Text(skill_listing.to_string()),
                 },
+                AnthropicMessage {
+                    role: "system".to_string(),
+                    content: AnthropicContent::Blocks(vec![AnthropicContentBlock::Text {
+                        text: "Additional system context.".to_string(),
+                    }]),
+                },
             ],
             tools: None,
             tool_choice: None,
@@ -767,12 +777,18 @@ mod tests {
 
         let result = convert_request(request).expect("convert");
         assert_eq!(result.instructions, "Base instructions.");
-        assert_eq!(result.input.len(), 2);
+        assert_eq!(result.input.len(), 3);
         assert!(matches!(
             &result.input[1],
             ResponseItem::Message { role, content, .. }
                 if role == "system"
-                    && matches!(&content[0], ContentItem::OutputText { text } if text.contains("deep-research"))
+                    && matches!(&content[0], ContentItem::InputText { text } if text.contains("deep-research"))
+        ));
+        assert!(matches!(
+            &result.input[2],
+            ResponseItem::Message { role, content, .. }
+                if role == "system"
+                    && matches!(&content[0], ContentItem::InputText { text } if text == "Additional system context.")
         ));
     }
 
