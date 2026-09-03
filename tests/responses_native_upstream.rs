@@ -934,6 +934,77 @@ async fn native_structured_output_is_validated_before_completion() {
 }
 
 #[tokio::test]
+async fn anthropic_optional_strict_fields_are_required_on_native_responses_wire() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sse(&text_events(
+                r#"{"ok":true,"reason":"complete","impossible":false}"#,
+            )),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let response = app(&server)
+        .await
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("content-type", "application/json")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(
+                    json!({
+                        "model":"gpt-5.6-sol",
+                        "max_tokens":128,
+                        "stream":false,
+                        "messages":[{"role":"user","content":"Evaluate the goal."}],
+                        "output_config":{"format":{
+                            "type":"json_schema",
+                            "name":"goal_result",
+                            "strict":true,
+                            "schema":{
+                                "type":"object",
+                                "properties":{
+                                    "impossible":{"type":"boolean"},
+                                    "ok":{"type":"boolean"},
+                                    "reason":{"type":"string"}
+                                },
+                                "required":["ok","reason"],
+                                "additionalProperties":false
+                            }
+                        }}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&response_body)
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let generation = requests
+        .iter()
+        .find(|request| request.url.path() == "/v1/responses")
+        .expect("generation request");
+    let upstream: Value = serde_json::from_slice(&generation.body).unwrap();
+    assert_eq!(
+        upstream["text"]["format"]["schema"]["required"],
+        json!(["ok", "reason", "impossible"])
+    );
+}
+
+#[tokio::test]
 async fn native_usage_without_provider_total_is_rejected_not_inferred() {
     let server = MockServer::start().await;
     let mut events = text_events("ok");

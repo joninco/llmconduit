@@ -33,6 +33,8 @@ use crate::models::responses::ResponseResource;
 use crate::models::responses::ResponseUsage;
 use crate::models::responses::ResponsesEnvelope;
 use crate::models::responses::ResponsesRequest;
+use crate::models::responses::StrictSchemaDialect;
+use crate::models::responses::ToolSpec;
 use crate::models::responses::WebSearchAction;
 use crate::monitor::DebugEventImage;
 use crate::monitor::MonitorEventKind;
@@ -6894,6 +6896,93 @@ mod tests {
         assert_eq!(body["input"][1]["id"], "rs_provider_identity");
     }
 
+    #[test]
+    fn native_anthropic_strict_schemas_require_every_object_property() {
+        let mut request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "client-alias",
+            "input": "evaluate",
+            "tools": [{
+                "type": "function",
+                "name": "inspect",
+                "strict": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "detail": {"type": "boolean"}
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }
+            }],
+            "text": {"format": {
+                "type": "json_schema",
+                "name": "goal_result",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "reason": {"type": "string"},
+                        "impossible": {"type": "boolean"},
+                        "details": {
+                            "type": "object",
+                            "properties": {
+                                "code": {"type": "integer"},
+                                "note": {"type": "string"}
+                            },
+                            "required": ["code"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "required": ["ok", "reason"],
+                    "additionalProperties": false,
+                    "$defs": {
+                        "metadata": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"}
+                            },
+                            "additionalProperties": false
+                        }
+                    }
+                }
+            }}
+        }))
+        .expect("Responses request");
+        request.strict_schema_dialect = crate::models::responses::StrictSchemaDialect::Anthropic;
+
+        let body =
+            native_responses_request_body(&request, "served-model").expect("native Responses body");
+
+        assert_eq!(
+            body["text"]["format"]["schema"]["required"],
+            json!(["ok", "reason", "details", "impossible"])
+        );
+        assert_eq!(
+            body["text"]["format"]["schema"]["properties"]["details"]["required"],
+            json!(["code", "note"])
+        );
+        assert_eq!(
+            body["text"]["format"]["schema"]["$defs"]["metadata"]["required"],
+            json!(["label"])
+        );
+        assert_eq!(
+            body["tools"][0]["parameters"]["required"],
+            json!(["path", "detail"])
+        );
+        assert_eq!(
+            request
+                .text
+                .as_ref()
+                .and_then(|text| text.format.as_ref())
+                .expect("canonical format")
+                .schema["required"],
+            json!(["ok", "reason"]),
+            "wire adaptation must not mutate the canonical validation schema"
+        );
+    }
+
     // G2 model-family detection + `chat_template_kwargs` injection now lives in
     // the upstream client (it must run against the FINAL per-provider model,
     // which routing/failover only know there). See `src/upstream.rs` tests.
@@ -7760,9 +7849,34 @@ pub(crate) fn native_responses_request_body(
         }
     }
     body.insert("input".to_string(), input);
+    let mut tools = request.tools.clone();
+    if request.strict_schema_dialect == StrictSchemaDialect::Anthropic {
+        for tool in &mut tools {
+            match tool {
+                ToolSpec::Function {
+                    strict: true,
+                    parameters,
+                    ..
+                } => require_all_strict_schema_properties(parameters),
+                ToolSpec::Namespace { tools, .. } => {
+                    for tool in tools {
+                        let crate::models::responses::NamespaceToolSpec::Function {
+                            strict,
+                            parameters,
+                            ..
+                        } = tool;
+                        if *strict {
+                            require_all_strict_schema_properties(parameters);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     body.insert(
         "tools".to_string(),
-        serde_json::to_value(&request.tools).map_err(|error| {
+        serde_json::to_value(tools).map_err(|error| {
             AppError::internal(format!("failed to serialize Responses tools: {error}"))
         })?,
     );
@@ -7803,6 +7917,14 @@ pub(crate) fn native_responses_request_body(
         );
     }
     if let Some(text) = &request.text {
+        let mut text = text.clone();
+        if request.strict_schema_dialect == StrictSchemaDialect::Anthropic
+            && let Some(format) = text.format.as_mut()
+            && format.kind == "json_schema"
+            && format.strict
+        {
+            require_all_strict_schema_properties(&mut format.schema);
+        }
         body.insert(
             "text".to_string(),
             serde_json::to_value(text).map_err(|error| {
@@ -7813,6 +7935,66 @@ pub(crate) fn native_responses_request_body(
         );
     }
     Ok(Value::Object(body))
+}
+
+/// Adapt Anthropic strict schemas to the stricter Responses API object rule.
+///
+/// Anthropic permits optional object properties in strict schemas. OpenAI-style
+/// Responses providers require every declared property to appear in `required`,
+/// including properties in nested schemas. The canonical request retains the
+/// caller's schema; only the native Responses wire copy is strengthened so
+/// generated values still satisfy the original property types.
+fn require_all_strict_schema_properties(schema: &mut Value) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+
+    let existing_required = object
+        .get("required")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let required = object
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .map(|properties| {
+            for property_schema in properties.values_mut() {
+                require_all_strict_schema_properties(property_schema);
+            }
+
+            let mut required = existing_required;
+            for property_name in properties.keys() {
+                if !required
+                    .iter()
+                    .any(|name| name.as_str() == Some(property_name))
+                {
+                    required.push(Value::String(property_name.clone()));
+                }
+            }
+            required
+        });
+    if let Some(required) = required {
+        object.insert("required".to_string(), Value::Array(required));
+    }
+
+    if let Some(definitions) = object.get_mut("$defs").and_then(Value::as_object_mut) {
+        for definition in definitions.values_mut() {
+            require_all_strict_schema_properties(definition);
+        }
+    }
+    if let Some(branches) = object.get_mut("anyOf").and_then(Value::as_array_mut) {
+        for branch in branches {
+            require_all_strict_schema_properties(branch);
+        }
+    }
+    if let Some(items) = object.get_mut("items") {
+        require_all_strict_schema_properties(items);
+    }
+    if let Some(additional_properties) = object.get_mut("additionalProperties")
+        && additional_properties.is_object()
+    {
+        require_all_strict_schema_properties(additional_properties);
+    }
 }
 
 fn unsupported_native_responses_parameter(request: &ResponsesRequest) -> Option<String> {
