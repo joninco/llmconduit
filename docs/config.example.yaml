@@ -3,14 +3,12 @@
 # =============================================================================
 # Path: ~/.config/llmconduit/config.yaml
 #
-# This file is GENERATED -- matches the PersistedConfig struct layout in
-# src/config.rs. Edit the code, then regenerate this doc by running:
-#   for doc in routes adapters engine config config.example.yaml \
-#           upstream tools observability dashboard cli funciones; do
-#     echo "==> regenerating... $doc"
-#   done
+# This file is GENERATED -- it matches the PersistedConfig struct layout in
+# src/config.rs. When the code changes, regenerate this file and docs/config.md
+# per the recipes in docs/regenerate.md.
 #
-# Environment overrides (LLMCONDUIT_*) take precedence over every value here.
+# Environment overrides (LLMCONDUIT_*) take precedence over every value here;
+# see the cheat sheet at the bottom.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -32,7 +30,7 @@
 # strings, or fragments. Put credentials in the dedicated key fields/env vars.
 #
 # upstream_base_url: "http://127.0.0.1:8000/v1"   # default
-# upstream_api_key: "sk-..."                      # or set OPENAI_API_KEY env
+# upstream_api_key: "sk-..."                      # or OPENAI_API_KEY env fallback
 # upstream_model: "gpt-4o"                        # model id sent upstream (default: request model)
 # upstream_request_log_path: "/var/log/llmconduit/requests.jsonl"
 
@@ -47,21 +45,27 @@
 upstreams:
   - name: "local-vllm"
     upstream_base_url: "http://localhost:8000/v1"
-    # Generation wire protocol: chat_completions (default) or responses.
-    # A failover chain must use one protocol throughout.
+    # Generation wire protocol: chat_completions (default) or codex_responses
+    # (narrow Codex Responses-Lite sidecar contract; the spelling "responses"
+    # is accepted as an alias). A failover chain must use one protocol
+    # throughout -- a nested fallback's wire_api must match its primary.
     # wire_api: chat_completions
 
     # Log all requests/responses sent to this upstream (JSONL, append-only).
+    # In routing mode the top-level upstream_request_log_path is NOT used by
+    # `upstreams:` entries -- the path must live here to log.
     upstream_request_log_path: "/var/log/llmconduit/local-vllm.jsonl"
 
-    # Optional nested fallback upstreams: if the primary upstream fails (non-
-    # 2xx / connection error / SSE failure), the engine retries each fallback
-    # in order before giving up.
+    # Optional nested fallback upstreams: if the primary fails (non-2xx /
+    # connection error / SSE failure), the engine retries each fallback in
+    # order before giving up.
     fallback_upstreams:
       - upstream_base_url: "http://localhost:8001/v1"
         exposed_model: "gpt-4o-mini"          # model id advertised to the client
-        # upstream_api_key: "sk-..."
-        # upstream_model: "gpt-4o-mini-custom"  # override backend model id
+        # upstream_api_key: "sk-..."           # mutually exclusive with the _env form
+        # upstream_api_key_env: "BACKUP_API_KEY"  # resolved at startup; startup fails
+        #                                        # if the variable is missing/empty
+        # upstream_model: "gpt-4o-mini-custom"    # override backend model id
         # upstream_chat_kwargs:
         #   temperature: 0.3
 
@@ -69,6 +73,16 @@ upstreams:
     # Client-provided values override these (client-wins merge).
     # upstream_chat_kwargs:
     #   temperature: 0.7
+
+    # Optional per-provider resilience overlays (sparse: omitted fields
+    # inherit the global blocks below). See the RESILIENCE section.
+    # upstream_retry:
+    #   max_attempts: 2
+    # upstream_circuit_breaker:
+    #   max_open_ms: 60000
+    # upstream_bulkhead:
+    #   max_in_flight: 8
+    #   max_queue: 4
 
     # Optional Responses feature declaration for this provider. Missing
     # advanced capabilities are treated conservatively as unsupported, apart
@@ -78,20 +92,22 @@ upstreams:
     #   structured_outputs: [text, json_object]
     #   reasoning_summary: upstream
 
-  - name: "openai"
-    upstream_base_url: "https://api.openai.com/v1"
-    upstream_api_key_env: "OPENAI_API_KEY"    # resolved at startup; never persisted
-    # upstream_api_key: "sk-..."              # mutually exclusive inline alternative
-    # upstream_model: "gpt-4o"                # override request model id
-    # upstream_request_log_path: "/var/log/llmconduit/openai.jsonl"
-    # fallback_upstreams: []                  # optional nested fallbacks
+  # Remote provider using an env-backed credential: upstream_api_key and
+  # upstream_api_key_env are mutually exclusive; the named variable must be
+  # present and non-empty at startup or llmconduit exits.
+  - name: "deepseek-api"
+    upstream_base_url: "https://api.deepseek.com/v1"
+    upstream_api_key_env: "DEEPSEEK_API_KEY"   # resolved at startup; never persisted
+    # upstream_api_key: "sk-..."               # inline alternative (either, not both)
+    # upstream_model: "deepseek-chat"          # optional catalog pin
+    # upstream_request_log_path: "/var/log/llmconduit/deepseek.jsonl"
 
   # Codex Responses-Lite sidecar example. This path preserves item IDs,
   # encrypted reasoning, usage, and function-call events without translating
   # through Chat Completions.
   # - name: "codex-subscription"
   #   upstream_base_url: "http://127.0.0.1:5033/v1"
-  #   upstream_api_key: "<dedicated loopback sidecar token>"
+  #   upstream_api_key_env: "CODEX_SIDECAR_TOKEN"
   #   wire_api: codex_responses
   #   responses_capabilities:
   #     parallel_tool_calls: false
@@ -120,15 +136,54 @@ model_routes:
 # FALLBACK UPSTREAMS (non-routing mode)
 # ---------------------------------------------------------------------------
 # When `upstreams:` is empty, these are tried in order if the primary
-# single-upstream fails. Each fallback has its own API key and model.
+# single-upstream fails. Each fallback has its own API key and model, and must
+# use the chat_completions wire protocol (use `upstreams:` for a
+# Responses-native routing provider).
 #
 # fallback_upstreams:
 #   - upstream_base_url: "http://backup:8000/v1"
 #     upstream_api_key: "sk-backup"
-#     upstream_api_key_env: "BACKUP_API_KEY"  # mutually exclusive with inline key
+#     # upstream_api_key_env: "BACKUP_API_KEY"  # mutually exclusive with inline key
 #     exposed_model: "backup-model"
 
-# Cooldown (seconds) before retrying a failed upstream.
+# ---------------------------------------------------------------------------
+# UPSTREAM RESILIENCE (global policy)
+# ---------------------------------------------------------------------------
+# Same-provider retry, adaptive circuit breaking, and optional bulkheads.
+# Each upstream/fallback can overlay individual fields via its
+# upstream_retry / upstream_circuit_breaker / upstream_bulkhead blocks.
+#
+# Bounded same-provider retry: pre-output only, limited to explicit transient
+# HTTP statuses (transport/stream failures fall through to nested fallback
+# instead of repeating the same provider).
+upstream_retry:                                # defaults shown
+  enabled: true
+  max_attempts: 3                              # 1..=10
+  initial_backoff_ms: 500                      # >= 1
+  max_backoff_ms: 4000                         # >= initial_backoff_ms
+  total_budget_ms: 10000                       # 1..=60000
+  honor_retry_after: true                      # obey upstream Retry-After (capped)
+  max_retry_after_secs: 15                     # <= 60
+
+# Adaptive circuit breaker. `max_open_ms: 0` disables the circuit (compat
+# spelling for a disabled legacy cooldown). Omit this whole block to migrate
+# the deprecated upstream_failure_cooldown_secs into max_open_ms.
+upstream_circuit_breaker:
+  initial_open_ms: 2000
+  max_open_ms: 30000                           # <= 300000
+  half_open_max_probes: 1                      # must be 1
+
+# Optional per-provider concurrency bulkhead. Omitted/null = no limit. With a
+# limit, `max_queue` null/0 means immediate bounded rejection (never an
+# unbounded waiter list).
+# upstream_bulkhead:
+#   max_in_flight: 16                          # 1..=100000; null preserves existing concurrency
+#   max_queue: 32                              # requires max_in_flight; 0..=100000
+#   queue_timeout_ms: 5000                     # 1..=60000 when queue > 0
+
+# Deprecated legacy cooldown (seconds). When upstream_circuit_breaker is
+# absent, this migrates into the circuit's max_open_ms. Prefer the explicit
+# block above.
 upstream_failure_cooldown_secs: 30             # default
 
 # ---------------------------------------------------------------------------
@@ -142,6 +197,7 @@ upstream_failure_cooldown_secs: 30             # default
 #   structured_outputs: [text, json_object, json_schema]
 #   reasoning_summary: upstream       # upstream | unsupported
 #   encrypted_reasoning: unsupported  # passthrough | unsupported
+#   agent_message_encrypted_content: unsupported  # plaintext_compat | unsupported
 #   input_image: placeholder          # native | agent | placeholder | reject
 #   input_file: unsupported           # native | unsupported
 #   truncation_auto: unsupported      # upstream | unsupported
@@ -221,7 +277,8 @@ model_profiles:
   # Alternative to the fragment-based `reasoning_effort_map` above. Accepts
   # the same map levels but wraps each value as `{reasoning_effort: <value>}`
   # and adds a dynamic thinking kwarg. Mutually exclusive with the fragment
-  # form -- only one of `reasoning_effort` or `reasoning_effort_map` may be set.
+  # form -- only one of `reasoning_effort` or `reasoning_effort_map`/
+  # `reasoning_effort_default` may be set.
   #
   # claude-opus-4:
   #   reasoning_effort:
@@ -258,7 +315,8 @@ model_profiles:
   # ---- Native-vision override (G4) ----
   # `native_vision: true` forces the image agent OFF for this profile (the
   # backend is multimodal). `false` forces text-only even for models the
-  # family sniff would treat as native-vision. `None` defers to name autodetection.
+  # family sniff would treat as native-vision. Omit to defer to name
+  # auto-detection.
   # claude-opus-4:
   #   native_vision: true
 
@@ -310,8 +368,9 @@ model_profile_templates:
 # ---------------------------------------------------------------------------
 # SYSTEM PROMPT PREFIX
 # ---------------------------------------------------------------------------
-# Prepended to every system/developer turn. Useful for an invisible system
-# instruction before the user's first message.
+# Prepended to every system/developer turn (global prefix joins the profile
+# prefix with a blank line). Useful for an invisible system instruction
+# before the user's first message.
 #
 # system_prompt_prefix: "You are a helpful assistant running through llmconduit."
 
@@ -378,17 +437,17 @@ connect_timeout_secs: 10                         # default (TCP connect timeout)
 # bounded TTL-aware LRU. SQLite persists across restarts and requires `path`.
 # response_store:
 #   backend: memory                              # memory | sqlite
-#   path: null                                   # required for sqlite
-#   max_entries: 1000
-#   retention_hours: 720
+#   path: null                                   # required for sqlite; invalid for memory
+#   max_entries: 1000                            # >= 1
+#   retention_hours: 720                         # >= 1
 
 # Private visible-history replay is independent from Responses `store` and is
 # disabled by default. `max_replay_entries` is a deprecated size alias.
 # replay:
 #   enabled: false
-#   max_entries: 100
+#   max_entries: 100                             # >= 1
 
-# SSE frame byte ceiling (G6 DoS guard). An oversized/never-terminated upstream
+# SSE frame byte ceiling (DoS guard). An oversized/never-terminated upstream
 # SSE frame is rejected beyond this point before unbounded buffer growth.
 # max_sse_frame_bytes: 8388608                    # 8 MiB (default)
 
@@ -407,15 +466,16 @@ connect_timeout_secs: 10                         # default (TCP connect timeout)
 # ---------------------------------------------------------------------------
 # Billing rates (USD per 1k tokens) for the dashboard cost rollup. Keyed by
 # served model id (case-insensitive fallback). Can be wholesale-replaced by
-# LLMCONDUIT_PRICE_TABLE_JSON env var. Non-finite rates (NaN/Inf) are silently
-# dropped.
+# the LLMCONDUIT_PRICE_TABLE_JSON env var. Negative or non-finite rates
+# (NaN/Inf) are silently dropped.
 #
 # price_table:
 #   gpt-4o:
 #     input_per_1k: 2.50
 #     output_per_1k: 10.00
 #     cached_per_1k: 1.25
-#     # cached_price_configured: true   # additive boolean (gap 07); auto-detected
+#     # cached_price_configured: true   # presence flag; auto-derived from the
+#     #                                 # cached_per_1k key when omitted
 #   deepseek-chat:
 #     input_per_1k: 0.15
 #     output_per_1k: 0.60
@@ -426,40 +486,47 @@ connect_timeout_secs: 10                         # default (TCP connect timeout)
 # =============================================================================
 # ENVIRONMENT OVERRIDE CHEAT SHEET
 # =============================================================================
-# Env vars matched in `apply_env_overrides` (src/config.rs). YAML field always
-# wins when the env var is unset / empty / unparseable.
+# Env vars matched in `apply_env_overrides` (src/config.rs). A blank or
+# unparseable value is ignored, keeping the YAML value.
 #
-# LLMCONDUIT_BIND_ADDR                     bind_addr
-# LLMCONDUIT_UPSTREAM_BASE_URL             upstream_base_url
-# LLMCONDUIT_UPSTREAM_API_KEY              upstream_api_key
-# LLMCONDUIT_UPSTREAM_MODEL                upstream_model
-# LLMCONDUIT_TEMPLATE_FAMILY               template_family (global)
-# LLMCONDUIT_SYSTEM_PROMPT_PREFIX          system_prompt_prefix
-# LLMCONDUIT_UPSTREAM_REQUEST_LOG_PATH     upstream_request_log_path
-# LLMCONDUIT_API_LOG_BODY_MODE             api_log_body_mode
+# LLMCONDUIT_BIND_ADDR                      bind_addr
+# LLMCONDUIT_UPSTREAM_BASE_URL              upstream_base_url
+# LLMCONDUIT_UPSTREAM_API_KEY               upstream_api_key
+# LLMCONDUIT_UPSTREAM_MODEL                 upstream_model
+# LLMCONDUIT_TEMPLATE_FAMILY                template_family (global)
+# LLMCONDUIT_SYSTEM_PROMPT_PREFIX           system_prompt_prefix
+# LLMCONDUIT_UPSTREAM_REQUEST_LOG_PATH      upstream_request_log_path
+# LLMCONDUIT_API_LOG_BODY_MODE              api_log_body_mode
 # LLMCONDUIT_UPSTREAM_REQUEST_LOG_BODY_MODE upstream_request_log_body_mode
-# LLMCONDUIT_TURN_CAPTURE_DIR              turn_capture_dir
-# LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON     upstream_chat_kwargs (JSON map, wholesale replace)
-# LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS  upstream_failure_cooldown_secs
-# LLMCONDUIT_BRAVE_BASE_URL                brave_base_url
-# LLMCONDUIT_BRAVE_MAX_RESULTS             brave_max_results
-# LLMCONDUIT_REQUEST_TIMEOUT_SECS          request_timeout_secs
-# LLMCONDUIT_CONNECT_TIMEOUT_SECS          connect_timeout_secs
-# LLMCONDUIT_MAX_WEB_SEARCH_ROUNDS         max_web_search_rounds
-# LLMCONDUIT_FLATTEN_CONTENT               flatten_content
-# LLMCONDUIT_MAX_REPLAY_ENTRIES            max_replay_entries
-# LLMCONDUIT_DEBUG_LOG_MAX_AGE_HOURS       debug_log_max_age_hours
-# LLMCONDUIT_MIN_COMPLETION_TOKENS         min_completion_tokens
-# LLMCONDUIT_MAX_SSE_FRAME_BYTES           max_sse_frame_bytes
-# LLMCONDUIT_MAX_REQUEST_BODY_BYTES        max_request_body_bytes
-# LLMCONDUIT_IMAGE_AGENT_ENABLED           image_agent_enabled
-# LLMCONDUIT_VISION_URL                    vision_url
-# LLMCONDUIT_VISION_MODEL                  vision_model
-# LLMCONDUIT_IMAGE_CACHE_MAX_SIZE          image_cache_max_size
-# LLMCONDUIT_IMAGE_CACHE_TTL_SECS          image_cache_ttl_secs
-# LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY      unsupported_image_policy (placeholder|reject)
-# LLMCONDUIT_PRICE_TABLE_JSON              price_table (JSON map, wholesale replace)
-# BRAVE_SEARCH_API_KEY                     brave_api_key
-# OPENAI_API_KEY                           upstream_api_key (fallback when no YAML/env-first set)
-# LLMCONDUIT_API_TOKEN                     /v1/* auth token (environment-only)
+# LLMCONDUIT_TURN_CAPTURE_DIR               turn_capture_dir
+# LLMCONDUIT_UPSTREAM_CHAT_KWARGS_JSON      upstream_chat_kwargs (JSON map, wholesale replace)
+# LLMCONDUIT_UPSTREAM_FAILURE_COOLDOWN_SECS upstream_failure_cooldown_secs (deprecated)
+# LLMCONDUIT_BRAVE_BASE_URL                 brave_base_url
+# LLMCONDUIT_BRAVE_MAX_RESULTS              brave_max_results
+# LLMCONDUIT_REQUEST_TIMEOUT_SECS           request_timeout_secs
+# LLMCONDUIT_CONNECT_TIMEOUT_SECS           connect_timeout_secs
+# LLMCONDUIT_MAX_WEB_SEARCH_ROUNDS          max_web_search_rounds
+# LLMCONDUIT_FLATTEN_CONTENT                flatten_content
+# LLMCONDUIT_MAX_REPLAY_ENTRIES             max_replay_entries (deprecated; also seeds replay.max_entries)
+# LLMCONDUIT_REPLAY_ENABLED                 replay.enabled (boolean)
+# LLMCONDUIT_DEBUG_LOG_MAX_AGE_HOURS        debug_log_max_age_hours
+# LLMCONDUIT_MIN_COMPLETION_TOKENS          min_completion_tokens
+# LLMCONDUIT_MAX_SSE_FRAME_BYTES            max_sse_frame_bytes
+# LLMCONDUIT_MAX_REQUEST_BODY_BYTES         max_request_body_bytes
+# LLMCONDUIT_IMAGE_AGENT_ENABLED            image_agent_enabled
+# LLMCONDUIT_VISION_URL                     vision_url
+# LLMCONDUIT_VISION_MODEL                   vision_model
+# LLMCONDUIT_IMAGE_CACHE_MAX_SIZE           image_cache_max_size
+# LLMCONDUIT_IMAGE_CACHE_TTL_SECS           image_cache_ttl_secs
+# LLMCONDUIT_UNSUPPORTED_IMAGE_POLICY       unsupported_image_policy (placeholder|reject)
+# LLMCONDUIT_PRICE_TABLE_JSON               price_table (JSON map, wholesale replace)
+# BRAVE_SEARCH_API_KEY                      brave_api_key
+# OPENAI_API_KEY                            upstream_api_key (fallback when no YAML value and no LLMCONDUIT_UPSTREAM_API_KEY)
+#
+# Per-provider credential indirection: each upstream/fallback may set
+# upstream_api_key_env to any variable name; it is resolved at startup and
+# must be present and non-empty, or llmconduit exits.
+#
+# Environment-only (never written to YAML):
+# LLMCONDUIT_API_TOKEN                     /v1/* auth token
 # LLMCONDUIT_ALLOW_UNAUTHENTICATED_API     explicit non-loopback development override
