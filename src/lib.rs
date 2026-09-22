@@ -1,4 +1,5 @@
 pub mod adapters;
+pub mod anthropic_proxy;
 pub mod api_auth;
 pub mod backend_metrics;
 pub mod cli;

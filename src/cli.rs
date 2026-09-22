@@ -189,6 +189,7 @@ pub fn run_configure_flow(path: PathBuf) -> Result<PersistedConfig, String> {
         model_profile_templates: existing.model_profile_templates.clone(),
         model_profiles: existing.model_profiles.clone(),
         model_routes: existing.model_routes.clone(),
+        anthropic_passthrough: existing.anthropic_passthrough.clone(),
         template_family: existing.template_family.clone(),
         responses_capabilities: existing.responses_capabilities.clone(),
         brave_base_url,

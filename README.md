@@ -27,6 +27,10 @@ The default config path is:
 
 Configuration is loaded at startup. Restart llmconduit after editing the file.
 
+For a subscription-authenticated Claude Code lead with local-model teammates,
+see [native Anthropic passthrough](docs/anthropic-subscription-proxy.md). It selects
+native Messages requests by model or header before the translation engine.
+
 Minimal config:
 
 ```yaml

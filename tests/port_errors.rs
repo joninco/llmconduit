@@ -415,6 +415,7 @@ mod integration {
             model_profiles: std::collections::BTreeMap::new(),
             responses_capabilities: Default::default(),
             model_routes: Vec::new(),
+            anthropic_passthrough: None,
             template_family: None,
             brave_base_url: "https://example.com/".parse().expect("url"),
             brave_api_key: None,

@@ -1045,6 +1045,8 @@ pub struct Config {
     /// DECLARATION order is preserved (file order, then CLI `--model-route`
     /// merged in) so the FIRST matching glob wins when two globs overlap.
     pub model_routes: Vec<ModelRoute>,
+    /// Native subscription-authenticated Anthropic routing, before adapters.
+    pub anthropic_passthrough: Option<crate::anthropic_proxy::AnthropicPassthrough>,
     /// Forces the backend chat-template contract (`kimi`/`deepseek`) regardless
     /// of the model name, when family auto-detection from the model id is wrong
     /// (G2). Profile-level `template_family` overrides this global value.
@@ -1837,6 +1839,8 @@ pub struct PersistedConfig {
     /// `--model-route` specs are merged in after these.
     #[serde(default, skip_serializing_if = "OrderedModelRoutes::is_empty")]
     pub model_routes: OrderedModelRoutes,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_passthrough: Option<crate::anthropic_proxy::PersistedAnthropicPassthrough>,
     /// Global override for the backend chat-template family (`kimi`/`deepseek`).
     /// A matched model profile's `template_family` takes precedence (G2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2067,6 +2071,7 @@ impl Default for PersistedConfig {
             responses_capabilities:
                 crate::responses_capabilities::ResponsesCapabilitiesConfig::default(),
             model_routes: OrderedModelRoutes::default(),
+            anthropic_passthrough: None,
             template_family: None,
             brave_base_url: default_brave_base_url(),
             brave_api_key: None,
@@ -2253,6 +2258,11 @@ impl Config {
         let model_profiles =
             resolve_model_profiles(&config.model_profiles, &config.model_profile_templates)?;
         let model_routes = resolve_model_routes(&config.model_routes)?;
+        let anthropic_passthrough = config
+            .anthropic_passthrough
+            .as_ref()
+            .map(crate::anthropic_proxy::AnthropicPassthrough::resolve)
+            .transpose()?;
         let vision_url = match trim_nonempty(config.vision_url.as_deref()) {
             Some(url) => Some(parse_service_url(&url, "vision_url")?),
             None => None,
@@ -2334,6 +2344,7 @@ impl Config {
             model_profiles,
             responses_capabilities: config.responses_capabilities.clone(),
             model_routes,
+            anthropic_passthrough,
             template_family: normalize_template_family(config.template_family.as_deref()),
             brave_base_url,
             brave_api_key: config
@@ -4585,6 +4596,7 @@ response_store:
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
+            anthropic_passthrough: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         };
@@ -4664,6 +4676,7 @@ response_store:
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
+            anthropic_passthrough: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })
@@ -4851,6 +4864,7 @@ response_store:
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
+            anthropic_passthrough: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })
@@ -4934,6 +4948,7 @@ response_store:
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
+            anthropic_passthrough: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })
@@ -5047,6 +5062,7 @@ response_store:
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
+            anthropic_passthrough: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })
@@ -5160,6 +5176,7 @@ response_store:
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
+            anthropic_passthrough: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })
@@ -5577,6 +5594,7 @@ model_profiles:
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
+            anthropic_passthrough: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })
@@ -5646,6 +5664,7 @@ model_profiles:
             image_cache_ttl_secs: 300,
             unsupported_image_policy: UnsupportedImagePolicy::Placeholder,
             model_routes: OrderedModelRoutes::default(),
+            anthropic_passthrough: None,
             template_family: None,
             price_table: std::collections::HashMap::new(),
         })

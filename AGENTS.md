@@ -96,6 +96,7 @@ and HTTP 200 from `/v1/models`.
 | `src/cli.rs` | clap CLI + interactive configure |
 | `src/config.rs` | `Config`/`PersistedConfig`, profile resolution, env overrides |
 | `src/http.rs` | axum router, body-logging middleware, secret redaction, `/v1/models` transform |
+| `src/anthropic_proxy.rs` | Opt-in native Anthropic subscription transport and route validation |
 | `src/engine.rs` | `Gateway`, `run_turn` -- streaming + replay + tool-loop orchestration |
 | `src/upstream.rs` | `Reqwest`/`Failover`/`Routing` upstream clients, `/v1/completions` proxy |
 | `src/replay.rs` | SHA256-keyed LRU replay cache, longest-prefix match |
@@ -124,7 +125,7 @@ that projector or forward the private event dialect directly.
 
 ## Canonical protocol
 
-OpenAI Responses is the **single canonical internal protocol**. All inbound shapes convert in via adapters; all outbound shapes convert out via streaming converters. Do not add direct adapters between non-canonical shapes — go through Responses.
+OpenAI Responses is the **single canonical internal protocol** for translated requests. Inbound shapes convert in via adapters; outbound shapes convert out via streaming converters. Do not add direct adapters between non-canonical shapes — go through Responses. Explicit `anthropic_passthrough` rules select a separate native transport before adapters and profile application; that transport does not convert protocols. See `docs/anthropic-subscription-proxy.md`.
 
 Adapter direction map:
 
@@ -193,7 +194,7 @@ Profiles are considered against the resolved catalog model, the configured upstr
 - Don't add a typed field for a provider-specific knob if `extra_body` works.
 - Don't bypass `redact_payload_secrets` in `http.rs` when adding new logged surfaces.
 - Don't log API/upstream payload bodies by default. `api_log_body_mode` and `upstream_request_log_body_mode` default to `metadata`; `redacted_payload` remains an explicit opt-in and must use the shared secret + image-URI redactors.
-- Don't forward client credentials to upstreams. Raw proxy/header forwarding uses a narrow allowlist; inbound `authorization`, `x-api-key`, `api-key`, cookies, proxy credentials, and dashboard/session headers stay at the gateway.
+- Don't forward client credentials to translated upstreams. Header forwarding uses a narrow allowlist; inbound authorization, API keys, cookies, proxy credentials, and dashboard/session headers stay at the gateway. The explicit exception is `anthropic_passthrough`: selected native Messages/count-token requests forward subscription bearer authorization only to the validated `https://api.anthropic.com` origin, without redirects, retries, or key fallback. Native traffic uses metadata-only diagnostics and bypasses capture gates that could buffer or replace its response.
 - Don't introduce blocking IO on the tokio runtime. Upstream request log uses `spawn_blocking` for a reason.
 - Don't silence cancellation. Every long-running task in `run_turn` selects on `tx.closed()` so client hang-up cancels upstream work — preserve that pattern.
 - Don't lower the hard ceilings listed above.

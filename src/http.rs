@@ -5,6 +5,7 @@ use crate::adapters::chat_completions::ChatCompletionStreamConverter;
 use crate::adapters::responses_to_anthropic::AnthropicStreamCollector;
 use crate::adapters::responses_to_anthropic::AnthropicStreamConverter;
 use crate::adapters::responses_to_chat;
+use crate::anthropic_proxy::AnthropicProxy;
 use crate::config::UpstreamWireApi;
 use crate::dashboard_api::dashboard_catalog;
 use crate::dashboard_api::dashboard_durability;
@@ -106,6 +107,25 @@ pub struct RouterOptions {
 }
 
 pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
+    let proxy = gateway
+        .config()
+        .anthropic_passthrough
+        .clone()
+        .map(|config| Arc::new(AnthropicProxy::new(config, gateway.config())));
+    build_router_with_proxy(gateway, options, proxy)
+}
+
+#[derive(Clone)]
+struct ApiMiddlewareState {
+    gateway: Arc<Gateway>,
+    proxy: Option<Arc<AnthropicProxy>>,
+}
+
+pub(crate) fn build_router_with_proxy(
+    gateway: Arc<Gateway>,
+    options: RouterOptions,
+    proxy: Option<Arc<AnthropicProxy>>,
+) -> Router {
     // Read before `gateway` is moved into `.with_state(...)` below. Replaces
     // axum's stock 2 MiB `DefaultBodyLimit` with the configured cap (default
     // 10 MiB) so oversized inbound bodies are the operator's choice, not a
@@ -146,10 +166,12 @@ pub fn build_router(gateway: Arc<Gateway>, options: RouterOptions) -> Router {
         // on that same ceiling instead of axum's stock 2 MiB default. Both read
         // the single configured value (`max_request_body_bytes`, which the
         // middleware re-reads from the same gateway config) — there is no second,
-        // larger hidden limit. The middleware state stays `Arc<Gateway>` because
-        // `log_api_call` also opens the dashboard flow record from it.
+        // larger hidden limit. Native passthrough branches only after this cap.
         .layer(middleware::from_fn_with_state(
-            Arc::clone(&gateway),
+            ApiMiddlewareState {
+                gateway: Arc::clone(&gateway),
+                proxy,
+            },
             log_api_call,
         ))
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
@@ -476,10 +498,11 @@ fn is_length_limit_error(err: &axum::Error) -> bool {
 }
 
 async fn log_api_call(
-    State(gateway): State<Arc<Gateway>>,
+    State(state): State<ApiMiddlewareState>,
     request: Request,
     next: Next,
 ) -> Response {
+    let gateway = state.gateway;
     let api_call_id = format!("api_{}", Uuid::new_v4().simple());
     let method = request.method().clone();
     let uri = request.uri().clone();
@@ -555,6 +578,27 @@ async fn log_api_call(
             );
         }
     };
+
+    // Native responses bypass adapters and capture gates, which may buffer or
+    // replace responses. OAuth traffic gets metadata-only diagnostics even when
+    // payload logging or durable capture is enabled for translated traffic.
+    if let Some(proxy) = state.proxy
+        && let Some(rule) = proxy.matching_rule(&method, &uri, &headers, &body_bytes)
+    {
+        let response = match proxy.forward(&uri, &headers, body_bytes).await {
+            Ok(response) => response,
+            Err(error) => surface_error_response(uri.path(), error),
+        };
+        tracing::info!(
+            api_call_id = %api_call_id,
+            path = %uri.path(),
+            rule_index = rule,
+            status = response.status().as_u16(),
+            headers_elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "Anthropic passthrough response prepared"
+        );
+        return response;
+    }
 
     // D7a R3 #1: for a dashboard auth endpoint (login/logout) NO body-derived
     // field may be logged — a `body_sha256` + `body_bytes` length on the login

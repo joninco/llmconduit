@@ -1,5 +1,13 @@
 # Observability
 
+Native requests selected by `anthropic_passthrough` have metadata-only logs in
+`src/http.rs`: generated API call ID, endpoint, rule index, status, and time to
+headers. They bypass payload logging, turn capture, dashboard flow records, and
+capture-required response gates so native responses can stream unchanged.
+Subscription headers and native bodies are never captured. The capture and
+accounting facilities below apply to translated traffic; see
+[native Anthropic routing](anthropic-subscription-proxy.md) for its limits.
+
 | Component | File | Entry Point | Description |
 |-|-|-|-|
 

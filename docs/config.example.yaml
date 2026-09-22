@@ -133,6 +133,20 @@ model_routes:
     upstream_model: "sonnet-4-custom"                     # optional model remap
 
 # ---------------------------------------------------------------------------
+# NATIVE ANTHROPIC SUBSCRIPTION ROUTING (opt-in)
+# ---------------------------------------------------------------------------
+# Select before adapters/profiles. Requests retain their original bytes and OAuth
+# bearer token; only this exact HTTPS origin is allowed. Missing block = disabled.
+# See anthropic-subscription-proxy.md and anthropic-subscription.example.yaml.
+# anthropic_passthrough:
+#   upstream_origin: "https://api.anthropic.com"
+#   rules:
+#     - model: "claude-fable-*"
+#       # Optional AND condition; omit to include compaction/count-token requests:
+#       # headers:
+#       #   x-claude-code-request-class: "main"
+#
+# ---------------------------------------------------------------------------
 # FALLBACK UPSTREAMS (non-routing mode)
 # ---------------------------------------------------------------------------
 # When `upstreams:` is empty, these are tried in order if the primary

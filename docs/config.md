@@ -4,22 +4,22 @@
 
 Config is loaded from `~/.config/llmconduit/config.yaml` (or TOML via `.toml` extension) and
 overlaid with `LLMCONDUIT_*` environment variables. The post-env struct is `PersistedConfig`
-(line 1792); `Config::from_persisted` (line 2207) validates/resolves it into the runtime
+(line 1794); `Config::from_persisted` (line 2212) validates/resolves it into the runtime
 `Config` (line 1010).
 
 ## Struct Hierarchy
 
 ```
-PersistedConfig (1792)
- +-- upstreams: Vec<PersistedUpstream> (1746)
- |    +-- upstream_api_key | upstream_api_key_env   (mutually exclusive, line 3107)
+PersistedConfig (1794)
+ +-- upstreams: Vec<PersistedUpstream> (1748)
+ |    +-- upstream_api_key | upstream_api_key_env   (mutually exclusive, line 3118)
  |    +-- upstream_retry / upstream_circuit_breaker / upstream_bulkhead  (per-provider overlays)
- |    +-- fallback_upstreams: Vec<PersistedFallbackUpstream> (1700, same overlays)
+ |    +-- fallback_upstreams: Vec<PersistedFallbackUpstream> (1702, same overlays)
  +-- fallback_upstreams: Vec<PersistedFallbackUpstream>
  +-- upstream_retry: UpstreamRetryConfig (648)               [global policy]
  +-- upstream_circuit_breaker: Option<UpstreamCircuitBreakerConfig> (759)
  +-- upstream_bulkhead: UpstreamBulkheadConfig (843)
- +-- model_profile_templates: BTreeMap<String, PersistedModelProfile> (1527)
+ +-- model_profile_templates: BTreeMap<String, PersistedModelProfile> (1529)
  |    +-- roles: Option<RolesConfig> (431)
  |    |    +-- rules: BTreeMap<String, RoleRuleSet> (398)
  |    |    |    +-- RoleRule { when, action, target_role, tag, tag_attributes } (384)
@@ -34,18 +34,21 @@ PersistedConfig (1792)
  +-- responses_capabilities: ResponsesCapabilitiesConfig (responses_capabilities.rs:110)
  +-- response_store: ResponseStoreConfig (600)
  +-- replay: Option<ReplayConfig> (626)
- +-- model_routes: OrderedModelRoutes (1442, declaration-order map)
- |    +-- PersistedModelRoute { upstream_base_url, upstream_model } (1383)
- +-- price_table: HashMap<String, ModelPrice> (1177)
+ +-- model_routes: OrderedModelRoutes (1444, declaration-order map)
+ |    +-- PersistedModelRoute { upstream_base_url, upstream_model } (1385)
+ +-- anthropic_passthrough: Option<PersistedAnthropicPassthrough> (anthropic_proxy.rs)
+ |    +-- upstream_origin: String (only https://api.anthropic.com)
+ |    +-- rules: Vec<PersistedPassthroughRule> { model: Option<String>, headers: BTreeMap<String, String> }
+ +-- price_table: HashMap<String, ModelPrice> (1179)
       +-- input_per_1k, output_per_1k, cached_per_1k, cached_price_configured
 ```
 
 ---
 
-## PersistedConfig (line 1792)
+## PersistedConfig (line 1794)
 
 ```rust
-struct PersistedConfig {  // line 1792
+struct PersistedConfig {  // line 1794
     bind_addr: String,                                     // default "127.0.0.1:4000"
     upstream_base_url: String,                             // default "http://127.0.0.1:8000/v1"
     upstream_api_key: Option<String>,
@@ -66,6 +69,7 @@ struct PersistedConfig {  // line 1792
     model_profiles: BTreeMap<String, PersistedModelProfile>,
     responses_capabilities: ResponsesCapabilitiesConfig,
     model_routes: OrderedModelRoutes,                      // G7: ad-hoc routes in decl order
+    anthropic_passthrough: Option<PersistedAnthropicPassthrough>, // default None; see anthropic-subscription-proxy.md
     template_family: Option<String>,                       // global: "kimi" | "deepseek"
     brave_base_url: String,                                // default "https://api.search.brave.com/res/v1"
     brave_api_key: Option<String>,
@@ -93,10 +97,10 @@ struct PersistedConfig {  // line 1792
 
 ---
 
-## PersistedUpstream (line 1746)
+## PersistedUpstream (line 1748)
 
 ```rust
-struct PersistedUpstream {  // line 1746
+struct PersistedUpstream {  // line 1748
     name: Option<String>,
     upstream_base_url: String,
     upstream_api_key: Option<String>,
@@ -113,9 +117,9 @@ struct PersistedUpstream {  // line 1746
 }
 ```
 
-Auto-named `upstream-N` (1-based) when `name` is omitted (parse_upstream, line 3041).
+Auto-named `upstream-N` (1-based) when `name` is omitted (parse_upstream, line 3052).
 
-## Env-backed upstream credentials (resolve_upstream_api_key, line 3107)
+## Env-backed upstream credentials (resolve_upstream_api_key, line 3118)
 
 `upstream_api_key_env` names an environment variable resolved at startup. Rules:
 
@@ -128,17 +132,17 @@ Auto-named `upstream-N` (1-based) when `name` is omitted (parse_upstream, line 3
 
 ---
 
-## PersistedFallbackUpstream (line 1700)
+## PersistedFallbackUpstream (line 1702)
 
 ```rust
-struct PersistedFallbackUpstream {  // line 1700
+struct PersistedFallbackUpstream {  // line 1702
     name: Option<String>,
     upstream_base_url: String,
     upstream_api_key: Option<String>,
     upstream_api_key_env: Option<String>,      // mutually exclusive with upstream_api_key
     upstream_model: Option<String>,
     exposed_model: Option<String>,             // model id advertised to the client
-    wire_api: UpstreamWireApi,                 // must match its primary (line 3018)
+    wire_api: UpstreamWireApi,                 // must match its primary (line 3029)
     upstream_chat_kwargs: JsonMap<String, JsonValue>,
     upstream_request_log_path: Option<String>,
     responses_capabilities: Option<ResponsesCapabilitiesConfig>,
@@ -149,8 +153,8 @@ struct PersistedFallbackUpstream {  // line 1700
 ```
 
 Auto-named `fallback-N` (1-based). A nested fallback's `wire_api` must match its primary
-(line 3021); a top-level (non-routing) `fallback_upstreams` entry must be `chat_completions`
-(line 2241).
+(line 3032); a top-level (non-routing) `fallback_upstreams` entry must be `chat_completions`
+(line 2246).
 
 ---
 
@@ -219,12 +223,12 @@ explicit YAML `null` clears a global limit for this provider.
 
 ---
 
-## PersistedModelProfile (line 1527)
+## PersistedModelProfile (line 1529)
 
 Per-model overrides. Supports template inheritance via `extends`. Keyed by resolved model id.
 
 ```rust
-struct PersistedModelProfile {  // line 1527
+struct PersistedModelProfile {  // line 1529
     extends: Vec<String>,                                    // template name(s) to inherit from
     upstream_model: Option<String>,                          // remap to a different upstream model id
     system_prompt_prefix: Option<String>,
@@ -240,7 +244,7 @@ struct PersistedModelProfile {  // line 1527
 }
 ```
 
-The custom Deserialize (line 1572) also accepts unknown keys as `upstream_chat_kwargs`
+The custom Deserialize (line 1574) also accepts unknown keys as `upstream_chat_kwargs`
 shorthand (a flattened catch-all), then removes the recognized typed fields from that bucket
 so `template_family`, `roles`, `reasoning_effort*`, and `capabilities` are never double-counted
 as kwargs.
@@ -408,7 +412,7 @@ enum UpstreamWireApi {  // line 589, default: ChatCompletions
 `codex_responses` is the deliberately narrow Codex Responses-Lite sidecar contract, not a claim
 that arbitrary public Responses providers share its private headers/event dialect. A failover
 chain must use one protocol throughout: nested fallback `wire_api` must equal its primary's
-(line 3021), and top-level (non-routing) fallbacks must be `chat_completions` (line 2241).
+(line 3032), and top-level (non-routing) fallbacks must be `chat_completions` (line 2246).
 
 ## Responses state and private replay
 
@@ -436,7 +440,7 @@ Private replay defaults off and is not controlled by `store`. When replay is ena
 non-standard `llmconduit_replay:false` request extension bypasses lookup and insertion for that
 request and is consumed before upstream dispatch. `max_replay_entries` remains a deprecated size
 alias for older configurations; prefer `replay.max_entries` (when `replay` is absent, the alias
-still seeds the effective config, line 2288).
+still seeds the effective config, line 2298).
 
 ## API logging modes
 
@@ -480,13 +484,13 @@ Map keys and values are trimmed; empty entries are dropped (Deserialize, line 91
 
 ---
 
-## ModelPrice (line 1177)
+## ModelPrice (line 1179)
 
 Per-model billing rates, keyed by served model id. Drives dashboard flow cost rollup. Field
 names mirror the frozen frontend `ModelPrice` contract byte-for-byte.
 
 ```rust
-struct ModelPrice {  // line 1177
+struct ModelPrice {  // line 1179
     input_per_1k: f64,               // USD per 1k prompt tokens
     output_per_1k: f64,              // USD per 1k completion tokens
     cached_per_1k: f64,             // USD per 1k cached prompt tokens (default 0.0)
@@ -496,40 +500,40 @@ struct ModelPrice {  // line 1177
 
 `cached_price_configured` is the gap-07 presence seam: a `0.0` cached rate is ambiguous between
 "provider charges 0 for cache reads" and "entry omitted the rate". The custom Deserialize
-(line 1255) prefers an explicit flag, else derives presence from whether a `cached_per_1k` key
+(line 1257) prefers an explicit flag, else derives presence from whether a `cached_per_1k` key
 was present. Entries with a negative or non-finite rate are dropped with a warning
-(`retain_finite_prices`, line 1292; both YAML and the env JSON override feed through it).
+(`retain_finite_prices`, line 1294; both YAML and the env JSON override feed through it).
 
 ---
 
 ## Model routes (G7)
 
-`model_routes` is an `OrderedModelRoutes` (line 1442): a `Vec` of `(name, route)` pairs that
+`model_routes` is an `OrderedModelRoutes` (line 1444): a `Vec` of `(name, route)` pairs that
 (de)serializes as a YAML map while preserving declaration order, so overlapping globs are
-first-match-wins. Duplicate keys collapse to last-wins in place (`upsert`, line 1459). CLI
-`--model-route NAME=URL[,UPSTREAM_MODEL]` specs (parser at line 2784) merge in after env
+first-match-wins. Duplicate keys collapse to last-wins in place (`upsert`, line 1461). CLI
+`--model-route NAME=URL[,UPSTREAM_MODEL]` specs (parser at line 2795) merge in after env
 overrides, replacing a same-named file route in place.
 
 ```rust
-struct PersistedModelRoute {  // line 1383
+struct PersistedModelRoute {  // line 1385
     upstream_base_url: Option<String>,   // or bare string / `url` alias
     upstream_model: Option<String>,      // or `model` alias
 }
 ```
 
 Glob names (`*`, `?`, `[...]`) compile to anchored case-insensitive regexes (`glob_to_regex`,
-line 2705); an uncompilable pattern is a clean startup error. A route slots between an exact
+line 2716); an uncompilable pattern is a clean startup error. A route slots between an exact
 catalog id and the canonical-key/default fallbacks — an exact upstream id always beats a route.
 
 ---
 
 ## Resolved (Runtime) Structs
 
-The following are constructed by `Config::from_persisted` (line 2207) and are not serialized
+The following are constructed by `Config::from_persisted` (line 2212) and are not serialized
 directly.
 
 All configured service URLs are validated before these structs are built (`parse_service_url`,
-line 3150). Top-level, routing, fallback, model-route, Brave, and Vision URLs reject
+line 3161). Top-level, routing, fallback, model-route, Brave, and Vision URLs reject
 userinfo/passwords, query strings, and fragments; credentials belong in the dedicated key fields
 or environment variables and cannot be embedded in a projected URL.
 
@@ -556,6 +560,7 @@ struct Config {  // line 1010
     model_profiles: BTreeMap<String, ModelProfile>,
     responses_capabilities: ResponsesCapabilitiesConfig,
     model_routes: Vec<ModelRoute>,
+    anthropic_passthrough: Option<AnthropicPassthrough>,
     template_family: Option<String>,
     brave_base_url: Url,
     brave_api_key: Option<String>,
@@ -581,19 +586,19 @@ struct Config {  // line 1010
 }
 ```
 
-`has_backend_credentials` (line 1113): true when any primary, fallback, nested fallback, or
+`has_backend_credentials` (line 1115): true when any primary, fallback, nested fallback, or
 Brave config carries a credential; turn capture uses it to decide retention of raw peer output.
 
-### ModelProfile (line 1640)
+### ModelProfile (line 1642)
 
 Resolved profile after template inheritance. Same fields as `PersistedModelProfile` minus
-`extends`; `template_family` is normalized to `kimi`/`deepseek` (line 3168) and
-`system_prompt_prefix` is the template-chain prefixes joined with `"\n\n"` (line 2984).
+`extends`; `template_family` is normalized to `kimi`/`deepseek` (line 3179) and
+`system_prompt_prefix` is the template-chain prefixes joined with `"\n\n"` (line 2995).
 
-### ModelRoute (line 1338)
+### ModelRoute (line 1340)
 
 ```rust
-struct ModelRoute {  // line 1338
+struct ModelRoute {  // line 1340
     name: String,
     glob: Option<Regex>,   // compiled glob matcher, None for exact-match routes
     upstream_base_url: Url,
@@ -601,18 +606,18 @@ struct ModelRoute {  // line 1338
 }
 ```
 
-`route_matches` (line 1367) is the shared boolean match primitive (exact case-insensitive, or glob).
+`route_matches` (line 1369) is the shared boolean match primitive (exact case-insensitive, or glob).
 
-### UpstreamConfig (line 1306) / FallbackUpstreamConfig (line 1669)
+### UpstreamConfig (line 1308) / FallbackUpstreamConfig (line 1671)
 
 Resolved providers with parsed URL and `name: String` (auto-generated when omitted). Each carries
 a fully-resolved `resilience: UpstreamResilienceConfig` (global policy + that provider's
 overrides); the fallback adds `exposed_model: Option<String>`.
 
-### ReasoningEffortPolicy (line 1659)
+### ReasoningEffortPolicy (line 1661)
 
 ```rust
-struct ReasoningEffortPolicy {  // line 1659
+struct ReasoningEffortPolicy {  // line 1661
     map: BTreeMap<String, JsonValue>,
     default: Option<String>,
     upstream_reasoning: Option<ReasoningConfig>,  // present when built from the typed syntax
@@ -632,13 +637,13 @@ struct ReasoningEffortPolicy {  // line 1659
 - `merge_adjacent` only permits content-only roles: `system`, `developer`, `user`. Merging
   `assistant` or `tool` is rejected because it would discard `tool_calls`/`tool_call_id`.
 
-### Model Profile Validation (resolve_model_profiles, line 2813)
+### Model Profile Validation (resolve_model_profiles, line 2824)
 
 - `reasoning_effort` (typed shorthand) cannot be combined with `reasoning_effort_map` or
   `reasoning_effort_default`.
-- Cycles in `extends` are detected and rejected with a cycle trace error (line 2855).
+- Cycles in `extends` are detected and rejected with a cycle trace error (line 2866).
 - Unknown template references are rejected at startup (case-insensitive template lookup at
-  line 2860).
+  line 2871).
 
 ### Resilience Validation
 
@@ -649,24 +654,24 @@ struct ReasoningEffortPolicy {  // line 1659
 - Bulkhead (line 874): `max_in_flight` 1..=100000; `max_queue` requires `max_in_flight`; when
   queueing, `queue_timeout_ms` 1..=60000 and `max_queue <= 100000`.
 
-### Credentials (resolve_upstream_api_key, line 3107)
+### Credentials (resolve_upstream_api_key, line 3118)
 
 - `upstream_api_key` and `upstream_api_key_env` cannot both be set.
 - `_env` must name a valid identifier and resolve to a present, non-empty variable.
 
-### Price Table (retain_finite_prices, line 1292)
+### Price Table (retain_finite_prices, line 1294)
 
 - Any `ModelPrice` entry with a negative or non-finite rate is dropped with a warning (both YAML
   and env overrides).
 
-### SSE / Body Size Floors (in `from_persisted`, lines 2353–2365)
+### SSE / Body Size Floors (in `from_persisted`, lines 2364–2376)
 
 - `min_completion_tokens` is floored at 1.
 - `max_sse_frame_bytes` is floored at 1024 (1 KiB).
 - `max_request_body_bytes` is floored at 1024 (1 KiB).
 - `image_cache_max_size` is floored at 1.
 
-### Response store and replay (lines 2260–2294)
+### Response store and replay (lines 2270–2304)
 
 - `response_store.max_entries` and `response_store.retention_hours` must each be at least 1.
 - `response_store.backend: sqlite` requires a non-empty `path`.
@@ -677,45 +682,48 @@ struct ReasoningEffortPolicy {  // line 1659
 
 ## Resolution Logic
 
-### Config::from_persisted (line 2207)
+### Config::from_persisted (line 2212)
 
 1. Parse strings into typed values (`SocketAddr`, `Url`, `PathBuf`, `Duration`).
 2. Migrate the legacy cooldown into the circuit breaker when no explicit block is configured.
-3. Build the global resilience policy and validate it (line 2224).
+3. Build the global resilience policy and validate it (line 2229).
 4. Parse fallback upstreams (rejecting non-`chat_completions` top-level fallbacks) and routing
    upstreams (rejecting nested wire-protocol mismatch), each with its overlaid resilience.
-5. Resolve model profiles via `resolve_model_profiles` (line 2813) — recursive `extends` merge
+5. Resolve model profiles via `resolve_model_profiles` (line 2824) — recursive `extends` merge
    with cycle detection.
-6. Resolve model routes via `resolve_model_routes` (line 2753) — compile globs, reject blank
+6. Resolve model routes via `resolve_model_routes` (line 2764) — compile globs, reject blank
    keys / missing or invalid URLs.
+   Resolve optional `anthropic_passthrough` with `AnthropicPassthrough::resolve`: validate the
+   fixed HTTPS Anthropic origin, compile model globs, and validate header conditions. See
+   [native subscription routing](anthropic-subscription-proxy.md) for precedence and limits.
 7. Validate response store / replay bounds.
 8. Floor safety-critical values (completion tokens, frame/body byte caps, image-cache size).
 9. Filter non-finite price entries.
 
-### Template Inheritance (resolve_persisted_model_profile, line 2844)
+### Template Inheritance (resolve_persisted_model_profile, line 2855)
 
 - `extends` is a list of template names resolved from `model_profile_templates`.
 - Templates are resolved recursively (DFS) with cycle detection; lookup is exact then
   ASCII-case-insensitive.
-- Field merging (merge_resolved_model_profile, line 2878 / merge_persisted_model_profile, line 2928):
+- Field merging (merge_resolved_model_profile, line 2889 / merge_persisted_model_profile, line 2939):
   - `upstream_model`, `template_family`, `native_vision`, `roles`, `capabilities` — set-if-some
     (child wins).
   - `responses_capabilities` — field-by-field overlay (child's declared keys win).
-  - `system_prompt_prefix` — appended to a vector, joined by `"\n\n"` (line 2984).
-  - `upstream_chat_kwargs` — deep-merged (`merge_json_maps`, line 3473).
+  - `system_prompt_prefix` — appended to a vector, joined by `"\n\n"` (line 2995).
+  - `upstream_chat_kwargs` — deep-merged (`merge_json_maps`, line 3484).
   - `reasoning_effort_map` — per-level insert (child level overrides parent level);
     `reasoning_effort_default` set-if-some.
   - `reasoning_effort` (typed) replaces the fragment-based map/default entirely, and a child
-    fragment map clears an inherited typed config (line 2904).
+    fragment map clears an inherited typed config (line 2915).
 
-### Profile Lookup (model_profile, line 2651)
+### Profile Lookup (model_profile, line 2662)
 
 1. Exact key match in `model_profiles` BTreeMap.
 2. ASCII-case-insensitive fallback (first matching key).
-3. `model_profiles_for_resolved_model` (line 2627) collects, in order: final backend model,
+3. `model_profiles_for_resolved_model` (line 2638) collects, in order: final backend model,
    configured upstream model, then request model — deduplicated — and falls back to the `*`
    wildcard profile only when none matched. Consumers (`resolve_roles_config_for_resolved_model`
-   line 2616, `resolve_system_prompt_prefix_for_resolved_model` line 2579) scan that list in
+   line 2627, `resolve_system_prompt_prefix_for_resolved_model` line 2590) scan that list in
    reverse (request model first).
 
 ### Leaf policy accessors
@@ -739,7 +747,7 @@ routing/failover/exposed-alias remap:
 | `resolve_capabilities_for_upstream` | 2599 | id-keyed profile → alias targeting id → `*` profile |
 | `debug_log_dirs` | 2152 | deduped log dirs the running gateway actually writes (rotation) |
 
-### Env Overrides (apply_env_overrides, line 3256)
+### Env Overrides (apply_env_overrides, line 3267)
 
 Each `LLMCONDUIT_*` env var overrides the YAML value (blank/unparseable values are ignored).
 Key env vars:
@@ -777,9 +785,9 @@ security controls rather than `PersistedConfig` overrides. They must never be wr
 
 ### Config file loading
 
-`default_config_path` (line 3176) resolves `~/.config/llmconduit/config.yaml`. A missing file
-loads the default config. `.toml` paths (by extension, line 3190) parse via the `toml` crate and
-are read-only: `write_persisted_config` (line 3213) refuses to write TOML and creates/writes
+`default_config_path` (line 3187) resolves `~/.config/llmconduit/config.yaml`. A missing file
+loads the default config. `.toml` paths (by extension, line 3201) parse via the `toml` crate and
+are read-only: `write_persisted_config` (line 3224) refuses to write TOML and creates/writes
 YAML with mode 0600.
 
 ---

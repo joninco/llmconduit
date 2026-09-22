@@ -600,6 +600,7 @@ pub fn test_config() -> Config {
         responses_capabilities:
             llmconduit::responses_capabilities::ResponsesCapabilitiesConfig::default(),
         model_routes: Vec::new(),
+        anthropic_passthrough: None,
         template_family: None,
         brave_base_url: "https://example.com/".parse().expect("url"),
         brave_api_key: Some("test-key".to_string()),

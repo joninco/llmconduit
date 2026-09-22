@@ -1,0 +1,23 @@
+# Status: implemented routing configuration; live subscription/team verification
+# is described in anthropic-subscription-proxy.md. This separate loopback port
+# allows evaluation alongside a gateway on port 5022.
+bind_addr: "127.0.0.1:5023"
+request_timeout_secs: 1800
+connect_timeout_secs: 10
+
+# Claude Code supplies and refreshes its subscription OAuth bearer token.
+# The origin is validated at startup; there is no API key or fallback provider.
+anthropic_passthrough:
+  upstream_origin: "https://api.anthropic.com"
+  rules:
+    - model: "claude-fable-*"
+
+# Both vLLM servers must advertise this exact model ID from GET /v1/models.
+# These aliases use the canonical Responses engine and Chat Completions transport.
+model_routes:
+  "claude-opus-*":
+    upstream_base_url: "http://127.0.0.1:8000/v1"
+    upstream_model: "deepseek-ai/DeepSeek-V4.1-Flash"
+  "claude-haiku-*":
+    upstream_base_url: "http://127.0.0.1:8001/v1"
+    upstream_model: "deepseek-ai/DeepSeek-V4.1-Flash"

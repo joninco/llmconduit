@@ -338,6 +338,7 @@ mod tests {
                 model_profiles: std::collections::BTreeMap::new(),
                 responses_capabilities: Default::default(),
                 model_routes: Vec::new(),
+                anthropic_passthrough: None,
                 template_family: None,
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1")
                     .expect("url"),
@@ -397,6 +398,7 @@ mod tests {
                 model_profiles: std::collections::BTreeMap::new(),
                 responses_capabilities: Default::default(),
                 model_routes: Vec::new(),
+                anthropic_passthrough: None,
                 template_family: None,
                 brave_base_url: url::Url::parse("https://api.search.brave.com/res/v1/")
                     .expect("url"),
