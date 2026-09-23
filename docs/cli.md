@@ -40,7 +40,7 @@ Starts the gateway HTTP server. Handler lives inline in `src/main.rs` at lines 4
 |-|-|-|-|
 | `--config` | `Option<PathBuf>` | `~/.config/llmconduit/config.yaml` | Path to the config file. |
 | `--raw` | `bool` | `false` | Dump raw model delta text to the terminal while the gateway is running. Tracing log output is suppressed (sent to a sink) so it does not interleave with the raw stream. |
-| `--model-route` | `Vec<String>` (repeatable) | `[]` | Ad-hoc model route `NAME=URL[,UPSTREAM_MODEL]`. NAME may be a glob (e.g. `claude-opus-*`). Merged after config and env (CLI wins); a malformed spec is a clean startup error. |
+| `--model-route` | `Vec<String>` (repeatable) | `[]` | Ad-hoc model route `NAME=URL[,UPSTREAM_MODEL]`. NAME may be a glob (e.g. `local-*`). Merged after config and env (CLI wins); a malformed spec is a clean startup error. |
 
 The same start logic runs for the no-subcommand case (main.rs:72-88) with no flags set — default config path, no raw dump, no ad-hoc routes (env + file config only).
 

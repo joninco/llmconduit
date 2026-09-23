@@ -142,34 +142,27 @@ fn configuration_is_opt_in_and_validates_trust_and_selectors() {
         assert!(!error.contains("secret"));
     }
     // An omitted or empty `rules` list is valid and selects the Anthropic
-    // first-party model family, so an agent declaring an Anthropic model passes
-    // through without enumerating rules.
+    // first-party model families, so fable, opus, and haiku use the subscription
+    // and every other model string reaches the local routes.
     let mut config = persisted();
     config.anthropic_passthrough.as_mut().unwrap().rules.clear();
-    let config = Config::from_persisted(&config).expect("empty rules select the Anthropic family");
+    let config = Config::from_persisted(&config).expect("empty rules select the families");
     let passthrough = config.anthropic_passthrough.as_ref().unwrap();
     let uri: Uri = "/v1/messages".parse().unwrap();
     let headers = HeaderMap::new();
-    assert_eq!(
-        passthrough.matching_rule(
-            &Method::POST,
-            &uri,
-            &headers,
-            body(MODEL).as_bytes(),
-            &config
-        ),
-        Some(0)
-    );
-    assert_eq!(
-        passthrough.matching_rule(
-            &Method::POST,
-            &uri,
-            &headers,
-            body("deepseek-v4.1-flash").as_bytes(),
-            &config
-        ),
-        None
-    );
+    for (model, expected) in [
+        ("claude-fable-5-1", Some(0)),
+        ("claude-opus-5-5", Some(1)),
+        ("claude-haiku-4-5", Some(2)),
+        ("claude-sonnet-5", None),
+        ("deepseek-v4.1-flash", None),
+    ] {
+        assert_eq!(
+            passthrough.matching_rule(&Method::POST, &uri, &headers, body(model).as_bytes()),
+            expected,
+            "model {model}"
+        );
+    }
     // An unknown key is still rejected, so a misspelled selector cannot be
     // silently ignored.
     assert!(
@@ -193,18 +186,14 @@ fn model_and_header_rules_are_explicit_and_endpoint_scoped() {
             headers: [("x-llmconduit-route".into(), "anthropic".into())].into(),
         },
     ];
-    let config = Config::from_persisted(&config).unwrap();
-    let passthrough = config.anthropic_passthrough.as_ref().unwrap();
+    let config = Config::from_persisted(&config)
+        .unwrap()
+        .anthropic_passthrough
+        .unwrap();
     let mut headers = HeaderMap::new();
     let uri: Uri = "/v1/messages?beta=true".parse().unwrap();
     assert_eq!(
-        passthrough.matching_rule(
-            &Method::POST,
-            &uri,
-            &headers,
-            body(MODEL).as_bytes(),
-            &config
-        ),
+        config.matching_rule(&Method::POST, &uri, &headers, body(MODEL).as_bytes()),
         None
     );
     headers.insert(
@@ -212,62 +201,46 @@ fn model_and_header_rules_are_explicit_and_endpoint_scoped() {
         HeaderValue::from_static("main"),
     );
     assert_eq!(
-        passthrough.matching_rule(
-            &Method::POST,
-            &uri,
-            &headers,
-            body(MODEL).as_bytes(),
-            &config
-        ),
+        config.matching_rule(&Method::POST, &uri, &headers, body(MODEL).as_bytes()),
         Some(0)
     );
     assert_eq!(
-        passthrough.matching_rule(
+        config.matching_rule(
             &Method::POST,
             &uri,
             &headers,
-            body("claude-opus-4").as_bytes(),
-            &config
+            body("claude-opus-4").as_bytes()
         ),
         None
     );
     assert_eq!(
-        passthrough.matching_rule(
-            &Method::GET,
-            &uri,
-            &headers,
-            body(MODEL).as_bytes(),
-            &config
-        ),
+        config.matching_rule(&Method::GET, &uri, &headers, body(MODEL).as_bytes()),
         None
     );
     assert_eq!(
-        passthrough.matching_rule(
+        config.matching_rule(
             &Method::POST,
             &"/v1/chat/completions".parse().unwrap(),
             &headers,
-            body(MODEL).as_bytes(),
-            &config
+            body(MODEL).as_bytes()
         ),
         None
     );
     assert_eq!(
-        passthrough.matching_rule(
+        config.matching_rule(
             &Method::POST,
             &"/v1/messages/count_tokens".parse().unwrap(),
             &headers,
-            body(MODEL).as_bytes(),
-            &config
+            body(MODEL).as_bytes()
         ),
         Some(0)
     );
     assert_eq!(
-        passthrough.matching_rule(
+        config.matching_rule(
             &Method::POST,
             &uri,
             &headers,
-            br#"{"model":"claude-fable-5-1","model":"claude-opus-4"}"#,
-            &config
+            br#"{"model":"claude-fable-5-1","model":"claude-opus-4"}"#
         ),
         None
     );
@@ -276,33 +249,26 @@ fn model_and_header_rules_are_explicit_and_endpoint_scoped() {
         HeaderValue::from_static("main"),
     );
     assert_eq!(
-        passthrough.matching_rule(
-            &Method::POST,
-            &uri,
-            &headers,
-            body(MODEL).as_bytes(),
-            &config
-        ),
+        config.matching_rule(&Method::POST, &uri, &headers, body(MODEL).as_bytes()),
         None
     );
     headers.insert("x-llmconduit-route", HeaderValue::from_static("anthropic"));
     assert_eq!(
-        passthrough.matching_rule(
+        config.matching_rule(
             &Method::POST,
             &uri,
             &headers,
-            b"native validation belongs upstream",
-            &config
+            b"native validation belongs upstream"
         ),
         Some(1)
     );
 }
 
 #[test]
-fn locally_claimed_models_are_not_passed_through() {
-    // An agent declaring a locally routed model reaches the local backend even
-    // though the same model matches the Anthropic family selector, while an
-    // unclaimed Anthropic model still passes through.
+fn local_routes_do_not_suppress_anthropic_families() {
+    // A fable, opus, or haiku model uses the subscription even when an ad-hoc
+    // route names the same model, so the family set decides rather than the route
+    // table. Every other model string reaches the local routes.
     let mut config = persisted();
     config.anthropic_passthrough.as_mut().unwrap().rules.clear();
     config.model_routes.upsert(
@@ -316,94 +282,37 @@ fn locally_claimed_models_are_not_passed_through() {
     let passthrough = config.anthropic_passthrough.as_ref().unwrap();
     let uri: Uri = "/v1/messages".parse().unwrap();
     let headers = HeaderMap::new();
-    assert!(config.claims_model_locally("claude-opus-4-8"));
-    assert!(config.has_local_model_claims());
+    assert!(config.matches_model_route("claude-opus-5-5"));
     assert_eq!(
         passthrough.matching_rule(
             &Method::POST,
             &uri,
             &headers,
-            body("claude-opus-4-8").as_bytes(),
-            &config
+            body("claude-opus-5-5").as_bytes()
         ),
-        None
+        Some(1)
     );
     assert_eq!(
         passthrough.matching_rule(
             &Method::POST,
             &uri,
             &headers,
-            body(MODEL).as_bytes(),
-            &config
-        ),
-        Some(0)
-    );
-    assert_eq!(
-        passthrough.matching_rule(
-            &Method::POST,
-            &uri,
-            &headers,
-            body("deepseek-v4.1-flash").as_bytes(),
-            &config
+            body("deepseek-v4.1-flash").as_bytes()
         ),
         None
     );
 }
 
 #[test]
-fn explicit_upstream_models_are_claimed_locally() {
-    // A model an explicit upstream declares is served locally, so it is not
-    // forwarded to the subscription even though it names an Anthropic model.
-    let config: PersistedConfig = serde_yaml::from_str(
-        r#"
-upstream_base_url: http://127.0.0.1:1/v1
-anthropic_passthrough:
-  upstream_origin: https://api.anthropic.com
-upstreams:
-  - upstream_base_url: http://127.0.0.1:8000/v1
-    upstream_model: claude-opus-4-8
-"#,
-    )
-    .unwrap();
-    let config = Config::from_persisted(&config).unwrap();
-    let passthrough = config.anthropic_passthrough.as_ref().unwrap();
-    let uri: Uri = "/v1/messages".parse().unwrap();
-    let headers = HeaderMap::new();
-    assert!(config.claims_model_locally("claude-opus-4-8"));
-    assert_eq!(
-        passthrough.matching_rule(
-            &Method::POST,
-            &uri,
-            &headers,
-            body("claude-opus-4-8").as_bytes(),
-            &config
-        ),
-        None
-    );
-    assert_eq!(
-        passthrough.matching_rule(
-            &Method::POST,
-            &uri,
-            &headers,
-            body(MODEL).as_bytes(),
-            &config
-        ),
-        Some(0)
-    );
-}
-
-#[test]
-fn no_local_claims_means_no_body_parse_is_required() {
-    // Without local claims only a model-keyed rule forces the discriminator to be
-    // parsed, so a passthrough config that keys on headers alone never inspects
-    // an opaque body.
+fn header_only_rules_never_parse_the_model() {
+    // A rule that keys on headers alone still selects an opaque body, so the
+    // request model is parsed only when a rule keys on it.
     let mut config = persisted();
     config.anthropic_passthrough.as_mut().unwrap().rules = vec![PersistedPassthroughRule {
         model: None,
         headers: [("x-llmconduit-route".into(), "anthropic".into())].into(),
     }];
     let config = Config::from_persisted(&config).unwrap();
-    assert!(!config.has_local_model_claims());
     let passthrough = config.anthropic_passthrough.as_ref().unwrap();
     let uri: Uri = "/v1/messages".parse().unwrap();
     let mut headers = HeaderMap::new();
@@ -413,15 +322,14 @@ fn no_local_claims_means_no_body_parse_is_required() {
             &Method::POST,
             &uri,
             &headers,
-            b"native validation belongs upstream",
-            &config
+            b"native validation belongs upstream"
         ),
         Some(0)
     );
 }
 
 #[tokio::test]
-async fn agent_model_selects_local_backend_or_subscription() {
+async fn model_family_selects_subscription_or_local_route() {
     let anthropic = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -432,12 +340,13 @@ async fn agent_model_selects_local_backend_or_subscription() {
         .mount(&anthropic)
         .await;
     let local = local_model_server().await;
-    // No rules: the Anthropic first-party family is the selector. The local
-    // route claims the opus alias, so only the unclaimed model passes through.
+    // No rules: fable, opus, and haiku use the subscription. The local route
+    // claims a non-Anthropic alias, which is what an agent declares to reach a
+    // local backend.
     let mut config = persisted();
     config.anthropic_passthrough.as_mut().unwrap().rules.clear();
     config.model_routes.upsert(
-        "claude-opus-*".into(),
+        "deepseek-*".into(),
         PersistedModelRoute {
             upstream_base_url: Some(format!("{}/v1", local.uri())),
             upstream_model: Some("deepseek-ai/DeepSeek-V4.1-Flash".into()),
@@ -445,8 +354,8 @@ async fn agent_model_selects_local_backend_or_subscription() {
     );
     let router = app(config, &anthropic.uri());
     for (model, expected) in [
-        ("claude-opus-4-8", "local reply"),
         ("claude-fable-5-1", "native reply"),
+        ("deepseek-v4.1-flash", "local reply"),
     ] {
         let response = router
             .clone()
@@ -712,7 +621,7 @@ async fn local_aliases_keep_translation_and_never_receive_inbound_credentials() 
     let opus = local_model_server().await;
     let haiku = local_model_server().await;
     let mut config = persisted();
-    for (alias, server) in [("claude-opus-*", &opus), ("claude-haiku-*", &haiku)] {
+    for (alias, server) in [("local-opus", &opus), ("local-haiku", &haiku)] {
         config.model_routes.upsert(
             alias.into(),
             PersistedModelRoute {
@@ -722,7 +631,7 @@ async fn local_aliases_keep_translation_and_never_receive_inbound_credentials() 
         );
     }
     let router = app(config, &anthropic.uri());
-    for (model, server) in [("claude-opus-4-8", &opus), ("claude-haiku-4-5", &haiku)] {
+    for (model, server) in [("local-opus", &opus), ("local-haiku", &haiku)] {
         let mut req = request("/v1/messages", body(model));
         req.headers_mut()
             .insert("x-api-key", HeaderValue::from_static("gateway-test-secret"));

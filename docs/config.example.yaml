@@ -127,19 +127,20 @@ upstreams:
 # `upstream_base_url`/`url` and optional `upstream_model`/`model`.
 #
 model_routes:
-  claude-opus-*: "http://localhost:8000/v1"               # bare URL form
-  claude-sonnet-4:
+  local-coder: "http://localhost:8000/v1"                  # bare URL form
+  local-fast:
     upstream_base_url: "http://10.0.0.1:8000/v1"
-    upstream_model: "sonnet-4-custom"                     # optional model remap
+    upstream_model: "deepseek-ai/DeepSeek-V4.1-Flash"     # optional model remap
 
 # ---------------------------------------------------------------------------
 # NATIVE ANTHROPIC SUBSCRIPTION ROUTING (opt-in)
 # ---------------------------------------------------------------------------
 # Select before adapters/profiles. Requests retain their original bytes and OAuth
 # bearer token; only this exact HTTPS origin is allowed. Missing block = disabled.
-# Omitting `rules` selects the Anthropic first-party model family (`claude-*`), so a
-# subagent's `model:` frontmatter picks the destination and a model the
-# `model_routes` above claim is never passed through.
+# Omitting `rules` selects the Anthropic first-party model families
+# (`claude-fable-*`, `claude-opus-*`, `claude-haiku-*`), so those models use the
+# subscription and every other model string reaches the `model_routes` above. A
+# `model_routes` entry naming a `claude-opus-*` model does not divert it.
 # See anthropic-subscription-proxy.md and anthropic-subscription.example.yaml.
 # anthropic_passthrough:
 #   upstream_origin: "https://api.anthropic.com"

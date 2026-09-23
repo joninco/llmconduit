@@ -50,9 +50,9 @@ The `/v1/responses`, `/v1/messages`, and `/v1/chat/completions` POST handlers us
 `Gateway`; `/v1/completions` is a raw passthrough proxy. These translated/provider paths use a
 header allowlist that excludes inbound credentials. `anthropic_passthrough` intercepts native Messages
 and count-token requests in middleware and forwards subscription bearer authorization only to the validated
-Anthropic origin. Its default selector is the Anthropic first-party model family (`claude-*`), and a model
-an ad-hoc `model_routes` entry or an `upstreams` provider claims is never passed through. That transport
-preserves response bytes and bypasses capture gates.
+Anthropic origin. Its default selector is the Anthropic first-party model families (`claude-fable-*`,
+`claude-opus-*`, `claude-haiku-*`), so every other model string reaches the local routes. That
+transport preserves response bytes and bypasses capture gates.
 See [native Anthropic routing](anthropic-subscription-proxy.md).
 
 GET `/metrics` is a raw Prometheus scrape proxied from the first configured primary backend —

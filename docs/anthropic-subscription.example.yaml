@@ -8,24 +8,29 @@ connect_timeout_secs: 10
 # Claude Code supplies and refreshes its subscription OAuth bearer token.
 # The origin is validated at startup; there is no API key or fallback provider.
 #
-# No `rules` are declared, so the Anthropic first-party model family
-# (`claude-*`) selects native passthrough. A subagent's `model:` frontmatter is
-# the selector:
+# No `rules` are declared, so the Anthropic first-party model families
+# (`claude-fable-*`, `claude-opus-*`, `claude-haiku-*`) use the subscription.
+# A subagent's `model:` frontmatter is the selector, and Claude Code resolves a
+# short alias to a full id before sending it:
 #
-#   model: claude-fable-5-1   -> native Anthropic Messages (subscription)
-#   model: claude-opus-4-8    -> the local route below (translated)
+#   model: fable             -> claude-fable-*  -> subscription
+#   model: opus              -> claude-opus-*   -> subscription
+#   model: haiku             -> claude-haiku-*  -> subscription
+#   model: local-coder       -> the local route below (translated)
 #
-# A model the `model_routes` entries below claim is never passed through, even
-# though it matches the family. Declaring explicit `rules` replaces this default.
+# The family set decides, not the route table: a `claude-opus-*` entry below would
+# not divert that model to a local backend. Declaring explicit `rules` replaces
+# this default.
 anthropic_passthrough:
   upstream_origin: "https://api.anthropic.com"
 
 # Both vLLM servers must advertise this exact model ID from GET /v1/models.
-# These aliases use the canonical Responses engine and Chat Completions transport.
+# These non-Anthropic aliases use the canonical Responses engine and Chat
+# Completions transport, so an agent declaring one reaches a local replica.
 model_routes:
-  "claude-opus-*":
+  "local-coder":
     upstream_base_url: "http://127.0.0.1:8000/v1"
     upstream_model: "deepseek-ai/DeepSeek-V4.1-Flash"
-  "claude-haiku-*":
+  "local-fast":
     upstream_base_url: "http://127.0.0.1:8001/v1"
     upstream_model: "deepseek-ai/DeepSeek-V4.1-Flash"

@@ -695,8 +695,8 @@ struct ReasoningEffortPolicy {  // line 1661
    keys / missing or invalid URLs.
    Resolve optional `anthropic_passthrough` with `AnthropicPassthrough::resolve`: validate the
    fixed HTTPS Anthropic origin, compile model globs, and validate header conditions. An omitted
-   or empty `rules` list selects the Anthropic first-party model family (`claude-*`); a model
-   `model_routes` or an `upstreams` provider claims is never passed through. See
+   or empty `rules` list selects the Anthropic first-party model families (`claude-fable-*`,
+   `claude-opus-*`, `claude-haiku-*`); every other model string reaches the local routes. See
    [native subscription routing](anthropic-subscription-proxy.md) for precedence and limits.
 7. Validate response store / replay bounds.
 8. Floor safety-critical values (completion tokens, frame/body byte caps, image-cache size).

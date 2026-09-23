@@ -13,44 +13,53 @@ team messaging, login, and token refresh.
 ## Selection and configuration
 
 Selection is per request, so one Claude Code session can use native Anthropic
-Messages for the models that declare an Anthropic model and llmconduit's translation
-path for the models a local route claims. A subagent's `model:` frontmatter is the
-selector: it becomes the request's `model` field, which llmconduit reads before
-adapters, catalog lookup, defaults, profiles, and prompt injection.
+Messages for fable, opus, and haiku and llmconduit's translation path for every
+other model. A subagent's `model:` frontmatter is the selector: it becomes the
+request's `model` field, which llmconduit reads before adapters, catalog lookup,
+defaults, profiles, and prompt injection.
 
 The [example configuration](anthropic-subscription.example.yaml) declares no rules, so the
-Anthropic first-party model family (`claude-*`) selects native passthrough and two local
-`model_routes` entries claim the `claude-opus-*` and `claude-haiku-*` aliases for local
-replicas:
+Anthropic first-party model families (`claude-fable-*`, `claude-opus-*`, and
+`claude-haiku-*`) select native passthrough and two local `model_routes` entries claim
+non-Anthropic aliases for local replicas:
 
 | Agent `model:` frontmatter | Transport | Destination |
 |-|-|-|
 | `claude-fable-5-1` | Native Anthropic Messages | `https://api.anthropic.com` |
-| `claude-opus-4-8` | Translated Chat Completions | `http://127.0.0.1:8000/v1` |
-| `claude-haiku-4-5` | Translated Chat Completions | `http://127.0.0.1:8001/v1` |
+| `claude-opus-4-8` | Native Anthropic Messages | `https://api.anthropic.com` |
+| `claude-haiku-4-5` | Native Anthropic Messages | `https://api.anthropic.com` |
+| `local-coder` | Translated Chat Completions | `http://127.0.0.1:8000/v1` |
 
-Both translated routes send `deepseek-ai/DeepSeek-V4.1-Flash` as the backend model
-ID. Ordinary `model_routes` retain their catalog-first precedence and
-unmatched-model behavior. This assigns requests explicitly to two replicas; it does not
-load balance. Backend profiles must use the full served model ID.
+Claude Code resolves a short alias such as `opus` to a full id such as
+`claude-opus-5-5` before sending it, so the family patterns match both forms. Both
+translated routes send `deepseek-ai/DeepSeek-V4.1-Flash` as the backend model ID.
+Ordinary `model_routes` retain their catalog-first precedence and unmatched-model
+behavior. This assigns requests explicitly to two replicas; it does not load balance.
+Backend profiles must use the full served model ID.
 
-### Local claims win
+### Families use the subscription
 
-A model that configuration claims locally is never passed through, even when it matches
-the Anthropic family. Local claims are an ad-hoc `model_routes` entry, or a model that an
-explicit `upstreams` provider or one of its `fallback_upstreams` declares as
-`upstream_model` or `exposed_model`. This is what lets an agent declaring a local alias
-reach the local backend while the main loop, declaring an Anthropic model, passes through.
+A model matching an Anthropic first-party family uses the subscription, and every other
+model string reaches the local routes. The family set decides, not the route table: an ad-hoc
+`model_routes` entry naming a `claude-opus-*` model does not divert that model to a local
+backend. To route a local model, give it a non-Anthropic alias and declare that alias in
+`model_routes`. This is what lets the main loop and the fable, opus, and haiku teammates
+share one session on the subscription while a local-model agent reaches a local backend.
 
-Only config-declared claims are consulted. A claim that exists solely as an entry in a
-provider's fetched `/v1/models` catalog is not, because the passthrough decision is made
-synchronously before that catalog is loaded.
+Only the config-declared family set and the config-declared routes are consulted. A
+provider's fetched `/v1/models` catalog does not change the selection, because the
+passthrough decision is made synchronously before that catalog is loaded.
+
+A model string that matches no local route keeps the engine's existing unmatched-model
+behavior: it resolves to the first catalog model of the configured provider and logs a WARN.
+A model string that names a local backend without a matching route therefore still answers,
+from a backend the operator did not choose.
 
 ### Explicit rules
 
 `rules` is optional. Omit it, or set it to an empty list, to select the Anthropic
-first-party family. An explicit list replaces the default entirely, so rules can add a model
-the family pattern does not cover or narrow passthrough to specific requests. Patterns use
+first-party families. An explicit list replaces the default entirely, so rules can add a model
+the family patterns do not cover or narrow passthrough to specific requests. Patterns use
 the same case-insensitive glob syntax as `model_routes`: `*`, `?`, and character classes.
 Exact IDs also work. Model rules require valid JSON with a single string `model`; missing,
 duplicate, or malformed model fields do not match. The inspected body is never
@@ -74,8 +83,8 @@ anthropic_passthrough:
         x-llmconduit-route: "anthropic"
 ```
 
-Prefer the default or a model-only rule when Fable workflow, compaction, and
-token-count requests must follow the same route. Requiring class `main` excludes requests
+Prefer the default or a model-only rule when fable, opus, and haiku workflow,
+compaction, and token-count requests must all follow the same route. Requiring class `main` excludes requests
 with another or absent class. Client-supplied selectors are routing hints, not an
 authentication boundary.
 
@@ -188,10 +197,11 @@ gateway without changing saved Claude settings:
 3. Ask for a short lead response and an ordinary tool call. Check for the
    `Anthropic passthrough response prepared` event and native response. A 401 must
    remain an authentication failure; resolve login through Claude Code.
-4. Ask the lead to create native teammates using `opus` and `haiku`. Confirm
-   translated requests reach ports 8000 and 8001 with the full DeepSeek ID. Have
-   teammates exchange a message and complete a shared task. Do not invoke
-   `lci-run` for this check.
+4. Ask the lead to create native teammates using `opus` and `haiku`. Confirm those
+   teammates' requests reach the subscription rather than ports 8000 and 8001. Then ask
+   the lead to create a teammate declaring the local alias (`local-coder`) and confirm a
+   translated request reaches port 8000 with the full DeepSeek ID. Have teammates exchange
+   a message and complete a shared task. Do not invoke `lci-run` for this check.
 5. Trigger token counting and confirm matching Fable count requests use the native
    endpoint when emitted by the client. Interrupt a streaming lead response and
    verify upstream cancellation. Inspect sanitized diagnostics: subscription
