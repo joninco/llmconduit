@@ -141,9 +141,37 @@ fn configuration_is_opt_in_and_validates_trust_and_selectors() {
         let error = Config::from_persisted(&config).expect_err("invalid selector rejected");
         assert!(!error.contains("secret"));
     }
+    // An omitted or empty `rules` list is valid and selects the Anthropic
+    // first-party model family, so an agent declaring an Anthropic model passes
+    // through without enumerating rules.
     let mut config = persisted();
     config.anthropic_passthrough.as_mut().unwrap().rules.clear();
-    assert!(Config::from_persisted(&config).is_err());
+    let config = Config::from_persisted(&config).expect("empty rules select the Anthropic family");
+    let passthrough = config.anthropic_passthrough.as_ref().unwrap();
+    let uri: Uri = "/v1/messages".parse().unwrap();
+    let headers = HeaderMap::new();
+    assert_eq!(
+        passthrough.matching_rule(
+            &Method::POST,
+            &uri,
+            &headers,
+            body(MODEL).as_bytes(),
+            &config
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        passthrough.matching_rule(
+            &Method::POST,
+            &uri,
+            &headers,
+            body("deepseek-v4.1-flash").as_bytes(),
+            &config
+        ),
+        None
+    );
+    // An unknown key is still rejected, so a misspelled selector cannot be
+    // silently ignored.
     assert!(
         serde_yaml::from_str::<PersistedAnthropicPassthrough>(
             "upstream_origin: https://api.anthropic.com\nrules: []\napi_key: secret\n"
@@ -165,14 +193,18 @@ fn model_and_header_rules_are_explicit_and_endpoint_scoped() {
             headers: [("x-llmconduit-route".into(), "anthropic".into())].into(),
         },
     ];
-    let config = Config::from_persisted(&config)
-        .unwrap()
-        .anthropic_passthrough
-        .unwrap();
+    let config = Config::from_persisted(&config).unwrap();
+    let passthrough = config.anthropic_passthrough.as_ref().unwrap();
     let mut headers = HeaderMap::new();
     let uri: Uri = "/v1/messages?beta=true".parse().unwrap();
     assert_eq!(
-        config.matching_rule(&Method::POST, &uri, &headers, body(MODEL).as_bytes()),
+        passthrough.matching_rule(
+            &Method::POST,
+            &uri,
+            &headers,
+            body(MODEL).as_bytes(),
+            &config
+        ),
         None
     );
     headers.insert(
@@ -180,46 +212,62 @@ fn model_and_header_rules_are_explicit_and_endpoint_scoped() {
         HeaderValue::from_static("main"),
     );
     assert_eq!(
-        config.matching_rule(&Method::POST, &uri, &headers, body(MODEL).as_bytes()),
-        Some(0)
-    );
-    assert_eq!(
-        config.matching_rule(
+        passthrough.matching_rule(
             &Method::POST,
             &uri,
             &headers,
-            body("claude-opus-4").as_bytes()
+            body(MODEL).as_bytes(),
+            &config
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        passthrough.matching_rule(
+            &Method::POST,
+            &uri,
+            &headers,
+            body("claude-opus-4").as_bytes(),
+            &config
         ),
         None
     );
     assert_eq!(
-        config.matching_rule(&Method::GET, &uri, &headers, body(MODEL).as_bytes()),
+        passthrough.matching_rule(
+            &Method::GET,
+            &uri,
+            &headers,
+            body(MODEL).as_bytes(),
+            &config
+        ),
         None
     );
     assert_eq!(
-        config.matching_rule(
+        passthrough.matching_rule(
             &Method::POST,
             &"/v1/chat/completions".parse().unwrap(),
             &headers,
-            body(MODEL).as_bytes()
+            body(MODEL).as_bytes(),
+            &config
         ),
         None
     );
     assert_eq!(
-        config.matching_rule(
+        passthrough.matching_rule(
             &Method::POST,
             &"/v1/messages/count_tokens".parse().unwrap(),
             &headers,
-            body(MODEL).as_bytes()
+            body(MODEL).as_bytes(),
+            &config
         ),
         Some(0)
     );
     assert_eq!(
-        config.matching_rule(
+        passthrough.matching_rule(
             &Method::POST,
             &uri,
             &headers,
-            br#"{"model":"claude-fable-5-1","model":"claude-opus-4"}"#
+            br#"{"model":"claude-fable-5-1","model":"claude-opus-4"}"#,
+            &config
         ),
         None
     );
@@ -228,19 +276,190 @@ fn model_and_header_rules_are_explicit_and_endpoint_scoped() {
         HeaderValue::from_static("main"),
     );
     assert_eq!(
-        config.matching_rule(&Method::POST, &uri, &headers, body(MODEL).as_bytes()),
+        passthrough.matching_rule(
+            &Method::POST,
+            &uri,
+            &headers,
+            body(MODEL).as_bytes(),
+            &config
+        ),
         None
     );
     headers.insert("x-llmconduit-route", HeaderValue::from_static("anthropic"));
     assert_eq!(
-        config.matching_rule(
+        passthrough.matching_rule(
             &Method::POST,
             &uri,
             &headers,
-            b"native validation belongs upstream"
+            b"native validation belongs upstream",
+            &config
         ),
         Some(1)
     );
+}
+
+#[test]
+fn locally_claimed_models_are_not_passed_through() {
+    // An agent declaring a locally routed model reaches the local backend even
+    // though the same model matches the Anthropic family selector, while an
+    // unclaimed Anthropic model still passes through.
+    let mut config = persisted();
+    config.anthropic_passthrough.as_mut().unwrap().rules.clear();
+    config.model_routes.upsert(
+        "claude-opus-*".into(),
+        PersistedModelRoute {
+            upstream_base_url: Some("http://127.0.0.1:8000/v1".into()),
+            upstream_model: Some("deepseek-ai/DeepSeek-V4.1-Flash".into()),
+        },
+    );
+    let config = Config::from_persisted(&config).unwrap();
+    let passthrough = config.anthropic_passthrough.as_ref().unwrap();
+    let uri: Uri = "/v1/messages".parse().unwrap();
+    let headers = HeaderMap::new();
+    assert!(config.claims_model_locally("claude-opus-4-8"));
+    assert!(config.has_local_model_claims());
+    assert_eq!(
+        passthrough.matching_rule(
+            &Method::POST,
+            &uri,
+            &headers,
+            body("claude-opus-4-8").as_bytes(),
+            &config
+        ),
+        None
+    );
+    assert_eq!(
+        passthrough.matching_rule(
+            &Method::POST,
+            &uri,
+            &headers,
+            body(MODEL).as_bytes(),
+            &config
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        passthrough.matching_rule(
+            &Method::POST,
+            &uri,
+            &headers,
+            body("deepseek-v4.1-flash").as_bytes(),
+            &config
+        ),
+        None
+    );
+}
+
+#[test]
+fn explicit_upstream_models_are_claimed_locally() {
+    // A model an explicit upstream declares is served locally, so it is not
+    // forwarded to the subscription even though it names an Anthropic model.
+    let config: PersistedConfig = serde_yaml::from_str(
+        r#"
+upstream_base_url: http://127.0.0.1:1/v1
+anthropic_passthrough:
+  upstream_origin: https://api.anthropic.com
+upstreams:
+  - upstream_base_url: http://127.0.0.1:8000/v1
+    upstream_model: claude-opus-4-8
+"#,
+    )
+    .unwrap();
+    let config = Config::from_persisted(&config).unwrap();
+    let passthrough = config.anthropic_passthrough.as_ref().unwrap();
+    let uri: Uri = "/v1/messages".parse().unwrap();
+    let headers = HeaderMap::new();
+    assert!(config.claims_model_locally("claude-opus-4-8"));
+    assert_eq!(
+        passthrough.matching_rule(
+            &Method::POST,
+            &uri,
+            &headers,
+            body("claude-opus-4-8").as_bytes(),
+            &config
+        ),
+        None
+    );
+    assert_eq!(
+        passthrough.matching_rule(
+            &Method::POST,
+            &uri,
+            &headers,
+            body(MODEL).as_bytes(),
+            &config
+        ),
+        Some(0)
+    );
+}
+
+#[test]
+fn no_local_claims_means_no_body_parse_is_required() {
+    // Without local claims only a model-keyed rule forces the discriminator to be
+    // parsed, so a passthrough config that keys on headers alone never inspects
+    // an opaque body.
+    let mut config = persisted();
+    config.anthropic_passthrough.as_mut().unwrap().rules = vec![PersistedPassthroughRule {
+        model: None,
+        headers: [("x-llmconduit-route".into(), "anthropic".into())].into(),
+    }];
+    let config = Config::from_persisted(&config).unwrap();
+    assert!(!config.has_local_model_claims());
+    let passthrough = config.anthropic_passthrough.as_ref().unwrap();
+    let uri: Uri = "/v1/messages".parse().unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert("x-llmconduit-route", HeaderValue::from_static("anthropic"));
+    assert_eq!(
+        passthrough.matching_rule(
+            &Method::POST,
+            &uri,
+            &headers,
+            b"native validation belongs upstream",
+            &config
+        ),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn agent_model_selects_local_backend_or_subscription() {
+    let anthropic = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            r#"{"id":"msg_native","type":"message","role":"assistant","model":"claude-fable-5-1","content":[{"type":"text","text":"native reply"}],"stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}"#,
+            "application/json",
+        ))
+        .mount(&anthropic)
+        .await;
+    let local = local_model_server().await;
+    // No rules: the Anthropic first-party family is the selector. The local
+    // route claims the opus alias, so only the unclaimed model passes through.
+    let mut config = persisted();
+    config.anthropic_passthrough.as_mut().unwrap().rules.clear();
+    config.model_routes.upsert(
+        "claude-opus-*".into(),
+        PersistedModelRoute {
+            upstream_base_url: Some(format!("{}/v1", local.uri())),
+            upstream_model: Some("deepseek-ai/DeepSeek-V4.1-Flash".into()),
+        },
+    );
+    let router = app(config, &anthropic.uri());
+    for (model, expected) in [
+        ("claude-opus-4-8", "local reply"),
+        ("claude-fable-5-1", "native reply"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(request("/v1/messages", body(model)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let payload: serde_json::Value = serde_json::from_slice(&bytes(response).await).unwrap();
+        assert_eq!(payload["content"][0]["text"], expected, "model {model}");
+    }
+    // Each destination saw exactly its own request.
+    assert_eq!(anthropic.received_requests().await.unwrap().len(), 1);
+    assert_eq!(local.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

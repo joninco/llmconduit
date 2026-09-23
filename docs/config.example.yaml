@@ -137,14 +137,18 @@ model_routes:
 # ---------------------------------------------------------------------------
 # Select before adapters/profiles. Requests retain their original bytes and OAuth
 # bearer token; only this exact HTTPS origin is allowed. Missing block = disabled.
+# Omitting `rules` selects the Anthropic first-party model family (`claude-*`), so a
+# subagent's `model:` frontmatter picks the destination and a model the
+# `model_routes` above claim is never passed through.
 # See anthropic-subscription-proxy.md and anthropic-subscription.example.yaml.
 # anthropic_passthrough:
 #   upstream_origin: "https://api.anthropic.com"
-#   rules:
-#     - model: "claude-fable-*"
-#       # Optional AND condition; omit to include compaction/count-token requests:
-#       # headers:
-#       #   x-claude-code-request-class: "main"
+#   # Optional; declaring rules replaces the Anthropic-family default:
+#   # rules:
+#   #   - model: "claude-fable-*"
+#   #     # Optional AND condition; omit to include compaction/count-token requests:
+#   #     headers:
+#   #       x-claude-code-request-class: "main"
 #
 # ---------------------------------------------------------------------------
 # FALLBACK UPSTREAMS (non-routing mode)

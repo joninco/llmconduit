@@ -1377,6 +1377,13 @@ pub fn route_matches(routes: &[ModelRoute], model: &str) -> bool {
     })
 }
 
+/// Whether a config-declared upstream model id names `requested_model`. Unlike a
+/// route NAME, an upstream model id is a literal served id rather than a glob, so
+/// the comparison is case-insensitive equality.
+fn declares_model(declared: Option<&str>, requested_model: &str) -> bool {
+    declared.is_some_and(|declared| declared.trim().eq_ignore_ascii_case(requested_model))
+}
+
 /// Persisted form of a model route. Accepts either a bare URL string
 /// (`name = "http://host:8000"`) or a table with `upstream_base_url`/`url` and
 /// `upstream_model`/`model`, mirroring claude-relay's str-or-table coercion.
@@ -2427,6 +2434,48 @@ impl Config {
     /// catalog id still beats a route.
     pub fn matches_model_route(&self, model: &str) -> bool {
         route_matches(&self.model_routes, model)
+    }
+
+    /// Whether `model` is claimed by a LOCAL destination declared in
+    /// configuration: an ad-hoc `model_routes` entry, or a model declared by an
+    /// explicit `upstreams` provider or one of its `fallback_upstreams`. The
+    /// native Anthropic passthrough consults this so a locally claimed model
+    /// reaches the local backend instead of the subscription.
+    ///
+    /// Only config-declared claims are visible here. A claim that exists solely
+    /// as an entry in a provider's FETCHED `/v1/models` catalog is not
+    /// consulted, because the passthrough decision is made synchronously before
+    /// the catalog is loaded.
+    pub fn claims_model_locally(&self, model: &str) -> bool {
+        let trimmed = model.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if self.matches_model_route(trimmed) {
+            return true;
+        }
+        self.upstreams.iter().any(|provider| {
+            declares_model(provider.upstream_model.as_deref(), trimmed)
+                || provider.fallback_upstreams.iter().any(|fallback| {
+                    declares_model(fallback.exposed_model.as_deref(), trimmed)
+                        || declares_model(fallback.upstream_model.as_deref(), trimmed)
+                })
+        })
+    }
+
+    /// Whether ANY local claim is declared in configuration, i.e. whether
+    /// [`Self::claims_model_locally`] can return `true` for some model. The
+    /// passthrough consults this to decide whether a request `model` field must
+    /// be parsed at all, so a config with no local claims and no model-keyed
+    /// passthrough rule never parses a request body.
+    pub fn has_local_model_claims(&self) -> bool {
+        !self.model_routes.is_empty()
+            || self.upstreams.iter().any(|provider| {
+                provider.upstream_model.is_some()
+                    || provider.fallback_upstreams.iter().any(|fallback| {
+                        fallback.exposed_model.is_some() || fallback.upstream_model.is_some()
+                    })
+            })
     }
 
     /// Plain single-provider mode: no `upstreams` (routing), no `model_routes`

@@ -15,12 +15,24 @@ use url::Url;
 use crate::config::{Config, glob_to_regex};
 use crate::error::{AppError, AppResult};
 
+/// Anthropic first-party model ids, as they appear in a request `model` field.
+/// Every first-party id is namespaced `claude-`, and no locally served model
+/// id uses that prefix, so this pattern separates the two destinations without
+/// enumerating every model version.
+pub(crate) const ANTHROPIC_MODEL_FAMILY: &str = "claude-*";
+
 /// Opt-in configuration. No upstream credential is stored here: Claude Code
 /// supplies and refreshes its subscription bearer token on each request.
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PersistedAnthropicPassthrough {
     pub upstream_origin: String,
+    /// Optional explicit selectors. When omitted, the Anthropic first-party model
+    /// family ([`ANTHROPIC_MODEL_FAMILY`]) is the selector: an Anthropic model
+    /// passes through, and every other model falls through to the local routes.
+    /// Locally claimed models are excluded either way
+    /// ([`crate::config::Config::claims_model_locally`]).
+    #[serde(default)]
     pub rules: Vec<PersistedPassthroughRule>,
 }
 
@@ -58,11 +70,22 @@ impl AnthropicPassthrough {
                 "anthropic_passthrough.upstream_origin must be https://api.anthropic.com (no credentials, custom port, path, query, or fragment)".into(),
             );
         }
-        if config.rules.is_empty() {
-            return Err("anthropic_passthrough.rules must not be empty".into());
-        }
-        let rules = config
-            .rules
+        // An omitted `rules` list selects the Anthropic first-party model family,
+        // so an agent that declares an Anthropic model in its `model` frontmatter
+        // passes through to the subscription while every other model falls
+        // through to the local routes. An explicit list replaces the default
+        // entirely.
+        let default_rules;
+        let configured_rules = if config.rules.is_empty() {
+            default_rules = vec![PersistedPassthroughRule {
+                model: Some(ANTHROPIC_MODEL_FAMILY.to_string()),
+                headers: BTreeMap::new(),
+            }];
+            &default_rules
+        } else {
+            &config.rules
+        };
+        let rules = configured_rules
             .iter()
             .enumerate()
             .map(|(index, rule)| {
@@ -119,6 +142,7 @@ impl AnthropicPassthrough {
         uri: &Uri,
         headers: &HeaderMap,
         body: &[u8],
+        config: &Config,
     ) -> Option<usize> {
         if method != Method::POST
             || !matches!(uri.path(), "/v1/messages" | "/v1/messages/count_tokens")
@@ -132,13 +156,28 @@ impl AnthropicPassthrough {
         struct ModelSelector {
             model: Option<String>,
         }
-        let model = if self.rules.iter().any(|rule| rule.model.is_some()) {
+        // Parse the discriminator only when a rule keys on it or a local claim
+        // could suppress the match. A passthrough config with neither never
+        // parses the body, so an opaque body stays untouched.
+        let needs_model =
+            self.rules.iter().any(|rule| rule.model.is_some()) || config.has_local_model_claims();
+        let model = if needs_model {
             serde_json::from_slice::<ModelSelector>(body)
                 .ok()
                 .and_then(|selector| selector.model)
         } else {
             None
         };
+        // Local claims win: a model that an ad-hoc route or an explicit
+        // upstream declares is served locally, so it must not be forwarded to the
+        // subscription even when a rule matches it. This is what lets an agent
+        // declaring a local model reach the local backend while the main loop
+        // passes through.
+        if let Some(model) = model.as_deref()
+            && config.claims_model_locally(model)
+        {
+            return None;
+        }
         self.rules.iter().position(|rule| {
             rule.model.as_ref().is_none_or(|pattern| {
                 model
@@ -181,8 +220,10 @@ impl AnthropicProxy {
         uri: &Uri,
         headers: &HeaderMap,
         body: &[u8],
+        gateway_config: &Config,
     ) -> Option<usize> {
-        self.config.matching_rule(method, uri, headers, body)
+        self.config
+            .matching_rule(method, uri, headers, body, gateway_config)
     }
 
     pub(crate) async fn forward(

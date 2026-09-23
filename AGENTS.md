@@ -125,7 +125,7 @@ that projector or forward the private event dialect directly.
 
 ## Canonical protocol
 
-OpenAI Responses is the **single canonical internal protocol** for translated requests. Inbound shapes convert in via adapters; outbound shapes convert out via streaming converters. Do not add direct adapters between non-canonical shapes — go through Responses. Explicit `anthropic_passthrough` rules select a separate native transport before adapters and profile application; that transport does not convert protocols. See `docs/anthropic-subscription-proxy.md`.
+OpenAI Responses is the **single canonical internal protocol** for translated requests. Inbound shapes convert in via adapters; outbound shapes convert out via streaming converters. Do not add direct adapters between non-canonical shapes — go through Responses. `anthropic_passthrough` selects a separate native transport before adapters and profile application; that transport does not convert protocols. Its default selector is the Anthropic first-party model family (`claude-*`), and a model an ad-hoc `model_routes` entry or an `upstreams` provider claims is never passed through. See `docs/anthropic-subscription-proxy.md`.
 
 Adapter direction map:
 

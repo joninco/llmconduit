@@ -581,9 +581,12 @@ async fn log_api_call(
 
     // Native responses bypass adapters and capture gates, which may buffer or
     // replace responses. OAuth traffic gets metadata-only diagnostics even when
-    // payload logging or durable capture is enabled for translated traffic.
+    // payload logging or durable capture is enabled for translated traffic. A model
+    // that a local route or upstream claims is excluded here, so it reaches the
+    // local backend instead of the subscription.
     if let Some(proxy) = state.proxy
-        && let Some(rule) = proxy.matching_rule(&method, &uri, &headers, &body_bytes)
+        && let Some(rule) =
+            proxy.matching_rule(&method, &uri, &headers, &body_bytes, gateway.config())
     {
         let response = match proxy.forward(&uri, &headers, body_bytes).await {
             Ok(response) => response,

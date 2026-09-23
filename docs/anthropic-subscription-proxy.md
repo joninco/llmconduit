@@ -12,31 +12,56 @@ team messaging, login, and token refresh.
 
 ## Selection and configuration
 
-The [example configuration](anthropic-subscription.example.yaml) maps:
+Selection is per request, so one Claude Code session can use native Anthropic
+Messages for the models that declare an Anthropic model and llmconduit's translation
+path for the models a local route claims. A subagent's `model:` frontmatter is the
+selector: it becomes the request's `model` field, which llmconduit reads before
+adapters, catalog lookup, defaults, profiles, and prompt injection.
 
-| Request model | Transport | Destination |
-|---|---|---|
-| `claude-fable-*` | Native Anthropic Messages | `https://api.anthropic.com` |
-| `claude-opus-*` | Translated Chat Completions | `http://127.0.0.1:8000/v1` |
-| `claude-haiku-*` | Translated Chat Completions | `http://127.0.0.1:8001/v1` |
+The [example configuration](anthropic-subscription.example.yaml) declares no rules, so the
+Anthropic first-party model family (`claude-*`) selects native passthrough and two local
+`model_routes` entries claim the `claude-opus-*` and `claude-haiku-*` aliases for local
+replicas:
+
+| Agent `model:` frontmatter | Transport | Destination |
+|-|-|-|
+| `claude-fable-5-1` | Native Anthropic Messages | `https://api.anthropic.com` |
+| `claude-opus-4-8` | Translated Chat Completions | `http://127.0.0.1:8000/v1` |
+| `claude-haiku-4-5` | Translated Chat Completions | `http://127.0.0.1:8001/v1` |
 
 Both translated routes send `deepseek-ai/DeepSeek-V4.1-Flash` as the backend model
 ID. Ordinary `model_routes` retain their catalog-first precedence and
-unmatched-model behavior. This assigns requests explicitly to two replicas; it
-does not load balance. Backend profiles must use the full served model ID.
+unmatched-model behavior. This assigns requests explicitly to two replicas; it does not
+load balance. Backend profiles must use the full served model ID.
 
-Native selection reads the top-level JSON `model` before adapters, catalog
-lookup, defaults, profiles, and prompt injection. Patterns use the same
-case-insensitive glob syntax as `model_routes`: `*`, `?`, and character classes.
-Exact IDs also work. Model rules require valid JSON with a single string `model`;
-missing, duplicate, or malformed model fields do not match. The inspected body
-is never reserialized.
+### Local claims win
 
-Header conditions use exact, case-sensitive values. All conditions within one
-rule must match; the first matching rule wins. A header-only rule can select an
-opaque body. At least one condition and one rule are required. Unknown
-configuration fields are rejected. Header names are case-insensitive and limited
-to `x-claude-code-*` and the custom header `x-llmconduit-route`.
+A model that configuration claims locally is never passed through, even when it matches
+the Anthropic family. Local claims are an ad-hoc `model_routes` entry, or a model that an
+explicit `upstreams` provider or one of its `fallback_upstreams` declares as
+`upstream_model` or `exposed_model`. This is what lets an agent declaring a local alias
+reach the local backend while the main loop, declaring an Anthropic model, passes through.
+
+Only config-declared claims are consulted. A claim that exists solely as an entry in a
+provider's fetched `/v1/models` catalog is not, because the passthrough decision is made
+synchronously before that catalog is loaded.
+
+### Explicit rules
+
+`rules` is optional. Omit it, or set it to an empty list, to select the Anthropic
+first-party family. An explicit list replaces the default entirely, so rules can add a model
+the family pattern does not cover or narrow passthrough to specific requests. Patterns use
+the same case-insensitive glob syntax as `model_routes`: `*`, `?`, and character classes.
+Exact IDs also work. Model rules require valid JSON with a single string `model`; missing,
+duplicate, or malformed model fields do not match. The inspected body is never
+reserialized.
+
+Header conditions use exact, case-sensitive values. All conditions within one rule must
+match; the first matching rule wins. A header-only rule can select an opaque body, which is
+the only configuration that does not parse the request `model`. At least one condition per
+rule is required. Unknown configuration fields are rejected. Header names are
+case-insensitive and limited to `x-claude-code-*` and the custom header
+`x-llmconduit-route`.
 
 ```yaml
 anthropic_passthrough:
@@ -49,17 +74,22 @@ anthropic_passthrough:
         x-llmconduit-route: "anthropic"
 ```
 
-Prefer the model-only example when Fable workflow, compaction, and token-count
-requests must follow the same route. Requiring class `main` excludes requests
-with another or absent class. Client-supplied selectors are routing hints, not
-an authentication boundary.
+Prefer the default or a model-only rule when Fable workflow, compaction, and
+token-count requests must follow the same route. Requiring class `main` excludes requests
+with another or absent class. Client-supplied selectors are routing hints, not an
+authentication boundary.
 
 Claude Code 2.1.274 and captured Messages bodies were inspected: requests contain
 full IDs such as `claude-opus-4-8`, not only UI aliases such as `opus`. No
 Fable-specific header is assumed. Claude Code documents optional request-class
 and agent-type hints; custom-base-URL clients enable them with
-`CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`. Verify the installed client's behavior
-before requiring headers. See the official
+`CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`. A subagent's `model:` frontmatter accepts any
+string and reaches the wire verbatim, so the client logs
+`claude-code:unrecognized_model` rather than rejecting an id it does not recognize. That
+per-agent field is the selector this configuration routes on. Claude Code cannot name a
+non-Anthropic model or endpoint anywhere else: `ANTHROPIC_DEFAULT_*_MODEL` and a
+subagent's `model:` remap only the model id sent to a process-global base URL. Verify the
+installed client's behavior before requiring headers. See the official
 [gateway compatibility guide](https://code.claude.com/docs/en/llm-gateway-protocol).
 
 ## Subscription authentication

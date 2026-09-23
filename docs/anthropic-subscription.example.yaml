@@ -7,10 +7,18 @@ connect_timeout_secs: 10
 
 # Claude Code supplies and refreshes its subscription OAuth bearer token.
 # The origin is validated at startup; there is no API key or fallback provider.
+#
+# No `rules` are declared, so the Anthropic first-party model family
+# (`claude-*`) selects native passthrough. A subagent's `model:` frontmatter is
+# the selector:
+#
+#   model: claude-fable-5-1   -> native Anthropic Messages (subscription)
+#   model: claude-opus-4-8    -> the local route below (translated)
+#
+# A model the `model_routes` entries below claim is never passed through, even
+# though it matches the family. Declaring explicit `rules` replaces this default.
 anthropic_passthrough:
   upstream_origin: "https://api.anthropic.com"
-  rules:
-    - model: "claude-fable-*"
 
 # Both vLLM servers must advertise this exact model ID from GET /v1/models.
 # These aliases use the canonical Responses engine and Chat Completions transport.
